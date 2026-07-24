@@ -1,32 +1,33 @@
 #pragma once
 
-#include <atomic>
-
 namespace ibex::runtime {
 
-/// One query at a time: a process-wide guard on top-level query execution.
+/// One query at a time: a host-runtime guard on top-level query execution.
 ///
-/// The runtime executes at most one in-flight `interpret()` (later, executor)
-/// invocation per process — see the runtime multithreading plan, Phase 0 item 6.
+/// The host runtime executes at most one in-flight `interpret()` (later,
+/// executor) invocation — see the runtime multithreading plan, Phase 0 item 6.
 /// A second *top-level* entry is rejected with a stable error rather than
 /// serialized. Two things trigger that rejection:
 ///
 ///   * once workers exist, a second thread entering `interpret()` while a query
 ///     is already running; and
-///   * a re-entrant entry from an extern/plugin that calls back into
-///     `interpret()` from inside the query it is running under — it could not
-///     wait for the pool lease it already holds without deadlocking.
+///   * a nested entry attempted while the host query owns the lease. Calling
+///     `interpret()` from an extern/plugin callback is unsupported; plugins
+///     provide data/functions to their host query and do not start queries.
 ///
-/// Because there is never more than one live query, the process-wide interrupt
+/// Because there is never more than one live host query, the process-wide interrupt
 /// flag (`interrupt.hpp`) needs no per-query scoping: it means "cancel the one
 /// running query." This lease is the enforcement of that single-live-query
 /// invariant, which the LazyTable cache freeze/thaw and the deferred-scan
 /// ownership both rely on.
 
 namespace detail {
-// One instance process-wide (inline variable). False when no query is running.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline std::atomic<bool> query_in_flight{false};
+// Backed by the host runtime implementation, rather than an inline variable in
+// this public header. Bundled plugins link static runtime code too; they are
+// forbidden from initiating interpretation, so query ownership belongs to the
+// embedding runtime that owns the top-level entry point.
+[[nodiscard]] auto try_claim_query_execution() noexcept -> bool;
+auto release_query_execution() noexcept -> void;
 }  // namespace detail
 
 /// RAII claim on the single query slot. Construction attempts the claim in one
@@ -37,21 +38,14 @@ inline std::atomic<bool> query_in_flight{false};
 /// exception.
 class QueryExecutionLease {
    public:
-    QueryExecutionLease() noexcept {
-        bool expected = false;
-        // acq_rel on success publishes/pairs with the releasing store below so a
-        // subsequent query observes the previous one's writes; acquire on
-        // failure is enough to see that the slot is taken.
-        held_ = detail::query_in_flight.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
-    }
+    QueryExecutionLease() noexcept { held_ = detail::try_claim_query_execution(); }
     QueryExecutionLease(const QueryExecutionLease&) = delete;
     QueryExecutionLease(QueryExecutionLease&&) = delete;
     auto operator=(const QueryExecutionLease&) -> QueryExecutionLease& = delete;
     auto operator=(QueryExecutionLease&&) -> QueryExecutionLease& = delete;
     ~QueryExecutionLease() {
         if (held_) {
-            detail::query_in_flight.store(false, std::memory_order_release);
+            detail::release_query_execution();
         }
     }
 

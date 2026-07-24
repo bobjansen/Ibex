@@ -800,6 +800,14 @@ identical to the existing serial accumulation order.
 
 ## Generated C++ and Plugins
 
+- A plugin/extern callback must never call `runtime::interpret()` (or any
+  future executor entry point). Plugins provide sources and functions to the
+  host query; nested query execution is unsupported. The host runtime rejects a
+  nested call that reaches its entry point, but the policy does not rely on
+  coordinating static runtime copies linked into plugin DSOs. This keeps
+  worker-pool ownership, cancellation, deferred scans, and the one-query lease
+  with the embedding runtime.
+
 - Phase 1 applies to `runtime::interpret()` only. Generated C++ emits direct,
   separate `ibex::ops::*` calls; it does **not** delegate to `interpret()` and
   therefore remains serial in this phase. Its differential-parity suite remains

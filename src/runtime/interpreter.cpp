@@ -9,6 +9,7 @@
 #include <ibex/runtime/query_lease.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -43,6 +44,26 @@
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
+
+namespace detail {
+
+namespace {
+std::atomic<bool> query_in_flight{false};
+}
+
+auto try_claim_query_execution() noexcept -> bool {
+    bool expected = false;
+    // A successful claim observes all writes from the preceding query's release;
+    // a failed claim only needs to observe that the slot is occupied.
+    return query_in_flight.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire);
+}
+
+auto release_query_execution() noexcept -> void {
+    query_in_flight.store(false, std::memory_order_release);
+}
+
+}  // namespace detail
 
 namespace {
 

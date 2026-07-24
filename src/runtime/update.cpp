@@ -1700,20 +1700,6 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
         }
     }
-    bool drop_ordering = false;
-    if (output.ordering.has_value()) {
-        for (const auto& field : fields) {
-            for (const auto& key : *output.ordering) {
-                if (field.alias == key.name) {
-                    drop_ordering = true;
-                    break;
-                }
-            }
-            if (drop_ordering) {
-                break;
-            }
-        }
-    }
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
         if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
@@ -1758,10 +1744,18 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
         add_computed_column(output, field.alias, std::move(*col));
     }
-    if (drop_ordering) {
-        output.ordering.reset();
-    }
-    normalize_time_index(output);
+    // A field that writes a sort key's values in place invalidates it as a key
+    // even though the column stays present (the overwrite rule); the time index
+    // cannot be updated (rejected above), so it always survives. The column loop
+    // never touches the metadata fields, so `output` still carries the input's.
+    apply_table_properties(
+        output, derive_table_properties(
+                    table_properties_of(output),
+                    [&](const std::string& name) -> std::optional<std::string> {
+                        const bool overwritten = std::ranges::any_of(
+                            fields, [&](const ir::FieldSpec& f) { return f.alias == name; });
+                        return overwritten ? std::nullopt : std::optional<std::string>{name};
+                    }));
     return output;
 }
 

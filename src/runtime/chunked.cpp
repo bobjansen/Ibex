@@ -556,6 +556,23 @@ class ChunkedRenameOperator final : public Operator {
                 return std::unexpected("rename: column not found: " + spec.old_name);
             }
         }
+        // Rewrite the chunk's order-sensitive metadata through the same shared
+        // rule as the serial `rename_table`, so a renamed sort key / time index
+        // is relabeled here too rather than left carrying its old column name.
+        if (chunk.ordering.has_value() || chunk.time_index.has_value()) {
+            auto props = derive_table_properties(
+                TableProperties{.ordering = chunk.ordering, .time_index = chunk.time_index},
+                [&](const std::string& name) -> std::optional<std::string> {
+                    for (const auto& spec : *renames_) {
+                        if (spec.old_name == name) {
+                            return spec.new_name;
+                        }
+                    }
+                    return name;
+                });
+            chunk.ordering = std::move(props.ordering);
+            chunk.time_index = std::move(props.time_index);
+        }
         return std::optional<Chunk>{std::move(chunk)};
     }
 

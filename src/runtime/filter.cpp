@@ -2195,15 +2195,16 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
         }
     }
 
-    if (input.ordering.has_value() &&
-        (project == nullptr || ordering_keys_present(*input.ordering, output.index))) {
-        output.ordering = input.ordering;
-    }
-    if (input.time_index.has_value() &&
-        (project == nullptr || output.index.contains(*input.time_index))) {
-        output.time_index = input.time_index;
-    }
-    normalize_time_index(output);
+    // A row-local filter preserves order and time index; a fused projection
+    // keeps each only when its column survives the selection.
+    apply_table_properties(
+        output,
+        derive_table_properties(table_properties_of(input),
+                                [&](const std::string& name) -> std::optional<std::string> {
+                                    return (project == nullptr || output.index.contains(name))
+                                               ? std::optional<std::string>{name}
+                                               : std::nullopt;
+                                }));
     return output;
 }
 

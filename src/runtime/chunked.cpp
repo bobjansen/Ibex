@@ -471,14 +471,16 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
                                        const std::vector<ir::FieldSpec>* fields,
                                        const std::vector<ir::ColumnRef>* project_columns,
                                        std::vector<ir::ColumnRef> gather_columns,
-                                       const ScalarRegistry* scalars, const ExternRegistry* externs)
+                                       const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                       const ExecutionContext& exec)
         : child_(std::move(child)),
           predicate_(predicate),
           fields_(fields),
           project_columns_(project_columns),
           gather_columns_(std::move(gather_columns)),
           scalars_(scalars),
-          externs_(externs) {}
+          externs_(externs),
+          exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -495,7 +497,8 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
                 return std::unexpected(std::move(filtered.error()));
             }
             const bool empty = !filtered->columns.empty() && filtered->rows() == 0;
-            auto updated = update_table(std::move(filtered.value()), *fields_, scalars_, externs_);
+            auto updated =
+                update_table(std::move(filtered.value()), *fields_, scalars_, externs_, *exec_);
             if (!updated.has_value()) {
                 return std::unexpected(std::move(updated.error()));
             }
@@ -523,6 +526,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
     std::vector<ir::ColumnRef> gather_columns_;
     const ScalarRegistry* scalars_;
     const ExternRegistry* externs_;
+    const ExecutionContext* exec_;
 };
 
 class ChunkedRenameOperator final : public Operator {
@@ -571,8 +575,13 @@ using ir::is_row_local_update_expr;
 class ChunkedUpdateOperator final : public Operator {
    public:
     ChunkedUpdateOperator(OperatorPtr child, const std::vector<ir::FieldSpec>* fields,
-                          const ScalarRegistry* scalars, const ExternRegistry* externs)
-        : child_(std::move(child)), fields_(fields), scalars_(scalars), externs_(externs) {}
+                          const ScalarRegistry* scalars, const ExternRegistry* externs,
+                          const ExecutionContext& exec)
+        : child_(std::move(child)),
+          fields_(fields),
+          scalars_(scalars),
+          externs_(externs),
+          exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         auto chunk_res = child_->next();
@@ -583,7 +592,7 @@ class ChunkedUpdateOperator final : public Operator {
             return std::optional<Chunk>{};
         }
         Table t = chunk_to_table(std::move(*chunk_res.value()));
-        auto out = update_table(std::move(t), *fields_, scalars_, externs_);
+        auto out = update_table(std::move(t), *fields_, scalars_, externs_, *exec_);
         if (!out.has_value()) {
             return std::unexpected(std::move(out.error()));
         }
@@ -595,6 +604,7 @@ class ChunkedUpdateOperator final : public Operator {
     const std::vector<ir::FieldSpec>* fields_;
     const ScalarRegistry* scalars_;
     const ExternRegistry* externs_;
+    const ExecutionContext* exec_;
 };
 
 class ChunkedHeadOperator final : public Operator {
@@ -5804,7 +5814,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         return std::make_unique<ChunkedFilterUpdateProjectOperator>(
             std::move(child_op.value()), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-            std::move(gather_cols), scalars, externs);
+            std::move(gather_cols), scalars, externs, exec);
     }
 
     if (node.kind() == ir::NodeKind::Rename) {
@@ -6116,7 +6126,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return build_unary_materializing_operator(
                 *update.children().front(), registry, scalars, externs, exec, model_out,
                 [&](Table input) -> std::expected<Table, std::string> {
-                    return apply_guarded_update(std::move(input), update, scalars, externs);
+                    return apply_guarded_update(std::move(input), update, scalars, externs, exec);
                 });
         }
         if (!update.group_by().empty()) {
@@ -6129,7 +6139,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     *update.children().front(), registry, scalars, externs, exec, model_out,
                     [&](Table input) -> std::expected<Table, std::string> {
                         return grouped_update_table(std::move(input), update.fields(),
-                                                    update.group_by(), scalars, externs);
+                                                    update.group_by(), scalars, externs, exec);
                     });
             }
             if (!all_rank || !update.tuple_fields().empty()) {
@@ -6167,13 +6177,13 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
-            return std::make_unique<ChunkedUpdateOperator>(std::move(child_op.value()),
-                                                           &update.fields(), scalars, externs);
+            return std::make_unique<ChunkedUpdateOperator>(
+                std::move(child_op.value()), &update.fields(), scalars, externs, exec);
         }
         auto child = build_unary_materializing_operator(
             *update.children().front(), registry, scalars, externs, exec, model_out,
             [&](Table input) {
-                return update_table(std::move(input), update.fields(), scalars, externs);
+                return update_table(std::move(input), update.fields(), scalars, externs, exec);
             });
         if (!child.has_value()) {
             return std::unexpected(std::move(child.error()));
@@ -6253,12 +6263,13 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected(
                 "window requires a TimeFrame — use as_timeframe() to designate a timestamp column");
         }
-        auto result = update_node.group_by().empty()
-                          ? windowed_update_table(std::move(source.value()), update_node.fields(),
-                                                  win.duration(), scalars, externs, win.aligned())
-                          : grouped_windowed_update_table(
-                                std::move(source.value()), update_node.fields(), win.duration(),
-                                update_node.group_by(), scalars, externs, win.aligned());
+        auto result =
+            update_node.group_by().empty()
+                ? windowed_update_table(std::move(source.value()), update_node.fields(),
+                                        win.duration(), scalars, externs, exec, win.aligned())
+                : grouped_windowed_update_table(std::move(source.value()), update_node.fields(),
+                                                win.duration(), update_node.group_by(), scalars,
+                                                externs, exec, win.aligned());
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
         }

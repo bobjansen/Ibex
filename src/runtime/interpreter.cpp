@@ -474,7 +474,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(child.error());
             }
             if (update.guard() != nullptr) {
-                return apply_guarded_update(std::move(child.value()), update, scalars, externs);
+                return apply_guarded_update(std::move(child.value()), update, scalars, externs,
+                                            exec);
             }
             if (!update.group_by().empty()) {
                 const bool all_rank = std::all_of(
@@ -505,9 +506,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         "update + by: tuple-bound fields are not yet supported in grouped updates");
                 }
                 return grouped_update_table(std::move(child.value()), update.fields(),
-                                            update.group_by(), scalars, externs);
+                                            update.group_by(), scalars, externs, exec);
             }
-            auto result = update_table(std::move(child.value()), update.fields(), scalars, externs);
+            auto result =
+                update_table(std::move(child.value()), update.fields(), scalars, externs, exec);
             if (!result) {
                 return result;
             }
@@ -606,10 +608,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             auto windowed =
                 update_node.group_by().empty()
                     ? windowed_update_table(std::move(source.value()), update_node.fields(),
-                                            win.duration(), scalars, externs, win.aligned())
+                                            win.duration(), scalars, externs, exec, win.aligned())
                     : grouped_windowed_update_table(std::move(source.value()), update_node.fields(),
                                                     win.duration(), update_node.group_by(), scalars,
-                                                    externs, win.aligned());
+                                                    externs, exec, win.aligned());
             if (!windowed.has_value() || !win.select_only()) {
                 return windowed;
             }
@@ -1249,7 +1251,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(filtered.error());
             }
             auto updated =
-                update_table(std::move(filtered.value()), fup.fields(), scalars, externs);
+                update_table(std::move(filtered.value()), fup.fields(), scalars, externs, exec);
             if (!updated) {
                 return std::unexpected(updated.error());
             }

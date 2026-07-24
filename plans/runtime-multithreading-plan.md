@@ -620,6 +620,64 @@ fails loudly instead of racing silently.
 
 ## Phase 1 — First Parallel Island
 
+**STATUS (2026-07-24): slices 1a and 1b have landed.** The executor exists and
+scales; eligibility is still the narrow set below.
+
+- **Slice 1a — serial island.** `ExecutionContext.parallel` makes
+  `build_operator()` consult `analyze_parallel_island()` at its seam and run an
+  eligible row-local chain over `PartitionedTableSource` morsels, serially.
+  `SerialIslandOrderValidator` + `preserve_empty_morsels` enforce a 1:1
+  input→output morsel contract with stamped identity, and the lazy/deferred
+  source gate is applied at the seam.
+- **Slice 1b — worker pool and ordered merger.** `WorkerPool`
+  (`include/ibex/runtime/worker_pool.hpp`) is the process-owned, pre-spawned,
+  mutex+condvar pool described below. `ParallelIslandOperator`
+  (`src/runtime/chunked.cpp`) dispenses morsels from one atomic cursor, runs a
+  per-worker copy of the map chain, and merges results through a bounded ring
+  indexed by `sequence`. Errors are recorded by lowest sequence, and no morsel
+  below a reported failure is abandoned, so the error a query reports does not
+  depend on thread timing. `island_worker_count()` is the grain-size serial
+  threshold; below it the 1a serial chain still runs. Knobs: `IBEX_PARALLEL`,
+  `IBEX_THREADS`, `IBEX_MORSEL_ROWS`. Islands stay **off by default**.
+
+**Two findings from 1b's measurements, both worth carrying forward:**
+
+1. **The multi-chunk concat was quadratic.** `MaterializeOperator` reserved
+   exactly `size + chunk` per chunk, and `reserve` allocates precisely what it
+   is asked for — so every chunk reallocated and copied the whole accumulated
+   column. Invisible at one chunk; at 306 morsels it was 93% of runtime in
+   `memmove` and made the island 15× *slower* than the serial path. Fixed by
+   growing the reservation geometrically. This was a pre-existing defect on
+   every chunked path, not an island-specific one.
+2. **A computed `select` does not reach the island on the REPL/script path.**
+   `filter … , select { y = f(x) }` lowers to `Project(Update(Filter(x)))`, and
+   only `canonicalize` R6 fuses that into the eligible `FilterUpdateProject`.
+   The REPL and whole-script paths do not run canonicalize, so the island there
+   captures only the top `Project` while the `Update` — where the work is —
+   stays a serial barrier. Widening eligibility to standalone row-local `Update`
+   (the conditional-classification work called out below) is worth more on that
+   path than any further executor tuning.
+
+**Acceptance measurement (local, 24-core WSL2, release, 20M rows).** The
+compute-heavy row-local workload the acceptance criterion asks for, expressed as
+a heavy filter predicate (six `exp`/`tanh` terms) so the work lands inside an
+eligible node. Whole-script wall time, so it includes ~0.5s of serial generation
+and aggregation that no island touches:
+
+| threads | 1 | 2 | 4 | 8 | 16 | 24 | serial (no island) |
+|---|---|---|---|---|---|---|---|
+| wall (s) | 3.08 | 1.89 | 1.36 | 1.08 | 0.96 | 0.98 | 2.64 |
+| CPU | 99% | 169% | 256% | 360% | 516% | 591% | 99% |
+
+Net of the serial fraction the island itself is roughly 2.6s → 0.5s at 8
+threads. That is the executor working. The bandwidth-bound cases behave exactly
+as the Amdahl section predicts: a `y = x + q` island is ~1.0s at any thread
+count, and still *slower* than the 0.52s serial path, because the Phase-0
+materializing gather and the serial merge concat cost more than the map saves.
+**Range-aware zero-copy kernels are therefore the next lever, not more
+threads** — until a morsel stops being a copy, low-arithmetic-intensity islands
+cannot win.
+
 Build one bounded, ordered parallel pipeline:
 
 ```text
@@ -656,6 +714,15 @@ reads the immutable source by absolute row index and returns a task-owned
 result. The merger appends results strictly by morsel `sequence`. The executor
 keeps the source table alive until every task has joined, including error and
 cancellation paths.
+
+**Allocator and output ownership — chosen strategy (1b).** Each task owns the
+chunk it produces and the merger's consumer moves it straight into the
+downstream concat. Nothing escapes into task-local scratch, so no arena
+ownership is transferred and `ScratchArena` is unused. This is the simplest
+strategy the paragraph below allows; the presized query-owned buffer pool is the
+next option if allocation shows up in the measurements. It has not yet been
+stressed across selectivities and allocator configurations — that measurement is
+still owed before any allocator claim.
 
 **Allocator and output ownership.** Parallel task-owned filter output means
 many concurrent, variable-sized allocations — a known risk given the

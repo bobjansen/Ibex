@@ -3378,8 +3378,10 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
 
     runtime::ModelResult captured_model;
+    runtime::ExecutionContext exec;
+    runtime::configure_parallel_from_env(exec);
     auto evaluated = runtime::interpret(*lowered.value(), *eval_tables, &scalars, &externs,
-                                        model_out != nullptr ? &captured_model : nullptr);
+                                        model_out != nullptr ? &captured_model : nullptr, exec);
     if (!evaluated) {
         return std::unexpected(evaluated.error());
     }
@@ -4553,7 +4555,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
             tables.insert_or_assign(name, std::move(table.value()));
         }
-        const runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
+        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
+        runtime::configure_parallel_from_env(exec);
         return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
     };
 

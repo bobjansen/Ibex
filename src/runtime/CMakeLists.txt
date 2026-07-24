@@ -18,7 +18,10 @@ add_library(ibex_runtime STATIC
     table_compare.cpp
     update.cpp
     window.cpp
+    worker_pool.cpp
 )
+
+find_package(Threads REQUIRED)
 add_library(Ibex::runtime ALIAS ibex_runtime)
 
 target_include_directories(ibex_runtime
@@ -31,6 +34,7 @@ target_link_libraries(ibex_runtime
     PUBLIC
         Ibex::core
         Ibex::ir
+        Threads::Threads
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt

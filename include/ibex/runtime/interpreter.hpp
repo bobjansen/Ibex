@@ -5,6 +5,7 @@
 #include <ibex/ir/node.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -330,27 +331,55 @@ using DeferredScanRegistry = std::map<std::string, DeferredScan>;
 /// seed, and worker-failure/cancellation state are added by later phases. A
 /// default-constructed context (no deferred scans) reproduces the pre-context
 /// serial behavior.
+/// Per-query counters for the parallel-island executor. Optional: a query only
+/// pays for them when an `ExecutionContext` points at one, and they are touched
+/// once per island (never per row or per morsel), so they are free on the hot
+/// path.
+///
+/// Their reason to exist is that the island decision is invisible from the
+/// outside — a parallel island and a serial one produce identical output by
+/// construction. Without a counter, a benchmark or a test cannot tell "ran in
+/// parallel" from "silently fell back to serial", which is the failure mode
+/// that makes a parallel test hollow.
+struct ParallelIslandStats {
+    std::atomic<std::uint64_t> parallel_islands{0};  ///< islands run on worker threads
+    std::atomic<std::uint64_t> serial_islands{0};    ///< islands below the grain threshold
+    std::atomic<std::uint64_t> morsels{0};           ///< morsels those islands partitioned into
+};
+
 struct ExecutionContext {
     /// Deferred lazy scans the whole-script driver installed for this query, or
     /// null when the query has none. Not owned: the driver keeps the registry
     /// alive for the whole `interpret()` call.
     const DeferredScanRegistry* deferred_scans = nullptr;
 
-    /// Runtime-multithreading Phase 1 (serial-island slice). When set,
-    /// `build_operator()` consults `analyze_parallel_island()` at its seam and,
-    /// for an eligible row-local parallel-map chain, executes it over a
-    /// `PartitionedTableSource` in fixed morsel grains instead of a single
-    /// whole-table chunk. This first slice runs those morsels *serially* through
-    /// the existing chunked operators — no worker pool yet — so output is
-    /// byte-identical to the plain serial path; the flag exists to exercise the
-    /// island wiring and morsel handoff before threads are introduced. Default
-    /// off keeps every existing caller on the untouched serial chain.
+    /// Runtime-multithreading Phase 1. When set, `build_operator()` consults
+    /// `analyze_parallel_island()` at its seam and, for an eligible row-local
+    /// parallel-map chain, executes it over morsels of the materialized island
+    /// input instead of a single whole-table chunk. Whether those morsels run
+    /// on worker threads or serially is decided per island by the size
+    /// thresholds below; either way an ordered merger emits results in morsel
+    /// `sequence` order, so output is byte-identical to the plain serial path.
+    /// Default off keeps every existing caller on the untouched serial chain.
     bool parallel = false;
 
-    /// Morsel row-grain for the partitioned island source when `parallel` is
-    /// set. A source is partitioned into contiguous ranges of at most this many
-    /// rows. Ignored when `parallel` is false.
+    /// Morsel row-grain for the island source when `parallel` is set. The input
+    /// is partitioned into contiguous ranges of at most this many rows, and one
+    /// range is one parallel task. Ignored when `parallel` is false.
     std::size_t parallel_grain = 65536;
+
+    /// Island thread budget, or 0 to use the process pool's size
+    /// (`IBEX_THREADS`). Clamped to the pool size and to the morsel count.
+    std::size_t parallel_threads = 0;
+
+    /// The plan's grain-size serial threshold: an island input smaller than
+    /// this stays on the serial morsel chain rather than paying task,
+    /// synchronization, and merge overhead to parallelize cache-resident work.
+    /// Tests that need the worker path on a small table set this to 0.
+    std::size_t parallel_min_rows = 65536;
+
+    /// Optional island counters, or null to record nothing. Not owned.
+    ParallelIslandStats* parallel_stats = nullptr;
 
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.
@@ -362,6 +391,16 @@ struct ExecutionContext {
         return it == deferred_scans->end() ? nullptr : &it->second;
     }
 };
+
+/// Apply the parallel-island environment switches to `exec`:
+/// `IBEX_PARALLEL` enables islands, `IBEX_THREADS` sets the thread budget, and
+/// `IBEX_MORSEL_ROWS` overrides the morsel grain (and, when set explicitly,
+/// drops the serial threshold to that grain so a deliberately small grain is
+/// honored). Unset variables leave `exec` untouched.
+///
+/// This is how a benchmark run turns the executor on: parallel islands stay off
+/// by default until Phase 1's acceptance measurements say otherwise.
+void configure_parallel_from_env(ExecutionContext& exec);
 
 /// True if the plan subtree `node` reads any lazy/deferred source — a `Scan`
 /// with no eager registry entry that resolves through `exec`'s deferred-scan

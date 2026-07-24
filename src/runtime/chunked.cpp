@@ -26,6 +26,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <expected>
 #include <limits>
 #include <memory>
@@ -5849,7 +5850,10 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         // threshold would silently override the knob it was asked to honor.
         exec.parallel_min_rows = std::min(exec.parallel_min_rows, grain);
     }
-    exec.parallel_threads = default_thread_count();
+    // `parallel_threads` is deliberately left alone. `IBEX_THREADS` already
+    // sizes the process pool, and a zero budget means "use the pool", so the
+    // environment reaches the island either way — while a caller that set its
+    // own budget before calling this keeps it.
 }
 
 // True if any Scan in `node`'s subtree reads a lazy/deferred source: no eager
@@ -6061,6 +6065,15 @@ class ParallelIslandOperator final : public Operator {
         }
 
         // No chunk: the island stopped early. Report why, deterministically.
+        //
+        // An interrupt outranks a recorded data error. A worker that fails at
+        // the moment the user hits Ctrl+C is a race, and reporting its message
+        // would make cancellation surface as an arbitrary query error depending
+        // on which thread won. The cancellation contract says such a query
+        // reports "interrupted", so the interrupt is checked first.
+        if (interrupt_requested()) {
+            return fail(interrupt_message());
+        }
         // Copy the message out before `fail()`, which takes the same lock.
         std::optional<std::string> failure;
         {
@@ -6070,14 +6083,42 @@ class ParallelIslandOperator final : public Operator {
         if (failure.has_value()) {
             return fail(std::move(*failure));
         }
-        if (interrupt_requested()) {
-            return fail(interrupt_message());
-        }
         return fail("parallel island: missing output morsel");
     }
 
    private:
-    void run_worker(std::size_t worker_id) {
+    // Whatever happens to a worker — normal exhaustion, a recorded error, or an
+    // exception — it must stop counting as active and must wake the merger.
+    // Skipping this on any path leaves the consumer waiting for a sequence that
+    // is never coming, which is a hang rather than an error.
+    void worker_exited() noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            --active_workers_;
+        }
+        ready_.notify_all();
+    }
+
+    void run_worker(std::size_t worker_id) noexcept {
+        std::uint64_t sequence = 0;
+        try {
+            run_worker_loop(worker_id, sequence);
+        } catch (const std::exception& error) {
+            // An exception is not part of the operator protocol (evaluation
+            // reports failure through `expected`), so it is something
+            // unplanned — an allocation failure while materializing a morsel,
+            // say. Convert it to a sequence-tagged island error so it obeys the
+            // same lowest-sequence determinism as any other failure, rather
+            // than unwinding through a pool thread.
+            record_error(sequence,
+                         "parallel island: worker exception: " + std::string(error.what()));
+        } catch (...) {
+            record_error(sequence, "parallel island: worker threw a non-standard exception");
+        }
+        worker_exited();
+    }
+
+    void run_worker_loop(std::size_t worker_id, std::uint64_t& claimed) {
         auto& worker = workers_[worker_id];
         const std::size_t rows = input_->rows();
         while (true) {
@@ -6085,6 +6126,9 @@ class ParallelIslandOperator final : public Operator {
             if (sequence >= morsel_count_) {
                 break;
             }
+            // Published so an exception thrown below is attributed to the
+            // morsel that was in flight, not to sequence 0.
+            claimed = sequence;
             {
                 std::unique_lock lock(mutex_);
                 // Backpressure: this morsel's ring slot is only free once the
@@ -6127,11 +6171,6 @@ class ParallelIslandOperator final : public Operator {
             }
             ready_.notify_one();
         }
-        {
-            const std::scoped_lock lock(mutex_);
-            --active_workers_;
-        }
-        ready_.notify_all();
     }
 
     void record_error(std::uint64_t sequence, std::string message) {
@@ -6155,9 +6194,18 @@ class ParallelIslandOperator final : public Operator {
         space_.notify_all();
     }
 
-    void cancel_and_join() {
-        cancel();
-        batch_.wait();
+    // Called from the destructor, so nothing here may throw: an escaping
+    // exception during destruction terminates the process. Worker bodies are
+    // already noexcept and convert failures into island errors, so there is
+    // nothing for `wait()` to rethrow — this guards the path regardless.
+    void cancel_and_join() noexcept {
+        try {
+            cancel();
+            batch_.wait();
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+            // Nothing left to report: the caller is either unwinding or has
+            // already chosen the message it will return.
+        }
     }
 
     // Drain the island cleanly at EOF, then check the per-worker chains really
@@ -6166,6 +6214,11 @@ class ParallelIslandOperator final : public Operator {
     [[nodiscard]] auto finish() -> std::expected<std::optional<Chunk>, std::string> {
         finished_ = true;
         batch_.wait();
+        // Same precedence as `next()`: a cancelled run reports cancellation
+        // even if a worker also failed on its way out.
+        if (interrupt_requested()) {
+            return std::unexpected(interrupt_message());
+        }
         if (error_.has_value()) {
             return std::unexpected(*error_);
         }

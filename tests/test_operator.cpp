@@ -1,5 +1,6 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/ops.hpp>
 
@@ -239,4 +240,171 @@ TEST_CASE("MaterializeOperator returns an empty Table when the source is empty")
     REQUIRE(result.has_value());
     REQUIRE(result.value().columns.empty());
     REQUIRE(result.value().rows() == 0);
+}
+
+namespace {
+
+// Byte-for-byte column comparison for the round-trip tests: same alternative,
+// same length, same elements (categorical compared by resolved string).
+auto columns_equal(const runtime::ColumnValue& a, const runtime::ColumnValue& b) -> bool {
+    if (a.index() != b.index()) {
+        return false;
+    }
+    return std::visit(
+        [&](const auto& lhs) -> bool {
+            using Col = std::decay_t<decltype(lhs)>;
+            const auto& rhs = std::get<Col>(b);
+            if (lhs.size() != rhs.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < lhs.size(); ++i) {
+                if (lhs[i] != rhs[i]) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        a);
+}
+
+// Assert MaterializeOperator(PartitionedTableSource(input, grain)) reproduces
+// `input` byte-for-byte: schema, column data, validity, and table metadata.
+void require_roundtrip(const runtime::Table& input, std::size_t grain) {
+    runtime::MaterializeOperator sink{
+        std::make_unique<runtime::PartitionedTableSource>(&input, grain)};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+    const auto& out = result.value();
+
+    REQUIRE(out.columns.size() == input.columns.size());
+    REQUIRE(out.rows() == input.rows());
+    for (std::size_t c = 0; c < input.columns.size(); ++c) {
+        REQUIRE(out.columns[c].name == input.columns[c].name);
+        REQUIRE(columns_equal(*out.columns[c].column, *input.columns[c].column));
+        REQUIRE(out.columns[c].validity.has_value() == input.columns[c].validity.has_value());
+        if (input.columns[c].validity.has_value()) {
+            const auto& want = *input.columns[c].validity;
+            const auto& got = *out.columns[c].validity;
+            REQUIRE(got.size() == want.size());
+            for (std::size_t r = 0; r < want.size(); ++r) {
+                REQUIRE(got[r] == want[r]);
+            }
+        }
+    }
+    REQUIRE(out.ordering.has_value() == input.ordering.has_value());
+    REQUIRE(out.time_index.has_value() == input.time_index.has_value());
+}
+
+}  // namespace
+
+TEST_CASE("PartitionedTableSource round-trips a multi-type table at every grain") {
+    runtime::Table input;
+    input.add_column("i", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7});
+    input.add_column("d", Column<double>{1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5});
+    input.add_column("s", Column<std::string>{"a", "bb", "ccc", "d", "ee", "f", "ggg"});
+    input.add_column("c", Column<Categorical>{std::vector<std::string>{"x", "y"},
+                                              std::vector<std::int32_t>{0, 1, 0, 1, 1, 0, 1}});
+
+    // Grains that divide evenly, don't divide evenly, equal the size, and exceed it.
+    for (std::size_t grain :
+         {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{7}, std::size_t{100}}) {
+        require_roundtrip(input, grain);
+    }
+}
+
+TEST_CASE("PartitionedTableSource treats grain 0 as 1") {
+    runtime::Table input;
+    input.add_column("i", Column<std::int64_t>{10, 20, 30});
+    require_roundtrip(input, 0);
+}
+
+TEST_CASE("PartitionedTableSource preserves nulls across range boundaries") {
+    runtime::Table input;
+    input.add_column("i", Column<std::int64_t>{1, 2, 3, 4, 5},
+                     runtime::ValidityBitmap{true, false, true, false, true});
+    // A grain of 2 splits the nulls across chunk boundaries.
+    require_roundtrip(input, 2);
+}
+
+TEST_CASE("PartitionedTableSource preserves ordering and time_index") {
+    runtime::Table input;
+    input.add_column("ts", Column<std::int64_t>{1, 2, 3, 4});
+    input.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0});
+    input.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}};
+    input.time_index = std::string{"ts"};
+
+    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(&input, 2)};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+    const auto& out = result.value();
+    REQUIRE(out.ordering.has_value());
+    REQUIRE((*out.ordering)[0].name == "ts");
+    REQUIRE(out.time_index.has_value());
+    REQUIRE(*out.time_index == "ts");
+}
+
+TEST_CASE("PartitionedTableSource emits one empty schema-carrier chunk for a zero-row table") {
+    runtime::Table input;
+    input.add_column("i", Column<std::int64_t>{});
+    input.add_column("s", Column<std::string>{});
+
+    runtime::PartitionedTableSource source{&input, 4};
+    auto first = source.next();
+    REQUIRE(first.has_value());
+    REQUIRE(first.value().has_value());  // one empty schema carrier
+    REQUIRE(first.value()->columns.size() == 2);
+    REQUIRE(first.value()->rows() == 0);
+    REQUIRE(first.value()->sequence == 0);
+    REQUIRE(first.value()->row_offset == 0);
+
+    auto second = source.next();
+    REQUIRE(second.has_value());
+    REQUIRE_FALSE(second.value().has_value());
+
+    // And it round-trips the (empty) schema through Materialize.
+    require_roundtrip(input, 4);
+}
+
+TEST_CASE("PartitionedTableSource emits one chunk for a column-less frame") {
+    runtime::Table input;
+    input.logical_rows = 42;  // e.g. a Table(n) scaffold
+
+    runtime::PartitionedTableSource source{&input, 8};
+    auto first = source.next();
+    REQUIRE(first.has_value());
+    REQUIRE(first.value().has_value());
+    REQUIRE(first.value()->columns.empty());
+    REQUIRE(first.value()->rows() == 42);
+    REQUIRE(first.value()->sequence == 0);
+
+    auto second = source.next();
+    REQUIRE(second.has_value());
+    REQUIRE_FALSE(second.value().has_value());
+
+    runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(&input, 8)};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+    REQUIRE(result.value().columns.empty());
+    REQUIRE(result.value().rows() == 42);
+}
+
+TEST_CASE("PartitionedTableSource stamps ascending sequence and absolute row_offset") {
+    runtime::Table input;
+    input.add_column("i", Column<std::int64_t>{0, 1, 2, 3, 4, 5, 6});  // 7 rows
+
+    runtime::PartitionedTableSource source{&input, 3};
+    // Expect ranges [0,3), [3,6), [6,7): sequence 0,1,2 and row_offset 0,3,6.
+    const std::size_t expected_offsets[] = {0, 3, 6};
+    const std::size_t expected_rows[] = {3, 3, 1};
+    for (std::uint64_t seq = 0; seq < 3; ++seq) {
+        auto chunk = source.next();
+        REQUIRE(chunk.has_value());
+        REQUIRE(chunk.value().has_value());
+        REQUIRE(chunk.value()->sequence == seq);
+        REQUIRE(chunk.value()->row_offset == expected_offsets[seq]);
+        REQUIRE(chunk.value()->rows() == expected_rows[seq]);
+    }
+    auto done = source.next();
+    REQUIRE(done.has_value());
+    REQUIRE_FALSE(done.value().has_value());
 }

@@ -10466,3 +10466,65 @@ TEST_CASE("interpret rejects a re-entrant query while one is in flight", "[runti
     REQUIRE(ok.has_value());
     REQUIRE(ok->rows() == 2);
 }
+
+namespace {
+
+// Run `program` over a two-column int table `t(k, v)` and return the result's
+// order-sensitive metadata for the table-properties rule tests below.
+auto metadata_of(const char* program) -> runtime::Table {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{3, 1, 2});
+    t.add_column("v", Column<std::int64_t>{30, 10, 20});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto ir = require_ir(program);
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    return std::move(*result);
+}
+
+}  // namespace
+
+TEST_CASE("Table properties: update overwriting a sort key clears ordering",
+          "[runtime][metadata]") {
+    // The overwrite rule the shared helper must carry: `k` stays present but its
+    // values are rewritten, so it is no longer a valid sort key. A presence-only
+    // check would wrongly keep the ordering here.
+    auto out = metadata_of("t[order { k asc }][update { k = k + 100 }];");
+    REQUIRE_FALSE(out.ordering.has_value());
+}
+
+TEST_CASE("Table properties: update leaving the sort key alone preserves ordering",
+          "[runtime][metadata]") {
+    auto out = metadata_of("t[order { k asc }][update { w = v + 1 }];");
+    REQUIRE(out.ordering.has_value());
+    REQUIRE(out.ordering->size() == 1);
+    REQUIRE((*out.ordering)[0].name == "k");
+    REQUIRE((*out.ordering)[0].ascending);
+}
+
+TEST_CASE("Table properties: projecting away the sort key clears ordering (presence rule)",
+          "[runtime][metadata]") {
+    auto dropped = metadata_of("t[order { k asc }][select { v }];");
+    REQUIRE_FALSE(dropped.ordering.has_value());
+
+    auto kept = metadata_of("t[order { k asc }][select { k, v }];");
+    REQUIRE(kept.ordering.has_value());
+    REQUIRE((*kept.ordering)[0].name == "k");
+}
+
+TEST_CASE("Table properties: rename rewrites the sort key name", "[runtime][metadata]") {
+    auto out = metadata_of("t[order { k asc }][rename kk = k];");
+    REQUIRE(out.ordering.has_value());
+    REQUIRE(out.ordering->size() == 1);
+    REQUIRE((*out.ordering)[0].name == "kk");
+    REQUIRE((*out.ordering)[0].ascending);
+}
+
+TEST_CASE("Table properties: fused filter+update overwriting the sort key clears ordering",
+          "[runtime][metadata]") {
+    // Exercises the metadata rule through the filter+update path: the sort key
+    // survives the filter but is overwritten by the update, so ordering is gone.
+    auto out = metadata_of("t[order { k asc }][filter v > 5, update { k = k * 2 }];");
+    REQUIRE_FALSE(out.ordering.has_value());
+}

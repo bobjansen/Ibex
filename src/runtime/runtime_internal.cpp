@@ -69,6 +69,49 @@ auto normalize_time_index(Table& table) -> void {
     table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
 }
 
+auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate)
+    -> TableProperties {
+    TableProperties out;
+    // Time index first: whether it survives gates the ordering rule below.
+    bool time_index_lost = false;
+    if (input.time_index.has_value()) {
+        if (auto mapped = fate(*input.time_index); mapped.has_value()) {
+            out.time_index = std::move(*mapped);
+        } else {
+            time_index_lost = true;
+        }
+    }
+    if (input.ordering.has_value()) {
+        std::vector<ir::OrderKey> kept;
+        kept.reserve(input.ordering->size());
+        bool preserved = !time_index_lost;  // lose the time index -> lose ordering
+        if (preserved) {
+            for (const auto& key : *input.ordering) {
+                auto mapped = fate(key.name);
+                if (!mapped.has_value()) {  // dropped or overwritten -> no ordering
+                    preserved = false;
+                    break;
+                }
+                kept.push_back({.name = std::move(*mapped), .ascending = key.ascending});
+            }
+        }
+        if (preserved) {
+            out.ordering = std::move(kept);
+        }
+    }
+    return out;
+}
+
+auto table_properties_of(const Table& table) -> TableProperties {
+    return TableProperties{.ordering = table.ordering, .time_index = table.time_index};
+}
+
+auto apply_table_properties(Table& table, const TableProperties& props) -> void {
+    table.ordering = props.ordering;
+    table.time_index = props.time_index;
+    normalize_time_index(table);
+}
+
 auto int64_to_date_checked(std::int64_t value) -> Date {
     if (value < std::numeric_limits<std::int32_t>::min() ||
         value > std::numeric_limits<std::int32_t>::max()) {

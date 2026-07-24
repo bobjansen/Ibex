@@ -10554,3 +10554,32 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
     auto out = metadata_of("t[order { k asc }][filter v > 5, update { k = k * 2 }];");
     REQUIRE_FALSE(out.ordering.has_value());
 }
+
+// The parallel-island seam must keep a query that reads a lazy/deferred source
+// on the serial chain (the LazyTable synchronization contract's interim gate).
+// analyze_parallel_island() checks only the map chain's IR shape; the
+// lazy/deferred verdict is this source-node predicate, reported up to the seam.
+TEST_CASE("Parallel seam: lazy/deferred input is ineligible", "[runtime][parallel]") {
+    auto ir = require_ir("df[filter x > 0];");
+
+    // Eager registry table: not a deferred source, so the gate does not fire.
+    runtime::TableRegistry eager;
+    runtime::Table t;
+    t.add_column("x", Column<std::int64_t>{1, -1, 2});
+    eager.emplace("df", std::move(t));
+    const runtime::ExecutionContext no_deferred;
+    CHECK_FALSE(runtime::node_reads_deferred_source(*ir, eager, no_deferred));
+
+    // Same plan, but `df` resolves only through the deferred-scan registry:
+    // no eager entry + a deferred entry => the gate fires. Presence is all the
+    // predicate inspects, so a default (null-lazy) DeferredScan suffices.
+    runtime::TableRegistry empty;
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{});
+    const runtime::ExecutionContext exec{.deferred_scans = &deferred};
+    CHECK(runtime::node_reads_deferred_source(*ir, empty, exec));
+
+    // An unknown source (neither eager nor deferred) is not treated as deferred;
+    // the serial builder reports the missing-table error as usual.
+    CHECK_FALSE(runtime::node_reads_deferred_source(*ir, empty, no_deferred));
+}

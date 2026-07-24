@@ -363,6 +363,15 @@ struct ExecutionContext {
     }
 };
 
+/// True if the plan subtree `node` reads any lazy/deferred source — a `Scan`
+/// with no eager registry entry that resolves through `exec`'s deferred-scan
+/// registry (the parquet / build-narrowed-probe path). The runtime
+/// multithreading plan makes such queries ineligible for a parallel island
+/// until the LazyTable synchronization contract is implemented; the parallel
+/// seam in `build_operator()` consults this to fall back to the serial chain.
+[[nodiscard]] auto node_reads_deferred_source(const ir::Node& node, const TableRegistry& registry,
+                                              const ExecutionContext& exec) -> bool;
+
 /// Materialize a deferred scan now: static conjuncts plus whatever bounds its
 /// filter slot carries (if `ready`). The single decode path for deferred
 /// sources — both the chunked join and the interpret fallback use it.

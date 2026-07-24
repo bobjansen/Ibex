@@ -85,6 +85,56 @@ struct TableRangeMorsel {
     return out;
 }
 
+/// Materialize rows `[begin, end)` of `input` as a chunk stamped with its
+/// morsel identity (`sequence`, and `row_offset = begin`).
+///
+/// One construction point for every morsel, whatever pulls it: the serial
+/// `PartitionedTableSource` below and the parallel island's workers must
+/// produce byte-identical chunks for the same range, so they must not each
+/// build one. A column-less frame (e.g. a `Table(n)` scaffold) carries only its
+/// `logical_rows`; `begin == end` yields the zero-row schema/metadata carrier.
+[[nodiscard]] inline auto make_morsel_chunk(const Table& input, std::size_t begin, std::size_t end,
+                                            std::uint64_t sequence) -> Chunk {
+    Chunk chunk;
+    chunk.columns.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        chunk.columns.push_back(ColumnEntry{
+            .name = entry.name,
+            .column = std::make_shared<ColumnValue>(gather_range(*entry.column, begin, end)),
+            .validity = gather_validity(entry.validity, begin, end)});
+    }
+    if (input.columns.empty()) {
+        chunk.logical_rows = end - begin;
+    }
+    chunk.ordering = input.ordering;
+    chunk.time_index = input.time_index;
+    chunk.sequence = sequence;
+    chunk.row_offset = begin;
+    return chunk;
+}
+
+/// Number of morsels `PartitionedTableSource` (or a parallel island over the
+/// same table) produces for `input` at `grain`. A zero-row input still yields
+/// exactly one carrier morsel.
+[[nodiscard]] inline auto partitioned_morsel_count(const Table& input, std::size_t grain)
+    -> std::uint64_t {
+    const std::size_t normalized_grain = grain == 0 ? 1 : grain;
+    const std::size_t rows = input.rows();
+    if (rows == 0) {
+        return 1;
+    }
+    return static_cast<std::uint64_t>((rows + normalized_grain - 1) / normalized_grain);
+}
+
+/// The row range of morsel `sequence` over `rows` total rows at `grain`.
+[[nodiscard]] inline auto morsel_row_range(std::size_t rows, std::size_t grain,
+                                           std::uint64_t sequence)
+    -> std::pair<std::size_t, std::size_t> {
+    const std::size_t normalized_grain = grain == 0 ? 1 : grain;
+    const std::size_t begin = std::min(static_cast<std::size_t>(sequence) * normalized_grain, rows);
+    return {begin, std::min(begin + normalized_grain, rows)};
+}
+
 /// Source operator that partitions one immutable `Table` into contiguous row
 /// ranges and emits each as a chunk stamped with its `sequence` and
 /// `row_offset`. Ranges are produced in ascending row order, so the serial
@@ -110,45 +160,14 @@ class PartitionedTableSource final : public Operator {
         : input_(&input), grain_(grain == 0 ? 1 : grain) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        // Column-less frames still have stable logical row ranges. They need no
-        // data gather, but a future range-aware kernel must receive the same
-        // morsel identity as it would for an ordinary table.
-        if (input_->columns.empty()) {
-            const std::size_t total = input_->rows();
-            if (cursor_ >= total) {
-                // A zero-row column-less frame has no schema columns, but it
-                // still needs one carrier so the sink observes its metadata.
-                if (total == 0 && !emitted_empty_) {
-                    emitted_empty_ = true;
-                    Chunk chunk;
-                    chunk.logical_rows = 0;
-                    chunk.ordering = input_->ordering;
-                    chunk.time_index = input_->time_index;
-                    chunk.sequence = sequence_++;
-                    chunk.row_offset = 0;
-                    return std::optional<Chunk>{std::move(chunk)};
-                }
-                return std::optional<Chunk>{};
-            }
-            const std::size_t begin = cursor_;
-            const std::size_t end = std::min(begin + grain_, total);
-            cursor_ = end;
-            Chunk chunk;
-            chunk.logical_rows = end - begin;
-            chunk.ordering = input_->ordering;
-            chunk.time_index = input_->time_index;
-            chunk.sequence = sequence_++;
-            chunk.row_offset = begin;
-            return std::optional<Chunk>{std::move(chunk)};
-        }
-
         const std::size_t total = input_->rows();
         if (cursor_ >= total) {
-            // Zero-row table: emit one empty schema-carrier chunk so the schema
-            // and metadata still reach the sink (matches TableSourceOperator).
+            // Zero-row input (with or without columns): emit exactly one
+            // carrier so the schema, logical rows, and metadata still reach the
+            // sink (matches TableSourceOperator).
             if (total == 0 && !emitted_empty_) {
                 emitted_empty_ = true;
-                return std::optional<Chunk>{make_range_chunk(0, 0)};
+                return std::optional<Chunk>{make_morsel_chunk(*input_, 0, 0, sequence_++)};
             }
             return std::optional<Chunk>{};
         }
@@ -156,26 +175,10 @@ class PartitionedTableSource final : public Operator {
         const std::size_t begin = cursor_;
         const std::size_t end = std::min(begin + grain_, total);
         cursor_ = end;
-        return std::optional<Chunk>{make_range_chunk(begin, end)};
+        return std::optional<Chunk>{make_morsel_chunk(*input_, begin, end, sequence_++)};
     }
 
    private:
-    [[nodiscard]] auto make_range_chunk(std::size_t begin, std::size_t end) -> Chunk {
-        Chunk chunk;
-        chunk.columns.reserve(input_->columns.size());
-        for (const auto& entry : input_->columns) {
-            chunk.columns.push_back(ColumnEntry{
-                .name = entry.name,
-                .column = std::make_shared<ColumnValue>(gather_range(*entry.column, begin, end)),
-                .validity = gather_validity(entry.validity, begin, end)});
-        }
-        chunk.ordering = input_->ordering;
-        chunk.time_index = input_->time_index;
-        chunk.sequence = sequence_++;
-        chunk.row_offset = begin;
-        return chunk;
-    }
-
     const Table* input_;
     std::size_t grain_;
     std::size_t cursor_ = 0;

@@ -96,9 +96,14 @@ auto make_trades() -> runtime::TableRegistry {
     return reg;
 }
 
-// Run a program with the Phase 1 serial-island path enabled at a small morsel
-// grain, so an eligible chain is partitioned into several ranges.
-auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain)
+// Run a program with the Phase 1 island path enabled at a small morsel grain,
+// so an eligible chain is partitioned into several ranges.
+//
+// `threads == 1` keeps the island on its serial morsel chain; anything larger
+// drops the grain-size threshold to 0 so even a tiny test table fans out across
+// worker threads and comes back through the ordered merger.
+auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain,
+                  std::size_t threads = 1, runtime::ParallelIslandStats* stats = nullptr)
     -> runtime::Table {
     auto parsed = parser::parse(src);
     REQUIRE(parsed.has_value());
@@ -107,9 +112,23 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_grain = grain;
+    exec.parallel_threads = threads;
+    exec.parallel_min_rows = threads > 1 ? 0 : exec.parallel_min_rows;
+    exec.parallel_stats = stats;
     auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
     REQUIRE(result.has_value());
     return std::move(*result);
+}
+
+// Run on worker threads and fail if the island quietly fell back to serial.
+// Without this the whole worker-path suite could pass while testing nothing.
+auto run_on_workers(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain,
+                    std::size_t threads) -> runtime::Table {
+    runtime::ParallelIslandStats stats;
+    auto table = run_parallel(src, tables, grain, threads, &stats);
+    REQUIRE(stats.parallel_islands.load() == 1);
+    REQUIRE(stats.serial_islands.load() == 0);
+    return table;
 }
 
 // Byte-for-byte table equality: schema, row count, values, validity, and
@@ -2059,4 +2078,131 @@ TEST_CASE("E2E: parallel serial-island handles a column-less row scaffold", "[e2
     require_tables_equal(serial, island);
     REQUIRE(island.rows() == 3);
     CHECK(col_i64(island, "c") == std::vector<std::int64_t>{1, 1, 1});
+}
+
+// --- Phase 1 worker-pool island equivalence ----------------------------------
+//
+// Same island, now fanned out across worker threads and reassembled by the
+// ordered merger. The contract is unchanged and absolute: byte-identical to the
+// serial result, for every worker count and every morsel grain. Anything else
+// would mean the merger, not the map, decides the answer.
+
+namespace {
+
+// Wide enough that a small grain produces far more morsels than the in-flight
+// ring holds, so the merger's backpressure and slot reuse are actually
+// exercised rather than skipped by a one-pass fit. Nulls land at irregular
+// positions so they straddle range boundaries at every grain.
+auto make_wide_island_table(std::size_t rows) -> runtime::TableRegistry {
+    Column<std::int64_t> price;
+    Column<std::int64_t> qty;
+    Column<std::string> symbol;
+    price.reserve(rows);
+    qty.reserve(rows);
+    symbol.reserve(rows);
+    runtime::ValidityBitmap qty_valid;
+    qty_valid.reserve(rows);
+    const char* symbols[] = {"AAPL", "GOOG", "MSFT"};
+    for (std::size_t i = 0; i < rows; ++i) {
+        price.push_back(static_cast<std::int64_t>((i * 37) % 1000));
+        qty.push_back(static_cast<std::int64_t>(i % 13));
+        symbol.push_back(symbols[i % 3]);
+        qty_valid.push_back(i % 7 != 3);
+    }
+    runtime::Table t;
+    t.add_column("price", std::move(price));
+    t.add_column("qty", std::move(qty));
+    t.add_column("symbol", std::move(symbol));
+    t.columns[1].validity = std::move(qty_valid);
+
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+
+}  // namespace
+
+TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e][parallel]") {
+    auto tables = make_wide_island_table(1000);
+
+    const char* cases[] = {
+        "t[filter price > 350];",
+        "t[filter price > 350, select { price, qty }];",
+        "t[filter qty > 2, select { price, notional = price * qty }];",
+        "t[select { price, qty }];",
+        "t[filter price > 150][rename px = price];",
+        "t[filter price > 995];",  // very selective: most morsels are empty
+    };
+    for (const auto* src : cases) {
+        INFO("query: " << src);
+        auto serial = run(src, tables);
+        // Grains chosen so morsel counts (143, 34, 8) bracket the ring window,
+        // and worker counts that both divide and do not divide them.
+        for (const std::size_t grain : {7U, 30U, 128U}) {
+            for (const std::size_t threads : {2U, 3U, 8U}) {
+                INFO("grain " << grain << ", threads " << threads);
+                require_tables_equal(serial, run_on_workers(src, tables, grain, threads));
+            }
+        }
+    }
+}
+
+TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empty result",
+          "[e2e][parallel]") {
+    runtime::Table t;
+    Column<std::int64_t> ts;
+    Column<std::int64_t> value;
+    ts.reserve(200);
+    value.reserve(200);
+    for (std::size_t i = 0; i < 200; ++i) {
+        ts.push_back(static_cast<std::int64_t>(i) * 10);
+        value.push_back(static_cast<std::int64_t>(i));
+    }
+    t.add_column("ts", std::move(ts));
+    t.add_column("value", std::move(value));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    // The island runs after the Ascribe barrier; time_index and ordering must
+    // survive every morsel and the merge.
+    constexpr auto metadata_query = R"(as_timeframe(t, "ts")[filter value > 1][rename time = ts];)";
+    auto serial_metadata = run(metadata_query, tables);
+    auto island_metadata = run_on_workers(metadata_query, tables, 8, 4);
+    require_tables_equal(serial_metadata, island_metadata);
+    REQUIRE(island_metadata.time_index == "time");
+    REQUIRE(island_metadata.ordering.has_value());
+
+    // Every morsel is empty: the merger must still see one output morsel per
+    // input morsel and the result must keep the serial schema.
+    auto serial_empty = run("t[filter value > 9999, select { ts, value }];", tables);
+    auto island_empty =
+        run_on_workers("t[filter value > 9999, select { ts, value }];", tables, 8, 4);
+    require_tables_equal(serial_empty, island_empty);
+    REQUIRE(island_empty.columns.size() == 2);
+    REQUIRE(island_empty.rows() == 0);
+}
+
+TEST_CASE("E2E: parallel island cancels cleanly when interrupted", "[e2e][parallel]") {
+    // A pending interrupt must unwind the island through the usual error
+    // channel — cancelling in-flight workers and joining them before the
+    // operator (which owns the table they read) is destroyed. The value of the
+    // test is that it terminates and does not use freed memory.
+    auto tables = make_wide_island_table(1000);
+    auto parsed = parser::parse("t[filter price > 350, select { price, qty }];");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_grain = 7;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+
+    runtime::request_interrupt();
+    auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    runtime::clear_interrupt();
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == runtime::interrupt_message());
 }

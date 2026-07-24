@@ -309,9 +309,13 @@ ownership boundary that makes later parallel changes reviewable.
    constructor, and expression evaluation (`ColumnEvalCtx` and its consumers).
    This is a large, benefit-free refactor in isolation, but it establishes the
    only safe ownership path for query state once work moves to another thread.
-   Guard `LazyTable`'s decoded-column cache and dynamic scan-filter publication,
-   or mark lazy/deferred sources ineligible until their synchronization contract
-   exists.
+   For Phase 0, mark any query reading a lazy/deferred source ineligible for a
+   parallel island (see [Eligibility](#lazytable-synchronization-contract)). That
+   ineligibility is an **interim gate, not the solution** — it is free here
+   because nothing runs parallel yet, but lazy/deferred sources are the parquet
+   scan path (essentially all TPC-H/PDS-H), i.e. the large memory-bound scans
+   parallelism most benefits, so a later phase is obligated to lift it under the
+   *LazyTable Synchronization Contract* below.
 6. **Failure/cancellation.** A worker error records its morsel-sequenced
    failure, suppresses unnecessary higher-sequence work, drains/joins the
    required submitted tasks, and reports a normal `std::expected` error. The
@@ -371,6 +375,217 @@ ownership boundary that makes later parallel changes reviewable.
    specify which pass walks the expression trees of the candidate `Passthrough`
    nodes and reports the result up to that single eligibility decision, so the two
    do not each grow their own copy of the check.
+
+## LazyTable Synchronization Contract
+
+`LazyTable` (`include/ibex/runtime/lazy_table.hpp`) is the shared source object
+behind every parquet/deferred scan. Before it can be touched by more than one
+worker, it needs a documented ownership contract — not blanket "make it
+thread-safe." The hazard surface is narrower than the whole object, and scoping
+the fix to the actual shared mutable state is what keeps late materialization
+intact.
+
+**Hazard surface — two boundaries, not one.** There are two distinct concurrency
+concerns, and `cache_` is only the first.
+
+The **first** is `cache_` (`robin_hood::unordered_map<std::string, ColumnEntry>`),
+a memo of **whole-file** columns — the only *directly* writable shared data
+member. The plain-data members are set once at construction and never
+reassigned (`schema_`, `rows_`, `stats_`), so they are safe to read
+concurrently. It is a mistake — one an earlier draft of this plan made — to
+think the selective paths avoid `cache_`:
+
+- `project` / `materialize` decode whole columns straight into `cache_`.
+- `project_where` and `join_key_selection` decode their **predicate and
+  dynamic-key** columns whole-file through `decode_whole_columns`, which
+  **writes** `cache_` (and reuses any already-cached column).
+- `project_rows` — and `join_key_selection`'s fused branch, which calls it —
+  **reads** `cache_`, gathering the selection from any column previously cached
+  whole-file.
+
+What the selective paths actually bypass is **caching their gathered output**: a
+selection-scoped column must never masquerade as a whole-file cache entry (that
+would corrupt a later whole-column read). That is a correctness invariant about
+what gets *written into* `cache_`, not isolation *from* it. So the real
+safe/unsafe boundary is **per operation, not per path**: every selective call
+splits into (a) a whole-file predicate/key decode that reads or writes shared
+`cache_`, and (b) a selection-scoped decode + gather that lands only in
+caller-owned output. Even a single `project_where` does both.
+
+The **second** boundary is the callbacks. `decode_` (`ColumnDecodeFn`) and
+`key_filter_scan_` (`KeyFilterScanFn`) are `std::function`s supplied by the
+plugin backing the source. The stored function object is never reassigned — but
+that is **not** the same as being safe to call concurrently. The callable closes
+over the source's reader state (an Arrow/Parquet `FileReader`, its column
+readers, decode buffers), which is generally mutable and typically *not* safe
+for concurrent calls; a single Arrow `FileReader` is not. Freezing `cache_` does
+nothing for this: contract half (b) — the per-worker selection-scoped decode —
+*is* a concurrent invocation of `decode_`, and the fused `key_filter_scan_`
+decodes during its scan the same way. So the source must guarantee one of:
+
+- the callbacks are safe to call concurrently (internally synchronized, or
+  genuinely per-call stateless); or
+- each worker is handed its own decoder/reader instance — the source exposes a
+  per-worker factory or clone, not one shared closure.
+
+This is a **source/plugin registration requirement**, aligned with the
+`thread_safe` plugin metadata (see [Generated C++ and
+Plugins](#generated-c-and-plugins)). A source that makes neither guarantee is
+ineligible for concurrent decode even with `cache_` frozen: its `decode_` calls
+must be serialized, which in practice means hoisting the whole decode into the
+single-threaded build phase (fine for predicate/key columns; it forfeits
+parallel late materialization of that source's projected output). For the
+Parquet source the realistic path is per-worker readers (open-per-morsel or a
+reader pool), since one `FileReader` cannot be shared across concurrent calls.
+
+**Interim gate (Phase 0).** Until the contract below is implemented, a query
+that reads any lazy/deferred source is ineligible for a parallel island. This
+is a gate the executor's single eligibility pass records, not a property of
+`LazyTable`. It costs nothing in Phase 0 (no parallel execution exists) and must
+not be treated as the answer: excluding lazy sources permanently would restrict
+parallelism to fully-materialized in-memory tables — the small cases — while the
+large memory-bound scans that parallelize best stay serial, inverting the
+payoff. Lifting the gate is a Phase 3/4 obligation, not optional.
+
+**The contract — immutable-after-build.** `LazyTable` has two lifecycle phases
+per query:
+
+1. A **build/decode phase** that is single-threaded or externally synchronized.
+   Any write to `cache_` happens here, before execution fan-out.
+2. A **read-only execution phase** in which `cache_` is never mutated.
+   Concurrent readers need no *mutual exclusion*, but they still need a
+   happens-before edge from the build-phase writes: the fan-out point (task
+   submission) must publish the frozen `cache_` — release on the dispatching
+   thread, acquire on each worker — exactly as the dynamic filter is published
+   below. "Read-only" removes the lock, not the obligation to make the writes
+   visible; without the edge a worker can observe a stale or mid-rehash
+   `robin_hood` map. "Read-only" is also stronger than "no writes": readers take
+   **raw pointers** into cache-held buffers (`membership_pass_rate` aliases a key
+   column's `data()`/validity through `KeyColumn`, and those pointers outlive the
+   lookup), so the execution phase must forbid **eviction or replacement** of
+   entries, not merely concurrent mutation. A rehash is harmless (buffers sit
+   behind `shared_ptr` and do not move), but any later LRU or
+   re-`insert_or_assign` on `cache_` mid-execution would dangle those pointers.
+
+Concretely:
+
+- **Whole-file `cache_` writes hoist into the build phase.** Because the
+  selective paths write `cache_` for their predicate columns, "build" must
+  pre-decode not just whole projections but **every predicate column any deferred
+  scan references** — the driver already knows these (`DeferredScan` carries
+  `conjuncts`, `demand`, and `key_column`). The **dynamic key column is
+  deliberately excluded** from this list; pre-caching it disables an existing
+  optimization, so it gets its own decision below. After fan-out `cache_` is
+  read-only, so concurrent `project_rows` / `project_where` reads are safe. This
+  matches the Phase 1 morsel model (workers read absolute row indices from shared
+  immutable input) and keeps synchronization off the hot path. Fallback where
+  pre-decode is impossible: per-slot synchronized fills (a `std::once_flag`/future
+  per column name) so concurrent demand for one column decodes exactly once.
+  Duplicate uncoordinated decodes of the same column are forbidden either way.
+- **The dynamic key column — pre-cache vs. fused key-scan is an explicit
+  choice, not a default.** `project_where` and `join_key_selection` take the
+  fused `key_filter_scan_` path *only when the key is not already cached*
+  (`!cache_.contains(key)`, lazy_table.cpp:183 and :446): the source evaluates
+  the join-key filter inside its own decoder and never materializes the key
+  column whole-file — the decode-fusion Stage 4 win (q17 −54%, q08 −51%). So the
+  "pre-cache every predicate column" rule above must **not** be extended to the
+  key by reflex: doing so silently forces the whole-key fallback. Pick one:
+  - **(a) Accept the whole-key fallback.** Pre-cache the key like a predicate
+    column; the fused path is skipped, the key is decoded whole-file and filtered
+    in memory. Simplest for concurrency (workers only read a frozen cache), but
+    it regresses precisely the queries the pushdown work optimized — so it ships
+    only with a benchmark quantifying the loss.
+  - **(b) Preserve fused scans (recommended).** Do *not* pre-cache the key. Run
+    key selection (fused `key_filter_scan_`, or its whole-key fallback) as the
+    serial **phase A** of the two-phase deferred probe, before fan-out. Phase A
+    is once-per-scan, not per-morsel, so it needs no per-worker decoder; only
+    phase B (projected-column `project_rows` over the surviving selection) fans
+    out. This also falls out naturally from phasing: deferred-probe joins do not
+    parallelize until Phase 4, so the key-selection stays serial until then
+    regardless. Should phase A itself ever be parallelized, it inherits boundary
+    2's per-worker-decoder requirement.
+- **Selective paths run per-worker only on an already-populated cache.** With
+  predicate columns pre-cached, a phase-B worker running `project_where` /
+  `project_rows` on its own morsel only (a) reads immutable `cache_` and
+  (b) decodes its own selection into its own output via
+  `decode_(…, &selection)` — sharing nothing writable. That decode is the
+  parallel late-materialization work and must stay lazy; do not pre-materialize
+  the projected output. Two preconditions are load-bearing here: (1) a worker
+  that hits a **not-yet-cached** predicate column would perform a `cache_`
+  write, which must not happen concurrently (the dynamic key is decoded in serial
+  phase A, not in a phase-B worker — see the key-column decision above); and
+  (2) the per-worker
+  `decode_(…, &selection)` calls are concurrent, so `decode_` must be
+  concurrently callable or each worker must own its decoder (the second boundary
+  above). Eligibility must guarantee **both** — pre-cache *and* concurrent-safe
+  decode — or fall back to serial.
+
+**The freeze is per query, and the object outlives the query.** A `let`-bound
+`LazyTable` (a `LazyTablePtr` in the source registry) persists across statements,
+so `cache_` accumulates and the build/execution split is a *per-query cycle*:
+each query's build phase reopens `cache_` for writes, then re-freezes it for that
+query's fan-out. This thaw is only safe under the one-query-at-a-time invariant
+(Phase 0 item 6): the executor must guarantee every worker of query N has
+**joined** before query N+1's build phase writes `cache_`. Tie the thaw to that
+join barrier — otherwise a straggler reader from the previous query races the
+next query's build. "Immutable-after-build" is therefore a per-execution
+property re-established each query, not a write-once-forever one.
+
+**Respect the late-materialization tension.** Late materialization decodes
+*during* execution — the two-phase deferred probe (`join_key_selection` +
+`project_rows`) is itself the parallel work. The pre-cache requirement therefore
+covers exactly the **whole-file predicate columns** that flow through `cache_`
+(plus the dynamic key only under key-decision option (a)), and nothing more: the
+selection-scoped decode of projected output (`decode_(remaining, &selected)` in
+`project_where`, `decode_(missing, &selected)` in `project_rows`) stays lazy and
+per-worker. "Pre-decode everything" is wrong in *both* directions — hoisting the
+projected output would defeat late materialization, while leaving a predicate
+decode lazy leaves a concurrent `cache_` write. Hoist the whole-file half, keep
+the selection-scoped half lazy.
+
+**Dynamic scan-filter publication.** The join build side publishes a
+Bloom/IN-list/min-max filter into the probe-side scan's `DynamicScanFilter`
+(`project_where`'s `dynamic`/`dynamic_key`, `join_key_selection`). This is a
+build→probe handoff. The one-query-at-a-time pipeline already orders it: the
+join build completes (hash table built *and* filter published) before any
+probe-side scan worker launches, so it is a structural happens-before rather
+than a lock. Make that explicit, and sharpen what `ready` means. Today `ready`
+is a plain bool and `!ready` is a *sound no-filter fallback* — the header
+contract says a scan materialized before the join decides simply decodes
+unfiltered (interpreter.hpp:276–280), which is safe only because publication and
+consumption are the same thread. Under a parallel build→probe dependency,
+redefine `ready` as the **atomic publication of the build's decision**, not of a
+filter's mere presence: the build stores `ready = true` *even when it decides to
+produce no filter* (empty payload), with release semantics, after the payload
+(`min`/`max`/`in_list`/`bloom`) is fully written; the probe reads `ready` with
+acquire. The payload is **immutable after that release store** — no lazy
+finalization, no in-place edits by a probe. With the dependency asserted in the
+executor, every probe worker observes `ready == true` carrying a definite
+decision (a filter, or deliberately none), so the "`!ready` ⇒ decode unfiltered"
+fallback is **prohibited** on the parallel path: a probe that sees `!ready` there
+is an ordering bug, not a tolerable race. The serial interpreter keeps the old
+fallback; the prohibition attaches only once the parallel build→probe dependency
+exists.
+
+**Tests.** A parity test asserting a query over a lazy/deferred source returns
+the identical answer under 1, 2, and N threads; one exercising whole-column
+`cache_` reuse across two concurrent references to the same source, proving the
+column decodes once and both readers see it; a filter-publication test that a
+probe fanned out under N threads always observes a published decision (`ready`
+true, filter *or* deliberately none) and never the `!ready` fallback, including
+the build-decides-no-filter case; — whichever key-decision is chosen — a test
+pinning it: under (a) that the key is pre-cached and answers match, or under (b)
+that the fused `key_filter_scan_` path is still taken (the key stays out of
+`cache_`) and answers match; and a **callback-contract test that actively
+detects a violation** rather than trusting the prose — a fake `ColumnDecodeFn`
+(and `KeyFilterScanFn`) that, on entry, sets an atomic in-flight flag and fails
+the test if it is already set, then clears it on exit. For a source declaring
+its callbacks serialized, drive a fan-out and assert the flag never trips (the
+executor really did serialize). For a source declaring per-worker readers, hand
+each worker a distinct decoder instance from the factory and assert both that no
+single instance is ever re-entered concurrently *and* that the instances handed
+out are distinct — so a regression that quietly shares one reader across workers
+fails loudly instead of racing silently.
 
 ## Phase 1 — First Parallel Island
 
@@ -556,11 +771,14 @@ guarantee changes.
   bounded read/decode concurrency.
 - Keep projection/predicate pushdown in the source; parallel decoding must not
   defeat late materialization or dynamic filter pushdown.
-- Give `LazyTable` a documented synchronization/cache ownership strategy before
-  sharing it among tasks. Per-query decode futures or synchronized cache fills
-  are candidates; duplicate uncoordinated decodes are not.
-- Publish dynamic Bloom/IN-list filters with synchronization and an explicit
-  build-before-probe dependency. Do not rely on the current same-thread timing.
+- Implement the [LazyTable Synchronization Contract](#lazytable-synchronization-contract)
+  and lift the Phase 0 lazy/deferred-source ineligibility gate: immutable-after-build
+  `cache_` (coordinated pre-fan-out decode preferred, per-slot synchronized fills
+  otherwise; never duplicate uncoordinated decodes), with the selective paths
+  left lazy and per-worker.
+- Publish dynamic Bloom/IN-list filters with acquire/release synchronization and
+  an explicit build-before-probe dependency asserted in the executor, per that
+  contract. Do not rely on the current same-thread timing.
 
 ## Phase 4 — Parallel Barriers
 

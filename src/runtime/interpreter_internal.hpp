@@ -852,7 +852,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 // interpreter.cpp — dispatcher, small table ops, registries.
 [[nodiscard]] auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                  ModelResult* model_out = nullptr)
+                                  const ExecutionContext& exec, ModelResult* model_out = nullptr)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto ordering_keys_present(
     const std::vector<ir::OrderKey>& keys,
@@ -1108,7 +1108,7 @@ enum class FloatCleanMode : std::uint8_t {
 // chunked.cpp — streaming operator pipeline, rank, extern-call execution.
 [[nodiscard]] auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                  ModelResult* model_out)
+                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string>;
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
 [[nodiscard]] auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,

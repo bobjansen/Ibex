@@ -318,23 +318,34 @@ struct DeferredScan {
 /// Keyed by scan (instance) name as it appears in the plan.
 using DeferredScanRegistry = std::map<std::string, DeferredScan>;
 
-/// Installs the deferred-scan registry consulted by `interpret` on this
-/// thread for the guard's lifetime (the same execution-scoped pattern as
-/// cooperative interruption). The registry must outlive the guard.
-class ScopedDeferredScans {
-   public:
-    explicit ScopedDeferredScans(const DeferredScanRegistry* scans) noexcept;
-    ~ScopedDeferredScans();
-    ScopedDeferredScans(const ScopedDeferredScans&) = delete;
-    auto operator=(const ScopedDeferredScans&) -> ScopedDeferredScans& = delete;
-    ScopedDeferredScans(ScopedDeferredScans&&) = delete;
-    auto operator=(ScopedDeferredScans&&) -> ScopedDeferredScans& = delete;
+/// Query-scoped execution context. Created once at the `interpret()` boundary
+/// and threaded explicitly through operator construction (`build_operator`) and
+/// the full-table interpreter (`interpret_node`) instead of an execution-scoped
+/// thread-local. Making per-query state an explicit parameter is the
+/// prerequisite for moving work onto worker threads (see the runtime
+/// multithreading plan, Phase 0): a worker must be able to see this state
+/// without relying on the thread it happens to run on.
+///
+/// Phase 0 owns only the deferred-scan registry; the query thread budget, RNG
+/// seed, and worker-failure/cancellation state are added by later phases. A
+/// default-constructed context (no deferred scans) reproduces the pre-context
+/// serial behavior.
+struct ExecutionContext {
+    /// Deferred lazy scans the whole-script driver installed for this query, or
+    /// null when the query has none. Not owned: the driver keeps the registry
+    /// alive for the whole `interpret()` call.
+    const DeferredScanRegistry* deferred_scans = nullptr;
 
-   private:
-    const DeferredScanRegistry* previous_;
+    /// Look up a deferred scan by its plan (instance) name, or null if there is
+    /// no registry or no matching entry.
+    [[nodiscard]] auto deferred_scan(const std::string& name) const -> const DeferredScan* {
+        if (deferred_scans == nullptr) {
+            return nullptr;
+        }
+        const auto it = deferred_scans->find(name);
+        return it == deferred_scans->end() ? nullptr : &it->second;
+    }
 };
-
-[[nodiscard]] auto current_deferred_scans() noexcept -> const DeferredScanRegistry*;
 
 /// Materialize a deferred scan now: static conjuncts plus whatever bounds its
 /// filter slot carries (if `ready`). The single decode path for deferred
@@ -372,6 +383,14 @@ class ExternRegistry;
                              const ScalarRegistry* scalars = nullptr,
                              const ExternRegistry* externs = nullptr,
                              ModelResult* model_out = nullptr) -> std::expected<Table, std::string>;
+
+/// `interpret()` overload for callers that supply an explicit query
+/// `ExecutionContext` (e.g. the whole-script driver installing deferred scans).
+/// The context is borrowed for the duration of the call and must outlive it.
+[[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
+                             const ScalarRegistry* scalars, const ExternRegistry* externs,
+                             ModelResult* model_out, const ExecutionContext& exec)
+    -> std::expected<Table, std::string>;
 
 /// Invoke an extern whose first argument is a table. The scalar result, if
 /// any, is intentionally discarded: this API is the execution seam for

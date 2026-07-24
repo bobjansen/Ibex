@@ -29,7 +29,10 @@ Options:
   --target <ref|WORKTREE>   Target state (default: WORKTREE)
   --warmup <N>              Warmup iterations for ibex_bench (default: 1)
   --iters <N>               Timed iterations for ibex_bench (default: 7)
-  --repeats <N>             Repeats per side; report median (default: 3)
+  --repeats <N>             Repeats per side; report median (default: 15).
+                            Repeats are cheap next to the two Release builds, so
+                            the default favors tighter IQRs; raise it further for
+                            a small suite subset.
   --interleave              Run sides per repeat instead of in side-sized
                             blocks, alternating their run positions to balance
                             slow machine drift (thermal, background load).
@@ -65,7 +68,7 @@ BASE_STATE="HEAD"
 TARGET_STATE="WORKTREE"
 WARMUP=1
 ITERS=7
-REPEATS=3
+REPEATS=15
 INTERLEAVE=0
 REPLICA_CONTROL=0
 KEEP_TEMP=0

@@ -25,7 +25,7 @@ Options:
   --gcc-flags <flags>    Override generated-query GCC flags
   --warmup <N>           Warmup iterations inside each compiled binary (default: 1)
   --iters <N>            Timed iterations inside each compiled binary (default: 7)
-  --repeats <N>          Repeats per compiler; report median (default: 3)
+  --repeats <N>          Repeats per compiler; report median (default: 15)
   --interleave           Alternate clang/gcc repeats (default: off)
   --taskset <cpuset>     Pin benchmark runs with taskset -c
   --csv <path>           prices.csv path
@@ -52,7 +52,7 @@ CLANG_FLAGS="${CLANG_FLAGS:-}"
 GCC_FLAGS="${GCC_FLAGS:-}"
 WARMUP=1
 ITERS=7
-REPEATS=3
+REPEATS=15
 INTERLEAVE=0
 TASKSET_CPUSET=""
 OUT=""

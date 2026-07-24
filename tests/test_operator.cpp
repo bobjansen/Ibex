@@ -117,6 +117,15 @@ class VectorSource final : public runtime::Operator {
     std::size_t pos_ = 0;
 };
 
+auto make_int_chunk_valid(const std::string& name, std::vector<std::int64_t> values,
+                          std::optional<std::vector<bool>> validity) -> runtime::Chunk {
+    auto chunk = make_int_chunk(name, std::move(values));
+    if (validity.has_value()) {
+        chunk.columns[0].validity = runtime::ValidityBitmap{*validity};
+    }
+    return chunk;
+}
+
 }  // namespace
 
 TEST_CASE("MaterializeOperator concatenates multi-chunk int streams") {
@@ -148,6 +157,73 @@ TEST_CASE("MaterializeOperator rejects chunk schema mismatches") {
     auto result = sink.run();
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().find("schema mismatch") != std::string::npos);
+}
+
+TEST_CASE("MaterializeOperator concatenates validity across multi-chunk streams") {
+    std::vector<runtime::Chunk> chunks;
+    // Chunk 0: all valid, no bitmap. Chunk 1: carries nulls. Chunk 2: no bitmap.
+    chunks.push_back(make_int_chunk_valid("x", {1, 2}, std::nullopt));
+    chunks.push_back(make_int_chunk_valid("x", {3, 4, 5}, std::vector<bool>{true, false, true}));
+    chunks.push_back(make_int_chunk_valid("x", {6, 7}, std::nullopt));
+
+    runtime::MaterializeOperator sink{std::make_unique<VectorSource>(std::move(chunks))};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+
+    const auto& out = result.value();
+    REQUIRE(out.rows() == 7);
+    const auto* entry = out.find_entry("x");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    const auto& v = *entry->validity;
+    REQUIRE(v.size() == 7);
+    // Chunk 0 backfilled valid, chunk 1 nulls the middle, chunk 2 filled valid.
+    const std::vector<bool> expected{true, true, true, false, true, true, true};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        REQUIRE(v[i] == expected[i]);
+    }
+}
+
+TEST_CASE("MaterializeOperator keeps bitmap-free multi-chunk streams bitmap-free") {
+    // No chunk carries a validity bitmap, so the concatenated column must stay
+    // bitmap-free (the zero-overhead common case): the helper never
+    // materializes a bitmap unless some chunk actually has one.
+    std::vector<runtime::Chunk> chunks;
+    chunks.push_back(make_int_chunk_valid("x", {1, 2}, std::nullopt));
+    chunks.push_back(make_int_chunk_valid("x", {3, 4}, std::nullopt));
+
+    runtime::MaterializeOperator sink{std::make_unique<VectorSource>(std::move(chunks))};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+
+    const auto& out = result.value();
+    REQUIRE(out.rows() == 4);
+    const auto* entry = out.find_entry("x");
+    REQUIRE(entry != nullptr);
+    REQUIRE_FALSE(entry->validity.has_value());
+}
+
+TEST_CASE("MaterializeOperator accumulates logical rows across zero-column chunks") {
+    // Column-less frames (e.g. Table(n) scaffolds) carry their row count in
+    // `logical_rows`; a multi-chunk zero-column stream must report the total.
+    std::vector<runtime::Chunk> chunks;
+    runtime::Chunk a;
+    a.logical_rows = 3;
+    runtime::Chunk b;
+    b.logical_rows = 5;
+    runtime::Chunk c;
+    c.logical_rows = 2;
+    chunks.push_back(std::move(a));
+    chunks.push_back(std::move(b));
+    chunks.push_back(std::move(c));
+
+    runtime::MaterializeOperator sink{std::make_unique<VectorSource>(std::move(chunks))};
+    auto result = sink.run();
+    REQUIRE(result.has_value());
+
+    const auto& out = result.value();
+    REQUIRE(out.columns.empty());
+    REQUIRE(out.rows() == 10);
 }
 
 TEST_CASE("MaterializeOperator returns an empty Table when the source is empty") {

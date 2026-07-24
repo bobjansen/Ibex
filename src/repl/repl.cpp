@@ -4553,8 +4553,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
             tables.insert_or_assign(name, std::move(table.value()));
         }
-        const runtime::ScopedDeferredScans deferred_guard(&deferred_scans);
-        return runtime::interpret(*rewritten, tables, nullptr, &externs);
+        const runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
+        return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
     };
 
     // Bindings the lowerer marked as shared are evaluated exactly once, in

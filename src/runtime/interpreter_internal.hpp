@@ -556,6 +556,13 @@ struct ColumnEvalCtx {
     // window resets on the epoch grid (`[floor(t/dur)*dur, t]`) instead of
     // trailing (`[t-dur, t]`). Ignored for count windows.
     bool window_aligned = false;
+    // Query-scoped execution state (deferred scans now; the RNG stream in a
+    // later phase), carried so a column kernel can reach it explicitly instead
+    // of via a thread-local — the ownership path a worker thread will need (see
+    // runtime multithreading plan, Phase 0 item 5). Null in the deliberately
+    // restricted evaluators that also null `externs` (filter predicate position,
+    // the numeric fast path): those do not thread query state either.
+    const ExecutionContext* exec = nullptr;
 };
 
 // How a Scalar builtin's per-row `eval` meets a Null argument
@@ -983,24 +990,26 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
 
 // update.cpp — update/select field application (incl. fast numeric paths).
 [[nodiscard]] auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
-                                const ScalarRegistry* scalars, const ExternRegistry* externs)
-    -> std::expected<Table, std::string>;
+                                const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                const ExecutionContext& exec) -> std::expected<Table, std::string>;
 [[nodiscard]] auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                         const std::vector<ir::ColumnRef>& group_by,
                                         const ScalarRegistry* scalars,
-                                        const ExternRegistry* externs)
+                                        const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                                          ir::Duration duration, const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs, bool aligned = false)
+                                         const ExternRegistry* externs,
+                                         const ExecutionContext& exec, bool aligned = false)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto grouped_windowed_update_table(
     Table input, const std::vector<ir::FieldSpec>& fields, ir::Duration duration,
     const std::vector<ir::ColumnRef>& group_by, const ScalarRegistry* scalars,
-    const ExternRegistry* externs, bool aligned = false) -> std::expected<Table, std::string>;
+    const ExternRegistry* externs, const ExecutionContext& exec, bool aligned = false)
+    -> std::expected<Table, std::string>;
 [[nodiscard]] auto apply_guarded_update(Table input, const ir::UpdateNode& update,
                                         const ScalarRegistry* scalars,
-                                        const ExternRegistry* externs)
+                                        const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input,
                                                 std::size_t rows, ExprType output_kind,

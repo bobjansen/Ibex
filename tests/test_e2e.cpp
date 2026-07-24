@@ -2147,6 +2147,49 @@ TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e]
     }
 }
 
+TEST_CASE("E2E: parallel island runs a row-local update on worker threads", "[e2e][parallel]") {
+    auto tables = make_wide_island_table(1000);
+
+    // A standalone `update` is where a query's arithmetic lives; these are the
+    // shapes that put it inside the island rather than in a serial barrier.
+    const char* cases[] = {
+        "t[update { n = price * 2 }];",
+        "t[update { n = price * qty + 1 }][filter n > 100];",
+        "t[filter price > 100][update { n = price - qty }][select { price, n }];",
+        "t[update { n = price * 2 }][rename m = n];",
+        "t[update { qty = qty + 1 }];",  // overwrites an existing nullable column
+    };
+    for (const auto* src : cases) {
+        INFO("query: " << src);
+        auto serial = run(src, tables);
+        for (const std::size_t threads : {2U, 8U}) {
+            INFO("threads " << threads);
+            require_tables_equal(serial, run_on_workers(src, tables, 7, threads));
+        }
+    }
+}
+
+TEST_CASE("E2E: parallel island leaves a non-row-local update serial", "[e2e][parallel]") {
+    auto tables = make_wide_island_table(1000);
+    // Each of these would be silently wrong per morsel: the transform reads
+    // neighbouring rows, and the grouped/guarded forms are not row-local at
+    // all. The result must match the serial answer, which means the island
+    // declined them. (An ungrouped aggregate in an update is rejected by
+    // evaluation itself, so it is covered in the lowerer test instead.)
+    const char* cases[] = {
+        "t[update { c = cumsum(price) }];",
+        "t[update { m = price }, by symbol];",
+        "t[where price > 500 update { price = 0 }];",
+    };
+    for (const auto* src : cases) {
+        INFO("query: " << src);
+        auto serial = run(src, tables);
+        runtime::ParallelIslandStats stats;
+        auto parallel = run_parallel(src, tables, 7, 8, &stats);
+        require_tables_equal(serial, parallel);
+    }
+}
+
 TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empty result",
           "[e2e][parallel]") {
     runtime::Table t;

@@ -39,6 +39,10 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `window` requires TimeFrame operand
 
 ## Benchmarking Notes
+- When a user requests a benchmark command, run that command directly with any
+  requested resource caps and wait for it to finish. Do not add backgrounding,
+  ad-hoc wrappers, or substitute workflows merely to work around agent-tool
+  timing; report a genuine tool or system failure plainly if one occurs.
 - **Always check performance after changes on hot execution paths**, including
   refactors intended to be behavior- or serial-only. Build and measure the
   affected release-path workload against a pre-change baseline with

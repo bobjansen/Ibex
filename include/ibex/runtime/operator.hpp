@@ -4,6 +4,7 @@
 #include <ibex/runtime/interrupt.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -31,6 +32,22 @@ struct Chunk {
     /// the matching field on `Table`. Only consulted by `rows()` when `columns`
     /// is empty.
     std::optional<std::size_t> logical_rows;
+
+    /// Position of this chunk in its source's emission order. When a chunked
+    /// source partitions one immutable table into row ranges (see
+    /// `PartitionedTableSource` / `TableRangeMorsel`), workers may produce those
+    /// ranges out of order; `sequence` lets an ordered merger reassemble the
+    /// original row order. Zero for the single-source and chunk-at-a-time
+    /// paths that do not partition. Chunk-preserving operators must copy it
+    /// through unchanged (including empty schema-carrier chunks).
+    std::uint64_t sequence = 0;
+
+    /// Absolute starting row of this chunk within its source table, i.e. the
+    /// index in the original (un-partitioned) table of this chunk's first row.
+    /// Zero for non-partitioned sources. Like `sequence`, it must survive
+    /// chunk-preserving operators so range-aware kernels can address the shared
+    /// input by absolute index.
+    std::size_t row_offset = 0;
 
     void add_column(std::string name, ColumnValue column,
                     std::optional<ValidityBitmap> validity = std::nullopt) {

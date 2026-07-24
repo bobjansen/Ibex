@@ -2711,9 +2711,9 @@ struct DeferredProbeScan {
     const std::string* name = nullptr;  ///< scan (instance) name in the plan
 };
 
-auto deferred_probe_scan_of(const ir::Node& right) -> DeferredProbeScan {
-    const auto* deferred = current_deferred_scans();
-    if (deferred == nullptr) {
+auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
+    -> DeferredProbeScan {
+    if (exec.deferred_scans == nullptr) {
         return {};
     }
     const ir::Node* cur = &right;
@@ -2728,9 +2728,14 @@ auto deferred_probe_scan_of(const ir::Node& right) -> DeferredProbeScan {
         return {};
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto it = deferred->find(static_cast<const ir::ScanNode&>(*cur).source_name());
-    return it == deferred->end() ? DeferredProbeScan{}
-                                 : DeferredProbeScan{.scan = &it->second, .name = &it->first};
+    const auto& name = static_cast<const ir::ScanNode&>(*cur).source_name();
+    const auto* scan = exec.deferred_scan(name);
+    if (scan == nullptr) {
+        return {};
+    }
+    // Recover the stored key iterator to expose the registry's own name string.
+    const auto it = exec.deferred_scans->find(name);
+    return DeferredProbeScan{.scan = scan, .name = &it->first};
 }
 
 /// Inner hash join for single-key no-predicate joins.
@@ -2762,8 +2767,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// the operator.
     ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
                              const TableRegistry* registry, const ScalarRegistry* scalars,
-                             const ExternRegistry* externs, const std::vector<std::string>* keys,
-                             const DeferredScan* probe, std::string probe_name)
+                             const ExternRegistry* externs, const ExecutionContext& exec,
+                             const std::vector<std::string>* keys, const DeferredScan* probe,
+                             std::string probe_name)
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
@@ -2771,7 +2777,8 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_right_node_(right_node),
           deferred_registry_(registry),
           deferred_scalars_(scalars),
-          deferred_externs_(externs) {}
+          deferred_externs_(externs),
+          deferred_exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -2954,7 +2961,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
         auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
-                                    deferred_externs_);
+                                    deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
             return std::move(right.error());
         }
@@ -2971,8 +2978,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     auto interpret_wrapped_right(Table scan_table) -> std::optional<std::string> {
         TableRegistry local = *deferred_registry_;
         local.insert_or_assign(deferred_probe_name_, std::move(scan_table));
-        auto right =
-            interpret_node(*deferred_right_node_, local, deferred_scalars_, deferred_externs_);
+        auto right = interpret_node(*deferred_right_node_, local, deferred_scalars_,
+                                    deferred_externs_, *deferred_exec_);
         if (!right.has_value()) {
             return std::move(right.error());
         }
@@ -3680,6 +3687,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     const TableRegistry* deferred_registry_ = nullptr;
     const ScalarRegistry* deferred_scalars_ = nullptr;
     const ExternRegistry* deferred_externs_ = nullptr;
+    const ExecutionContext* deferred_exec_ = nullptr;
 
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
@@ -5548,9 +5556,10 @@ template <typename Fn>
 
 auto build_unary_materializing_operator(const ir::Node& child_node, const TableRegistry& registry,
                                         const ScalarRegistry* scalars,
-                                        const ExternRegistry* externs, ModelResult* model_out,
-                                        Fn fn) -> std::expected<OperatorPtr, std::string> {
-    auto child_op = build_operator(child_node, registry, scalars, externs, model_out);
+                                        const ExternRegistry* externs, const ExecutionContext& exec,
+                                        ModelResult* model_out, Fn fn)
+    -> std::expected<OperatorPtr, std::string> {
+    auto child_op = build_operator(child_node, registry, scalars, externs, exec, model_out);
     if (!child_op.has_value()) {
         return std::unexpected(std::move(child_op.error()));
     }
@@ -5574,13 +5583,14 @@ template <typename Fn>
 auto build_binary_materializing_operator(const ir::Node& left_node, const ir::Node& right_node,
                                          const TableRegistry& registry,
                                          const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs, ModelResult* model_out,
+                                         const ExternRegistry* externs,
+                                         const ExecutionContext& exec, ModelResult* model_out,
                                          Fn fn) -> std::expected<OperatorPtr, std::string> {
-    auto left_op = build_operator(left_node, registry, scalars, externs, model_out);
+    auto left_op = build_operator(left_node, registry, scalars, externs, exec, model_out);
     if (!left_op.has_value()) {
         return std::unexpected(std::move(left_op.error()));
     }
-    auto right_op = build_operator(right_node, registry, scalars, externs, model_out);
+    auto right_op = build_operator(right_node, registry, scalars, externs, exec, model_out);
     if (!right_op.has_value()) {
         return std::unexpected(std::move(right_op.error()));
     }
@@ -5686,7 +5696,8 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
-                    ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+                    const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
     // Phase 1 invokes analyze_parallel_island() at this physical-execution
     // seam once RuntimeOptions can request a parallel executor. Do not run the
     // analysis merely to discard it on the serial path: build_operator() is a
@@ -5697,7 +5708,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("filter node missing child");
         }
         auto child_op =
-            build_operator(*filter.children().front(), registry, scalars, externs, model_out);
+            build_operator(*filter.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5710,8 +5721,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (project.children().empty()) {
             return std::unexpected("project node missing child");
         }
-        auto child_op =
-            build_operator(*project.children().front(), registry, scalars, externs, model_out);
+        auto child_op = build_operator(*project.children().front(), registry, scalars, externs,
+                                       exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5726,7 +5737,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("filter_project node missing child");
         }
         auto child_op =
-            build_operator(*fp.children().front(), registry, scalars, externs, model_out);
+            build_operator(*fp.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5741,7 +5752,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("filter_head node missing child");
         }
         auto child_op =
-            build_operator(*fh.children().front(), registry, scalars, externs, model_out);
+            build_operator(*fh.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5754,7 +5765,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("filter_tail node missing child");
         }
         auto child_op =
-            build_operator(*ft.children().front(), registry, scalars, externs, model_out);
+            build_operator(*ft.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5787,7 +5798,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             gather_cols.push_back(ir::ColumnRef{.name = name});
         }
         auto child_op =
-            build_operator(*fup.children().front(), registry, scalars, externs, model_out);
+            build_operator(*fup.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5802,7 +5813,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("rename node missing child");
         }
         auto child_op =
-            build_operator(*rename.children().front(), registry, scalars, externs, model_out);
+            build_operator(*rename.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5840,7 +5851,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("distinct node missing child");
         }
         auto child_op =
-            build_operator(*node.children().front(), registry, scalars, externs, model_out);
+            build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5853,7 +5864,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("order node missing child");
         }
         auto child_op =
-            build_operator(*order.children().front(), registry, scalars, externs, model_out);
+            build_operator(*order.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5896,8 +5907,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             }
         }
         if (streamable) {
-            auto child_op =
-                build_operator(*agg.children().front(), registry, scalars, externs, model_out);
+            auto child_op = build_operator(*agg.children().front(), registry, scalars, externs,
+                                           exec, model_out);
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
@@ -5918,7 +5929,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("topk node missing child");
         }
         auto child_op =
-            build_operator(*topk.children().front(), registry, scalars, externs, model_out);
+            build_operator(*topk.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5942,7 +5953,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         // Head(Filter(x)) with no group_by is rewritten by R7 into FilterHead(x);
         // Head past Project/Rename is handled by R4.
         auto child_op =
-            build_operator(*head.children().front(), registry, scalars, externs, model_out);
+            build_operator(*head.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -5962,7 +5973,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         // Tail(Order(x)) → TopK via R16; Tail(Filter(x)) no-group_by → FilterTail via R8;
         // Tail past Project/Rename via R4.
         return build_unary_materializing_operator(
-            *tail.children().front(), registry, scalars, externs, model_out,
+            *tail.children().front(), registry, scalars, externs, exec, model_out,
             [&](Table input) { return tail_table(input, *count, tail.group_by()); });
     }
 
@@ -5971,7 +5982,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("columns node missing child");
         }
         return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, model_out,
+                                                  externs, exec, model_out,
                                                   [](Table input) { return columns_table(input); });
     }
 
@@ -5981,7 +5992,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("melt node missing child");
         }
         return build_unary_materializing_operator(
-            *mn.children().front(), registry, scalars, externs, model_out,
+            *mn.children().front(), registry, scalars, externs, exec, model_out,
             [&](Table input) { return melt_table(input, mn.id_columns(), mn.measure_columns()); });
     }
 
@@ -5991,7 +6002,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("dcast node missing child");
         }
         return build_unary_materializing_operator(
-            *dn.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+            *dn.children().front(), registry, scalars, externs, exec, model_out, [&](Table input) {
                 return dcast_table(input, dn.pivot_column(), dn.value_column(), dn.row_keys());
             });
     }
@@ -6001,7 +6012,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("cov node missing child");
         }
         return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, model_out,
+                                                  externs, exec, model_out,
                                                   [](Table input) { return cov_table(input); });
     }
 
@@ -6010,7 +6021,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("corr node missing child");
         }
         return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, model_out,
+                                                  externs, exec, model_out,
                                                   [](Table input) { return corr_table(input); });
     }
 
@@ -6019,7 +6030,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("transpose node missing child");
         }
         return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, model_out,
+            *node.children().front(), registry, scalars, externs, exec, model_out,
             [](Table input) { return transpose_table(input); });
     }
 
@@ -6033,12 +6044,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             !join.predicate().has_value() && join.keys().size() == 1;
         if (streamable_semi_anti) {
             auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, model_out);
+                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
             }
             auto right_op =
-                build_operator(*join.children()[1], registry, scalars, externs, model_out);
+                build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
             if (!right_op.has_value()) {
                 return std::unexpected(std::move(right_op.error()));
             }
@@ -6053,21 +6064,21 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                       !join.predicate().has_value() && join.keys().size() == 1;
         if (streamable_inner) {
             auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, model_out);
+                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
             }
             // A deferred probe scan must not be interpreted here — the join
             // publishes build-side bounds into its filter slot first, then
             // interprets the right subtree itself (resolve_deferred_probe).
-            if (const auto probe = deferred_probe_scan_of(*join.children()[1]);
+            if (const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
                 probe.scan != nullptr) {
                 return std::make_unique<ChunkedInnerJoinOperator>(
                     std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, &join.keys(), probe.scan, *probe.name);
+                    externs, exec, &join.keys(), probe.scan, *probe.name);
             }
             auto right_op =
-                build_operator(*join.children()[1], registry, scalars, externs, model_out);
+                build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
             if (!right_op.has_value()) {
                 return std::unexpected(std::move(right_op.error()));
             }
@@ -6080,7 +6091,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(
-            *join.children()[0], *join.children()[1], registry, scalars, externs, model_out,
+            *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
                                        compute_mask);
@@ -6092,7 +6103,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("matmul node expects exactly two children");
         }
         return build_binary_materializing_operator(
-            *node.children()[0], *node.children()[1], registry, scalars, externs, model_out,
+            *node.children()[0], *node.children()[1], registry, scalars, externs, exec, model_out,
             [](Table left, Table right) { return matmul_table(left, right); });
     }
 
@@ -6103,7 +6114,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         if (update.guard() != nullptr) {
             return build_unary_materializing_operator(
-                *update.children().front(), registry, scalars, externs, model_out,
+                *update.children().front(), registry, scalars, externs, exec, model_out,
                 [&](Table input) -> std::expected<Table, std::string> {
                     return apply_guarded_update(std::move(input), update, scalars, externs);
                 });
@@ -6115,7 +6126,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 });
             if (!all_rank && update.tuple_fields().empty()) {
                 return build_unary_materializing_operator(
-                    *update.children().front(), registry, scalars, externs, model_out,
+                    *update.children().front(), registry, scalars, externs, exec, model_out,
                     [&](Table input) -> std::expected<Table, std::string> {
                         return grouped_update_table(std::move(input), update.fields(),
                                                     update.group_by(), scalars, externs);
@@ -6126,7 +6137,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     "update + by: tuple-bound fields are not yet supported in grouped updates");
             }
             return build_unary_materializing_operator(
-                *update.children().front(), registry, scalars, externs, model_out,
+                *update.children().front(), registry, scalars, externs, exec, model_out,
                 [&](Table input) -> std::expected<Table, std::string> {
                     Table result = std::move(input);
                     for (const auto& field : update.fields()) {
@@ -6151,8 +6162,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             std::all_of(update.fields().begin(), update.fields().end(),
                         [](const ir::FieldSpec& f) { return is_row_local_update_expr(f.expr); });
         if (all_row_local && update.tuple_fields().empty()) {
-            auto child_op =
-                build_operator(*update.children().front(), registry, scalars, externs, model_out);
+            auto child_op = build_operator(*update.children().front(), registry, scalars, externs,
+                                           exec, model_out);
             if (!child_op.has_value()) {
                 return std::unexpected(std::move(child_op.error()));
             }
@@ -6160,7 +6171,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                                            &update.fields(), scalars, externs);
         }
         auto child = build_unary_materializing_operator(
-            *update.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+            *update.children().front(), registry, scalars, externs, exec, model_out,
+            [&](Table input) {
                 return update_table(std::move(input), update.fields(), scalars, externs);
             });
         if (!child.has_value()) {
@@ -6171,7 +6183,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected(std::move(result.error()));
         }
         for (const auto& tspec : update.tuple_fields()) {
-            auto src = interpret_node(*tspec.source, registry, scalars, externs);
+            auto src = interpret_node(*tspec.source, registry, scalars, externs, exec);
             if (!src.has_value()) {
                 return std::unexpected(std::move(src.error()));
             }
@@ -6208,7 +6220,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("resample node missing child");
         }
         return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, model_out, [&](Table input) {
+            *node.children().front(), registry, scalars, externs, exec, model_out,
+            [&](Table input) {
                 return resample_table(input, rs.duration(), rs.group_by(), rs.aggregations());
             });
     }
@@ -6227,8 +6240,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (child_node.children().empty()) {
             return std::unexpected("window: update node missing child");
         }
-        auto source_op =
-            build_operator(*child_node.children().front(), registry, scalars, externs, model_out);
+        auto source_op = build_operator(*child_node.children().front(), registry, scalars, externs,
+                                        exec, model_out);
         if (!source_op.has_value()) {
             return std::unexpected(std::move(source_op.error()));
         }
@@ -6283,7 +6296,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("as_timeframe node missing child");
         }
         auto child_op =
-            build_operator(*node.children().front(), registry, scalars, externs, model_out);
+            build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -6297,7 +6310,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("model node missing child");
         }
         auto child_op =
-            build_operator(*mn.children().front(), registry, scalars, externs, model_out);
+            build_operator(*mn.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
@@ -6323,7 +6336,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Construct || node.kind() == ir::NodeKind::Stream) {
-        auto table = interpret_node(node, registry, scalars, externs, model_out);
+        auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
         if (!table.has_value()) {
             return std::unexpected(std::move(table.error()));
         }
@@ -6336,12 +6349,12 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!preamble.has_value()) {
             return std::unexpected(std::move(preamble.error()));
         }
-        return build_operator(program.main_node(), registry, scalars, externs, model_out);
+        return build_operator(program.main_node(), registry, scalars, externs, exec, model_out);
     }
 
     // Remaining node kinds fall through to interpret_node. Scan is already
     // handled as a source by the caller.
-    auto table = interpret_node(node, registry, scalars, externs, model_out);
+    auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }

@@ -47,7 +47,7 @@ Options:
   --iters <N>                 Timed iterations per repeat (default: 5)
   --inner-runs <N>            REPL invocations per timed iteration, to
                                amortize process startup (default: 3)
-  --repeats <N>                Repeats per side (default: 3)
+  --repeats <N>                Repeats per side (default: 15)
   --serial                    Disable interleaving (all base repeats, then target)
   --taskset <cpuset>          Pin runs with taskset -c
   --numa-node <N>              Pin runs with numactl node/memory bind
@@ -73,7 +73,7 @@ declare -a CONFIGURE_ARGS=()
 WARMUP=1
 ITERS=5
 INNER_RUNS=3
-REPEATS=3
+REPEATS=15
 INTERLEAVE=1
 TASKSET_CPUSET=""
 NUMA_NODE=""

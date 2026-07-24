@@ -147,24 +147,6 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
-// Execution-scoped deferred-scan registry (same pattern as cooperative
-// interruption): installed by the whole-script driver around interpret(),
-// consulted by the Scan fallback below and by the chunked inner join.
-static thread_local const DeferredScanRegistry* g_deferred_scans = nullptr;
-
-ScopedDeferredScans::ScopedDeferredScans(const DeferredScanRegistry* scans) noexcept
-    : previous_(g_deferred_scans) {
-    g_deferred_scans = scans;
-}
-
-ScopedDeferredScans::~ScopedDeferredScans() {
-    g_deferred_scans = previous_;
-}
-
-auto current_deferred_scans() noexcept -> const DeferredScanRegistry* {
-    return g_deferred_scans;
-}
-
 /// Whether synthesizing `[min, max]` bound conjuncts is worth it for this
 /// scan: only when the estimated pruning against the source's footer range is
 /// at least ~20% (uniform-distribution estimate — the only one a min/max pair
@@ -375,7 +357,8 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
-                    ModelResult* model_out) -> std::expected<Table, std::string> {
+                    const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
     // Cooperative interruption boundary: a Ctrl+C during a long-running plan
     // unwinds here between operators rather than killing the process.
     if (interrupt_requested()) {
@@ -388,16 +371,14 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (it == registry.end()) {
                 // A deferred lazy source has no registry entry; decode it here
                 // with whatever bounds its join has published so far.
-                if (const auto* deferred = current_deferred_scans(); deferred != nullptr) {
-                    if (const auto entry = deferred->find(scan.source_name());
-                        entry != deferred->end()) {
-                        auto table = materialize_deferred_scan(entry->second);
-                        if (!table.has_value()) {
-                            return std::unexpected(std::move(table.error()));
-                        }
-                        normalize_time_index(table.value());
-                        return std::move(table.value());
+                if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                    deferred != nullptr) {
+                    auto table = materialize_deferred_scan(*deferred);
+                    if (!table.has_value()) {
+                        return std::unexpected(std::move(table.error()));
                     }
+                    normalize_time_index(table.value());
+                    return std::move(table.value());
                 }
                 return std::unexpected("unknown table: " + scan.source_name() +
                                        " (available: " + format_tables(registry) + ")");
@@ -411,7 +392,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (filter.children().empty()) {
                 return std::unexpected("filter node missing child");
             }
-            auto child = interpret_node(*filter.children().front(), registry, scalars, externs);
+            auto child =
+                interpret_node(*filter.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -422,7 +404,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (project.children().empty()) {
                 return std::unexpected("project node missing child");
             }
-            auto child = interpret_node(*project.children().front(), registry, scalars, externs);
+            auto child =
+                interpret_node(*project.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -432,7 +415,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().empty()) {
                 return std::unexpected("distinct node missing child");
             }
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -443,7 +426,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (order.children().empty()) {
                 return std::unexpected("order node missing child");
             }
-            auto child = interpret_node(*order.children().front(), registry, scalars, externs);
+            auto child =
+                interpret_node(*order.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -458,7 +442,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!count) {
                 return std::unexpected(count.error());
             }
-            auto child = interpret_node(*head.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*head.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -473,7 +457,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!count) {
                 return std::unexpected(count.error());
             }
-            auto child = interpret_node(*tail.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*tail.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -484,7 +468,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (update.children().empty()) {
                 return std::unexpected("update node missing child");
             }
-            auto child = interpret_node(*update.children().front(), registry, scalars, externs);
+            auto child =
+                interpret_node(*update.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -527,7 +512,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return result;
             }
             for (const auto& tspec : update.tuple_fields()) {
-                auto src = interpret_node(*tspec.source, registry, scalars, externs);
+                auto src = interpret_node(*tspec.source, registry, scalars, externs, exec);
                 if (!src) {
                     return std::unexpected(src.error());
                 }
@@ -563,7 +548,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (rename.children().empty()) {
                 return std::unexpected("rename node missing child");
             }
-            auto child = interpret_node(*rename.children().front(), registry, scalars, externs);
+            auto child =
+                interpret_node(*rename.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -584,7 +570,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 }
                 return aggregate_table(it->second, agg.group_by(), agg.aggregations());
             }
-            auto child = interpret_node(child_node, registry, scalars, externs);
+            auto child = interpret_node(child_node, registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -592,7 +578,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value())
                 return child;
             return resample_table(child.value(), rs.duration(), rs.group_by(), rs.aggregations());
@@ -608,7 +594,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
             // Evaluate the source (grandchild) without the window context.
             auto source =
-                interpret_node(*child_node.children().front(), registry, scalars, externs);
+                interpret_node(*child_node.children().front(), registry, scalars, externs, exec);
             if (!source.has_value()) {
                 return source;
             }
@@ -650,7 +636,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value()) {
                 return child;
             }
@@ -687,7 +673,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
         }
         case ir::NodeKind::Ascribe: {
             const auto& asc = static_cast<const ir::AscribeNode&>(node);
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value()) {
                 return child;
             }
@@ -735,7 +721,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().empty()) {
                 return std::unexpected("columns node missing child");
             }
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value()) {
                 return child;
             }
@@ -764,11 +750,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (join.children().size() != 2) {
                 return std::unexpected("join node expects exactly two children");
             }
-            auto left = interpret_node(*join.children()[0], registry, scalars, externs);
+            auto left = interpret_node(*join.children()[0], registry, scalars, externs, exec);
             if (!left) {
                 return std::unexpected(left.error());
             }
-            auto right = interpret_node(*join.children()[1], registry, scalars, externs);
+            auto right = interpret_node(*join.children()[1], registry, scalars, externs, exec);
             if (!right) {
                 return std::unexpected(right.error());
             }
@@ -781,7 +767,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (mn.children().empty()) {
                 return std::unexpected("melt node missing child");
             }
-            auto child = interpret_node(*mn.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*mn.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -792,7 +778,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (dn.children().empty()) {
                 return std::unexpected("dcast node missing child");
             }
-            auto child = interpret_node(*dn.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*dn.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -802,7 +788,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().empty()) {
                 return std::unexpected("cov node missing child");
             }
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -812,7 +798,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().empty()) {
                 return std::unexpected("corr node missing child");
             }
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -822,7 +808,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().empty()) {
                 return std::unexpected("transpose node missing child");
             }
-            auto child = interpret_node(*node.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -832,11 +818,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (node.children().size() != 2) {
                 return std::unexpected("matmul node expects exactly two children");
             }
-            auto left = interpret_node(*node.children()[0], registry, scalars, externs);
+            auto left = interpret_node(*node.children()[0], registry, scalars, externs, exec);
             if (!left) {
                 return std::unexpected(left.error());
             }
-            auto right = interpret_node(*node.children()[1], registry, scalars, externs);
+            auto right = interpret_node(*node.children()[1], registry, scalars, externs, exec);
             if (!right) {
                 return std::unexpected(right.error());
             }
@@ -849,7 +835,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             std::vector<Table> operands;
             operands.reserve(node.children().size());
             for (const auto& child : node.children()) {
-                auto result = interpret_node(*child, registry, scalars, externs);
+                auto result = interpret_node(*child, registry, scalars, externs, exec);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
@@ -1016,7 +1002,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     return {};
                 TableRegistry stream_reg = registry;
                 stream_reg["__stream_input__"] = buf;
-                auto output = interpret_node(transform_ir, stream_reg, scalars, externs);
+                auto output = interpret_node(transform_ir, stream_reg, scalars, externs, exec);
                 if (!output)
                     return std::unexpected(output.error());
                 if (output->rows() == 0)
@@ -1135,7 +1121,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (col.expr_node) {
                     // Expression column: evaluate the sub-node to produce a Table,
                     // then extract the target column from it.
-                    auto sub = interpret_node(*col.expr_node, registry, scalars, externs);
+                    auto sub = interpret_node(*col.expr_node, registry, scalars, externs, exec);
                     if (!sub.has_value())
                         return std::unexpected(sub.error());
                     if (sub->columns.size() == 1) {
@@ -1200,7 +1186,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (mn.children().empty()) {
                 return std::unexpected("model node missing child");
             }
-            auto child = interpret_node(*mn.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*mn.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1228,7 +1214,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!preamble.has_value()) {
                 return std::unexpected(std::move(preamble.error()));
             }
-            return interpret_node(program.main_node(), registry, scalars, externs, model_out);
+            return interpret_node(program.main_node(), registry, scalars, externs, exec, model_out);
         }
         case ir::NodeKind::FilterProject: {
             // Fused shape produced by canonicalize R5. Materializing fallback
@@ -1238,7 +1224,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (fp.children().empty()) {
                 return std::unexpected("filter_project node missing child");
             }
-            auto child = interpret_node(*fp.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*fp.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1254,7 +1240,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (fup.children().empty()) {
                 return std::unexpected("filter_update_project node missing child");
             }
-            auto child = interpret_node(*fup.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*fup.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1274,7 +1260,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (topk.children().empty()) {
                 return std::unexpected("topk node missing child");
             }
-            auto child = interpret_node(*topk.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*topk.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1292,7 +1278,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (fh.children().empty()) {
                 return std::unexpected("filter_head node missing child");
             }
-            auto child = interpret_node(*fh.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*fh.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1307,7 +1293,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (ft.children().empty()) {
                 return std::unexpected("filter_tail node missing child");
             }
-            auto child = interpret_node(*ft.children().front(), registry, scalars, externs);
+            auto child = interpret_node(*ft.children().front(), registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
@@ -1431,15 +1417,22 @@ auto Table::find(const std::string& name) const -> const ColumnValue* {
 }
 
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
-               const ExternRegistry* externs, ModelResult* model_out)
+               const ExternRegistry* externs, ModelResult* model_out, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     tune_allocator_once();
-    auto op = build_operator(node, registry, scalars, externs, model_out);
+    auto op = build_operator(node, registry, scalars, externs, exec, model_out);
     if (!op.has_value()) {
         return std::unexpected(std::move(op.error()));
     }
     MaterializeOperator sink{std::move(op.value())};
     return sink.run();
+}
+
+auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
+               const ExternRegistry* externs, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
+    const ExecutionContext exec{};
+    return interpret(node, registry, scalars, externs, model_out, exec);
 }
 
 auto invoke_table_consumer(const ExternRegistry& externs, const std::string& callee,

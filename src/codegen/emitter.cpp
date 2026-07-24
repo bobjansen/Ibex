@@ -116,8 +116,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
         if (config.bench_mode)
             throw std::runtime_error("table entry point cannot be a benchmark harness");
         out << "ibex::runtime::Table " << config.entry_point_name << "() {\n";
-    } else
+    } else {
         out << "int main() {\n";
+    }
 
     if (!config.scalar_bindings.empty()) {
         out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";

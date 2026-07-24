@@ -111,10 +111,22 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     return std::move(*result);
 }
 
-// Byte-for-byte table equality: schema, row count, per-column data and validity.
+// Byte-for-byte table equality: schema, row count, values, validity, and
+// order-sensitive metadata. This is the serial-island parity contract: the
+// partitioned path must not let per-morsel handling change table properties.
 void require_tables_equal(const runtime::Table& a, const runtime::Table& b) {
     REQUIRE(a.columns.size() == b.columns.size());
     REQUIRE(a.rows() == b.rows());
+    REQUIRE(a.logical_rows == b.logical_rows);
+    REQUIRE(a.time_index == b.time_index);
+    REQUIRE(a.ordering.has_value() == b.ordering.has_value());
+    if (a.ordering.has_value()) {
+        REQUIRE(a.ordering->size() == b.ordering->size());
+        for (std::size_t key = 0; key < a.ordering->size(); ++key) {
+            REQUIRE((*a.ordering)[key].name == (*b.ordering)[key].name);
+            REQUIRE((*a.ordering)[key].ascending == (*b.ordering)[key].ascending);
+        }
+    }
     for (std::size_t c = 0; c < a.columns.size(); ++c) {
         REQUIRE(a.columns[c].name == b.columns[c].name);
         const auto& av = *a.columns[c].column;
@@ -1961,4 +1973,33 @@ TEST_CASE("E2E: parallel serial-island falls back to serial for ineligible shape
     auto serial = run("t[select { price, prev = lag(price, 1) }];", tables);
     auto parallel = run_parallel("t[select { price, prev = lag(price, 1) }];", tables, 3);
     require_tables_equal(serial, parallel);
+}
+
+TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered schema",
+          "[e2e][parallel]") {
+    runtime::Table t;
+    t.add_column("ts", Column<std::int64_t>{400, 100, 300, 200, 500});
+    t.add_column("value", Column<std::int64_t>{4, 1, 3, 2, 5});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    // The Ascribe node is a serial boundary; filter + rename after it is the
+    // partitioned island. Renaming the time-index column exercises metadata
+    // propagation through every morsel and the final materialization.
+    constexpr auto metadata_query = R"(as_timeframe(t, "ts")[filter value > 1][rename time = ts];)";
+    auto serial_metadata = run(metadata_query, tables);
+    auto island_metadata = run_parallel(metadata_query, tables, 2);
+    require_tables_equal(serial_metadata, island_metadata);
+    REQUIRE(island_metadata.time_index == "time");
+    REQUIRE(island_metadata.ordering.has_value());
+    REQUIRE((*island_metadata.ordering)[0].name == "time");
+
+    // Grain 3 produces four input morsels. Every one is rejected; the final
+    // table must nevertheless retain the projected schema and zero rows.
+    constexpr auto all_filtered_query = R"(t[filter value > 99, select { ts, value }];)";
+    auto serial_empty = run(all_filtered_query, tables);
+    auto island_empty = run_parallel(all_filtered_query, tables, 2);
+    require_tables_equal(serial_empty, island_empty);
+    REQUIRE(island_empty.columns.size() == 2);
+    REQUIRE(island_empty.rows() == 0);
 }

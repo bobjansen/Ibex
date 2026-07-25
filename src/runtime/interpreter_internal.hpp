@@ -1075,6 +1075,28 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
+/// How many whole-table column-kernel leaves the numeric-tree compiler has
+/// spliced (`Int64(like(col, "pat"))` and friends) since the last reset.
+///
+/// Exists because "this leaf declines under a partial range" is not observable
+/// in the output: with a range beginning at zero the spliced whole-table column
+/// and the range agree on every value, so the decline can only be seen by
+/// asking whether it happened. What it costs when it does not decline is a
+/// whole-table kernel evaluation for a morsel-sized answer, plus that morsel
+/// taking the fused-tree path while its siblings take the per-row one — and
+/// those two disagree about the payload of a null cell.
+///
+/// The counter also lets a test prove the *positive* case, that a whole range
+/// really does splice; without that, asserting zero under a partial range would
+/// pass just as well if the expression never reached the splice at all.
+///
+/// Process-wide and relaxed: it is incremented once per compiled leaf, never
+/// per row. The state lives in a host TU rather than an inline variable in this
+/// header, because bundled plugins statically link runtime code and would
+/// otherwise each get their own copy (the RTLD_LOCAL trap).
+[[nodiscard]] auto column_kernel_splice_count() -> std::uint64_t;
+void reset_column_kernel_splice_count();
+
 /// The fused numeric fast path, evaluated over `range`. Input columns are read
 /// from `range.begin`; the result is dense. A leaf that would need whole-table
 /// evaluation (a spliced `like`/cast kernel) declines under a partial range

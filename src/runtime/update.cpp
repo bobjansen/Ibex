@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -466,9 +467,13 @@ auto to_numeric_column(const ColumnValue& src, ExprType want) -> std::optional<C
 // numeric compiler on the same node. The materialized column is owned by
 // `temps`, whose heap buffers outlive the block evaluation (moving a Column on a
 // `temps` reallocation preserves its data pointer).
+// Splice counter. File-local in this host TU on purpose — see the declaration
+// in interpreter_internal.hpp for why it must not be an inline header variable.
+std::atomic<std::uint64_t> g_column_kernel_splices{0};
+
 auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                             std::vector<NumericUpdateNode>& nodes, std::vector<ColumnValue>& temps,
-                            std::size_t begin) -> std::optional<std::uint32_t> {
+                            RowRange range) -> std::optional<std::uint32_t> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr || !call->named_args.empty()) {
         return std::nullopt;
@@ -478,7 +483,7 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
     // per morsel — the O(morsels x rows) shape that has bitten this path
     // before. Decline instead; the caller falls back to the per-row loop, which
     // is linear in the range.
-    if (begin != 0) {
+    if (!range.is_whole(input.rows())) {
         return std::nullopt;
     }
 
@@ -565,22 +570,23 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
         node.dbl = std::get<Column<double>>(temps.back()).data();
     }
     nodes.push_back(node);
+    g_column_kernel_splices.fetch_add(1, std::memory_order_relaxed);
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
 auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                                      const ScalarRegistry* scalars,
                                      std::vector<NumericUpdateNode>& nodes,
-                                     std::vector<ColumnValue>& temps, std::size_t begin)
+                                     std::vector<ColumnValue>& temps, RowRange range)
     -> std::optional<std::uint32_t> {
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left =
-            try_compile_numeric_update_expr(*bin->left, input, scalars, nodes, temps, begin);
+            try_compile_numeric_update_expr(*bin->left, input, scalars, nodes, temps, range);
         if (!left.has_value()) {
             return std::nullopt;
         }
         auto right =
-            try_compile_numeric_update_expr(*bin->right, input, scalars, nodes, temps, begin);
+            try_compile_numeric_update_expr(*bin->right, input, scalars, nodes, temps, range);
         if (!right.has_value()) {
             return std::nullopt;
         }
@@ -610,7 +616,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                 return std::nullopt;
             }
             auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
-                                                         temps, begin);
+                                                         temps, range);
             if (!child.has_value()) {
                 return std::nullopt;
             }
@@ -633,7 +639,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         if ((is_min || is_max) && call->args.size() >= 2 && call->named_args.empty()) {
             std::optional<std::uint32_t> acc;
             for (const auto& arg : call->args) {
-                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes, temps, begin);
+                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes, temps, range);
                 if (!a.has_value()) {
                     return std::nullopt;  // non-numeric arg (string/date/…): slow path
                 }
@@ -659,7 +665,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         if (call->args.size() == 1 && call->named_args.empty()) {
             if (auto fn = lookup_unary_double_fn(call->callee)) {
                 auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
-                                                             temps, begin);
+                                                             temps, range);
                 if (!child.has_value()) {
                     return std::nullopt;
                 }
@@ -681,7 +687,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         // A column-kernel call (e.g. `Int64(like(col, "pat"))`): evaluate it once
         // into a numeric column leaf rather than dropping the whole enclosing
         // expression to the per-row evaluator.
-        return try_splice_column_leaf(expr, input, scalars, nodes, temps, begin);
+        return try_splice_column_leaf(expr, input, scalars, nodes, temps, range);
     }
 
     auto operand = resolve_fast_operand(expr, input, scalars);
@@ -700,10 +706,10 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             // Leaves are read as `node.i64[block_offset + i]` with a block
             // offset relative to the range, so advancing the base pointer here
             // is all the range costs the tree.
-            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data() + begin;
+            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data() + range.begin;
         } else {
             node.kind = NumericUpdateNode::Kind::DoubleColumn;
-            node.dbl = std::get<Column<double>>(*operand->column).data() + begin;
+            node.dbl = std::get<Column<double>>(*operand->column).data() + range.begin;
         }
     } else {
         if (operand->kind == ExprType::Int) {
@@ -1374,6 +1380,14 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange ra
 
 }  // namespace
 
+auto column_kernel_splice_count() -> std::uint64_t {
+    return g_column_kernel_splices.load(std::memory_order_relaxed);
+}
+
+void reset_column_kernel_splice_count() {
+    g_column_kernel_splices.store(0, std::memory_order_relaxed);
+}
+
 auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, RowRange range,
                                   ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
@@ -1401,7 +1415,7 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, RowR
     // pointers into these; reserved so pushes never reallocate mid-compile.
     std::vector<ColumnValue> temps;
     temps.reserve(8);
-    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps, range.begin);
+    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps, range);
     if (!root.has_value() || nodes[*root].type != output_kind) {
         return std::nullopt;
     }

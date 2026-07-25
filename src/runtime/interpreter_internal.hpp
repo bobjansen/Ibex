@@ -48,12 +48,44 @@ struct ComputedColumn {
     std::optional<ValidityBitmap> validity;
 };
 
+/// A half-open row range `[begin, begin + count)` of some table.
+///
+/// Threaded through the vectorized evaluators so a caller can evaluate over a
+/// slice of a table without first gathering that slice into a table of its own
+/// — the zero-copy morsel path (runtime multithreading plan, Phase 2).
+///
+/// Deliberately not convertible from `std::size_t`, and the evaluators take it
+/// with no default: every former `n` call site has to name its range, so a
+/// missed one is a compile error rather than a silent whole-table evaluation.
+///
+/// The asymmetry to keep in mind when reading the kernels: *inputs* borrowed
+/// from the table are read at `begin + i`, while *outputs* are always dense and
+/// written at `i`. A computed intermediate is therefore already at offset 0.
+struct RowRange {
+    std::size_t begin = 0;
+    std::size_t count = 0;
+
+    [[nodiscard]] static constexpr auto whole(std::size_t n) noexcept -> RowRange {
+        return {.begin = 0, .count = n};
+    }
+    [[nodiscard]] constexpr auto end() const noexcept -> std::size_t { return begin + count; }
+    /// True when this range covers a whole `n`-row table, so offset-free fast
+    /// paths (whole-bitmap copies, borrowed columns) stay valid.
+    [[nodiscard]] constexpr auto is_whole(std::size_t n) const noexcept -> bool {
+        return begin == 0 && count == n;
+    }
+};
+
 // Column result: either a pointer into the table (zero-copy) or an owned computed column,
 // plus optional validity tracking for null propagation.
 struct ColResult {
     std::variant<const ColumnValue*, ColumnValue> data;
     const ValidityBitmap* validity = nullptr;      // source column validity (no-copy)
     std::optional<ValidityBitmap> owned_validity;  // for computed expressions
+    /// Logical row 0 of this result lives at index `offset` of `data` (and of
+    /// `validity`). Non-zero only for a column borrowed from the table under a
+    /// non-whole `RowRange`; an owned computed column is dense, so 0.
+    std::size_t offset = 0;
 
     explicit ColResult(const ColumnValue* p) : data(p) {}
     explicit ColResult(ColumnValue v) : data(std::move(v)) {}
@@ -875,23 +907,35 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const Table& table,
-                                const ScalarRegistry* scalars, std::size_t n)
+                                const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<Mask, std::string>;
 // coalesce kernel (validity-aware Transform; args evaluated via eval_value_vec).
 [[nodiscard]] auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
-                                        const ScalarRegistry* scalars, std::size_t rows)
+                                        const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const Table& table,
-                                  const ScalarRegistry* scalars, std::size_t n)
+                                  const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ColResult, std::string>;
-[[nodiscard]] auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& rhs,
-                             std::size_t n) -> std::expected<ColumnValue, std::string>;
-[[nodiscard]] auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
+/// Element-wise arithmetic. `lhs_off`/`rhs_off` are the operands' `ColResult::offset`
+/// — the output is always dense, so only the inputs carry one.
+[[nodiscard]] auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
+                             const ColumnValue& rhs, std::size_t rhs_off, std::size_t n)
+    -> std::expected<ColumnValue, std::string>;
+/// AND two validity bitmaps into a dense `n`-bit result, reading each from its
+/// own offset. Keeps the whole-bitmap copy when both offsets are 0.
+[[nodiscard]] auto merge_validity(const ValidityBitmap* a, std::size_t a_off,
+                                  const ValidityBitmap* b, std::size_t b_off, std::size_t n)
     -> std::optional<ValidityBitmap>;
-[[nodiscard]] auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
+[[nodiscard]] auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange rows)
     -> std::optional<ValidityBitmap>;
 [[nodiscard]] auto filter_table(const Table& input, const ir::Expr& predicate,
                                 const ScalarRegistry* scalars) -> std::expected<Table, std::string>;
+/// Filter rows `[rows.begin, rows.end())` of `input` without gathering that
+/// slice first: the predicate is evaluated in place and only surviving rows are
+/// materialized. Equivalent to slicing `input` and calling `filter_table` on it.
+[[nodiscard]] auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
+                                      const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string>;
 [[nodiscard]] auto filter_project_table(const Table& input, const ir::Expr& predicate,
                                         const std::vector<ir::ColumnRef>& columns,
                                         const ScalarRegistry* scalars)

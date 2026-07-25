@@ -30,6 +30,7 @@ set(IBEX_TEST_SOURCES
     test_interpreter.cpp
     test_interrupt.cpp
     test_codegen.cpp
+    test_filter_range.cpp
     test_filter_selection.cpp
     test_join.cpp
     test_lazy_table.cpp
@@ -47,6 +48,9 @@ endif()
 add_executable(ibex_tests ${IBEX_TEST_SOURCES})
 
 target_include_directories(ibex_tests PRIVATE
+    # test_filter_range.cpp exercises the range-aware evaluators, which are
+    # declared in the runtime's internal headers rather than the public API.
+    "${PROJECT_SOURCE_DIR}/src/runtime"
     "${PROJECT_SOURCE_DIR}/libs/csv"
     "${PROJECT_SOURCE_DIR}/libs/kafka"
     "${PROJECT_SOURCE_DIR}/libs/json"

@@ -1321,7 +1321,7 @@ auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars
 
 auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
     -> std::optional<ValidityBitmap> {
-    return merge_validity(a, b, n);
+    return merge_validity(a, 0, b, 0, n);
 }
 
 void Table::add_column(std::string name, ColumnValue column) {

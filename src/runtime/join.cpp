@@ -647,7 +647,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 batch.add_column(item.batch_name, *item.column);
             }
 
-            auto mask_res = mask_evaluator(*predicate, batch, scalars, n_right);
+            auto mask_res = mask_evaluator(*predicate, batch, scalars, RowRange::whole(n_right));
             if (!mask_res) {
                 return std::unexpected(mask_res.error());
             }

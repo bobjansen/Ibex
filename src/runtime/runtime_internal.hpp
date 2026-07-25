@@ -41,13 +41,16 @@ struct Mask {
     std::vector<uint8_t> value;
     std::optional<std::vector<uint8_t>> valid;  // nullopt = all rows valid
 
-    void apply_validity(const ValidityBitmap* v, std::size_t n) {
+    /// Adopt `v` as this mask's 3VL validity. `off` is the source offset — the
+    /// mask itself is always dense, so row `i` reads `(*v)[off + i]`.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters) — source offset, then row count
+    void apply_validity(const ValidityBitmap* v, std::size_t off, std::size_t n) {
         if (v == nullptr) {
             return;
         }
         valid.emplace(n, uint8_t{1});
         for (std::size_t i = 0; i < n; ++i) {
-            (*valid)[i] = static_cast<uint8_t>((*v)[i]);
+            (*valid)[i] = static_cast<uint8_t>((*v)[off + i]);
         }
     }
 };

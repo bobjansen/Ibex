@@ -175,7 +175,7 @@ auto float_clean_kernel(const ir::CallExpr& call, const Table& input, std::size_
 
 auto coalesce_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
                      const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
-    return eval_coalesce_column(call, input, ctx.scalars, rows);
+    return eval_coalesce_column(call, input, ctx.scalars, RowRange::whole(rows));
 }
 
 // One `like` argument in kernel shape: a String literal / lexical String scalar,
@@ -304,8 +304,9 @@ auto like_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
         }
     }
 
-    return ComputedColumn{.column = ColumnValue{std::move(out)},
-                          .validity = merge_validity(value->validity, pattern->validity, rows)};
+    return ComputedColumn{
+        .column = ColumnValue{std::move(out)},
+        .validity = merge_validity(value->validity, 0, pattern->validity, 0, rows)};
 }
 
 // Int64/Int32/Int and Float64/Float32 over a bare column, literal, or lexical
@@ -1795,7 +1796,7 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     // nested whole-column calls cannot be built per row. Evaluate them
     // through the vectorized, validity-aware path.
     if (field_uses_vectorized_eval(expr)) {
-        auto res = eval_value_vec(expr, input, ctx.scalars, rows);
+        auto res = eval_value_vec(expr, input, ctx.scalars, RowRange::whole(rows));
         if (!res) {
             return std::unexpected(res.error());
         }
@@ -1813,8 +1814,9 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     }
     if (auto fast = try_fast_update_numeric_expr(expr, input, rows, inferred.value(), ctx.scalars);
         fast.has_value()) {
-        return ComputedColumn{.column = std::move(fast.value()),
-                              .validity = collect_expr_validity(expr, input, rows)};
+        return ComputedColumn{
+            .column = std::move(fast.value()),
+            .validity = collect_expr_validity(expr, input, RowRange::whole(rows))};
     }
     ColumnValue new_column;
     switch (inferred.value()) {

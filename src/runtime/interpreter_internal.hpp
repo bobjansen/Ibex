@@ -936,6 +936,12 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
                                       const ScalarRegistry* scalars)
     -> std::expected<Table, std::string>;
+/// `filter_table_range` with a fused projection — the ranged form of
+/// `filter_project_table`, which is what `filter …, select …` canonicalizes to.
+[[nodiscard]] auto filter_project_table_range(const Table& input, const ir::Expr& predicate,
+                                              const std::vector<ir::ColumnRef>& columns,
+                                              RowRange rows, const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string>;
 [[nodiscard]] auto filter_project_table(const Table& input, const ir::Expr& predicate,
                                         const std::vector<ir::ColumnRef>& columns,
                                         const ScalarRegistry* scalars)

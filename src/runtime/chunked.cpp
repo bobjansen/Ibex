@@ -5940,15 +5940,27 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
     }
 }
 
-// The base of one worker's island chain: a source the worker refills with the
-// morsel it just claimed. The chain above it is an ordinary chunked map chain,
-// so a worker needs no range-aware kernels — it consumes a materialized morsel
-// exactly as the serial path does. (Replacing this gather with a zero-copy
-// range kernel is the next lever; `TableRangeMorsel` already carries the
-// pointer+range shape that needs.)
-class MorselFeeder final : public Operator {
+// The base of one worker's island chain: a source the worker points at the
+// morsel it just claimed. Two implementations, differing only in whether the
+// morsel's rows are copied out of the shared input before the chain sees them.
+class MorselSource : public Operator {
    public:
-    void supply(Chunk chunk) { pending_ = std::move(chunk); }
+    /// Aim the source at rows [begin, end) of the island's input. The next
+    /// `next()` produces exactly that morsel and then reports exhaustion, so
+    /// one call feeds one turn of the worker loop.
+    virtual void set_morsel(std::size_t begin, std::size_t end, std::uint64_t sequence) = 0;
+};
+
+// Gathering source: materializes the morsel, then the chain above runs over it
+// exactly as the serial path does. The fallback for any island whose head this
+// file cannot evaluate by range.
+class GatherMorselSource final : public MorselSource {
+   public:
+    explicit GatherMorselSource(const Table& input) : input_(&input) {}
+
+    void set_morsel(std::size_t begin, std::size_t end, std::uint64_t sequence) override {
+        pending_ = make_morsel_chunk(*input_, begin, end, sequence);
+    }
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!pending_.has_value()) {
@@ -5960,26 +5972,124 @@ class MorselFeeder final : public Operator {
     }
 
    private:
+    const Table* input_;
     std::optional<Chunk> pending_;
 };
+
+// Range-filtering source: absorbs the island's head `Filter` and evaluates its
+// predicate directly over the input's rows [begin, end), so the morsel is never
+// materialized. Only surviving rows are ever copied — the gather the serial
+// path pays for every row is gone.
+//
+// This is one operator doing the work of two, so it owes both their contracts:
+// the morsel identity a gathering source would have stamped (`sequence` and
+// `row_offset`, which the worker loop re-checks), and the head filter's
+// `preserve_empty_morsels` behaviour — an empty result is still emitted,
+// because the merger indexes by sequence and a skipped morsel is a lost slot
+// rather than a smaller answer.
+class RangeFilterMorselSource final : public MorselSource {
+   public:
+    RangeFilterMorselSource(const Table& input, const ir::Expr* predicate,
+                            const std::vector<ir::ColumnRef>* project,
+                            const ScalarRegistry* scalars)
+        : input_(&input), predicate_(predicate), project_(project), scalars_(scalars) {}
+
+    void set_morsel(std::size_t begin, std::size_t end, std::uint64_t sequence) override {
+        pending_ = ChunkIdentity{.sequence = sequence, .row_offset = begin};
+        begin_ = begin;
+        end_ = end;
+    }
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!pending_.has_value()) {
+            return std::optional<Chunk>{};
+        }
+        const auto identity = *pending_;
+        pending_.reset();
+        const RowRange rows{.begin = begin_, .count = end_ - begin_};
+        auto filtered =
+            project_ == nullptr
+                ? filter_table_range(*input_, *predicate_, rows, scalars_)
+                : filter_project_table_range(*input_, *predicate_, *project_, rows, scalars_);
+        if (!filtered.has_value()) {
+            return std::unexpected(std::move(filtered.error()));
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()), identity)};
+    }
+
+   private:
+    const Table* input_;
+    const ir::Expr* predicate_;
+    const std::vector<ir::ColumnRef>* project_;
+    const ScalarRegistry* scalars_;
+    std::optional<ChunkIdentity> pending_;
+    std::size_t begin_ = 0;
+    std::size_t end_ = 0;
+};
+
+/// How a head operator is evaluated by range, when it can be. A filter head is
+/// where gathering costs most — it copies rows the predicate is about to throw
+/// away — and `FilterProject` is included because that is what `filter …,
+/// select …` canonicalizes to, so restricting this to a bare `Filter` would
+/// miss the shape most real queries take.
+struct RangeHead {
+    const ir::Expr* predicate = nullptr;
+    const std::vector<ir::ColumnRef>* project = nullptr;  ///< null when unfused
+};
+
+/// The head's range form, or nullopt when it has to be built above a gathered
+/// morsel instead.
+///
+/// A column-less table is excluded because its row count lives in the chunk's
+/// `logical_rows` rather than in any column, which only the gathering source
+/// carries over.
+[[nodiscard]] auto range_filter_head(const ir::Node& node, const Table& input)
+    -> std::optional<RangeHead> {
+    if (input.columns.empty()) {
+        return std::nullopt;
+    }
+    if (node.kind() == ir::NodeKind::Filter) {
+        return RangeHead{.predicate = &static_cast<const ir::FilterNode&>(node).predicate()};
+    }
+    if (node.kind() == ir::NodeKind::FilterProject) {
+        const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+        return RangeHead{.predicate = &fp.predicate(), .project = &fp.columns()};
+    }
+    return std::nullopt;
+}
 
 // One worker's private copy of the island's map chain. The operators are
 // per-worker (they carry mutable per-chunk state); the IR nodes, registries,
 // and the input table they read are shared and immutable for the island's
 // lifetime.
 struct IslandWorkerChain {
-    MorselFeeder* feeder = nullptr;  // owned by `chain`, refilled per morsel
+    MorselSource* source = nullptr;  // owned by `chain`, re-aimed per morsel
     OperatorPtr chain;
 };
 
 [[nodiscard]] auto build_island_worker_chain(const std::vector<const ir::Node*>& operators,
-                                             const ScalarRegistry* scalars,
+                                             const Table& input, const ScalarRegistry* scalars,
                                              const ExternRegistry* externs,
                                              const ExecutionContext& exec)
     -> std::expected<IslandWorkerChain, std::string> {
-    auto feeder = std::make_unique<MorselFeeder>();
-    IslandWorkerChain worker{.feeder = feeder.get(), .chain = std::move(feeder)};
-    for (const ir::Node* op_node : operators) {
+    // A qualifying head is absorbed into the source rather than built as an
+    // operator above it — same output, without materializing the morsel first.
+    std::size_t first_op = 0;
+    std::unique_ptr<MorselSource> source;
+    if (!operators.empty()) {
+        if (auto head = range_filter_head(*operators.front(), input); head.has_value()) {
+            source = std::make_unique<RangeFilterMorselSource>(input, head->predicate,
+                                                               head->project, scalars);
+            first_op = 1;
+        }
+    }
+    if (source == nullptr) {
+        source = std::make_unique<GatherMorselSource>(input);
+    }
+
+    IslandWorkerChain worker{.source = source.get(), .chain = std::move(source)};
+    for (std::size_t i = first_op; i < operators.size(); ++i) {
+        const ir::Node* op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly
         // one identified output morsel — the merger indexes by sequence, so a
         // silently coalesced empty result would be a lost slot, not a smaller
@@ -6178,7 +6288,7 @@ class ParallelIslandOperator final : public Operator {
             }
 
             const auto [begin, end] = morsel_row_range(rows, grain_, sequence);
-            worker.feeder->supply(make_morsel_chunk(*input_, begin, end, sequence));
+            worker.source->set_morsel(begin, end, sequence);
             auto produced = worker.chain->next();
 
             if (!produced.has_value()) {
@@ -6391,10 +6501,15 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     }
 
     if (worker_count >= 2) {
+        if (exec.parallel_stats != nullptr && !candidate.operators.empty() &&
+            range_filter_head(*candidate.operators.front(), *owned).has_value()) {
+            exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
+        }
         std::vector<IslandWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            auto worker = build_island_worker_chain(candidate.operators, scalars, externs, exec);
+            auto worker =
+                build_island_worker_chain(candidate.operators, *owned, scalars, externs, exec);
             if (!worker.has_value()) {
                 return std::unexpected(std::move(worker.error()));
             }

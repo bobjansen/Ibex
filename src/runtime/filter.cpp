@@ -2368,6 +2368,13 @@ auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange 
     return filter_table_impl(input, predicate, nullptr, 0, scalars, rows);
 }
 
+auto filter_project_table_range(const Table& input, const ir::Expr& predicate,
+                                const std::vector<ir::ColumnRef>& columns, RowRange rows,
+                                const ScalarRegistry* scalars)
+    -> std::expected<Table, std::string> {
+    return filter_table_impl(input, predicate, &columns, 0, scalars, rows);
+}
+
 namespace {
 
 // ─── Fused bounds ─────────────────────────────────────────────────────────────

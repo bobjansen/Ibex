@@ -1436,7 +1436,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
         // Shared field evaluator; ctx.window carries the enclosing `window`
         // clause's duration as the rolling_* fallback (a per-call window
         // overrides it).
-        auto col = evaluate_field(field.expr, output,
+        auto col = evaluate_field(field.expr, output, RowRange::whole(output.rows()),
                                   ColumnEvalCtx{.scalars = scalars,
                                                 .externs = externs,
                                                 .window = duration,
@@ -1736,7 +1736,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         // ctx.window stays empty (only a per-call window arg can supply a
         // rolling span).
         auto col = evaluate_field(
-            field.expr, output,
+            field.expr, output, RowRange::whole(output.rows()),
             ColumnEvalCtx{
                 .scalars = scalars, .externs = externs, .window = std::nullopt, .exec = &exec});
         if (!col) {

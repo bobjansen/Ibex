@@ -1683,12 +1683,12 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 // functions are not available in predicate position (externs
                 // are not threaded into this vectorized evaluator).
                 auto col = evaluate_field(
-                    expr, table,
+                    expr, table, rows,
                     ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
                 if (!col) {
                     return std::unexpected(col.error());
                 }
-                return slice_computed(std::move(*col), rows, table.rows());
+                return ColResult{std::move(col->column), std::move(col->validity)};
             } else if constexpr (std::is_same_v<T, ir::CompareExpr> ||
                                  std::is_same_v<T, ir::LogicalExpr> ||
                                  std::is_same_v<T, ir::IsNullExpr>) {
@@ -1833,7 +1833,7 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
     ir::Expr rewritten_expr;
     rewritten_expr.node = std::move(rewritten);
     auto col = evaluate_field(
-        rewritten_expr, tmp,
+        rewritten_expr, tmp, RowRange::whole(n),
         ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
     if (!col) {
         return std::unexpected(col.error());
@@ -2352,13 +2352,20 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
             } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
                 return is_range_native_expr(*node.operand);
             } else {
-                // CallExpr is the case that matters: every call — including a
-                // plain Scalar one like `abs(x)`, which island eligibility
-                // admits — lands in one of the whole-table-then-slice branches
-                // (`evaluate_field`, a column kernel, or
-                // `eval_scalar_over_columns`). RankExpr and anything else new
-                // are excluded by the same default, which is the safe
-                // direction: a false negative only costs a gather.
+                // CallExpr stays excluded, and the reason is now cost, not
+                // correctness. `evaluate_field` IS range-native as of this
+                // slice — but only via its per-row loop, because the fused
+                // numeric tree declines a partial range (its leaves capture
+                // whole-column pointers). Admitting calls here therefore trades
+                // a morsel gather plus a vectorized kernel for a boxed per-row
+                // eval, and that loses: `abs(a) > 50` over 20M rows measured
+                // 0.44-0.54s with calls admitted against 0.37-0.38s gathering.
+                //
+                // Range-threading the numeric tree is what unblocks this; until
+                // then the gather is genuinely the faster path. RankExpr and
+                // anything added later are excluded by the same default, which
+                // is the safe direction: a false negative only costs a gather,
+                // a false positive costs O(morsels x rows).
                 return false;
             }
         },

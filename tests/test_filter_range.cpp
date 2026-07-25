@@ -245,3 +245,121 @@ TEST_CASE("filter_table_range partitions reassemble the whole-table result", "[f
         CHECK(total == whole->rows());
     }
 }
+
+// `evaluate_field` under a partial range. Nothing in production passes it one
+// yet — `is_range_native_expr` still excludes calls on cost grounds — so
+// without these the range-threading in it would be untested code, exercised
+// for the first time by whoever opens that gate.
+namespace {
+
+/// Wrap a computed column for comparison, blanking the payload of every null
+/// cell first.
+///
+/// A null cell's payload is undefined in Ibex — the grouping key deliberately
+/// ignores it for exactly this reason — and the two sub-paths of
+/// `evaluate_field` genuinely disagree about it. The fused numeric tree
+/// computes on the undefined payload and masks afterwards (`0 + 1` → 1,
+/// null), while the per-row loop short-circuits on Null and pushes a default
+/// (0, null). Since a partial range declines the fused tree, comparing raw
+/// payloads would flag that pre-existing difference rather than anything about
+/// row ranges. Validity itself is still compared exactly.
+auto computed_to_table(runtime::ComputedColumn col) -> runtime::Table {
+    if (col.validity.has_value()) {
+        const auto& valid = *col.validity;
+        std::visit(
+            [&](auto& c) {
+                using ColT = std::decay_t<decltype(c)>;
+                for (std::size_t i = 0; i < c.size(); ++i) {
+                    if (!valid[i]) {
+                        if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                            // codes are already uniform for null cells
+                        } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                            c.set(i, false);
+                        } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                            // flat buffer: leave as produced
+                        } else {
+                            c[i] = typename ColT::value_type{};
+                        }
+                    }
+                }
+            },
+            col.column);
+    }
+    // An all-true bitmap and no bitmap both mean "every row valid" — the
+    // concat in MaterializeOperator relies on exactly that equivalence — but
+    // the two paths pick different representations when a range happens to
+    // contain no nulls. Normalize so the comparison is about validity, not
+    // about how it is stored.
+    if (col.validity.has_value()) {
+        bool all_valid = true;
+        for (std::size_t i = 0; i < col.validity->size() && all_valid; ++i) {
+            all_valid = (*col.validity)[i];
+        }
+        if (all_valid) {
+            col.validity.reset();
+        }
+    }
+    runtime::Table t;
+    if (col.validity.has_value()) {
+        t.add_column("v", std::move(col.column), std::move(*col.validity));
+    } else {
+        t.add_column("v", std::move(col.column));
+    }
+    return t;
+}
+
+void check_field_range(const runtime::Table& table, const ir::Expr& expr, RowRange rows,
+                       const char* label) {
+    INFO(label << " over [" << rows.begin << ", " << rows.end() << ")");
+    const runtime::ColumnEvalCtx ctx{
+        .scalars = nullptr, .externs = nullptr, .window = std::nullopt};
+
+    auto ranged = runtime::evaluate_field(expr, table, rows, ctx);
+    auto gathered = gather_rows(table, rows);
+    auto expected = runtime::evaluate_field(expr, gathered, RowRange::whole(gathered.rows()), ctx);
+
+    REQUIRE(expected.has_value());
+    REQUIRE(ranged.has_value());
+    auto mismatch = runtime::compare_tables(computed_to_table(std::move(*expected)),
+                                            computed_to_table(std::move(*ranged)));
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
+}  // namespace
+
+TEST_CASE("evaluate_field over a partial range matches evaluating a gathered range",
+          "[filter][range]") {
+    constexpr std::size_t kRows = 200;
+    const auto table = make_table(kRows);
+
+    std::vector<NamedPredicate> fields;
+    // Per-row path: a scalar call. Under a partial range the fused numeric tree
+    // declines, so this also cross-checks the per-row loop against the fused
+    // kernel that the whole-range oracle takes.
+    fields.push_back(
+        {"scalar call", ir::Expr{.node = ir::CallExpr{.callee = "abs", .args = {col_ref("id")}}}});
+    fields.push_back({"nested arithmetic in a call",
+                      ir::Expr{.node = ir::CallExpr{.callee = "abs",
+                                                    .args = {arith(ir::ArithmeticOp::Sub,
+                                                                   col_ref("id"), ilit(100))}}}});
+    // Vectorized path: a boolean node in value position.
+    fields.push_back({"boolean node", cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))});
+    // Nulls must be carried at the right offset, not merely the right width.
+    fields.push_back(
+        {"nullable column arithmetic", ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Add,
+                                                                       .left = col_ref("nullable"),
+                                                                       .right = ilit(1)}}});
+    fields.push_back(
+        {"boolean over a nullable column", cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
+
+    for (const auto& f : fields) {
+        for (const std::size_t grain : {1U, 7U, 63U, 64U, 65U, 200U}) {
+            for (std::size_t begin = 0; begin < kRows; begin += grain) {
+                const std::size_t count = std::min(grain, kRows - begin);
+                check_field_range(table, f.expr, RowRange{.begin = begin, .count = count}, f.label);
+            }
+        }
+    }
+}

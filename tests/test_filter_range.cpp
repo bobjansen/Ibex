@@ -339,11 +339,13 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     // declines, so this also cross-checks the per-row loop against the fused
     // kernel that the whole-range oracle takes.
     fields.push_back(
-        {"scalar call", ir::Expr{.node = ir::CallExpr{.callee = "abs", .args = {col_ref("id")}}}});
+        {"scalar call", ir::Expr{.node = ir::CallExpr{
+                                     .callee = "abs", .args = {col_ref("id")}, .named_args = {}}}});
     fields.push_back({"nested arithmetic in a call",
-                      ir::Expr{.node = ir::CallExpr{.callee = "abs",
-                                                    .args = {arith(ir::ArithmeticOp::Sub,
-                                                                   col_ref("id"), ilit(100))}}}});
+                      ir::Expr{.node = ir::CallExpr{
+                                   .callee = "abs",
+                                   .args = {arith(ir::ArithmeticOp::Sub, col_ref("id"), ilit(100))},
+                                   .named_args = {}}}});
     // Vectorized path: a boolean node in value position.
     fields.push_back({"boolean node", cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))});
     // Nulls must be carried at the right offset, not merely the right width.

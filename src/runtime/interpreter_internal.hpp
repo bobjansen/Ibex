@@ -1075,8 +1075,12 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
+/// The fused numeric fast path, evaluated over `range`. Input columns are read
+/// from `range.begin`; the result is dense. A leaf that would need whole-table
+/// evaluation (a spliced `like`/cast kernel) declines under a partial range
+/// rather than re-running over the whole column per call.
 [[nodiscard]] auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input,
-                                                std::size_t rows, ExprType output_kind,
+                                                RowRange range, ExprType output_kind,
                                                 const ScalarRegistry* scalars)
     -> std::optional<ColumnValue>;
 

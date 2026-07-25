@@ -1518,13 +1518,19 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
 
 // Copy rows `[rows.begin, rows.end())` of a column into a dense column.
 //
-// The escape hatch for the two evaluator branches that cannot honour a range
+// The escape hatch for the evaluator branches that cannot honour a range
 // themselves: a whole-column builtin (rolling/cum/lag — not row-local, so
-// evaluating it over a slice would change its answer) and, for now, the
-// per-row field evaluator. Both run over the whole table and are then sliced,
-// which is correct but pays the copy a range was meant to avoid. Neither is
-// reachable from a parallel island: `is_subset_evaluable_expr` admits only
-// Scalar calls, so the island gate rejects these before they get here.
+// evaluating it over a slice would change its answer), `eval_scalar_over_columns`,
+// and, for now, the per-row field evaluator. Each runs over the whole table and
+// is then sliced: correct, but it pays the copy a range was meant to avoid.
+//
+// **These are reachable from a parallel island, and a caller that lets one
+// through pays O(morsels x rows).** Island eligibility (`is_subset_evaluable_expr`)
+// admits Scalar calls, and every call — `abs(x)` included — routes here. A
+// filter island that absorbed `abs(a) > 50` re-ran `abs` over the whole 20M-row
+// table once per morsel and measured 10x slower than serial. `is_range_native_expr`
+// is the gate that keeps such predicates on the gathering source; it has to be
+// widened in step with the evaluators, never ahead of them.
 auto slice_column(const ColumnValue& src, RowRange rows) -> ColumnValue {
     ColumnValue out = make_empty_like(src);
     std::visit(
@@ -2361,6 +2367,37 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
 auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
     return filter_table_impl(input, predicate, nullptr, 0, scalars, RowRange::whole(input.rows()));
+}
+
+auto is_range_native_expr(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
+                // A column ref is *the* borrowed leaf and a literal broadcasts
+                // to the range's width — both range-native by construction.
+                return true;
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
+                return is_range_native_expr(*node.left) && is_range_native_expr(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                // `right` is null for unary Not.
+                return is_range_native_expr(*node.left) &&
+                       (node.right == nullptr || is_range_native_expr(*node.right));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return is_range_native_expr(*node.operand);
+            } else {
+                // CallExpr is the case that matters: every call — including a
+                // plain Scalar one like `abs(x)`, which island eligibility
+                // admits — lands in one of the whole-table-then-slice branches
+                // (`evaluate_field`, a column kernel, or
+                // `eval_scalar_over_columns`). RankExpr and anything else new
+                // are excluded by the same default, which is the safe
+                // direction: a false negative only costs a gather.
+                return false;
+            }
+        },
+        expr.node);
 }
 
 auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,

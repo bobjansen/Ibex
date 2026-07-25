@@ -6040,19 +6040,33 @@ struct RangeHead {
 /// The head's range form, or nullopt when it has to be built above a gathered
 /// morsel instead.
 ///
-/// A column-less table is excluded because its row count lives in the chunk's
-/// `logical_rows` rather than in any column, which only the gathering source
-/// carries over.
+/// Two things disqualify a head:
+///
+/// - A predicate that is not `is_range_native_expr`. Island eligibility admits
+///   Scalar calls, but every call still evaluates whole-table-and-slice, so
+///   absorbing `abs(a) > 50` would re-run `abs` over the entire input once per
+///   morsel — measured at 10x slower than serial on 20M rows. Gathering is the
+///   correct choice there: the morsel is materialized once and the predicate
+///   then runs over morsel-sized data.
+/// - A column-less table, whose row count lives in the chunk's `logical_rows`
+///   rather than in any column; only the gathering source carries that over.
 [[nodiscard]] auto range_filter_head(const ir::Node& node, const Table& input)
     -> std::optional<RangeHead> {
     if (input.columns.empty()) {
         return std::nullopt;
     }
     if (node.kind() == ir::NodeKind::Filter) {
-        return RangeHead{.predicate = &static_cast<const ir::FilterNode&>(node).predicate()};
+        const auto& predicate = static_cast<const ir::FilterNode&>(node).predicate();
+        if (!is_range_native_expr(predicate)) {
+            return std::nullopt;
+        }
+        return RangeHead{.predicate = &predicate};
     }
     if (node.kind() == ir::NodeKind::FilterProject) {
         const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+        if (!is_range_native_expr(fp.predicate())) {
+            return std::nullopt;
+        }
         return RangeHead{.predicate = &fp.predicate(), .project = &fp.columns()};
     }
     return std::nullopt;

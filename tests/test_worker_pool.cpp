@@ -100,3 +100,32 @@ TEST_CASE("default_thread_count is at least one", "[runtime][worker_pool]") {
     CHECK(runtime::default_thread_count() >= 1);
     CHECK(runtime::process_worker_pool().size() >= 1);
 }
+
+TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
+          "[runtime][worker_pool]") {
+    // The guard against nested parallelism. Anything reachable from inside a
+    // parallel island — update_table's field split, today — checks this before
+    // submitting work of its own, because submitting from a worker deadlocks
+    // the pool. A flag that is never observed to be true would silence that
+    // check rather than enforce it.
+    runtime::WorkerPool pool(2);
+
+    CHECK_FALSE(runtime::on_worker_pool_thread());
+
+    std::atomic<int> saw_true{0};
+    std::atomic<int> ran{0};
+    {
+        auto batch = pool.submit(2, [&](std::size_t) {
+            ran.fetch_add(1, std::memory_order_relaxed);
+            if (runtime::on_worker_pool_thread()) {
+                saw_true.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        batch.wait();
+    }
+    CHECK(ran.load() == 2);
+    CHECK(saw_true.load() == 2);
+
+    // And it is not left set on the calling thread afterwards.
+    CHECK_FALSE(runtime::on_worker_pool_thread());
+}

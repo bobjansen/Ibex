@@ -70,11 +70,34 @@ struct WorkerPool::Impl {
     std::vector<std::jthread> threads;
 };
 
+// Declared rather than included: `invariant_violation` lives in the
+// interpreter's internal header, and this file is a lower-level primitive that
+// should not depend on it. Defined in interpreter.cpp, same library.
+[[noreturn]] void invariant_violation(std::string_view detail);
+
+namespace {
+
+// True on a thread owned by some WorkerPool. Set for the thread's whole life,
+// not per task, so it is correct anywhere down a task's call stack.
+//
+// Lives in this host TU rather than an inline variable in the header: bundled
+// plugins statically link runtime code and would otherwise each get their own
+// copy (the RTLD_LOCAL trap that also governs the pool singleton and the query
+// lease).
+thread_local bool t_on_pool_thread = false;
+
+}  // namespace
+
+auto on_worker_pool_thread() noexcept -> bool {
+    return t_on_pool_thread;
+}
+
 WorkerPool::WorkerPool(std::size_t threads)
     : impl_(std::make_unique<Impl>()), threads_(threads == 0 ? 1 : threads) {
     impl_->threads.reserve(threads_);
     for (std::size_t i = 0; i < threads_; ++i) {
         impl_->threads.emplace_back([this] {
+            t_on_pool_thread = true;
             while (true) {
                 Task task;
                 {
@@ -103,6 +126,18 @@ WorkerPool::~WorkerPool() {
 }
 
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
+    // Reentrant submission cannot work with this pool and must never be a
+    // silent hang. The worker set is fixed and every Batch is waited on (if not
+    // explicitly, then by its destructor), so a worker that submits and waits
+    // blocks one of the threads its own work needs. With enough of them the
+    // pool deadlocks, and it would do so only under a particular interleaving.
+    // Callers that might run on a pool thread ask `on_worker_pool_thread()`
+    // first and take their serial path.
+    if (on_worker_pool_thread()) {
+        invariant_violation(
+            "WorkerPool::submit called from a pool worker — nested submission deadlocks; "
+            "check on_worker_pool_thread() and run serially instead");
+    }
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);

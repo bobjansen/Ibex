@@ -2081,7 +2081,8 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
     if (col_ref != nullptr) {
         agg_col_name = col_ref->name;
     } else {
-        auto col_result = eval_value_vec(*node.args[0], input, scalars, input.rows());
+        auto col_result =
+            eval_value_vec(*node.args[0], input, scalars, RowRange::whole(input.rows()));
         if (!col_result) {
             return std::unexpected(col_result.error());
         }
@@ -2167,7 +2168,7 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                 }
                 const ColumnValue lhs_col = broadcast_scalar_column(*scalar_from_expr(*lhs), 1);
                 const ColumnValue rhs_col = broadcast_scalar_column(*scalar_from_expr(*rhs), 1);
-                auto result = arith_vec(node.op, lhs_col, rhs_col, 1);
+                auto result = arith_vec(node.op, lhs_col, 0, rhs_col, 0, 1);
                 if (!result) {
                     return std::unexpected(result.error());
                 }
@@ -2339,7 +2340,7 @@ auto broadcast_aggregate_column(const Table& input, const ir::FieldSpec& field,
             !folded) {
             return std::unexpected(folded.error());
         }
-        auto col = eval_value_vec(rewritten, working, scalars, input.rows());
+        auto col = eval_value_vec(rewritten, working, scalars, RowRange::whole(input.rows()));
         if (!col) {
             return std::unexpected(col.error());
         }

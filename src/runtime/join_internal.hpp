@@ -13,7 +13,7 @@ namespace ibex::runtime {
 using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Expr& predicate,
                                                                     const Table& table,
                                                                     const ScalarRegistry* scalars,
-                                                                    std::size_t n);
+                                                                    RowRange rows);
 
 [[nodiscard]] auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                    const std::vector<std::string>& keys, const ir::Expr* predicate,

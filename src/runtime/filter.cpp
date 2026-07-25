@@ -57,10 +57,42 @@ namespace ibex::runtime {
 
 // Column result: either a pointer into the table (zero-copy) or an owned computed column,
 // plus optional validity tracking for null propagation.
-auto merge_validity(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
-    -> std::optional<ValidityBitmap> {
+namespace {
+
+/// Copy `n` bits starting at `off` into a dense bitmap. Bit-by-bit: an offset
+/// slice is generally not word-aligned, and this only runs when a borrowed
+/// column with nulls is read under a non-whole range.
+auto slice_validity(const ValidityBitmap& v, std::size_t off, std::size_t n) -> ValidityBitmap {
+    ValidityBitmap out(n, false);
+    for (std::size_t i = 0; i < n; ++i) {
+        out.set(i, v[off + i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+auto merge_validity(const ValidityBitmap* a, std::size_t a_off, const ValidityBitmap* b,
+                    std::size_t b_off, std::size_t n) -> std::optional<ValidityBitmap> {
     if (!a && !b)
         return std::nullopt;
+    if (a_off != 0 || b_off != 0) {
+        // Offset slice: build both sides dense, then AND. The word-wise path
+        // below assumes bit i of each input is row i, which an offset breaks.
+        if (!a)
+            return slice_validity(*b, b_off, n);
+        if (!b)
+            return slice_validity(*a, a_off, n);
+        ValidityBitmap out = slice_validity(*a, a_off, n);
+        if (a == b && a_off == b_off)
+            return out;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!(*b)[b_off + i]) {
+                out.set(i, false);
+            }
+        }
+        return out;
+    }
     if (!a)
         return ValidityBitmap(*b);
     if (!b)
@@ -153,13 +185,15 @@ auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
 // Returns nullopt if no referenced column has a validity bitmap.
-auto collect_expr_validity(const ir::Expr& expr, const Table& table, std::size_t n)
+auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange rows)
     -> std::optional<ValidityBitmap> {
     std::optional<ValidityBitmap> result;
+    // `result` is already dense (offset 0); each newly merged table bitmap is
+    // read from the range's start.
     auto merge_in = [&](const ValidityBitmap* v) {
         if (!v)
             return;
-        result = merge_validity(result ? &*result : nullptr, v, n);
+        result = merge_validity(result ? &*result : nullptr, 0, v, rows.begin, rows.count);
     };
     std::function<void(const ir::Expr&)> walk = [&](const ir::Expr& e) {
         std::visit(
@@ -250,7 +284,8 @@ auto arith_into(ir::ArithmeticOp op, const L* __restrict lp, const R* __restrict
 }  // namespace
 
 // Dispatch arith_into over all numeric column-type combinations.
-auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n)
+auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, std::size_t lhs_off,
+               const ColumnValue& rhs, std::size_t rhs_off, std::size_t n)
     -> std::expected<ColumnValue, std::string> {
     // int64 × int64 → int64, except `/`: division yields Float64 regardless
     // of operand types — matching type inference and the fused numeric and
@@ -264,8 +299,8 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
                 Column<double> out;
                 out.resize(n);
                 double* __restrict dp = out.data();
-                const std::int64_t* __restrict lp = l->data();
-                const std::int64_t* __restrict rp = r->data();
+                const std::int64_t* __restrict lp = l->data() + lhs_off;
+                const std::int64_t* __restrict rp = r->data() + rhs_off;
                 for (std::size_t i = 0; i < n; ++i) {
                     dp[i] = static_cast<double>(lp[i]) / static_cast<double>(rp[i]);
                 }
@@ -273,13 +308,13 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
             }
             Column<std::int64_t> out;
             out.resize(n);
-            arith_into(op, l->data(), r->data(), out.data(), n);
+            arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // int64 × double → double
             Column<double> out;
             out.resize(n);
-            arith_into(op, l->data(), r->data(), out.data(), n);
+            arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
     }
@@ -287,13 +322,13 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {  // double × int64 → double
             Column<double> out;
             out.resize(n);
-            arith_into(op, l->data(), r->data(), out.data(), n);
+            arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {  // double × double → double
             Column<double> out;
             out.resize(n);
-            arith_into(op, l->data(), r->data(), out.data(), n);
+            arith_into(op, l->data() + lhs_off, r->data() + rhs_off, out.data(), n);
             return ColumnValue{std::move(out)};
         }
     }
@@ -303,8 +338,8 @@ auto arith_vec(ir::ArithmeticOp op, const ColumnValue& lhs, const ColumnValue& r
                 Column<std::int64_t> out;
                 out.resize(n);
                 for (std::size_t i = 0; i < n; ++i) {
-                    out[i] = static_cast<std::int64_t>((*l)[i].days) -
-                             static_cast<std::int64_t>((*r)[i].days);
+                    out[i] = static_cast<std::int64_t>((*l)[lhs_off + i].days) -
+                             static_cast<std::int64_t>((*r)[rhs_off + i].days);
                 }
                 return ColumnValue{std::move(out)};
             }
@@ -410,8 +445,11 @@ auto cmp_col_scalar_into_double(ir::CompareOp op, const double* __restrict cp, d
 using LitVal = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 namespace {
 
-auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& lit, std::size_t n,
-                        const ValidityBitmap* validity = nullptr)
+// `off` is the source offset of `col` and `validity` (a borrowed column under a
+// non-whole RowRange); the produced mask is always dense.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t off,
+                        const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
     result.value.resize(n);
@@ -421,30 +459,30 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
             switch (op) {
                 case ir::CompareOp::Eq:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) == *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) == *s;
                     break;
                 case ir::CompareOp::Ne:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) != *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) != *s;
                     break;
                 case ir::CompareOp::Lt:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) < *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) < *s;
                     break;
                 case ir::CompareOp::Le:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) <= *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) <= *s;
                     break;
                 case ir::CompareOp::Gt:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) > *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) > *s;
                     break;
                 case ir::CompareOp::Ge:
                     for (std::size_t i = 0; i < n; ++i)
-                        mp[i] = std::string_view((*str_col)[i]) >= *s;
+                        mp[i] = std::string_view((*str_col)[off + i]) >= *s;
                     break;
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* cat_col = std::get_if<Column<Categorical>>(&col)) {
@@ -453,40 +491,40 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                 switch (op) {
                     case ir::CompareOp::Eq:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = codes[i] == *code;
+                            mp[i] = codes[off + i] == *code;
                         break;
                     case ir::CompareOp::Ne:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = codes[i] != *code;
+                            mp[i] = codes[off + i] != *code;
                         break;
                     case ir::CompareOp::Lt:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = std::string_view((*cat_col)[i]) < *s;
+                            mp[i] = std::string_view((*cat_col)[off + i]) < *s;
                         break;
                     case ir::CompareOp::Le:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = std::string_view((*cat_col)[i]) <= *s;
+                            mp[i] = std::string_view((*cat_col)[off + i]) <= *s;
                         break;
                     case ir::CompareOp::Gt:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = std::string_view((*cat_col)[i]) > *s;
+                            mp[i] = std::string_view((*cat_col)[off + i]) > *s;
                         break;
                     case ir::CompareOp::Ge:
                         for (std::size_t i = 0; i < n; ++i)
-                            mp[i] = std::string_view((*cat_col)[i]) >= *s;
+                            mp[i] = std::string_view((*cat_col)[off + i]) >= *s;
                         break;
                 }
-                result.apply_validity(validity, n);
+                result.apply_validity(validity, off, n);
                 return result;
             }
             if (op == ir::CompareOp::Eq || op == ir::CompareOp::Ne) {
                 const uint8_t v = (op == ir::CompareOp::Ne) ? 1 : 0;
                 std::fill(mp, mp + n, v);
-                result.apply_validity(validity, n);
+                result.apply_validity(validity, off, n);
                 return result;
             }
             for (std::size_t i = 0; i < n; ++i) {
-                const std::string_view cv = (*cat_col)[i];
+                const std::string_view cv = (*cat_col)[off + i];
                 switch (op) {
                     case ir::CompareOp::Lt:
                         mp[i] = cv < *s;
@@ -505,7 +543,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         return std::unexpected("filter: cannot compare string and numeric");
@@ -515,7 +553,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         if (const auto* date_col = std::get_if<Column<Date>>(&col)) {
             const auto rhs = date_value->days;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = date_col->data()[idx].days;
+                const auto lhs = date_col->data()[off + idx].days;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -537,7 +575,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         return std::unexpected("filter: cannot compare date and non-date");
@@ -547,7 +585,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         if (const auto* ts_col = std::get_if<Column<Timestamp>>(&col)) {
             const auto rhs = ts_value->nanos;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = ts_col->data()[idx].nanos;
+                const auto lhs = ts_col->data()[off + idx].nanos;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -569,35 +607,35 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         return std::unexpected("filter: cannot compare timestamp and non-timestamp");
     }
 
     if (const auto* int_col = std::get_if<Column<std::int64_t>>(&col)) {
-        const std::int64_t* cp = int_col->data();
+        const std::int64_t* cp = int_col->data() + off;
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             cmp_col_scalar_into(op, cp, *i, mp, n);
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             cmp_col_scalar_into(op, cp, *d, mp, n);
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
     }
     if (const auto* dbl_col = std::get_if<Column<double>>(&col)) {
-        const double* cp = dbl_col->data();
+        const double* cp = dbl_col->data() + off;
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             cmp_col_scalar_into_double(op, cp, static_cast<double>(*i), mp, n);
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             cmp_col_scalar_into_double(op, cp, *d, mp, n);
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
     }
@@ -605,7 +643,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             const std::int64_t rhs = *i;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const std::int64_t lhs = date_col->data()[idx].days;
+                const std::int64_t lhs = date_col->data()[off + idx].days;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -627,13 +665,13 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = static_cast<double>(date_col->data()[idx].days);
+                const auto lhs = static_cast<double>(date_col->data()[off + idx].days);
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -655,7 +693,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
     }
@@ -663,7 +701,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
         if (const auto* i = std::get_if<std::int64_t>(&lit)) {
             const std::int64_t rhs = *i;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const std::int64_t lhs = ts_col->data()[idx].nanos;
+                const std::int64_t lhs = ts_col->data()[off + idx].nanos;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -685,13 +723,13 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
         if (const auto* d = std::get_if<double>(&lit)) {
             const double rhs = *d;
             for (std::size_t idx = 0; idx < n; ++idx) {
-                const auto lhs = static_cast<double>(ts_col->data()[idx].nanos);
+                const auto lhs = static_cast<double>(ts_col->data()[off + idx].nanos);
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[idx] = lhs == rhs;
@@ -713,7 +751,7 @@ auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, const LitVal& 
                         break;
                 }
             }
-            result.apply_validity(validity, n);
+            result.apply_validity(validity, off, n);
             return result;
         }
     }
@@ -760,7 +798,10 @@ auto cmp_into(ir::CompareOp op, const L* __restrict lp, const R* __restrict rp,
 }
 
 // Dispatch column-vs-column comparison over all type combinations.
-auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rhs, std::size_t n,
+// `lhs_off`/`rhs_off` are the operands' source offsets (and their validity
+// bitmaps'); the produced mask is dense.
+auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, std::size_t lhs_off,
+                 const ColumnValue& rhs, std::size_t rhs_off, std::size_t n,
                  const ValidityBitmap* lv = nullptr, const ValidityBitmap* rv = nullptr)
     -> std::expected<Mask, std::string> {
     Mask result;
@@ -768,36 +809,36 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     uint8_t* mp = result.value.data();
     if (const auto* l = std::get_if<Column<std::int64_t>>(&lhs)) {
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, l->data(), r->data(), mp, n);
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
-            cmp_into(op, l->data(), r->data(), mp, n);
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
     }
     if (const auto* l = std::get_if<Column<double>>(&lhs)) {
         if (const auto* r = std::get_if<Column<double>>(&rhs)) {
-            cmp_into(op, l->data(), r->data(), mp, n);
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
         if (const auto* r = std::get_if<Column<std::int64_t>>(&rhs)) {
-            cmp_into(op, l->data(), r->data(), mp, n);
+            cmp_into(op, l->data() + lhs_off, r->data() + rhs_off, mp, n);
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
@@ -805,8 +846,8 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     if (const auto* l = std::get_if<Column<Date>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Date>>(&rhs)) {
             for (std::size_t i = 0; i < n; ++i) {
-                const auto left_value = l->data()[i].days;
-                const auto right_value = r->data()[i].days;
+                const auto left_value = l->data()[lhs_off + i].days;
+                const auto right_value = r->data()[rhs_off + i].days;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[i] = left_value == right_value;
@@ -829,8 +870,8 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                 }
             }
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
@@ -838,8 +879,8 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     if (const auto* l = std::get_if<Column<Timestamp>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Timestamp>>(&rhs)) {
             for (std::size_t i = 0; i < n; ++i) {
-                const auto left_value = l->data()[i].nanos;
-                const auto right_value = r->data()[i].nanos;
+                const auto left_value = l->data()[lhs_off + i].nanos;
+                const auto right_value = r->data()[rhs_off + i].nanos;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         mp[i] = left_value == right_value;
@@ -862,8 +903,8 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
                 }
             }
             {
-                auto merged_v = merge_validity(lv, rv, n);
-                result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+                auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+                result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
                 return result;
             }
         }
@@ -872,33 +913,39 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
         switch (op) {
             case ir::CompareOp::Eq:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) == std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) == std::string_view(rcol[rhs_off + i]);
                 break;
             case ir::CompareOp::Ne:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) != std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) != std::string_view(rcol[rhs_off + i]);
                 break;
             case ir::CompareOp::Lt:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) < std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) < std::string_view(rcol[rhs_off + i]);
                 break;
             case ir::CompareOp::Le:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) <= std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) <= std::string_view(rcol[rhs_off + i]);
                 break;
             case ir::CompareOp::Gt:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) > std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) > std::string_view(rcol[rhs_off + i]);
                 break;
             case ir::CompareOp::Ge:
                 for (std::size_t i = 0; i < n; ++i)
-                    mp[i] = std::string_view(lcol[i]) >= std::string_view(rcol[i]);
+                    mp[i] =
+                        std::string_view(lcol[lhs_off + i]) >= std::string_view(rcol[rhs_off + i]);
                 break;
         }
     };
     auto return_with_validity = [&] -> Mask {
-        auto merged_v = merge_validity(lv, rv, n);
-        result.apply_validity(merged_v ? &*merged_v : nullptr, n);
+        auto merged_v = merge_validity(lv, lhs_off, rv, rhs_off, n);
+        result.apply_validity(merged_v ? &*merged_v : nullptr, 0, n);
         return std::move(result);
     };
 
@@ -915,8 +962,8 @@ auto compare_vec(ir::CompareOp op, const ColumnValue& lhs, const ColumnValue& rh
     if (const auto* l = std::get_if<Column<Categorical>>(&lhs)) {
         if (const auto* r = std::get_if<Column<Categorical>>(&rhs)) {
             if (l->dictionary_ptr() == r->dictionary_ptr()) {
-                const auto* lc = l->codes().data();
-                const auto* rc = r->codes().data();
+                const auto* lc = l->codes().data() + lhs_off;
+                const auto* rc = r->codes().data() + rhs_off;
                 switch (op) {
                     case ir::CompareOp::Eq:
                         for (std::size_t i = 0; i < n; ++i)
@@ -971,7 +1018,9 @@ struct NumericCmpSpec {
     double lit_dbl = 0.0;
 };
 
-auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
+// `begin` is the evaluated range's first row: the captured data pointers are
+// advanced past it so the kernels stay 0-based.
+auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table, std::size_t begin)
     -> std::optional<NumericCmpSpec> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
     if (cmp == nullptr) {
@@ -1013,10 +1062,10 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table)
     spec.op = op;
     if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Int64;
-        spec.i64 = int_column->data();
+        spec.i64 = int_column->data() + begin;
     } else if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Double;
-        spec.dbl = double_column->data();
+        spec.dbl = double_column->data() + begin;
     } else {
         return std::nullopt;
     }
@@ -1054,7 +1103,7 @@ struct NumericArithCmpSpec {
     double lit_dbl = 0.0;
 };
 
-auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table)
+auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table, std::size_t begin)
     -> std::optional<NumericOperandSpec> {
     NumericOperandSpec spec{};
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
@@ -1087,19 +1136,19 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table)
     }
     if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Int64;
-        spec.i64 = int_column->data();
+        spec.i64 = int_column->data() + begin;
         return spec;
     }
     if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
         spec.kind = NumericSpecKind::Double;
-        spec.dbl = double_column->data();
+        spec.dbl = double_column->data() + begin;
         return spec;
     }
     return std::nullopt;
 }
 
-auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table)
-    -> std::optional<NumericArithCmpSpec> {
+auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table,
+                                        std::size_t begin) -> std::optional<NumericArithCmpSpec> {
     const ir::BinaryExpr* bin = nullptr;
     const ir::Literal* lit = nullptr;
     ir::CompareOp op = cmp.op;
@@ -1123,8 +1172,8 @@ auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table&
         return std::nullopt;
     }
 
-    auto lhs = try_extract_numeric_operand_spec(*bin->left, table);
-    auto rhs = try_extract_numeric_operand_spec(*bin->right, table);
+    auto lhs = try_extract_numeric_operand_spec(*bin->left, table, begin);
+    auto rhs = try_extract_numeric_operand_spec(*bin->right, table, begin);
     if (!lhs || !rhs) {
         return std::nullopt;
     }
@@ -1464,8 +1513,68 @@ namespace {
 // into columns, then apply the scalar function over them. Defined after
 // eval_value_vec (it recurses into it).
 auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
-                              const ScalarRegistry* scalars, std::size_t n)
+                              const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ColResult, std::string>;
+
+// Copy rows `[rows.begin, rows.end())` of a column into a dense column.
+//
+// The escape hatch for the two evaluator branches that cannot honour a range
+// themselves: a whole-column builtin (rolling/cum/lag — not row-local, so
+// evaluating it over a slice would change its answer) and, for now, the
+// per-row field evaluator. Both run over the whole table and are then sliced,
+// which is correct but pays the copy a range was meant to avoid. Neither is
+// reachable from a parallel island: `is_subset_evaluable_expr` admits only
+// Scalar calls, so the island gate rejects these before they get here.
+auto slice_column(const ColumnValue& src, RowRange rows) -> ColumnValue {
+    ColumnValue out = make_empty_like(src);
+    std::visit(
+        [&](const auto& s) {
+            using ColT = std::decay_t<decltype(s)>;
+            auto* dst = std::get_if<ColT>(&out);
+            if (dst == nullptr) {
+                invariant_violation("slice_column: source/destination column type mismatch");
+            }
+            if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                dst->resize(rows.count);
+                std::memcpy(dst->codes_data(), s.codes_data() + rows.begin,
+                            rows.count * sizeof(*s.codes_data()));
+            } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                const uint32_t* src_off = s.offsets_data();
+                const std::size_t total = src_off[rows.end()] - src_off[rows.begin];
+                dst->resize_for_gather(rows.count, total);
+                uint32_t* dst_off = dst->offsets_data();
+                const uint32_t base = src_off[rows.begin];
+                for (std::size_t i = 0; i <= rows.count; ++i) {
+                    dst_off[i] = src_off[rows.begin + i] - base;
+                }
+                std::memcpy(dst->chars_data(), s.chars_data() + base, total);
+            } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                dst->resize(rows.count);
+                for (std::size_t i = 0; i < rows.count; ++i) {
+                    dst->set(i, s[rows.begin + i]);
+                }
+            } else {
+                using T = typename ColT::value_type;
+                dst->resize(rows.count);
+                std::memcpy(dst->data(), s.data() + rows.begin, rows.count * sizeof(T));
+            }
+        },
+        src);
+    return out;
+}
+
+// Evaluate a whole-table-only sub-expression and keep just the range's rows.
+auto slice_computed(ComputedColumn col, RowRange rows, std::size_t table_rows) -> ColResult {
+    if (rows.is_whole(table_rows)) {
+        return ColResult{std::move(col.column), std::move(col.validity)};
+    }
+    ColumnValue sliced = slice_column(col.column, rows);
+    std::optional<ValidityBitmap> validity;
+    if (col.validity.has_value()) {
+        validity = slice_validity(*col.validity, rows.begin, rows.count);
+    }
+    return ColResult{std::move(sliced), std::move(validity)};
+}
 
 // Turn a boolean Mask into a `Column<Bool>` ColResult (3VL nulls -> validity).
 inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
@@ -1491,13 +1600,18 @@ inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
 auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
-                    std::size_t n) -> std::expected<ColResult, std::string> {
+                    RowRange rows) -> std::expected<ColResult, std::string> {
+    const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<ColResult, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 if (const auto* col = table.find(node.name)) {
+                    // The only borrowed leaf: the whole table column is handed
+                    // back with the range's start as its offset, so no slice is
+                    // materialized. Everything computed from it is dense.
                     ColResult r{col};
+                    r.offset = rows.begin;
                     auto idx_it = table.index.find(node.name);
                     if (idx_it != table.index.end()) {
                         const auto& entry = table.columns[idx_it->second];
@@ -1534,17 +1648,19 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     node.value);
                 return ColResult{std::move(cv)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                auto lhs = eval_value_vec(*node.left, table, scalars, n);
+                auto lhs = eval_value_vec(*node.left, table, scalars, rows);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs = eval_value_vec(*node.right, table, scalars, n);
+                auto rhs = eval_value_vec(*node.right, table, scalars, rows);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                auto result = arith_vec(node.op, deref_col(*lhs), deref_col(*rhs), n);
+                auto result = arith_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
+                                        rhs->offset, n);
                 if (!result)
                     return std::unexpected(result.error());
                 ColResult res{std::move(*result)};
-                res.owned_validity = merge_validity(lhs->get_validity(), rhs->get_validity(), n);
+                res.owned_validity = merge_validity(lhs->get_validity(), lhs->offset,
+                                                    rhs->get_validity(), rhs->offset, n);
                 return res;
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (const auto* fn = find_builtin(node.callee);
@@ -1560,7 +1676,10 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     // window argument.
                     const ColumnEvalCtx ctx{
                         .scalars = scalars, .externs = nullptr, .window = std::nullopt};
-                    auto col = column_eval_of(*fn)(node, table, n, ctx);
+                    // Not row-local: evaluated over the whole table and sliced,
+                    // never over the range alone (see slice_column).
+                    const std::size_t kernel_rows = table.rows();
+                    auto col = column_eval_of(*fn)(node, table, kernel_rows, ctx);
                     if (!col) {
                         return std::unexpected(col.error());
                     }
@@ -1569,12 +1688,12 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     // cannot line up row-for-row.
                     const std::size_t got =
                         std::visit([](const auto& c) { return c.size(); }, col->column);
-                    if (got != n) {
+                    if (got != kernel_rows) {
                         return std::unexpected(node.callee + ": generates " + std::to_string(got) +
                                                " rows but the expression needs " +
-                                               std::to_string(n));
+                                               std::to_string(kernel_rows));
                     }
-                    return ColResult{std::move(col->column), std::move(col->validity)};
+                    return slice_computed(std::move(*col), rows, kernel_rows);
                 }
                 // A scalar call (abs, sqrt, casts, round, pmin/pmax, date
                 // parts, …). If any argument nests a non-row-local
@@ -1585,7 +1704,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 const bool args_need_vec = std::ranges::any_of(
                     node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
                 if (args_need_vec) {
-                    return eval_scalar_over_columns(node, table, scalars, n);
+                    return eval_scalar_over_columns(node, table, scalars, rows);
                 }
                 // Otherwise delegate to the shared field evaluator, which
                 // dispatches through the registry (per-row, incl. the
@@ -1598,14 +1717,14 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 if (!col) {
                     return std::unexpected(col.error());
                 }
-                return ColResult{std::move(col->column), std::move(col->validity)};
+                return slice_computed(std::move(*col), rows, table.rows());
             } else if constexpr (std::is_same_v<T, ir::CompareExpr> ||
                                  std::is_same_v<T, ir::LogicalExpr> ||
                                  std::is_same_v<T, ir::IsNullExpr>) {
                 // Boolean-producing nodes used in value position: evaluate the
                 // predicate to a Mask and return it as a Column<Bool> (3VL nulls
                 // become column validity).
-                auto m = compute_mask(expr, table, scalars, n);
+                auto m = compute_mask(expr, table, scalars, rows);
                 if (!m) {
                     return std::unexpected(m.error());
                 }
@@ -1625,8 +1744,9 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
 // (checked at inference; re-checked here since kernels are also called with
 // unvalidated calls from the update ladders).
 auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
-                          const ScalarRegistry* scalars, std::size_t rows)
+                          const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ComputedColumn, std::string> {
+    const std::size_t n = rows.count;
     if (call.args.size() < 2) {
         return std::unexpected("coalesce: expected at least 2 arguments");
     }
@@ -1652,19 +1772,19 @@ auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
         [&](const auto& c0) -> std::expected<ComputedColumn, std::string> {
             using Col = std::decay_t<decltype(c0)>;
             Col out;
-            out.reserve(rows);
-            ValidityBitmap valid(rows, true);
+            out.reserve(n);
+            ValidityBitmap valid(n, true);
             bool any_invalid = false;
-            for (std::size_t i = 0; i < rows; ++i) {
+            for (std::size_t i = 0; i < n; ++i) {
                 bool filled = false;
                 for (const auto& cr : cols) {
                     const auto* vk = cr.get_validity();
-                    if (vk == nullptr || (*vk)[i]) {
+                    if (vk == nullptr || (*vk)[cr.offset + i]) {
                         const auto* tc = std::get_if<Col>(&deref_col(cr));
                         if (tc == nullptr) {
                             return std::unexpected("coalesce: arguments must share one type");
                         }
-                        out.push_back((*tc)[i]);
+                        out.push_back((*tc)[cr.offset + i]);
                         filled = true;
                         break;
                     }
@@ -1698,8 +1818,13 @@ auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
 // null — standard scalar null propagation.
 namespace {
 auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
-                              const ScalarRegistry* scalars, std::size_t n)
+                              const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ColResult, std::string> {
+    // Materializes its vectorized arguments as extra columns of a copy of the
+    // whole table, so the synthesized columns have to be table-length: a
+    // range's worth would leave `tmp` with columns of two different lengths.
+    // Evaluate whole and slice (see slice_column).
+    const std::size_t n = table.rows();
     Table tmp = table;
     ir::CallExpr rewritten;
     rewritten.callee = call.callee;
@@ -1710,7 +1835,7 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
             rewritten.args.push_back(arg);  // row-local: keep verbatim (deep-copied)
             continue;
         }
-        auto c = eval_value_vec(*arg, table, scalars, n);
+        auto c = eval_value_vec(*arg, table, scalars, RowRange::whole(n));
         if (!c) {
             return std::unexpected(c.error());
         }
@@ -1742,7 +1867,7 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
     if (!col) {
         return std::unexpected(col.error());
     }
-    return ColResult{std::move(col->column), std::move(col->validity)};
+    return slice_computed(std::move(*col), rows, n);
 }
 }  // namespace
 
@@ -1827,7 +1952,7 @@ auto try_extract_in_list(const ir::Expr& expr)
 /// per-row cost is one indexed load regardless of how long the list is. The
 /// generic OR path instead builds a full-width mask per arm and combines them,
 /// which is what a SQL `IN` degrades into once it is spelled as an OR-chain.
-auto try_in_list_mask(const ir::Expr& expr, const Table& table, std::size_t n)
+auto try_in_list_mask(const ir::Expr& expr, const Table& table, RowRange rows)
     -> std::optional<Mask> {
     auto in_list = try_extract_in_list(expr);
     if (!in_list.has_value()) {
@@ -1852,12 +1977,13 @@ auto try_in_list_mask(const ir::Expr& expr, const Table& table, std::size_t n)
     }
 
     Mask mask;
-    mask.value.resize(n);
-    const auto* codes = cat->codes_data();
-    for (std::size_t row = 0; row < n; ++row) {
+    mask.value.resize(rows.count);
+    const auto* codes = cat->codes_data() + rows.begin;
+    for (std::size_t row = 0; row < rows.count; ++row) {
         mask.value[row] = code_ok[static_cast<std::size_t>(codes[row])];
     }
-    mask.apply_validity(entry.validity.has_value() ? &*entry.validity : nullptr, n);
+    mask.apply_validity(entry.validity.has_value() ? &*entry.validity : nullptr, rows.begin,
+                        rows.count);
     return mask;
 }
 
@@ -1866,7 +1992,8 @@ auto try_in_list_mask(const ir::Expr& expr, const Table& table, std::size_t n)
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
 auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
-                  std::size_t n) -> std::expected<Mask, std::string> {
+                  RowRange rows) -> std::expected<Mask, std::string> {
+    const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<Mask, std::string> {
             using T = std::decay_t<decltype(node)>;
@@ -1874,7 +2001,8 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // Fast path: row-local numeric arithmetic compared to a literal.
                 // This avoids materializing expressions such as `price * qty`
                 // when the filter only needs the final keep/drop mask.
-                if (auto spec = try_extract_numeric_arith_cmp_spec(node, table); spec.has_value()) {
+                if (auto spec = try_extract_numeric_arith_cmp_spec(node, table, rows.begin);
+                    spec.has_value()) {
                     Mask fused;
                     fused.value.resize(n);
                     dispatch_numeric_arith_cmp_kernel(*spec, fused.value.data(), n);
@@ -1882,34 +2010,34 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 }
                 // Fast path: column/expr op literal (no broadcast needed).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.right->node)) {
-                    auto lhs = eval_value_vec(*node.left, table, scalars, n);
+                    auto lhs = eval_value_vec(*node.left, table, scalars, rows);
                     if (!lhs)
                         return std::unexpected(lhs.error());
-                    return compare_col_scalar(node.op, deref_col(*lhs), lit->value, n,
+                    return compare_col_scalar(node.op, deref_col(*lhs), lhs->offset, lit->value, n,
                                               lhs->get_validity());
                 }
                 // Fast path: literal op column/expr (flip the operator).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.left->node)) {
-                    auto rhs = eval_value_vec(*node.right, table, scalars, n);
+                    auto rhs = eval_value_vec(*node.right, table, scalars, rows);
                     if (!rhs)
                         return std::unexpected(rhs.error());
-                    return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), lit->value, n,
-                                              rhs->get_validity());
+                    return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), rhs->offset,
+                                              lit->value, n, rhs->get_validity());
                 }
                 // General: both sides are column expressions.
-                auto lhs = eval_value_vec(*node.left, table, scalars, n);
+                auto lhs = eval_value_vec(*node.left, table, scalars, rows);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs = eval_value_vec(*node.right, table, scalars, n);
+                auto rhs = eval_value_vec(*node.right, table, scalars, rows);
                 if (!rhs)
                     return std::unexpected(rhs.error());
-                auto res = compare_vec(node.op, deref_col(*lhs), deref_col(*rhs), n,
-                                       lhs->get_validity(), rhs->get_validity());
+                auto res = compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
+                                       rhs->offset, n, lhs->get_validity(), rhs->get_validity());
                 return res;
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::Not) {
                     // NOT null = null; NOT true = false; NOT false = true
-                    auto mask = compute_mask(*node.left, table, scalars, n);
+                    auto mask = compute_mask(*node.left, table, scalars, rows);
                     if (!mask)
                         return std::unexpected(mask.error());
                     for (auto& v : mask->value)
@@ -1922,15 +2050,15 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // categorical column) is a membership test, not a chain of
                 // independent ORs — one pass, no mask per arm.
                 if (!is_and) {
-                    if (auto in_mask = try_in_list_mask(expr, table, n); in_mask.has_value()) {
+                    if (auto in_mask = try_in_list_mask(expr, table, rows); in_mask.has_value()) {
                         return std::move(*in_mask);
                     }
                 }
                 // Fast path: two numeric (column cmp literal) terms without nulls.
                 // Evaluate both comparisons and combine in a single pass.
-                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table);
+                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table, rows.begin);
                     lspec.has_value()) {
-                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table);
+                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table, rows.begin);
                         rspec.has_value()) {
                         Mask fused;
                         fused.value.resize(n);
@@ -1947,10 +2075,10 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // 3VL AND/OR (see truth tables): combine values, then recompute
                 // validity so a known-false (AND) / known-true (OR) on either
                 // side makes the row definitively valid.
-                auto left = compute_mask(*node.left, table, scalars, n);
+                auto left = compute_mask(*node.left, table, scalars, rows);
                 if (!left)
                     return std::unexpected(left.error());
-                auto right = compute_mask(*node.right, table, scalars, n);
+                auto right = compute_mask(*node.right, table, scalars, rows);
                 if (!right)
                     return std::unexpected(right.error());
                 const uint8_t* lp = left->value.data();
@@ -1991,8 +2119,10 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                         const auto& entry = table.columns[it->second];
                         if (entry.validity.has_value()) {
                             const auto& bm = *entry.validity;
-                            for (std::size_t i = 0; i < n; ++i)
-                                m.value[i] = static_cast<uint8_t>(want_null ? !bm[i] : bm[i]);
+                            for (std::size_t i = 0; i < n; ++i) {
+                                const bool v = bm[rows.begin + i];
+                                m.value[i] = static_cast<uint8_t>(want_null ? !v : v);
+                            }
                         }
                         // no validity bitmap → all rows valid → fill stays correct
                     }
@@ -2006,7 +2136,7 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // reference (`filter is_manual`) or a Bool-returning scalar
                 // builtin (`filter is_nan(x)`). Evaluate and check the result
                 // type before giving up.
-                auto val = eval_value_vec(expr, table, scalars, n);
+                auto val = eval_value_vec(expr, table, scalars, rows);
                 if (!val)
                     return std::unexpected(val.error());
                 const auto* bcol = std::get_if<Column<bool>>(&deref_col(*val));
@@ -2015,8 +2145,8 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 Mask m;
                 m.value.resize(n);
                 for (std::size_t i = 0; i < n; ++i)
-                    m.value[i] = static_cast<uint8_t>((*bcol)[i]);
-                m.apply_validity(val->get_validity(), n);
+                    m.value[i] = static_cast<uint8_t>((*bcol)[val->offset + i]);
+                m.apply_validity(val->get_validity(), val->offset, n);
                 return m;
             }
         },
@@ -2027,10 +2157,14 @@ namespace {
 
 auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                        const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
-                       const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    const std::size_t n = input.rows();
+                       const ScalarRegistry* scalars, RowRange rows)
+    -> std::expected<Table, std::string> {
+    // `n` and every index below are range-relative: the mask, the keep-word
+    // blocks and the output are all dense. Only the gather converts back to a
+    // source index, by adding `rows.begin` (see for_each_selected).
+    const std::size_t n = rows.count;
 
-    auto mask_result = compute_mask(predicate, input, scalars, n);
+    auto mask_result = compute_mask(predicate, input, scalars, rows);
     if (!mask_result)
         return std::unexpected(mask_result.error());
 
@@ -2102,10 +2236,12 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
         }
     }
 
+    // Yields *source* row indices, so every gather below reads the right rows
+    // whether or not the range starts at 0.
     auto for_each_selected = [&](auto&& fn) {
         for (std::size_t w = 0; w < n_words; ++w) {
             std::uint64_t bits = keep_words[w];
-            const std::size_t base = w * 64;
+            const std::size_t base = rows.begin + (w * 64);
             while (bits != 0) {
                 const int bit = std::countr_zero(bits);
                 fn(base + static_cast<std::size_t>(bit));
@@ -2156,13 +2292,25 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                     dst->resize(out_n);
                     auto* __restrict dst_words = dst->words_data();
                     const auto* __restrict src_words = src.words_data();
+                    const std::size_t src_words_n = (src.size() + 63) / 64;
                     std::size_t out_bit = 0;
                     for (std::size_t w = 0; w < n_words; ++w) {
                         const std::uint64_t select = keep_words[w];
                         if (select == 0) {
                             continue;
                         }
-                        const std::uint64_t packed = pack_selected_bool_bits(src_words[w], select);
+                        // `select` bit b is range row w*64+b, i.e. source row
+                        // rows.begin + w*64 + b — which is only word `w` of the
+                        // source when the range starts on a word boundary.
+                        // Otherwise the 64 source bits straddle two words.
+                        const std::size_t src_bit = rows.begin + (w * 64);
+                        const std::size_t sw = src_bit / 64;
+                        const auto shift = static_cast<unsigned>(src_bit % 64);
+                        std::uint64_t src_bits = src_words[sw] >> shift;
+                        if (shift != 0 && sw + 1 < src_words_n) {
+                            src_bits |= src_words[sw + 1] << (64 - shift);
+                        }
+                        const std::uint64_t packed = pack_selected_bool_bits(src_bits, select);
                         append_packed_bool_bits(packed,
                                                 static_cast<std::size_t>(std::popcount(select)),
                                                 dst_words, out_bit);
@@ -2212,7 +2360,12 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
 
 auto filter_table(const Table& input, const ir::Expr& predicate, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
-    return filter_table_impl(input, predicate, nullptr, 0, scalars);
+    return filter_table_impl(input, predicate, nullptr, 0, scalars, RowRange::whole(input.rows()));
+}
+
+auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
+                        const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+    return filter_table_impl(input, predicate, nullptr, 0, scalars, rows);
 }
 
 namespace {
@@ -2825,7 +2978,8 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             continue;
         }
 
-        auto mask = compute_mask(conjuncts[conjunct_index], input, scalars, rows);
+        auto mask =
+            compute_mask(conjuncts[conjunct_index], input, scalars, RowRange::whole(input.rows()));
         if (!mask) {
             return std::unexpected(mask.error());
         }
@@ -2867,7 +3021,7 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
     // branches on a predicate that, at q10's ~25% hit rate, the predictor
     // cannot learn. Sizing the result up front makes the fill branchless.
     if (!conjuncts.empty()) {
-        auto mask = compute_mask(conjuncts.front(), input, scalars, input.rows());
+        auto mask = compute_mask(conjuncts.front(), input, scalars, RowRange::whole(input.rows()));
         if (!mask) {
             return std::unexpected(mask.error());
         }
@@ -2905,12 +3059,13 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
 auto filter_project_table(const Table& input, const ir::Expr& predicate,
                           const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
-    return filter_table_impl(input, predicate, &columns, 0, scalars);
+    return filter_table_impl(input, predicate, &columns, 0, scalars, RowRange::whole(input.rows()));
 }
 
 auto filter_table_limit(const Table& input, const ir::Expr& predicate, std::size_t row_limit,
                         const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    return filter_table_impl(input, predicate, nullptr, row_limit, scalars);
+    return filter_table_impl(input, predicate, nullptr, row_limit, scalars,
+                             RowRange::whole(input.rows()));
 }
 
 }  // namespace ibex::runtime

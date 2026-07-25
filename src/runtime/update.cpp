@@ -1779,7 +1779,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     const std::size_t n = input.rows();
 
     // Mask: a row matches iff the predicate is true AND not null.
-    auto mask = compute_mask(*update.guard(), input, scalars, n);
+    auto mask = compute_mask(*update.guard(), input, scalars, RowRange::whole(n));
     if (!mask) {
         return std::unexpected(mask.error());
     }

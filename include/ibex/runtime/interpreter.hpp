@@ -345,6 +345,12 @@ struct ParallelIslandStats {
     std::atomic<std::uint64_t> parallel_islands{0};  ///< islands run on worker threads
     std::atomic<std::uint64_t> serial_islands{0};    ///< islands below the grain threshold
     std::atomic<std::uint64_t> morsels{0};           ///< morsels those islands partitioned into
+    /// Islands whose head operator was absorbed into a range-evaluating source
+    /// instead of being run above a gathered morsel. Observability for the
+    /// zero-copy path: it is a silent optimization, so without a counter a
+    /// regression to gathering everywhere would only show up as a slow
+    /// benchmark.
+    std::atomic<std::uint64_t> range_heads{0};
 };
 
 struct ExecutionContext {

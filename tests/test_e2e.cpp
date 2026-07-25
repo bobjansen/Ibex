@@ -2308,3 +2308,39 @@ TEST_CASE("E2E: parallel island cancels cleanly when interrupted", "[e2e][parall
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == runtime::interrupt_message());
 }
+
+TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source",
+          "[e2e][parallel]") {
+    // The zero-copy path is a silent optimization: if `range_filter_head` ever
+    // stopped matching, every island would go back to gathering each morsel and
+    // the whole suite would still pass. These assertions are the only thing
+    // that would notice.
+    auto tables = make_wide_island_table(1000);
+
+    SECTION("a filter head is absorbed") {
+        runtime::ParallelIslandStats stats;
+        auto island = run_parallel("t[filter price > 350];", tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 1);
+        // Absorbing the head must not change the answer.
+        require_tables_equal(run("t[filter price > 350];", tables), island);
+    }
+
+    SECTION("a filter head still absorbed when operators follow it") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350, select { price, qty }];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a non-filter head keeps the gathering source") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[update { n = price * 2 }];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+}

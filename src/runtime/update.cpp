@@ -10,6 +10,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1733,6 +1734,126 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     return output;
 }
 
+namespace {
+
+/// Evaluate one update field across worker threads, or serially when that is
+/// not worthwhile or not safe.
+///
+/// This is where a 1:1 operator wants its parallelism, rather than in a
+/// morsel island. `update_table` builds its output by *moving* the input
+/// (`Table output = std::move(input)`), so a passthrough column costs nothing —
+/// which means an island's per-morsel gather and its merge concat are not "one
+/// copy too many" for this shape, they are pure overhead invented by
+/// morselization. Splitting only the field computation leaves the zero-copy
+/// passthrough intact and adds one copy of the computed column, instead of two
+/// copies of the entire table.
+///
+/// Declines, falling back to a single whole-range evaluation, when:
+///   - parallelism is off, the table is small, or the pool has one thread;
+///   - the expression is not `is_range_native_expr` — evaluating it per range
+///     would re-read the whole table per range (see that function);
+///   - the result is not Int64/Double. Other types are not harder in principle,
+///     but a Categorical result would need its per-piece dictionaries merged,
+///     and a wrong merge is silent. Numeric covers the case this exists for.
+auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
+                                   const ColumnEvalCtx& ctx, const ExecutionContext& exec)
+    -> std::expected<ComputedColumn, std::string> {
+    const std::size_t rows = table.rows();
+    const auto whole = [&] { return evaluate_field(expr, table, RowRange::whole(rows), ctx); };
+
+    if (!exec.parallel || rows < exec.parallel_min_rows || !is_range_native_expr(expr)) {
+        return whole();
+    }
+    auto inferred = infer_expr_type(expr, table, ctx.scalars, ctx.externs);
+    if (!inferred.has_value() ||
+        (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double)) {
+        return whole();
+    }
+
+    const std::size_t grain = exec.parallel_grain == 0 ? 1 : exec.parallel_grain;
+    const std::size_t morsels = (rows + grain - 1) / grain;
+    auto& pool = process_worker_pool();
+    const std::size_t threads =
+        std::min(morsels, exec.parallel_threads != 0 ? exec.parallel_threads : pool.size());
+    if (threads < 2 || morsels < 2) {
+        return whole();
+    }
+
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // One slot per morsel, each written by exactly one worker — no lock, and
+    // the result order is positional rather than dependent on completion order.
+    std::vector<std::expected<ComputedColumn, std::string>> pieces(morsels);
+    std::atomic<std::size_t> cursor{0};
+    auto batch = pool.submit(threads, [&](std::size_t) {
+        while (true) {
+            const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (index >= morsels) {
+                return;
+            }
+            const std::size_t begin = index * grain;
+            const std::size_t count = std::min(grain, rows - begin);
+            pieces[index] =
+                evaluate_field(expr, table, RowRange{.begin = begin, .count = count}, ctx);
+        }
+    });
+    batch.wait();
+
+    // Lowest failing morsel wins, so the reported error does not depend on
+    // thread timing — the same rule the island merger uses.
+    for (auto& piece : pieces) {
+        if (!piece.has_value()) {
+            return std::unexpected(piece.error());
+        }
+    }
+
+    const bool any_validity =
+        std::ranges::any_of(pieces, [](const auto& p) { return p->validity.has_value(); });
+    ColumnValue out = inferred.value() == ExprType::Int ? ColumnValue{Column<std::int64_t>{}}
+                                                        : ColumnValue{Column<double>{}};
+    std::visit(
+        [&](auto& dst) {
+            using ColT = std::decay_t<decltype(dst)>;
+            // Only the two numeric alternatives are constructed above; the rest
+            // exist so the visit compiles over the whole variant.
+            if constexpr (std::is_same_v<ColT, Column<std::int64_t>> ||
+                          std::is_same_v<ColT, Column<double>>) {
+                dst.resize_for_overwrite(rows);
+                std::size_t at = 0;
+                for (auto& piece : pieces) {
+                    const auto& src = std::get<ColT>(piece->column);
+                    std::memcpy(dst.data() + at, src.data(),
+                                src.size() * sizeof(typename ColT::value_type));
+                    at += src.size();
+                }
+            } else {
+                invariant_violation("evaluate_field_maybe_parallel: non-numeric result column");
+            }
+        },
+        out);
+
+    std::optional<ValidityBitmap> validity;
+    if (any_validity) {
+        ValidityBitmap merged(rows, true);
+        std::size_t at = 0;
+        for (auto& piece : pieces) {
+            const std::size_t n = std::visit([](const auto& c) { return c.size(); }, piece->column);
+            if (piece->validity.has_value()) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    merged.set(at + i, (*piece->validity)[i]);
+                }
+            }
+            at += n;
+        }
+        validity = std::move(merged);
+    }
+    return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
+}
+
+}  // namespace
+
 auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                   const ExecutionContext& exec) -> std::expected<Table, std::string> {
@@ -1779,10 +1900,11 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         // shared field evaluator. No enclosing `window` clause here, so
         // ctx.window stays empty (only a per-call window arg can supply a
         // rolling span).
-        auto col = evaluate_field(
-            field.expr, output, RowRange::whole(output.rows()),
+        auto col = evaluate_field_maybe_parallel(
+            field.expr, output,
             ColumnEvalCtx{
-                .scalars = scalars, .externs = externs, .window = std::nullopt, .exec = &exec});
+                .scalars = scalars, .externs = externs, .window = std::nullopt, .exec = &exec},
+            exec);
         if (!col) {
             return std::unexpected(col.error());
         }

@@ -1516,70 +1516,35 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
                               const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ColResult, std::string>;
 
-// Copy rows `[rows.begin, rows.end())` of a column into a dense column.
+// Result of a sub-expression that could only be evaluated over the whole table.
 //
-// The escape hatch for the evaluator branches that cannot honour a range
-// themselves: a whole-column builtin (rolling/cum/lag — not row-local, so
-// evaluating it over a slice would change its answer), `eval_scalar_over_columns`,
-// and, for now, the per-row field evaluator. Each runs over the whole table and
-// is then sliced: correct, but it pays the copy a range was meant to avoid.
+// Three evaluator branches cannot honour a partial range: a whole-column
+// builtin (rolling/cum/lag — not row-local, so evaluating it over a slice would
+// change its answer), `eval_scalar_over_columns`, and the per-row field
+// evaluator. All three are `CallExpr` branches, and `is_range_native_expr`
+// rejects every `CallExpr`, so **under a partial range none of them is
+// reachable** — reaching one means the gate and the evaluators have drifted
+// apart.
 //
-// **These are reachable from a parallel island, and a caller that lets one
-// through pays O(morsels x rows).** Island eligibility (`is_subset_evaluable_expr`)
-// admits Scalar calls, and every call — `abs(x)` included — routes here. A
-// filter island that absorbed `abs(a) > 50` re-ran `abs` over the whole 20M-row
-// table once per morsel and measured 10x slower than serial. `is_range_native_expr`
-// is the gate that keeps such predicates on the gathering source; it has to be
-// widened in step with the evaluators, never ahead of them.
-auto slice_column(const ColumnValue& src, RowRange rows) -> ColumnValue {
-    ColumnValue out = make_empty_like(src);
-    std::visit(
-        [&](const auto& s) {
-            using ColT = std::decay_t<decltype(s)>;
-            auto* dst = std::get_if<ColT>(&out);
-            if (dst == nullptr) {
-                invariant_violation("slice_column: source/destination column type mismatch");
-            }
-            if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                dst->resize(rows.count);
-                std::memcpy(dst->codes_data(), s.codes_data() + rows.begin,
-                            rows.count * sizeof(*s.codes_data()));
-            } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                const uint32_t* src_off = s.offsets_data();
-                const std::size_t total = src_off[rows.end()] - src_off[rows.begin];
-                dst->resize_for_gather(rows.count, total);
-                uint32_t* dst_off = dst->offsets_data();
-                const uint32_t base = src_off[rows.begin];
-                for (std::size_t i = 0; i <= rows.count; ++i) {
-                    dst_off[i] = src_off[rows.begin + i] - base;
-                }
-                std::memcpy(dst->chars_data(), s.chars_data() + base, total);
-            } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                dst->resize(rows.count);
-                for (std::size_t i = 0; i < rows.count; ++i) {
-                    dst->set(i, s[rows.begin + i]);
-                }
-            } else {
-                using T = typename ColT::value_type;
-                dst->resize(rows.count);
-                std::memcpy(dst->data(), s.data() + rows.begin, rows.count * sizeof(T));
-            }
-        },
-        src);
-    return out;
-}
-
-// Evaluate a whole-table-only sub-expression and keep just the range's rows.
+// That drift is what this abort exists to catch. It is not a wrong answer: the
+// natural alternative, evaluating whole-table and slicing, is perfectly
+// correct. It is O(morsels x rows), and therefore silent — a filter island that
+// absorbed `abs(a) > 50` re-ran `abs` over the whole 20M-row input once per
+// morsel and measured 10x slower than the serial path, with every correctness
+// test still green. The previous version of this comment asserted these
+// branches were unreachable from an island and was simply wrong; an assert
+// keeps the claim honest in a way a comment demonstrably did not.
+//
+// Widening `is_range_native_expr` ahead of the evaluators lands here. Widening
+// an evaluator without the gate only costs a gather.
 auto slice_computed(ComputedColumn col, RowRange rows, std::size_t table_rows) -> ColResult {
-    if (rows.is_whole(table_rows)) {
-        return ColResult{std::move(col.column), std::move(col.validity)};
+    if (!rows.is_whole(table_rows)) {
+        invariant_violation(
+            "filter: expression needs whole-table evaluation under a partial row range — "
+            "is_range_native_expr admitted a predicate the evaluators cannot evaluate by "
+            "range (see range_filter_head)");
     }
-    ColumnValue sliced = slice_column(col.column, rows);
-    std::optional<ValidityBitmap> validity;
-    if (col.validity.has_value()) {
-        validity = slice_validity(*col.validity, rows.begin, rows.count);
-    }
-    return ColResult{std::move(sliced), std::move(validity)};
+    return ColResult{std::move(col.column), std::move(col.validity)};
 }
 
 // Turn a boolean Mask into a `Column<Bool>` ColResult (3VL nulls -> validity).
@@ -1683,7 +1648,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     const ColumnEvalCtx ctx{
                         .scalars = scalars, .externs = nullptr, .window = std::nullopt};
                     // Not row-local: evaluated over the whole table and sliced,
-                    // never over the range alone (see slice_column).
+                    // never over the range alone (see slice_computed).
                     const std::size_t kernel_rows = table.rows();
                     auto col = column_eval_of(*fn)(node, table, kernel_rows, ctx);
                     if (!col) {
@@ -1829,7 +1794,7 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
     // Materializes its vectorized arguments as extra columns of a copy of the
     // whole table, so the synthesized columns have to be table-length: a
     // range's worth would leave `tmp` with columns of two different lengths.
-    // Evaluate whole and slice (see slice_column).
+    // Evaluate whole-table (see slice_computed).
     const std::size_t n = table.rows();
     Table tmp = table;
     ir::CallExpr rewritten;
@@ -2400,8 +2365,26 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
         expr.node);
 }
 
+namespace {
+
+/// Enforce the precondition at the API boundary, so a caller that forgot the
+/// gate fails here with its own name in the message rather than deep inside the
+/// evaluator. Distinct from the abort in `slice_computed`: that one catches the
+/// gate drifting out of step with the evaluators, this one catches not
+/// consulting the gate at all.
+void require_range_evaluable(const Table& input, const ir::Expr& predicate, RowRange rows) {
+    if (!rows.is_whole(input.rows()) && !is_range_native_expr(predicate)) {
+        invariant_violation(
+            "filter_table_range: predicate is not range-native — callers passing a partial "
+            "row range must check is_range_native_expr first");
+    }
+}
+
+}  // namespace
+
 auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
                         const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
+    require_range_evaluable(input, predicate, rows);
     return filter_table_impl(input, predicate, nullptr, 0, scalars, rows);
 }
 
@@ -2409,6 +2392,7 @@ auto filter_project_table_range(const Table& input, const ir::Expr& predicate,
                                 const std::vector<ir::ColumnRef>& columns, RowRange rows,
                                 const ScalarRegistry* scalars)
     -> std::expected<Table, std::string> {
+    require_range_evaluable(input, predicate, rows);
     return filter_table_impl(input, predicate, &columns, 0, scalars, rows);
 }
 

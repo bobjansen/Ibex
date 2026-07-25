@@ -701,6 +701,44 @@ materializing gather and the serial merge concat cost more than the map saves.
 threads** — until a morsel stops being a copy, low-arithmetic-intensity islands
 cannot win.
 
+### Phase 2 slice 2a/2b: range-aware filter (landed 2026-07-25)
+
+`RowRange {begin, count}` threads through the filter's evaluators and
+`ColResult` carries an `offset`. The offset enters at exactly one place — the
+borrowed `ir::ColumnRef` leaf in `eval_value_vec` — so everything computed from
+it is dense and only kernels taking a *borrowed* operand need it. A `Filter` or
+`FilterProject` island head is now absorbed into `RangeFilterMorselSource`,
+which evaluates the predicate over the input's rows directly; the morsel is
+never materialized.
+
+**The prediction above was wrong, and the measurement is worth keeping.**
+Removing the gather moved a 20-filter/5M-row island from 1.48s to 1.38s
+(min-of-6, interleaved) against 0.94s serial — about 7%. The gather was *not*
+the island's dominant cost, and removing it alone does not make a
+bandwidth-bound filter island beat serial.
+
+The discriminating experiment: with a selective predicate, where the output and
+therefore the merge concat is small, the island does win — 0.14s vs 0.16s
+serial (0.17s gathering), and 0.14–0.16s vs 0.18–0.21s for `filter …, select`.
+
+**So the remaining cost is the merge copy, not the gather.** A filter island
+materializes its output per morsel and `MaterializeOperator` then copies all of
+it again, so the island does twice the output copying the serial path does.
+That is why the win tracks output size rather than input size. Removing it
+needs the final output presized and workers writing into disjoint slices —
+which for a filter means a two-phase pass (compute all masks, popcount for
+exact per-morsel sizes, presize, then gather into slices), because a filter's
+cardinality is not known up front. **That two-phase filter island is the next
+lever, and it is a bigger structural change than 2a/2b were.**
+
+Not yet range-aware: `evaluate_field` (the per-row registry path shared with
+`update`), whole-column builtins, and `eval_scalar_over_columns` all evaluate
+whole-table and slice. Each is documented at `slice_column` in filter.cpp and
+none is reachable from an island, since `is_subset_evaluable_expr` admits only
+Scalar calls. Range-threading `evaluate_field` is what would unlock the 1:1
+`Project`/`Update` shapes, where the output cardinality *is* known and the
+merge copy can be removed without a two-phase pass.
+
 Build one bounded, ordered parallel pipeline:
 
 ```text

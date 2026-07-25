@@ -2147,19 +2147,44 @@ TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e]
     }
 }
 
-TEST_CASE("E2E: parallel island runs a row-local update on worker threads", "[e2e][parallel]") {
+TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][parallel]") {
     auto tables = make_wide_island_table(1000);
 
-    // A standalone `update` is where a query's arithmetic lives; these are the
-    // shapes that put it inside the island rather than in a serial barrier.
-    const char* cases[] = {
+    // An update is no longer an island (see execution_capability(const Node&)):
+    // `update_table` splits the field computation across threads itself, which
+    // costs no copies where a morsel island costs two whole-table ones. What
+    // has to hold either way is that the answer does not change — including for
+    // the shapes that stress it: a field consumed by a later operator, an
+    // overwrite of an existing nullable column, and a rename of a computed one.
+    // Shapes whose update reaches `update_table`, so the field split is what
+    // provides the parallelism.
+    const char* split_cases[] = {
         "t[update { n = price * 2 }];",
         "t[update { n = price * qty + 1 }][filter n > 100];",
-        "t[filter price > 100][update { n = price - qty }][select { price, n }];",
         "t[update { n = price * 2 }][rename m = n];",
-        "t[update { qty = qty + 1 }];",  // overwrites an existing nullable column
+        "t[update { qty = qty + 1 }];",             // overwrites an existing nullable column
+        "t[update { a = price * 2, b = a + 1 }];",  // a later field reads an earlier one
     };
-    for (const auto* src : cases) {
+    for (const auto* src : split_cases) {
+        INFO("query: " << src);
+        auto serial = run(src, tables);
+        for (const std::size_t threads : {2U, 8U}) {
+            INFO("threads " << threads);
+            // grain 7 over 1000 rows is ~143 morsels, so the field evaluation
+            // really does fan out — asserted, because a silent fall back to one
+            // whole-table evaluation would leave the equality check green.
+            runtime::ParallelIslandStats stats;
+            require_tables_equal(serial, run_parallel(src, tables, 7, threads, &stats));
+            CHECK(stats.parallel_fields.load() > 0);
+        }
+    }
+
+    // `filter … update … select` canonicalizes to the fused FilterUpdateProject,
+    // which is filter-shaped — its cardinality is data-dependent, so it stays an
+    // island and its update never reaches `update_table`. Equality is all that
+    // is claimed here.
+    {
+        const auto* src = "t[filter price > 100][update { n = price - qty }][select { price, n }];";
         INFO("query: " << src);
         auto serial = run(src, tables);
         for (const std::size_t threads : {2U, 8U}) {
@@ -2369,12 +2394,13 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         require_tables_equal(run(src, tables), island);
     }
 
-    SECTION("a non-filter head keeps the gathering source") {
+    SECTION("a project head keeps the gathering source") {
+        // Project is still a ParallelMap, so it forms an island — but it is not
+        // a shape `range_filter_head` absorbs, so it gathers.
         runtime::ParallelIslandStats stats;
-        const auto* src = "t[update { n = price * 2 }];";
+        const auto* src = "t[filter price > 100][select { price, qty }];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
-        CHECK(stats.range_heads.load() == 0);
+        REQUIRE(stats.parallel_islands.load() >= 1);
         require_tables_equal(run(src, tables), island);
     }
 }

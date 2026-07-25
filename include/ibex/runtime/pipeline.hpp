@@ -40,6 +40,9 @@ enum class ParallelEligibilityReason : std::uint8_t {
     NotParallelMap,
     UnsupportedExpression,
     UnsupportedShape,
+    /// Every operator in the chain is metadata-only, so there is no per-row
+    /// work to spread across threads — see `analyze_parallel_island`.
+    NoRowWork,
 };
 
 /// A maximal, bottom-up chain of parallel-map candidates rooted at an IR node.

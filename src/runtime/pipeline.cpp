@@ -36,6 +36,15 @@ auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
 
 namespace {
 
+/// True when a node relabels or selects columns without touching a row.
+///
+/// `project_table` and `rename_table` both build their output with
+/// `add_column_shared` — they copy no rows at all, and cost O(columns) rather
+/// than O(rows). There is nothing in them to parallelize.
+auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool {
+    return kind == ir::NodeKind::Project || kind == ir::NodeKind::Rename;
+}
+
 auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
     switch (node.kind()) {
         case ir::NodeKind::Filter:
@@ -103,6 +112,25 @@ auto analyze_parallel_island(const ir::Node& root) -> ParallelIslandCandidate {
 
     if (candidate.operators.empty()) {
         candidate.reason = ParallelEligibilityReason::NotParallelMap;
+        return candidate;
+    }
+
+    // A chain of nothing but Project/Rename has no per-row work in it, so an
+    // island would gather every morsel and concatenate the results — two whole
+    // table copies — in order to parallelize what is a pointer assignment per
+    // column. Measured on 20M rows across six columns, a bare `select` went
+    // from 0.65-0.83s serial to 1.20-1.36s as an island, and a bare `rename`
+    // from 0.68-0.72s to 1.31-1.45s.
+    //
+    // They stay ParallelMap rather than being demoted, because a `select` or
+    // `rename` sitting above a filter belongs in that filter's island: it is
+    // free there, and excluding it would split the chain and materialize
+    // between the two halves.
+    if (std::ranges::all_of(candidate.operators, [](const ir::Node* node) {
+            return is_metadata_only_node(node->kind());
+        })) {
+        candidate.operators.clear();
+        candidate.reason = ParallelEligibilityReason::NoRowWork;
         return candidate;
     }
 

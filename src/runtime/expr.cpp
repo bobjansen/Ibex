@@ -1766,12 +1766,25 @@ auto field_uses_vectorized_eval(const ir::Expr& expr) -> bool {
 //   4. the per-row eval_expr loop.
 // update_table and windowed_update_table (and through them the grouped,
 // guarded, and chunked variants) and evaluate_field_column all dispatch here.
-auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCtx& ctx)
-    -> std::expected<ComputedColumn, std::string> {
-    std::size_t rows = input.rows();
+auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
+                    const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+    const std::size_t table_rows = input.rows();
+    const bool whole = range.is_whole(table_rows);
+    // Row count of the *result*. The paths that honour a partial range produce
+    // exactly this many rows; the ones that do not are guarded below.
+    const std::size_t rows = range.count;
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
         if (const auto* fn = find_builtin(call->callee);
             fn != nullptr && use_column_kernel(*fn, *call)) {
+            // A whole-column builtin (rolling/cum/lag, generators) reads
+            // neighbouring rows or the whole frame, so a range would change its
+            // answer rather than just its cost. These are permanently
+            // non-range-native, not merely un-threaded yet.
+            if (!whole) {
+                invariant_violation(
+                    "evaluate_field: whole-column builtin under a partial row range — "
+                    "is_range_native_expr must never admit a column-kernel call");
+            }
             auto col = column_eval_of(*fn)(*call, input, rows, ctx);
             if (!col) {
                 return col;
@@ -1796,9 +1809,19 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     // nested whole-column calls cannot be built per row. Evaluate them
     // through the vectorized, validity-aware path.
     if (field_uses_vectorized_eval(expr)) {
-        auto res = eval_value_vec(expr, input, ctx.scalars, RowRange::whole(rows));
+        auto res = eval_value_vec(expr, input, ctx.scalars, range);
         if (!res) {
             return std::unexpected(res.error());
+        }
+        // `field_uses_vectorized_eval` is true only for a boolean node or a
+        // nested whole-column call, and both produce an owned dense column —
+        // never the borrowed-with-offset leaf. A borrowed result here would
+        // need densifying, which this branch does not do, so check rather than
+        // copy the wrong rows.
+        if (res->offset != 0) {
+            invariant_violation(
+                "evaluate_field: vectorized path returned a borrowed column with a row "
+                "offset; it can only produce dense results");
         }
         ColumnValue col;
         if (auto* owned = std::get_if<ColumnValue>(&res->data)) {
@@ -1812,11 +1835,18 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
         }
         return ComputedColumn{.column = std::move(col), .validity = std::move(validity)};
     }
-    if (auto fast = try_fast_update_numeric_expr(expr, input, rows, inferred.value(), ctx.scalars);
-        fast.has_value()) {
-        return ComputedColumn{
-            .column = std::move(fast.value()),
-            .validity = collect_expr_validity(expr, input, RowRange::whole(rows))};
+    // The fused numeric tree is not range-threaded yet: its leaves capture
+    // whole-column data pointers. Declining under a partial range falls through
+    // to the per-row loop below, which is range-native — linear in the range,
+    // just with a higher constant than the fused kernel. Correct either way;
+    // threading the tree is the follow-on slice.
+    if (whole) {
+        if (auto fast =
+                try_fast_update_numeric_expr(expr, input, rows, inferred.value(), ctx.scalars);
+            fast.has_value()) {
+            return ComputedColumn{.column = std::move(fast.value()),
+                                  .validity = collect_expr_validity(expr, input, range)};
+        }
     }
     ColumnValue new_column;
     switch (inferred.value()) {
@@ -1846,13 +1876,16 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, const ColumnEvalCt
     // payloads (plans/exprvalue-null-arm-plan.md, stage 2).
     ValidityBitmap validity(rows, true);
     bool any_null = false;
-    for (std::size_t row = 0; row < rows; ++row) {
+    // `eval_expr` indexes the input directly, so the loop walks source rows
+    // while the output is appended densely; validity is indexed by output row.
+    for (std::size_t row = range.begin; row < range.end(); ++row) {
+        const std::size_t out_row = row - range.begin;
         auto value = eval_expr(expr, input, row, ctx.scalars, ctx.externs);
         if (!value) {
             return std::unexpected(value.error());
         }
         if (std::holds_alternative<Null>(value.value())) {
-            validity.set(row, false);
+            validity.set(out_row, false);
             any_null = true;
             std::visit(
                 [](auto& col) {

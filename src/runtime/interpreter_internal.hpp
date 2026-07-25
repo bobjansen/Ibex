@@ -1164,7 +1164,13 @@ enum class FloatCleanMode : std::uint8_t {
 // the registry, then vectorized / fast / per-row. All update paths and
 // the vectorized evaluator's scalar-call delegation dispatch through it
 // (stage 6 of the plan).
-[[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input,
+//
+// `rows` selects which rows of `input` to evaluate; the result is always dense
+// (row 0 of the output is row `rows.begin` of the input). Not every sub-path
+// honours a partial range yet — see `is_range_native_expr`, which is the
+// authority on which expressions may be given one, and `evaluate_field`'s own
+// asserts for what happens if that gate and this function disagree.
+[[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange rows,
                                   const ColumnEvalCtx& ctx)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,

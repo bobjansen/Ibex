@@ -49,6 +49,10 @@ auto arith(ir::ArithmeticOp op, ir::ExprPtr l, ir::ExprPtr r) -> ir::ExprPtr {
     return ir::make_expr_ptr(
         ir::Expr{.node = ir::BinaryExpr{.op = op, .left = std::move(l), .right = std::move(r)}});
 }
+auto call(const char* callee, std::vector<ir::ExprPtr> args) -> ir::ExprPtr {
+    return ir::make_expr_ptr(ir::Expr{
+        .node = ir::CallExpr{.callee = callee, .args = std::move(args), .named_args = {}}});
+}
 
 /// A table wide enough that every column kind the gather special-cases is
 /// covered: fixed-width, bool (bit-packed), string (flat buffer), categorical
@@ -335,9 +339,7 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     const auto table = make_table(kRows);
 
     std::vector<NamedPredicate> fields;
-    // Per-row path: a scalar call. Under a partial range the fused numeric tree
-    // declines, so this also cross-checks the per-row loop against the fused
-    // kernel that the whole-range oracle takes.
+    // Scalar calls are range-native through the fused numeric tree.
     fields.push_back(
         {"scalar call", ir::Expr{.node = ir::CallExpr{
                                      .callee = "abs", .args = {col_ref("id")}, .named_args = {}}}});
@@ -346,6 +348,15 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
                                    .callee = "abs",
                                    .args = {arith(ir::ArithmeticOp::Sub, col_ref("id"), ilit(100))},
                                    .named_args = {}}}});
+    // Coverage for the per-row fallback that a declined splice lands in — the
+    // decline itself is not observable here (see the splice-counter test
+    // below), because a whole-table `like` and the range agree on every value.
+    fields.push_back(
+        {"spliced like leaf declines for a partial range",
+         ir::Expr{.node = ir::BinaryExpr{
+                      .op = ir::ArithmeticOp::Add,
+                      .left = call("Int64", {call("like", {col_ref("name"), slit("row-1")})}),
+                      .right = col_ref("id")}}});
     // Vectorized path: a boolean node in value position.
     fields.push_back({"boolean node", cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))});
     // Nulls must be carried at the right offset, not merely the right width.
@@ -361,6 +372,52 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
             for (std::size_t begin = 0; begin < kRows; begin += grain) {
                 const std::size_t count = std::min(grain, kRows - begin);
                 check_field_range(table, f.expr, RowRange{.begin = begin, .count = count}, f.label);
+            }
+        }
+    }
+}
+
+TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filter][range]") {
+    // `try_splice_column_leaf` evaluates its kernel over the WHOLE table, so it
+    // must decline for every partial range — including one that begins at zero,
+    // which is morsel 0 of every island. That decline cannot be tested through
+    // output: with begin == 0 the spliced whole-table column and the range
+    // agree on every value, so a value oracle passes either way (this was
+    // confirmed by mutation — restoring the `begin != 0` guard left the
+    // equivalence tests entirely green). The counter is the only witness.
+    constexpr std::size_t kRows = 200;
+    const auto table = make_table(kRows);
+    // `Int64(like(...)) + id` is the shape the splice exists for: a column
+    // kernel wrapped in a numeric cast, as a leaf of a numeric tree.
+    const ir::Expr expr{.node = ir::BinaryExpr{
+                            .op = ir::ArithmeticOp::Add,
+                            .left = call("Int64", {call("like", {col_ref("name"), slit("row-1")})}),
+                            .right = col_ref("id")}};
+    const runtime::ColumnEvalCtx ctx{
+        .scalars = nullptr, .externs = nullptr, .window = std::nullopt};
+
+    SECTION("a whole range does splice") {
+        // Without this the zero below would be satisfied just as well by an
+        // expression that never reaches the splice at all.
+        runtime::reset_column_kernel_splice_count();
+        auto whole = runtime::evaluate_field(expr, table, RowRange::whole(kRows), ctx);
+        REQUIRE(whole.has_value());
+        CHECK(runtime::column_kernel_splice_count() > 0);
+    }
+
+    SECTION("every partial range declines, including one beginning at zero") {
+        for (const std::size_t grain : {1U, 7U, 64U, 199U}) {
+            for (std::size_t begin = 0; begin < kRows; begin += grain) {
+                const std::size_t count = std::min(grain, kRows - begin);
+                if (count == kRows) {
+                    continue;  // that is the whole range, covered above
+                }
+                INFO("range [" << begin << ", " << (begin + count) << ")");
+                runtime::reset_column_kernel_splice_count();
+                auto ranged = runtime::evaluate_field(
+                    expr, table, RowRange{.begin = begin, .count = count}, ctx);
+                REQUIRE(ranged.has_value());
+                CHECK(runtime::column_kernel_splice_count() == 0);
             }
         }
     }

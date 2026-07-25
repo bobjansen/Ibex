@@ -930,9 +930,26 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
     -> std::optional<ValidityBitmap>;
 [[nodiscard]] auto filter_table(const Table& input, const ir::Expr& predicate,
                                 const ScalarRegistry* scalars) -> std::expected<Table, std::string>;
+/// True when every sub-expression of `expr` is evaluated by a range-aware path,
+/// so evaluating it under a partial `RowRange` touches only that range's rows.
+///
+/// **Callers passing a partial range must check this first.** Three evaluator
+/// branches still evaluate whole-table and slice (see `slice_column` in
+/// filter.cpp), and they do not produce a wrong answer — they produce a silent
+/// O(morsels x rows) blowup, because each morsel re-evaluates the fallback over
+/// the entire table. A parallel island that absorbed such a predicate measured
+/// 10x *slower* than the serial path it replaced.
+///
+/// This mirrors `eval_value_vec` / `compute_mask` and has to be kept in step
+/// with them: it is a claim about what those functions do, not an independent
+/// rule. Widening either evaluator without widening this leaves performance on
+/// the floor; widening this without the evaluator reintroduces the blowup.
+[[nodiscard]] auto is_range_native_expr(const ir::Expr& expr) -> bool;
+
 /// Filter rows `[rows.begin, rows.end())` of `input` without gathering that
-/// slice first: the predicate is evaluated in place and only surviving rows are
-/// materialized. Equivalent to slicing `input` and calling `filter_table` on it.
+/// slice first. For a partial range the predicate must satisfy
+/// `is_range_native_expr`, or the evaluation degrades to whole-table work per
+/// call.
 [[nodiscard]] auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
                                       const ScalarRegistry* scalars)
     -> std::expected<Table, std::string>;

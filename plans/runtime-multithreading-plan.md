@@ -733,11 +733,28 @@ lever, and it is a bigger structural change than 2a/2b were.**
 
 Not yet range-aware: `evaluate_field` (the per-row registry path shared with
 `update`), whole-column builtins, and `eval_scalar_over_columns` all evaluate
-whole-table and slice. Each is documented at `slice_column` in filter.cpp and
-none is reachable from an island, since `is_subset_evaluable_expr` admits only
-Scalar calls. Range-threading `evaluate_field` is what would unlock the 1:1
-`Project`/`Update` shapes, where the output cardinality *is* known and the
-merge copy can be removed without a two-phase pass.
+whole-table and slice. Each is documented at `slice_column` in filter.cpp.
+
+**These ARE reachable from an island, and the first version of this slice shipped
+a 10x regression because of it.** Island eligibility is
+`is_subset_evaluable_expr`, which admits Scalar calls — and every call, `abs(x)`
+included, routes to one of those fallbacks. A head absorbing `abs(a) > 50` re-ran
+`abs` over the whole 20M-row input once per morsel: 305 full-table passes,
+measured at 3.7s against 0.38s serial. (An earlier draft of this section claimed
+the opposite; it was wrong.)
+
+`is_range_native_expr` (filter.cpp, declared in interpreter_internal.hpp) is the
+gate. `range_filter_head` requires it, so a scalar-call predicate stays on
+`GatherMorselSource`, where the morsel is materialized once and the predicate
+then runs over morsel-sized data. **It is a claim about what the evaluators do,
+so it must be widened in step with them and never ahead of them** — ahead
+reintroduces the blowup, behind only costs a gather. e2e tests assert
+`range_heads == 0` for `abs(price) > 350` and for a scalar call buried in one arm
+of an `&&`.
+
+Range-threading `evaluate_field` is what would both remove that restriction and
+unlock the 1:1 `Project`/`Update` shapes, where the output cardinality *is* known
+and the merge copy can be removed without a two-phase pass.
 
 Build one bounded, ordered parallel pipeline:
 

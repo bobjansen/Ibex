@@ -2335,6 +2335,29 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         require_tables_equal(run(src, tables), island);
     }
 
+    SECTION("a scalar-call predicate falls back to the gathering source") {
+        // `abs` is a Scalar call, so island eligibility admits it — but every
+        // call still evaluates whole-table-and-slice. Absorbing this head would
+        // re-run `abs` over the entire input once per morsel: correct, and
+        // catastrophically slow (measured 10x slower than serial on 20M rows).
+        // The gathering source runs it over morsel-sized data instead.
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter abs(price) > 350];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a scalar call anywhere in the predicate disqualifies the head") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350 && abs(qty) < 5];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+
     SECTION("a non-filter head keeps the gathering source") {
         runtime::ParallelIslandStats stats;
         const auto* src = "t[update { n = price * 2 }];";

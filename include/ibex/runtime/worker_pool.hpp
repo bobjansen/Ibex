@@ -84,6 +84,14 @@ class WorkerPool {
 /// code and would otherwise each get their own pool (the RTLD_LOCAL trap).
 [[nodiscard]] auto process_worker_pool() -> WorkerPool&;
 
+/// True when the calling thread belongs to a WorkerPool.
+///
+/// The guard against nested parallelism. Anything that may run inside a pool
+/// task — an operator in a parallel island, and so everything it calls — must
+/// check this before submitting work of its own, because `WorkerPool::submit`
+/// from a worker deadlocks (and aborts loudly rather than hanging).
+[[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
+
 /// Thread budget for the compute-bound row-local island, from `IBEX_THREADS`.
 /// Unset or `auto` means `std::thread::hardware_concurrency()`; an explicit
 /// count is used as given; anything unparseable or zero falls back to 1.

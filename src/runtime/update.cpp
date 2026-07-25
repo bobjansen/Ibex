@@ -1761,6 +1761,14 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     const std::size_t rows = table.rows();
     const auto whole = [&] { return evaluate_field(expr, table, RowRange::whole(rows), ctx); };
 
+    // Reentrancy: the island's fused FilterUpdateProject operator calls
+    // update_table from a worker thread, so this can be reached on one.
+    // Submitting from there deadlocks the pool (WorkerPool::submit aborts
+    // rather than let it happen), and the morsel is already one worker's share
+    // of the table — splitting it again would only oversubscribe.
+    if (on_worker_pool_thread()) {
+        return whole();
+    }
     if (!exec.parallel || rows < exec.parallel_min_rows || !is_range_native_expr(expr)) {
         return whole();
     }

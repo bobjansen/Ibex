@@ -1835,18 +1835,14 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
         }
         return ComputedColumn{.column = std::move(col), .validity = std::move(validity)};
     }
-    // The fused numeric tree is not range-threaded yet: its leaves capture
-    // whole-column data pointers. Declining under a partial range falls through
-    // to the per-row loop below, which is range-native — linear in the range,
-    // just with a higher constant than the fused kernel. Correct either way;
-    // threading the tree is the follow-on slice.
-    if (whole) {
-        if (auto fast =
-                try_fast_update_numeric_expr(expr, input, rows, inferred.value(), ctx.scalars);
-            fast.has_value()) {
-            return ComputedColumn{.column = std::move(fast.value()),
-                                  .validity = collect_expr_validity(expr, input, range)};
-        }
+    // The fused numeric tree is range-aware: its leaves advance their base
+    // pointers by `range.begin`, and a leaf that would still need whole-table
+    // evaluation declines so this falls through to the per-row loop below
+    // rather than re-reading the whole column per call.
+    if (auto fast = try_fast_update_numeric_expr(expr, input, range, inferred.value(), ctx.scalars);
+        fast.has_value()) {
+        return ComputedColumn{.column = std::move(fast.value()),
+                              .validity = collect_expr_validity(expr, input, range)};
     }
     ColumnValue new_column;
     switch (inferred.value()) {

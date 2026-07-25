@@ -172,9 +172,13 @@ auto get_double_value(const FastOperand& op, std::size_t row) -> double {
     invariant_violation("get_double_value: unexpected operand column type");
 }
 
-auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_t rows,
+auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange range,
                             ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
+    // `rows` is the output width; `begin` offsets every read of an input column
+    // so the result is dense for the range.
+    const std::size_t rows = range.count;
+    const std::size_t begin = range.begin;
     const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
     if (bin == nullptr) {
         return std::nullopt;
@@ -243,10 +247,10 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         // Falls back to nullptr + scalar=0 for int-typed columns (uncommon path
         // handled by the fallback reserve+push_back loop below).
         const double* lp = (left->is_column && left->kind == ExprType::Double)
-                               ? std::get<Column<double>>(*left->column).data()
+                               ? std::get<Column<double>>(*left->column).data() + begin
                                : nullptr;
         const double* rp = (right->is_column && right->kind == ExprType::Double)
-                               ? std::get<Column<double>>(*right->column).data()
+                               ? std::get<Column<double>>(*right->column).data() + begin
                                : nullptr;
         const double ls = left->is_column ? 0.0 : get_double_value(*left, 0);
         const double rs = right->is_column ? 0.0 : get_double_value(*right, 0);
@@ -277,8 +281,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         Column<double> out;
         out.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row)
-            out.push_back(apply_double_op(bin->op, get_double_value(*left, row),
-                                          get_double_value(*right, row)));
+            out.push_back(apply_double_op(bin->op, get_double_value(*left, begin + row),
+                                          get_double_value(*right, begin + row)));
         return ColumnValue{std::move(out)};
     }
     if (output_kind == ExprType::Int) {
@@ -290,10 +294,10 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
             return ColumnValue{std::move(out)};
         }
         const std::int64_t* lp = (left->is_column && left->kind == ExprType::Int)
-                                     ? std::get<Column<std::int64_t>>(*left->column).data()
+                                     ? std::get<Column<std::int64_t>>(*left->column).data() + begin
                                      : nullptr;
         const std::int64_t* rp = (right->is_column && right->kind == ExprType::Int)
-                                     ? std::get<Column<std::int64_t>>(*right->column).data()
+                                     ? std::get<Column<std::int64_t>>(*right->column).data() + begin
                                      : nullptr;
         std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
         std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
@@ -323,8 +327,8 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, std::size_
         Column<std::int64_t> out;
         out.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row)
-            out.push_back(
-                apply_int_op(bin->op, get_int_value(*left, row), get_int_value(*right, row)));
+            out.push_back(apply_int_op(bin->op, get_int_value(*left, begin + row),
+                                       get_int_value(*right, begin + row)));
         return ColumnValue{std::move(out)};
     }
     return std::nullopt;
@@ -463,10 +467,18 @@ auto to_numeric_column(const ColumnValue& src, ExprType want) -> std::optional<C
 // `temps`, whose heap buffers outlive the block evaluation (moving a Column on a
 // `temps` reallocation preserves its data pointer).
 auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
-                            std::vector<NumericUpdateNode>& nodes, std::vector<ColumnValue>& temps)
-    -> std::optional<std::uint32_t> {
+                            std::vector<NumericUpdateNode>& nodes, std::vector<ColumnValue>& temps,
+                            std::size_t begin) -> std::optional<std::uint32_t> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    // The spliced kernel (`like`, a numeric cast) runs over the WHOLE table, so
+    // under a partial range this leaf would re-evaluate the entire column once
+    // per morsel — the O(morsels x rows) shape that has bitten this path
+    // before. Decline instead; the caller falls back to the per-row loop, which
+    // is linear in the range.
+    if (begin != 0) {
         return std::nullopt;
     }
 
@@ -559,14 +571,16 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
 auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
                                      const ScalarRegistry* scalars,
                                      std::vector<NumericUpdateNode>& nodes,
-                                     std::vector<ColumnValue>& temps)
+                                     std::vector<ColumnValue>& temps, std::size_t begin)
     -> std::optional<std::uint32_t> {
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
-        auto left = try_compile_numeric_update_expr(*bin->left, input, scalars, nodes, temps);
+        auto left =
+            try_compile_numeric_update_expr(*bin->left, input, scalars, nodes, temps, begin);
         if (!left.has_value()) {
             return std::nullopt;
         }
-        auto right = try_compile_numeric_update_expr(*bin->right, input, scalars, nodes, temps);
+        auto right =
+            try_compile_numeric_update_expr(*bin->right, input, scalars, nodes, temps, begin);
         if (!right.has_value()) {
             return std::nullopt;
         }
@@ -595,8 +609,8 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
             if (kern == nullptr) {
                 return std::nullopt;
             }
-            auto child =
-                try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes, temps);
+            auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
+                                                         temps, begin);
             if (!child.has_value()) {
                 return std::nullopt;
             }
@@ -619,7 +633,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         if ((is_min || is_max) && call->args.size() >= 2 && call->named_args.empty()) {
             std::optional<std::uint32_t> acc;
             for (const auto& arg : call->args) {
-                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes, temps);
+                auto a = try_compile_numeric_update_expr(*arg, input, scalars, nodes, temps, begin);
                 if (!a.has_value()) {
                     return std::nullopt;  // non-numeric arg (string/date/…): slow path
                 }
@@ -644,8 +658,8 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         // a Double argument): compile the child, wrap in a UnaryDouble node.
         if (call->args.size() == 1 && call->named_args.empty()) {
             if (auto fn = lookup_unary_double_fn(call->callee)) {
-                auto child =
-                    try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes, temps);
+                auto child = try_compile_numeric_update_expr(*call->args[0], input, scalars, nodes,
+                                                             temps, begin);
                 if (!child.has_value()) {
                     return std::nullopt;
                 }
@@ -667,7 +681,7 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
         // A column-kernel call (e.g. `Int64(like(col, "pat"))`): evaluate it once
         // into a numeric column leaf rather than dropping the whole enclosing
         // expression to the per-row evaluator.
-        return try_splice_column_leaf(expr, input, scalars, nodes, temps);
+        return try_splice_column_leaf(expr, input, scalars, nodes, temps, begin);
     }
 
     auto operand = resolve_fast_operand(expr, input, scalars);
@@ -683,10 +697,13 @@ auto try_compile_numeric_update_expr(const ir::Expr& expr, const Table& input,
     if (operand->is_column) {
         if (operand->kind == ExprType::Int) {
             node.kind = NumericUpdateNode::Kind::IntColumn;
-            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data();
+            // Leaves are read as `node.i64[block_offset + i]` with a block
+            // offset relative to the range, so advancing the base pointer here
+            // is all the range costs the tree.
+            node.i64 = std::get<Column<std::int64_t>>(*operand->column).data() + begin;
         } else {
             node.kind = NumericUpdateNode::Kind::DoubleColumn;
-            node.dbl = std::get<Column<double>>(*operand->column).data();
+            node.dbl = std::get<Column<double>>(*operand->column).data() + begin;
         }
     } else {
         if (operand->kind == ExprType::Int) {
@@ -1029,9 +1046,13 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
 // mixed int/double clip or a nested pmin(pmax(...)) falls through to the generic
 // blocked NumericUpdateNode evaluator. The compare order (`b < a ? b : a`) matches the
 // scalar pmin builtin for NaN/tie parity.
-auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size_t rows,
+auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, RowRange range,
                              ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
+    // `rows` is the output width; `begin` offsets every read of an input column
+    // so the result is dense for the range.
+    const std::size_t rows = range.count;
+    const std::size_t begin = range.begin;
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr) {
         return std::nullopt;
@@ -1069,9 +1090,9 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
 
     if (output_kind == ExprType::Double) {
         const double* lp =
-            left->is_column ? std::get<Column<double>>(*left->column).data() : nullptr;
+            left->is_column ? std::get<Column<double>>(*left->column).data() + begin : nullptr;
         const double* rp =
-            right->is_column ? std::get<Column<double>>(*right->column).data() : nullptr;
+            right->is_column ? std::get<Column<double>>(*right->column).data() + begin : nullptr;
         Column<double> out;
         out.resize_for_overwrite(rows);
         run(out.data(), lp, left->is_column ? 0.0 : get_double_value(*left, 0), rp,
@@ -1079,10 +1100,12 @@ auto try_fast_update_pminmax(const ir::Expr& expr, const Table& input, std::size
         return ColumnValue{std::move(out)};
     }
     if (output_kind == ExprType::Int) {
-        const std::int64_t* lp =
-            left->is_column ? std::get<Column<std::int64_t>>(*left->column).data() : nullptr;
-        const std::int64_t* rp =
-            right->is_column ? std::get<Column<std::int64_t>>(*right->column).data() : nullptr;
+        const std::int64_t* lp = left->is_column
+                                     ? std::get<Column<std::int64_t>>(*left->column).data() + begin
+                                     : nullptr;
+        const std::int64_t* rp = right->is_column
+                                     ? std::get<Column<std::int64_t>>(*right->column).data() + begin
+                                     : nullptr;
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         run(out.data(), lp, left->is_column ? std::int64_t{0} : get_int_value(*left, 0), rp,
@@ -1231,9 +1254,13 @@ namespace {
 // loop keeps each body a direct, inlinable kernel (vsqrtpd/vandpd/vroundpd) or a
 // libmvec chunk. Remaining transcendentals (trig/hyperbolic) fall through to the
 // scalar tree-walk.
-auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t rows,
+auto try_fast_update_unary(const ir::Expr& expr, const Table& input, RowRange range,
                            ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
+    // `rows` is the output width; `begin` offsets every read of an input column
+    // so the result is dense for the range.
+    const std::size_t rows = range.count;
+    const std::size_t begin = range.begin;
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
     if (call == nullptr || !call->named_args.empty()) {
         return std::nullopt;
@@ -1245,7 +1272,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         if (moderef == nullptr || !arg || !arg->is_column || arg->kind != ExprType::Double) {
             return std::nullopt;
         }
-        const double* src = std::get<Column<double>>(*arg->column).data();
+        const double* src = std::get<Column<double>>(*arg->column).data() + begin;
         Column<std::int64_t> out;
         out.resize_for_overwrite(rows);
         std::int64_t* dst = out.data();
@@ -1293,9 +1320,11 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         ColumnValue owned;  // backing store if the argument is computed
         const double* src = nullptr;
         if (arg && arg->is_column && arg->kind == ExprType::Double) {
-            src = std::get<Column<double>>(*arg->column).data();
+            src = std::get<Column<double>>(*arg->column).data() + begin;
         } else {
-            auto materialised = try_fast_update_numeric_expr(*call->args[0], input, rows,
+            // Ranged: the temp comes back dense for the range, so the
+            // `owned` pointer below is read at offset 0, not `begin`.
+            auto materialised = try_fast_update_numeric_expr(*call->args[0], input, range,
                                                              ExprType::Double, scalars);
             if (!materialised || !std::holds_alternative<Column<double>>(*materialised)) {
                 return std::nullopt;  // non-double / non-fast arg: tree-walk
@@ -1316,7 +1345,7 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
         if (!arg || !arg->is_column || arg->kind != ExprType::Double) {
             return std::nullopt;
         }
-        const double* src = std::get<Column<double>>(*arg->column).data();
+        const double* src = std::get<Column<double>>(*arg->column).data() + begin;
         Column<double> out;
         out.resize_for_overwrite(rows);
         double* dst = out.data();
@@ -1345,18 +1374,19 @@ auto try_fast_update_unary(const ir::Expr& expr, const Table& input, std::size_t
 
 }  // namespace
 
-auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std::size_t rows,
+auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, RowRange range,
                                   ExprType output_kind, const ScalarRegistry* scalars)
     -> std::optional<ColumnValue> {
-    if (auto fast = try_fast_update_binary(expr, input, rows, output_kind, scalars);
+    const std::size_t rows = range.count;
+    if (auto fast = try_fast_update_binary(expr, input, range, output_kind, scalars);
         fast.has_value()) {
         return fast;
     }
-    if (auto fast = try_fast_update_pminmax(expr, input, rows, output_kind, scalars);
+    if (auto fast = try_fast_update_pminmax(expr, input, range, output_kind, scalars);
         fast.has_value()) {
         return fast;
     }
-    if (auto fast = try_fast_update_unary(expr, input, rows, output_kind, scalars);
+    if (auto fast = try_fast_update_unary(expr, input, range, output_kind, scalars);
         fast.has_value()) {
         return fast;
     }
@@ -1371,7 +1401,7 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, std:
     // pointers into these; reserved so pushes never reallocate mid-compile.
     std::vector<ColumnValue> temps;
     temps.reserve(8);
-    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps);
+    auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps, range.begin);
     if (!root.has_value() || nodes[*root].type != output_kind) {
         return std::nullopt;
     }

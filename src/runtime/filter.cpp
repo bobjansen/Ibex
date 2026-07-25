@@ -76,9 +76,14 @@ auto merge_validity(const ValidityBitmap* a, std::size_t a_off, const ValidityBi
                     std::size_t b_off, std::size_t n) -> std::optional<ValidityBitmap> {
     if (!a && !b)
         return std::nullopt;
-    if (a_off != 0 || b_off != 0) {
-        // Offset slice: build both sides dense, then AND. The word-wise path
-        // below assumes bit i of each input is row i, which an offset breaks.
+    // The word-wise path below assumes bit i of each input is row i AND that
+    // copying a whole source bitmap yields exactly `n` bits. A non-zero offset
+    // breaks the first; a range that starts at 0 but is shorter than the source
+    // breaks the second — it would return a bitmap of the source's length, not
+    // the range's. Both take the general path.
+    const bool exact_width = (a == nullptr || a->size() == n) && (b == nullptr || b->size() == n);
+    if (a_off != 0 || b_off != 0 || !exact_width) {
+        // Offset slice: build both sides dense, then AND.
         if (!a)
             return slice_validity(*b, b_off, n);
         if (!b)
@@ -2351,19 +2356,29 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
                        (node.right == nullptr || is_range_native_expr(*node.right));
             } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
                 return is_range_native_expr(*node.operand);
+            } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                // Mirrors eval_value_vec's CallExpr branch, which is what picks
+                // the sub-path — these are its three non-range-native outcomes,
+                // in its order:
+                const auto* fn = find_builtin(node.callee);
+                if (fn == nullptr) {
+                    return false;  // extern or unknown: not evaluated here at all
+                }
+                if (use_column_kernel(*fn, node)) {
+                    return false;  // whole-column builtin — a range changes its answer
+                }
+                if (std::ranges::any_of(
+                        node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); })) {
+                    return false;  // routes to eval_scalar_over_columns, still whole-table
+                }
+                // Otherwise it delegates to `evaluate_field`, whose fused
+                // numeric tree and per-row loop are both range-native. Named
+                // args are literals or bare identifiers (window spans, round
+                // modes), never evaluated per row.
+                return std::ranges::all_of(node.args,
+                                           [](const auto& a) { return is_range_native_expr(*a); });
             } else {
-                // CallExpr stays excluded, and the reason is now cost, not
-                // correctness. `evaluate_field` IS range-native as of this
-                // slice — but only via its per-row loop, because the fused
-                // numeric tree declines a partial range (its leaves capture
-                // whole-column pointers). Admitting calls here therefore trades
-                // a morsel gather plus a vectorized kernel for a boxed per-row
-                // eval, and that loses: `abs(a) > 50` over 20M rows measured
-                // 0.44-0.54s with calls admitted against 0.37-0.38s gathering.
-                //
-                // Range-threading the numeric tree is what unblocks this; until
-                // then the gather is genuinely the faster path. RankExpr and
-                // anything added later are excluded by the same default, which
+                // RankExpr and anything added later. Excluded by default, which
                 // is the safe direction: a false negative only costs a gather,
                 // a false positive costs O(morsels x rows).
                 return false;

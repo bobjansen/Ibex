@@ -2335,25 +2335,36 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         require_tables_equal(run(src, tables), island);
     }
 
-    SECTION("a scalar-call predicate falls back to the gathering source") {
-        // `abs` is a Scalar call, so island eligibility admits it — but every
-        // call still evaluates whole-table-and-slice. Absorbing this head would
-        // re-run `abs` over the entire input once per morsel: correct, and
-        // catastrophically slow (measured 10x slower than serial on 20M rows).
-        // The gathering source runs it over morsel-sized data instead.
+    SECTION("a scalar-call predicate is absorbed once evaluate_field is range-native") {
+        // `abs` routes through evaluate_field, whose fused numeric tree and
+        // per-row loop are both range-aware. This was deliberately excluded
+        // while only the per-row loop was threaded, because declining the fused
+        // tree per morsel cost more than gathering.
         runtime::ParallelIslandStats stats;
         const auto* src = "t[filter abs(price) > 350];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
         REQUIRE(stats.parallel_islands.load() == 1);
-        CHECK(stats.range_heads.load() == 0);
+        CHECK(stats.range_heads.load() == 1);
         require_tables_equal(run(src, tables), island);
     }
 
-    SECTION("a scalar call anywhere in the predicate disqualifies the head") {
+    SECTION("a scalar call in one arm of a conjunction is still absorbed") {
         runtime::ParallelIslandStats stats;
         const auto* src = "t[filter price > 350 && abs(qty) < 5];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
         REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.range_heads.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a whole-column builtin keeps the gathering source") {
+        // rolling/cum/lag read neighbouring rows, so a range would change the
+        // answer rather than just the cost. Permanently non-range-native — and
+        // evaluate_field aborts rather than compute one, so if this ever
+        // regressed the abort would fire instead of a wrong answer.
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter lag(price, 1) > 350];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.range_heads.load() == 0);
         require_tables_equal(run(src, tables), island);
     }

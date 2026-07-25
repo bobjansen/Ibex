@@ -351,6 +351,12 @@ struct ParallelIslandStats {
     /// regression to gathering everywhere would only show up as a slow
     /// benchmark.
     std::atomic<std::uint64_t> range_heads{0};
+    /// Update fields whose evaluation was split across worker threads inside
+    /// `update_table`, rather than run as one whole-table evaluation. Same
+    /// reason as `range_heads`: the split is invisible in the output, so
+    /// without a counter a regression to serial would leave every test green
+    /// and only show up as a slow benchmark.
+    std::atomic<std::uint64_t> parallel_fields{0};
 };
 
 struct ExecutionContext {

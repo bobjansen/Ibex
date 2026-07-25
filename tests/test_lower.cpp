@@ -65,41 +65,47 @@ TEST_CASE("Parallel-island eligibility follows lowered canonical IR", "[runtime]
     CHECK(candidate.operators[0]->kind() == ir::NodeKind::FilterProject);
 }
 
-TEST_CASE("Parallel-island eligibility admits a row-local update", "[runtime][pipeline]") {
-    // An `update` is where a query's arithmetic lives. It is a barrier in
-    // general, but an unguarded, ungrouped, scalar-only one is a row-local map,
-    // and an island that excluded it would parallelize the projection around
-    // the work rather than the work.
+TEST_CASE("Parallel-island eligibility excludes a bare update", "[runtime][pipeline]") {
+    // An `update` is row-local, and an earlier slice did admit it here. It is
+    // excluded again on measurement: an update is 1:1 and `update_table` builds
+    // its output by moving the input, so a morsel island buys parallelism over
+    // the computed column at the price of two whole-table copies, while
+    // `update_table` now splits that computation across threads with none. See
+    // execution_capability(const ir::Node&) for the numbers.
     {
         auto program = require_parse("df[update { n = price * 2 }];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
         auto candidate = runtime::analyze_parallel_island(**result);
-        REQUIRE(candidate.eligible());
-        REQUIRE(candidate.input != nullptr);
-        CHECK(candidate.input->kind() == ir::NodeKind::Scan);
-        REQUIRE(candidate.operators.size() == 1);
-        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Update);
+        CHECK_FALSE(candidate.eligible());
+        CHECK(candidate.reason == runtime::ParallelEligibilityReason::NotParallelMap);
     }
     {
-        // And it chains with the other map kinds (source-to-sink order).
-        auto program = require_parse("df[update { n = price * 2 }][filter n > 5];");
+        // An update above a filter does not drag the filter out of an island:
+        // build_operator retries at each node, so the filter below still forms
+        // one of its own.
+        auto program = require_parse("df[filter price > 5][update { n = price * 2 }];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
         auto candidate = runtime::analyze_parallel_island(**result);
-        REQUIRE(candidate.eligible());
-        REQUIRE(candidate.operators.size() == 2);
-        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Update);
-        CHECK(candidate.operators[1]->kind() == ir::NodeKind::Filter);
+        CHECK_FALSE(candidate.eligible());
+
+        const ir::Node* child = (**result).children().front().get();
+        REQUIRE(child != nullptr);
+        auto below = runtime::analyze_parallel_island(*child);
+        CHECK(below.eligible());
     }
 }
 
 TEST_CASE("Parallel-island eligibility rejects updates that are not row-local",
           "[runtime][pipeline]") {
-    // Each of these is a barrier for a different reason, and each would be
-    // silently wrong if evaluated one morsel at a time.
+    // Every update is excluded from an island now, so these pass for the same
+    // reason a plain one does. They are kept because each would be *silently
+    // wrong* rather than merely slow if some later change re-admitted updates
+    // without re-checking row-locality — the aggregate case especially, which
+    // the looser `is_row_local_update_expr` accepts.
     const char* cases[] = {
         // Aggregate over the whole table: per morsel this becomes a per-morsel
         // mean. `is_row_local_update_expr` (which routes the *serial* chunked

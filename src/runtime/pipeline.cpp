@@ -36,26 +36,6 @@ auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
 
 namespace {
 
-/// True for an update the island may run one morsel at a time.
-///
-/// The field test is `is_subset_evaluable_expr` (scalar-only), deliberately
-/// stricter than the `is_row_local_update_expr` that routes an update to the
-/// serial `ChunkedUpdateOperator`. That looser predicate admits aggregate
-/// calls: `y = x - mean(x)` passes it, and per morsel that would mean a
-/// per-morsel aggregate. Evaluation happens to reject an ungrouped aggregate in
-/// an update today, but eligibility must not rest on another layer's error —
-/// the serial path also gets away with the looser test only because its source
-/// hands over the whole table as one chunk, and an island must not inherit that
-/// assumption.
-auto is_row_local_update_node(const ir::UpdateNode& update) -> bool {
-    if (update.guard() != nullptr || !update.group_by().empty() || !update.tuple_fields().empty()) {
-        return false;
-    }
-    return std::ranges::all_of(update.fields(), [](const ir::FieldSpec& field) {
-        return ir::is_subset_evaluable_expr(field.expr);
-    });
-}
-
 auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
     switch (node.kind()) {
         case ir::NodeKind::Filter:
@@ -73,10 +53,6 @@ auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
                 return ir::is_subset_evaluable_expr(field.expr);
             });
         }
-        case ir::NodeKind::Update:
-            // Already proved by execution_capability(const Node&); a node that
-            // failed it never reaches here as a ParallelMap.
-            return true;
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
             return true;
@@ -88,11 +64,23 @@ auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
 }  // namespace
 
 auto execution_capability(const ir::Node& node) -> ExecutionCapability {
-    if (node.kind() == ir::NodeKind::Update) {
-        return is_row_local_update_node(static_cast<const ir::UpdateNode&>(node))
-                   ? ExecutionCapability::ParallelMap
-                   : ExecutionCapability::Barrier;
-    }
+    // A bare `update` is deliberately NOT a ParallelMap, even though it is
+    // row-local and an earlier slice did admit it here.
+    //
+    // An update is 1:1, and `update_table` builds its output by moving the
+    // input, so a passthrough column costs nothing. Running one through a
+    // morsel island therefore adds two whole-table copies (the per-morsel
+    // gather and the merge concat) to buy parallelism over the computed column
+    // alone — and `update_table` can now split that computation across threads
+    // by itself, with no copies at all. Measured on 20M rows, net of
+    // generation: a heavy update over six columns is 0.32s serial, 0.72s as an
+    // island, 0.08s split inside the operator; over two columns, 0.29s / 0.27s
+    // / 0.09s. The island loses on the wide table and wins nothing on the
+    // narrow one.
+    //
+    // Filter-shaped nodes stay ParallelMap: their cardinality is
+    // data-dependent, so they cannot presize an output, and the island's
+    // ordered merger is what resolves that.
     return execution_capability(node.kind());
 }
 

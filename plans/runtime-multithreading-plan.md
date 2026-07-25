@@ -752,6 +752,22 @@ reintroduces the blowup, behind only costs a gather. e2e tests assert
 `range_heads == 0` for `abs(price) > 350` and for a scalar call buried in one arm
 of an `&&`.
 
+The invariant is enforced, not just documented — the original defect passed every
+correctness test, so a comment was demonstrably not enough. Two aborts catch the
+two distinct failures:
+
+- `require_range_evaluable`, at the `filter_table_range` /
+  `filter_project_table_range` boundary: a caller passed a partial range without
+  consulting the gate.
+- `slice_computed`: the gate admitted a predicate an evaluator branch still
+  cannot evaluate by range — the two have drifted apart.
+
+Because a partial range can no longer reach a whole-table branch, the slicing
+fallback itself is gone (`slice_column` deleted); `slice_computed` now only
+unwraps the whole-range case. Both aborts were mutation-verified: widening the
+gate to admit `CallExpr` trips the first, removing the check from
+`range_filter_head` trips the second.
+
 Range-threading `evaluate_field` is what would both remove that restriction and
 unlock the 1:1 `Project`/`Update` shapes, where the output cardinality *is* known
 and the merge copy can be removed without a two-phase pass.

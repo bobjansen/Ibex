@@ -99,6 +99,43 @@ TEST_CASE("Parallel-island eligibility excludes a bare update", "[runtime][pipel
     }
 }
 
+TEST_CASE("Parallel-island eligibility requires per-row work", "[runtime][pipeline]") {
+    // `project_table` and `rename_table` build their output with
+    // `add_column_shared` — no rows are copied, and the cost is O(columns). An
+    // island of nothing but those would gather every morsel and concatenate the
+    // results in order to parallelize a pointer assignment: measured on 20M
+    // rows over six columns, a bare `select` went 0.65-0.83s serial to
+    // 1.20-1.36s as an island, a bare `rename` 0.68-0.72s to 1.31-1.45s.
+    {
+        for (const auto* src : {"df[select { price, qty }];", "df[rename px = price];",
+                                "df[select { price, qty }][rename p = price];"}) {
+            INFO("query: " << src);
+            auto program = require_parse(src);
+            auto result = parser::lower(program);
+            REQUIRE(result.has_value());
+
+            auto candidate = runtime::analyze_parallel_island(**result);
+            CHECK_FALSE(candidate.eligible());
+            CHECK(candidate.reason == runtime::ParallelEligibilityReason::NoRowWork);
+        }
+    }
+    {
+        // But they are not demoted from ParallelMap, because above a filter
+        // they belong in that filter's island — free there, and excluding them
+        // would split the chain and materialize in between. This is the case
+        // the rule must not break.
+        auto program = require_parse("df[filter price > 5][rename px = price];");
+        auto result = parser::lower(program);
+        REQUIRE(result.has_value());
+
+        auto candidate = runtime::analyze_parallel_island(**result);
+        REQUIRE(candidate.eligible());
+        REQUIRE(candidate.operators.size() == 2);
+        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Filter);
+        CHECK(candidate.operators[1]->kind() == ir::NodeKind::Rename);
+    }
+}
+
 TEST_CASE("Parallel-island eligibility rejects updates that are not row-local",
           "[runtime][pipeline]") {
     // Every update is excluded from an island now, so these pass for the same

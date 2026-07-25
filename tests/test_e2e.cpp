@@ -2057,27 +2057,31 @@ TEST_CASE("E2E: parallel serial-island handles a zero-row input", "[e2e][paralle
     }
 }
 
-TEST_CASE("E2E: parallel serial-island handles a column-less row scaffold", "[e2e][parallel]") {
+TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][parallel]") {
     // A `Table(n)` scaffold carries its row count in `logical_rows` with no
-    // columns. The partitioned source splits it into logical row ranges (grain 2
-    // over 3 rows -> two morsels), so the project runs per morsel and the
-    // validator sees a full, ordered stream that reassembles to 3 rows.
+    // columns, which is the shape most likely to be dropped by a path that
+    // reasons about columns.
+    //
+    // It no longer forms an island. The plan is Project(Update(Scan)): the
+    // update is a barrier now, leaving a chain of just the project, and a
+    // metadata-only chain has no per-row work to spread (NoRowWork). Both of
+    // those are deliberate, so this asserts the reason rather than eligibility
+    // — a different reason would mean something else changed. The morsel
+    // source's own column-less handling is covered in test_operator.cpp.
     {
-        // Guard: the case is only meaningful if it actually takes the parallel
-        // island (a column-less input), not a silent serial fallback.
         auto parsed = parser::parse("Table(3)[select { c = 1 }];");
         REQUIRE(parsed.has_value());
         auto lowered = parser::lower(*parsed);
         REQUIRE(lowered.has_value());
         auto candidate = runtime::analyze_parallel_island(**lowered);
-        REQUIRE(candidate.eligible());  // takes the island, not a serial fallback
-        REQUIRE(candidate.input != nullptr);
+        CHECK_FALSE(candidate.eligible());
+        CHECK(candidate.reason == runtime::ParallelEligibilityReason::NoRowWork);
     }
     auto serial = run("Table(3)[select { c = 1 }];", {});
-    auto island = run_parallel("Table(3)[select { c = 1 }];", {}, 2);
-    require_tables_equal(serial, island);
-    REQUIRE(island.rows() == 3);
-    CHECK(col_i64(island, "c") == std::vector<std::int64_t>{1, 1, 1});
+    auto parallel = run_parallel("Table(3)[select { c = 1 }];", {}, 2);
+    require_tables_equal(serial, parallel);
+    REQUIRE(parallel.rows() == 3);
+    CHECK(col_i64(parallel, "c") == std::vector<std::int64_t>{1, 1, 1});
 }
 
 // --- Phase 1 worker-pool island equivalence ----------------------------------
@@ -2129,8 +2133,11 @@ TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e]
         "t[filter price > 350];",
         "t[filter price > 350, select { price, qty }];",
         "t[filter qty > 2, select { price, notional = price * qty }];",
-        "t[select { price, qty }];",
+        // A select/rename above a filter rides in the filter's island, which is
+        // why Project and Rename stay ParallelMap even though a chain of only
+        // those is refused.
         "t[filter price > 150][rename px = price];",
+        "t[filter price > 150][select { price, qty }];",
         "t[filter price > 995];",  // very selective: most morsels are empty
     };
     for (const auto* src : cases) {

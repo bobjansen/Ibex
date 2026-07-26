@@ -304,11 +304,45 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     for (std::size_t i = 0; i < rows; ++i)
                         fk.str.push_back(col[i]);
                 } else {
-                    // Categorical: sort by dictionary value (string_view into shared dict)
-                    fk.kind = FlatKind::Str;
-                    fk.str.reserve(rows);
-                    for (std::size_t i = 0; i < rows; ++i)
-                        fk.str.push_back(col[i]);
+                    // Categorical: rank the DICTIONARY by value, then map each
+                    // row's code through that ranking, so this becomes an
+                    // ordinary integer key and takes the radix paths above.
+                    //
+                    // The obvious alternative — flatten to one string_view per
+                    // row and let `ordinal_encode` discover the distinct values
+                    // — hashes every row to rebuild a dictionary the column is
+                    // already carrying. Sorting 5M rows by a 3-value symbol
+                    // spent ~13% of the whole query doing exactly that.
+                    const auto& dict = col.dictionary();
+                    std::vector<std::uint32_t> order(dict.size());
+                    std::iota(order.begin(), order.end(), 0U);
+                    std::ranges::sort(
+                        order, [&](std::uint32_t a, std::uint32_t b) { return dict[a] < dict[b]; });
+                    // Equal strings must share a rank. Two dictionary entries
+                    // can hold the same value (dictionaries are per row group
+                    // upstream), and giving those distinct ranks would order
+                    // equal values as if they differed.
+                    std::vector<std::uint64_t> rank(dict.size());
+                    std::uint64_t next = 0;
+                    for (std::size_t r = 0; r < order.size(); ++r) {
+                        if (r > 0 && dict[order[r]] != dict[order[r - 1]]) {
+                            ++next;
+                        }
+                        rank[order[r]] = next;
+                    }
+                    fk.kind = FlatKind::I64;
+                    fk.u64.reserve(rows);
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        const auto code = col.code_at(i);
+                        // A null row's code carries no meaning: nulls are ranked
+                        // by `is_null` in the comparator, and a null-bearing key
+                        // never reaches a radix path at all.
+                        const std::uint64_t value =
+                            (code >= 0 && static_cast<std::size_t>(code) < rank.size())
+                                ? rank[static_cast<std::size_t>(code)]
+                                : 0;
+                        fk.u64.push_back(value ^ kSignFlip);
+                    }
                 }
             },
             *column);

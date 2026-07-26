@@ -731,6 +731,66 @@ exact per-morsel sizes, presize, then gather into slices), because a filter's
 cardinality is not known up front. **That two-phase filter island is the next
 lever, and it is a bigger structural change than 2a/2b were.**
 
+### The two-phase filter — DONE, and it is the largest island win so far
+
+`TwoPhaseFilterOperator` (chunked.cpp) replaces the ordered merger for an island
+that is *exactly one* range-native `Filter` / `FilterProject`:
+
+- **Phase A** (parallel) — every morsel evaluates the predicate and packs its
+  surviving rows into keep words. Only the counts matter afterwards.
+- **prefix sum** (serial, O(morsels)) — each morsel learns the row, and for
+  string columns the byte, where its output begins. The output is allocated
+  once, at exactly the final size.
+- **Phase B** (parallel) — every morsel gathers its rows straight into that
+  output at its own offset. Disjoint slices, no locking, nothing copied twice.
+
+One chunk is emitted, and `MaterializeOperator` *moves* its first chunk rather
+than concatenating it, so the merge copy is gone rather than merely cheaper.
+Ordering is structural (a morsel's rows land at its prefix-sum offset), so there
+is no ring and no merger.
+
+Interleaved, min-of-5, 20M rows / 6 columns / 8 threads, net of generation. The
+"merger" column is the same binary with the gate forced off, so this isolates
+the two-phase pass rather than comparing builds:
+
+| shape | serial | ordered merger | two-phase |
+|---|---:|---:|---:|
+| 4 filters, 93% kept | 1686 | 2489 | **265** |
+| 4 filters, 6.7% kept | 133 | 133 | **~0** |
+| 4 scalar-call filters | 297 | 277 | **32** |
+
+Every round beat every round on all three shapes. The bulk-output filter — the
+one shape where parallel had been *losing* to serial, and the reason islands
+were still off by default — is now 6.4x faster than serial and 9.4x faster than
+the merger it replaces.
+
+**Restriction, and it is a correctness gate rather than a tuning knob.**
+`filter_gather_is_thread_safe` refuses any output column that is bit-packed: a
+`Column<bool>` or a validity bitmap stores 64 rows per word, so two morsels
+meeting mid-word would read-modify-write the same word and lose bits. Disjoint
+output *rows* are only disjoint *memory* for columns with at least one
+addressable unit per row. Those shapes stay on the ordered merger, which is
+still correct and still the right structure for them. Widening this to nullable
+columns — the common real-world case — needs either a zeroed destination plus
+`atomic_ref` fetch_or on the two boundary words, or a serial boundary fixup
+(at most one word per morsel boundary, so O(morsels)).
+
+**The refactor that made it expressible.** `filter_table_impl` was split into
+`compute_filter_selection` / `build_filter_output_layout` /
+`count_selected_chars` / `presize_filter_output` / `gather_selection_into`
+(declared in interpreter_internal.hpp), and the serial path was routed through
+them first, so the parallel filter shares one gather with the serial one instead
+of growing a second that can drift.
+
+**Observability:** `ParallelIslandStats::two_phase_filters`, for the same reason
+as `range_heads` — both paths produce byte-identical output, so a silent fall
+back to the merger (a narrowed gate, a newly nullable column) would cost the
+merge copy again with every test green. Mutation-verified three ways: forcing
+the gate open, collapsing the row prefix sum, and collapsing the byte prefix sum
+each fail the suite. Notably, forcing the gate open failed **only** the counter
+assertion — the bit-packing race did not manifest at 1000 rows, which is exactly
+why the counter is load-bearing.
+
 Not yet range-aware: `evaluate_field` (the per-row registry path shared with
 `update`), whole-column builtins, and `eval_scalar_over_columns` all evaluate
 whole-table and slice. Each is documented at `slice_column` in filter.cpp.

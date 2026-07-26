@@ -10860,3 +10860,61 @@ TEST_CASE("Interpret order gathers every column kind identically in parallel",
         }
     }
 }
+
+// The rolling extrema deque holds candidate row indices in a power-of-two ring.
+// A count window reserves its capacity up front so the push can skip a bounds
+// check -- but row `i` is pushed BEFORE the window is trimmed, so the deque
+// transiently holds the previous window's candidates plus one. Reserving only
+// the window width lets that push wrap and overwrite the front, which returns
+// the newest value where the oldest belongs: a wrong answer, not a crash.
+//
+// It needs a power-of-two window (capacity == width exactly, no slack) and
+// monotonic input (nothing is ever popped, so the deque reaches its maximum).
+// The whole suite missed this, so both extrema and both parities are covered.
+TEST_CASE("rolling extrema over a power-of-two count window", "[interpreter][window]") {
+    constexpr std::size_t kRows = 300;
+    auto run = [&](const char* query, std::size_t width, bool ascending) {
+        Column<std::int64_t> val;
+        val.reserve(kRows);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            // Monotonic, so the deque never pops and grows to its bound.
+            val.push_back(static_cast<std::int64_t>(ascending ? i : kRows - i));
+        }
+        runtime::Table table;
+        table.add_column("val", std::move(val));
+        runtime::TableRegistry registry;
+        registry.emplace("data", table);
+        auto ir = require_ir(query);
+        auto res = runtime::interpret(*ir, registry);
+        REQUIRE(res.has_value());
+        const auto* out = std::get_if<Column<std::int64_t>>(res->find("m"));
+        REQUIRE(out != nullptr);
+        REQUIRE(out->size() == kRows);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const std::size_t lo = i + 1 >= width ? i + 1 - width : 0;
+            std::int64_t want =
+                ascending ? static_cast<std::int64_t>(lo) : static_cast<std::int64_t>(kRows - i);
+            // Ascending input: the minimum of [lo, i] is at lo, the maximum at i.
+            // Descending input: reversed.
+            if (std::string(query).find("rolling_max") != std::string::npos) {
+                want = ascending ? static_cast<std::int64_t>(i)
+                                 : static_cast<std::int64_t>(kRows - lo);
+            }
+            CAPTURE(i, width, ascending);
+            REQUIRE((*out)[i] == want);
+        }
+    };
+
+    SECTION("rolling_min, ascending (nothing is ever popped)") {
+        run("data[update { m = rolling_min(val, 64) }];", 64, true);
+    }
+    SECTION("rolling_max, descending (nothing is ever popped)") {
+        run("data[update { m = rolling_max(val, 64) }];", 64, false);
+    }
+    SECTION("a non-power-of-two width, where the reservation has slack") {
+        run("data[update { m = rolling_min(val, 50) }];", 50, true);
+    }
+    SECTION("a width of one") {
+        run("data[update { m = rolling_min(val, 1) }];", 1, true);
+    }
+}

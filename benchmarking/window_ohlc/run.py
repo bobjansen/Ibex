@@ -193,12 +193,16 @@ def main() -> None:
     # before any such import, so setting it here is honoured.
     if args.threads == "1":
         os.environ["POLARS_MAX_THREADS"] = "1"
+        # Ibex runs parallel islands by DEFAULT now, so pinning the other two
+        # without pinning it would quietly hand Ibex threads its competitors
+        # were denied -- and the headline "single-threaded, Ibex wins at every
+        # scale" result was measured back when Ibex had no threads to give.
+        os.environ["IBEX_PARALLEL"] = "0"
         duck_threads = 1
         label = "1t"        # single-threaded / per-core
     else:
         duck_threads = args.duckdb_threads
         label = "mt"        # multi-threaded (each engine's default)
-    # Ibex is single-threaded regardless, so its `threads` tag is always "1t".
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     rows_out = ["engine\tthreads\trows\tsymbols\twindow\tmin_ms\tmedian_ms"]
@@ -211,7 +215,7 @@ def main() -> None:
                 for engine in args.engines:
                     if engine == "ibex":
                         mn, md = bench_ibex(pq, window, args.iters)
-                        tag = "1t"
+                        tag = label
                     elif engine == "polars":
                         mn, md = bench_polars(pq, window, args.iters)
                         tag = label

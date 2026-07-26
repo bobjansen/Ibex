@@ -5862,8 +5862,8 @@ auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t
 }
 
 void configure_parallel_from_env(ExecutionContext& exec) {
-    if (parallel_enabled_from_env()) {
-        exec.parallel = true;
+    if (const auto want = parallel_enabled_from_env(); want.has_value()) {
+        exec.parallel = *want;
     }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
         exec.parallel_grain = grain;

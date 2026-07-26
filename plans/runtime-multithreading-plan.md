@@ -838,6 +838,39 @@ set for reconsidering the `IBEX_PARALLEL` default. That decision still wants a
 wider sweep (narrow tables, small inputs near `parallel_min_rows`, the grain
 itself is still an untuned 65536) before flipping.
 
+### Parallel islands are ON by default — and window_ohlc is untouched by it
+
+`ExecutionContext::parallel` now defaults to true. `IBEX_PARALLEL` became a
+**two-way** switch (`0`/`off`/`false`/`no` as well as the true-ish values, and
+`nullopt` when unset so a caller's own choice survives) — a switch that could
+only turn islands on would leave no way to turn them off, which is what a user
+hitting a threading bug or an A/B measuring the feature needs. Verified end to
+end at 20M rows / 6 columns / 4 bulk filters, net of generation: default
+**250ms**, `IBEX_PARALLEL=0` **1157ms**, explicit on **225ms**.
+
+**The window-OHLC suite does not move: ±1.5% at 1M and 5M rows, both flavours.**
+That is worth stating plainly, because window_ohlc is the benchmark that made
+the case for multithreading in the first place (Polars and DuckDB pull 3.3-3.9x
+from threads there; Ibex pulled 1x). Instrumenting `analyze_parallel_island`
+over the real query shows why: **every node is `NotParallelMap` with zero
+operators** — Scan, AsTimeframe, Aggregate, Window, Order are all barriers. No
+island is ever formed, so no amount of island work can help it.
+
+So the multithreading built so far — morsel islands over row-local map chains —
+does not touch the workload that motivated multithreading. Closing the
+window_ohlc gap needs a *grouped windowed aggregate* to become parallel, which
+is a different piece of work: partition by group key, not by row range. That is
+the honest next target, and it is not a variation on what exists.
+
+**Harness fairness bug the flip created, now fixed.** `run.py --threads 1`
+pinned Polars and DuckDB but not Ibex, and hardcoded Ibex's tag as `1t` on the
+assumption that Ibex had no threads to give. Left alone it would have handed
+Ibex threads its competitors were denied, silently inflating exactly the
+"single-threaded, Ibex wins at every scale" result. It now sets
+`IBEX_PARALLEL=0` in that mode and tags each engine with the mode it really ran
+in; the README records that pre-change `mt` rows are single-threaded Ibex and do
+not compare with new ones.
+
 ### The two knobs are now derived, not tuned
 
 A 96-config sweep (4k..4M grain x 2/6/16 columns x both selectivities) settled that

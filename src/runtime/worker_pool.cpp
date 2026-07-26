@@ -8,6 +8,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -212,9 +213,15 @@ auto process_worker_pool() -> WorkerPool& {
     return pool;
 }
 
-auto parallel_enabled_from_env() -> bool {
+auto parallel_enabled_from_env() -> std::optional<bool> {
     const auto raw = env_value("IBEX_PARALLEL");
-    return raw == "1" || raw == "on" || raw == "true" || raw == "yes";
+    if (raw == "1" || raw == "on" || raw == "true" || raw == "yes") {
+        return true;
+    }
+    if (raw == "0" || raw == "off" || raw == "false" || raw == "no") {
+        return false;
+    }
+    return std::nullopt;
 }
 
 auto morsel_rows_from_env() -> std::size_t {

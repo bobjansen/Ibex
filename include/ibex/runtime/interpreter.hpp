@@ -357,6 +357,13 @@ struct ParallelIslandStats {
     /// without a counter a regression to serial would leave every test green
     /// and only show up as a slow benchmark.
     std::atomic<std::uint64_t> parallel_fields{0};
+    /// Islands run as a two-phase filter — output presized from per-morsel
+    /// popcounts, then gathered into disjoint slices — instead of through the
+    /// ordered merger. Same reason as `range_heads`: both produce identical
+    /// output, so without a counter a silent fall back to the merger (a
+    /// narrowed gate, a newly nullable column) would cost the merge copy again
+    /// with every test still green.
+    std::atomic<std::uint64_t> two_phase_filters{0};
 };
 
 struct ExecutionContext {

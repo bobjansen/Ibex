@@ -2411,3 +2411,165 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         require_tables_equal(run(src, tables), island);
     }
 }
+
+namespace {
+
+// A table whose every column can be gathered into concurrently: no validity
+// bitmap and no `Column<bool>`, both of which pack 64 rows to a word. The
+// string column is deliberately variable-width, because that is what forces the
+// two-phase pass to prefix-sum *bytes* as well as rows.
+auto make_two_phase_table(std::size_t rows) -> runtime::TableRegistry {
+    Column<std::int64_t> price;
+    Column<double> weight;
+    Column<std::string> symbol;
+    price.reserve(rows);
+    weight.reserve(rows);
+    symbol.reserve(rows);
+    const char* symbols[] = {"A", "BB", "CCCC", "DDDDDDDD", ""};
+    for (std::size_t i = 0; i < rows; ++i) {
+        price.push_back(static_cast<std::int64_t>((i * 37) % 1000));
+        weight.push_back(static_cast<double>(i) * 0.5);
+        symbol.push_back(symbols[i % 5]);
+    }
+    runtime::Table t;
+    t.add_column("price", std::move(price));
+    t.add_column("weight", std::move(weight));
+    t.add_column("symbol", std::move(symbol));
+
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+
+}  // namespace
+
+TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[e2e][parallel]") {
+    // The two-phase filter is a silent optimization in the strongest sense: it
+    // produces byte-identical output to the ordered merger, so nothing but a
+    // counter can tell which one ran. Every section therefore asserts BOTH the
+    // path taken and the answer — a `two_phase_filters` assertion alone would
+    // pass against a broken gather, and an equality assertion alone would pass
+    // against a silent fall back to the merger.
+    auto tables = make_two_phase_table(1000);
+
+    SECTION("a bare filter takes the two-phase path") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a fused projection takes it too") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350, select { symbol, weight }];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("an empty result presizes to zero rows") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 100000];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("keeping every row still lands each morsel at its own offset") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price >= 0];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a grain that does not divide the input") {
+        // The last morsel is short, so its prefix-sum offset is the one that
+        // exposes an off-by-one in the row or byte accounting.
+        for (const std::size_t grain : {std::size_t{1}, std::size_t{3}, std::size_t{64},
+                                        std::size_t{65}, std::size_t{333}, std::size_t{999}}) {
+            runtime::ParallelIslandStats stats;
+            const auto* src = "t[filter price > 200];";
+            auto island = run_parallel(src, tables, grain, 4, &stats);
+            CAPTURE(grain);
+            require_tables_equal(run(src, tables), island);
+        }
+    }
+
+    SECTION("an operator above the filter keeps the ordered merger") {
+        // Anything above the filter consumes per-morsel chunks, which is
+        // exactly what the two-phase form does not produce.
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350][rename px = price];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a non-range-native predicate keeps the ordered merger") {
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter lag(price, 1) > 350];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        CHECK(stats.two_phase_filters.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+}
+
+TEST_CASE("E2E: a bit-packed output column keeps the filter on the ordered merger",
+          "[e2e][parallel]") {
+    // Disjoint output ROWS are disjoint MEMORY only for columns storing at
+    // least one addressable unit per row. A validity bitmap and a
+    // `Column<bool>` pack 64 rows into a word, so two morsels meeting mid-word
+    // would read-modify-write the same word and lose bits. This is a data race,
+    // not a slow path, so the refusal has to hold.
+    SECTION("a nullable column refuses") {
+        auto tables = make_wide_island_table(1000);
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350];";  // keeps nullable `qty`
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("projecting the nullable column away allows it again") {
+        // The check is on the columns the filter actually OUTPUTS, so a fused
+        // projection that drops the bitmap is back on the fast path. This is
+        // what makes the previous section a real gate rather than a table-wide
+        // veto that would happen to pass.
+        auto tables = make_wide_island_table(1000);
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350, select { price, symbol }];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a bool column refuses") {
+        Column<std::int64_t> price;
+        Column<bool> flag;
+        price.reserve(500);
+        flag.reserve(500);
+        for (std::size_t i = 0; i < 500; ++i) {
+            price.push_back(static_cast<std::int64_t>((i * 37) % 1000));
+            flag.push_back(i % 3 == 0);
+        }
+        runtime::Table t;
+        t.add_column("price", std::move(price));
+        t.add_column("flag", std::move(flag));
+        runtime::TableRegistry tables;
+        tables.emplace("t", std::move(t));
+
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 0);
+        require_tables_equal(run(src, tables), island);
+    }
+}

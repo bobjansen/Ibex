@@ -2131,18 +2131,34 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
 
 namespace {
 
-auto filter_table_impl(const Table& input, const ir::Expr& predicate,
-                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
-                       const ScalarRegistry* scalars, RowRange rows)
-    -> std::expected<Table, std::string> {
-    // `n` and every index below are range-relative: the mask, the keep-word
-    // blocks and the output are all dense. Only the gather converts back to a
-    // source index, by adding `rows.begin` (see for_each_selected).
+// Yields the *source* row index of every selected row, so a gather reads the
+// right rows whether or not the range starts at 0.
+template <typename Fn>
+void for_each_selected_row(const FilterSelection& sel, RowRange rows, const Fn& fn) {
+    for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
+        std::uint64_t bits = sel.keep_words[w];
+        const std::size_t base = rows.begin + (w * 64);
+        while (bits != 0) {
+            const int bit = std::countr_zero(bits);
+            fn(base + static_cast<std::size_t>(bit));
+            bits &= (bits - 1);
+        }
+    }
+}
+
+}  // namespace
+
+auto compute_filter_selection(const Table& input, const ir::Expr& predicate,
+                              const ScalarRegistry* scalars, RowRange rows, std::size_t row_limit)
+    -> std::expected<FilterSelection, std::string> {
+    // `n` and every index below are range-relative: the mask and the keep-word
+    // blocks are both dense.
     const std::size_t n = rows.count;
 
     auto mask_result = compute_mask(predicate, input, scalars, rows);
-    if (!mask_result)
+    if (!mask_result) {
         return std::unexpected(mask_result.error());
+    }
 
     // 3VL: keep row iff value[i]==1 AND (no valid vector OR valid[i]==1)
     const uint8_t* mp = mask_result->value.data();
@@ -2151,9 +2167,9 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     // Block-wise compaction: keep bits per 64-row chunk + popcount for out size.
     // When `row_limit` is non-zero, stop scanning after we've accumulated that
     // many kept rows — any suffix words stay zero and gather skips them.
+    FilterSelection sel;
     const std::size_t n_words = (n + 63) / 64;
-    std::vector<std::uint64_t> keep_words(n_words, 0);
-    std::size_t out_n = 0;
+    sel.keep_words.assign(n_words, 0);
     for (std::size_t w = 0; w < n_words; ++w) {
         const std::size_t base = w * 64;
         const std::size_t lim = std::min<std::size_t>(64, n - base);
@@ -2166,10 +2182,10 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
         const std::uint64_t bits = pack_mask_word_scalar(mp + base, vp ? vp + base : nullptr, lim);
 #endif
         const auto block_kept = static_cast<std::size_t>(std::popcount(bits));
-        if (row_limit != 0 && out_n + block_kept >= row_limit) {
+        if (row_limit != 0 && sel.kept + block_kept >= row_limit) {
             // Trim this block's high-order keep bits so we emit exactly
-            // `row_limit - out_n` more rows and then stop.
-            std::size_t remaining = row_limit - out_n;
+            // `row_limit - kept` more rows and then stop.
+            std::size_t remaining = row_limit - sel.kept;
             std::uint64_t trimmed = 0;
             std::uint64_t b = bits;
             while (remaining > 0 && b != 0) {
@@ -2177,101 +2193,137 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                 b &= b - 1;
                 --remaining;
             }
-            keep_words[w] = trimmed;
-            out_n = row_limit;
+            sel.keep_words[w] = trimmed;
+            sel.kept = row_limit;
             break;
         }
-        keep_words[w] = bits;
-        out_n += block_kept;
+        sel.keep_words[w] = bits;
+        sel.kept += block_kept;
     }
+    return sel;
+}
 
-    // Build output skeleton: either all input columns (no projection) or
-    // just the projected subset. `src_of_dst[d]` maps an output column index
-    // to its source index in `input.columns`.
-    Table output;
-    std::vector<std::size_t> src_of_dst;
+auto build_filter_output_layout(const Table& input, const std::vector<ir::ColumnRef>* project)
+    -> std::expected<FilterOutputLayout, std::string> {
+    FilterOutputLayout layout;
     if (project == nullptr) {
-        output.columns.reserve(input.columns.size());
-        src_of_dst.reserve(input.columns.size());
+        layout.output.columns.reserve(input.columns.size());
+        layout.src_of_dst.reserve(input.columns.size());
         for (std::size_t i = 0; i < input.columns.size(); ++i) {
             const auto& entry = input.columns[i];
-            output.add_column(entry.name, make_empty_like(*entry.column));
-            src_of_dst.push_back(i);
+            layout.output.add_column(entry.name, make_empty_like(*entry.column));
+            layout.src_of_dst.push_back(i);
         }
-    } else {
-        output.columns.reserve(project->size());
-        src_of_dst.reserve(project->size());
-        for (const auto& col : *project) {
-            auto it = input.index.find(col.name);
-            if (it == input.index.end()) {
-                return std::unexpected("select column not found: " + col.name);
-            }
-            const auto& entry = input.columns[it->second];
-            output.add_column(entry.name, make_empty_like(*entry.column));
-            src_of_dst.push_back(it->second);
+        return layout;
+    }
+    layout.output.columns.reserve(project->size());
+    layout.src_of_dst.reserve(project->size());
+    for (const auto& col : *project) {
+        auto it = input.index.find(col.name);
+        if (it == input.index.end()) {
+            return std::unexpected("select column not found: " + col.name);
+        }
+        const auto& entry = input.columns[it->second];
+        layout.output.add_column(entry.name, make_empty_like(*entry.column));
+        layout.src_of_dst.push_back(it->second);
+    }
+    return layout;
+}
+
+void count_selected_chars(const Table& input, const std::vector<std::size_t>& src_of_dst,
+                          const FilterSelection& sel, RowRange rows,
+                          std::vector<std::size_t>& chars) {
+    for (std::size_t d = 0; d < src_of_dst.size(); ++d) {
+        const auto* src =
+            std::get_if<Column<std::string>>(input.columns[src_of_dst[d]].column.get());
+        if (src == nullptr) {
+            continue;
+        }
+        const uint32_t* src_off = src->offsets_data();
+        std::size_t total = 0;
+        for_each_selected_row(sel, rows,
+                              [&](std::size_t si) { total += src_off[si + 1] - src_off[si]; });
+        chars[d] += total;
+    }
+}
+
+void presize_filter_output(Table& output, const Table& input,
+                           const std::vector<std::size_t>& src_of_dst, std::size_t rows_total,
+                           const std::vector<std::size_t>& chars_total) {
+    for (std::size_t d = 0; d < output.columns.size(); ++d) {
+        std::visit(
+            [&](auto& dst) {
+                using ColT = std::decay_t<decltype(dst)>;
+                if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    dst.resize_for_gather(rows_total, chars_total[d]);
+                    // Row 0 starts at byte 0; every gather then writes only the
+                    // *end* offset of each row it produces, so this one entry
+                    // is what makes the offsets array well-formed no matter how
+                    // the rows are divided up.
+                    dst.offsets_data()[0] = 0;
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    // Zero-filled on purpose: the bit appender ORs into its
+                    // destination word rather than assigning it.
+                    dst.resize(rows_total);
+                } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    dst.resize(rows_total);
+                } else if constexpr (std::is_trivially_default_constructible_v<
+                                         typename ColT::value_type>) {
+                    // Every output row is written by exactly one gather, so
+                    // value-initializing here would be a wasted pass over the
+                    // whole column.
+                    dst.resize_for_overwrite(rows_total);
+                } else {
+                    dst.resize(rows_total);
+                }
+            },
+            *output.columns[d].column);
+        if (input.columns[src_of_dst[d]].validity.has_value()) {
+            output.columns[d].validity.emplace(rows_total, false);
         }
     }
+}
 
-    // Yields *source* row indices, so every gather below reads the right rows
-    // whether or not the range starts at 0.
-    auto for_each_selected = [&](auto&& fn) {
-        for (std::size_t w = 0; w < n_words; ++w) {
-            std::uint64_t bits = keep_words[w];
-            const std::size_t base = rows.begin + (w * 64);
-            while (bits != 0) {
-                const int bit = std::countr_zero(bits);
-                fn(base + static_cast<std::size_t>(bit));
-                bits &= (bits - 1);
-            }
-        }
-    };
-
-    auto copy_column = [&](std::size_t dst_idx) {
-        const std::size_t src_idx = src_of_dst[dst_idx];
-        const auto& src_entry = input.columns[src_idx];
-        auto& dst_entry = output.columns[dst_idx];
+void gather_selection_into(Table& output, const Table& input,
+                           const std::vector<std::size_t>& src_of_dst, const FilterSelection& sel,
+                           RowRange rows, GatherDest dst) {
+    for (std::size_t d = 0; d < output.columns.size(); ++d) {
+        const auto& src_entry = input.columns[src_of_dst[d]];
+        auto& dst_entry = output.columns[d];
+        const std::size_t char_base = dst.char_base == nullptr ? 0 : (*dst.char_base)[d];
         std::visit(
             [&](const auto& src) {
                 using ColT = std::decay_t<decltype(src)>;
-                auto* dst = std::get_if<ColT>(dst_entry.column.get());
-                if (dst == nullptr) {
+                auto* out = std::get_if<ColT>(dst_entry.column.get());
+                if (out == nullptr) {
                     invariant_violation(
                         "filter_table: source/destination gather column type mismatch");
                 }
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    dst->resize(out_n);
                     const auto* sp = src.codes_data();
-                    auto* dp = dst->codes_data();
-                    std::size_t j = 0;
-                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
+                    auto* dp = out->codes_data();
+                    std::size_t j = dst.row;
+                    for_each_selected_row(sel, rows, [&](std::size_t si) { dp[j++] = sp[si]; });
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                    // Two-pass flat-buffer gather: compute total bytes, then bulk-memcpy
-                    // slabs.
                     const uint32_t* src_off = src.offsets_data();
-                    std::size_t total_chars = 0;
-                    for_each_selected(
-                        [&](std::size_t si) { total_chars += src_off[si + 1] - src_off[si]; });
-                    dst->resize_for_gather(out_n, total_chars);
-                    uint32_t* dst_off = dst->offsets_data();
-                    char* dst_char = dst->chars_data();
+                    uint32_t* dst_off = out->offsets_data();
+                    char* dst_char = out->chars_data();
                     const char* src_char = src.chars_data();
-                    dst_off[0] = 0;
-                    uint32_t cur = 0;
-                    std::size_t j = 0;
-                    for_each_selected([&](std::size_t si) {
+                    auto cur = static_cast<uint32_t>(char_base);
+                    std::size_t j = dst.row;
+                    for_each_selected_row(sel, rows, [&](std::size_t si) {
                         const uint32_t len = src_off[si + 1] - src_off[si];
                         std::memcpy(dst_char + cur, src_char + src_off[si], len);
                         cur += len;
                         dst_off[++j] = cur;
                     });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    dst->resize(out_n);
-                    auto* __restrict dst_words = dst->words_data();
+                    auto* __restrict dst_words = out->words_data();
                     const auto* __restrict src_words = src.words_data();
                     const std::size_t src_words_n = (src.size() + 63) / 64;
-                    std::size_t out_bit = 0;
-                    for (std::size_t w = 0; w < n_words; ++w) {
-                        const std::uint64_t select = keep_words[w];
+                    std::size_t out_bit = dst.row;
+                    for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
+                        const std::uint64_t select = sel.keep_words[w];
                         if (select == 0) {
                             continue;
                         }
@@ -2293,43 +2345,67 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                     }
                 } else {
                     using T = ColT::value_type;
-                    dst->resize(out_n);
                     const T* sp = src.data();
-                    T* dp = dst->data();
-                    std::size_t j = 0;
-                    for_each_selected([&](std::size_t si) { dp[j++] = sp[si]; });
+                    T* dp = out->data();
+                    std::size_t j = dst.row;
+                    for_each_selected_row(sel, rows, [&](std::size_t si) { dp[j++] = sp[si]; });
                 }
             },
             *src_entry.column);
-    };
 
-    for (std::size_t c = 0; c < output.columns.size(); ++c) {
-        copy_column(c);
-    }
-
-    // Propagate validity bitmaps using the same selected row set.
-    for (std::size_t c = 0; c < output.columns.size(); ++c) {
-        const std::size_t src_idx = src_of_dst[c];
-        if (input.columns[src_idx].validity.has_value()) {
-            const auto& src_bm = *input.columns[src_idx].validity;
-            ValidityBitmap dst_bm(out_n, false);
-            std::size_t j = 0;
-            for_each_selected([&](std::size_t si) { dst_bm.set(j++, src_bm[si]); });
-            output.columns[c].validity = std::move(dst_bm);
+        // Validity travels with the same selected row set.
+        if (src_entry.validity.has_value()) {
+            const auto& src_bm = *src_entry.validity;
+            auto& dst_bm = *dst_entry.validity;
+            std::size_t j = dst.row;
+            for_each_selected_row(sel, rows, [&](std::size_t si) { dst_bm.set(j++, src_bm[si]); });
         }
     }
+}
+
+auto filter_gather_is_thread_safe(const Table& input, const std::vector<std::size_t>& src_of_dst)
+    -> bool {
+    return std::ranges::none_of(src_of_dst, [&](std::size_t src_idx) {
+        const auto& entry = input.columns[src_idx];
+        return entry.validity.has_value() || std::holds_alternative<Column<bool>>(*entry.column);
+    });
+}
+
+namespace {
+
+auto filter_table_impl(const Table& input, const ir::Expr& predicate,
+                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
+                       const ScalarRegistry* scalars, RowRange rows)
+    -> std::expected<Table, std::string> {
+    auto sel = compute_filter_selection(input, predicate, scalars, rows, row_limit);
+    if (!sel) {
+        return std::unexpected(std::move(sel.error()));
+    }
+    auto layout = build_filter_output_layout(input, project);
+    if (!layout) {
+        return std::unexpected(std::move(layout.error()));
+    }
+
+    // This filter owns its whole output, so it is both the only writer and the
+    // one that sizes it: count, presize, gather at offset zero. A parallel
+    // filter runs the same three steps, but sizes once for every morsel and
+    // hands each a different destination.
+    std::vector<std::size_t> chars(layout->output.columns.size(), 0);
+    count_selected_chars(input, layout->src_of_dst, *sel, rows, chars);
+    presize_filter_output(layout->output, input, layout->src_of_dst, sel->kept, chars);
+    gather_selection_into(layout->output, input, layout->src_of_dst, *sel, rows, GatherDest{});
 
     // A row-local filter preserves order and time index; a fused projection
     // keeps each only when its column survives the selection.
     apply_table_properties(
-        output,
-        derive_table_properties(table_properties_of(input),
-                                [&](const std::string& name) -> std::optional<std::string> {
-                                    return (project == nullptr || output.index.contains(name))
-                                               ? std::optional<std::string>{name}
-                                               : std::nullopt;
-                                }));
-    return output;
+        layout->output,
+        derive_table_properties(
+            table_properties_of(input), [&](const std::string& name) -> std::optional<std::string> {
+                return (project == nullptr || layout->output.index.contains(name))
+                           ? std::optional<std::string>{name}
+                           : std::nullopt;
+            }));
+    return std::move(layout->output);
 }
 
 }  // namespace

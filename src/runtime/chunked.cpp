@@ -6462,6 +6462,281 @@ class ParallelIslandOperator final : public Operator {
     WorkerPool::Batch batch_;
 };
 
+// Runtime-multithreading Phase 2: the two-phase parallel filter.
+//
+// What the ordered merger above cannot remove is the merge itself. Each worker
+// materializes its morsel's surviving rows, and `MaterializeOperator` then
+// copies all of them again into one table — so a filter island copies its
+// output twice where the serial path copies it once. That is why island wins
+// track OUTPUT size rather than input size: a selective predicate wins easily,
+// and a bulk one loses no matter how much input work is parallelized.
+//
+// A filter cannot simply presize its output and skip the merge, because its
+// cardinality is data-dependent — nobody knows where morsel 7's rows belong
+// until morsels 0-6 have been counted. So run the filter in two passes:
+//
+//   Phase A   every morsel evaluates the predicate and packs its surviving
+//             rows into keep words, in parallel. Only the counts matter after.
+//   (serial)  an exclusive prefix sum over those counts gives each morsel the
+//             row — and, for string columns, the byte — where its output
+//             begins. The output is then allocated ONCE, at exactly the
+//             final size.
+//   Phase B   every morsel gathers its rows straight into that shared output
+//             at its own offset, in parallel. The slices are disjoint, so no
+//             locking is needed and nothing is copied twice.
+//
+// The result is emitted as ONE chunk, which `MaterializeOperator` moves instead
+// of concatenating. Ordering is structural — a morsel's rows land at its
+// prefix-sum offset — so there is no ring, no merger, and the output is
+// byte-identical to the serial filter's.
+//
+// What it costs: phase A's keep words are held for every morsel at once, which
+// is one bit per input row (2.5MB for 20M rows), and phase B re-walks them.
+// Neither re-evaluates the predicate.
+//
+// Restriction (`filter_gather_is_thread_safe`): disjoint output ROWS are only
+// disjoint MEMORY for columns storing at least one addressable unit per row.
+// `Column<bool>` and validity bitmaps pack 64 rows to a word, so two morsels
+// meeting mid-word would read-modify-write the same word and lose bits. Those
+// shapes stay on the ordered merger.
+class TwoPhaseFilterOperator final : public Operator {
+   public:
+    TwoPhaseFilterOperator(std::unique_ptr<Table> input, const ir::Expr& predicate,
+                           bool fused_project, const ScalarRegistry* scalars,
+                           FilterOutputLayout layout, std::size_t grain, std::uint64_t morsel_count,
+                           std::size_t workers, WorkerPool& pool)
+        : input_(std::move(input)),
+          predicate_(&predicate),
+          fused_project_(fused_project),
+          scalars_(scalars),
+          layout_(std::move(layout)),
+          grain_(grain == 0 ? 1 : grain),
+          morsel_count_(morsel_count),
+          workers_(workers),
+          pool_(&pool) {
+        selections_.resize(static_cast<std::size_t>(morsel_count_));
+        row_at_.assign(static_cast<std::size_t>(morsel_count_), 0);
+    }
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (done_) {
+            return std::optional<Chunk>{};
+        }
+        done_ = true;
+        auto table = run();
+        if (!table.has_value()) {
+            return std::unexpected(std::move(table.error()));
+        }
+        // Sequence 0 / row_offset 0: this operator emits the island's whole
+        // output at once, so it is trivially the first and only morsel.
+        return std::optional<Chunk>{table_to_chunk(std::move(table.value()), ChunkIdentity{})};
+    }
+
+   private:
+    [[nodiscard]] auto run() -> std::expected<Table, std::string> {
+        const std::size_t n_cols = layout_.output.columns.size();
+        const bool has_strings = std::ranges::any_of(layout_.src_of_dst, [&](std::size_t src) {
+            return std::holds_alternative<Column<std::string>>(*input_->columns[src].column);
+        });
+        if (has_strings) {
+            chars_at_.assign(static_cast<std::size_t>(morsel_count_),
+                             std::vector<std::size_t>(n_cols, 0));
+        }
+
+        if (auto failure = run_over_morsels([this](std::uint64_t sequence) { phase_a(sequence); });
+            failure.has_value()) {
+            return std::unexpected(std::move(*failure));
+        }
+
+        // Exclusive prefix sums: each morsel's counts become its offsets, and
+        // the running totals become the output's exact size. Serial on purpose
+        // — it is O(morsels), not O(rows).
+        std::size_t rows_total = 0;
+        for (std::size_t m = 0; m < selections_.size(); ++m) {
+            row_at_[m] = rows_total;
+            rows_total += selections_[m].kept;
+        }
+        std::vector<std::size_t> chars_total(n_cols, 0);
+        if (has_strings) {
+            for (std::size_t d = 0; d < n_cols; ++d) {
+                for (auto& per_morsel : chars_at_) {
+                    const std::size_t count = per_morsel[d];
+                    per_morsel[d] = chars_total[d];
+                    chars_total[d] += count;
+                }
+            }
+        }
+
+        presize_filter_output(layout_.output, *input_, layout_.src_of_dst, rows_total, chars_total);
+
+        if (auto failure = run_over_morsels([this](std::uint64_t sequence) { phase_b(sequence); });
+            failure.has_value()) {
+            return std::unexpected(std::move(*failure));
+        }
+
+        // Identical rule to the serial filter: a row-local filter preserves
+        // order and time index; a fused projection keeps each only when its
+        // column survives.
+        apply_table_properties(
+            layout_.output, derive_table_properties(
+                                table_properties_of(*input_),
+                                [&](const std::string& name) -> std::optional<std::string> {
+                                    return (!fused_project_ || layout_.output.index.contains(name))
+                                               ? std::optional<std::string>{name}
+                                               : std::nullopt;
+                                }));
+        return std::move(layout_.output);
+    }
+
+    void phase_a(std::uint64_t sequence) {
+        const auto rows = morsel_range(sequence);
+        auto selection =
+            compute_filter_selection(*input_, *predicate_, scalars_, rows, /*row_limit=*/0);
+        if (!selection.has_value()) {
+            record_error(sequence, std::move(selection.error()));
+            return;
+        }
+        auto& slot = selections_[static_cast<std::size_t>(sequence)];
+        slot = std::move(selection.value());
+        if (!chars_at_.empty()) {
+            count_selected_chars(*input_, layout_.src_of_dst, slot, rows,
+                                 chars_at_[static_cast<std::size_t>(sequence)]);
+        }
+    }
+
+    void phase_b(std::uint64_t sequence) {
+        const auto index = static_cast<std::size_t>(sequence);
+        gather_selection_into(
+            layout_.output, *input_, layout_.src_of_dst, selections_[index], morsel_range(sequence),
+            GatherDest{.row = row_at_[index],
+                       .char_base = chars_at_.empty() ? nullptr : &chars_at_[index]});
+    }
+
+    [[nodiscard]] auto morsel_range(std::uint64_t sequence) const -> RowRange {
+        const auto [begin, end] = morsel_row_range(input_->rows(), grain_, sequence);
+        return RowRange{.begin = begin, .count = end - begin};
+    }
+
+    // Run `body` over every morsel across the pool and join. A failure is
+    // reported with the LOWEST morsel sequence, the same determinism rule the
+    // ordered merger uses, so which morsel's error a query reports never
+    // depends on thread timing. Workers abandon only morsels ABOVE a recorded
+    // failure, so no morsel below it is skipped.
+    template <typename Body>
+    [[nodiscard]] auto run_over_morsels(const Body& body) -> std::optional<std::string> {
+        reset_failure();
+        std::atomic<std::uint64_t> cursor{0};
+        {
+            auto batch = pool_->submit(workers_, [&](std::size_t) noexcept {
+                while (true) {
+                    const std::uint64_t sequence = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (sequence >= morsel_count_) {
+                        return;
+                    }
+                    if (failure_below(sequence) || interrupt_requested()) {
+                        return;
+                    }
+                    // A worker may not unwind into the pool, so an unplanned
+                    // exception becomes a sequence-tagged error like any other.
+                    // The message itself allocates and the exception most
+                    // expected here is bad_alloc, so there is an
+                    // allocation-free fallback underneath it.
+                    try {
+                        body(sequence);
+                    } catch (const std::exception& error) {
+                        try {
+                            record_error(sequence, "parallel filter: worker exception: " +
+                                                       std::string(error.what()));
+                        } catch (...) {
+                            record_fault(sequence,
+                                         "parallel filter: worker exception (no memory to "
+                                         "report it)");
+                        }
+                    } catch (...) {
+                        record_fault(sequence,
+                                     "parallel filter: worker threw a non-standard exception");
+                    }
+                }
+            });
+            batch.wait();
+        }
+        // Same precedence as the ordered merger: an interrupt outranks a
+        // recorded data error, so a worker failing as Ctrl+C arrives still
+        // reports cancellation rather than an arbitrary error.
+        if (interrupt_requested()) {
+            return interrupt_message();
+        }
+        const std::scoped_lock lock(mutex_);
+        if (!has_error_) {
+            return std::nullopt;
+        }
+        return error_fixed_ != nullptr ? std::string(error_fixed_) : error_owned_;
+    }
+
+    void reset_failure() noexcept {
+        const std::scoped_lock lock(mutex_);
+        has_error_ = false;
+        error_fixed_ = nullptr;
+        error_owned_.clear();
+    }
+
+    [[nodiscard]] auto failure_below(std::uint64_t sequence) noexcept -> bool {
+        const std::scoped_lock lock(mutex_);
+        return has_error_ && error_sequence_ < sequence;
+    }
+
+    void record_error(std::uint64_t sequence, std::string message) {
+        const std::scoped_lock lock(mutex_);
+        if (claim_failure(sequence)) {
+            error_owned_ = std::move(message);
+            error_fixed_ = nullptr;
+        }
+    }
+
+    void record_fault(std::uint64_t sequence, const char* message) noexcept {
+        const std::scoped_lock lock(mutex_);
+        if (claim_failure(sequence)) {
+            error_owned_.clear();  // frees, never allocates
+            error_fixed_ = message;
+        }
+    }
+
+    [[nodiscard]] auto claim_failure(std::uint64_t sequence) noexcept -> bool {
+        if (has_error_ && sequence >= error_sequence_) {
+            return false;
+        }
+        has_error_ = true;
+        error_sequence_ = sequence;
+        return true;
+    }
+
+    // `input_` is declared first so it outlives everything reading it.
+    std::unique_ptr<Table> input_;
+    const ir::Expr* predicate_;
+    bool fused_project_ = false;
+    const ScalarRegistry* scalars_;
+    FilterOutputLayout layout_;
+    std::size_t grain_ = 1;
+    std::uint64_t morsel_count_ = 0;
+    std::size_t workers_ = 0;
+    WorkerPool* pool_;
+
+    // Written by phase A, read by phase B. Every element is touched by exactly
+    // one worker (indexed by its own morsel sequence), so these need no lock —
+    // the join between the phases is the synchronization.
+    std::vector<FilterSelection> selections_;
+    std::vector<std::size_t> row_at_;
+    std::vector<std::vector<std::size_t>> chars_at_;  // empty when no string column
+
+    std::mutex mutex_;
+    bool has_error_ = false;
+    std::string error_owned_;
+    const char* error_fixed_ = nullptr;
+    std::uint64_t error_sequence_ = 0;
+
+    bool done_ = false;
+};
+
 // How many workers an island of `morsel_count` morsels over `rows` rows should
 // run on: 0 means "stay on the serial morsel chain".
 //
@@ -6515,10 +6790,32 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     }
 
     if (worker_count >= 2) {
-        if (exec.parallel_stats != nullptr && !candidate.operators.empty() &&
-            range_filter_head(*candidate.operators.front(), *owned).has_value()) {
+        const auto head = candidate.operators.empty()
+                              ? std::nullopt
+                              : range_filter_head(*candidate.operators.front(), *owned);
+        if (exec.parallel_stats != nullptr && head.has_value()) {
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
+
+        // A lone range-native filter can skip the merger entirely by presizing
+        // its output — see TwoPhaseFilterOperator. It has to be the ONLY
+        // operator: anything above it consumes per-morsel chunks, which is the
+        // very thing the two-phase form does not produce.
+        if (head.has_value() && candidate.operators.size() == 1) {
+            auto layout = build_filter_output_layout(*owned, head->project);
+            // A missing projected column is left to the ordered merger below,
+            // which reports it through the normal evaluation path.
+            if (layout.has_value() && filter_gather_is_thread_safe(*owned, layout->src_of_dst)) {
+                if (exec.parallel_stats != nullptr) {
+                    exec.parallel_stats->two_phase_filters.fetch_add(1, std::memory_order_relaxed);
+                }
+                return std::make_unique<TwoPhaseFilterOperator>(
+                    std::move(owned), *head->predicate, head->project != nullptr, scalars,
+                    std::move(layout.value()), exec.parallel_grain, expected_morsels, worker_count,
+                    process_worker_pool());
+            }
+        }
+
         std::vector<IslandWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {

@@ -953,6 +953,90 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto filter_table_range(const Table& input, const ir::Expr& predicate, RowRange rows,
                                       const ScalarRegistry* scalars)
     -> std::expected<Table, std::string>;
+
+// ---------------------------------------------------------------------------
+// A filter, taken apart. `filter_table_range` runs these four steps back to
+// back over one range and owns the whole result. A *parallel* filter cannot:
+// it has to learn how many rows every morsel keeps before it knows where any
+// morsel's rows belong, so it runs step 1 over every morsel, prefix-sums the
+// counts, sizes the output once, and only then runs step 4 with each morsel
+// writing a disjoint slice. Splitting them here is what lets both callers share
+// one gather rather than growing a second one that can disagree.
+// ---------------------------------------------------------------------------
+
+/// Which rows of a range survive a predicate: one bit per row packed 64 to a
+/// word, plus the popcount. Range-relative — bit `w*64 + b` of `keep_words` is
+/// source row `rows.begin + w*64 + b` — because the mask, the keep words and
+/// the output are all dense; only the gather converts back to a source index.
+struct FilterSelection {
+    std::vector<std::uint64_t> keep_words;
+    std::size_t kept = 0;
+};
+
+/// Step 1: evaluate `predicate` over `rows` and pack the surviving rows.
+/// `row_limit` stops the scan once that many rows are kept (0 = no limit); any
+/// suffix words stay zero and the gather skips them.
+[[nodiscard]] auto compute_filter_selection(const Table& input, const ir::Expr& predicate,
+                                            const ScalarRegistry* scalars, RowRange rows,
+                                            std::size_t row_limit)
+    -> std::expected<FilterSelection, std::string>;
+
+/// A filter's output columns, and where each one reads from:
+/// `src_of_dst[d]` indexes `input.columns` for output column `d`.
+struct FilterOutputLayout {
+    Table output;
+    std::vector<std::size_t> src_of_dst;
+};
+
+/// Step 2: the empty output skeleton — every input column, or just the
+/// projected subset. Fails if a projected name is not in `input`.
+[[nodiscard]] auto build_filter_output_layout(const Table& input,
+                                              const std::vector<ir::ColumnRef>* project)
+    -> std::expected<FilterOutputLayout, std::string>;
+
+/// Step 3a: add the bytes this selection's rows contribute to each string
+/// output column into `chars` (indexed by output column; untouched for every
+/// other type). Additive so a parallel filter can total across morsels.
+void count_selected_chars(const Table& input, const std::vector<std::size_t>& src_of_dst,
+                          const FilterSelection& sel, RowRange rows,
+                          std::vector<std::size_t>& chars);
+
+/// Step 3b: size every output column for `rows_total` rows and, for string
+/// columns, `chars_total[d]` bytes. Also allocates an all-false validity bitmap
+/// wherever the source column has one. Must be called once, before any gather.
+void presize_filter_output(Table& output, const Table& input,
+                           const std::vector<std::size_t>& src_of_dst, std::size_t rows_total,
+                           const std::vector<std::size_t>& chars_total);
+
+/// Where one selection's rows land in a presized output. `row` is the first
+/// output row it writes; `char_base[d]` the first byte, which only a string
+/// column reads. Both zero for a filter that owns its whole output; non-zero
+/// for one morsel of a parallel filter writing into a shared one.
+///
+/// **Concurrency:** distinct `GatherDest`s write disjoint rows, which is
+/// disjoint *memory* only for columns that store a row per addressable unit.
+/// `Column<bool>` data and validity bitmaps pack 64 rows into a word, so two
+/// morsels meeting mid-word write the same word. `filter_gather_is_thread_safe`
+/// is the check that keeps those off the parallel path.
+struct GatherDest {
+    std::size_t row = 0;
+    const std::vector<std::size_t>* char_base = nullptr;  ///< null = all zero
+};
+
+/// Step 4: copy this selection's rows (and their validity) into a presized
+/// `output` at `dst`.
+void gather_selection_into(Table& output, const Table& input,
+                           const std::vector<std::size_t>& src_of_dst, const FilterSelection& sel,
+                           RowRange rows, GatherDest dst);
+
+/// True when the columns `src_of_dst` selects can be gathered into by several
+/// threads at once — that is, when none of them is bit-packed. See
+/// `GatherDest`: a `Column<bool>` or a validity bitmap shares a 64-bit word
+/// across a morsel boundary, so two workers would read-modify-write the same
+/// word and lose bits. This is a *data race*, not a slow path, so it gates the
+/// parallel gather rather than merely deoptimizing it.
+[[nodiscard]] auto filter_gather_is_thread_safe(const Table& input,
+                                                const std::vector<std::size_t>& src_of_dst) -> bool;
 /// `filter_table_range` with a fused projection — the ranged form of
 /// `filter_project_table`, which is what `filter …, select …` canonicalizes to.
 [[nodiscard]] auto filter_project_table_range(const Table& input, const ir::Expr& predicate,

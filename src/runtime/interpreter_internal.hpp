@@ -1014,10 +1014,12 @@ void presize_filter_output(Table& output, const Table& input,
 /// for one morsel of a parallel filter writing into a shared one.
 ///
 /// **Concurrency:** distinct `GatherDest`s write disjoint rows, which is
-/// disjoint *memory* only for columns that store a row per addressable unit.
-/// `Column<bool>` data and validity bitmaps pack 64 rows into a word, so two
-/// morsels meeting mid-word write the same word. `filter_gather_is_thread_safe`
-/// is the check that keeps those off the parallel path.
+/// disjoint *memory* for every column that stores at least one addressable unit
+/// per row. `Column<bool>` data and validity bitmaps do not — they pack 64 rows
+/// into a word, so two gathers meeting mid-word write the same word. Those are
+/// handled rather than excluded: the destination is zero-filled, the writes only
+/// ever set bits, and the (at most two) words a gather can share with a
+/// neighbour are OR-ed in atomically. See `SharedBitWords` in filter.cpp.
 struct GatherDest {
     std::size_t row = 0;
     const std::vector<std::size_t>* char_base = nullptr;  ///< null = all zero
@@ -1030,11 +1032,23 @@ void gather_selection_into(Table& output, const Table& input,
                            RowRange rows, GatherDest dst);
 
 /// True when the columns `src_of_dst` selects can be gathered into by several
-/// threads at once — that is, when none of them is bit-packed. See
-/// `GatherDest`: a `Column<bool>` or a validity bitmap shares a 64-bit word
-/// across a morsel boundary, so two workers would read-modify-write the same
-/// word and lose bits. This is a *data race*, not a slow path, so it gates the
-/// parallel gather rather than merely deoptimizing it.
+/// threads at once.
+///
+/// Every column kind currently in `ColumnValue` qualifies: most store at least
+/// one addressable unit per row, so disjoint rows are disjoint memory, and the
+/// two that are bit-packed (`Column<bool>` and any column's validity bitmap)
+/// are handled by the shared-word rule in `gather_selection_into` rather than
+/// excluded. So this answers true for every table today.
+///
+/// It is kept, rather than deleted as vacuous, because it is written as an
+/// allowlist per column kind: a new `ColumnValue` alternative answers **false**
+/// until someone has checked it, which costs a fallback to the ordered merger.
+/// Deleting it would make the same omission a silent data race instead. This
+/// gates correctness, not speed — hence the safe default rather than an
+/// optimistic one.
+///
+/// `ParallelIslandStats::two_phase_filters` is what makes such a fallback
+/// visible; both paths produce identical output.
 [[nodiscard]] auto filter_gather_is_thread_safe(const Table& input,
                                                 const std::vector<std::size_t>& src_of_dst) -> bool;
 /// `filter_table_range` with a fused projection — the ranged form of

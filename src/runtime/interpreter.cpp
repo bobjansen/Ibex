@@ -434,7 +434,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return order_table(child.value(), order.keys());
+            return order_table(child.value(), order.keys(), exec);
         }
         case ir::NodeKind::Head: {
             const auto& head = static_cast<const ir::HeadNode&>(node);
@@ -668,7 +668,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected("as_timeframe: column '" + atf.column() +
                                        "' must be Timestamp, Date, or Int");
             }
-            auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}});
+            auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}}, exec);
             if (!sorted.has_value()) {
                 return sorted;
             }
@@ -1269,7 +1269,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            auto sorted = order_table(child.value(), topk.keys());
+            auto sorted = order_table(child.value(), topk.keys(), exec);
             if (!sorted) {
                 return std::unexpected(sorted.error());
             }

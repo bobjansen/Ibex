@@ -168,6 +168,47 @@ namespace {
 // Sort `input` by an already-resolved key list. The TimeFrame ordering policy
 // (and any implicit time-index tiebreaker) is decided by the public
 // `order_table` wrapper below before this runs.
+/// True when `name`'s values never decrease down the column.
+///
+/// Two callers: skipping a sort whose key is already ordered, and deciding
+/// whether a TimeFrame's implicit time tiebreaker has anything left to do.
+/// Conservative — a column carrying nulls, or of a type not handled here,
+/// answers false.
+[[nodiscard]] auto column_is_non_decreasing(const Table& input, const std::string& name) -> bool {
+    const auto* entry = input.find_entry(name);
+    if (entry == nullptr || entry->validity.has_value()) {
+        return false;
+    }
+    const auto* column = input.find(name);
+    if (column == nullptr) {
+        return false;
+    }
+    const std::size_t rows = input.rows();
+    bool sorted = false;
+    std::visit(
+        [&](const auto& col) {
+            using ColT = std::decay_t<decltype(col)>;
+            auto scan = [&](auto get) {
+                sorted = true;
+                for (std::size_t i = 1; i < rows; ++i) {
+                    if (get(col, i) < get(col, i - 1)) {
+                        sorted = false;
+                        return;
+                    }
+                }
+            };
+            if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                scan([](const auto& c, std::size_t i) { return c[i].nanos; });
+            } else if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
+                scan([](const auto& c, std::size_t i) { return c[i]; });
+            } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                scan([](const auto& c, std::size_t i) { return c[i].days; });
+            }
+        },
+        *column);
+    return sorted;
+}
+
 auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& resolved_keys)
     -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
@@ -240,6 +281,11 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         std::vector<std::string_view> str;  // views into original column storage
         bool ascending = true;
         const ValidityBitmap* validity = nullptr;  // null when the key has no nulls
+        /// Number of distinct values when this key was built as a DENSE RANK in
+        /// [0, cardinality), or 0 when the key is an arbitrary integer. Only a
+        /// dense rank can be counting-sorted, because the bucket array is
+        /// indexed by the key itself.
+        std::size_t cardinality = 0;
 
         [[nodiscard]] auto is_null(std::size_t row) const noexcept -> bool {
             return validity != nullptr && !(*validity)[row];
@@ -331,6 +377,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                         rank[order[r]] = next;
                     }
                     fk.kind = FlatKind::I64;
+                    fk.cardinality = dict.empty() ? 0 : static_cast<std::size_t>(next) + 1;
                     fk.u64.reserve(rows);
                     for (std::size_t i = 0; i < rows; ++i) {
                         const auto code = col.code_at(i);
@@ -347,6 +394,59 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             },
             *column);
         flat_keys.push_back(std::move(fk));
+    }
+
+    // Fast path: a single dense-ranked key with few distinct values — counting
+    // sort. One increment and one write per row over a bucket array that fits in
+    // L1, against the general radix's EIGHT byte-histograms per row.
+    //
+    // The radix already skips the seven passes whose byte never varies, so it
+    // does a single scatter — but it still builds all eight histograms to
+    // discover that, and on a 5M-row sort by a 3-value symbol that histogram
+    // pass alone was the largest single cost in the whole query.
+    //
+    // Stability comes free: rows are appended to their bucket in input order.
+    if (!has_null_keys && flat_keys.size() == 1 && flat_keys[0].kind == FlatKind::I64 &&
+        flat_keys[0].cardinality != 0) {
+        constexpr std::size_t kCountingSortCap = 1U << 12;
+        const std::size_t buckets = flat_keys[0].cardinality;
+        if (buckets <= kCountingSortCap) {
+            const auto& keys = flat_keys[0].u64;
+            std::vector<std::size_t> position(buckets + 1, 0);
+            for (std::size_t i = 0; i < rows; ++i) {
+                ++position[(keys[i] ^ kSignFlip) + 1];
+            }
+            if (flat_keys[0].ascending) {
+                for (std::size_t b = 1; b <= buckets; ++b) {
+                    position[b] += position[b - 1];
+                }
+            } else {
+                // Descending: buckets are laid out high-to-low, but rows still
+                // enter each bucket in input order, so equal keys stay stable.
+                std::vector<std::size_t> counts(position.begin() + 1, position.end());
+                std::size_t total = 0;
+                for (std::size_t b = buckets; b-- > 0;) {
+                    position[b] = total;
+                    total += counts[b];
+                }
+            }
+            auto build = [&]<typename Idx>() -> SortIdx {
+                std::vector<Idx> idx(rows);
+                for (std::size_t i = 0; i < rows; ++i) {
+                    idx[position[keys[i] ^ kSignFlip]++] = static_cast<Idx>(i);
+                }
+                return SortIdx{std::move(idx)};
+            };
+            auto sort_result = rows <= std::numeric_limits<std::uint32_t>::max()
+                                   ? build.template operator()<std::uint32_t>()
+                                   : build.template operator()<std::uint64_t>();
+            return std::visit(
+                [&]<typename Idx>(
+                    const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
+                    return gather_rows(input, idx, &resolved_keys);
+                },
+                sort_result);
+        }
     }
 
     // Fast path: single ascending I64 key — radix sort (pre-sorted case already handled above).
@@ -528,6 +628,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
     // resets `ordering` to time-only, so the true multi-key order is restored
     // here after the sort.
     bool relaxed_timeframe = false;
+    std::vector<ir::OrderKey> ordering_out;  // empty = same as the keys we sort by
     if (input.time_index.has_value()) {
         const bool time_only =
             keys.size() == 1 && keys[0].name == *input.time_index && keys[0].ascending;
@@ -539,14 +640,34 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             if (std::ranges::none_of(resolved_keys, [&](const ir::OrderKey& k) {
                     return k.name == *input.time_index;
                 })) {
-                resolved_keys.push_back(ir::OrderKey{.name = *input.time_index, .ascending = true});
+                const ir::OrderKey time_key{.name = *input.time_index, .ascending = true};
+                // The resulting order IS (leading keys..., time) either way — that
+                // is what the metadata below records.
+                ordering_out = resolved_keys;
+                ordering_out.push_back(time_key);
+                // But actually SORTING by the time index is only necessary when
+                // the input is not already time-ascending. Every path in
+                // `order_table_resolved` is stable, so a stable sort by the
+                // leading keys already leaves each group in its original — and
+                // therefore time-ascending — order.
+                //
+                // A TimeFrame is time-sorted by construction, so this nearly
+                // always holds; it is verified rather than assumed because
+                // getting it wrong would silently misorder rows within a group.
+                // Skipping it turns `order symbol` on a TimeFrame from a two-key
+                // radix — including a full 64-bit pass over every timestamp —
+                // into a single-key sort, which was half the cost of the sort.
+                if (!column_is_non_decreasing(input, *input.time_index)) {
+                    resolved_keys.push_back(time_key);
+                }
             }
         }
     }
     auto result = order_table_resolved(input, resolved_keys);
     if (result.has_value() && relaxed_timeframe) {
         result->time_index = input.time_index;
-        result->ordering = std::move(resolved_keys);
+        result->ordering =
+            ordering_out.empty() ? std::move(resolved_keys) : std::move(ordering_out);
     }
     return result;
 }

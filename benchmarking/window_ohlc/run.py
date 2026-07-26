@@ -66,7 +66,8 @@ def gen_data(rows: int, nsym: int) -> Path:
 def _ibex_query(window: str) -> str:
     win = f"window {WINDOW} aligned" if window == "aligned" else f"window {WINDOW}"
     ws = ", window_start = window_start()" if window == "aligned" else ""
-    return ('t[ select { price = price, open = first(price), close = last(price)'
+    return ('t[ select { price = price, open = first(price), high = max(price), '
+            'low = min(price), close = last(price), volume_sum = sum(volume)'
             f'{ws} }}, by symbol, {win}, order symbol ];')
 
 def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
@@ -120,47 +121,138 @@ def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
 def bench_polars(parquet: Path, window: str, iters: int) -> tuple[float, float]:
     import polars as pl
     df = pl.read_parquet(parquet)          # preloaded, not timed
+    part = ["symbol", "window_start"]
     if window == "aligned":
+        # The frame is expanding WITHIN each bucket (equivalently, DuckDB's
+        # ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), so high/low/volume
+        # are cumulative, not whole-bucket. `.max().over()` here would compute a
+        # different -- and cheaper -- answer than the other two engines.
         def q():
             return (df.with_columns(pl.col("timestamp").dt.truncate(WINDOW).alias("window_start"))
-                      .with_columns(pl.col("price").first().over(["symbol", "window_start"]).alias("open"),
-                                    pl.col("price").alias("close"))
+                      .with_columns(pl.col("price").first().over(part).alias("open"),
+                                    pl.col("price").cum_max().over(part).alias("high"),
+                                    pl.col("price").cum_min().over(part).alias("low"),
+                                    pl.col("price").alias("close"),
+                                    pl.col("volume").cum_sum().over(part).alias("volume_sum"))
                       .sort("symbol"))
     else:
         def q():
             agg = (df.rolling(index_column="timestamp", period=WINDOW, group_by="symbol")
-                     .agg(open=pl.col("price").first(), close=pl.col("price").last()))
+                     .agg(open=pl.col("price").first(), high=pl.col("price").max(),
+                          low=pl.col("price").min(), close=pl.col("price").last(),
+                          volume_sum=pl.col("volume").sum()))
             return df.join(agg, on=["symbol", "timestamp"], how="left").sort("symbol")
     return _timeit(q, iters)
 
 # ── DuckDB (in-memory table, materialised to Arrow) ──────────────────────────
+
+def _duckdb_sql(window: str) -> str:
+    if window == "aligned":
+        return f"""
+        SELECT timestamp, symbol, price,
+               first_value(price) OVER w AS open, max(price) OVER w AS high,
+               min(price) OVER w AS low, price AS close,
+               sum(volume) OVER w AS volume_sum,
+               time_bucket(INTERVAL '{WINDOW}', timestamp) AS window_start
+        FROM t
+        WINDOW w AS (PARTITION BY symbol, time_bucket(INTERVAL '{WINDOW}', timestamp)
+                     ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        ORDER BY symbol"""
+    return f"""
+        SELECT timestamp, symbol, price,
+               first_value(price) OVER w AS open, max(price) OVER w AS high,
+               min(price) OVER w AS low, price AS close,
+               sum(volume) OVER w AS volume_sum
+        FROM t
+        WINDOW w AS (PARTITION BY symbol ORDER BY timestamp
+                     RANGE BETWEEN INTERVAL '{WINDOW}' PRECEDING AND CURRENT ROW)
+        ORDER BY symbol"""
+
 
 def bench_duckdb(parquet: Path, window: str, iters: int, threads: int) -> tuple[float, float]:
     import duckdb
     con = duckdb.connect()
     con.execute(f"PRAGMA threads={threads}")
     con.execute(f"CREATE TABLE t AS SELECT * FROM read_parquet('{parquet}')")
-    if window == "aligned":
-        sql = f"""
-        SELECT timestamp, symbol, price,
-               first_value(price) OVER w AS open, price AS close,
-               time_bucket(INTERVAL '{WINDOW}', timestamp) AS window_start
-        FROM t
-        WINDOW w AS (PARTITION BY symbol, time_bucket(INTERVAL '{WINDOW}', timestamp)
-                     ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-        ORDER BY symbol"""
-    else:
-        sql = f"""
-        SELECT timestamp, symbol, price,
-               first_value(price) OVER w AS open, price AS close
-        FROM t
-        WINDOW w AS (PARTITION BY symbol ORDER BY timestamp
-                     RANGE BETWEEN INTERVAL '{WINDOW}' PRECEDING AND CURRENT ROW)
-        ORDER BY symbol"""
+    sql = _duckdb_sql(window)
     fetch = getattr(duckdb.DuckDBPyConnection, "to_arrow_table", None)
     q = (lambda: con.execute(sql).to_arrow_table()) if fetch else \
         (lambda: con.execute(sql).fetch_arrow_table())
     return _timeit(q, iters)
+
+# ── cross-engine verification ────────────────────────────────────────────────
+# A benchmark that reports three timings for three different answers is worth
+# nothing. This recomputes the OHLCV columns in Polars and DuckDB and compares
+# them against Ibex row by row, so "identical output" is a checked claim rather
+# than an asserted one.
+
+OHLCV = ["open", "high", "low", "close", "volume_sum"]
+
+def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
+    """Return a list of human-readable mismatches; empty means all three agree."""
+    import polars as pl
+    import duckdb
+
+    problems: list[str] = []
+    # Ibex writes its result out so it can be read back without a pty.
+    out = HERE / "data" / f"_verify_{window}.parquet"
+    script = HERE / "data" / f"_verify_{window}.ibex"
+    script.write_text(
+        'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";\n'
+        'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
+        f'let t = as_timeframe(read_parquet("{parquet}"), "timestamp");\n'
+        f'let r = {_ibex_query(window)[:-1]};\n'
+        f'write_parquet(r, "{out}");\n'
+    )
+    subprocess.run([str(IBEX_BIN), str(script)], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    script.unlink(missing_ok=True)
+
+    # Sort every frame the same way; `order symbol` alone is not a total order.
+    keys = ["symbol", "timestamp"]
+    ibex = pl.read_parquet(out).sort(keys)
+    out.unlink(missing_ok=True)
+
+    df = pl.read_parquet(parquet)
+    part = ["symbol", "window_start"]
+    if window == "aligned":
+        pol = (df.with_columns(pl.col("timestamp").dt.truncate(WINDOW).alias("window_start"))
+                 .with_columns(pl.col("price").first().over(part).alias("open"),
+                               pl.col("price").cum_max().over(part).alias("high"),
+                               pl.col("price").cum_min().over(part).alias("low"),
+                               pl.col("price").alias("close"),
+                               pl.col("volume").cum_sum().over(part).alias("volume_sum")))
+    else:
+        agg = (df.rolling(index_column="timestamp", period=WINDOW, group_by="symbol")
+                 .agg(open=pl.col("price").first(), high=pl.col("price").max(),
+                      low=pl.col("price").min(), close=pl.col("price").last(),
+                      volume_sum=pl.col("volume").sum()))
+        pol = df.join(agg, on=["symbol", "timestamp"], how="left")
+    pol = pol.sort(keys)
+
+    con = duckdb.connect()
+    con.execute(f"CREATE TABLE t AS SELECT * FROM read_parquet('{parquet}')")
+    fetch = getattr(duckdb.DuckDBPyConnection, "to_arrow_table", None)
+    res = con.execute(_duckdb_sql(window))
+    duck = pl.from_arrow(res.to_arrow_table() if fetch else res.fetch_arrow_table()).sort(keys)
+
+    if not (len(ibex) == len(pol) == len(duck)):
+        return [f"{window}: row counts differ - "
+                f"ibex={len(ibex)} polars={len(pol)} duckdb={len(duck)}"]
+
+    for name, other in (("polars", pol), ("duckdb", duck)):
+        for col in OHLCV:
+            missing = [w for w, f in (("ibex", ibex), (name, other)) if col not in f.columns]
+            if missing:
+                problems.append(f"{window}: {', '.join(missing)} missing column {col}")
+                continue
+            a = ibex[col].cast(pl.Float64)
+            b = other[col].cast(pl.Float64)
+            bad = int(((a - b).abs() > tol).sum())
+            if bad:
+                problems.append(f"{window}: {name} differs from ibex in {col} "
+                                f"on {bad}/{len(a)} rows")
+    return problems
 
 # ── shared timing helper ─────────────────────────────────────────────────────
 
@@ -186,6 +278,8 @@ def main() -> None:
                          "engine's default parallelism (DuckDB uses --duckdb-threads).")
     ap.add_argument("--engines", nargs="+", default=["ibex", "polars", "duckdb"])
     ap.add_argument("--out", type=Path, default=HERE / "results" / "results.tsv")
+    ap.add_argument("--verify", action="store_true",
+                    help="check all three engines produce identical OHLCV values, then exit")
     args = ap.parse_args()
 
     # Polars fixes its thread pool at import time, so the env var must be set
@@ -203,6 +297,23 @@ def main() -> None:
     else:
         duck_threads = args.duckdb_threads
         label = "mt"        # multi-threaded (each engine's default)
+
+    if args.verify:
+        failures = []
+        for rows in args.rows:
+            for nsym in args.symbols:
+                pq = gen_data(rows, nsym)
+                for window in args.window:
+                    problems = verify_engines(pq, window)
+                    tag = f"{rows} rows x {nsym} symbols, {window}"
+                    if problems:
+                        failures.extend(problems)
+                        for p in problems:
+                            print(f"MISMATCH  {tag}: {p}", file=sys.stderr)
+                    else:
+                        print(f"ok        {tag}: ibex == polars == duckdb on "
+                              + ", ".join(OHLCV), file=sys.stderr)
+        sys.exit(1 if failures else 0)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     rows_out = ["engine\tthreads\trows\tsymbols\twindow\tmin_ms\tmedian_ms"]

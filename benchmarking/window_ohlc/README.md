@@ -6,12 +6,27 @@ the canonical market-data "OHLC bars per symbol" shape:
 ```
 t[ select { price = price,
             open  = first(price),
+            high  = max(price),
+            low   = min(price),
             close = last(price),
+            volume_sum = sum(volume),
             window_start = window_start() },
    by symbol,
    window 10s [aligned],
    order symbol ];
 ```
+
+Full OHLCV, not a reduced open/close pair — a benchmark that computes only the
+two cheapest aggregates invites the reading that the shape was chosen to
+flatter someone. The frame is **expanding within each bucket**, so `high`,
+`low` and `volume_sum` are running values, matching DuckDB's
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. In Polars that means
+`cum_max`/`cum_min`/`cum_sum` over the partition; plain `.max().over()` would
+compute a whole-bucket answer, which is both different and cheaper.
+
+`run.py --verify` recomputes the OHLCV columns in all three engines and
+compares them row by row against Ibex, so "identical output" is checked rather
+than claimed. It exits non-zero on any mismatch.
 
 Two window flavours are benchmarked:
 

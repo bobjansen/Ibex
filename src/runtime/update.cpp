@@ -1604,20 +1604,71 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.
-    robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+    //
+    // The key is hashed and compared IN PLACE against the candidate group's
+    // stored key, so a `Key` is built once per GROUP rather than once per row.
+    // Boxing one per row — a heap vector of ScalarValue, built only to probe
+    // the index and then thrown away — measured ~60% of a grouped-window
+    // query's runtime, dwarfing the window it exists to organize. This is the
+    // same treatment group-by and distinct already had.
+    std::vector<KeyCol> key_cols;
+    key_cols.reserve(group_columns.size());
+    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+        auto col = make_key_col(*group_columns[ci], group_validity[ci]);
+        if (!col.has_value()) {
+            key_cols.clear();  // a type the in-place path cannot resolve
+            break;
+        }
+        key_cols.push_back(*col);
+    }
+
     std::vector<std::vector<std::size_t>> group_rows;
-    for (std::size_t r = 0; r < rows; ++r) {
-        Key key;
-        key.values.reserve(group_columns.size());
-        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-            push_key_value(key, *group_columns[ci], group_validity[ci], r);
+    if (key_cols.size() == group_columns.size()) {
+        std::vector<Key> group_keys;
+        KeyRowIndex index;
+        std::vector<std::uint32_t> row_gid(rows);
+        for (std::size_t r = 0; r < rows; ++r) {
+            row_gid[r] = index.find_or_insert(group_keys, key_cols, r, [&] {
+                Key key;
+                key.values.reserve(group_columns.size());
+                for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                    push_key_value(key, *group_columns[ci], group_validity[ci], r);
+                }
+                group_keys.push_back(std::move(key));
+                return static_cast<std::uint32_t>(group_keys.size() - 1);
+            });
         }
-        auto [it, inserted] =
-            group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
-        if (inserted) {
-            group_rows.emplace_back();
+        // Counted first so each group's vector is allocated once at its exact
+        // size; appending in row order is what keeps each group time-sorted.
+        std::vector<std::size_t> counts(group_keys.size(), 0);
+        for (std::size_t r = 0; r < rows; ++r) {
+            ++counts[row_gid[r]];
         }
-        group_rows[it->second].push_back(r);
+        group_rows.resize(group_keys.size());
+        for (std::size_t g = 0; g < group_rows.size(); ++g) {
+            group_rows[g].reserve(counts[g]);
+        }
+        for (std::size_t r = 0; r < rows; ++r) {
+            group_rows[row_gid[r]].push_back(r);
+        }
+    } else {
+        // Fallback for a key column `make_key_col` cannot resolve. No built-in
+        // type reaches it today; it exists so an added column kind degrades to
+        // the slower grouping rather than to a wrong answer.
+        robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+        for (std::size_t r = 0; r < rows; ++r) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], r);
+            }
+            auto [it, inserted] =
+                group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
+            if (inserted) {
+                group_rows.emplace_back();
+            }
+            group_rows[it->second].push_back(r);
+        }
     }
 
     auto run_group =

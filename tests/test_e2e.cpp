@@ -2665,6 +2665,49 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         require_tables_equal(run(src, tables), parallel);
     }
 
+    SECTION("a null group key forms its own group") {
+        // Asserted on VALUES, not by comparing the parallel path against the
+        // serial one: both now share the in-place key path, so a
+        // parallel-vs-serial check could not see the grouping itself changing.
+        // Six rows inside one window, alternating "A" and a null symbol:
+        //   group A    -> rows 0,2,4, prices 1,3,5 -> first = 1
+        //   group null -> rows 1,3,5, prices 2,4,6 -> first = 2
+        // A null key merging into the empty-string group would give 1 for every
+        // row; a null key merging into no group at all would give each row its
+        // own price.
+        Column<Timestamp> ts;
+        Column<std::string> symbol;
+        Column<double> price;
+        runtime::ValidityBitmap symbol_valid;
+        for (std::size_t i = 0; i < 6; ++i) {
+            ts.push_back(Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL});
+            symbol.push_back(i % 2 == 0 ? "A" : "");
+            price.push_back(static_cast<double>(i + 1));
+            symbol_valid.push_back(i % 2 == 0);
+        }
+        runtime::Table t;
+        t.add_column("ts", std::move(ts));
+        t.add_column("symbol", std::move(symbol));
+        t.add_column("price", std::move(price));
+        t.columns[1].validity = std::move(symbol_valid);
+        t.time_index = "ts";
+        runtime::TableRegistry tables;
+        tables.emplace("t", std::move(t));
+
+        auto result = run("t[ select { open = first(price) }, by symbol, window 10s ];", tables);
+        const auto* open = result.find("open");
+        REQUIRE(open != nullptr);
+        const auto* col = std::get_if<Column<double>>(open);
+        REQUIRE(col != nullptr);
+        REQUIRE(col->size() == 6);
+        CHECK((*col)[0] == 1.0);
+        CHECK((*col)[1] == 2.0);
+        CHECK((*col)[2] == 1.0);
+        CHECK((*col)[3] == 2.0);
+        CHECK((*col)[4] == 1.0);
+        CHECK((*col)[5] == 2.0);
+    }
+
     SECTION("a generator field refuses to run groups concurrently") {
         // `rand_*` draws from one shared stream, so running groups out of order
         // would change the ANSWER, not just the timing. This is the section

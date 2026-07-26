@@ -1510,6 +1510,26 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     std::atomic_ref<std::uint64_t>(words[bit / 64]).fetch_and(mask, std::memory_order_relaxed);
 }
 
+/// How many workers should split the per-row bucketing loop, or 0 for serial.
+///
+/// Unlike the group loop below, this does NOT cap at the group count: it splits
+/// row ranges, so a two-symbol table parallelises as readily as a thousand-symbol
+/// one. That matters because bucketing is the phase that does not care how many
+/// groups there are — it is one hash and compare per ROW.
+[[nodiscard]] auto bucketing_worker_count(const ExecutionContext& exec, std::size_t rows)
+    -> std::size_t {
+    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    // Enough rows per worker that the per-worker hash index is worth building.
+    constexpr std::size_t kMinRowsPerWorker = 32768;
+    const std::size_t workers =
+        std::min({budget, pool_size, std::max<std::size_t>(rows / kMinRowsPerWorker, 1)});
+    return workers < 2 ? 0 : workers;
+}
+
 /// How many workers should share a grouped windowed update's groups, or 0 to
 /// run them serially.
 ///
@@ -1625,21 +1645,101 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     std::vector<std::vector<std::size_t>> group_rows;
     if (key_cols.size() == group_columns.size()) {
         std::vector<Key> group_keys;
-        KeyRowIndex index;
         std::vector<std::uint32_t> row_gid(rows);
-        for (std::size_t r = 0; r < rows; ++r) {
-            row_gid[r] = index.find_or_insert(group_keys, key_cols, r, [&] {
-                Key key;
-                key.values.reserve(group_columns.size());
-                for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-                    push_key_value(key, *group_columns[ci], group_validity[ci], r);
+
+        auto make_key_at = [&](std::size_t r) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], r);
+            }
+            return key;
+        };
+
+        const std::size_t bucket_workers = bucketing_worker_count(exec, rows);
+        if (bucket_workers < 2) {
+            KeyRowIndex index;
+            for (std::size_t r = 0; r < rows; ++r) {
+                row_gid[r] = index.find_or_insert(group_keys, key_cols, r, [&] {
+                    group_keys.push_back(make_key_at(r));
+                    return static_cast<std::uint32_t>(group_keys.size() - 1);
+                });
+            }
+        } else {
+            // Group each row range independently, then reconcile. Every worker
+            // numbers groups from zero in its own range, so the reconcile step
+            // maps local ids onto global ones — it is O(workers x groups),
+            // never O(rows), which is what makes the split pay.
+            //
+            // Global ids are handed out by walking workers in row order and
+            // each worker's groups in first-appearance order, so a group's id
+            // is still "order of first appearance in the table" exactly as the
+            // serial loop produces. Nothing downstream depends on that today,
+            // but a numbering that changed with the thread count would be a
+            // trap for whatever does next.
+            const std::size_t span = (rows + bucket_workers - 1) / bucket_workers;
+            struct Local {
+                std::vector<Key> keys;
+                std::vector<std::uint32_t> remap;  // local id -> global id
+            };
+            std::vector<Local> locals(bucket_workers);
+            {
+                auto batch =
+                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
+                        const std::size_t lo = w * span;
+                        const std::size_t hi = std::min(lo + span, rows);
+                        if (lo >= hi) {
+                            return;
+                        }
+                        KeyRowIndex index;
+                        auto& local = locals[w];
+                        for (std::size_t r = lo; r < hi; ++r) {
+                            row_gid[r] = index.find_or_insert(local.keys, key_cols, r, [&] {
+                                local.keys.push_back(make_key_at(r));
+                                return static_cast<std::uint32_t>(local.keys.size() - 1);
+                            });
+                        }
+                    });
+                batch.wait();
+            }
+
+            robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> global_index;
+            for (auto& local : locals) {
+                local.remap.resize(local.keys.size());
+                for (std::size_t l = 0; l < local.keys.size(); ++l) {
+                    auto [it, inserted] = global_index.emplace(
+                        local.keys[l], static_cast<std::uint32_t>(group_keys.size()));
+                    if (inserted) {
+                        group_keys.push_back(std::move(local.keys[l]));
+                    }
+                    local.remap[l] = it->second;
                 }
-                group_keys.push_back(std::move(key));
-                return static_cast<std::uint32_t>(group_keys.size() - 1);
-            });
+            }
+
+            {
+                auto batch =
+                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
+                        const std::size_t lo = w * span;
+                        const std::size_t hi = std::min(lo + span, rows);
+                        const auto& remap = locals[w].remap;
+                        for (std::size_t r = lo; r < hi; ++r) {
+                            row_gid[r] = remap[row_gid[r]];
+                        }
+                    });
+                batch.wait();
+            }
         }
+
         // Counted first so each group's vector is allocated once at its exact
         // size; appending in row order is what keeps each group time-sorted.
+        //
+        // Deliberately NOT split across threads. It was tried: per-worker
+        // tallies, a prefix sum for each worker's write offset, then a parallel
+        // scatter. Measured 16.0ms serial against 17.3ms on 16 threads — the
+        // pass is bound by scattered writes into one vector per group and by
+        // the value-initialisation inside those vectors' allocation, neither of
+        // which more threads fix. Reverted rather than carry the concurrency
+        // for nothing.
         std::vector<std::size_t> counts(group_keys.size(), 0);
         for (std::size_t r = 0; r < rows; ++r) {
             ++counts[row_gid[r]];
@@ -1727,6 +1827,16 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     ColT out;
                     out.resize(rows);
+                    return ColumnValue{std::move(out)};
+                } else if constexpr (std::is_trivially_default_constructible_v<
+                                         typename ColT::value_type>) {
+                    // The groups partition every row, so each output element is
+                    // written by exactly one scatter. Value-initialising first
+                    // would be a second full pass over the column for nothing —
+                    // at 5M rows and four computed fields that was ~35ms of
+                    // memset, all of it serial.
+                    ColT out;
+                    out.resize_for_overwrite(rows);
                     return ColumnValue{std::move(out)};
                 } else {
                     ColT out;

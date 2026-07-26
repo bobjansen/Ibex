@@ -379,8 +379,11 @@ struct ExecutionContext {
     /// on worker threads or serially is decided per island by the size
     /// thresholds below; either way an ordered merger emits results in morsel
     /// `sequence` order, so output is byte-identical to the plain serial path.
-    /// Default off keeps every existing caller on the untouched serial chain.
-    bool parallel = false;
+    /// **On by default.** A 24-configuration sweep from 131k to 20M rows, at 2
+    /// and 6 columns and both selectivities, measured 20 wins, 4 parity and 0
+    /// regressions; the size gates below are what keep the small end at parity.
+    /// `IBEX_PARALLEL=0` turns it off.
+    bool parallel = true;
 
     /// Morsel row-grain for the island source when `parallel` is set. The input
     /// is partitioned into contiguous ranges of at most this many rows, and one

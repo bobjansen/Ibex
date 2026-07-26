@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -128,4 +130,62 @@ TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
 
     // And it is not left set on the calling thread afterwards.
     CHECK_FALSE(runtime::on_worker_pool_thread());
+}
+
+// `IBEX_PARALLEL` has to answer both ways.
+//
+// Parallel islands are on by default, so a switch that could only turn them ON
+// would leave a user hitting a threading bug -- or an A/B measuring the feature
+// -- with no way to turn them off. That is exactly the kind of gap nothing else
+// would catch: the flag would look like it worked in every test that sets it to
+// "1", which is the only value the old one understood.
+TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
+          "[runtime][parallel][worker_pool]") {
+    struct EnvGuard {
+        std::optional<std::string> saved;
+        EnvGuard() {
+            if (const char* v = std::getenv("IBEX_PARALLEL"); v != nullptr) {
+                saved = v;
+            }
+        }
+        ~EnvGuard() {
+            if (saved.has_value()) {
+                ::setenv("IBEX_PARALLEL", saved->c_str(), 1);
+            } else {
+                ::unsetenv("IBEX_PARALLEL");
+            }
+        }
+        EnvGuard(const EnvGuard&) = delete;
+        auto operator=(const EnvGuard&) -> EnvGuard& = delete;
+        EnvGuard(EnvGuard&&) = delete;
+        auto operator=(EnvGuard&&) -> EnvGuard& = delete;
+    } const guard;
+
+    SECTION("unset leaves the caller's choice alone") {
+        ::unsetenv("IBEX_PARALLEL");
+        CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
+    }
+
+    SECTION("true-ish values ask for on") {
+        for (const char* value : {"1", "on", "true", "yes"}) {
+            ::setenv("IBEX_PARALLEL", value, 1);
+            CAPTURE(value);
+            REQUIRE(runtime::parallel_enabled_from_env().has_value());
+            CHECK(runtime::parallel_enabled_from_env().value());
+        }
+    }
+
+    SECTION("false-ish values ask for off") {
+        for (const char* value : {"0", "off", "false", "no"}) {
+            ::setenv("IBEX_PARALLEL", value, 1);
+            CAPTURE(value);
+            REQUIRE(runtime::parallel_enabled_from_env().has_value());
+            CHECK_FALSE(runtime::parallel_enabled_from_env().value());
+        }
+    }
+
+    SECTION("an unrecognized value leaves the choice alone rather than guessing") {
+        ::setenv("IBEX_PARALLEL", "maybe", 1);
+        CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
+    }
 }

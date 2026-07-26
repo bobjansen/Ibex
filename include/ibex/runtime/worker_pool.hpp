@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace ibex::runtime {
 
@@ -102,10 +103,15 @@ class WorkerPool {
 [[nodiscard]] auto default_thread_count() -> std::size_t;
 
 /// Whether `IBEX_PARALLEL` asks the interpreter to enable parallel islands.
-/// Off unless the variable is set to a true-ish value (`1`, `on`, `true`,
-/// `yes`). This is the benchmark/opt-in switch: the parallel executor is not on
-/// by default until Phase 1's acceptance measurements are in.
-[[nodiscard]] auto parallel_enabled_from_env() -> bool;
+/// `nullopt` when `IBEX_PARALLEL` is unset or unrecognized, so the caller keeps
+/// whatever it already chose; otherwise the requested setting.
+///
+/// It answers BOTH ways on purpose. Parallel islands are on by default now, so
+/// a switch that could only turn them on would leave no way to turn them off —
+/// which is what a user hitting a threading bug, or an A/B measuring the
+/// feature, actually needs. Accepts `1`/`on`/`true`/`yes` and
+/// `0`/`off`/`false`/`no`.
+[[nodiscard]] auto parallel_enabled_from_env() -> std::optional<bool>;
 
 /// Morsel row-grain override from `IBEX_MORSEL_ROWS`, or 0 when unset/invalid
 /// (meaning: keep the `ExecutionContext` default).

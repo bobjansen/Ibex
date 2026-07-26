@@ -35,6 +35,7 @@
 #include <optional>
 #include <pdqsort.h>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -6510,12 +6511,14 @@ class ParallelIslandOperator final : public Operator {
 class TwoPhaseFilterOperator final : public Operator {
    public:
     TwoPhaseFilterOperator(std::unique_ptr<Table> input, const ir::Expr& predicate,
-                           bool fused_project, const ScalarRegistry* scalars,
-                           FilterOutputLayout layout, std::size_t grain, std::uint64_t morsel_count,
-                           std::size_t workers, WorkerPool& pool)
+                           bool fused_project, std::vector<const ir::Node*> tail,
+                           const ScalarRegistry* scalars, FilterOutputLayout layout,
+                           std::size_t grain, std::uint64_t morsel_count, std::size_t workers,
+                           WorkerPool& pool)
         : input_(std::move(input)),
           predicate_(&predicate),
           fused_project_(fused_project),
+          tail_(std::move(tail)),
           scalars_(scalars),
           layout_(std::move(layout)),
           grain_(grain == 0 ? 1 : grain),
@@ -6593,7 +6596,42 @@ class TwoPhaseFilterOperator final : public Operator {
                                                ? std::optional<std::string>{name}
                                                : std::nullopt;
                                 }));
-        return std::move(layout_.output);
+
+        // Metadata-only operators above the filter run ONCE over the finished
+        // output rather than per morsel. `project_table` / `rename_table` build
+        // their result with `add_column_shared` — zero rows copied, O(columns)
+        // — so running them serially here costs nothing, while routing the
+        // chain through the ordered merger to parallelize them costs the whole
+        // merge copy. Measured: `filter … rename` at 93% selectivity was 2.3x
+        // SLOWER than serial on the merger.
+        //
+        // Applying them to the concatenated output is equivalent to applying
+        // them per morsel because neither reads a row; and because these are
+        // the same two functions the serial path calls, the ordering and
+        // time-index rules cannot diverge from it either.
+        Table result = std::move(layout_.output);
+        for (const ir::Node* node : tail_) {
+            auto next = apply_metadata_only(*node, result);
+            if (!next.has_value()) {
+                return std::unexpected(std::move(next.error()));
+            }
+            result = std::move(next.value());
+        }
+        return result;
+    }
+
+    [[nodiscard]] static auto apply_metadata_only(const ir::Node& node, const Table& input)
+        -> std::expected<Table, std::string> {
+        switch (node.kind()) {
+            case ir::NodeKind::Project:
+                return project_table(input, static_cast<const ir::ProjectNode&>(node).columns());
+            case ir::NodeKind::Rename:
+                return rename_table(input, static_cast<const ir::RenameNode&>(node).renames());
+            default:
+                // The island builder only admits `is_metadata_only_node` kinds
+                // into `tail_`, so reaching this means the two have drifted.
+                invariant_violation("two-phase filter: non-metadata operator in the tail");
+        }
     }
 
     void phase_a(std::uint64_t sequence) {
@@ -6722,6 +6760,9 @@ class TwoPhaseFilterOperator final : public Operator {
     std::unique_ptr<Table> input_;
     const ir::Expr* predicate_;
     bool fused_project_ = false;
+    /// Metadata-only operators above the filter, source-to-sink, applied once
+    /// to the finished output. Every element is `is_metadata_only_node`.
+    std::vector<const ir::Node*> tail_;
     const ScalarRegistry* scalars_;
     FilterOutputLayout layout_;
     std::size_t grain_ = 1;
@@ -6805,11 +6846,15 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // A lone range-native filter can skip the merger entirely by presizing
-        // its output — see TwoPhaseFilterOperator. It has to be the ONLY
-        // operator: anything above it consumes per-morsel chunks, which is the
-        // very thing the two-phase form does not produce.
-        if (head.has_value() && candidate.operators.size() == 1) {
+        // A range-native filter can skip the merger entirely by presizing its
+        // output — see TwoPhaseFilterOperator. Anything above it must be
+        // metadata-only: a row-touching operator would need the per-morsel
+        // chunks the two-phase form does not produce, but Project and Rename
+        // copy no rows and so are simply run once over the finished output.
+        const auto tail = std::span{candidate.operators}.subspan(head.has_value() ? 1 : 0);
+        if (head.has_value() && std::ranges::all_of(tail, [](const ir::Node* node) {
+                return is_metadata_only_node(node->kind());
+            })) {
             auto layout = build_filter_output_layout(*owned, head->project);
             // A missing projected column is left to the ordered merger below,
             // which reports it through the normal evaluation path.
@@ -6818,7 +6863,8 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
                     exec.parallel_stats->two_phase_filters.fetch_add(1, std::memory_order_relaxed);
                 }
                 return std::make_unique<TwoPhaseFilterOperator>(
-                    std::move(owned), *head->predicate, head->project != nullptr, scalars,
+                    std::move(owned), *head->predicate, head->project != nullptr,
+                    std::vector<const ir::Node*>(tail.begin(), tail.end()), scalars,
                     std::move(layout.value()), exec.parallel_grain, expected_morsels, worker_count,
                     process_worker_pool());
             }

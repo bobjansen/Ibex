@@ -81,6 +81,18 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
 /// `push_back()` and `pop_front()` per row, and `buf_.size()` is a pointer
 /// subtraction the compiler has to redo after any write it cannot prove leaves
 /// the vector alone.
+///
+/// NOT measurably faster than deriving the mask each time, on any shape tried:
+/// Int64 and Double, ascending and descending input, widths 256 and 1024, up to
+/// 10M rows. An interleaved run once showed 1.32x for Int64, but building each
+/// side TWICE put two builds of identical source 66ms and 61ms apart — the same
+/// spread as the change itself, so that reading was code layout, not the mask.
+/// Kept for parity with the standalone index_ring_deque library and because it
+/// is strictly less work, not for a speedup.
+///
+/// Removing the per-row `isnan` check entirely (the obvious next suspect) made
+/// the Double case slightly SLOWER, so it is not the cost either. Whatever
+/// dominates this loop, it is not the deque arithmetic.
 class IndexRingDeque {
    public:
     explicit IndexRingDeque(std::size_t initial_capacity = 0) {
@@ -114,13 +126,6 @@ class IndexRingDeque {
     void push_back(std::size_t value) {
         if (size_ == buf_.size())
             grow_and_linearize();
-        push_back_unchecked(value);
-    }
-
-    /// Precondition: `size() < capacity()`. For callers that reserved a known
-    /// maximum — a count window can never hold more candidates than its width,
-    /// so it can skip the capacity check per row.
-    void push_back_unchecked(std::size_t value) noexcept {
         buf_[(head_ + size_) & mask_] = value;
         ++size_;
     }
@@ -1063,8 +1068,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // `count_n + 1`, not `count_n`: row `i` is pushed BEFORE the
                     // window is trimmed below, so the deque transiently holds
                     // the previous window's candidates plus one. Reserving only
-                    // the window width lets `push_back_unchecked` wrap and
-                    // overwrite the front — a silent wrong answer, not a crash.
+                    // the window width guarantees one reallocation on a
+                    // power-of-two width, and is the bound an unchecked push
+                    // would silently overrun — see the regression test.
                     IndexRingDeque dq(is_count ? std::min(count_n, rows) + 1 : 0);
                     std::size_t nan_cnt = 0;  // valid-but-NaN elements currently in window
                     std::size_t lo = 0;
@@ -1083,16 +1089,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 while (!dq.empty() && (is_min ? (col[dq.back()] >= col[i])
                                                               : (col[dq.back()] <= col[i])))
                                     dq.pop_back();
-                                // A count window reserved `min(count_n, rows)`
-                                // up front and the monotonic invariant keeps at
-                                // most one candidate per live observation, so
-                                // the capacity check cannot fire. A time window
-                                // has no such bound and keeps the checked push.
-                                if (is_count) {
-                                    dq.push_back_unchecked(i);
-                                } else {
-                                    dq.push_back(i);
-                                }
+                                dq.push_back(i);
                             }
                         }
                         while (lo < i && should_drop(lo, i)) {

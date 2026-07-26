@@ -385,7 +385,12 @@ struct ExecutionContext {
     /// Morsel row-grain for the island source when `parallel` is set. The input
     /// is partitioned into contiguous ranges of at most this many rows, and one
     /// range is one parallel task. Ignored when `parallel` is false.
-    std::size_t parallel_grain = 65536;
+    ///
+    /// **0 means derive it from the input** (`island_grain`), which is the
+    /// default: a measured sweep found no grain in a 1000x band that loses to
+    /// serial, so there is nothing here worth asking a user to tune. A non-zero
+    /// value is an explicit override and is used as given.
+    std::size_t parallel_grain = 0;
 
     /// Island thread budget, or 0 to use the process pool's size
     /// (`IBEX_THREADS`). Clamped to the pool size and to the morsel count.
@@ -395,7 +400,22 @@ struct ExecutionContext {
     /// this stays on the serial morsel chain rather than paying task,
     /// synchronization, and merge overhead to parallelize cache-resident work.
     /// Tests that need the worker path on a small table set this to 0.
+    ///
+    /// This is a floor on ROWS, which is the right unit for splitting one
+    /// expression across ranges (`evaluate_field_maybe_parallel`, whose work is
+    /// per row). An island also copies per *cell*, so it applies
+    /// `parallel_min_cells` on top of this.
     std::size_t parallel_min_rows = 65536;
+
+    /// Second island threshold, in cells (rows x output columns), or 0 to skip
+    /// the check.
+    ///
+    /// An island's cost is dominated by copying rows out, which scales with
+    /// table WIDTH — so a row count alone cannot say whether the work is worth
+    /// a fan-out. Measured: 131,072 rows won at 6 columns and *lost* at 2, on
+    /// the same predicate. Both clear any sane row threshold; only the cell
+    /// count separates them.
+    std::size_t parallel_min_cells = 512UL * 1024;
 
     /// Optional island counters, or null to record nothing. Not owned.
     ParallelIslandStats* parallel_stats = nullptr;

@@ -37,11 +37,16 @@ Two window flavours are benchmarked:
   `time.perf_counter`.
 - `--threads` picks the comparison:
   - `auto` (default): each engine's default parallelism — DuckDB uses
-    `--duckdb-threads` (8), Polars its default pool, Ibex is single-threaded.
+    `--duckdb-threads` (8), Polars its default pool, Ibex its parallel islands.
     This is the *what-users-experience* comparison.
-  - `1`: single-threaded everywhere (`POLARS_MAX_THREADS=1`, DuckDB `threads=1`).
-    The apples-to-apples *engine efficiency* comparison. Ibex is always 1 thread,
-    so its `threads` tag stays `1t` in both modes.
+  - `1`: single-threaded everywhere (`POLARS_MAX_THREADS=1`, DuckDB
+    `threads=1`, `IBEX_PARALLEL=0`). The apples-to-apples *engine efficiency*
+    comparison.
+
+  **Ibex is no longer single-threaded by default**, so every engine is now
+  pinned in `1` mode and tagged with the mode it actually ran in. Results
+  recorded before that change tagged Ibex `1t` in both modes; those `mt` rows
+  are single-threaded Ibex and are not comparable with new `mt` rows.
   Keep both columns — one is not a substitute for the other. Polars fixes its
   thread pool at import, so `--threads` is a whole-process switch: run the suite
   once per mode and combine the TSVs.

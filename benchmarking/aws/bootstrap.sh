@@ -756,7 +756,14 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
         mkdir -p "$OHLC_OUT" /ibex/benchmarking/results
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
-            echo "instance_type=$(curl -fsS --max-time 5 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+            # IMDSv2 is enforced, so the metadata call needs a token first --
+            # a plain GET returns 401 and the type silently reads "unknown".
+            imds_token=$(curl -fsS --max-time 5 -X PUT \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+                http://169.254.169.254/latest/api/token 2>/dev/null || true)
+            echo "instance_type=$(curl -fsS --max-time 5 \
+                -H "X-aws-ec2-metadata-token: ${imds_token}" \
+                http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
             echo "nproc=$(nproc)"
             echo "cores_swept=${IBEX_OHLC_CORES:-}"
             uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'

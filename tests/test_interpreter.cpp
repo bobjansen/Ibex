@@ -10699,3 +10699,76 @@ TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
         CHECK((*seq)[2] == 20);
     }
 }
+
+// Ordering a TimeFrame by a non-time key appends the time index as an implicit
+// final tiebreaker, so each leading-key group stays time-ascending. When the
+// input is ALREADY time-ascending a stable sort by the leading keys achieves
+// that on its own, and the extra key is skipped — which is worth a test in both
+// directions, because getting the skip wrong misorders rows inside a group
+// rather than failing loudly.
+TEST_CASE("Interpret order on a TimeFrame keeps each group time-ascending",
+          "[interpreter][order]") {
+    auto make = [](std::vector<std::int64_t> nanos, std::vector<std::string> symbols) {
+        Column<Timestamp> ts;
+        Column<std::string> sym;
+        for (std::size_t i = 0; i < nanos.size(); ++i) {
+            ts.push_back(Timestamp{nanos[i]});
+            sym.push_back(symbols[i]);
+        }
+        runtime::Table t;
+        t.add_column("ts", std::move(ts));
+        t.add_column("symbol", std::move(sym));
+        t.time_index = "ts";
+        runtime::TableRegistry reg;
+        reg.emplace("t", std::move(t));
+        return reg;
+    };
+
+    auto check_grouped_time_ascending = [](const runtime::Table& result) {
+        const auto* ts = std::get_if<Column<Timestamp>>(result.find("ts"));
+        const auto* sym = std::get_if<Column<std::string>>(result.find("symbol"));
+        REQUIRE(ts != nullptr);
+        REQUIRE(sym != nullptr);
+        REQUIRE(ts->size() == 6);
+        // Symbols grouped, and within each group timestamps ascending.
+        for (std::size_t i = 1; i < ts->size(); ++i) {
+            if ((*sym)[i] == (*sym)[i - 1]) {
+                CAPTURE(i);
+                CHECK((*ts)[i].nanos > (*ts)[i - 1].nanos);
+            }
+        }
+        CHECK((*sym)[0] == "A");
+        CHECK((*sym)[2] == "A");
+        CHECK((*sym)[3] == "B");
+    };
+
+    SECTION("already time-ascending: the tiebreaker is redundant and skipped") {
+        auto tables = make({0, 1, 2, 3, 4, 5}, {"B", "A", "B", "A", "B", "A"});
+        auto ir = require_ir("t[order { symbol asc }];");
+        auto result = runtime::interpret(*ir, tables);
+        REQUIRE(result.has_value());
+        check_grouped_time_ascending(*result);
+        // The order IS (symbol, ts) whether or not ts was sorted on, so the
+        // metadata has to say so — a downstream window relies on it.
+        REQUIRE(result->ordering.has_value());
+        REQUIRE(result->ordering->size() == 2);
+        CHECK((*result->ordering)[0].name == "symbol");
+        CHECK((*result->ordering)[1].name == "ts");
+    }
+
+    SECTION("not time-ascending: the tiebreaker still has work to do") {
+        // Same symbols, timestamps deliberately out of order. If the skip ever
+        // fired here, each group would come out in input order (1, 0, 2 for A)
+        // instead of time order.
+        auto tables = make({5, 1, 4, 0, 3, 2}, {"B", "A", "B", "A", "B", "A"});
+        auto ir = require_ir("t[order { symbol asc }];");
+        auto result = runtime::interpret(*ir, tables);
+        REQUIRE(result.has_value());
+        check_grouped_time_ascending(*result);
+        const auto* ts = std::get_if<Column<Timestamp>>(result->find("ts"));
+        REQUIRE(ts != nullptr);
+        CHECK((*ts)[0].nanos == 0);
+        CHECK((*ts)[1].nanos == 1);
+        CHECK((*ts)[2].nanos == 2);
+    }
+}

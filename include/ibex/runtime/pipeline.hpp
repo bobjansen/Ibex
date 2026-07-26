@@ -22,6 +22,16 @@ enum class ExecutionCapability : std::uint8_t {
 /// analyze_parallel_island(), not duplicated at call sites.
 [[nodiscard]] auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability;
 
+/// True when a node relabels or selects columns without touching a row.
+///
+/// `project_table` and `rename_table` both build their output with
+/// `add_column_shared` — they copy no rows at all, and cost O(columns) rather
+/// than O(rows). Two callers depend on that: `analyze_parallel_island` refuses
+/// a chain made only of these (there is nothing to parallelize), and the
+/// two-phase filter runs them **once over its finished output** rather than
+/// per morsel, which is what lets a `filter … rename` chain keep the fast path.
+[[nodiscard]] auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool;
+
 /// Classify one node, which some kinds only answer with the node in hand.
 ///
 /// `Update` is the case that needs it: a bare update is a barrier in general —

@@ -2499,13 +2499,36 @@ TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[
         }
     }
 
-    SECTION("an operator above the filter keeps the ordered merger") {
-        // Anything above the filter consumes per-morsel chunks, which is
-        // exactly what the two-phase form does not produce.
+    SECTION("a metadata-only operator above the filter keeps the fast path") {
+        // Rename copies no rows, so it runs once over the finished output
+        // rather than forcing the chain back onto the merger.
         runtime::ParallelIslandStats stats;
         const auto* src = "t[filter price > 350][rename px = price];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
         REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 1);
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a chain of metadata-only operators above the filter") {
+        runtime::ParallelIslandStats stats;
+        const auto* src =
+            "t[filter price > 350][rename px = price][select { px, symbol }][rename s = symbol];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_islands.load() == 1);
+        CHECK(stats.two_phase_filters.load() == 1);
+        // Ordering and time-index metadata has to survive the tail identically
+        // to the serial path — which it does by construction, since these are
+        // the same two functions the serial path calls.
+        require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("a row-touching operator above the filter keeps the ordered merger") {
+        // An update computes per row, so it needs the per-morsel chunks the
+        // two-phase form does not produce.
+        runtime::ParallelIslandStats stats;
+        const auto* src = "t[filter price > 350][select { doubled = price * 2 }];";
+        auto island = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.two_phase_filters.load() == 0);
         require_tables_equal(run(src, tables), island);
     }

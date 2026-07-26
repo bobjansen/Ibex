@@ -810,6 +810,43 @@ The regression test uses 50k rows at grain 37 (coprime with 64, so essentially
 every boundary lands mid-word) on 8 threads, and fails 5 runs out of 5 when the
 `fetch_or` is replaced by a plain `|=`.
 
+### Metadata-only operators ride along, and every island shape now wins
+
+A `filter … rename` chain was the last shape losing to serial, because a second
+operator sent the island back to the ordered merger. But Project and Rename copy
+no rows (the same fact that made a chain of only those `NoRowWork`), so the
+two-phase filter now accepts a **metadata-only tail** and applies it once to the
+finished output via `project_table` / `rename_table` — the same two functions the
+serial path calls, so the ordering and time-index rules cannot diverge. A
+row-touching operator above the filter still needs per-morsel chunks and still
+takes the merger. `is_metadata_only_node` moved to pipeline.hpp for the second
+caller.
+
+Full survey, 20M rows / 6 cols / 8 threads, min-of-4, net of generation:
+
+| shape | serial | island | |
+|---|---:|---:|---|
+| 4 bulk filters (93%) | 1334 | **271** | 4.9x |
+| 4 selective filters (6.7%) | 129 | **~0** | — |
+| 4 bulk filters + rename | 1382 | **256** | 5.4x |
+| 4 fused filter-update-project | 772 | **386** | 2.0x |
+| 4 bulk filters, nullable column | 2097 | **418** | 5.0x |
+| generation only (no island) | 0 | 8 | parity |
+
+**No island shape measured now loses to serial**, which is the condition the plan
+set for reconsidering the `IBEX_PARALLEL` default. That decision still wants a
+wider sweep (narrow tables, small inputs near `parallel_min_rows`, the grain
+itself is still an untuned 65536) before flipping.
+
+**MEASUREMENT TRAP, cost a wrong conclusion for two rounds:** `ninja ibex_tests`
+does **not** build `tools/ibex`. The `filter … rename` shape was recorded as a
+2.3x *loss* twice, from a benchmark running the pre-fix tool while the test suite
+ran the fixed one — the tests and the benchmark disagreed because they were
+different binaries. A one-line diagnostic print showed the two-phase path firing
+with `tail=1`, which is what exposed it. Always build the default target before
+benchmarking, and when tests and a benchmark disagree about whether a path is
+taken, suspect the build before the code.
+
 **The refactor that made it expressible.** `filter_table_impl` was split into
 `compute_filter_selection` / `build_filter_output_layout` /
 `count_selected_chars` / `presize_filter_output` / `gather_selection_into`

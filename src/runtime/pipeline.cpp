@@ -34,16 +34,11 @@ auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
     }
 }
 
-namespace {
-
-/// True when a node relabels or selects columns without touching a row.
-///
-/// `project_table` and `rename_table` both build their output with
-/// `add_column_shared` — they copy no rows at all, and cost O(columns) rather
-/// than O(rows). There is nothing in them to parallelize.
 auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool {
     return kind == ir::NodeKind::Project || kind == ir::NodeKind::Rename;
 }
+
+namespace {
 
 auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
     switch (node.kind()) {

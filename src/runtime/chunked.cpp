@@ -5842,6 +5842,25 @@ class SerialIslandOrderValidator final : public Operator {
     std::size_t grain_ = 1;
 };
 
+auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
+    if (exec.parallel_grain != 0) {
+        return exec.parallel_grain;  // explicit override, used as given
+    }
+    // Aim for this many morsels per worker, so one slow morsel cannot strand
+    // the others. Below ~2 per thread the sweep shows real imbalance loss.
+    constexpr std::size_t kMorselsPerThread = 4;
+    // The measured good band was 16k-256k; clamp inside it. The upper bound is
+    // what stops the formula from choosing a grain worse than the old constant
+    // on a large input — see the declaration.
+    constexpr std::size_t kMinGrain = 4096;
+    constexpr std::size_t kMaxGrain = 65536;
+
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t threads = std::max<std::size_t>(std::min(budget, pool_size), 1);
+    return std::clamp(rows / (threads * kMorselsPerThread), kMinGrain, kMaxGrain);
+}
+
 void configure_parallel_from_env(ExecutionContext& exec) {
     if (parallel_enabled_from_env()) {
         exec.parallel = true;
@@ -6793,9 +6812,31 @@ class TwoPhaseFilterOperator final : public Operator {
 // ring synchronization, and the merge cost more than the map they parallelize —
 // cache-resident work should not pay for threads. A single morsel is serial by
 // definition, and a one-thread budget means the caller asked for serial.
-[[nodiscard]] auto island_worker_count(const ExecutionContext& exec, std::size_t rows,
-                                       std::uint64_t morsel_count) -> std::size_t {
-    if (morsel_count < 2 || rows < exec.parallel_min_rows) {
+/// Whether this input is worth morselizing at all — a *different* question from
+/// how many workers it deserves, and conflating the two is a trap worth naming.
+///
+/// A "refused" island used to mean a serial sweep of morsels, which still pays
+/// per-morsel materialization and the merge concat. So refusing by dropping the
+/// worker count made a small query **slower than never forming an island**:
+/// measured 100ms against 36ms for the plain serial path, and it got worse once
+/// the grain was derived, because that turned 2 morsels into 32. When the
+/// answer is no, the input has to run as ONE whole-table chunk.
+///
+/// Two thresholds, because an island's cost has two dimensions. Rows alone
+/// cannot express it: 131,072 rows won at 6 columns and lost at 2 on the very
+/// same predicate, and every row threshold puts those on the same side.
+[[nodiscard]] auto island_is_worth_morselizing(const ExecutionContext& exec, std::size_t rows,
+                                               std::size_t columns) -> bool {
+    if (rows < exec.parallel_min_rows) {
+        return false;
+    }
+    return exec.parallel_min_cells == 0 || columns == 0 ||
+           rows * columns >= exec.parallel_min_cells;
+}
+
+[[nodiscard]] auto island_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
+    -> std::size_t {
+    if (morsel_count < 2) {
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
@@ -6829,8 +6870,10 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         return std::unexpected(std::move(input_tbl.error()));
     }
     auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
-    const auto expected_morsels = partitioned_morsel_count(*owned, exec.parallel_grain);
-    const std::size_t worker_count = island_worker_count(exec, owned->rows(), expected_morsels);
+    const std::size_t grain = island_grain(exec, owned->rows());
+    const auto expected_morsels = partitioned_morsel_count(*owned, grain);
+    const bool morselize = island_is_worth_morselizing(exec, owned->rows(), owned->columns.size());
+    const std::size_t worker_count = morselize ? island_worker_count(exec, expected_morsels) : 0;
     if (exec.parallel_stats != nullptr) {
         auto& stats = *exec.parallel_stats;
         (worker_count >= 2 ? stats.parallel_islands : stats.serial_islands)
@@ -6865,7 +6908,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
                 return std::make_unique<TwoPhaseFilterOperator>(
                     std::move(owned), *head->predicate, head->project != nullptr,
                     std::vector<const ir::Node*>(tail.begin(), tail.end()), scalars,
-                    std::move(layout.value()), exec.parallel_grain, expected_morsels, worker_count,
+                    std::move(layout.value()), grain, expected_morsels, worker_count,
                     process_worker_pool());
             }
         }
@@ -6880,12 +6923,30 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
             }
             workers.push_back(std::move(worker.value()));
         }
-        return std::make_unique<ParallelIslandOperator>(std::move(owned), std::move(workers),
-                                                        exec.parallel_grain, expected_morsels,
-                                                        process_worker_pool());
+        return std::make_unique<ParallelIslandOperator>(std::move(owned), std::move(workers), grain,
+                                                        expected_morsels, process_worker_pool());
     }
 
-    OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, exec.parallel_grain);
+    if (!morselize) {
+        // Too little work to be worth splitting: run the chain over one
+        // whole-table chunk. This is the plain serial path — same map
+        // operators, same `preserve_empty_morsels = false`, one chunk in and
+        // one chunk out — so it costs exactly what not forming an island costs.
+        // Morselizing here instead would add a per-morsel gather and a merge
+        // concat to buy parallelism that was already judged not worth having.
+        OperatorPtr serial = std::make_unique<TableSourceOperator>(std::move(*owned));
+        for (const ir::Node* op_node : candidate.operators) {
+            auto next = build_row_local_map_operator(*op_node, std::move(serial), scalars, externs,
+                                                     exec, false);
+            if (!next.has_value()) {
+                return std::unexpected("parallel island: " + next.error());
+            }
+            serial = std::move(next.value());
+        }
+        return serial;
+    }
+
+    OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, grain);
     for (const ir::Node* op_node : candidate.operators) {
         auto next =
             build_row_local_map_operator(*op_node, std::move(chain), scalars, externs, exec, true);
@@ -6896,8 +6957,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         chain = std::move(next.value());
     }
 
-    chain = std::make_unique<SerialIslandOrderValidator>(std::move(chain), expected_morsels,
-                                                         exec.parallel_grain);
+    chain = std::make_unique<SerialIslandOrderValidator>(std::move(chain), expected_morsels, grain);
     return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
 }
 

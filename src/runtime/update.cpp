@@ -1778,7 +1778,11 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         return whole();
     }
 
-    const std::size_t grain = exec.parallel_grain == 0 ? 1 : exec.parallel_grain;
+    // Same derivation as an island's, so the two parallel paths partition
+    // alike. Note a zero `parallel_grain` now means "derive", not "one row per
+    // morsel" — reading it directly here would have split a 20M-row update into
+    // 20M tasks.
+    const std::size_t grain = island_grain(exec, rows);
     const std::size_t morsels = (rows + grain - 1) / grain;
     auto& pool = process_worker_pool();
     const std::size_t threads =

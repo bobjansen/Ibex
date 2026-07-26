@@ -946,6 +946,25 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// the floor; widening this without the evaluator reintroduces the blowup.
 [[nodiscard]] auto is_range_native_expr(const ir::Expr& expr) -> bool;
 
+/// The morsel row-grain to partition `rows` into, honouring an explicit
+/// `exec.parallel_grain` and otherwise deriving one.
+///
+/// Derivation, from a 96-config sweep of 4k..4M grains over 2/6/16-column
+/// tables at both selectivities: **every** grain in that 1000x band beat the
+/// serial path, and 16k-256k was within ~20% of optimal everywhere. So this is
+/// not a tuning knob, and there is nothing here to ask a user about.
+///
+/// The one consistent degradation was at very large grains, and it is purely
+/// load imbalance — it tracks morsels-per-thread falling below ~2, not the
+/// grain in absolute terms. Hence `rows / (threads * 4)`: enough morsels that
+/// every worker gets several, so a slow one cannot strand the rest.
+///
+/// **The upper clamp is load-bearing.** An uncapped `rows / (threads * 4)`
+/// gives 625k rows at 20M/8 threads, which the sweep measured as clearly worse
+/// than 64k. The formula may only shrink the grain below the plateau for small
+/// inputs, never grow it past.
+[[nodiscard]] auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t;
+
 /// Filter rows `[rows.begin, rows.end())` of `input` without gathering that
 /// slice first. For a partial range the predicate must satisfy
 /// `is_range_native_expr`, or the evaluation degrades to whole-table work per

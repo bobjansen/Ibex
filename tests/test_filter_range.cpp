@@ -10,9 +10,11 @@
 
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -419,6 +421,70 @@ TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filte
                 REQUIRE(ranged.has_value());
                 CHECK(runtime::column_kernel_splice_count() == 0);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Morsel grain derivation.
+//
+// A 96-config sweep found no grain in a 4k..4M band that loses to serial, so
+// this is deliberately a formula rather than a knob. What the formula must
+// guarantee is only this: enough morsels per worker that one slow morsel cannot
+// strand the rest, without ever exceeding the measured plateau.
+// ---------------------------------------------------------------------------
+TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][parallel]") {
+    ibex::runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 8;
+
+    SECTION("an explicit grain is honoured exactly") {
+        exec.parallel_grain = 12345;
+        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 12345);
+        // Including one that the derivation would never choose itself.
+        exec.parallel_grain = 8'000'000;
+        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 8'000'000);
+    }
+
+    SECTION("a large input clamps to the plateau, not to rows/threads") {
+        // The upper clamp is the load-bearing half of the formula: an uncapped
+        // rows/(threads*4) would give 625k here, which the sweep measured as
+        // clearly worse than 64k. If this ever returns something larger, the
+        // clamp has been dropped and large inputs have silently regressed.
+        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 65536);
+    }
+
+    SECTION("a small input shrinks the grain to keep every worker fed") {
+        // 200k rows at the old fixed 64k grain is 4 morsels for 8 threads --
+        // half the pool idle. The derived grain gives each worker several.
+        //
+        // The budget is clamped to the real pool, so the expectation has to be
+        // computed from the pool too: hard-coding 8 here would fail on any
+        // machine with fewer cores, which is exactly where CI runs.
+        const std::size_t threads =
+            std::min<std::size_t>(8, ibex::runtime::process_worker_pool().size());
+        const std::size_t grain = ibex::runtime::island_grain(exec, 200'000);
+        CHECK(grain < 65536);
+        const std::size_t morsels = (200'000 + grain - 1) / grain;
+        CHECK(morsels >= threads * 2);
+    }
+
+    SECTION("a tiny input still floors at a usable grain") {
+        // Never one row per morsel: that would be more tasks than work.
+        CHECK(ibex::runtime::island_grain(exec, 10) == 4096);
+        CHECK(ibex::runtime::island_grain(exec, 0) == 4096);
+    }
+
+    SECTION("more threads means smaller morsels at the same input size") {
+        // Budgets of 1 and 2 rather than 2 and 8, so the comparison survives a
+        // two-core machine; a single-core pool clamps both and has nothing to
+        // compare.
+        if (ibex::runtime::process_worker_pool().size() >= 2) {
+            exec.parallel_threads = 1;
+            const std::size_t few = ibex::runtime::island_grain(exec, 200'000);
+            exec.parallel_threads = 2;
+            const std::size_t many = ibex::runtime::island_grain(exec, 200'000);
+            CHECK(many < few);
         }
     }
 }

@@ -838,6 +838,43 @@ set for reconsidering the `IBEX_PARALLEL` default. That decision still wants a
 wider sweep (narrow tables, small inputs near `parallel_min_rows`, the grain
 itself is still an untuned 65536) before flipping.
 
+### The two knobs are now derived, not tuned
+
+A 96-config sweep (4k..4M grain x 2/6/16 columns x both selectivities) settled that
+`parallel_grain` is not a tuning knob: **every grain in that 1000x band beat the
+serial path**, and 16k-256k was within ~20% of optimal everywhere. There is
+nothing here worth asking a user about, so a tuning tool would only move the
+burden rather than remove it.
+
+- **`parallel_grain` defaults to 0 = derive** (`island_grain`):
+  `clamp(rows / (threads * 4), 4096, 65536)`. The divisor keeps every worker fed
+  — the one consistent degradation in the sweep was at large grains, and it
+  tracked *morsels per thread falling below ~2*, not the grain in absolute
+  terms. **The upper clamp is load-bearing:** uncapped, the formula gives 625k
+  at 20M rows / 8 threads, which measured clearly worse than 64k. It may shrink
+  the grain below the plateau for small inputs, never grow it past. Verified
+  against the explicit grains it replaces: the derived value lands within
+  0.96x-1.15x of the best hand-picked grain in all six shapes.
+- **`parallel_min_cells` (new, 512k) joins `parallel_min_rows`.** An island
+  copies rows out, so its cost scales with *cells*, not rows: 131,072 rows won
+  at 6 columns and lost at 2 on the same predicate, and no row threshold can
+  separate those.
+
+**The trap that made the first attempt worse, not better.** Refusing an island
+by returning a zero worker count did **not** stop it forming — it ran the
+*serial island*, which still morselizes and still pays the merge concat. So the
+narrow case the cell gate was written to protect went from +4ms to **+64ms**
+against a 36ms serial baseline, because deriving the grain had turned its 2
+morsels into 32. Refusing has to mean *one whole-table chunk*, not *morsels
+swept serially*. `island_is_worth_morselizing` is now a separate question from
+`island_worker_count`, and a negative answer builds the plain serial chain
+(same map operators, `preserve_empty_morsels = false`, one chunk in and out).
+
+Sweep B re-run over the defaults, 24 configurations from 131k to 20M rows at 2
+and 6 columns, both selectivities: **20 wins, 4 parity, 0 regressions.** The
+narrow gated case is now exactly at parity (+0ms) where it was +64. Wins scale
+from -13ms at 262k rows to -576ms at 20M.
+
 **MEASUREMENT TRAP, cost a wrong conclusion for two rounds:** `ninja ibex_tests`
 does **not** build `tools/ibex`. The `filter … rename` shape was recorded as a
 2.3x *loss* twice, from a benchmark running the pre-fix tool while the test suite

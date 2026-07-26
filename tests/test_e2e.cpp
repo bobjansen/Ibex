@@ -2583,6 +2583,113 @@ auto make_bit_packed_table(std::size_t rows) -> runtime::TableRegistry {
 
 }  // namespace
 
+namespace {
+
+// A TimeFrame with `groups` symbols interleaved in time order, which is the
+// precondition the per-group rolling buffer relies on.
+auto make_grouped_window_table(std::size_t rows, std::size_t groups) -> runtime::TableRegistry {
+    Column<Timestamp> ts;
+    Column<std::string> symbol;
+    Column<double> price;
+    ts.reserve(rows);
+    symbol.reserve(rows);
+    price.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        ts.push_back(Timestamp{static_cast<std::int64_t>(i) * 1'000'000LL});
+        symbol.push_back("S" + std::to_string(i % groups));
+        price.push_back(static_cast<double>((i * 37) % 100) + 0.5);
+    }
+    runtime::Table t;
+    t.add_column("ts", std::move(ts));
+    t.add_column("symbol", std::move(symbol));
+    t.add_column("price", std::move(price));
+    t.time_index = "ts";
+
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+
+}  // namespace
+
+TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[e2e][parallel]") {
+    // Parallelism here is across GROUPS, because a group's rolling buffer must
+    // not cross a group boundary. Both directions are asserted via the counter:
+    // the output is identical either way, so a gate that silently stopped
+    // matching would cost the parallelism with every value test still green.
+    const auto* src =
+        "t[ select { price = price, open = first(price), close = last(price) },"
+        "   by symbol, window 10s ];";
+
+    auto run_grouped = [&](const runtime::TableRegistry& tables, std::size_t threads,
+                           runtime::ParallelIslandStats& stats) {
+        auto parsed = parser::parse(src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        runtime::ExecutionContext exec;
+        exec.parallel = true;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = &stats;
+        auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    SECTION("several groups fan out and match the serial answer") {
+        auto tables = make_grouped_window_table(4000, 8);
+        runtime::ParallelIslandStats stats;
+        auto parallel = run_grouped(tables, 4, stats);
+        CHECK(stats.parallel_group_windows.load() == 1);
+        require_tables_equal(run(src, tables), parallel);
+    }
+
+    SECTION("a single group has nothing to spread") {
+        // The cap is the group count, not the thread count -- worth asserting,
+        // because it is the reason this optimization does nothing for a
+        // low-cardinality key however many cores are free.
+        auto tables = make_grouped_window_table(4000, 1);
+        runtime::ParallelIslandStats stats;
+        auto parallel = run_grouped(tables, 4, stats);
+        CHECK(stats.parallel_group_windows.load() == 0);
+        require_tables_equal(run(src, tables), parallel);
+    }
+
+    SECTION("one thread stays serial") {
+        auto tables = make_grouped_window_table(4000, 8);
+        runtime::ParallelIslandStats stats;
+        auto parallel = run_grouped(tables, 1, stats);
+        CHECK(stats.parallel_group_windows.load() == 0);
+        require_tables_equal(run(src, tables), parallel);
+    }
+
+    SECTION("a generator field refuses to run groups concurrently") {
+        // `rand_*` draws from one shared stream, so running groups out of order
+        // would change the ANSWER, not just the timing. This is the section
+        // that would catch someone widening the gate to "any builtin".
+        auto tables = make_grouped_window_table(4000, 8);
+        const auto* gen_src =
+            "t[ select { price = price, noise = rand_normal(0, 1), open = first(price) },"
+            "   by symbol, window 10s ];";
+        auto parsed = parser::parse(gen_src);
+        REQUIRE(parsed.has_value());
+        auto lowered = parser::lower(*parsed);
+        REQUIRE(lowered.has_value());
+        runtime::ExecutionContext exec;
+        exec.parallel = true;
+        exec.parallel_threads = 4;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        runtime::ParallelIslandStats stats;
+        exec.parallel_stats = &stats;
+        auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        CHECK(stats.parallel_group_windows.load() == 0);
+    }
+}
+
 TEST_CASE("E2E: the island size gate counts cells, not rows", "[e2e][parallel]") {
     // An island copies rows out, so its cost scales with table WIDTH. Measured:
     // 131,072 rows won at 6 columns and lost at 2, on the same predicate --

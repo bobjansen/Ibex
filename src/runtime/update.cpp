@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <expected>
+#include <mutex>
 #include <optional>
 #include <robin_hood.h>
 #include <string>
@@ -1496,6 +1497,64 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     return output;
 }
 
+/// Clear one bit of a shared validity bitmap.
+///
+/// Groups scatter to disjoint ROWS, but a bitmap packs 64 rows into a word, so
+/// two groups can meet inside one word — and unlike a filter's output, the rows
+/// a group owns are scattered rather than contiguous, so there is no "only the
+/// two edge words are shared" structure to exploit here. Every write must be
+/// atomic. It is sound because these writes only ever turn bits OFF: AND is
+/// commutative and associative, so the interleaving cannot matter.
+inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
+    const std::uint64_t mask = ~(std::uint64_t{1} << (bit % 64));
+    std::atomic_ref<std::uint64_t>(words[bit / 64]).fetch_and(mask, std::memory_order_relaxed);
+}
+
+/// How many workers should share a grouped windowed update's groups, or 0 to
+/// run them serially.
+///
+/// Parallelism here is across GROUPS, not row ranges: each group's rolling
+/// buffer must not cross a group boundary, so a group is the natural
+/// indivisible unit. That also caps the speedup at the group count, which is
+/// why a two-symbol table gains nothing however many cores are free.
+[[nodiscard]] auto grouped_window_worker_count(const ExecutionContext& exec,
+                                               std::size_t remaining_groups, std::size_t rows,
+                                               const Table& first_sub,
+                                               const std::vector<std::string>& new_field_names,
+                                               const std::vector<ir::FieldSpec>& fields)
+    -> std::size_t {
+    // `run_group` is reached from a worker only through this function, but the
+    // island executor can call the whole update from a pool thread; submitting
+    // from there deadlocks the pool.
+    if (on_worker_pool_thread() || !exec.parallel || remaining_groups < 2) {
+        return 0;
+    }
+    if (rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    // An extern call or a Generator would not merely be slower out of order —
+    // it would answer differently. See `is_group_parallel_safe_expr`.
+    for (const auto& field : fields) {
+        if (!ir::is_group_parallel_safe_expr(field.expr)) {
+            return 0;
+        }
+    }
+    // A bool output column is bit-packed, and a group's rows are scattered, so
+    // two groups writing one word would lose bits. Validity has the same shape
+    // but is monotone and handled atomically; a bool VALUE is not monotone, so
+    // it is refused instead. Rolling/aggregate fields are numeric in practice.
+    for (const auto& fname : new_field_names) {
+        const auto* sample = first_sub.find(fname);
+        if (sample != nullptr && std::holds_alternative<Column<bool>>(*sample)) {
+            return 0;
+        }
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers = std::min({budget, pool_size, remaining_groups});
+    return workers < 2 ? 0 : workers;
+}
+
 /// Per-group windowed update: partition the input by `group_by`, run the
 /// regular `windowed_update_table` on each per-group slice, then scatter the
 /// new field columns back into a single full-sized output. The rolling
@@ -1668,8 +1727,23 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
 
     // Lazy-allocated per-field validity bitmaps. We only construct one if at
     // least one group's sub-result has a validity bitmap for that field —
-    // most pure-arithmetic outputs stay all-valid and pay nothing.
+    // most pure-arithmetic outputs stay all-valid and pay nothing. The
+    // laziness is what decides the OUTPUT REPRESENTATION (bitmap vs no
+    // bitmap), so it has to survive parallelism unchanged rather than being
+    // traded for a simpler eager allocation.
     std::vector<std::optional<ValidityBitmap>> output_validity(new_field_names.size());
+
+    // Allocation happens at most once per field, so a mutex around just that is
+    // uncontended in practice; the bit writes then proceed outside it. The
+    // vector is pre-sized and never resized, so the pointer stays valid.
+    std::mutex validity_mutex;
+    auto ensure_validity = [&](std::size_t f_idx) -> ValidityBitmap* {
+        const std::scoped_lock lock(validity_mutex);
+        if (!output_validity[f_idx].has_value()) {
+            output_validity[f_idx] = ValidityBitmap(rows, true);
+        }
+        return &*output_validity[f_idx];
+    };
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
                                 const std::vector<std::size_t>& indices) {
@@ -1677,45 +1751,112 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
         }
-        if (!output_validity[f_idx].has_value()) {
-            output_validity[f_idx] = ValidityBitmap(rows, true);
-        }
+        auto* out_bm = ensure_validity(f_idx);
         const auto& sub_bm = *sub_entry->validity;
-        auto& out_bm = *output_validity[f_idx];
+        auto* words = out_bm->words_data();
         for (std::size_t i = 0; i < indices.size(); ++i) {
             if (!sub_bm[i]) {
-                out_bm.set(indices[i], false);
+                clear_validity_bit(words, indices[i]);
             }
         }
     };
 
-    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
-        const auto& fname = new_field_names[f];
-        auto* dst = output.find(fname);
-        const auto* src = first->find(fname);
-        if (auto err = scatter_into(*dst, *src, group_rows[0])) {
-            return std::unexpected(*err);
-        }
-        scatter_validity(f, *first, group_rows[0]);
+    // Resolved once: `find` walks a hash map, and every group would otherwise
+    // repeat that per field.
+    std::vector<ColumnValue*> dst_columns;
+    dst_columns.reserve(new_field_names.size());
+    for (const auto& fname : new_field_names) {
+        dst_columns.push_back(output.find(fname));
     }
 
-    for (std::size_t g = 1; g < group_rows.size(); ++g) {
-        auto sub = run_group(group_rows[g]);
-        if (!sub.has_value()) {
-            return std::unexpected(sub.error());
-        }
+    // One group's whole contribution: run the windowed update over its slice,
+    // then scatter the new columns into the rows it owns. Groups own disjoint
+    // rows, which is exactly what makes them independent of each other.
+    auto scatter_group =
+        [&](const Table& sub,
+            const std::vector<std::size_t>& indices) -> std::optional<std::string> {
         for (std::size_t f = 0; f < new_field_names.size(); ++f) {
-            const auto& fname = new_field_names[f];
-            auto* dst = output.find(fname);
-            const auto* src = sub->find(fname);
+            const auto* src = sub.find(new_field_names[f]);
             if (src == nullptr) {
-                return std::unexpected("window: missing column '" + fname +
-                                       "' in grouped sub-result");
+                return "window: missing column '" + new_field_names[f] + "' in grouped sub-result";
             }
-            if (auto err = scatter_into(*dst, *src, group_rows[g])) {
+            if (auto err = scatter_into(*dst_columns[f], *src, indices)) {
+                return err;
+            }
+            scatter_validity(f, sub, indices);
+        }
+        return std::nullopt;
+    };
+
+    if (auto err = scatter_group(*first, group_rows[0])) {
+        return std::unexpected(*err);
+    }
+
+    const std::size_t workers = grouped_window_worker_count(exec, group_rows.size() - 1, rows,
+                                                            *first, new_field_names, fields);
+    if (workers < 2) {
+        for (std::size_t g = 1; g < group_rows.size(); ++g) {
+            auto sub = run_group(group_rows[g]);
+            if (!sub.has_value()) {
+                return std::unexpected(sub.error());
+            }
+            if (auto err = scatter_group(*sub, group_rows[g])) {
                 return std::unexpected(*err);
             }
-            scatter_validity(f, *sub, group_rows[g]);
+        }
+    } else {
+        if (exec.parallel_stats != nullptr) {
+            exec.parallel_stats->parallel_group_windows.fetch_add(1, std::memory_order_relaxed);
+        }
+        // Groups are claimed from one cursor rather than pre-assigned: group
+        // sizes are data-dependent and can differ by orders of magnitude, so a
+        // static split would leave workers idle behind the largest group.
+        std::atomic<std::size_t> cursor{1};
+        std::mutex error_mutex;
+        std::optional<std::string> failure;
+        std::size_t failure_group = 0;
+        auto& pool = process_worker_pool();
+        {
+            auto batch = pool.submit(workers, [&](std::size_t) noexcept {
+                while (true) {
+                    const std::size_t g = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (g >= group_rows.size()) {
+                        return;
+                    }
+                    {
+                        // Abandon only groups above a recorded failure, so the
+                        // reported error never depends on thread timing.
+                        const std::scoped_lock lock(error_mutex);
+                        if (failure.has_value() && failure_group < g) {
+                            return;
+                        }
+                    }
+                    std::optional<std::string> err;
+                    try {
+                        auto sub = run_group(group_rows[g]);
+                        if (!sub.has_value()) {
+                            err = std::move(sub.error());
+                        } else {
+                            err = scatter_group(*sub, group_rows[g]);
+                        }
+                    } catch (const std::exception& e) {
+                        err = std::string("window + by: worker exception: ") + e.what();
+                    } catch (...) {
+                        err = std::string("window + by: worker threw a non-standard exception");
+                    }
+                    if (err.has_value()) {
+                        const std::scoped_lock lock(error_mutex);
+                        if (!failure.has_value() || g < failure_group) {
+                            failure = std::move(err);
+                            failure_group = g;
+                        }
+                    }
+                }
+            });
+            batch.wait();
+        }
+        if (failure.has_value()) {
+            return std::unexpected(std::move(*failure));
         }
     }
 

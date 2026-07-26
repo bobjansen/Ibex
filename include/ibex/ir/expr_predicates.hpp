@@ -61,6 +61,25 @@ struct BuiltinFunctionInfo {
 /// a subset of rows (gather/scatter) — used by the guarded `where … update`.
 [[nodiscard]] auto is_subset_evaluable_expr(const Expr& expr) -> bool;
 
+/// True if `expr` may be evaluated for several groups concurrently.
+///
+/// Permits Scalar, Transform and Aggregate calls — a grouped windowed update
+/// runs each group over its own slice, so a rolling or aggregate call sees only
+/// that group either way. Two things are refused:
+///
+/// - **An unknown callee**, i.e. an extern/plugin function. They are left
+///   unclassified on purpose (see `BuiltinFunctionInfo`) so planning cannot
+///   assume they are deterministic or safe to duplicate, and the runtime's rule
+///   is that a plugin runs on the thread of the query that called it.
+/// - **`Generator`** (`rand_*`), which draws from one shared RNG stream.
+///   Running groups concurrently would reorder the draws and change the answer
+///   rather than just the timing — the failure a value test would catch only by
+///   luck.
+///
+/// `RankExpr` is refused too. Per-group rank would in fact be safe, but the
+/// standing rule for this work is that anything unproven defaults to unsafe.
+[[nodiscard]] auto is_group_parallel_safe_expr(const Expr& expr) -> bool;
+
 /// Collects the set of column names referenced anywhere inside `expr` into `out`.
 void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out);
 

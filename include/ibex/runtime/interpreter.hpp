@@ -364,6 +364,12 @@ struct ParallelIslandStats {
     /// narrowed gate, a newly nullable column) would cost the merge copy again
     /// with every test still green.
     std::atomic<std::uint64_t> two_phase_filters{0};
+    /// Grouped windowed updates whose groups were spread across worker threads.
+    /// Same reason as the counters above: the output is identical either way,
+    /// so without this a gate that quietly stopped matching — a newly nullable
+    /// field, an extern call added to a query — would cost the parallelism with
+    /// every test still green.
+    std::atomic<std::uint64_t> parallel_group_windows{0};
 };
 
 struct ExecutionContext {

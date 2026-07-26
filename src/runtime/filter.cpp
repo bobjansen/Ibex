@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -142,19 +143,71 @@ auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept 
 #endif
 }
 
+/// The words of a bit-packed output that a single gather may share with another
+/// gather running at the same time.
+///
+/// A gather writes a contiguous run of output bits, so it can only meet a
+/// neighbour at the two ends of that run: every word strictly between them has
+/// all 64 of its bits inside this run and is exclusively owned. Marking just
+/// those two words is what keeps the atomics off the hot loop.
+///
+/// When a run is short enough to sit inside one word, `first == last` and that
+/// single word is written atomically — which is also the case where three or
+/// more gathers can meet in one word, and it needs no special handling because
+/// OR is commutative and associative.
+struct SharedBitWords {
+    std::size_t first = 0;
+    std::size_t last = 0;
+
+    /// For a run of `count` bits starting at output bit `begin`. An empty run
+    /// writes nothing, so its bounds are never consulted.
+    [[nodiscard]] static auto of_run(std::size_t begin, std::size_t count) noexcept
+        -> SharedBitWords {
+        constexpr std::size_t kBitsPerWord = 64;
+        return {.first = begin / kBitsPerWord,
+                .last = (begin + (count == 0 ? 0 : count - 1)) / kBitsPerWord};
+    }
+
+    [[nodiscard]] auto contains(std::size_t word) const noexcept -> bool {
+        return word == first || word == last;
+    }
+};
+
+/// OR `bits` into output word `index`, atomically iff that word may be shared
+/// with a concurrent gather.
+///
+/// Sound only because every bit-packed destination is zero-filled before any
+/// gather runs and these writes only ever *set* bits — so the interleaving
+/// cannot matter. A write that had to clear a bit could not use this, which is
+/// why the validity gather below skips its false bits instead of assigning
+/// them. A plain store to an exclusively-owned word races with nothing: sharing
+/// a cache line with an atomic write is a performance question, not a
+/// correctness one.
+inline void or_bits_into_word(std::uint64_t* words, std::size_t index, std::uint64_t bits,
+                              SharedBitWords shared) noexcept {
+    if (bits == 0) {
+        return;
+    }
+    if (shared.contains(index)) {
+        std::atomic_ref<std::uint64_t>(words[index]).fetch_or(bits, std::memory_order_relaxed);
+    } else {
+        words[index] |= bits;
+    }
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
-                             Column<bool>::word_type* dst_words, std::size_t& out_bit) noexcept
-    -> void {
+                             Column<bool>::word_type* dst_words, std::size_t& out_bit,
+                             SharedBitWords shared) noexcept -> void {
     if (count == 0) {
         return;
     }
     constexpr std::size_t kBitsPerWord = sizeof(Column<bool>::word_type) * 8;
     const std::size_t dst_word = out_bit / kBitsPerWord;
     const auto shift = static_cast<unsigned>(out_bit % kBitsPerWord);
-    dst_words[dst_word] |= packed << shift;
+    or_bits_into_word(dst_words, dst_word, packed << shift, shared);
     if (shift != 0 && count > kBitsPerWord - shift) {
-        dst_words[dst_word + 1] |= packed >> (kBitsPerWord - shift);
+        or_bits_into_word(dst_words, dst_word + 1, packed >> (kBitsPerWord - shift), shared);
     }
     out_bit += count;
 }
@@ -2318,9 +2371,10 @@ void gather_selection_into(Table& output, const Table& input,
                         dst_off[++j] = cur;
                     });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    auto* __restrict dst_words = out->words_data();
+                    auto* dst_words = out->words_data();
                     const auto* __restrict src_words = src.words_data();
                     const std::size_t src_words_n = (src.size() + 63) / 64;
+                    const auto shared = SharedBitWords::of_run(dst.row, sel.kept);
                     std::size_t out_bit = dst.row;
                     for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
                         const std::uint64_t select = sel.keep_words[w];
@@ -2341,7 +2395,7 @@ void gather_selection_into(Table& output, const Table& input,
                         const std::uint64_t packed = pack_selected_bool_bits(src_bits, select);
                         append_packed_bool_bits(packed,
                                                 static_cast<std::size_t>(std::popcount(select)),
-                                                dst_words, out_bit);
+                                                dst_words, out_bit, shared);
                     }
                 } else {
                     using T = ColT::value_type;
@@ -2354,20 +2408,61 @@ void gather_selection_into(Table& output, const Table& input,
             *src_entry.column);
 
         // Validity travels with the same selected row set.
+        //
+        // Accumulated a word at a time rather than a bit at a time, so the
+        // shared-word rule applies per word instead of per bit. A false bit is
+        // simply not written: the destination is zero-filled, so skipping it
+        // gives the same answer *and* keeps every write monotonic, which is
+        // what lets a shared word be OR-ed in atomically.
         if (src_entry.validity.has_value()) {
             const auto& src_bm = *src_entry.validity;
             auto& dst_bm = *dst_entry.validity;
+            auto* dst_words = dst_bm.words_data();
+            const auto shared = SharedBitWords::of_run(dst.row, sel.kept);
             std::size_t j = dst.row;
-            for_each_selected_row(sel, rows, [&](std::size_t si) { dst_bm.set(j++, src_bm[si]); });
+            std::size_t word = shared.first;
+            std::uint64_t acc = 0;
+            for_each_selected_row(sel, rows, [&](std::size_t si) {
+                const std::size_t target = j / 64;
+                if (target != word) {
+                    or_bits_into_word(dst_words, word, acc, shared);
+                    acc = 0;
+                    word = target;
+                }
+                if (src_bm[si]) {
+                    acc |= std::uint64_t{1} << (j % 64);
+                }
+                ++j;
+            });
+            or_bits_into_word(dst_words, word, acc, shared);
         }
     }
 }
 
 auto filter_gather_is_thread_safe(const Table& input, const std::vector<std::size_t>& src_of_dst)
     -> bool {
-    return std::ranges::none_of(src_of_dst, [&](std::size_t src_idx) {
-        const auto& entry = input.columns[src_idx];
-        return entry.validity.has_value() || std::holds_alternative<Column<bool>>(*entry.column);
+    // Listed per column kind rather than answered once, so that adding a
+    // variant alternative defaults it to "not safe" and costs a fallback to the
+    // ordered merger — never a silent data race. Every kind below either stores
+    // at least one addressable unit per row (disjoint rows are then disjoint
+    // memory) or is bit-packed and written through `or_bits_into_word`.
+    return std::ranges::all_of(src_of_dst, [&](std::size_t src_idx) {
+        return std::visit(
+            [](const auto& col) {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    return true;  // bit-packed; shared-word rule
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    return true;  // one offset per row, disjoint byte slabs
+                } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    return true;  // one code per row
+                } else if constexpr (std::is_trivially_copyable_v<typename ColT::value_type>) {
+                    return true;  // one value per row
+                } else {
+                    return false;
+                }
+            },
+            *input.columns[src_idx].column);
     });
 }
 

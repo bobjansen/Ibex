@@ -764,16 +764,51 @@ one shape where parallel had been *losing* to serial, and the reason islands
 were still off by default — is now 6.4x faster than serial and 9.4x faster than
 the merger it replaces.
 
-**Restriction, and it is a correctness gate rather than a tuning knob.**
-`filter_gather_is_thread_safe` refuses any output column that is bit-packed: a
+**Bit-packed columns: handled, not excluded.** Disjoint output *rows* are only
+disjoint *memory* for columns with at least one addressable unit per row. A
 `Column<bool>` or a validity bitmap stores 64 rows per word, so two morsels
-meeting mid-word would read-modify-write the same word and lose bits. Disjoint
-output *rows* are only disjoint *memory* for columns with at least one
-addressable unit per row. Those shapes stay on the ordered merger, which is
-still correct and still the right structure for them. Widening this to nullable
-columns — the common real-world case — needs either a zeroed destination plus
-`atomic_ref` fetch_or on the two boundary words, or a serial boundary fixup
-(at most one word per morsel boundary, so O(morsels)).
+meeting mid-word read-modify-write the same word.
+
+Note that a 64-row-aligned morsel grain does **not** fix this, and it is worth
+recording why, because it is the obvious idea: the destination offset is the
+prefix sum of *popcounts*, not of morsel sizes. With a 64-row grain, a morsel
+keeping 37 rows leaves the next one starting at output row 37. Input alignment
+buys nothing; the only case where it would is 100% selectivity.
+
+What works instead (`SharedBitWords` in filter.cpp): a gather writes a
+*contiguous* run of output bits, so it can meet a neighbour only at the two ends
+of that run — every word strictly between them is exclusively owned. So the
+first and last word are OR-ed in with a relaxed `std::atomic_ref::fetch_or` and
+everything between is a plain store. Two atomics per morsel per bit-packed
+column (~600 for a 20M-row island) rather than one per word.
+
+Soundness rests on the writes being **monotonic**: the destination is
+zero-filled before any gather runs, and these writes only ever *set* bits, so OR
+is commutative and associative and the interleaving cannot matter. That is why
+the validity gather now skips its false bits instead of assigning them — the old
+`set(j, v)` had to clear, which `fetch_or` cannot express. Rewriting it to
+accumulate a word at a time also made the *serial* path faster: 2412ms -> 2081ms
+on a bulk nullable filter, unchanged on a selective one (which gathers 14x less
+validity — the mechanism check).
+
+`filter_gather_is_thread_safe` survives as a per-column-kind allowlist, so a new
+variant alternative defaults to "not safe" and costs a fallback rather than a
+silent race.
+
+Measured on the same shapes with a nullable column present (20M rows, 7 cols,
+interleaved min-of-4, net of generation) — "narrow" is the pre-widening binary,
+which refuses these columns and so runs the merger:
+
+| shape | serial | narrow (merger) | widened |
+|---|---:|---:|---:|
+| 4 filters, 93% kept | 1972 | 3133 | **321** |
+| 4 filters, 6.7% kept | 197 | 153 | **~0** |
+
+**Testing the race needed deliberate sizing.** The 1000-row cases pass whether
+or not the shared words are atomic — too few boundaries, too short a window.
+The regression test uses 50k rows at grain 37 (coprime with 64, so essentially
+every boundary lands mid-word) on 8 threads, and fails 5 runs out of 5 when the
+`fetch_or` is replaced by a plain `|=`.
 
 **The refactor that made it expressible.** `filter_table_impl` was split into
 `compute_filter_selection` / `build_filter_output_layout` /

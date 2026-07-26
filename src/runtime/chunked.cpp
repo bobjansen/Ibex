@@ -6494,11 +6494,19 @@ class ParallelIslandOperator final : public Operator {
 // is one bit per input row (2.5MB for 20M rows), and phase B re-walks them.
 // Neither re-evaluates the predicate.
 //
-// Restriction (`filter_gather_is_thread_safe`): disjoint output ROWS are only
-// disjoint MEMORY for columns storing at least one addressable unit per row.
-// `Column<bool>` and validity bitmaps pack 64 rows to a word, so two morsels
-// meeting mid-word would read-modify-write the same word and lose bits. Those
-// shapes stay on the ordered merger.
+// Writing into disjoint output ROWS is only disjoint in MEMORY for columns
+// storing at least one addressable unit per row. `Column<bool>` and validity
+// bitmaps pack 64 rows to a word, so two morsels meeting mid-word touch the
+// same word; `gather_selection_into` resolves that with the shared-word rule
+// (see `SharedBitWords` in filter.cpp) rather than excluding those columns.
+// `filter_gather_is_thread_safe` remains as the allowlist that keeps a future
+// column kind out until someone has checked it.
+//
+// Note a 64-row-aligned grain would NOT have made those columns safe, which is
+// the tempting shortcut: an output offset is the prefix sum of POPCOUNTS, not
+// of morsel sizes, so a morsel keeping 37 of its 64 rows already leaves the
+// next one starting mid-word. Grain only aligns the SOURCE read, and reads
+// never race.
 class TwoPhaseFilterOperator final : public Operator {
    public:
     TwoPhaseFilterOperator(std::unique_ptr<Table> input, const ir::Expr& predicate,

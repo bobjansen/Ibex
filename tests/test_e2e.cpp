@@ -2519,57 +2519,85 @@ TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[
     }
 }
 
-TEST_CASE("E2E: a bit-packed output column keeps the filter on the ordered merger",
-          "[e2e][parallel]") {
+namespace {
+
+// A table whose bit-packed columns are the point: `flag` is a `Column<bool>`
+// and `qty` carries a validity bitmap. Both store 64 rows per word, so two
+// morsels meeting mid-word write the same word.
+auto make_bit_packed_table(std::size_t rows) -> runtime::TableRegistry {
+    Column<std::int64_t> price;
+    Column<std::int64_t> qty;
+    Column<bool> flag;
+    price.reserve(rows);
+    qty.reserve(rows);
+    flag.reserve(rows);
+    runtime::ValidityBitmap qty_valid;
+    qty_valid.reserve(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        price.push_back(static_cast<std::int64_t>((i * 37) % 1000));
+        qty.push_back(static_cast<std::int64_t>(i % 13));
+        // Deliberately irregular against 64 and against any grain below, so a
+        // lost or misplaced bit changes the answer rather than cancelling out.
+        flag.push_back(i % 3 == 0);
+        qty_valid.push_back(i % 7 != 3);
+    }
+    runtime::Table t;
+    t.add_column("price", std::move(price));
+    t.add_column("qty", std::move(qty));
+    t.add_column("flag", std::move(flag));
+    t.columns[1].validity = std::move(qty_valid);
+
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+
+}  // namespace
+
+TEST_CASE("E2E: a bit-packed output column is gathered into concurrently", "[e2e][parallel]") {
     // Disjoint output ROWS are disjoint MEMORY only for columns storing at
     // least one addressable unit per row. A validity bitmap and a
     // `Column<bool>` pack 64 rows into a word, so two morsels meeting mid-word
-    // would read-modify-write the same word and lose bits. This is a data race,
-    // not a slow path, so the refusal has to hold.
-    SECTION("a nullable column refuses") {
+    // read-modify-write the same word. Rather than excluding those shapes, the
+    // gather zero-fills the destination, only ever sets bits, and OR-s the (at
+    // most two) words it can share with a neighbour in atomically.
+    SECTION("a nullable column takes the two-phase path") {
         auto tables = make_wide_island_table(1000);
         runtime::ParallelIslandStats stats;
         const auto* src = "t[filter price > 350];";  // keeps nullable `qty`
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
-        CHECK(stats.two_phase_filters.load() == 0);
-        require_tables_equal(run(src, tables), island);
-    }
-
-    SECTION("projecting the nullable column away allows it again") {
-        // The check is on the columns the filter actually OUTPUTS, so a fused
-        // projection that drops the bitmap is back on the fast path. This is
-        // what makes the previous section a real gate rather than a table-wide
-        // veto that would happen to pass.
-        auto tables = make_wide_island_table(1000);
-        runtime::ParallelIslandStats stats;
-        const auto* src = "t[filter price > 350, select { price, symbol }];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
         REQUIRE(stats.parallel_islands.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
         require_tables_equal(run(src, tables), island);
     }
 
-    SECTION("a bool column refuses") {
-        Column<std::int64_t> price;
-        Column<bool> flag;
-        price.reserve(500);
-        flag.reserve(500);
-        for (std::size_t i = 0; i < 500; ++i) {
-            price.push_back(static_cast<std::int64_t>((i * 37) % 1000));
-            flag.push_back(i % 3 == 0);
-        }
-        runtime::Table t;
-        t.add_column("price", std::move(price));
-        t.add_column("flag", std::move(flag));
-        runtime::TableRegistry tables;
-        tables.emplace("t", std::move(t));
-
+    SECTION("a bool column takes the two-phase path") {
+        auto tables = make_bit_packed_table(1000);
         runtime::ParallelIslandStats stats;
         const auto* src = "t[filter price > 350];";
         auto island = run_parallel(src, tables, 7, 4, &stats);
         REQUIRE(stats.parallel_islands.load() == 1);
-        CHECK(stats.two_phase_filters.load() == 0);
+        CHECK(stats.two_phase_filters.load() == 1);
         require_tables_equal(run(src, tables), island);
+    }
+
+    SECTION("thousands of mid-word morsel boundaries under contention") {
+        // The sizing is the test. A 1000-row table has too few boundaries and
+        // too short a window for two threads to collide, so it passes whether
+        // or not the shared words are written atomically — verified, by
+        // mutation, when the gate refused these columns outright. This uses a
+        // grain that is coprime with 64 so essentially every boundary lands
+        // mid-word, and enough morsels that adjacent ones are in flight
+        // together on 8 threads.
+        auto tables = make_bit_packed_table(50000);
+        const auto* src = "t[filter qty > 2];";
+        auto serial = run(src, tables);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            CAPTURE(attempt);
+            runtime::ParallelIslandStats stats;
+            auto island = run_parallel(src, tables, 37, 8, &stats);
+            REQUIRE(stats.two_phase_filters.load() == 1);
+            require_tables_equal(serial, island);
+        }
     }
 }

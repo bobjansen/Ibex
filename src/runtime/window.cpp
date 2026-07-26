@@ -72,6 +72,15 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
     return lo;
 }
 
+/// A deque specialised for indices. Its power-of-two capacity turns wraparound
+/// into a mask, and its contiguous storage avoids the node allocations a
+/// `std::deque` of candidates would pay.
+///
+/// The mask is cached rather than derived from `buf_.size()` on each use. That
+/// matters because the rolling extrema loop below touches `back()`,
+/// `push_back()` and `pop_front()` per row, and `buf_.size()` is a pointer
+/// subtraction the compiler has to redo after any write it cannot prove leaves
+/// the vector alone.
 class IndexRingDeque {
    public:
     explicit IndexRingDeque(std::size_t initial_capacity = 0) {
@@ -80,34 +89,39 @@ class IndexRingDeque {
             if (!cap.has_value())
                 throw std::length_error("rolling_min/max deque capacity overflow");
             buf_.resize(*cap);
+            mask_ = buf_.size() - 1;
         }
     }
 
     [[nodiscard]] auto empty() const noexcept -> bool { return size_ == 0; }
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+    [[nodiscard]] auto capacity() const noexcept -> std::size_t { return buf_.size(); }
     [[nodiscard]] auto front() const noexcept -> std::size_t { return buf_[head_]; }
     [[nodiscard]] auto back() const noexcept -> std::size_t {
-        return buf_[(head_ + size_ - 1) & mask()];
+        return buf_[(head_ + size_ - 1) & mask_];
     }
 
+    // `head_` is deliberately left where it is when the deque empties: the ring
+    // is valid from any head position, so resetting it would be a branch per
+    // pop for no benefit.
     void pop_front() noexcept {
-        head_ = (head_ + 1) & mask();
+        head_ = (head_ + 1) & mask_;
         --size_;
-        if (size_ == 0) {
-            head_ = 0;
-        }
     }
 
-    void pop_back() noexcept {
-        --size_;
-        if (size_ == 0) {
-            head_ = 0;
-        }
-    }
+    void pop_back() noexcept { --size_; }
 
     void push_back(std::size_t value) {
         if (size_ == buf_.size())
             grow_and_linearize();
-        buf_[(head_ + size_) & mask()] = value;
+        push_back_unchecked(value);
+    }
+
+    /// Precondition: `size() < capacity()`. For callers that reserved a known
+    /// maximum — a count window can never hold more candidates than its width,
+    /// so it can skip the capacity check per row.
+    void push_back_unchecked(std::size_t value) noexcept {
+        buf_[(head_ + size_) & mask_] = value;
         ++size_;
     }
 
@@ -120,12 +134,11 @@ class IndexRingDeque {
         return std::bit_ceil(n);
     }
 
-    [[nodiscard]] auto mask() const noexcept -> std::size_t { return buf_.size() - 1; }
-
     void grow_and_linearize() {
         const std::size_t old_cap = buf_.size();
         if (old_cap == 0) {
             buf_.resize(16);
+            mask_ = buf_.size() - 1;
             return;
         }
         if (old_cap > (std::numeric_limits<std::size_t>::max() / 2)) {
@@ -139,11 +152,13 @@ class IndexRingDeque {
                     next.begin() + static_cast<std::ptrdiff_t>(first_count));
         buf_ = std::move(next);
         head_ = 0;
+        mask_ = buf_.size() - 1;
     }
 
     std::vector<std::size_t> buf_;
     std::size_t head_ = 0;
     std::size_t size_ = 0;
+    std::size_t mask_ = 0;
 };
 
 }  // namespace
@@ -1045,7 +1060,12 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 // It reuses expired front slots, so memory tracks the live window
                 // width instead of total input rows.
                 try {
-                    IndexRingDeque dq(is_count ? std::min(count_n, rows) : 0);
+                    // `count_n + 1`, not `count_n`: row `i` is pushed BEFORE the
+                    // window is trimmed below, so the deque transiently holds
+                    // the previous window's candidates plus one. Reserving only
+                    // the window width lets `push_back_unchecked` wrap and
+                    // overwrite the front — a silent wrong answer, not a crash.
+                    IndexRingDeque dq(is_count ? std::min(count_n, rows) + 1 : 0);
                     std::size_t nan_cnt = 0;  // valid-but-NaN elements currently in window
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
@@ -1063,7 +1083,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 while (!dq.empty() && (is_min ? (col[dq.back()] >= col[i])
                                                               : (col[dq.back()] <= col[i])))
                                     dq.pop_back();
-                                dq.push_back(i);
+                                // A count window reserved `min(count_n, rows)`
+                                // up front and the monotonic invariant keeps at
+                                // most one candidate per live observation, so
+                                // the capacity check cannot fire. A time window
+                                // has no such bound and keeps the checked push.
+                                if (is_count) {
+                                    dq.push_back_unchecked(i);
+                                } else {
+                                    dq.push_back(i);
+                                }
                             }
                         }
                         while (lo < i && should_drop(lo, i)) {

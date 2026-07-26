@@ -7,6 +7,7 @@
 #include <ibex/runtime/query_lease.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/table_compare.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -10770,5 +10771,92 @@ TEST_CASE("Interpret order on a TimeFrame keeps each group time-ascending",
         CHECK((*ts)[0].nanos == 0);
         CHECK((*ts)[1].nanos == 1);
         CHECK((*ts)[2].nanos == 2);
+    }
+}
+
+// The sort's gather runs across worker threads: output row i reads input row
+// idx[i], so ranges of output rows split perfectly. Two things make that safe
+// and neither is visible in a serial run, so both are asserted here.
+//
+//   * Range boundaries are aligned to 64 rows. A Column<bool> and a validity
+//     bitmap pack 64 rows per word, so an unaligned split would have two
+//     threads read-modify-write one word and lose bits.
+//   * A string column is one indivisible task, because its offsets are
+//     cumulative and a partial range has no meaning.
+//
+// The table is deliberately wide, long enough to cross many range boundaries,
+// and carries every column kind the gather special-cases.
+TEST_CASE("Interpret order gathers every column kind identically in parallel",
+          "[interpreter][order][parallel]") {
+    constexpr std::size_t kRows = 5000;
+    Column<std::int64_t> key;
+    Column<double> value;
+    Column<bool> flag;
+    Column<std::string> name;
+    Column<Categorical> tag{std::vector<std::string>{"alpha", "beta", "gamma"},
+                            std::vector<std::int32_t>{}};
+    runtime::ValidityBitmap value_valid;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Descending key, so every row actually moves.
+        key.push_back(static_cast<std::int64_t>(kRows - i));
+        value.push_back(static_cast<double>(i) * 1.5);
+        // Irregular against 64 so a lost or misplaced bit changes the answer.
+        flag.push_back(i % 3 == 0);
+        name.push_back("row-" + std::to_string(i));
+        tag.push_code(static_cast<std::int32_t>(i % 3));
+        value_valid.push_back(i % 7 != 2);
+    }
+    runtime::Table table;
+    table.add_column("key", std::move(key));
+    table.add_column("value", std::move(value));
+    table.add_column("flag", std::move(flag));
+    table.add_column("name", std::move(name));
+    table.add_column("tag", std::move(tag));
+    table.columns[1].validity = std::move(value_valid);
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    auto ir = require_ir("t[order { key asc }];");
+
+    auto run_with = [&](bool parallel) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    auto serial = run_with(false);
+    auto parallel = run_with(true);
+
+    // Byte-identical, including validity and the order-sensitive metadata --
+    // the parallel gather has to reproduce the serial one exactly, not merely
+    // agree on values.
+    auto mismatch = runtime::compare_tables(serial, parallel);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+
+    // And the sort actually happened, so the comparison is not of two
+    // untouched copies.
+    const auto* sorted_key = std::get_if<Column<std::int64_t>>(parallel.find("key"));
+    REQUIRE(sorted_key != nullptr);
+    REQUIRE(sorted_key->size() == kRows);
+    CHECK((*sorted_key)[0] == 1);
+    CHECK((*sorted_key)[kRows - 1] == static_cast<std::int64_t>(kRows));
+
+    // Spot-check the bit-packed column against the permutation it should have
+    // followed: input row i holds flag (i % 3 == 0) and lands at output row
+    // kRows - 1 - i.
+    const auto* sorted_flag = std::get_if<Column<bool>>(parallel.find("flag"));
+    REQUIRE(sorted_flag != nullptr);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const std::size_t out = kRows - 1 - i;
+        if ((*sorted_flag)[out] != (i % 3 == 0)) {
+            FAIL("flag mismatch at output row " << out);
+        }
     }
 }

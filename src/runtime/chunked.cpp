@@ -1244,8 +1244,9 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
 namespace {
 class ChunkedOrderOperator final : public Operator {
    public:
-    ChunkedOrderOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys)
-        : child_(std::move(child)), keys_(keys) {}
+    ChunkedOrderOperator(OperatorPtr child, const std::vector<ir::OrderKey>* keys,
+                         const ExecutionContext& exec)
+        : child_(std::move(child)), keys_(keys), exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (mode_ == Mode::Ingest) {
@@ -1334,7 +1335,7 @@ class ChunkedOrderOperator final : public Operator {
         if (!concatenated.has_value()) {
             return std::unexpected(std::move(concatenated.error()));
         }
-        auto sorted = order_table(concat, *keys_);
+        auto sorted = order_table(concat, *keys_, *exec_);
         if (!sorted.has_value()) {
             return std::unexpected(std::move(sorted.error()));
         }
@@ -1541,6 +1542,7 @@ class ChunkedOrderOperator final : public Operator {
 
     OperatorPtr child_;
     const std::vector<ir::OrderKey>* keys_;
+    const ExecutionContext* exec_;
     Mode mode_ = Mode::Ingest;
     std::vector<Chunk> buffered_;
     std::vector<ir::OrderKey> resolved_keys_;
@@ -1563,8 +1565,8 @@ class ChunkedOrderOperator final : public Operator {
 /// operators see a chunked TimeFrame.
 class ChunkedAsTimeframeOperator final : public Operator {
    public:
-    ChunkedAsTimeframeOperator(OperatorPtr child, std::string column)
-        : child_(std::move(child)), column_(std::move(column)) {}
+    ChunkedAsTimeframeOperator(OperatorPtr child, std::string column, const ExecutionContext& exec)
+        : child_(std::move(child)), column_(std::move(column)), exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (mode_ == Mode::Ingest) {
@@ -1715,7 +1717,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
         }
         buffered_.clear();
 
-        auto sorted = order_table(concat, {{.name = column_, .ascending = true}});
+        auto sorted = order_table(concat, {{.name = column_, .ascending = true}}, *exec_);
         if (!sorted.has_value()) {
             return std::unexpected(std::move(sorted.error()));
         }
@@ -1782,6 +1784,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
 
     OperatorPtr child_;
     std::string column_;
+    const ExecutionContext* exec_;
     Mode mode_ = Mode::Ingest;
     std::vector<Chunk> buffered_;
     std::optional<std::int64_t> prev_last_nanos_;
@@ -7136,7 +7139,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!child_op.has_value()) {
             return std::unexpected(std::move(child_op.error()));
         }
-        return std::make_unique<ChunkedOrderOperator>(std::move(child_op.value()), &order.keys());
+        return std::make_unique<ChunkedOrderOperator>(std::move(child_op.value()), &order.keys(),
+                                                      exec);
     }
 
     if (node.kind() == ir::NodeKind::Aggregate) {
@@ -7570,7 +7574,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected(std::move(child_op.error()));
         }
         return std::make_unique<ChunkedAsTimeframeOperator>(std::move(child_op.value()),
-                                                            atf.column());
+                                                            atf.column(), exec);
     }
 
     if (node.kind() == ir::NodeKind::Model) {

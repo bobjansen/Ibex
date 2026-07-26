@@ -7,9 +7,11 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -168,6 +170,108 @@ namespace {
 // Sort `input` by an already-resolved key list. The TimeFrame ordering policy
 // (and any implicit time-index tiebreaker) is decided by the public
 // `order_table` wrapper below before this runs.
+/// Gather a sort permutation across worker threads.
+///
+/// This is the sort's second half: the radix produces a permutation, and then
+/// every column is rewritten through it. That rewrite is pure data movement —
+/// output row `i` reads input row `idx[i]` — so it splits perfectly, and after
+/// the key work was cut down it became the largest remaining serial block in a
+/// sorted query.
+///
+/// Work is split by (column x row range) rather than by column alone: a column
+/// count is a poor divisor (a 4-column table cannot use 8 threads) and column
+/// widths differ. **Range boundaries are aligned to 64 rows**, which is what
+/// makes `Column<bool>` and validity bitmaps safe to write concurrently — their
+/// words then belong to exactly one range. Output rows are contiguous, so that
+/// alignment is available here; a scattered scatter cannot buy it.
+///
+/// A string column is one indivisible task: its offsets are cumulative, so a
+/// partial range has no meaning without a prefix sum over ranges.
+template <typename Idx>
+auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
+                          const std::vector<ir::OrderKey>* ordering, const ExecutionContext& exec)
+    -> Table {
+    const std::size_t rows = idx.size();
+    const std::size_t n_cols = input.columns.size();
+
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t threads = std::min(budget, pool_size);
+    const bool worth_it =
+        exec.parallel && !on_worker_pool_thread() && threads >= 2 && n_cols != 0 &&
+        rows >= exec.parallel_min_rows &&
+        (exec.parallel_min_cells == 0 || rows * n_cols >= exec.parallel_min_cells);
+    if (!worth_it) {
+        return gather_rows(input, idx, ordering);
+    }
+
+    // Allocate every output column first: the column vector must not be
+    // resized once workers hold pointers into it.
+    Table output;
+    output.columns.reserve(n_cols);
+    for (const auto& entry : input.columns) {
+        output.add_column(entry.name, make_gather_column(*entry.column, rows));
+        if (entry.validity.has_value()) {
+            output.columns.back().validity = ValidityBitmap(rows, false);
+        }
+    }
+
+    struct Task {
+        std::size_t column;
+        std::size_t lo;
+        std::size_t hi;
+    };
+    std::vector<Task> tasks;
+    constexpr std::size_t kAlign = 64;
+    // Enough tasks that a slow one cannot strand the rest, rounded up to whole
+    // 64-row words so no two tasks share a bit-packed word.
+    std::size_t span = (rows + (threads * 4) - 1) / (threads * 4);
+    span = ((span + kAlign - 1) / kAlign) * kAlign;
+    span = std::max(span, kAlign);
+    for (std::size_t c = 0; c < n_cols; ++c) {
+        if (std::holds_alternative<Column<std::string>>(*input.columns[c].column)) {
+            tasks.push_back({.column = c, .lo = 0, .hi = rows});  // indivisible
+            continue;
+        }
+        for (std::size_t lo = 0; lo < rows; lo += span) {
+            tasks.push_back({.column = c, .lo = lo, .hi = std::min(lo + span, rows)});
+        }
+    }
+
+    std::atomic<std::size_t> cursor{0};
+    {
+        auto batch = process_worker_pool().submit(threads, [&](std::size_t) noexcept {
+            while (true) {
+                const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (t >= tasks.size()) {
+                    return;
+                }
+                const auto& task = tasks[t];
+                const auto& src = input.columns[task.column];
+                gather_range_into(*output.columns[task.column].column, *src.column, idx, task.lo,
+                                  task.hi);
+                if (src.validity.has_value()) {
+                    gather_validity_range(*output.columns[task.column].validity, *src.validity, idx,
+                                          task.lo, task.hi);
+                }
+            }
+        });
+        batch.wait();
+    }
+
+    // Finalisation must match the serial gather exactly, `else` branch included
+    // — a dropped ordering here would be invisible in the values and wrong in
+    // the metadata.
+    if (ordering != nullptr) {
+        output.ordering = *ordering;
+    } else {
+        output.ordering = input.ordering;
+    }
+    output.time_index = input.time_index;
+    normalize_time_index(output);
+    return output;
+}
+
 /// True when `name`'s values never decrease down the column.
 ///
 /// Two callers: skipping a sort whose key is already ordered, and deciding
@@ -209,8 +313,8 @@ namespace {
     return sorted;
 }
 
-auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& resolved_keys)
-    -> std::expected<Table, std::string> {
+auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& resolved_keys,
+                          const ExecutionContext& exec) -> std::expected<Table, std::string> {
     std::size_t rows = input.rows();
     if (rows <= 1 || input.columns.empty()) {
         Table output = input;
@@ -443,7 +547,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
             return std::visit(
                 [&]<typename Idx>(
                     const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
-                    return gather_rows(input, idx, &resolved_keys);
+                    return gather_rows_parallel(input, idx, &resolved_keys, exec);
                 },
                 sort_result);
         }
@@ -455,7 +559,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         auto sort_result = radix_sort_u64_asc(std::move(flat_keys[0].u64), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
-                return gather_rows(input, idx, &resolved_keys);
+                return gather_rows_parallel(input, idx, &resolved_keys, exec);
             },
             sort_result);
     }
@@ -470,7 +574,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         auto sort_result = radix_sort_u64_asc(std::move(radix_keys), rows);
         return std::visit(
             [&]<typename Idx>(const std::vector<Idx>& idx) -> std::expected<Table, std::string> {
-                return gather_rows(input, idx, &resolved_keys);
+                return gather_rows_parallel(input, idx, &resolved_keys, exec);
             },
             sort_result);
     }
@@ -506,10 +610,10 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         [&](std::vector<std::vector<std::uint64_t>>& codes) -> std::expected<Table, std::string> {
         if (rows <= std::numeric_limits<std::uint32_t>::max()) {
             auto idx = lsd_multi_radix<std::uint32_t>(codes, rows);
-            return gather_rows(input, idx, &resolved_keys);
+            return gather_rows_parallel(input, idx, &resolved_keys, exec);
         }
         auto idx = lsd_multi_radix<std::uint64_t>(codes, rows);
-        return gather_rows(input, idx, &resolved_keys);
+        return gather_rows_parallel(input, idx, &resolved_keys, exec);
     };
 
     // Invert order-preserving codes for a descending key so an ascending radix
@@ -611,13 +715,13 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     std::vector<std::size_t> idx(rows);
     std::iota(idx.begin(), idx.end(), std::size_t{0});
     pdqsort(idx.begin(), idx.end(), compare_row);
-    return gather_rows(input, idx, &resolved_keys);
+    return gather_rows_parallel(input, idx, &resolved_keys, exec);
 }
 
 }  // namespace
 
-auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
-    -> std::expected<Table, std::string> {
+auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
+                 const ExecutionContext& exec) -> std::expected<Table, std::string> {
     auto resolved_keys = ordering_keys_for_table(input, keys);
     // A TimeFrame is time-sorted by construction. Ordering it purely by the time
     // index (ascending) preserves that. Ordering by any other key reshuffles the
@@ -663,7 +767,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys)
             }
         }
     }
-    auto result = order_table_resolved(input, resolved_keys);
+    auto result = order_table_resolved(input, resolved_keys, exec);
     if (result.has_value() && relaxed_timeframe) {
         result->time_index = input.time_index;
         result->ordering =

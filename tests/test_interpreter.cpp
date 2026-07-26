@@ -10583,3 +10583,119 @@ TEST_CASE("Parallel seam: lazy/deferred input is ineligible", "[runtime][paralle
     // the serial builder reports the missing-table error as usual.
     CHECK_FALSE(runtime::node_reads_deferred_source(*ir, empty, no_deferred));
 }
+
+// Ordering by a Categorical column ranks its DICTIONARY and maps each row's
+// code through that ranking, rather than flattening to one string_view per row
+// and re-deriving the distinct values by hashing all of them. These cases pin
+// the behaviour that substitution has to preserve.
+TEST_CASE("Interpret order by a categorical column sorts by dictionary value",
+          "[interpreter][order]") {
+    SECTION("ascending order follows the value, not the code") {
+        // Codes are deliberately assigned in the opposite order to the values,
+        // so anything that sorted by raw code would be visibly wrong.
+        Column<Categorical> symbol{std::vector<std::string>{"C", "B", "A"},
+                                   std::vector<std::int32_t>{0, 1, 2, 1}};
+        runtime::Table table;
+        table.add_column("symbol", std::move(symbol));
+        table.add_column("seq", Column<std::int64_t>{10, 20, 30, 40});
+
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir("t[order { symbol asc }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+
+        const auto* sym = std::get_if<Column<Categorical>>(result->find("symbol"));
+        const auto* seq = std::get_if<Column<std::int64_t>>(result->find("seq"));
+        REQUIRE(sym != nullptr);
+        REQUIRE(seq != nullptr);
+        REQUIRE(sym->size() == 4);
+        CHECK((*sym)[0] == "A");
+        CHECK((*sym)[1] == "B");
+        CHECK((*sym)[2] == "B");
+        CHECK((*sym)[3] == "C");
+        // Stable within equal keys: the two "B" rows keep their input order.
+        CHECK((*seq)[1] == 20);
+        CHECK((*seq)[2] == 40);
+    }
+
+    SECTION("descending order reverses the values") {
+        Column<Categorical> symbol{std::vector<std::string>{"C", "B", "A"},
+                                   std::vector<std::int32_t>{0, 1, 2}};
+        runtime::Table table;
+        table.add_column("symbol", std::move(symbol));
+
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir("t[order { symbol desc }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* sym = std::get_if<Column<Categorical>>(result->find("symbol"));
+        REQUIRE(sym != nullptr);
+        CHECK((*sym)[0] == "C");
+        CHECK((*sym)[1] == "B");
+        CHECK((*sym)[2] == "A");
+    }
+
+    SECTION("duplicate dictionary entries keep equal values STABLE") {
+        // Dictionaries are per row group upstream, so one string can occupy
+        // several codes. What that breaks is not value order — duplicates always
+        // sort adjacently, so ranking per entry still puts every "A" before
+        // every "B" — it is STABILITY: two rows holding the same value through
+        // different codes would be ordered by code rather than by input
+        // position. So this asserts the input order survives, which is the only
+        // thing that actually distinguishes the two implementations.
+        //
+        // Three rows hold "A" through three DIFFERENT codes, and a "B" sits
+        // first so the key is not already ordered — otherwise the sort
+        // short-circuits on a pre-sorted key and neither implementation runs.
+        Column<Categorical> symbol{std::vector<std::string>{"B", "A", "A", "A"},
+                                   std::vector<std::int32_t>{0, 3, 1, 2}};
+        runtime::Table table;
+        table.add_column("symbol", std::move(symbol));
+        table.add_column("seq", Column<std::int64_t>{10, 20, 30, 40});
+
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir("t[order { symbol asc }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* sym = std::get_if<Column<Categorical>>(result->find("symbol"));
+        const auto* seq = std::get_if<Column<std::int64_t>>(result->find("seq"));
+        REQUIRE(sym != nullptr);
+        REQUIRE(seq != nullptr);
+        REQUIRE(seq->size() == 4);
+        CHECK((*sym)[0] == "A");
+        CHECK((*sym)[1] == "A");
+        CHECK((*sym)[2] == "A");
+        CHECK((*sym)[3] == "B");
+        // The three "A" rows keep their input order; ranking per entry would
+        // reorder them by code instead.
+        CHECK((*seq)[0] == 20);
+        CHECK((*seq)[1] == 30);
+        CHECK((*seq)[2] == 40);
+        CHECK((*seq)[3] == 10);
+    }
+
+    SECTION("nulls sort last and take the comparator path") {
+        Column<Categorical> symbol{std::vector<std::string>{"B", "A"},
+                                   std::vector<std::int32_t>{0, 1, 0}};
+        runtime::Table table;
+        table.add_column("symbol", std::move(symbol));
+        table.columns[0].validity = runtime::ValidityBitmap{true, false, true};
+        table.add_column("seq", Column<std::int64_t>{10, 20, 30});
+
+        runtime::TableRegistry registry;
+        registry.emplace("t", table);
+        auto ir = require_ir("t[order { symbol asc }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* seq = std::get_if<Column<std::int64_t>>(result->find("seq"));
+        REQUIRE(seq != nullptr);
+        REQUIRE(seq->size() == 3);
+        // Rows 0 and 2 are both "B"; the null row sorts last regardless.
+        CHECK((*seq)[0] == 10);
+        CHECK((*seq)[1] == 30);
+        CHECK((*seq)[2] == 20);
+    }
+}

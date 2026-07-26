@@ -735,6 +735,75 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     exit 0
 fi
 
+# ── Window-OHLC mode (run-window-ohlc.sh) ──────────────────────────────────────
+# Rolling open/close bars per time window per symbol, across Ibex, Polars and
+# DuckDB on identical Ibex-generated Parquet.
+#
+# Two sweeps, because the query has two independent scaling axes and they pull
+# in opposite directions for different engines: symbol count at a fixed row
+# count, and row count at a fixed symbol count.
+#
+# Every engine is pinned to the same cores and given the same thread budget, so
+# a result is "this engine on N cores" rather than "this engine on whatever
+# pool it chose". That is the whole reason for running on a clean box.
+if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
+    OHLC_DIR=/ibex/benchmarking/window_ohlc
+    OHLC_OUT="$OHLC_DIR/results"
+    ARTIFACT=/ibex/benchmarking/results/window_ohlc.tar.gz
+
+    finish_ohlc() {
+        local code=$?
+        mkdir -p "$OHLC_OUT" /ibex/benchmarking/results
+        {
+            echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
+            echo "instance_type=$(curl -fsS --max-time 5 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+            echo "nproc=$(nproc)"
+            echo "cores_swept=${IBEX_OHLC_CORES:-}"
+            uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'
+        } > "$OHLC_OUT/versions.txt" 2>&1 || true
+        tar -C "$OHLC_DIR" -czf "$ARTIFACT" results
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
+        shutdown -h now
+        return "$code"
+    }
+    trap finish_ohlc EXIT
+
+    build_ibex
+    uv sync --project /ibex
+    mkdir -p "$OHLC_OUT"
+
+    read -r -a OHLC_ROWS <<< "${IBEX_OHLC_ROWS:-5000000 20000000 50000000}"
+    read -r -a OHLC_SYMBOLS <<< "${IBEX_OHLC_SYMBOLS:-3 8 20 100}"
+    read -r -a OHLC_CORES <<< "${IBEX_OHLC_CORES:-$(nproc)}"
+    OHLC_ITERS="${IBEX_OHLC_ITERS:-5}"
+    OHLC_SWEEP_ROWS="${IBEX_OHLC_SWEEP_ROWS:-20000000}"
+    OHLC_SWEEP_SYMBOLS="${IBEX_OHLC_SWEEP_SYMBOLS:-3}"
+
+    # $1 = cores, $2 = output basename, rest = run.py arguments.
+    run_ohlc() {
+        local n="$1" name="$2"
+        shift 2
+        echo "=== window-ohlc: $name on ${n} core(s)"
+        POLARS_MAX_THREADS="$n" IBEX_THREADS="$n" \
+            taskset -c "0-$((n - 1))" \
+            uv run --project /ibex python3 "$OHLC_DIR/run.py" \
+                --engines ibex polars duckdb \
+                --iters "$OHLC_ITERS" --duckdb-threads "$n" --threads auto \
+                --window aligned sliding \
+                --out "$OHLC_OUT/${name}.tsv" "$@"
+    }
+
+    # Generated once per (rows, symbols) pair and reused by every core count,
+    # so the sweeps below compare compute rather than data.
+    for n in "${OHLC_CORES[@]}"; do
+        run_ohlc "$n" "symbols_c${n}" \
+            --rows "$OHLC_SWEEP_ROWS" --symbols "${OHLC_SYMBOLS[@]}"
+        run_ohlc "$n" "rows_c${n}" \
+            --rows "${OHLC_ROWS[@]}" --symbols "$OHLC_SWEEP_SYMBOLS"
+    done
+    exit 0
+fi
+
 if [[ "${IBEX_BUILD_REQUIRED:-1}" == "1" ]]; then
     build_ibex
 else

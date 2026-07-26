@@ -10,6 +10,7 @@ pull the results back as a CSV. Three layers:
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
 | `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
+| `run-window-ohlc.sh` | local       | One instance runs the window-OHLC suite (Ibex/Polars/DuckDB) and downloads a TSV artifact. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
 | `bisect-git.sh`      | local       | Single-instance performance `git bisect` for one benchmark query. |
 | `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
@@ -75,6 +76,33 @@ downloads `benchmarking/results/tpch_aws_<timestamp>.tar.gz`; extract it to get
 one TSV per framework and a `versions.txt` manifest. Use `--sf 1,10` to run
 multiple scale factors sequentially. SF-10 needs materially more disk/RAM; use
 `--type r7i.4xlarge` when in doubt.
+
+## 3a.2 Window-OHLC (Ibex vs Polars vs DuckDB)
+
+```bash
+git push
+./benchmarking/aws/run-window-ohlc.sh --on-demand
+```
+
+Rolling open/close bars per time window per symbol, on identical
+Ibex-generated Parquet. Two sweeps, because the query has two independent
+scaling axes: **symbol count** at a fixed row count (`--symbols`, default
+`3 8 20 100` at `--sweep-rows 20000000`) and **row count** at a fixed symbol
+count (`--rows`, default `5000000 20000000 50000000` at `--sweep-symbols 3`).
+
+Every engine is pinned to the same cores with `taskset` and given the same
+thread budget (`IBEX_THREADS`, `POLARS_MAX_THREADS`, DuckDB `PRAGMA threads`),
+so a row reads as "this engine on N cores" rather than "this engine on
+whatever pool it chose for itself" — which is the whole reason to run it on a
+clean box rather than a laptop. `--cores "8 16 32"` repeats both sweeps at each
+core count for a scaling curve; the default uses every vCPU on the instance.
+
+Default instance is `m7i.8xlarge` (32 vCPU / 128 GiB): the memory is sized so a
+50M-row frame fits in three engines at once. Downloads
+`benchmarking/results/window_ohlc_aws_<timestamp>.tar.gz` — one TSV per sweep
+per core count, plus a `versions.txt` recording the instance type, core count
+and engine versions. Data files are generated on the box and are not part of
+the artifact.
 
 ## 3b. Run one instance per engine (parallel, isolated)
 

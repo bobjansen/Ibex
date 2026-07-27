@@ -80,6 +80,20 @@ struct BuiltinFunctionInfo {
 /// standing rule for this work is that anything unproven defaults to unsafe.
 [[nodiscard]] auto is_group_parallel_safe_expr(const Expr& expr) -> bool;
 
+/// True if, under an *aligned* window clause, every row's value depends only on
+/// rows in its own window bucket.
+///
+/// This is what licenses splitting one group's rows at bucket boundaries and
+/// evaluating the pieces independently — the split needs no halo because no
+/// call reaches across the cut. Permits only Scalar calls (row-local) and the
+/// rolling family without a per-call window override (bounded below by
+/// `bucket_start`). Everything else — `lag`, `diff`, `cumsum`, a bare
+/// Aggregate, an extern — is refused, because it reads across buckets.
+///
+/// Only meaningful for `aligned`: a trailing window spans `[t - dur, t]`, which
+/// straddles any boundary we might pick.
+[[nodiscard]] auto is_bucket_local_window_expr(const Expr& expr) -> bool;
+
 /// Collects the set of column names referenced anywhere inside `expr` into `out`.
 void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out);
 

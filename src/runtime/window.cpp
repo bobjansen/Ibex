@@ -229,11 +229,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
     // start = t - unit, end = t (the row's own timestamp).
     auto bound = [&](std::int64_t t, std::int64_t unit) -> std::int64_t {
         if (aligned) {
-            std::int64_t q = t / unit;
-            if (t < 0 && t % unit != 0) {
-                --q;  // floor toward -inf
-            }
-            const std::int64_t start = q * unit;
+            const std::int64_t start = window_bucket_index(t, unit) * unit;
             return want_end ? start + unit : start;
         }
         return want_end ? t : t - unit;
@@ -316,12 +312,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     // negative timestamps bucket correctly), and the window is [bucket_start, t].
     const bool aligned_dur = aligned && !is_count;
     auto bucket_start = [&](std::size_t i) -> std::int64_t {
-        const std::int64_t t = time_vals[i];
-        std::int64_t q = t / dur_val;
-        if (t < 0 && t % dur_val != 0) {
-            --q;  // floor for negative timestamps
-        }
-        return q * dur_val;
+        return window_bucket_index(time_vals[i], dur_val) * dur_val;
     };
 
     // Spec-aware window bounds, shared by both rolling mechanisms.

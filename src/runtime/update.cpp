@@ -1610,7 +1610,7 @@ struct GroupedRows {
 /// come out ascending — the same order a serial append produces, and the order
 /// the single-buffer rolling implementation requires. Getting this backwards
 /// would not be slower, it would silently un-sort each group.
-[[nodiscard]] auto build_grouped_rows(const std::vector<std::uint32_t>& row_gid,
+[[nodiscard]] auto build_grouped_rows(std::span<const std::uint32_t> row_gid,
                                       std::size_t group_count, const ExecutionContext& exec)
     -> GroupedRows {
     const std::size_t rows = row_gid.size();
@@ -1873,7 +1873,13 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Every grouping path below produces the same two things: a group id per
     // row, and a group count. The CSR bucketing that turns them into per-group
     // row lists is then shared.
-    std::vector<std::uint32_t> row_gid(rows);
+    //
+    // Left uninitialised: every path below assigns all `rows` entries before
+    // anything reads one, so value-initialising first would be an 8MB memset at
+    // 2M rows whose every byte is overwritten. A path that ever wrote only some
+    // rows would read garbage here rather than a zero, so keep them total.
+    auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
+    const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
     std::size_t group_count = 0;
     if (key_cols.size() == group_columns.size()) {
         std::vector<Key> group_keys;

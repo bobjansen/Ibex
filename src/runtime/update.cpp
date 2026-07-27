@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <robin_hood.h>
@@ -1576,6 +1577,118 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     return workers < 2 ? 0 : workers;
 }
 
+/// Row indices bucketed by group, in CSR form: `flat` holds every row index
+/// once, and group `g` owns `flat[offsets[g] .. offsets[g + 1])`, ascending.
+///
+/// One flat buffer rather than a vector per group. The per-group vectors it
+/// replaces cost an allocation each, and — because a parallel scatter must
+/// write by index rather than append — could only be filled concurrently after
+/// a `resize` that value-initialised every element. Writing 16MB of zeroes to
+/// overwrite them immediately is what made the previous attempt at threading
+/// this slower than the serial loop it replaced.
+struct GroupedRows {
+    std::unique_ptr<std::size_t[]> flat;
+    std::vector<std::size_t> offsets;  // group_count + 1 entries
+
+    [[nodiscard]] auto group_count() const noexcept -> std::size_t {
+        return offsets.empty() ? 0 : offsets.size() - 1;
+    }
+    [[nodiscard]] auto operator[](std::size_t g) const noexcept -> std::span<const std::size_t> {
+        return {flat.get() + offsets[g], offsets[g + 1] - offsets[g]};
+    }
+};
+
+/// Bucket `row_gid` into CSR form.
+///
+/// Both passes — the histogram and the scatter — are split across workers when
+/// the group count is small enough for a private histogram per worker. Each
+/// worker owns a row range and writes only into the slice its own tally
+/// reserved, so no two workers touch the same element and no atomics are
+/// needed.
+///
+/// Group `g`'s region receives worker ranges in row order, so its row indices
+/// come out ascending — the same order a serial append produces, and the order
+/// the single-buffer rolling implementation requires. Getting this backwards
+/// would not be slower, it would silently un-sort each group.
+[[nodiscard]] auto build_grouped_rows(const std::vector<std::uint32_t>& row_gid,
+                                      std::size_t group_count, const ExecutionContext& exec)
+    -> GroupedRows {
+    const std::size_t rows = row_gid.size();
+    GroupedRows out;
+    out.offsets.assign(group_count + 1, 0);
+    out.flat = std::make_unique_for_overwrite<std::size_t[]>(rows);
+
+    // The private histograms are a workers x groups matrix, so threading only
+    // pays while that stays small. High cardinality keeps the serial pass,
+    // which is also where it is least penalised: with many groups the
+    // increments hit many different counters, and the dependency chain that
+    // makes a few-group histogram slow breaks up on its own.
+    constexpr std::size_t kMaxHistogramCells = 1U << 16U;
+    std::size_t workers = bucketing_worker_count(exec, rows);
+    if (workers >= 2 && workers * group_count > kMaxHistogramCells) {
+        workers = 0;
+    }
+
+    if (workers < 2) {
+        for (std::size_t r = 0; r < rows; ++r) {
+            ++out.offsets[row_gid[r] + 1];
+        }
+        for (std::size_t g = 0; g < group_count; ++g) {
+            out.offsets[g + 1] += out.offsets[g];
+        }
+        std::vector<std::size_t> cursor(out.offsets.begin(), out.offsets.end() - 1);
+        for (std::size_t r = 0; r < rows; ++r) {
+            out.flat[cursor[row_gid[r]]++] = r;
+        }
+        return out;
+    }
+
+    const std::size_t span = (rows + workers - 1) / workers;
+    // Row-major by worker: the inner loop over rows touches one worker's row of
+    // the matrix, so that is the axis worth keeping contiguous.
+    std::vector<std::size_t> hist(workers * group_count, 0);
+    auto& pool = process_worker_pool();
+    {
+        auto batch = pool.submit(workers, [&](std::size_t w) noexcept {
+            const std::size_t lo = w * span;
+            const std::size_t hi = std::min(lo + span, rows);
+            std::size_t* tally = hist.data() + (w * group_count);
+            for (std::size_t r = lo; r < hi; ++r) {
+                ++tally[row_gid[r]];
+            }
+        });
+        batch.wait();
+    }
+
+    // Exclusive prefix in (group, worker) order, turning each tally into that
+    // worker's write cursor for that group. Groups are contiguous in `flat`,
+    // and workers within a group are in row order.
+    std::size_t running = 0;
+    for (std::size_t g = 0; g < group_count; ++g) {
+        out.offsets[g] = running;
+        for (std::size_t w = 0; w < workers; ++w) {
+            std::size_t& cell = hist[(w * group_count) + g];
+            const std::size_t n = cell;
+            cell = running;
+            running += n;
+        }
+    }
+    out.offsets[group_count] = running;
+
+    {
+        auto batch = pool.submit(workers, [&](std::size_t w) noexcept {
+            const std::size_t lo = w * span;
+            const std::size_t hi = std::min(lo + span, rows);
+            std::size_t* cursor = hist.data() + (w * group_count);
+            for (std::size_t r = lo; r < hi; ++r) {
+                out.flat[cursor[row_gid[r]]++] = r;
+            }
+        });
+        batch.wait();
+    }
+    return out;
+}
+
 /// Cut one group's row list into pieces of at least `target` rows, each ending
 /// on a window-bucket boundary. `bucket_of(row)` gives the bucket index of a
 /// row; it is non-decreasing along `idx` because rows arrive time-sorted, which
@@ -1625,15 +1738,15 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
 /// groups, so the high-cardinality case is untouched *by construction* rather
 /// than by tuning. It is also skipped when no cut lands inside the group — a
 /// window as long as the data has one bucket and nothing to divide.
-[[nodiscard]] auto build_window_tasks(const std::vector<std::vector<std::size_t>>& group_rows,
-                                      const Table& input, ir::Duration duration, bool aligned,
+[[nodiscard]] auto build_window_tasks(const GroupedRows& group_rows, const Table& input,
+                                      ir::Duration duration, bool aligned,
                                       const std::vector<ir::FieldSpec>& fields,
                                       const ExecutionContext& exec, std::size_t rows)
     -> std::vector<std::span<const std::size_t>> {
     std::vector<std::span<const std::size_t>> tasks;
-    tasks.reserve(group_rows.size());
-    for (const auto& g : group_rows) {
-        tasks.emplace_back(g);
+    tasks.reserve(group_rows.group_count());
+    for (std::size_t g = 0; g < group_rows.group_count(); ++g) {
+        tasks.push_back(group_rows[g]);
     }
 
     if (!aligned || on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
@@ -1642,7 +1755,7 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
     const std::size_t workers = std::min(budget, pool_size);
-    if (workers < 2 || group_rows.size() >= workers) {
+    if (workers < 2 || group_rows.group_count() >= workers) {
         return tasks;  // enough groups to keep the pool busy already
     }
     for (const auto& field : fields) {
@@ -1757,10 +1870,13 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         key_cols.push_back(*col);
     }
 
-    std::vector<std::vector<std::size_t>> group_rows;
+    // Every grouping path below produces the same two things: a group id per
+    // row, and a group count. The CSR bucketing that turns them into per-group
+    // row lists is then shared.
+    std::vector<std::uint32_t> row_gid(rows);
+    std::size_t group_count = 0;
     if (key_cols.size() == group_columns.size()) {
         std::vector<Key> group_keys;
-        std::vector<std::uint32_t> row_gid(rows);
 
         auto make_key_at = [&](std::size_t r) {
             Key key;
@@ -1845,27 +1961,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             }
         }
 
-        // Counted first so each group's vector is allocated once at its exact
-        // size; appending in row order is what keeps each group time-sorted.
-        //
-        // Deliberately NOT split across threads. It was tried: per-worker
-        // tallies, a prefix sum for each worker's write offset, then a parallel
-        // scatter. Measured 16.0ms serial against 17.3ms on 16 threads — the
-        // pass is bound by scattered writes into one vector per group and by
-        // the value-initialisation inside those vectors' allocation, neither of
-        // which more threads fix. Reverted rather than carry the concurrency
-        // for nothing.
-        std::vector<std::size_t> counts(group_keys.size(), 0);
-        for (std::size_t r = 0; r < rows; ++r) {
-            ++counts[row_gid[r]];
-        }
-        group_rows.resize(group_keys.size());
-        for (std::size_t g = 0; g < group_rows.size(); ++g) {
-            group_rows[g].reserve(counts[g]);
-        }
-        for (std::size_t r = 0; r < rows; ++r) {
-            group_rows[row_gid[r]].push_back(r);
-        }
+        group_count = group_keys.size();
     } else {
         // Fallback for a key column `make_key_col` cannot resolve. No built-in
         // type reaches it today; it exists so an added column kind degrades to
@@ -1878,13 +1974,15 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 push_key_value(key, *group_columns[ci], group_validity[ci], r);
             }
             auto [it, inserted] =
-                group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
+                group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_count));
             if (inserted) {
-                group_rows.emplace_back();
+                ++group_count;
             }
-            group_rows[it->second].push_back(r);
+            row_gid[r] = it->second;
         }
     }
+
+    const GroupedRows group_rows = build_grouped_rows(row_gid, group_count, exec);
 
     // The unit of work is a span of row indices, not necessarily a whole group:
     // under an aligned window `build_window_tasks` may cut one group into

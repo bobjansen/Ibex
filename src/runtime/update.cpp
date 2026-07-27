@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -1575,6 +1576,120 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     return workers < 2 ? 0 : workers;
 }
 
+/// Cut one group's row list into pieces of at least `target` rows, each ending
+/// on a window-bucket boundary. `bucket_of(row)` gives the bucket index of a
+/// row; it is non-decreasing along `idx` because rows arrive time-sorted, which
+/// is what lets each cut be a binary search instead of a scan.
+template <typename BucketOf>
+void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target,
+                            BucketOf bucket_of, std::vector<std::span<const std::size_t>>& out) {
+    const std::size_t m = idx.size();
+    std::size_t p = 0;
+    while (p < m) {
+        if (m - p <= target) {  // the tail is too short to be worth cutting again
+            out.push_back(idx.subspan(p));
+            return;
+        }
+        // Nominal cut at p + target, then pushed forward to the end of whatever
+        // bucket that row belongs to. Pushing forward (never back) keeps every
+        // piece at least `target` rows long.
+        const std::size_t q = p + target;
+        const std::int64_t b = bucket_of(idx[q - 1]);
+        std::size_t lo = q;
+        std::size_t hi = m;
+        while (lo < hi) {
+            const std::size_t mid = lo + ((hi - lo) / 2);
+            if (bucket_of(idx[mid]) <= b) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        out.push_back(idx.subspan(p, lo - p));
+        p = lo;
+    }
+}
+
+/// Build the work list for a grouped windowed update: normally one item per
+/// group, but under an aligned window a group may be cut into several.
+///
+/// Parallelism across groups caps the speedup at the group count — three
+/// symbols leave thirteen of sixteen cores idle, which is exactly the shape a
+/// per-symbol OHLC bar query has. Under an *aligned* window each row's value
+/// depends only on rows in its own bucket (see `is_bucket_local_window_expr`),
+/// so a group's rows can be cut at any bucket boundary and the pieces run
+/// independently: no halo, no overlap, and each piece's rolling state starts
+/// where the bucket would have reset it anyway.
+///
+/// Splitting is skipped entirely once there are already at least `budget`
+/// groups, so the high-cardinality case is untouched *by construction* rather
+/// than by tuning. It is also skipped when no cut lands inside the group — a
+/// window as long as the data has one bucket and nothing to divide.
+[[nodiscard]] auto build_window_tasks(const std::vector<std::vector<std::size_t>>& group_rows,
+                                      const Table& input, ir::Duration duration, bool aligned,
+                                      const std::vector<ir::FieldSpec>& fields,
+                                      const ExecutionContext& exec, std::size_t rows)
+    -> std::vector<std::span<const std::size_t>> {
+    std::vector<std::span<const std::size_t>> tasks;
+    tasks.reserve(group_rows.size());
+    for (const auto& g : group_rows) {
+        tasks.emplace_back(g);
+    }
+
+    if (!aligned || on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+        return tasks;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers = std::min(budget, pool_size);
+    if (workers < 2 || group_rows.size() >= workers) {
+        return tasks;  // enough groups to keep the pool busy already
+    }
+    for (const auto& field : fields) {
+        if (!ir::is_bucket_local_window_expr(field.expr)) {
+            return tasks;
+        }
+    }
+
+    // Aim past the worker count so a group whose buckets divide unevenly can
+    // still be balanced by work stealing, but keep each piece large enough that
+    // its own gather and scatter dominate the fixed per-piece cost.
+    constexpr std::size_t kMinSplitRows = 32768;
+    const std::size_t target = std::max(rows / (workers * 4), kMinSplitRows);
+
+    const auto* tcv = input.find(*input.time_index);
+    std::vector<std::span<const std::size_t>> split;
+    // Each piece holds at least `target` rows, so this bound is never exceeded.
+    split.reserve((rows / target) + tasks.size());
+    if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
+        const std::int64_t unit = duration.count();
+        if (unit <= 0) {
+            return tasks;
+        }
+        auto bucket_of = [&](std::size_t r) { return window_bucket_index((*ts)[r].nanos, unit); };
+        for (const auto& task : tasks) {
+            split_at_bucket_bounds(task, target, bucket_of, split);
+        }
+    } else if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
+        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+        const std::int64_t unit = duration.count() / kNsPerDay;
+        if (unit <= 0) {
+            return tasks;
+        }
+        auto bucket_of = [&](std::size_t r) { return window_bucket_index((*dt)[r].days, unit); };
+        for (const auto& task : tasks) {
+            split_at_bucket_bounds(task, target, bucket_of, split);
+        }
+    } else {
+        return tasks;
+    }
+
+    if (split.size() <= tasks.size()) {
+        return tasks;  // nothing divided; keep the plainer work list
+    }
+    return split;
+}
+
 /// Per-group windowed update: partition the input by `group_by`, run the
 /// regular `windowed_update_table` on each per-group slice, then scatter the
 /// new field columns back into a single full-sized output. The rolling
@@ -1771,8 +1886,15 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         }
     }
 
+    // The unit of work is a span of row indices, not necessarily a whole group:
+    // under an aligned window `build_window_tasks` may cut one group into
+    // several pieces. Everything below treats a piece exactly as it treats a
+    // group, and for the same reason — disjoint rows, and no expression that
+    // reads across the cut.
+    const auto tasks = build_window_tasks(group_rows, input, duration, aligned, fields, exec, rows);
+
     auto run_group =
-        [&](const std::vector<std::size_t>& row_idx) -> std::expected<Table, std::string> {
+        [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {
         Table sub;
         for (const auto& entry : input.columns) {
             ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
@@ -1796,7 +1918,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     };
 
     // Run the first group to learn the new field column types/names.
-    auto first = run_group(group_rows[0]);
+    auto first = run_group(tasks[0]);
     if (!first.has_value()) {
         return std::unexpected(first.error());
     }
@@ -1859,7 +1981,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     }
 
     auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
-                           const std::vector<std::size_t>& indices) -> std::optional<std::string> {
+                           std::span<const std::size_t> indices) -> std::optional<std::string> {
         return std::visit(
             [&](auto& dcol) -> std::optional<std::string> {
                 using DT = std::decay_t<decltype(dcol)>;
@@ -1907,7 +2029,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     };
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
-                                const std::vector<std::size_t>& indices) {
+                                std::span<const std::size_t> indices) {
         const auto* sub_entry = sub_table.find_entry(new_field_names[f_idx]);
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
@@ -1933,9 +2055,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // One group's whole contribution: run the windowed update over its slice,
     // then scatter the new columns into the rows it owns. Groups own disjoint
     // rows, which is exactly what makes them independent of each other.
-    auto scatter_group =
-        [&](const Table& sub,
-            const std::vector<std::size_t>& indices) -> std::optional<std::string> {
+    auto scatter_group = [&](const Table& sub,
+                             std::span<const std::size_t> indices) -> std::optional<std::string> {
         for (std::size_t f = 0; f < new_field_names.size(); ++f) {
             const auto* src = sub.find(new_field_names[f]);
             if (src == nullptr) {
@@ -1949,19 +2070,19 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         return std::nullopt;
     };
 
-    if (auto err = scatter_group(*first, group_rows[0])) {
+    if (auto err = scatter_group(*first, tasks[0])) {
         return std::unexpected(*err);
     }
 
-    const std::size_t workers = grouped_window_worker_count(exec, group_rows.size() - 1, rows,
-                                                            *first, new_field_names, fields);
+    const std::size_t workers =
+        grouped_window_worker_count(exec, tasks.size() - 1, rows, *first, new_field_names, fields);
     if (workers < 2) {
-        for (std::size_t g = 1; g < group_rows.size(); ++g) {
-            auto sub = run_group(group_rows[g]);
+        for (std::size_t g = 1; g < tasks.size(); ++g) {
+            auto sub = run_group(tasks[g]);
             if (!sub.has_value()) {
                 return std::unexpected(sub.error());
             }
-            if (auto err = scatter_group(*sub, group_rows[g])) {
+            if (auto err = scatter_group(*sub, tasks[g])) {
                 return std::unexpected(*err);
             }
         }
@@ -1981,7 +2102,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             auto batch = pool.submit(workers, [&](std::size_t) noexcept {
                 while (true) {
                     const std::size_t g = cursor.fetch_add(1, std::memory_order_relaxed);
-                    if (g >= group_rows.size()) {
+                    if (g >= tasks.size()) {
                         return;
                     }
                     {
@@ -1994,11 +2115,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                     }
                     std::optional<std::string> err;
                     try {
-                        auto sub = run_group(group_rows[g]);
+                        auto sub = run_group(tasks[g]);
                         if (!sub.has_value()) {
                             err = std::move(sub.error());
                         } else {
-                            err = scatter_group(*sub, group_rows[g]);
+                            err = scatter_group(*sub, tasks[g]);
                         }
                     } catch (const std::exception& e) {
                         err = std::string("window + by: worker exception: ") + e.what();

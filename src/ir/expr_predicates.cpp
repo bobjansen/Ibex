@@ -135,36 +135,35 @@ auto fn_kind(std::string_view name) -> std::optional<FnKind> {
 
 namespace {
 
-// Walk `expr`; a call is disqualifying when `bad(fn_kind(callee))`. A `RankExpr`
-// node is always disqualifying (non-row-local). Shared by the row-local and
-// subset-evaluable predicates so both classify through `fn_kind`.
-template <typename BadKind>
-auto no_call_of_kind(const Expr& expr, BadKind bad) -> bool {
+// Walk `expr`; a call is disqualifying unless `ok(call)` accepts it. A
+// `RankExpr` node is always disqualifying (non-row-local). Shared by every
+// expression-class predicate below, so all of them agree on the traversal —
+// notably on descending into named arguments, which a hand-rolled walk forgets.
+template <typename OkCall>
+auto every_call(const Expr& expr, OkCall ok) -> bool {
     return std::visit(
         [&](const auto& n) -> bool {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef> || std::is_same_v<T, Literal>) {
                 return true;
             } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
-                return no_call_of_kind(*n.left, bad) && no_call_of_kind(*n.right, bad);
+                return every_call(*n.left, ok) && every_call(*n.right, ok);
             } else if constexpr (std::is_same_v<T, LogicalExpr>) {
                 // `right` is null for unary Not.
-                return no_call_of_kind(*n.left, bad) &&
-                       (n.right == nullptr || no_call_of_kind(*n.right, bad));
+                return every_call(*n.left, ok) && (n.right == nullptr || every_call(*n.right, ok));
             } else if constexpr (std::is_same_v<T, IsNullExpr>) {
-                return no_call_of_kind(*n.operand, bad);
+                return every_call(*n.operand, ok);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
-                const auto kind = fn_kind(n.callee);
-                if (!kind.has_value() || bad(*kind)) {
+                if (!ok(n)) {
                     return false;
                 }
                 for (const auto& arg : n.args) {
-                    if (!no_call_of_kind(*arg, bad)) {
+                    if (!every_call(*arg, ok)) {
                         return false;
                     }
                 }
                 for (const auto& na : n.named_args) {
-                    if (!no_call_of_kind(*na.value, bad)) {
+                    if (!every_call(*na.value, ok)) {
                         return false;
                     }
                 }
@@ -176,6 +175,17 @@ auto no_call_of_kind(const Expr& expr, BadKind bad) -> bool {
             }
         },
         expr.node);
+}
+
+// A call is disqualifying when `bad(fn_kind(callee))`. An unknown callee — an
+// extern or a plugin — is disqualifying for every predicate here: we cannot
+// classify what we cannot look up.
+template <typename BadKind>
+auto no_call_of_kind(const Expr& expr, BadKind bad) -> bool {
+    return every_call(expr, [&](const CallExpr& call) {
+        const auto kind = fn_kind(call.callee);
+        return kind.has_value() && !bad(*kind);
+    });
 }
 
 }  // namespace
@@ -194,6 +204,45 @@ auto is_group_parallel_safe_expr(const Expr& expr) -> bool {
     // is most of what this needs; Generator is the one classified kind that is
     // unsafe to run concurrently.
     return no_call_of_kind(expr, [](FnKind k) { return k == FnKind::Generator; });
+}
+
+auto is_bucket_local_window_expr(const Expr& expr) -> bool {
+    return every_call(expr, [](const CallExpr& call) {
+        const auto kind = fn_kind(call.callee);
+        if (!kind.has_value()) {
+            return false;
+        }
+        // Row-local by definition: a scalar call reads only its own row, so it
+        // cannot see across a bucket boundary.
+        if (*kind == FnKind::Scalar) {
+            return true;
+        }
+        // Classified Transform, but each is a pure function of its own row's
+        // timestamp and the clause's duration — as row-local as a Scalar. They
+        // are not reclassified because the other predicates that read `fn_kind`
+        // have their own reasons to treat them as non-row-local.
+        if (call.callee == "window_start" || call.callee == "window_end") {
+            return true;
+        }
+        // Every other kind reads neighbours or the whole slice. Of those, only
+        // the rolling family is bounded by the enclosing window: under
+        // `aligned` its lower bound is the current bucket's start (see
+        // `apply_rolling_func`). `lag`/`diff`/`cumsum` read across buckets
+        // freely, and a bare Aggregate reduces the entire slice.
+        if (!is_rolling_func(call.callee)) {
+            return false;
+        }
+        // A per-call window overrides the enclosing clause: `__window_n` is a
+        // count window, which knows nothing about the grid, and `__window_ns`
+        // is a different duration and so a different grid. Either way the
+        // boundaries we would split on no longer bound this call.
+        for (const auto& na : call.named_args) {
+            if (na.name == "__window_n" || na.name == "__window_ns") {
+                return false;
+            }
+        }
+        return true;
+    });
 }
 
 void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {

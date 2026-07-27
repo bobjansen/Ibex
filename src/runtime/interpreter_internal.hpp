@@ -1212,6 +1212,23 @@ using WindowSpec = std::variant<ir::Duration, CountWindow>;
 [[nodiscard]] auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec,
                                       bool aligned = false)
     -> std::expected<ComputedColumn, std::string>;
+
+/// Index of the aligned window bucket containing time `t`, in `unit` steps —
+/// `floor(t / unit)`, rounding toward -inf so negative timestamps bucket the
+/// same way positive ones do.
+///
+/// This is the ONE definition of the bucket grid. `apply_rolling_func` uses it
+/// to bound an aligned window, and the grouped windowed update uses it to pick
+/// the boundaries it may split a group at; if those two disagreed by one row
+/// the split would silently cut a window in half.
+[[nodiscard]] constexpr auto window_bucket_index(std::int64_t t, std::int64_t unit) noexcept
+    -> std::int64_t {
+    std::int64_t q = t / unit;
+    if (t < 0 && t % unit != 0) {
+        --q;
+    }
+    return q;
+}
 /// Column of nominal window bounds for the enclosing `window` clause: for each
 /// row, the start (`want_end=false`) or end (`want_end=true`) of the window
 /// containing its timestamp. `aligned` selects grid boundaries vs a trailing

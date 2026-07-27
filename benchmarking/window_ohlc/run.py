@@ -70,7 +70,8 @@ def _ibex_query(window: str) -> str:
             'low = min(price), close = last(price), volume_sum = sum(volume)'
             f'{ws} }}, by symbol, {win}, order symbol ];')
 
-def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
+def bench_ibex(parquet: Path, window: str, iters: int,
+               budget_s: float) -> tuple[float, float, bool]:
     q = _ibex_query(window)
     setup = [
         'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";',
@@ -83,10 +84,15 @@ def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
     buf = b""
     time_re = re.compile(r'time:\s*[\d.]+\s*(?:ms|us|s)\b')
 
-    def drain(min_times, timeout):
-        """Read until at least `min_times` `time:` lines are present, or timeout."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+    def drain(min_times, timeout_s: float | None):
+        """Read until at least `min_times` `time:` lines are present.
+
+        `None` means no deadline. This is distinct from the normal benchmark
+        budget: `--budget-s 0` promises to disable that budget rather than
+        silently replacing it with the old five-minute REPL timeout.
+        """
+        deadline = None if timeout_s is None else time.time() + timeout_s
+        while deadline is None or time.time() < deadline:
             r, _, _ = select.select([fd], [], [], 1.0)
             if r:
                 nonlocal buf
@@ -97,9 +103,16 @@ def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
     for line in setup:
         os.write(fd, (line + "\n").encode())
     drain(0, 5)                            # setup emits no `time:` lines
+    over = False
     for i in range(1, iters + 2):          # iters + 1 warmup
+        t0 = time.perf_counter()
         os.write(fd, (q + "\n").encode())
-        drain(i, 300)
+        # The drain timeout IS the budget: waiting longer than we are willing to
+        # spend on the whole execution only delays the abort.
+        drain(i, budget_s if budget_s else None)
+        if budget_s and time.perf_counter() - t0 > budget_s:
+            over = True
+            break
     os.write(fd, b"\x04")
     try:
         while True:
@@ -113,12 +126,17 @@ def bench_ibex(parquet: Path, window: str, iters: int) -> tuple[float, float]:
     mult = {"s": 1000.0, "ms": 1.0, "us": 0.001}
     times = [float(v) * mult[u] for v, u in
              re.findall(r'time:\s*([\d.]+)\s*(ms|us|s)\b', buf.decode(errors='replace'))]
-    times = sorted(times[1:])              # drop warmup
-    return times[0], times[len(times) // 2]
+    # Normally drop the warmup; an aborted run may have produced only the
+    # warmup, and reporting that is better than reporting nothing.
+    vals = sorted(times[1:]) if len(times) > 1 else sorted(times)
+    if not vals:
+        return float("inf"), float("inf"), True
+    return vals[0], vals[len(vals) // 2], over
 
 # ── Polars (eager, in-memory, materialised) ──────────────────────────────────
 
-def bench_polars(parquet: Path, window: str, iters: int) -> tuple[float, float]:
+def bench_polars(parquet: Path, window: str, iters: int,
+                 budget_s: float) -> tuple[float, float, bool]:
     import polars as pl
     df = pl.read_parquet(parquet)          # preloaded, not timed
     part = ["symbol", "window_start"]
@@ -142,7 +160,7 @@ def bench_polars(parquet: Path, window: str, iters: int) -> tuple[float, float]:
                           low=pl.col("price").min(), close=pl.col("price").last(),
                           volume_sum=pl.col("volume").sum()))
             return df.join(agg, on=["symbol", "timestamp"], how="left").sort("symbol")
-    return _timeit(q, iters)
+    return _timeit(q, iters, budget_s)
 
 # ── DuckDB (in-memory table, materialised to Arrow) ──────────────────────────
 
@@ -169,7 +187,8 @@ def _duckdb_sql(window: str) -> str:
         ORDER BY symbol"""
 
 
-def bench_duckdb(parquet: Path, window: str, iters: int, threads: int) -> tuple[float, float]:
+def bench_duckdb(parquet: Path, window: str, iters: int, threads: int,
+                 budget_s: float) -> tuple[float, float, bool]:
     import duckdb
     con = duckdb.connect()
     con.execute(f"PRAGMA threads={threads}")
@@ -178,7 +197,7 @@ def bench_duckdb(parquet: Path, window: str, iters: int, threads: int) -> tuple[
     fetch = getattr(duckdb.DuckDBPyConnection, "to_arrow_table", None)
     q = (lambda: con.execute(sql).to_arrow_table()) if fetch else \
         (lambda: con.execute(sql).fetch_arrow_table())
-    return _timeit(q, iters)
+    return _timeit(q, iters, budget_s)
 
 # ── cross-engine verification ────────────────────────────────────────────────
 # A benchmark that reports three timings for three different answers is worth
@@ -256,12 +275,24 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
 
 # ── shared timing helper ─────────────────────────────────────────────────────
 
-def _timeit(fn, iters: int) -> tuple[float, float]:
+def _timeit(fn, iters: int, budget_s: float) -> tuple[float, float, bool]:
+    """Time `fn` over `iters` iterations plus a warmup; abort if one execution
+    exceeds `budget_s`.
+
+    The budget checks the WARMUP too, and that is the point: a cell this slow
+    costs `iters + 1` executions to learn something one execution already told
+    us. DuckDB's 50M sliding case ran ~35 min per execution, so the full six
+    held a finished 5-hour matrix hostage for an uncompetitive number. The
+    aborted time is reported as measured and flagged, not dropped -- "slower
+    than the budget, here is roughly how much" beats a blank cell.
+    """
     ts = []
     for _ in range(iters + 1):             # +1 warmup
         t0 = time.perf_counter(); fn(); ts.append((time.perf_counter() - t0) * 1000)
+        if budget_s and ts[-1] > budget_s * 1000:
+            return ts[-1], ts[-1], True
     ts = sorted(ts[1:])
-    return ts[0], ts[len(ts) // 2]
+    return ts[0], ts[len(ts) // 2], False
 
 # ── orchestration ────────────────────────────────────────────────────────────
 
@@ -272,6 +303,9 @@ def main() -> None:
     ap.add_argument("--window", nargs="+", default=["aligned"], choices=["aligned", "sliding"])
     ap.add_argument("--iters", type=int, default=9)
     ap.add_argument("--duckdb-threads", type=int, default=8)
+    ap.add_argument("--budget-s", type=float, default=300.0,
+                    help="abort a cell once one execution exceeds this many "
+                         "seconds, recording it as over_budget (0 = no budget)")
     ap.add_argument("--threads", choices=["auto", "1"], default="auto",
                     help="'1' = single-threaded (per-core / apples-to-apples): "
                          "POLARS_MAX_THREADS=1 and DuckDB threads=1. 'auto' = each "
@@ -316,8 +350,8 @@ def main() -> None:
         sys.exit(1 if failures else 0)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    rows_out = ["engine\tthreads\trows\tsymbols\twindow\tmin_ms\tmedian_ms"]
-    print(f"{'engine':7} {'thr':>4} {'rows':>9} {'sym':>4} {'window':8} {'min_ms':>9} {'med_ms':>9}",
+    rows_out = ["engine\tthreads\trows\tsymbols\twindow\tmin_ms\tmedian_ms\tstatus"]
+    print(f"{'engine':7} {'thr':>4} {'rows':>9} {'sym':>4} {'window':8} {'min_ms':>9} {'med_ms':>9} status",
           file=sys.stderr)
     for rows in args.rows:
         for nsym in args.symbols:
@@ -325,20 +359,26 @@ def main() -> None:
             for window in args.window:
                 for engine in args.engines:
                     if engine == "ibex":
-                        mn, md = bench_ibex(pq, window, args.iters)
+                        mn, md, over = bench_ibex(pq, window, args.iters, args.budget_s)
                         tag = label
                     elif engine == "polars":
-                        mn, md = bench_polars(pq, window, args.iters)
+                        mn, md, over = bench_polars(pq, window, args.iters, args.budget_s)
                         tag = label
                     elif engine == "duckdb":
-                        mn, md = bench_duckdb(pq, window, args.iters, duck_threads)
+                        mn, md, over = bench_duckdb(pq, window, args.iters, duck_threads,
+                                                    args.budget_s)
                         tag = label
                     else:
                         continue
-                    rows_out.append(f"{engine}\t{tag}\t{rows}\t{nsym}\t{window}\t{mn:.3f}\t{md:.3f}")
-                    print(f"{engine:7} {tag:>4} {rows:>9} {nsym:>4} {window:8} {mn:>9.3f} {md:>9.3f}",
-                          file=sys.stderr)
-    args.out.write_text("\n".join(rows_out) + "\n")
+                    status = "over_budget" if over else "ok"
+                    rows_out.append(f"{engine}\t{tag}\t{rows}\t{nsym}\t{window}\t"
+                                    f"{mn:.3f}\t{md:.3f}\t{status}")
+                    print(f"{engine:7} {tag:>4} {rows:>9} {nsym:>4} {window:8} "
+                          f"{mn:>9.3f} {md:>9.3f} {status}", file=sys.stderr)
+                    # Rewritten after every cell, not once at the end: a sweep
+                    # that stalls or is interrupted still leaves every cell it
+                    # finished on disk for the uploader to ship.
+                    args.out.write_text("\n".join(rows_out) + "\n")
     print(f"\nwrote {args.out}", file=sys.stderr)
 
 if __name__ == "__main__":

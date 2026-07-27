@@ -95,8 +95,20 @@ uv run --project <ibex-root> benchmarking/window_ohlc/run.py \
 ```
 
 Flags: `--rows`, `--symbols`, `--window {aligned,sliding}`, `--iters`,
-`--engines`, `--duckdb-threads`, `--out`. Results are written as TSV
-(`engine  rows  symbols  window  min_ms  median_ms`).
+`--engines`, `--duckdb-threads`, `--budget-s`, `--out`. Results are written as
+TSV (`engine  threads  rows  symbols  window  min_ms  median_ms  status`).
+
+`--budget-s` (default 300) caps a single execution. Exceed it and the cell stops
+immediately — including on the warmup — reporting the time it did measure with
+`status = over_budget` instead of `ok`. An `over_budget` row is a real lower
+bound ("at least this slow"), not a finished measurement: `min_ms` and
+`median_ms` are the one execution that blew the budget, so don't read the median
+as a median. Pass `--budget-s 0` to disable.
+
+Why it exists: DuckDB's 50M-row sliding case ran ~35 min per execution, and at
+`--iters 5` that is six of them — nearly four hours to put a number on a cell
+already three orders of magnitude off the pace, while a finished five-hour
+matrix sat unshipped on the box.
 
 ## Notes / gotchas
 

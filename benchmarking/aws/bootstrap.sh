@@ -750,6 +750,20 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
     OHLC_DIR=/ibex/benchmarking/window_ohlc
     OHLC_OUT="$OHLC_DIR/results"
     ARTIFACT=/ibex/benchmarking/results/window_ohlc.tar.gz
+    # Partial snapshots go to their OWN key. They must not share the final one:
+    # the launcher's wait loop exits as soon as that key appears, so a
+    # first-sweep snapshot published there would masquerade as a finished run.
+    PARTIAL_KEY="${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz"
+
+    # Ship whatever is finished so far. Called after every sweep, because the
+    # EXIT trap being the only uploader once held five hours of completed
+    # sweeps hostage to a single slow cell -- any stall lost the entire run.
+    push_partial_ohlc() {
+        mkdir -p "$OHLC_OUT" /ibex/benchmarking/results
+        tar -C "$OHLC_DIR" -czf "$ARTIFACT" results 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
 
     finish_ohlc() {
         local code=$?
@@ -797,7 +811,9 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
                 --engines ibex polars duckdb \
                 --iters "$OHLC_ITERS" --duckdb-threads "$n" --threads auto \
                 --window aligned sliding \
+                --budget-s "${IBEX_OHLC_BUDGET_S:-300}" \
                 --out "$OHLC_OUT/${name}.tsv" "$@"
+        push_partial_ohlc
     }
 
     # Generated once per (rows, symbols) pair and reused by every core count,

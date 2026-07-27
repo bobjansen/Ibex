@@ -1,148 +1,244 @@
-<title>Window-OHLC benchmark — Ibex vs Polars vs DuckDB</title>
+<title>Ibex &mdash; Window-OHLC benchmark vs Polars and DuckDB</title>
 <style>
   .viz-root{
     color-scheme:light;
     --surface-1:#fcfcfb; --surface-2:#f3f3f0; --border:#e0e0da;
     --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#8a8983;
-    --ibex:#2a78d6; --polars:#008300; --duckdb:#e87ba4;
-    --win:#008300;
+    --ibex:#2a78d6; --polars:#008300; --duckdb:#e87ba4; --win:#008300;
+    --track:#e4e4de;
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     background:var(--surface-1); color:var(--text-primary);
-    max-width:1080px; margin:0 auto; padding:32px 24px 64px;
-    line-height:1.5;
+    max-width:1080px; margin:0 auto; padding:36px 24px 64px; line-height:1.5;
   }
   @media (prefers-color-scheme:dark){
     :root:where(:not([data-theme="light"])) .viz-root{
       color-scheme:dark;
       --surface-1:#1a1a19; --surface-2:#242423; --border:#3a3a37;
       --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
-      --ibex:#3987e5; --polars:#008300; --duckdb:#d55181; --win:#3fb15a;
+      --ibex:#3987e5; --polars:#00a80a; --duckdb:#d55181; --win:#3fb15a;
+      --track:#33332f;
     }
   }
   :root[data-theme="dark"] .viz-root{
     color-scheme:dark;
     --surface-1:#1a1a19; --surface-2:#242423; --border:#3a3a37;
     --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
-    --ibex:#3987e5; --polars:#008300; --duckdb:#d55181; --win:#3fb15a;
+    --ibex:#3987e5; --polars:#00a80a; --duckdb:#d55181; --win:#3fb15a;
+      --track:#33332f;
   }
-  .viz-root h1{font-size:26px; margin:0 0 6px; letter-spacing:-.02em;}
-  .viz-root h2{font-size:19px; margin:38px 0 2px; letter-spacing:-.01em;}
-  .viz-root .sub{color:var(--text-secondary); font-size:14px; margin:0 0 8px; max-width:74ch;}
-  .viz-root p{color:var(--text-secondary); font-size:14.5px; max-width:70ch;}
-  .viz-root code{background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:.9em;}
+  .viz-root h1{font-size:34px; margin:0 0 10px; letter-spacing:-.025em; line-height:1.15; text-wrap:balance;}
+  .viz-root h2{font-size:20px; margin:44px 0 2px; letter-spacing:-.015em;}
+  .viz-root .sub{color:var(--text-secondary); font-size:14.5px; margin:0 0 8px; max-width:74ch;}
+  .viz-root p{color:var(--text-secondary); font-size:14.5px; max-width:72ch;}
+  .viz-root code{background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:.88em;}
+  .lede{font-size:16.5px; color:var(--text-secondary); max-width:64ch; margin:0 0 4px;}
+  .lede b{color:var(--text-primary);}
+  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:26px 0 4px;}
+  @media(max-width:720px){ .stats{grid-template-columns:1fr;} }
+  .stat{background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:18px 18px 16px;}
+  .stat .big{font-size:40px; font-weight:700; letter-spacing:-.03em; color:var(--ibex);
+             font-variant-numeric:tabular-nums; line-height:1;}
+  .stat .lab{font-size:13px; color:var(--text-primary); font-weight:600; margin-top:8px;}
+  .stat .fine{font-size:11.5px; color:var(--text-muted); margin-top:3px;}
   .legend{display:flex; gap:18px; flex-wrap:wrap; margin:14px 0 8px; font-size:13px;}
   .legend span{display:inline-flex; align-items:center; gap:6px; color:var(--text-secondary);}
   .swatch{width:12px; height:12px; border-radius:3px; display:inline-block;}
-  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px 18px; margin-top:10px;}
-  @media(max-width:720px){ .grid{grid-template-columns:1fr;} }
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px 18px; margin-top:12px;}
+  .grid.four{grid-template-columns:repeat(4,1fr);}
+  @media(max-width:900px){ .grid.four{grid-template-columns:repeat(2,1fr);} }
+  @media(max-width:720px){ .grid,.grid.four{grid-template-columns:1fr;} }
   .panel{background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:12px 14px;}
   .panel .ptitle{font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:2px;}
   .panel .pnote{font-size:11.5px; color:var(--text-muted); margin-bottom:10px;}
+  .panel .pnote b{color:var(--ibex);}
   .row{display:flex; align-items:center; gap:8px; margin:5px 0;}
-  .row .name{width:66px; font-size:11.5px; color:var(--text-secondary); flex:none;}
-  .track{flex:1; position:relative; height:18px;}
-  .bar{height:18px; border-radius:0 4px 4px 0; min-width:2px;}
-  .row .val{font-size:11.5px; color:var(--text-primary); flex:none; width:66px; text-align:right; font-variant-numeric:tabular-nums;}
+  .row .name{width:62px; font-size:11.5px; color:var(--text-secondary); flex:none;}
+  .track{flex:1; position:relative; height:18px; background:var(--track); border-radius:3px;}
+  /* display:block is load-bearing -- a bare <span> is inline, so width/height are
+     ignored and an empty bar collapses to nothing at all. */
+  .bar{display:block; height:18px; border-radius:0 3px 3px 0; min-width:2px;}
+  .row .val{font-size:11.5px; color:var(--text-primary); flex:none; width:72px;
+            text-align:right; font-variant-numeric:tabular-nums;}
   .row.best .val{font-weight:700;}
   .row.best .name{color:var(--text-primary); font-weight:600;}
+  .row.na .val{color:var(--text-muted); font-style:italic; width:auto; white-space:nowrap;}
   .crown{color:var(--win); font-weight:700;}
+  .chartgrid{display:grid; grid-template-columns:repeat(2,1fr); gap:16px; margin-top:12px;}
+  @media(max-width:800px){ .chartgrid{grid-template-columns:1fr;} }
+  .chart{background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:14px 14px 10px;}
+  .chart .ctitle{font-size:13px; font-weight:600; color:var(--text-primary);}
+  .chart .cnote{font-size:11.5px; color:var(--text-muted); margin-bottom:6px;}
+  .chart svg{width:100%; height:auto; display:block; overflow:visible;}
+  .ax{stroke:var(--border); stroke-width:1;}
+  .axlab{fill:var(--text-muted); font-size:10px;}
+  .slope{font-size:10.5px; font-weight:600;}
+  .refline{stroke:var(--text-muted); stroke-width:1; stroke-dasharray:3 3; opacity:.55;}
+  .reflab{fill:var(--text-muted); font-size:9.5px; font-style:italic;}
+  .dot{stroke:var(--surface-2); stroke-width:2;}
+  .qgrid{display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:14px;}
+  @media(max-width:900px){ .qgrid{grid-template-columns:1fr;} }
+  .qcard{background:var(--surface-2); border:1px solid var(--border); border-radius:10px;
+         padding:12px 14px 14px; min-width:0;}
+  .qhead{display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600;
+         color:var(--text-primary); margin-bottom:8px;}
+  .qcard pre{margin:0; overflow-x:auto; font-size:11.5px; line-height:1.55;
+             color:var(--text-secondary); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  .qsub{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+        color:var(--text-muted); margin:0 0 10px;}
+  .ctarow{display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin:22px 0 4px;}
+  .cta{display:inline-block; background:var(--ibex); color:#fff; text-decoration:none;
+       font-size:14.5px; font-weight:600; padding:11px 20px; border-radius:8px;
+       border:1px solid transparent;}
+  .cta:hover{filter:brightness(1.08);}
+  .cta:focus-visible{outline:2px solid var(--text-primary); outline-offset:2px;}
+  .ctanote{font-size:13.5px; color:var(--text-muted);}
+  .why{display:grid; grid-template-columns:repeat(2,1fr); gap:14px 20px; margin-top:14px;}
+  @media(max-width:720px){ .why{grid-template-columns:1fr;} }
+  .why .item{background:var(--surface-2); border:1px solid var(--border);
+             border-radius:10px; padding:13px 16px;}
+  .why .item h3{margin:0 0 4px; font-size:13.5px; color:var(--text-primary); letter-spacing:-.01em;}
+  .why .item p{margin:0; font-size:13px; color:var(--text-secondary); max-width:none;}
+  .closing{background:var(--surface-2); border:1px solid var(--border); border-radius:12px;
+           padding:22px 24px; margin-top:26px;}
+  .closing h3{margin:0 0 6px; font-size:19px; color:var(--text-primary); letter-spacing:-.015em;}
+  .closing p{margin:0 0 14px; font-size:14.5px;}
+  .tablewrap{overflow-x:auto;}
   table{border-collapse:collapse; width:100%; font-size:12.5px; margin-top:10px;}
-  th,td{border:1px solid var(--border); padding:5px 9px; text-align:right; font-variant-numeric:tabular-nums;}
+  th,td{border:1px solid var(--border); padding:5px 9px; text-align:right;
+        font-variant-numeric:tabular-nums; white-space:nowrap;}
   th:first-child,td:first-child{text-align:left;}
   th{background:var(--surface-2); color:var(--text-secondary); font-weight:600;}
   td.w{color:var(--win); font-weight:700;}
-  details{margin-top:14px;}
+  details{margin-top:18px;}
   summary{cursor:pointer; font-size:13px; color:var(--text-secondary);}
-  .kbox{border-left:3px solid var(--ibex); background:var(--surface-2); padding:10px 14px; border-radius:0 8px 8px 0; margin:14px 0; font-size:14px; color:var(--text-secondary);}
+  .kbox{border-left:3px solid var(--ibex); background:var(--surface-2); padding:12px 16px;
+        border-radius:0 8px 8px 0; margin:16px 0; font-size:14.5px; color:var(--text-secondary);}
   .kbox b{color:var(--text-primary);}
   .tag{font-size:11px; color:var(--text-muted); font-weight:400;}
+  .foot{margin-top:30px; padding-top:16px; border-top:1px solid var(--border);
+        font-size:12.5px; color:var(--text-muted); max-width:80ch;}
+  .foot b{color:var(--text-secondary);}
 </style>
 
 <div class="viz-root">
-  <h1>Window-OHLC: Ibex vs Polars vs DuckDB</h1>
-  <p class="sub">Rolling <code>open</code>/<code>close</code> per time window, grouped &amp; ordered by symbol. Identical Parquet per config; compute + full materialisation only; <b>min of 6 runs</b> (warmup dropped). Single WSL2 box. All three verified identical (0 mismatches). Bars are milliseconds — <b>lower is faster</b>, <span class="crown">✓</span> = panel winner.</p>
+  <h1>Ibex computes rolling OHLCV bars<br>up to 104&times; faster than DuckDB.</h1>
+  <p class="lede"><b>Ibex</b> is a statically typed query language for columnar time-series data that compiles to native code. This is its core workload: rolling open / high / low / close / volume per time window, grouped by symbol &mdash; the query at the centre of every market-data pipeline. Benchmarked against <b>Polars</b> and <b>DuckDB</b> on a 32-core cloud box, identical data, identical answers.</p>
+
+  <div class="stats">
+    <div class="stat"><div class="big">36 / 36</div><div class="lab">configurations won</div><div class="fine">every row count, window type, symbol count and core count tested</div></div>
+    <div class="stat"><div class="big">24&times;</div><div class="lab">faster than Polars, at best</div><div class="fine">at 100 symbols; 9.0&ndash;9.8&times; on the 3-symbol aligned cases</div></div>
+    <div class="stat"><div class="big">104&times;</div><div class="lab">faster than DuckDB, at best</div><div class="fine">4.8 s vs 8 min 20 s at 50M rows</div></div>
+  </div>
+
+  <div class="ctarow">
+    <a class="cta" href="https://bobjansen.github.io/Ibex/">Get started with Ibex &rarr;</a>
+    <span class="ctanote">Docs, language reference and install instructions</span>
+  </div>
 
   <div class="legend">
-    <span><i class="swatch" style="background:var(--ibex)"></i> Ibex <span class="tag">(always 1 thread)</span></span>
+    <span><i class="swatch" style="background:var(--ibex)"></i> Ibex</span>
     <span><i class="swatch" style="background:var(--polars)"></i> Polars</span>
     <span><i class="swatch" style="background:var(--duckdb)"></i> DuckDB</span>
+    <span><span class="crown">&#10003;</span> fastest</span>
   </div>
 
+  <h2>Every scale, both window types <span class="tag">&mdash; 3 symbols, 32 cores</span></h2>
+  <p class="sub">Bars are wall-clock time; shorter is faster. Ibex is the sliver.</p>
+  <div class="grid"><div class="panel"><div class="ptitle">5M rows &middot; aligned &middot; 32 cores</div><div class="pnote">Ibex <b>9.0&times;</b> vs Polars, <b>8.4&times;</b> vs DuckDB</div><div class="row best" title="ibex: 85.7 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:11.1%;background:var(--ibex)"></span></span><span class="val">85.7 ms</span></div><div class="row " title="polars: 773 ms"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">773 ms</span></div><div class="row " title="duckdb: 718 ms"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:92.8%;background:var(--duckdb)"></span></span><span class="val">718 ms</span></div></div><div class="panel"><div class="ptitle">5M rows &middot; trailing &middot; 32 cores</div><div class="pnote">Ibex <b>2.9&times;</b> vs Polars, <b>12.1&times;</b> vs DuckDB</div><div class="row best" title="ibex: 448 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:8.3%;background:var(--ibex)"></span></span><span class="val">448 ms</span></div><div class="row " title="polars: 1.28 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:23.6%;background:var(--polars)"></span></span><span class="val">1.28 s</span></div><div class="row " title="duckdb: 5.42 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:100.0%;background:var(--duckdb)"></span></span><span class="val">5.42 s</span></div></div><div class="panel"><div class="ptitle">20M rows &middot; aligned &middot; 32 cores</div><div class="pnote">Ibex <b>9.6&times;</b> vs Polars, <b>8.3&times;</b> vs DuckDB</div><div class="row best" title="ibex: 347 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:10.4%;background:var(--ibex)"></span></span><span class="val">347 ms</span></div><div class="row " title="polars: 3.33 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">3.33 s</span></div><div class="row " title="duckdb: 2.89 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:86.7%;background:var(--duckdb)"></span></span><span class="val">2.89 s</span></div></div><div class="panel"><div class="ptitle">20M rows &middot; trailing &middot; 32 cores</div><div class="pnote">Ibex <b>2.8&times;</b> vs Polars, <b>26.4&times;</b> vs DuckDB</div><div class="row best" title="ibex: 1.75 s"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:3.8%;background:var(--ibex)"></span></span><span class="val">1.75 s</span></div><div class="row " title="polars: 4.95 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:10.7%;background:var(--polars)"></span></span><span class="val">4.95 s</span></div><div class="row " title="duckdb: 46.1 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:100.0%;background:var(--duckdb)"></span></span><span class="val">46.1 s</span></div></div><div class="panel"><div class="ptitle">50M rows &middot; aligned &middot; 32 cores</div><div class="pnote">Ibex <b>9.8&times;</b> vs Polars, <b>7.2&times;</b> vs DuckDB</div><div class="row best" title="ibex: 903 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:10.2%;background:var(--ibex)"></span></span><span class="val">903 ms</span></div><div class="row " title="polars: 8.88 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">8.88 s</span></div><div class="row " title="duckdb: 6.49 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:73.1%;background:var(--duckdb)"></span></span><span class="val">6.49 s</span></div></div><div class="panel"><div class="ptitle">50M rows &middot; trailing &middot; 32 cores</div><div class="pnote">Ibex <b>3.0&times;</b> faster than Polars</div><div class="row best" title="ibex: 4.70 s"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:33.1%;background:var(--ibex)"></span></span><span class="val">4.70 s</span></div><div class="row " title="polars: 14.2 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">14.2 s</span></div><div class="row na"><span class="name">duckdb</span><span class="track"></span><span class="val">did not finish</span></div></div></div>
+
+  <h2>What each engine runs</h2>
+  <p class="qsub">one OHLCV bar per 10-second window per symbol, ordered by symbol &middot; identical Parquet, verified identical output</p>
+  <p class="sub">Each engine gets the query written the way that engine wants it &mdash; no translation penalty, no deliberately awkward SQL. Input is pre-loaded into memory and only compute plus full materialisation is timed, so Parquet reading is excluded for all three.</p>
+  <div class="qgrid"><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--ibex)"></i>Ibex</div><pre>t[ select {
+     price = price,
+     open = first(price),
+     high = max(price),
+     low = min(price),
+     close = last(price),
+     volume_sum = sum(volume),
+     window_start = window_start() },
+   by symbol,
+   window 10s aligned,
+   order symbol ];</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--polars)"></i>Polars</div><pre>(df.with_columns(
+     pl.col(&quot;timestamp&quot;).dt.truncate(&quot;10s&quot;)
+       .alias(&quot;window_start&quot;))
+   .with_columns(
+     pl.col(&quot;price&quot;).first().over(part).alias(&quot;open&quot;),
+     pl.col(&quot;price&quot;).cum_max().over(part).alias(&quot;high&quot;),
+     pl.col(&quot;price&quot;).cum_min().over(part).alias(&quot;low&quot;),
+     pl.col(&quot;price&quot;).alias(&quot;close&quot;),
+     pl.col(&quot;volume&quot;).cum_sum().over(part)
+       .alias(&quot;volume_sum&quot;))
+   .sort(&quot;symbol&quot;))
+
+# part = [&quot;symbol&quot;, &quot;window_start&quot;]</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--duckdb)"></i>DuckDB</div><pre>SELECT timestamp, symbol, price,
+       first_value(price) OVER w AS open, max(price) OVER w AS high,
+       min(price) OVER w AS low, price AS close,
+       sum(volume) OVER w AS volume_sum,
+       time_bucket(INTERVAL &#x27;10s&#x27;, timestamp) AS window_start
+FROM t
+WINDOW w AS (PARTITION BY symbol, time_bucket(INTERVAL &#x27;10s&#x27;, timestamp)
+             ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+ORDER BY symbol</pre></div></div>
+  <p>The <b>trailing</b> flavour replaces the tumbling bucket with a window ending at each tick. Ibex drops <code>aligned</code>; Polars switches to <code>df.rolling(index_column="timestamp", period="10s", group_by="symbol")</code> plus a join back onto the original frame; DuckDB switches to <code>RANGE BETWEEN INTERVAL '10s' PRECEDING AND CURRENT ROW</code>.</p>
+
+  <h2>Ibex stays linear. DuckDB doesn't. <span class="tag">&mdash; 3 symbols, 8 cores</span></h2>
+  <p class="sub">Cost against data volume, <b>both axes logarithmic</b> &mdash; so a straight line is a power law and its <i>slope</i> is the scaling exponent <i>k</i>. Ibex and Polars run parallel to the dashed &ldquo;linear&rdquo; reference: double the rows, double the work. DuckDB climbs away from it.</p>
+  <div class="chartgrid"><div class="chart"><div class="ctitle">Aligned window</div><div class="cnote">3 symbols, 8 cores &mdash; every engine scales linearly here, k &asymp; 1</div><svg viewBox="0 0 520 300" role="img" aria-label="Log-log cost curve, aligned window"><line class="ax" x1="54" y1="250.6" x2="436" y2="250.6"/><text class="axlab" x="46" y="254.1" text-anchor="end">100 ms</text><line class="ax" x1="54" y1="189.9" x2="436" y2="189.9"/><text class="axlab" x="46" y="193.4" text-anchor="end">1 s</text><line class="ax" x1="54" y1="129.3" x2="436" y2="129.3"/><text class="axlab" x="46" y="132.8" text-anchor="end">10 s</text><line class="ax" x1="54" y1="68.7" x2="436" y2="68.7"/><text class="axlab" x="46" y="72.2" text-anchor="end">100 s</text><text class="axlab" x="84.6" y="280" text-anchor="middle">5M rows</text><text class="axlab" x="274.5" y="280" text-anchor="middle">20M rows</text><text class="axlab" x="400.1" y="280" text-anchor="middle">50M rows</text><line class="refline" x1="54.0" y1="247.4" x2="436.0" y2="174.0"/><text class="reflab" x="440.0" y="177.0">linear</text><path d="M84.6 241.5 L274.5 205.0 L400.1 180.4" fill="none" stroke="var(--ibex)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="241.5" r="4.5" fill="var(--ibex)"><title>ibex at 5M rows: 141 ms</title></circle><circle class="dot" cx="274.5" cy="205.0" r="4.5" fill="var(--ibex)"><title>ibex at 20M rows: 564 ms</title></circle><circle class="dot" cx="400.1" cy="180.4" r="4.5" fill="var(--ibex)"><title>ibex at 50M rows: 1.44 s</title></circle><text class="slope" x="409.1" y="183.9" fill="var(--ibex)">ibex</text><text class="axlab" x="409.1" y="195.4">k=1.01</text><path d="M84.6 192.0 L274.5 154.0 L400.1 128.1" fill="none" stroke="var(--polars)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="192.0" r="4.5" fill="var(--polars)"><title>polars at 5M rows: 926 ms</title></circle><circle class="dot" cx="274.5" cy="154.0" r="4.5" fill="var(--polars)"><title>polars at 20M rows: 3.93 s</title></circle><circle class="dot" cx="400.1" cy="128.1" r="4.5" fill="var(--polars)"><title>polars at 50M rows: 10.5 s</title></circle><text class="slope" x="409.1" y="131.6" fill="var(--polars)">polars</text><text class="axlab" x="409.1" y="143.1">k=1.05</text><path d="M84.6 194.4 L274.5 157.6 L400.1 133.0" fill="none" stroke="var(--duckdb)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="194.4" r="4.5" fill="var(--duckdb)"><title>duckdb at 5M rows: 844 ms</title></circle><circle class="dot" cx="274.5" cy="157.6" r="4.5" fill="var(--duckdb)"><title>duckdb at 20M rows: 3.42 s</title></circle><circle class="dot" cx="400.1" cy="133.0" r="4.5" fill="var(--duckdb)"><title>duckdb at 50M rows: 8.70 s</title></circle><text class="slope" x="409.1" y="136.5" fill="var(--duckdb)">duckdb</text><text class="axlab" x="409.1" y="148.0">k=1.01</text></svg></div><div class="chart"><div class="ctitle">Trailing window</div><div class="cnote">3 symbols, 8 cores &mdash; DuckDB pulls away from the reference</div><svg viewBox="0 0 520 300" role="img" aria-label="Log-log cost curve, trailing window"><line class="ax" x1="54" y1="250.6" x2="436" y2="250.6"/><text class="axlab" x="46" y="254.1" text-anchor="end">100 ms</text><line class="ax" x1="54" y1="189.9" x2="436" y2="189.9"/><text class="axlab" x="46" y="193.4" text-anchor="end">1 s</text><line class="ax" x1="54" y1="129.3" x2="436" y2="129.3"/><text class="axlab" x="46" y="132.8" text-anchor="end">10 s</text><line class="ax" x1="54" y1="68.7" x2="436" y2="68.7"/><text class="axlab" x="46" y="72.2" text-anchor="end">100 s</text><text class="axlab" x="84.6" y="280" text-anchor="middle">5M rows</text><text class="axlab" x="274.5" y="280" text-anchor="middle">20M rows</text><text class="axlab" x="400.1" y="280" text-anchor="middle">50M rows</text><line class="refline" x1="54.0" y1="217.3" x2="436.0" y2="143.9"/><text class="reflab" x="440.0" y="146.9">linear</text><path d="M84.6 211.5 L274.5 175.6 L400.1 148.7" fill="none" stroke="var(--ibex)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="211.5" r="4.5" fill="var(--ibex)"><title>ibex at 5M rows: 442 ms</title></circle><circle class="dot" cx="274.5" cy="175.6" r="4.5" fill="var(--ibex)"><title>ibex at 20M rows: 1.72 s</title></circle><circle class="dot" cx="400.1" cy="148.7" r="4.5" fill="var(--ibex)"><title>ibex at 50M rows: 4.80 s</title></circle><text class="slope" x="409.1" y="152.2" fill="var(--ibex)">ibex</text><text class="axlab" x="409.1" y="163.7">k=1.04</text><path d="M84.6 177.6 L274.5 140.7 L400.1 114.2" fill="none" stroke="var(--polars)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="177.6" r="4.5" fill="var(--polars)"><title>polars at 5M rows: 1.60 s</title></circle><circle class="dot" cx="274.5" cy="140.7" r="4.5" fill="var(--polars)"><title>polars at 20M rows: 6.50 s</title></circle><circle class="dot" cx="400.1" cy="114.2" r="4.5" fill="var(--polars)"><title>polars at 50M rows: 17.8 s</title></circle><text class="slope" x="409.1" y="117.7" fill="var(--polars)">polars</text><text class="axlab" x="409.1" y="129.2">k=1.05</text><path d="M84.6 128.6 L274.5 70.2 L400.1 26.4" fill="none" stroke="var(--duckdb)" stroke-width="2" stroke-linejoin="round"/><circle class="dot" cx="84.6" cy="128.6" r="4.5" fill="var(--duckdb)"><title>duckdb at 5M rows: 10.3 s</title></circle><circle class="dot" cx="274.5" cy="70.2" r="4.5" fill="var(--duckdb)"><title>duckdb at 20M rows: 94.6 s</title></circle><circle class="dot" cx="400.1" cy="26.4" r="4.5" fill="var(--duckdb)"><title>duckdb at 50M rows: 500.2 s</title></circle><text class="slope" x="409.1" y="29.9" fill="var(--duckdb)">duckdb</text><text class="axlab" x="409.1" y="41.4">k=1.69</text></svg></div></div>
+
+  <h2>So the lead widens as your data grows <span class="tag">&mdash; 3 symbols, 8 cores</span></h2>
+  <p class="sub">The same trailing-window query, expressed as how many times slower the competition runs it. Measured on 8 cores, the rung where every engine finished every size.</p>
+  <div class="grid"><div class="panel"><div class="ptitle">5M rows &middot; trailing &middot; 8 cores</div><div class="pnote">Ibex <b>442 ms</b> &middot; DuckDB 10.3 s</div><div class="row best" title="Ibex: 1&times;"><span class="name">Ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:4.3%;background:var(--ibex)"></span></span><span class="val">1&times;</span></div><div class="row " title="Polars: 3.6&times; slower"><span class="name">Polars</span><span class="track"><span class="bar" style="width:15.5%;background:var(--polars)"></span></span><span class="val">3.6&times; slower</span></div><div class="row " title="DuckDB: 23&times; slower"><span class="name">DuckDB</span><span class="track"><span class="bar" style="width:100.0%;background:var(--duckdb)"></span></span><span class="val">23&times; slower</span></div></div><div class="panel"><div class="ptitle">20M rows &middot; trailing &middot; 8 cores</div><div class="pnote">Ibex <b>1.72 s</b> &middot; DuckDB 94.6 s</div><div class="row best" title="Ibex: 1&times;"><span class="name">Ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:2.0%;background:var(--ibex)"></span></span><span class="val">1&times;</span></div><div class="row " title="Polars: 3.8&times; slower"><span class="name">Polars</span><span class="track"><span class="bar" style="width:6.9%;background:var(--polars)"></span></span><span class="val">3.8&times; slower</span></div><div class="row " title="DuckDB: 55&times; slower"><span class="name">DuckDB</span><span class="track"><span class="bar" style="width:100.0%;background:var(--duckdb)"></span></span><span class="val">55&times; slower</span></div></div><div class="panel"><div class="ptitle">50M rows &middot; trailing &middot; 8 cores</div><div class="pnote">Ibex <b>4.80 s</b> &middot; DuckDB 500.2 s</div><div class="row best" title="Ibex: 1&times;"><span class="name">Ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:2.0%;background:var(--ibex)"></span></span><span class="val">1&times;</span></div><div class="row " title="Polars: 3.7&times; slower"><span class="name">Polars</span><span class="track"><span class="bar" style="width:3.6%;background:var(--polars)"></span></span><span class="val">3.7&times; slower</span></div><div class="row " title="DuckDB: 104&times; slower"><span class="name">DuckDB</span><span class="track"><span class="bar" style="width:100.0%;background:var(--duckdb)"></span></span><span class="val">104&times; slower</span></div></div></div>
   <div class="kbox">
-    <b>Two questions, two answers.</b> <b>As you'd run it</b> (each engine's default threading), it's a crossover — Ibex owns small data and sliding windows; Polars' multithreading takes large aligned. <b>Per core</b> (everyone pinned to one thread), Ibex wins <b>every single config</b> — so its kernels are the most efficient of the three, and every loss above is thread count, not algorithms.
+    <b>DuckDB is superlinear on trailing windows.</b> Its cost tracks the rows inside each window frame, not just the rows in the table &mdash; so the gap compounds: <b>23&times;</b> at 5 million rows, <b>55&times;</b> at 20 million, <b>104&times;</b> at 50 million. At that last size DuckDB needs <b>8 minutes 20 seconds</b> per run. Ibex needs 4.80 s.
   </div>
 
-  <h2>1 · As you'd run it <span class="tag">— default parallelism (Ibex &amp; Polars-eager 1 thread, DuckDB 8)</span></h2>
-  <div id="mt" class="grid"></div>
+  <h2>And it widens with symbol count <span class="tag">&mdash; 20M rows, aligned window, 32 cores</span></h2>
+  <p class="sub">Real books carry hundreds of instruments, not three. As symbol count climbs, Ibex holds its time flat while Polars degrades.</p>
+  <div class="grid four"><div class="panel"><div class="ptitle">3 symbols</div><div class="pnote">Ibex <b>9.6&times;</b> faster than Polars</div><div class="row best" title="ibex: 347 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:10.4%;background:var(--ibex)"></span></span><span class="val">347 ms</span></div><div class="row " title="polars: 3.33 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">3.33 s</span></div><div class="row " title="duckdb: 2.89 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:86.7%;background:var(--duckdb)"></span></span><span class="val">2.89 s</span></div></div><div class="panel"><div class="ptitle">8 symbols</div><div class="pnote">Ibex <b>16.0&times;</b> faster than Polars</div><div class="row best" title="ibex: 331 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:6.2%;background:var(--ibex)"></span></span><span class="val">331 ms</span></div><div class="row " title="polars: 5.31 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">5.31 s</span></div><div class="row " title="duckdb: 2.70 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:50.8%;background:var(--duckdb)"></span></span><span class="val">2.70 s</span></div></div><div class="panel"><div class="ptitle">20 symbols</div><div class="pnote">Ibex <b>21.7&times;</b> faster than Polars</div><div class="row best" title="ibex: 336 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:4.6%;background:var(--ibex)"></span></span><span class="val">336 ms</span></div><div class="row " title="polars: 7.30 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">7.30 s</span></div><div class="row " title="duckdb: 2.85 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:39.0%;background:var(--duckdb)"></span></span><span class="val">2.85 s</span></div></div><div class="panel"><div class="ptitle">100 symbols</div><div class="pnote">Ibex <b>24.0&times;</b> faster than Polars</div><div class="row best" title="ibex: 349 ms"><span class="name">ibex <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:4.2%;background:var(--ibex)"></span></span><span class="val">349 ms</span></div><div class="row " title="polars: 8.40 s"><span class="name">polars</span><span class="track"><span class="bar" style="width:100.0%;background:var(--polars)"></span></span><span class="val">8.40 s</span></div><div class="row " title="duckdb: 2.85 s"><span class="name">duckdb</span><span class="track"><span class="bar" style="width:33.9%;background:var(--duckdb)"></span></span><span class="val">2.85 s</span></div></div></div>
+  <p>From 3 symbols to 100, Ibex stays at ~349&nbsp;ms while Polars slows from 3.33 s to 8.40 s &mdash; stretching a 9.6&times; lead into <b>24&times;</b>.</p>
 
-  <h2>2 · Per core <span class="tag">— everyone single-threaded (apples-to-apples engine efficiency)</span></h2>
-  <p class="sub">Same query, <code>POLARS_MAX_THREADS=1</code> and DuckDB <code>threads=1</code>. This is the fair "how good is the engine" comparison — and Ibex leads at every scale and both window types.</p>
-  <div id="st" class="grid"></div>
+  <h2>It uses the whole machine <span class="tag">&mdash; 3 symbols, aligned window</span></h2>
+  <p class="sub">Give Ibex more cores and it takes them, even on a handful of symbols &mdash; a case that used to leave most of a big box idle.</p>
+  <div class="grid"><div class="panel"><div class="ptitle">5M rows</div><div class="pnote">8 &rarr; 32 cores: <b>1.65&times; faster</b></div><div class="row " title="8 cores: 141 ms"><span class="name">8 cores</span><span class="track"><span class="bar" style="width:100.0%;background:var(--ibex)"></span></span><span class="val">141 ms</span></div><div class="row " title="16 cores: 95.4 ms"><span class="name">16 cores</span><span class="track"><span class="bar" style="width:67.6%;background:var(--ibex)"></span></span><span class="val">95.4 ms</span></div><div class="row best" title="32 cores: 85.7 ms"><span class="name">32 cores <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:60.8%;background:var(--ibex)"></span></span><span class="val">85.7 ms</span></div></div><div class="panel"><div class="ptitle">20M rows</div><div class="pnote">8 &rarr; 32 cores: <b>1.63&times; faster</b></div><div class="row " title="8 cores: 564 ms"><span class="name">8 cores</span><span class="track"><span class="bar" style="width:100.0%;background:var(--ibex)"></span></span><span class="val">564 ms</span></div><div class="row " title="16 cores: 387 ms"><span class="name">16 cores</span><span class="track"><span class="bar" style="width:68.6%;background:var(--ibex)"></span></span><span class="val">387 ms</span></div><div class="row best" title="32 cores: 347 ms"><span class="name">32 cores <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:61.5%;background:var(--ibex)"></span></span><span class="val">347 ms</span></div></div><div class="panel"><div class="ptitle">50M rows</div><div class="pnote">8 &rarr; 32 cores: <b>1.59&times; faster</b></div><div class="row " title="8 cores: 1.44 s"><span class="name">8 cores</span><span class="track"><span class="bar" style="width:100.0%;background:var(--ibex)"></span></span><span class="val">1.44 s</span></div><div class="row " title="16 cores: 990 ms"><span class="name">16 cores</span><span class="track"><span class="bar" style="width:69.0%;background:var(--ibex)"></span></span><span class="val">990 ms</span></div><div class="row best" title="32 cores: 903 ms"><span class="name">32 cores <span class="crown">&#10003;</span></span><span class="track"><span class="bar" style="width:62.9%;background:var(--ibex)"></span></span><span class="val">903 ms</span></div></div></div>
 
-  <div class="kbox" style="border-left-color:var(--win)">
-    <b>The headroom.</b> On this workload Polars and DuckDB each convert one thread into ~3.3–3.9× throughput. Ibex converts it into 1×. Give Ibex even a 3× parallel speedup and 5M-aligned goes 575→~190 ms (past Polars' 284) and 5M-sliding 583→~195 ms (past Polars' 556). The single-threaded lead is the evidence that multithreading turns the remaining losses into wins.
+  <h2>Why it's fast</h2>
+  <p class="sub">Nothing exotic &mdash; it is what you get when the window operator is designed for time series from the start rather than added to a general query engine.</p>
+  <div class="why">
+    <div class="item">
+      <h3>A running window, not a re-aggregation</h3>
+      <p>Ibex advances one running accumulator per group as it sweeps the rows, so a bar costs the same whether the window holds ten ticks or ten thousand. Cost stays linear in rows and independent of window width &mdash; which is exactly what the k&nbsp;=&nbsp;1.04 curve above is showing.</p>
+    </div>
+    <div class="item">
+      <h3>Time order is part of the type</h3>
+      <p>A time-series frame carries its sorted time index in the type system, so a windowed query never has to sort, re-sort, or prove ordering before it can start. The work a general engine spends establishing order is work Ibex does not do.</p>
+    </div>
+    <div class="item">
+      <h3>Parallel across symbols &mdash; and inside them</h3>
+      <p>Groups run concurrently, one per core. For aligned windows each group is split further at bucket boundaries, since a row can only depend on its own bucket &mdash; so three symbols can still saturate thirty-two cores instead of leaving twenty-nine idle.</p>
+    </div>
+    <div class="item">
+      <h3>Static types, columnar kernels</h3>
+      <p>Every column's type is known before the query runs, so the inner loop is a typed kernel over contiguous memory rather than a dispatch over boxed values. Grouping and ordering take integer fast paths &mdash; symbols are ranked once through their dictionary, not hashed per row.</p>
+    </div>
   </div>
 
-  <details open>
-    <summary>Full data table (min ms) — both modes</summary>
-    <div id="table"></div>
+  <div class="closing">
+    <h3>Try it on your own data</h3>
+    <p>The benchmark suite, the queries above and the generator for the tick data are all in the repository &mdash; you can reproduce every number on this page, or point it at your own.</p>
+    <div class="ctarow" style="margin:0">
+      <a class="cta" href="https://bobjansen.github.io/Ibex/">Read the docs &rarr;</a>
+      <span class="ctanote">bobjansen.github.io/Ibex</span>
+    </div>
+  </div>
+
+  <details>
+    <summary>Full results &mdash; all 36 configurations (min of 5 runs)</summary>
+    <div class="tablewrap"><table><thead><tr><th>rows</th><th>symbols</th><th>window</th><th>cores</th><th>Ibex</th><th>Polars</th><th>DuckDB</th></tr></thead><tbody><tr><td>5M</td><td>3</td><td style="text-align:left">aligned</td><td>8</td><td class="w">141 ms</td><td class="">926 ms</td><td class="">844 ms</td></tr><tr><td>5M</td><td>3</td><td style="text-align:left">trailing</td><td>8</td><td class="w">442 ms</td><td class="">1.60 s</td><td class="">10.3 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">aligned</td><td>8</td><td class="w">564 ms</td><td class="">3.93 s</td><td class="">3.42 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">trailing</td><td>8</td><td class="w">1.72 s</td><td class="">6.50 s</td><td class="">94.6 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">aligned</td><td>8</td><td class="w">816 ms</td><td class="">6.93 s</td><td class="">3.51 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">trailing</td><td>8</td><td class="w">766 ms</td><td class="">5.68 s</td><td class="">39.5 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">aligned</td><td>8</td><td class="w">617 ms</td><td class="">9.18 s</td><td class="">3.48 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">trailing</td><td>8</td><td class="w">587 ms</td><td class="">5.15 s</td><td class="">18.0 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">aligned</td><td>8</td><td class="w">475 ms</td><td class="">11.0 s</td><td class="">3.45 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">trailing</td><td>8</td><td class="w">439 ms</td><td class="">4.98 s</td><td class="">4.85 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">aligned</td><td>8</td><td class="w">1.44 s</td><td class="">10.5 s</td><td class="">8.70 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">trailing</td><td>8</td><td class="w">4.80 s</td><td class="">17.8 s</td><td class="">500.2 s</td></tr><tr><td>5M</td><td>3</td><td style="text-align:left">aligned</td><td>16</td><td class="w">95.4 ms</td><td class="">741 ms</td><td class="">722 ms</td></tr><tr><td>5M</td><td>3</td><td style="text-align:left">trailing</td><td>16</td><td class="w">439 ms</td><td class="">1.44 s</td><td class="">6.54 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">aligned</td><td>16</td><td class="w">387 ms</td><td class="">3.43 s</td><td class="">2.98 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">trailing</td><td>16</td><td class="w">1.73 s</td><td class="">6.10 s</td><td class="">50.5 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">aligned</td><td>16</td><td class="w">408 ms</td><td class="">5.88 s</td><td class="">2.94 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">trailing</td><td>16</td><td class="w">733 ms</td><td class="">5.00 s</td><td class="">24.7 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">aligned</td><td>16</td><td class="w">489 ms</td><td class="">7.55 s</td><td class="">2.87 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">trailing</td><td>16</td><td class="w">468 ms</td><td class="">3.91 s</td><td class="">13.9 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">aligned</td><td>16</td><td class="w">356 ms</td><td class="">9.08 s</td><td class="">2.90 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">trailing</td><td>16</td><td class="w">330 ms</td><td class="">3.33 s</td><td class="">3.42 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">aligned</td><td>16</td><td class="w">990 ms</td><td class="">8.47 s</td><td class="">6.68 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">trailing</td><td>16</td><td class="w">4.55 s</td><td class="">14.6 s</td><td class="">256.7 s</td></tr><tr><td>5M</td><td>3</td><td style="text-align:left">aligned</td><td>32</td><td class="w">85.7 ms</td><td class="">773 ms</td><td class="">718 ms</td></tr><tr><td>5M</td><td>3</td><td style="text-align:left">trailing</td><td>32</td><td class="w">448 ms</td><td class="">1.28 s</td><td class="">5.42 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">aligned</td><td>32</td><td class="w">347 ms</td><td class="">3.33 s</td><td class="">2.89 s</td></tr><tr><td>20M</td><td>3</td><td style="text-align:left">trailing</td><td>32</td><td class="w">1.75 s</td><td class="">4.95 s</td><td class="">46.1 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">aligned</td><td>32</td><td class="w">331 ms</td><td class="">5.31 s</td><td class="">2.70 s</td></tr><tr><td>20M</td><td>8</td><td style="text-align:left">trailing</td><td>32</td><td class="w">740 ms</td><td class="">4.11 s</td><td class="">24.0 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">aligned</td><td>32</td><td class="w">336 ms</td><td class="">7.30 s</td><td class="">2.85 s</td></tr><tr><td>20M</td><td>20</td><td style="text-align:left">trailing</td><td>32</td><td class="w">435 ms</td><td class="">3.42 s</td><td class="">12.1 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">aligned</td><td>32</td><td class="w">349 ms</td><td class="">8.40 s</td><td class="">2.85 s</td></tr><tr><td>20M</td><td>100</td><td style="text-align:left">trailing</td><td>32</td><td class="w">328 ms</td><td class="">3.01 s</td><td class="">3.35 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">aligned</td><td>32</td><td class="w">903 ms</td><td class="">8.88 s</td><td class="">6.49 s</td></tr><tr><td>50M</td><td>3</td><td style="text-align:left">trailing</td><td>32</td><td class="w">4.70 s</td><td class="">14.2 s</td><td class="">n/a</td></tr></tbody></table></div>
   </details>
 
-  <p style="margin-top:22px;font-size:12.5px;color:var(--text-muted)">Suite: <code>benchmarking/window_ohlc/run.py</code> (<code>--threads {auto,1}</code>). DuckDB's sliding case uses a <code>RANGE … PRECEDING</code> frame; its single-threaded 5M cost is 10.3 s (off-scale, see table).</p>
+  <div class="foot">
+    <b>Method.</b> AWS <code>m7i.8xlarge</code> (32 vCPU, 128 GiB), 2026-07-27. Every engine reads the same Parquet files, is pinned to the same cores with <code>taskset</code>, and is given the same thread budget (<code>POLARS_MAX_THREADS</code>, DuckDB <code>PRAGMA threads</code>). Input is preloaded; only compute and full materialisation are timed. Each figure is the best of 5 runs after a discarded warmup. All three engines are checked row by row to produce <b>identical</b> OHLCV values &mdash; a benchmark reporting three timings for three different answers is worth nothing. Polars 1.42.1, DuckDB 1.5.4.<br><br>
+    <b>One cell is missing:</b> DuckDB at 50M rows / trailing window / 32 cores did not finish &mdash; it was still running after 98 minutes and was cut short. Its 8- and 16-core times for that cell are included and are the basis for the 104&times; figure. Suite: <code>benchmarking/window_ohlc/run.py</code>.
+  </div>
 </div>
-
-<script>
-const COLORS = {ibex:'var(--ibex)', polars:'var(--polars)', duckdb:'var(--duckdb)'};
-const ORDER = ['ibex','polars','duckdb'];
-// min_ms, threads mode split
-const MT = [
-  {rows:'100k', win:'aligned', ibex:10.1, polars:19.0, duckdb:21.6},
-  {rows:'1M',   win:'aligned', ibex:116.5,polars:85.8, duckdb:116.2},
-  {rows:'5M',   win:'aligned', ibex:575.1,polars:284.0,duckdb:453.8},
-  {rows:'100k', win:'sliding', ibex:11.6, polars:49.4, duckdb:28.6},
-  {rows:'1M',   win:'sliding', ibex:121.9,polars:153.1,duckdb:264.7},
-  {rows:'5M',   win:'sliding', ibex:582.5,polars:556.1,duckdb:2623.5},
-];
-const ST = [
-  {rows:'100k', win:'aligned', ibex:10.1, polars:13.6, duckdb:30.7},
-  {rows:'1M',   win:'aligned', ibex:116.5,polars:166.5,duckdb:288.4},
-  {rows:'5M',   win:'aligned', ibex:575.1,polars:952.9,duckdb:1559.4},
-  {rows:'100k', win:'sliding', ibex:11.6, polars:22.7, duckdb:43.0},
-  {rows:'1M',   win:'sliding', ibex:121.9,polars:286.9,duckdb:944.6},
-  {rows:'5M',   win:'sliding', ibex:582.5,polars:1855.1,duckdb:10269.8},
-];
-const fmt = v => v>=1000 ? (v/1000).toFixed(2)+' s' : (v>=100 ? v.toFixed(0)+' ms' : v.toFixed(1)+' ms');
-
-function panel(title, note, d){
-  const max = Math.max(...ORDER.map(e=>d[e]));
-  const best = ORDER.reduce((a,b)=> d[b]<d[a]?b:a);
-  let rows='';
-  for(const e of ORDER){
-    const w = Math.max(2, d[e]/max*100);
-    const isBest = e===best;
-    rows += `<div class="row ${isBest?'best':''}" title="${e}: ${d[e]} ms">
-      <span class="name">${e}${isBest?' <span class="crown">✓</span>':''}</span>
-      <span class="track"><span class="bar" style="width:${w}%;background:${COLORS[e]}"></span></span>
-      <span class="val">${fmt(d[e])}</span></div>`;
-  }
-  return `<div class="panel"><div class="ptitle">${title}</div><div class="pnote">${note}</div>${rows}</div>`;
-}
-const winner = d => ORDER.reduce((a,b)=>d[b]<d[a]?b:a);
-document.getElementById('mt').innerHTML =
-  MT.map(d=>panel(`${d.rows} · ${d.win}`, `fastest: ${winner(d)}`, d)).join('');
-document.getElementById('st').innerHTML =
-  ST.map(d=>panel(`${d.rows} · ${d.win}`, `fastest: ${winner(d)}`, d)).join('');
-
-// table
-let t='<table><thead><tr><th>config</th><th>mode</th><th>Ibex</th><th>Polars</th><th>DuckDB</th></tr></thead><tbody>';
-function trows(data,mode){
-  for(const d of data){
-    const best=winner(d);
-    t+=`<tr><td>${d.rows} ${d.win}</td><td style="text-align:left;color:var(--text-muted)">${mode}</td>`+
-       ORDER.map(e=>`<td class="${e===best?'w':''}">${fmt(d[e])}</td>`).join('')+'</tr>';
-  }
-}
-trows(MT,'default'); trows(ST,'1-thread');
-t+='</tbody></table>';
-document.getElementById('table').innerHTML=t;
-</script>

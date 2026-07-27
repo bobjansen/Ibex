@@ -115,8 +115,24 @@ auto run(const std::string& name, const std::string& src,
 // the algorithm: a full sort is O(n log n), TopK heap-select is O(n log k), so
 // the gap survives any runner speed or build mode. A guard failing means the
 // fusion silently stopped firing (e.g. R16 didn't match and we fell back to
-// sort-then-slice) — that is a wiring regression, not a perf wobble. Margins
-// are set far below the observed ratio (~40×) so runner noise can't trip them.
+// sort-then-slice) — that is a wiring regression, not a perf wobble.
+//
+// A guard is only as good as its baseline. These margins were first set far
+// below a ~40x observed ratio, but the baseline is a full sort and the sort has
+// since been parallelised ("Gather a sort permutation across worker threads"),
+// which halved it on a 24-thread box: 24.3ms -> 11.4ms at 500k rows, while TopK
+// itself did not move (3.81ms -> 3.97ms). The ratios collapsed with it, and the
+// guards began failing intermittently on a change that had nothing to do with
+// TopK. They are recalibrated below against measured worst-of-5 ratios.
+//
+// So: when speeding up something that is another guard's BASELINE, expect to
+// re-measure here. A ratio guard cannot tell "the fast path regressed" from
+// "the slow path improved" — only the absolute numbers can, and the fix is to
+// re-floor the guard rather than to treat the fusion as broken.
+//
+// The margins stay well above 1.0x, which is where a genuine fallback to
+// sort-then-slice lands, and a machine with fewer cores has a slower (serial)
+// baseline and so a larger ratio — these floors are the hard case.
 struct Guard {
     std::string fast;  // case expected to be fast (the fused shape)
     std::string slow;  // un-fused baseline it must beat
@@ -126,14 +142,17 @@ struct Guard {
 
 const std::vector<Guard>& fusion_guards() {
     static const std::vector<Guard> guards = {
-        {"order_head_10", "wide_order_unsorted", 8.0,
+        // Measured worst-of-5 at 500k rows on 24 threads: 8.65x.
+        {"order_head_10", "wide_order_unsorted", 4.0,
          "Head(Order(x)) must fuse to TopK heap-select, not full sort + slice"},
-        {"order_tail_10", "wide_order_unsorted", 8.0,
+        // Measured worst-of-5: 4.75x. Noisier than the Head form because the
+        // whole input is consumed before the tail is known.
+        {"order_tail_10", "wide_order_unsorted", 3.0,
          "Tail(Order(x)) must fuse to TopK heap-select, not full sort + slice"},
-        // Looser margin: at modest row counts k=1000 is a larger fraction of n,
-        // so heap-select's edge narrows. 3x still catches a fallback to full
-        // sort (which would land near 1x) without tripping at small scales.
-        {"order_head_1000", "wide_order_unsorted", 3.0,
+        // Tightest of the three: at modest row counts k=1000 is a large
+        // fraction of n, so heap-select's edge narrows. Measured worst-of-5:
+        // 1.98x. Still well clear of the ~1x a fallback to full sort lands on.
+        {"order_head_1000", "wide_order_unsorted", 1.5,
          "TopK(k=1000) heap-select must still beat a full sort"},
     };
     return guards;

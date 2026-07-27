@@ -6,11 +6,17 @@
 # fixed row count, and row count at a fixed symbol count. Every engine is
 # pinned to the same cores with the same thread budget.
 #
-# The artifact is a tarball of per-sweep TSVs plus a versions.txt.
+# The artifact is a tarball of per-sweep TSVs plus a versions.txt. A partial
+# tarball is refreshed after every sweep under a separate key, so a run that
+# stalls or is interrupted still yields every sweep that finished.
+#
+# --budget-s (default 300) caps one execution of one cell; slower cells stop
+# after a single execution and are recorded as over_budget.
 #
 # Usage:
 #   ./benchmarking/aws/run-window-ohlc.sh --on-demand
 #   ./benchmarking/aws/run-window-ohlc.sh --rows "5000000 50000000" --cores "8 32"
+#   ./benchmarking/aws/run-window-ohlc.sh --budget-s 60
 
 set -euo pipefail
 
@@ -30,6 +36,7 @@ SWEEP_ROWS="20000000"
 SWEEP_SYMBOLS="3"
 CORES=""
 ITERS=5
+BUDGET_S=300
 KEY_NAME=""
 ON_DEMAND=0
 
@@ -41,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --sweep-symbols) SWEEP_SYMBOLS="$2"; shift 2 ;;
         --cores) CORES="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
+        --budget-s) BUDGET_S="$2"; shift 2 ;;
         --type) INSTANCE_TYPE="$2"; shift 2 ;;
         --key) KEY_NAME="$2"; shift 2 ;;
         --region) REGION="$2"; shift 2 ;;
@@ -72,7 +80,9 @@ echo "Rows   : ${ROWS} (at ${SWEEP_SYMBOLS} symbols)"
 echo "Symbols: ${SYMBOLS} (at ${SWEEP_ROWS} rows)"
 echo "Cores  : ${CORES:-all vCPUs on the box}"
 echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
+echo "Budget : ${BUDGET_S}s per execution ($([[ "$BUDGET_S" == "0" ]] && echo disabled || echo 'slower cells recorded as over_budget'))"
 echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
+echo "Partial: s3://$S3_BUCKET/${RESULT_KEY%.tar.gz}.partial.tar.gz (refreshed after each sweep)"
 
 ENV_ARGS=(
     "IBEX_OHLC_MODE=1"
@@ -81,6 +91,7 @@ ENV_ARGS=(
     "IBEX_OHLC_SWEEP_ROWS=${SWEEP_ROWS}"
     "IBEX_OHLC_SWEEP_SYMBOLS=${SWEEP_SYMBOLS}"
     "IBEX_OHLC_ITERS=${ITERS}"
+    "IBEX_OHLC_BUDGET_S=${BUDGET_S}"
     "IBEX_S3_BUCKET=${S3_BUCKET}"
     "IBEX_RESULT_KEY=${RESULT_KEY}"
     "IBEX_REGION=${REGION}"
@@ -103,7 +114,17 @@ while ! aws s3 ls "s3://${S3_BUCKET}/${RESULT_KEY}" --region "$REGION" >/dev/nul
     state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
         --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
     if [[ "$state" == "terminated" || "$state" == "shutting-down" ]]; then
-        echo "instance ended without an artifact; inspect the console log above" >&2
+        # The box snapshots after every sweep, so a run that died partway
+        # through still has every completed sweep sitting in the partial key.
+        PARTIAL="$IBEX_ROOT/benchmarking/results/window_ohlc_aws_${TIMESTAMP}.partial.tar.gz"
+        mkdir -p "$(dirname "$PARTIAL")"
+        if aws s3 cp "s3://${S3_BUCKET}/${RESULT_KEY%.tar.gz}.partial.tar.gz" \
+                "$PARTIAL" --region "$REGION" 2>/dev/null; then
+            echo "instance ended without a final artifact; recovered partial results" >&2
+            echo "Partial: $PARTIAL" >&2
+        else
+            echo "instance ended without an artifact; inspect the console log above" >&2
+        fi
         exit 1
     fi
     sleep 30

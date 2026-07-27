@@ -1,6 +1,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 
+#include <algorithm>
 #include <array>
 #include <robin_hood.h>
 #include <string>
@@ -136,9 +137,14 @@ auto fn_kind(std::string_view name) -> std::optional<FnKind> {
 namespace {
 
 // Walk `expr`; a call is disqualifying unless `ok(call)` accepts it. A
-// `RankExpr` node is always disqualifying (non-row-local). Shared by every
-// expression-class predicate below, so all of them agree on the traversal —
-// notably on descending into named arguments, which a hand-rolled walk forgets.
+// `RankExpr` node is always disqualifying — see the header on
+// `is_group_parallel_safe_expr` for why that is a default rather than a fact
+// about rank. Every expression-class predicate below shares this walk so that
+// the `ok` lambda is the ONLY thing they differ in; otherwise two predicates
+// could disagree about the same expression for reasons unrelated to their
+// policy. It also fixes the easy mistake in one place: `CallExpr` has two child
+// lists, and a walk that visits `args` but not `named_args` silently accepts an
+// expression whose disqualifying call is hidden in a named argument.
 template <typename OkCall>
 auto every_call(const Expr& expr, OkCall ok) -> bool {
     return std::visit(
@@ -157,17 +163,11 @@ auto every_call(const Expr& expr, OkCall ok) -> bool {
                 if (!ok(n)) {
                     return false;
                 }
-                for (const auto& arg : n.args) {
-                    if (!every_call(*arg, ok)) {
-                        return false;
-                    }
-                }
-                for (const auto& na : n.named_args) {
-                    if (!every_call(*na.value, ok)) {
-                        return false;
-                    }
-                }
-                return true;
+                return std::ranges::all_of(n.args,
+                                           [&](const auto& a) { return every_call(*a, ok); }) &&
+                       std::ranges::all_of(
+                           n.named_args, [&](const auto& na) { return every_call(*na.value, ok); });
+                // NOLINTNEXTLINE(bugprone-branch-clone)
             } else if constexpr (std::is_same_v<T, RankExpr>) {
                 return false;
             } else {
@@ -209,6 +209,9 @@ auto is_group_parallel_safe_expr(const Expr& expr) -> bool {
 auto is_bucket_local_window_expr(const Expr& expr) -> bool {
     return every_call(expr, [](const CallExpr& call) {
         const auto kind = fn_kind(call.callee);
+
+        // Unknown callee — an extern or a plugin. Unclassifiable, so unprovable;
+        // refuse, as every predicate here does. Also guards the deref below.
         if (!kind.has_value()) {
             return false;
         }
@@ -236,12 +239,9 @@ auto is_bucket_local_window_expr(const Expr& expr) -> bool {
         // count window, which knows nothing about the grid, and `__window_ns`
         // is a different duration and so a different grid. Either way the
         // boundaries we would split on no longer bound this call.
-        for (const auto& na : call.named_args) {
-            if (na.name == "__window_n" || na.name == "__window_ns") {
-                return false;
-            }
-        }
-        return true;
+        return std::ranges::all_of(call.named_args, [&](const auto& na) {
+            return !(na.name == "__window_n" || na.name == "__window_ns");
+        });
     });
 }
 

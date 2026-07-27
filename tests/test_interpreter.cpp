@@ -10918,3 +10918,154 @@ TEST_CASE("rolling extrema over a power-of-two count window", "[interpreter][win
         run("data[update { m = rolling_min(val, 1) }];", 1, true);
     }
 }
+
+// A grouped windowed update parallelises across GROUPS, which caps the speedup
+// at the group count -- three symbols leave most of a machine idle. Under an
+// aligned window a row's value depends only on rows in its own bucket, so one
+// group's rows may be cut at a bucket boundary and the pieces run
+// independently. The cut must be invisible: a piece that started mid-bucket
+// would restart its rolling state in the middle of a bar and report the wrong
+// open/high/low for every row up to the next boundary.
+TEST_CASE("aligned grouped window splits a group at bucket boundaries",
+          "[interpreter][window][parallel]") {
+    // Enough rows that the split's own minimum piece size is exceeded, with
+    // only three groups so the split -- not the group count -- is what supplies
+    // the parallelism.
+    constexpr std::size_t kGroups = 3;
+    constexpr std::size_t kPerGroup = 60000;
+    constexpr std::size_t kRows = kGroups * kPerGroup;
+    constexpr std::int64_t kSecond = 1'000'000'000LL;
+
+    Column<Timestamp> ts;
+    Column<std::string> sym;
+    Column<double> val;
+    runtime::ValidityBitmap val_valid;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        // Symbols interleave, so a group's rows are scattered through the table
+        // rather than contiguous -- the shape the gather and scatter face.
+        // One second apart, so a 1-minute bucket holds 60 rows per symbol and
+        // every piece spans many whole buckets.
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(r / kGroups) * kSecond));
+        sym.push_back("S" + std::to_string(r % kGroups));
+        // Irregular against both the bucket width and the piece size, so a
+        // misplaced boundary changes min/max rather than landing on a tie.
+        val.push_back(static_cast<double>((r * 7919) % 1000) / 8.0);
+        val_valid.push_back(r % 97 != 5);
+    }
+    runtime::Table table;
+    table.add_column("ts", std::move(ts));
+    table.add_column("sym", std::move(sym));
+    table.add_column("val", std::move(val));
+    table.columns[2].validity = std::move(val_valid);
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    auto ir = require_ir(
+        "t[ select { open = first(val), high = max(val), low = min(val), close = last(val), "
+        "ws = window_start() }, by sym, window 1m aligned ];");
+
+    auto run_with = [&](bool parallel) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    auto serial = run_with(false);
+    auto parallel = run_with(true);
+    REQUIRE(serial.rows() == kRows);
+
+    auto mismatch = runtime::compare_tables(serial, parallel);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+
+    // Independently of the two agreeing: check one bar against a hand-rolled
+    // reduction, so a bug shared by both paths cannot pass. Bucket 1 of symbol
+    // S0 is rows [60, 120) of that symbol, i.e. table rows 180, 183, ... 357.
+    double want_high = std::numeric_limits<double>::lowest();
+    double want_low = std::numeric_limits<double>::max();
+    const auto* val_col = std::get_if<Column<double>>(table.find("val"));
+    REQUIRE(val_col != nullptr);
+    const auto& valid = *table.columns[2].validity;
+    for (std::size_t r = 180; r < 360; r += kGroups) {
+        if (!valid[r]) {
+            continue;
+        }
+        want_high = std::max(want_high, (*val_col)[r]);
+        want_low = std::min(want_low, (*val_col)[r]);
+    }
+    // Row 357 is the last row of that bucket, so its running high/low equal the
+    // whole bar's.
+    const auto* high = std::get_if<Column<double>>(parallel.find("high"));
+    const auto* low = std::get_if<Column<double>>(parallel.find("low"));
+    REQUIRE(high != nullptr);
+    REQUIRE(low != nullptr);
+    CHECK((*high)[357] == want_high);
+    CHECK((*low)[357] == want_low);
+}
+
+// `lag` reads the previous row whatever bucket it is in, so a group carrying it
+// must NOT be cut: a piece boundary would turn one row's lag into a null. The
+// split is gated on every field being bucket-local, and this is the check that
+// the gate is actually consulted rather than merely present.
+TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
+          "[interpreter][window][parallel]") {
+    constexpr std::size_t kGroups = 3;
+    constexpr std::size_t kPerGroup = 60000;
+    constexpr std::size_t kRows = kGroups * kPerGroup;
+    constexpr std::int64_t kSecond = 1'000'000'000LL;
+
+    Column<Timestamp> ts;
+    Column<std::string> sym;
+    Column<double> val;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(r / kGroups) * kSecond));
+        sym.push_back("S" + std::to_string(r % kGroups));
+        val.push_back(static_cast<double>((r * 7919) % 1000) / 8.0);
+    }
+    runtime::Table table;
+    table.add_column("ts", std::move(ts));
+    table.add_column("sym", std::move(sym));
+    table.add_column("val", std::move(val));
+    table.time_index = "ts";
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+    auto ir = require_ir("t[ select { p = lag(val, 1) }, by sym, window 1m aligned ];");
+
+    auto run_with = [&](bool parallel) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    auto serial = run_with(false);
+    auto parallel = run_with(true);
+    auto mismatch = runtime::compare_tables(serial, parallel);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+
+    // `lag` crosses buckets freely, so the value at a would-be piece boundary
+    // has to be the previous row of the same symbol, not a null.
+    const auto* p = std::get_if<Column<double>>(parallel.find("p"));
+    const auto* val_col = std::get_if<Column<double>>(table.find("val"));
+    REQUIRE(p != nullptr);
+    REQUIRE(val_col != nullptr);
+    const auto& entry = *parallel.find_entry("p");
+    for (std::size_t r = kGroups; r < kRows; ++r) {
+        REQUIRE((!entry.validity.has_value() || (*entry.validity)[r]));
+        REQUIRE((*p)[r] == (*val_col)[r - kGroups]);
+    }
+}

@@ -1997,10 +1997,42 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // reads across the cut.
     const auto tasks = build_window_tasks(group_rows, input, duration, aligned, fields, exec, rows);
 
+    // Only the columns the window expressions actually read need to be gathered
+    // into each per-group slice. The gather is strided -- a group's rows are
+    // 1-in-`group_count` through the table -- so every column carried along
+    // costs a full cache line per row it does not use. `symbol` is the standard
+    // case: it is a group key, hence constant within the slice, hence gathered
+    // once per row to be read never.
+    //
+    // Two things must stay in the set beyond the expression references:
+    //   * the time index, which the windowing itself needs; and
+    //   * any column a field would OVERWRITE. `windowed_update_table` replaces
+    //     a same-named column in place instead of appending, and the
+    //     append-only assumption below (`first_new_idx`) is what turns its
+    //     result back into a list of new fields. Drop such a column from the
+    //     slice and the field appends instead, which would then add a DUPLICATE
+    //     to `output` -- it already carries every input column.
+    robin_hood::unordered_set<std::string> needed;
+    if (input.time_index.has_value()) {
+        needed.insert(*input.time_index);
+    }
+    for (const auto& field : fields) {
+        ir::collect_expr_column_refs(field.expr, needed);
+        needed.insert(field.alias);  // no-op unless it names an input column
+    }
+    std::vector<const ColumnEntry*> slice_columns;
+    slice_columns.reserve(input.columns.size());
+    for (const auto& entry : input.columns) {
+        if (needed.contains(entry.name)) {
+            slice_columns.push_back(&entry);
+        }
+    }
+
     auto run_group =
         [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {
         Table sub;
-        for (const auto& entry : input.columns) {
+        for (const auto* entry_ptr : slice_columns) {
+            const auto& entry = *entry_ptr;
             ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
             // Carry each input column's validity into the per-group slice — else a
             // rolling/lag field over a nullable input column (e.g. a computed
@@ -2026,7 +2058,9 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     if (!first.has_value()) {
         return std::unexpected(first.error());
     }
-    const std::size_t first_new_idx = input.columns.size();
+    // The slice carries only `slice_columns`, so that -- not the full input
+    // width -- is where the appended fields begin.
+    const std::size_t first_new_idx = slice_columns.size();
     if (first->columns.size() <= first_new_idx) {
         return std::unexpected("window: grouped update produced no new columns");
     }

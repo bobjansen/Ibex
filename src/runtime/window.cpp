@@ -1278,6 +1278,283 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
         return std::move(*fast);
     }
 
+    // Grouped vectorised path: the same trick as `simple_resample`, extended to
+    // ONE extra group key -- which is the shape every market-data resample has
+    // (`by symbol`).
+    //
+    // The generic path below builds a 5M-element `_bucket` column, hashes every
+    // row on the composite `(_bucket, symbol)`, and drives a `std::vector<
+    // AggSlot>` whose element carries two ScalarValues and a std::vector<double>
+    // for median -- allocated per group per aggregate whether or not the
+    // aggregate is `max`. Measured at 5M rows / 100 symbols / ~100 ticks per
+    // bar: 58.9ms, against 19.9ms for the ungrouped fast path on the same data,
+    // with AggSlot move/copy/growth alone ~15% of profile.
+    //
+    // This exploits the two facts the generic path throws away:
+    //   * the time index is sorted, so a bucket is a CONTIGUOUS row range -- no
+    //     bucket column and no hashing of it; and
+    //   * the group key has few distinct values, so a bucket's accumulators are
+    //     a dense array indexed by a factorized code, not a hash table.
+    //
+    // NOTE this is density-sensitive in a way worth stating: it wins because a
+    // bar holds many rows. On a degenerate feed (~1 row per bar) there is
+    // nothing to vectorise over and this saves nothing -- see
+    // benchmarking/window_ohlc/README.md on tick density.
+    auto grouped_simple_resample = [&] -> std::optional<std::expected<Table, std::string>> {
+        // One key only. Multi-key is not the common shape and a composite code
+        // would reintroduce exactly the per-row hashing this exists to avoid.
+        if (extra_group_by.size() != 1 || rows == 0) {
+            return std::nullopt;
+        }
+        const auto* key_entry = input.find_entry(extra_group_by[0].name);
+        if (key_entry == nullptr || key_entry->validity.has_value()) {
+            return std::nullopt;  // missing or nullable key -> generic path
+        }
+        for (const auto& agg : aggregations) {
+            switch (agg.func) {
+                case ir::AggFunc::Sum:
+                case ir::AggFunc::Mean:
+                case ir::AggFunc::Min:
+                case ir::AggFunc::Max:
+                case ir::AggFunc::Count:
+                case ir::AggFunc::First:
+                case ir::AggFunc::Last:
+                    break;
+                default:
+                    return std::nullopt;
+            }
+            if (agg.func == ir::AggFunc::Count) {
+                continue;
+            }
+            const auto* entry = input.find_entry(agg.column.name);
+            if (entry == nullptr || entry->validity.has_value()) {
+                return std::nullopt;
+            }
+            const ColumnValue& cv = *entry->column;
+            if (!std::holds_alternative<Column<std::int64_t>>(cv) &&
+                !std::holds_alternative<Column<double>>(cv)) {
+                return std::nullopt;
+            }
+        }
+
+        // Factorize the key. A Categorical arrives pre-factorized; a string or
+        // integer key costs one dictionary pass. Above `kMaxCodes` a dense
+        // per-bucket accumulator array stops being cache-resident and hashing
+        // is the right structure again -- that case is the standing
+        // high-cardinality group-by gap, not this path's business.
+        constexpr std::size_t kMaxCodes = 4096;
+        std::vector<std::int32_t> codes(rows);
+        std::size_t ncodes = 0;
+        const ColumnValue& key_cv = *key_entry->column;
+        std::vector<std::string> str_dict;   // for String reconstruction
+        std::vector<std::int64_t> int_dict;  // for Int64 reconstruction
+        const Column<Categorical>* cat = std::get_if<Column<Categorical>>(&key_cv);
+        if (cat != nullptr) {
+            ncodes = cat->dictionary().size();
+            if (ncodes > kMaxCodes) {
+                return std::nullopt;
+            }
+            for (std::size_t i = 0; i < rows; ++i) {
+                codes[i] = cat->code_at(i);
+            }
+        } else if (const auto* s = std::get_if<Column<std::string>>(&key_cv)) {
+            robin_hood::unordered_map<std::string, std::int32_t> idx;
+            for (std::size_t i = 0; i < rows; ++i) {
+                auto [it, inserted] = idx.emplace((*s)[i], static_cast<std::int32_t>(ncodes));
+                if (inserted) {
+                    str_dict.emplace_back((*s)[i]);  // string_view -> string: direct-init
+                    if (++ncodes > kMaxCodes) {
+                        return std::nullopt;
+                    }
+                }
+                codes[i] = it->second;
+            }
+        } else if (const auto* n = std::get_if<Column<std::int64_t>>(&key_cv)) {
+            robin_hood::unordered_map<std::int64_t, std::int32_t> idx;
+            for (std::size_t i = 0; i < rows; ++i) {
+                auto [it, inserted] = idx.emplace((*n)[i], static_cast<std::int32_t>(ncodes));
+                if (inserted) {
+                    int_dict.push_back((*n)[i]);
+                    if (++ncodes > kMaxCodes) {
+                        return std::nullopt;
+                    }
+                }
+                codes[i] = it->second;
+            }
+        } else {
+            return std::nullopt;  // key type this path cannot factorize
+        }
+
+        // Bucket boundaries: contiguous because the time index is sorted.
+        std::vector<std::size_t> starts;
+        std::vector<std::int64_t> bvals;
+        starts.reserve(1024);
+        bvals.reserve(1024);
+        std::int64_t prev = 0;
+        for (std::size_t i = 0; i < rows; ++i) {
+            const std::int64_t b = bucket_of(i);
+            if (i == 0 || b != prev) {
+                starts.push_back(i);
+                bvals.push_back(b);
+                prev = b;
+            }
+        }
+        const std::size_t nb = bvals.size();
+        starts.push_back(rows);
+
+        // One pass to lay out the output: which (bucket, code) pairs exist, in
+        // (bucket asc, first appearance within the bucket) order, and which
+        // output row each input row feeds. `first_row`/`last_row` make First
+        // and Last pure gathers over the OUTPUT -- no pass over the input at
+        // all -- which for an OHLC query removes two of the five scans.
+        std::vector<std::uint32_t> row_out(rows);
+        std::vector<std::int64_t> out_ts;
+        std::vector<std::int32_t> out_code;
+        std::vector<std::size_t> first_row;
+        std::vector<std::size_t> last_row;
+        std::vector<std::int64_t> out_count;
+        std::vector<std::int32_t> slot_of(ncodes, -1);
+        std::vector<std::int32_t> touched;
+        touched.reserve(std::min<std::size_t>(ncodes, 256));
+        for (std::size_t g = 0; g < nb; ++g) {
+            const std::size_t lo = starts[g];
+            const std::size_t hi = starts[g + 1];
+            for (std::size_t i = lo; i < hi; ++i) {
+                const std::int32_t c = codes[i];
+                std::int32_t slot = slot_of[static_cast<std::size_t>(c)];
+                if (slot < 0) {
+                    slot = static_cast<std::int32_t>(out_ts.size());
+                    slot_of[static_cast<std::size_t>(c)] = slot;
+                    touched.push_back(c);
+                    out_ts.push_back(bvals[g]);
+                    out_code.push_back(c);
+                    first_row.push_back(i);
+                    last_row.push_back(i);
+                    out_count.push_back(0);
+                }
+                row_out[i] = static_cast<std::uint32_t>(slot);
+                last_row[static_cast<std::size_t>(slot)] = i;
+                ++out_count[static_cast<std::size_t>(slot)];
+            }
+            for (const std::int32_t c : touched) {
+                slot_of[static_cast<std::size_t>(c)] = -1;
+            }
+            touched.clear();
+        }
+        const std::size_t n_out = out_ts.size();
+
+        Table out;
+        Column<Timestamp> ts_out;
+        ts_out.reserve(n_out);
+        for (const std::int64_t b : out_ts) {
+            ts_out.push_back(Timestamp{b});
+        }
+        out.add_column(ts_name, std::move(ts_out));
+
+        // Rebuild the key column in its ORIGINAL type -- the generic path emits
+        // the key as it found it, and a resample that silently changed a
+        // Categorical into a String would be a schema change, not a speedup.
+        if (cat != nullptr) {
+            std::vector<Column<Categorical>::code_type> out_codes(out_code.begin(), out_code.end());
+            out.add_column(
+                extra_group_by[0].name,
+                Column<Categorical>{cat->dictionary_ptr(), cat->index_ptr(), std::move(out_codes)});
+        } else if (!str_dict.empty()) {
+            Column<std::string> key_out;
+            key_out.reserve(n_out);
+            for (const std::int32_t c : out_code) {
+                key_out.push_back(str_dict[static_cast<std::size_t>(c)]);
+            }
+            out.add_column(extra_group_by[0].name, std::move(key_out));
+        } else {
+            Column<std::int64_t> key_out;
+            key_out.reserve(n_out);
+            for (const std::int32_t c : out_code) {
+                key_out.push_back(int_dict[static_cast<std::size_t>(c)]);
+            }
+            out.add_column(extra_group_by[0].name, std::move(key_out));
+        }
+
+        for (const auto& agg : aggregations) {
+            if (agg.func == ir::AggFunc::Count) {
+                Column<std::int64_t> c;
+                c.reserve(n_out);
+                for (const std::int64_t v : out_count) {
+                    c.push_back(v);
+                }
+                out.add_column(agg.alias, std::move(c));
+                continue;
+            }
+            const ColumnValue& cv = *input.find_entry(agg.column.name)->column;
+            std::visit(
+                [&](const auto& src) {
+                    using T = std::decay_t<decltype(src)>::value_type;
+                    if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                        if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
+                            const auto& pick =
+                                agg.func == ir::AggFunc::First ? first_row : last_row;
+                            Column<T> c;
+                            c.reserve(n_out);
+                            for (std::size_t o = 0; o < n_out; ++o) {
+                                c.push_back(src[pick[o]]);
+                            }
+                            out.add_column(agg.alias, std::move(c));
+                            return;
+                        }
+                        if (agg.func == ir::AggFunc::Mean) {
+                            std::vector<double> acc(n_out, 0.0);
+                            for (std::size_t i = 0; i < rows; ++i) {
+                                acc[row_out[i]] += static_cast<double>(src[i]);
+                            }
+                            Column<double> c;
+                            c.reserve(n_out);
+                            for (std::size_t o = 0; o < n_out; ++o) {
+                                c.push_back(acc[o] / static_cast<double>(out_count[o]));
+                            }
+                            out.add_column(agg.alias, std::move(c));
+                            return;
+                        }
+                        const T init = agg.func == ir::AggFunc::Min ? std::numeric_limits<T>::max()
+                                       : agg.func == ir::AggFunc::Max
+                                           ? std::numeric_limits<T>::lowest()
+                                           : T{};
+                        std::vector<T> acc(n_out, init);
+                        switch (agg.func) {
+                            case ir::AggFunc::Min:
+                                for (std::size_t i = 0; i < rows; ++i) {
+                                    T& a = acc[row_out[i]];
+                                    a = std::min(a, src[i]);
+                                }
+                                break;
+                            case ir::AggFunc::Max:
+                                for (std::size_t i = 0; i < rows; ++i) {
+                                    T& a = acc[row_out[i]];
+                                    a = std::max(a, src[i]);
+                                }
+                                break;
+                            default:  // Sum
+                                for (std::size_t i = 0; i < rows; ++i) {
+                                    acc[row_out[i]] += src[i];
+                                }
+                                break;
+                        }
+                        Column<T> c;
+                        c.reserve(n_out);
+                        for (std::size_t o = 0; o < n_out; ++o) {
+                            c.push_back(acc[o]);
+                        }
+                        out.add_column(agg.alias, std::move(c));
+                    }
+                },
+                cv);
+        }
+        out.time_index = ts_name;
+        return std::expected<Table, std::string>{std::move(out)};
+    };
+    if (auto fast = grouped_simple_resample(); fast.has_value()) {
+        return std::move(*fast);
+    }
+
     // Build bucket column: floor(ts.nanos / dur_ns) * dur_ns
     Column<std::int64_t> bucket_col;
     bucket_col.reserve(rows);

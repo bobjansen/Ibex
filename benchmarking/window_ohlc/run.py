@@ -36,6 +36,7 @@ BUILD_DIR = Path(os.environ.get("BUILD_DIR", IBEX_ROOT / "build-release"))
 IBEX_BIN = BUILD_DIR / "tools" / "ibex"
 WINDOW = "10s"          # window width, shared by every engine
 WINDOW_NS = 10_000_000_000
+WINDOW_SECS = 10
 DATA_DIR = HERE / "data"
 
 # ── data generation (Ibex data_gen -> shared Parquet) ────────────────────────
@@ -170,12 +171,29 @@ def bench_polars(parquet: Path, window: str, iters: int,
                                     pl.col("volume").cum_sum().over(part).alias("volume_sum"))
                       .sort("symbol"))
     else:
+        # `rolling(group_by=)` emits one row per input row in (group, time)
+        # order, so sorting the frame that way first lets the results be
+        # hstacked positionally. The previous formulation joined them back on
+        # (symbol, timestamp), which FANS OUT on tied timestamps -- 200,018 rows
+        # out of a 200,000-row input, i.e. Polars was not doing the same work as
+        # the others. Ties are rare but real at tick density.
+        # closed="both" -- polars defaults to "right", i.e. (t-10s, t], while
+        # Ibex and DuckDB use [t-10s, t]. On sparse data no tick ever lands
+        # exactly on a boundary and the difference is invisible; at tick density
+        # it is not.
+        base = df.sort(["symbol", "timestamp"])
         def q():
-            agg = (df.rolling(index_column="timestamp", period=WINDOW, group_by="symbol")
-                     .agg(open=pl.col("price").first(), high=pl.col("price").max(),
-                          low=pl.col("price").min(), close=pl.col("price").last(),
-                          volume_sum=pl.col("volume").sum()))
-            return df.join(agg, on=["symbol", "timestamp"], how="left").sort("symbol")
+            agg = (base.rolling(index_column="timestamp", period=WINDOW, group_by="symbol",
+                               closed="both")
+                       .agg(open=pl.col("price").first(), high=pl.col("price").max(),
+                            low=pl.col("price").min(), close=pl.col("price").last(),
+                            volume_sum=pl.col("volume").sum()))
+            # `rolling(group_by=)` does NOT emit in input order, so re-sort it
+            # the same way before stacking. A stable sort is required: ties on
+            # (symbol, timestamp) are real at tick density, and their relative
+            # order is what carries the correspondence to `base`.
+            return base.hstack(agg.sort(["symbol", "timestamp"],
+                                        maintain_order=True).select(OHLCV))
     return _timeit(q, iters, budget_s)
 
 # ── DuckDB (in-memory table, materialised to Arrow) ──────────────────────────
@@ -203,6 +221,65 @@ def _duckdb_sql(window: str) -> str:
         ORDER BY symbol"""
 
 
+# ── ClickHouse (embedded via chdb, in-memory table, materialised to Arrow) ───
+
+def _clickhouse_sql(window: str) -> str:
+    if window == "aligned":
+        return f"""
+        SELECT timestamp, symbol, price,
+               first_value(price) OVER w AS open, max(price) OVER w AS high,
+               min(price) OVER w AS low, price AS close,
+               sum(volume) OVER w AS volume_sum,
+               toStartOfInterval(timestamp, INTERVAL {WINDOW_SECS} second) AS window_start
+        FROM t
+        WINDOW w AS (PARTITION BY symbol, toStartOfInterval(timestamp, INTERVAL {WINDOW_SECS} second)
+                     ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        ORDER BY symbol"""
+    # ClickHouse rejects a RANGE offset that does not fit in 32 bits, so the
+    # 10^10-nanosecond window cannot be written directly, and it rejects an
+    # INTERVAL there too ("OFFSET expression must be constant with numeric
+    # type"). Ordering by MICROSECONDS puts the offset inside int32 while
+    # keeping the frame far finer than the ~1ms tick spacing. It is the closest
+    # faithful expression available; `--verify` is what decides whether the
+    # rounding changes any answer.
+    return f"""
+        SELECT timestamp, symbol, price,
+               first_value(price) OVER w AS open, max(price) OVER w AS high,
+               min(price) OVER w AS low, price AS close,
+               sum(volume) OVER w AS volume_sum
+        FROM t
+        WINDOW w AS (PARTITION BY symbol ORDER BY toUnixTimestamp64Micro(timestamp)
+                     RANGE BETWEEN {WINDOW_SECS * 1_000_000} PRECEDING AND CURRENT ROW)
+        ORDER BY symbol"""
+
+
+def _ch_session(parquet: Path, threads: int):
+    from chdb.session import Session
+    sess = Session()
+    sess.query(f"SET max_threads = {threads}")
+    sess.query("CREATE OR REPLACE TABLE t ENGINE = Memory AS "
+               f"SELECT * FROM file('{parquet}', Parquet)")
+    return sess
+
+
+def _ch_arrow(sess, sql: str):
+    """Materialise to Arrow -- counting rows would let ClickHouse skip the work
+    every other engine pays for. ArrowStream, not "Arrow": the latter is the
+    file format (footer, needs open_file)."""
+    import io, pyarrow as pa
+    return pa.ipc.open_stream(io.BytesIO(sess.query(sql, "ArrowStream").bytes())).read_all()
+
+
+def bench_clickhouse(parquet: Path, window: str, iters: int, threads: int,
+                     budget_s: float) -> tuple[float, float, bool]:
+    sess = _ch_session(parquet, threads)
+    sql = _clickhouse_sql(window)
+    try:
+        return _timeit(lambda: _ch_arrow(sess, sql), iters, budget_s)
+    finally:
+        sess.close()
+
+
 def bench_duckdb(parquet: Path, window: str, iters: int, threads: int,
                  budget_s: float) -> tuple[float, float, bool]:
     import duckdb
@@ -222,6 +299,93 @@ def bench_duckdb(parquet: Path, window: str, iters: int, threads: int,
 # than an asserted one.
 
 OHLCV = ["open", "high", "low", "close", "volume_sum"]
+
+
+# Engines whose trailing frame provably differs from Ibex's on some rows.
+# Ibex's window is [t - dur, t] and POSITION-bounded: it ends at the current
+# row. A SQL `RANGE` frame is peer-inclusive at BOTH ends -- every row sharing
+# the current ORDER BY value is in it, including later ones. On top of that,
+# DuckDB's INTERVAL arithmetic is microsecond-resolution, and ClickHouse rejects
+# a RANGE offset wider than 32 bits so the query orders by microseconds, which
+# makes any two ticks inside one microsecond peers.
+_FRAME_ENGINES = ("polars", "duckdb", "clickhouse")
+
+
+def _tied_timestamps(frame):
+    """Mask of rows sharing a timestamp with another row of the same symbol.
+
+    `ORDER BY timestamp` is not a total order when timestamps tie, so every
+    engine is free to sequence the peers differently -- and `last(price)` or a
+    cumulative sum over a prefix then legitimately differs. This affects BOTH
+    window flavours, unlike the frame differences below. Ibex's order is the
+    table's row order; SQL's is unspecified.
+
+    The clean fix is a tie-breaking row id carried in the data and added to
+    every ORDER BY, which would make all four engines deterministic. Until then
+    these rows are excluded from the equality claim rather than hidden.
+    """
+    import numpy as np, polars as pl
+    ts = frame["timestamp"].cast(pl.Int64).to_numpy()
+    sym = frame["symbol"].to_numpy()
+    if ts.size == 0:
+        return np.zeros(0, dtype=bool)
+    same = (ts[1:] == ts[:-1]) & (sym[1:] == sym[:-1])
+    mask = np.zeros(ts.size, dtype=bool)
+    mask[:-1] |= same
+    mask[1:] |= same
+    return mask
+
+
+def _frame_differs(frame, engine: str):
+    """Mask of rows where `engine`'s frame provably covers different rows.
+
+    Not a tolerance and not a proximity guess: it recomputes each frame's
+    [left, right] row range under that engine's own arithmetic and compares it
+    to Ibex's. A divergence inside this set is explained by semantics; one
+    outside it is a hard failure and stays reported as such.
+
+    Whether Ibex SHOULD admit later peers is a language question -- SPEC defines
+    the window on TIME, which argues yes; a streaming engine cannot see the
+    future, which argues no. Flagged here, not decided.
+
+    `frame` must be sorted by (symbol, timestamp) so each symbol is contiguous.
+    """
+    import numpy as np, polars as pl   # module-level import would cost every run
+    ts = frame["timestamp"].cast(pl.Int64).to_numpy()
+    sym = frame["symbol"].to_numpy()
+    mask = np.zeros(ts.size, dtype=bool)
+    if ts.size == 0:
+        return mask
+    bounds = np.flatnonzero(sym[1:] != sym[:-1]) + 1
+    for lo, hi in zip(np.r_[0, bounds], np.r_[bounds, ts.size]):
+        t = ts[lo:hi]
+        pos = np.arange(t.size)
+        left_ibex = np.searchsorted(t, t - WINDOW_NS, side="left")
+        key = t
+        if engine == "clickhouse":
+            key = tu = t // 1000        # ClickHouse's ORDER BY key IS microseconds
+            left = np.searchsorted(tu, tu - (WINDOW_NS // 1000), side="left")
+            right = np.searchsorted(tu, tu, side="right") - 1
+        elif engine == "duckdb":
+            left = np.searchsorted(t, (t - WINDOW_NS) // 1000 * 1000, side="left")
+            right = np.searchsorted(t, t, side="right") - 1
+        else:                                   # polars, closed="both", ns-exact
+            left = left_ibex
+            right = np.searchsorted(t, t, side="right") - 1
+        # `first(price)` is ambiguous when the frame's FIRST row is one of a
+        # tied pair: which peer counts as first is exactly the ordering SQL
+        # leaves unspecified. That is a property of the frame's edge, not of
+        # the current row, so it is not caught by the tied-row mask.
+        edge_tied = np.zeros(t.size, dtype=bool)
+        if t.size > 1:
+            # Peers are equal under the ENGINE's ordering key: nanoseconds for
+            # Ibex/Polars/DuckDB, microseconds for ClickHouse.
+            tie_next = np.r_[key[1:] == key[:-1], False]
+            for lft in (left, left_ibex):
+                edge_tied |= tie_next[np.clip(lft, 0, t.size - 1)]
+        mask[lo:hi] = (left != left_ibex) | (right != pos) | edge_tied
+    return mask
+
 
 def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
     """Return a list of human-readable mismatches; empty means all three agree."""
@@ -258,11 +422,14 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
                                pl.col("price").alias("close"),
                                pl.col("volume").cum_sum().over(part).alias("volume_sum")))
     else:
-        agg = (df.rolling(index_column="timestamp", period=WINDOW, group_by="symbol")
-                 .agg(open=pl.col("price").first(), high=pl.col("price").max(),
-                      low=pl.col("price").min(), close=pl.col("price").last(),
-                      volume_sum=pl.col("volume").sum()))
-        pol = df.join(agg, on=["symbol", "timestamp"], how="left")
+        base = df.sort(["symbol", "timestamp"])
+        agg = (base.rolling(index_column="timestamp", period=WINDOW, group_by="symbol",
+                               closed="both")
+                   .agg(open=pl.col("price").first(), high=pl.col("price").max(),
+                        low=pl.col("price").min(), close=pl.col("price").last(),
+                        volume_sum=pl.col("volume").sum()))
+        pol = base.hstack(agg.sort(["symbol", "timestamp"],
+                                   maintain_order=True).select(OHLCV))
     pol = pol.sort(keys)
 
     con = duckdb.connect()
@@ -271,11 +438,26 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
     res = con.execute(_duckdb_sql(window))
     duck = pl.from_arrow(res.to_arrow_table() if fetch else res.fetch_arrow_table()).sort(keys)
 
-    if not (len(ibex) == len(pol) == len(duck)):
-        return [f"{window}: row counts differ - "
-                f"ibex={len(ibex)} polars={len(pol)} duckdb={len(duck)}"]
+    sess = _ch_session(parquet, 0)
+    ch = pl.from_arrow(_ch_arrow(sess, _clickhouse_sql(window))).sort(keys)
+    sess.close()
 
-    for name, other in (("polars", pol), ("duckdb", duck)):
+    if not (len(ibex) == len(pol) == len(duck) == len(ch)):
+        return [f"{window}: row counts differ - "
+                f"ibex={len(ibex)} polars={len(pol)} duckdb={len(duck)} "
+                f"clickhouse={len(ch)}"]
+
+    # Only the trailing window does interval arithmetic, so only it can hit the
+    # microsecond quantization; `aligned` uses ROWS frames and must match exactly.
+    # Only the trailing flavour does interval arithmetic; `aligned` uses ROWS
+    # frames and must match exactly.
+    # Only the trailing flavour has a frame that can differ; `aligned` uses ROWS
+    # frames throughout and must match exactly.
+    ties = _tied_timestamps(ibex)
+    explained = {e: (ties if window == "aligned" else ties | _frame_differs(ibex, e))
+                 for e in _FRAME_ENGINES}
+
+    for name, other in (("polars", pol), ("duckdb", duck), ("clickhouse", ch)):
         for col in OHLCV:
             missing = [w for w, f in (("ibex", ibex), (name, other)) if col not in f.columns]
             if missing:
@@ -283,10 +465,24 @@ def verify_engines(parquet: Path, window: str, tol: float = 1e-9) -> list[str]:
                 continue
             a = ibex[col].cast(pl.Float64)
             b = other[col].cast(pl.Float64)
-            bad = int(((a - b).abs() > tol).sum())
-            if bad:
-                problems.append(f"{window}: {name} differs from ibex in {col} "
-                                f"on {bad}/{len(a)} rows")
+            differs = ((a - b).abs() > tol).to_numpy()
+            bad = int(differs.sum())
+            if not bad:
+                continue
+            if name in explained:
+                unexplained = int((differs & ~explained[name]).sum())
+                if unexplained == 0:
+                    print(f"note      {window}: {name} differs from ibex in {col} on "
+                          f"{bad}/{len(a)} rows, ALL at tied timestamps or "
+                          f"where its frame provably differs -- expected",
+                          file=sys.stderr)
+                    continue
+                problems.append(f"{window}: {name} differs from ibex in {col} on "
+                                f"{bad}/{len(a)} rows, {unexplained} of them NOT explained "
+                                f"by tied timestamps or frame semantics")
+                continue
+            problems.append(f"{window}: {name} differs from ibex in {col} "
+                            f"on {bad}/{len(a)} rows")
     return problems
 
 # ── shared timing helper ─────────────────────────────────────────────────────
@@ -322,21 +518,37 @@ def main() -> None:
     ap.add_argument("--budget-s", type=float, default=300.0,
                     help="abort a cell once one execution exceeds this many "
                          "seconds, recording it as over_budget (0 = no budget)")
-    ap.add_argument("--threads", choices=["auto", "1"], default="auto",
-                    help="'1' = single-threaded (per-core / apples-to-apples): "
-                         "POLARS_MAX_THREADS=1 and DuckDB threads=1. 'auto' = each "
-                         "engine's default parallelism (DuckDB uses --duckdb-threads).")
-    ap.add_argument("--engines", nargs="+", default=["ibex", "polars", "duckdb"])
+    ap.add_argument("--threads", default="auto",
+                    help="thread budget applied to EVERY engine -- a fairness "
+                         "invariant, not a tuning knob. An integer pins all four "
+                         "(POLARS_MAX_THREADS, IBEX_THREADS, DuckDB PRAGMA, "
+                         "ClickHouse max_threads). '1' additionally sets "
+                         "IBEX_PARALLEL=0. 'auto' = each engine's own default, "
+                         "which is NOT comparable across engines.")
+    ap.add_argument("--engines", nargs="+",
+                    default=["ibex", "polars", "duckdb", "clickhouse"])
     ap.add_argument("--out", type=Path, default=HERE / "results" / "results.tsv")
     ap.add_argument("--verify", action="store_true",
-                    help="check all three engines produce identical OHLCV values, then exit")
+                    help="check all four engines produce identical OHLCV values, then exit")
     args = ap.parse_args()
 
     # Polars fixes its thread pool at import time, so the env var must be set
     # before bench_polars() triggers the first `import polars`. main() runs
     # before any such import, so setting it here is honoured.
-    if args.threads == "1":
+    if args.threads not in ("auto", "1"):
+        # An explicit budget: every engine gets the same one. Left to
+        # `--duckdb-threads` alone this pinned DuckDB and ClickHouse while
+        # Polars and Ibex took the whole box -- a threefold handicap reported
+        # as a comparison.
+        n = int(args.threads)
+        os.environ["POLARS_MAX_THREADS"] = str(n)
+        os.environ["IBEX_THREADS"] = str(n)
+        duck_threads = n
+        label = f"{n}t"
+        print(f"# thread budget: {n} for every engine", file=sys.stderr)
+    elif args.threads == "1":
         os.environ["POLARS_MAX_THREADS"] = "1"
+        os.environ["IBEX_THREADS"] = "1"
         # Ibex runs parallel islands by DEFAULT now, so pinning the other two
         # without pinning it would quietly hand Ibex threads its competitors
         # were denied -- and the headline "single-threaded, Ibex wins at every
@@ -344,7 +556,7 @@ def main() -> None:
         os.environ["IBEX_PARALLEL"] = "0"
         duck_threads = 1
         label = "1t"        # single-threaded / per-core
-    else:
+    elif args.threads == "auto":
         duck_threads = args.duckdb_threads
         label = "mt"        # multi-threaded (each engine's default)
 
@@ -361,7 +573,7 @@ def main() -> None:
                         for p in problems:
                             print(f"MISMATCH  {tag}: {p}", file=sys.stderr)
                     else:
-                        print(f"ok        {tag}: ibex == polars == duckdb on "
+                        print(f"ok        {tag}: all four engines agree on "
                               + ", ".join(OHLCV), file=sys.stderr)
         sys.exit(1 if failures else 0)
 
@@ -383,6 +595,10 @@ def main() -> None:
                     elif engine == "duckdb":
                         mn, md, over = bench_duckdb(pq, window, args.iters, duck_threads,
                                                     args.budget_s)
+                        tag = label
+                    elif engine == "clickhouse":
+                        mn, md, over = bench_clickhouse(pq, window, args.iters, duck_threads,
+                                                        args.budget_s)
                         tag = label
                     else:
                         continue

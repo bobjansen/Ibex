@@ -110,10 +110,57 @@ Why it exists: DuckDB's 50M-row sliding case ran ~35 min per execution, and at
 already three orders of magnitude off the pace, while a finished five-hour
 matrix sat unshipped on the box.
 
+## resample_run.py — finished bars
+
+`run.py` computes a **running** bar state: one output row per input tick.
+`resample_run.py` computes **finished bars**: one row per bucket per symbol. Two
+different workloads, and the second is far friendlier to the competition —
+Polars gets `group_by_dynamic().agg()`, DuckDB and ClickHouse a plain
+`GROUP BY`, instead of the per-row window formulations the running variant
+forces on them. It adds **ClickHouse** (embedded, via `chdb`) as a fourth
+engine.
+
+```
+uv run --project <ibex-root> benchmarking/window_ohlc/resample_run.py --verify
+uv run --project <ibex-root> benchmarking/window_ohlc/resample_run.py \
+    --rows 5000000 --symbols 3 20 100 --threads 8
+```
+
+**`--threads` applies to every engine.** It is a fairness invariant, not a
+tuning knob: the first version of this suite inherited `--duckdb-threads 8` for
+DuckDB and ClickHouse while Polars and Ibex took the whole box, i.e. it
+handicapped two engines threefold and called the output a comparison.
+
+Findings, 5M rows, i7-13700, matched threads (min ms):
+
+| threads | symbols | Ibex | Polars | DuckDB | ClickHouse |
+|---------|---------|------|--------|--------|------------|
+| 4       | 20      | **45.9** | 328.8 | 134.8 | 46.3 |
+| 4       | 100     | **59.3** | 459.6 | 143.3 | 60.7 |
+| 8       | 20      | 47.2 | 190.3 | 72.8 | **28.7** |
+| 8       | 100     | 60.5 | 249.1 | 81.1 | **38.6** |
+
+**Ibex's resample is serial.** 61.4 / 60.2 / 60.8 / 60.3 ms at 1 / 2 / 4 / 8
+threads — perfectly flat, while every other engine roughly halves from 4 to 8.
+So it wins at low thread counts and loses at high ones, and ClickHouse's lead is
+parallelism Ibex is not using rather than throughput it does not have. Ibex
+beats DuckDB and Polars *while single-threaded*.
+
 ## Notes / gotchas
 
-- The `data/` dir caches generated Parquet by `(rows, symbols)`; delete it to
-  regenerate. A 5M-row file is ~115 MB.
+- **Tick density is load-bearing, and the default is wrong for bars.**
+  `gen_ticks`' own `interval_ms` default is 1000.0 — one tick per SECOND across
+  the whole feed. At that rate a 5M-row/100-symbol file spans 57.8 days, a
+  10-second bar holds 1.1 ticks, and `resample` yields 4.76M groups from 5M
+  rows: an identity operation wearing the name of an aggregation. It inverted a
+  result — Ibex measured 3-7x SLOWER than everyone, and at a realistic density
+  is 2x faster on the same query. `run.py` therefore pins
+  `TICK_INTERVAL_MS = 1.0` and puts it in the cached filename, because a file
+  generated at another density is a different benchmark, not a reusable one.
+  Before trusting any bar number, check `distinct(bucket, key)` against the row
+  count; near 1 means you are measuring group-by cardinality.
+- The `data/` dir caches generated Parquet by `(rows, symbols, interval_ms)`;
+  delete it to regenerate. A 5M-row file is ~115 MB.
 - Ibex timing goes through a pty because the REPL only prints `time:` on a TTY
   (`:timing on`). File/pipe mode stays silent.
 - WSL2 / shared boxes drift; treat MIN as the signal and re-run if a row looks

@@ -110,6 +110,61 @@ Why it exists: DuckDB's 50M-row sliding case ran ~35 min per execution, and at
 already three orders of magnitude off the pace, while a finished five-hour
 matrix sat unshipped on the box.
 
+## Four engines, and what `--verify` actually proves
+
+Both suites run **Ibex, Polars, DuckDB and ClickHouse** (embedded, via `chdb`).
+`--threads N` applies to every engine in both: a fairness invariant, not a
+tuning knob.
+
+`--verify` does not compare with a tolerance. It recomputes each engine's
+trailing frame `[left, right]` under **that engine's own arithmetic and its own
+ordering key**, and accepts a divergence only where the covered row sets
+provably differ, or where tied timestamps make the answer ambiguous. Anything
+else is a hard failure and exits non-zero. Four real defects had to be fixed
+before all 12 configurations passed, three of them invisible on the old sparse
+data:
+
+- **Polars was doing different work.** The sliding query joined the rolling
+  result back on `(symbol, timestamp)`, which FANS OUT on tied timestamps --
+  200,018 rows from a 200,000-row input. Now a stable re-sort plus positional
+  stack; `rolling(group_by=)` does not emit in input order.
+- **Polars used a different window convention** -- `rolling` defaults to
+  `closed="right"`, i.e. `(t-10s, t]`, against Ibex's and DuckDB's
+  `[t-10s, t]`. Now `closed="both"`.
+- **DuckDB quantizes the frame edge to microseconds.** Its `INTERVAL`
+  arithmetic is microsecond-resolution: at `t = 10s + 1ns` it reports `n=3`,
+  including a tick 10s+1ns away, where Ibex correctly reports `n=2`. ClickHouse
+  cannot express a nanosecond RANGE offset at all (32-bit offset cap), so its
+  query orders by microseconds. Ibex and Polars carry nanoseconds -- a real
+  capability, paid for in the bandwidth of 8-byte timestamps touched on every
+  frame comparison.
+- **`ORDER BY timestamp` is ambiguous at ties**, which affects `aligned` too,
+  since `last(price)` over a prefix depends on how peers are sequenced.
+
+OPEN LANGUAGE QUESTION, flagged not settled: a SQL `RANGE` frame is
+peer-inclusive at both ends, so a later tick sharing the current timestamp is
+inside it. Ibex's trailing window is position-bounded and ends at the current
+row. SPEC defines the window on TIME (argues for admitting peers); a streaming
+engine cannot see the future (argues against). The clean fix for the tie
+ambiguity is a tie-breaking row id in the data, added to every `ORDER BY`.
+
+Window suite, 5M rows, matched threads, min ms -- Ibex wins 10 of 12:
+
+| thr | sym | flavour | Ibex | Polars | DuckDB | ClickHouse |
+|-----|-----|---------|------|--------|--------|------------|
+| 8   | 3   | aligned | **128** | 301 | 1706 | 767 |
+| 8   | 3   | sliding | 370 | **188** | 10786 | 2299 |
+| 8   | 20  | aligned | **139** | 356 | 977 | 761 |
+| 8   | 20  | sliding | **163** | 949 | 4324 | 1008 |
+| 8   | 100 | aligned | **113** | 436 | 989 | 888 |
+| 8   | 100 | sliding | **146** | 943 | 2285 | 874 |
+
+The one loss is **3 symbols, sliding**: Ibex is ~2x Polars and does not improve
+from 4 to 8 threads (374.6 -> 370.5ms). A sliding window has no bucket
+boundaries to cut at, so parallelism caps at the group count -- three symbols
+leave most cores idle. Aligned does not have this problem because
+`split_at_bucket_bounds` cuts within a group.
+
 ## resample_run.py — finished bars
 
 `run.py` computes a **running** bar state: one output row per input tick.

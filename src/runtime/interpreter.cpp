@@ -637,7 +637,25 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             for (const auto& field : update_node.fields()) {
                 keep_col(field.alias);
             }
-            return project_table(windowed.value(), keep);
+            // `project_table` runs `normalize_time_index`, which rewrites any
+            // ordering to "time index, ascending" whenever a time index
+            // survives. For a grouped window that claim is FALSE -- the rows
+            // are group-major -- and it is not merely cosmetic: sort elision
+            // reads `ordering`, so a downstream `order <time index>` would be
+            // skipped as a no-op and hand back unsorted rows. Restore what the
+            // window actually produced, exactly as `order_table` does after its
+            // own gather.
+            auto ordering = windowed->ordering;
+            auto projected = project_table(windowed.value(), keep);
+            if (projected.has_value() && ordering.has_value()) {
+                const bool keeps_all = std::ranges::all_of(*ordering, [&](const ir::OrderKey& key) {
+                    return projected->find(key.name) != nullptr;
+                });
+                if (keeps_all) {
+                    projected->ordering = std::move(ordering);
+                }
+            }
+            return projected;
         }
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);

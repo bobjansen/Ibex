@@ -2863,13 +2863,14 @@ TEST_CASE("grouped windowed rolling carries per-group input validity", "[rolling
     const auto* entry = result->find_entry("m");
     REQUIRE(entry != nullptr);
     REQUIRE(entry->validity.has_value());
+    // Group-major output: A's two rows, then B's two.
     CHECK(runtime::is_null(*entry, 0));        // A's first row: window {NULL} -> NULL
-    CHECK(runtime::is_null(*entry, 1));        // B's first row: window {NULL} -> NULL
-    CHECK_FALSE(runtime::is_null(*entry, 2));  // A: {NULL, 30} -> 30
+    CHECK_FALSE(runtime::is_null(*entry, 1));  // A: {NULL, 30} -> 30
+    CHECK(runtime::is_null(*entry, 2));        // B's first row: window {NULL} -> NULL
     CHECK_FALSE(runtime::is_null(*entry, 3));  // B: {NULL, 40} -> 40
     const auto* m = std::get_if<Column<double>>(result->find("m"));
     REQUIRE(m != nullptr);
-    CHECK((*m)[2] == Catch::Approx(30.0));
+    CHECK((*m)[1] == Catch::Approx(30.0));
     CHECK((*m)[3] == Catch::Approx(40.0));
 }
 
@@ -3362,14 +3363,68 @@ TEST_CASE("window + select + by keeps windows within each group") {
     REQUIRE(result->find("symbol") != nullptr);
     const auto* open = std::get_if<Column<double>>(result->find("open"));
     const auto* close = std::get_if<Column<double>>(result->find("close"));
+    const auto* symbol_col = std::get_if<Column<std::string>>(result->find("symbol"));
     REQUIRE(open != nullptr);
     REQUIRE(close != nullptr);
-    // row 2 is symbol A: open=10 (first A in window), close=20 (current)
-    REQUIRE((*open)[2] == 10.0);
-    REQUIRE((*close)[2] == 20.0);
-    // row 3 is symbol B: open=99, close=88 — the intervening A rows are excluded
+    REQUIRE(symbol_col != nullptr);
+    // Output is GROUP-MAJOR (see grouped_windowed_update_table): A's rows then
+    // B's, each time-ascending. So the rows are A@0, A@2, B@1, B@3.
+    REQUIRE((*symbol_col)[0] == "A");
+    REQUIRE((*symbol_col)[1] == "A");
+    REQUIRE((*symbol_col)[2] == "B");
+    REQUIRE((*symbol_col)[3] == "B");
+    // A's second row: open=10 (first A in window), close=20 (current)
+    REQUIRE((*open)[1] == 10.0);
+    REQUIRE((*close)[1] == 20.0);
+    // B's second row: open=99, close=88 — the intervening A rows are excluded
     REQUIRE((*open)[3] == 99.0);
     REQUIRE((*close)[3] == 88.0);
+}
+
+TEST_CASE("grouped window emits group-major rows and records that ordering") {
+    // The contract, asserted directly rather than inferred from index arithmetic
+    // elsewhere: a grouped window returns all of one group's rows, then the
+    // next, each group still time-ascending, and says so in `ordering`. It is
+    // NOT globally time-ascending -- SPEC has a grouped update drop the ordering
+    // constraint, and this operator trades the old time order for one strided
+    // pass instead of two.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "B"});
+    table.add_column("price", Column<double>{10.0, 99.0, 20.0, 88.0});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[select { close = last(price) }, by symbol, window 2ns];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 4);
+
+    const auto* sym = std::get_if<Column<std::string>>(result->find("symbol"));
+    const auto* ts = std::get_if<Column<Timestamp>>(result->find("ts"));
+    REQUIRE(sym != nullptr);
+    REQUIRE(ts != nullptr);
+
+    // Group-major: each symbol's rows are contiguous.
+    CHECK((*sym)[0] == "A");
+    CHECK((*sym)[1] == "A");
+    CHECK((*sym)[2] == "B");
+    CHECK((*sym)[3] == "B");
+    // Time-ascending WITHIN each group, which is what keeps this a well-formed
+    // TimeFrame and a downstream grouped window correct.
+    CHECK((*ts)[0].nanos < (*ts)[1].nanos);
+    CHECK((*ts)[2].nanos < (*ts)[3].nanos);
+    // But not globally: row 1 (A@2) is later than row 2 (B@1).
+    CHECK((*ts)[1].nanos > (*ts)[2].nanos);
+
+    // And the metadata says so, rather than silently claiming time order.
+    REQUIRE(result->ordering.has_value());
+    REQUIRE(result->ordering->size() == 2);
+    CHECK((*result->ordering)[0].name == "symbol");
+    CHECK((*result->ordering)[1].name == "ts");
+    CHECK(result->time_index.has_value());
 }
 
 TEST_CASE("rolling_sum preserves other columns and time_index") {
@@ -11002,12 +11057,16 @@ TEST_CASE("aligned grouped window splits a group at bucket boundaries",
     }
     // Row 357 is the last row of that bucket, so its running high/low equal the
     // whole bar's.
+    // Output is GROUP-MAJOR: all of S0, then S1, then S2, each time-ascending.
+    // Input row r holds symbol r % kGroups and is that symbol's (r / kGroups)th
+    // row, so it lands here.
+    auto out_row = [](std::size_t r) { return ((r % kGroups) * kPerGroup) + (r / kGroups); };
     const auto* high = std::get_if<Column<double>>(parallel.find("high"));
     const auto* low = std::get_if<Column<double>>(parallel.find("low"));
     REQUIRE(high != nullptr);
     REQUIRE(low != nullptr);
-    CHECK((*high)[357] == want_high);
-    CHECK((*low)[357] == want_low);
+    CHECK((*high)[out_row(357)] == want_high);
+    CHECK((*low)[out_row(357)] == want_low);
 }
 
 // `lag` reads the previous row whatever bucket it is in, so a group carrying it
@@ -11063,9 +11122,14 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
     const auto* val_col = std::get_if<Column<double>>(table.find("val"));
     REQUIRE(p != nullptr);
     REQUIRE(val_col != nullptr);
+    // Output is GROUP-MAJOR: all of S0, then S1, then S2, each time-ascending.
+    // Input row r holds symbol r % kGroups and is that symbol's (r / kGroups)th
+    // row, so it lands here.
+    auto out_row = [](std::size_t r) { return ((r % kGroups) * kPerGroup) + (r / kGroups); };
     const auto& entry = *parallel.find_entry("p");
     for (std::size_t r = kGroups; r < kRows; ++r) {
-        REQUIRE((!entry.validity.has_value() || (*entry.validity)[r]));
-        REQUIRE((*p)[r] == (*val_col)[r - kGroups]);
+        const std::size_t o = out_row(r);
+        REQUIRE((!entry.validity.has_value() || (*entry.validity)[o]));
+        REQUIRE((*p)[o] == (*val_col)[r - kGroups]);
     }
 }

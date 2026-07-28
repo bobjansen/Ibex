@@ -720,6 +720,17 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
 
 }  // namespace
 
+auto permute_table_rows(const Table& input, const std::vector<std::size_t>& perm,
+                        std::vector<ir::OrderKey> ordering, const ExecutionContext& exec) -> Table {
+    // `nullptr` ordering, then overwritten: the gather's own finalisation runs
+    // `normalize_time_index`, which resets `ordering` to time-only. `order_table`
+    // restores the true multi-key order the same way, after the fact.
+    Table output = gather_rows_parallel(input, perm, nullptr, exec);
+    output.time_index = input.time_index;
+    output.ordering = std::move(ordering);
+    return output;
+}
+
 auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
                  const ExecutionContext& exec) -> std::expected<Table, std::string> {
     auto resolved_keys = ordering_keys_for_table(input, keys);

@@ -1295,7 +1295,27 @@ TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e
 
     // Create the SPSC-backed source.  Capacity of 8 is ample for this test.
     auto buf = std::make_shared<runtime::StreamBuffered>(8);
-    registry.register_table("tick_src", buf->make_source_fn());
+    // Wait for the event loop's next source poll before starting the delay for
+    // tick 2.  That poll cannot happen until tick 1 has been added to the open
+    // bucket.  Without this handshake, a slow test thread can let the producer
+    // enqueue both ticks before the consumer handles the first one, defeating
+    // the wall-clock-flush scenario this test is intended to exercise.
+    auto source_fn = buf->make_source_fn();
+    std::atomic<bool> first_tick_returned{false};
+    std::atomic<bool> consumer_ready_for_second_tick{false};
+    registry.register_table(
+        "tick_src", [source_fn = std::move(source_fn), &first_tick_returned,
+                     &consumer_ready_for_second_tick](const runtime::ExternArgs& args) mutable {
+            if (first_tick_returned.load(std::memory_order_acquire)) {
+                consumer_ready_for_second_tick.store(true, std::memory_order_release);
+            }
+            auto result = source_fn(args);
+            if (result && std::holds_alternative<runtime::Table>(result.value()) &&
+                std::get<runtime::Table>(result.value()).rows() > 0) {
+                first_tick_returned.store(true, std::memory_order_release);
+            }
+            return result;
+        });
 
     registry.register_scalar_table_consumer(
         "tick_sink", runtime::ScalarKind::Int,
@@ -1305,14 +1325,18 @@ TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e
             return runtime::ExternValue{std::int64_t{0}};
         });
 
-    // Producer: write tick 1, sleep past the 20 ms bucket, write tick 2, close.
-    std::thread producer([&buf] {
+    // Producer: write tick 1, wait until the consumer has processed it, then
+    // sleep past the 20 ms bucket before writing tick 2.
+    std::thread producer([&buf, &consumer_ready_for_second_tick] {
         runtime::Table t1;
         t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
         t1.add_column("price", Column<double>{200.0});
         t1.time_index = "ts";
         buf->write(t1);
 
+        while (!consumer_ready_for_second_tick.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
         runtime::Table t2;
@@ -2700,11 +2724,14 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         const auto* col = std::get_if<Column<double>>(open);
         REQUIRE(col != nullptr);
         REQUIRE(col->size() == 6);
+        // Group-major output: the three "A" rows (input 0, 2, 4), then the
+        // three null-symbol rows (input 1, 3, 5). Every row's `open` is its own
+        // group's first price, so 1.0 for A and 2.0 for the null group.
         CHECK((*col)[0] == 1.0);
-        CHECK((*col)[1] == 2.0);
+        CHECK((*col)[1] == 1.0);
         CHECK((*col)[2] == 1.0);
         CHECK((*col)[3] == 2.0);
-        CHECK((*col)[4] == 1.0);
+        CHECK((*col)[4] == 2.0);
         CHECK((*col)[5] == 2.0);
     }
 

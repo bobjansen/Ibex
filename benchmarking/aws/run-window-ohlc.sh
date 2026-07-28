@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # run-window-ohlc.sh — run the window-OHLC suite on one clean EC2 benchmark box.
 #
-# Rolling open/close bars per time window per symbol, across Ibex, Polars and
-# DuckDB on identical Ibex-generated Parquet. Two sweeps: symbol count at a
-# fixed row count, and row count at a fixed symbol count. Every engine is
-# pinned to the same cores with the same thread budget.
+# Two workloads across FOUR engines -- Ibex, Polars, DuckDB and ClickHouse
+# (embedded, via chdb) -- on identical Ibex-generated Parquet:
 #
-# The artifact is a tarball of per-sweep TSVs plus a versions.txt. A partial
-# tarball is refreshed after every sweep under a separate key, so a run that
-# stalls or is interrupted still yields every sweep that finished.
+#   window   (run.py)          running bar state, one output row per input tick
+#   resample (resample_run.py) finished bars, one row per bucket per symbol
+#
+# Two sweeps each: symbol count at a fixed row count, and row count at a fixed
+# symbol count. Every engine gets the SAME thread budget (`--threads $n`, not
+# `--duckdb-threads`), and the whole process is pinned to the same cores.
+#
+# The run verifies that all four engines agree at 1M rows BEFORE timing
+# anything -- four numbers for four different answers is worth nothing. A
+# verify failure is loud but non-fatal, so a stalled comparison still yields
+# data with the warning attached.
+#
+# The artifact is a tarball of per-sweep TSVs plus a versions.txt recording
+# engine versions AND the tick interval (which is part of the result: at
+# gen_ticks' 1000ms default a 10s bar holds ~1 tick and the bar suites measure
+# group-by cardinality rather than aggregation). A partial tarball is refreshed
+# after every sweep under a separate key, so a run that stalls or is
+# interrupted still yields every sweep that finished.
 #
 # --budget-s (default 300) caps one execution of one cell; slower cells stop
 # after a single execution and are recorded as over_budget.

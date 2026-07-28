@@ -780,7 +780,13 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
                 http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
             echo "nproc=$(nproc)"
             echo "cores_swept=${IBEX_OHLC_CORES:-}"
-            uv run --project /ibex python3 -c 'import duckdb, polars; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}")'
+            echo "engines=ibex polars duckdb clickhouse"
+            # The tick spacing IS part of the result: at gen_ticks' own 1000ms
+            # default a 10s bar holds ~1 tick and the bar suites measure
+            # group-by cardinality instead of aggregation.
+            echo "tick_interval_ms=$(uv run --project /ibex python3 -c \
+                'import importlib.util as u; s=u.spec_from_file_location("r","/ibex/benchmarking/window_ohlc/run.py"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.TICK_INTERVAL_MS)' 2>/dev/null || echo unknown)"
+            uv run --project /ibex python3 -c 'import duckdb, polars, chdb; print(f"duckdb={duckdb.__version__}"); print(f"polars={polars.__version__}"); print(f"chdb={chdb.__version__}")'
         } > "$OHLC_OUT/versions.txt" 2>&1 || true
         tar -C "$OHLC_DIR" -czf "$ARTIFACT" results
         aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
@@ -801,20 +807,55 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
     OHLC_SWEEP_SYMBOLS="${IBEX_OHLC_SWEEP_SYMBOLS:-3}"
 
     # $1 = cores, $2 = output basename, rest = run.py arguments.
+    # `--threads "$n"` gives EVERY engine the same budget (Polars, Ibex, DuckDB
+    # and ClickHouse alike) rather than pinning only some of them; the taskset
+    # then bounds the whole process. Passing `--threads auto` with
+    # `--duckdb-threads` was the shape that once handicapped two engines
+    # threefold and reported it as a comparison.
     run_ohlc() {
         local n="$1" name="$2"
         shift 2
         echo "=== window-ohlc: $name on ${n} core(s)"
-        POLARS_MAX_THREADS="$n" IBEX_THREADS="$n" \
-            taskset -c "0-$((n - 1))" \
+        taskset -c "0-$((n - 1))" \
             uv run --project /ibex python3 "$OHLC_DIR/run.py" \
-                --engines ibex polars duckdb \
-                --iters "$OHLC_ITERS" --duckdb-threads "$n" --threads auto \
+                --engines ibex polars duckdb clickhouse \
+                --iters "$OHLC_ITERS" --threads "$n" \
                 --window aligned sliding \
                 --budget-s "${IBEX_OHLC_BUDGET_S:-300}" \
                 --out "$OHLC_OUT/${name}.tsv" "$@"
         push_partial_ohlc
     }
+
+    # The finished-bars companion: one row per bucket per symbol, where the
+    # competition gets group_by_dynamic / plain GROUP BY instead of per-row
+    # window functions. A narrow gap published beside a wide one is what makes
+    # the wide one believable.
+    run_resample() {
+        local n="$1" name="$2"
+        shift 2
+        echo "=== resample: $name on ${n} core(s)"
+        taskset -c "0-$((n - 1))" \
+            uv run --project /ibex python3 "$OHLC_DIR/resample_run.py" \
+                --engines ibex polars duckdb clickhouse \
+                --iters "$OHLC_ITERS" --threads "$n" \
+                --budget-s "${IBEX_OHLC_BUDGET_S:-300}" \
+                --out "$OHLC_OUT/${name}.tsv" "$@"
+        push_partial_ohlc
+    }
+
+    # Prove the four engines agree before spending hours timing them. A suite
+    # that reports four numbers for four different answers is worth nothing,
+    # and this is cheap at 1M rows.
+    echo "=== verifying all engines agree (1M rows)"
+    taskset -c "0-$((${OHLC_CORES[0]} - 1))" \
+        uv run --project /ibex python3 "$OHLC_DIR/run.py" \
+            --rows 1000000 --symbols "${OHLC_SYMBOLS[@]}" \
+            --window aligned sliding --verify \
+        || echo "!!! VERIFY FAILED -- timings below are not a comparison"
+    taskset -c "0-$((${OHLC_CORES[0]} - 1))" \
+        uv run --project /ibex python3 "$OHLC_DIR/resample_run.py" \
+            --rows 1000000 --symbols "${OHLC_SYMBOLS[@]}" --verify \
+        || echo "!!! RESAMPLE VERIFY FAILED -- timings below are not a comparison"
 
     # Generated once per (rows, symbols) pair and reused by every core count,
     # so the sweeps below compare compute rather than data.
@@ -822,6 +863,10 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
         run_ohlc "$n" "symbols_c${n}" \
             --rows "$OHLC_SWEEP_ROWS" --symbols "${OHLC_SYMBOLS[@]}"
         run_ohlc "$n" "rows_c${n}" \
+            --rows "${OHLC_ROWS[@]}" --symbols "$OHLC_SWEEP_SYMBOLS"
+        run_resample "$n" "resample_symbols_c${n}" \
+            --rows "$OHLC_SWEEP_ROWS" --symbols "${OHLC_SYMBOLS[@]}"
+        run_resample "$n" "resample_rows_c${n}" \
             --rows "${OHLC_ROWS[@]}" --symbols "$OHLC_SWEEP_SYMBOLS"
     done
     exit 0

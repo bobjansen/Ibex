@@ -40,20 +40,36 @@ DATA_DIR = HERE / "data"
 
 # ── data generation (Ibex data_gen -> shared Parquet) ────────────────────────
 
-def gen_data(rows: int, nsym: int) -> Path:
+# Mean gap between consecutive ticks, in milliseconds, across ALL symbols.
+#
+# Pinned rather than left to `gen_ticks`'s own default, which is 1000.0 -- one
+# tick per SECOND for the whole feed. At that rate a 5M-row/100-symbol file
+# spans 57.8 days, a 10-second bar holds 1.1 ticks, and `resample` produces
+# 4.76M groups from 5M rows: an identity operation wearing the name of an
+# aggregation. Real feeds are three to four orders of magnitude denser.
+#
+# At 1ms, 5M ticks span ~83 minutes, and a 10-second bar holds ~100 ticks at
+# 100 symbols or ~3300 at 3 -- bars with contents, which is what the suite
+# claims to measure. The value is in the filename because a cached file
+# generated at another density is a DIFFERENT benchmark, not a reusable one.
+TICK_INTERVAL_MS = 1.0
+
+
+def gen_data(rows: int, nsym: int, interval_ms: float = TICK_INTERVAL_MS) -> Path:
     """Generate (or reuse) a Parquet tick file with `rows` rows and `nsym`
     symbols. Deterministic via seed_rng(42)."""
     DATA_DIR.mkdir(exist_ok=True)
-    path = DATA_DIR / f"ticks_r{rows}_s{nsym}.parquet"
+    tag = f"r{rows}_s{nsym}_i{interval_ms:g}"
+    path = DATA_DIR / f"ticks_{tag}.parquet"
     if path.exists():
         return path
     symbols = ",".join(f"S{i}" for i in range(nsym))
-    script = HERE / "data" / f"_gen_r{rows}_s{nsym}.ibex"
+    script = HERE / "data" / f"_gen_{tag}.ibex"
     script.write_text(
         'import data_gen;\n'
         'extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";\n'
         'seed_rng(42);\n'
-        f'let t = gen_ticks({rows}, "{symbols}");\n'
+        f'let t = gen_ticks({rows}, "{symbols}", 100.0, 0.5, {interval_ms}, 0);\n'
         f'write_parquet(t, "{path}");\n'
     )
     subprocess.run([str(IBEX_BIN), str(script)], check=True,

@@ -1157,6 +1157,23 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
 
 [[nodiscard]] auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
                                const ExecutionContext& exec) -> std::expected<Table, std::string>;
+
+/// Rewrite every column of `input` through `perm` -- output row `i` takes input
+/// row `perm[i]` -- and record `ordering` on the result.
+///
+/// This is the second half of `order_table` without the first: the sort exists
+/// to PRODUCE a permutation, and a caller that already holds one (a grouped
+/// operator's CSR bucketing, say) should not pay a radix pass to rediscover it.
+/// The movement itself is the expensive part and is threaded by column x row
+/// range; a hand-rolled serial gather in its place measured 0.85x, i.e. slower
+/// than not permuting at all.
+///
+/// `ordering` is asserted, not derived: `perm` is opaque here, so the caller
+/// states what order it puts the rows in. Getting it wrong is invisible in the
+/// values and wrong in the metadata.
+[[nodiscard]] auto permute_table_rows(const Table& input, const std::vector<std::size_t>& perm,
+                                      std::vector<ir::OrderKey> ordering,
+                                      const ExecutionContext& exec) -> Table;
 [[nodiscard]] auto head_table(const Table& input, std::size_t count,
                               const std::vector<ir::ColumnRef>& group_by)
     -> std::expected<Table, std::string>;

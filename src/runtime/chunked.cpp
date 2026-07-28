@@ -7554,9 +7554,22 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             for (const auto& field : update_node.fields()) {
                 keep_col(field.alias);
             }
+            // `project_table` runs `normalize_time_index`, which rewrites the
+            // ordering to "time index ascending" whenever a time index
+            // survives. For a grouped window that is FALSE -- the rows are
+            // group-major -- and sort elision reads `ordering`, so a downstream
+            // `order <time index>` would be dropped as a no-op and hand back
+            // unsorted rows. Restore what the window actually produced.
+            auto window_ordering = result->ordering;
             auto projected = project_table(result.value(), keep);
             if (!projected.has_value()) {
                 return std::unexpected(std::move(projected.error()));
+            }
+            if (window_ordering.has_value() &&
+                std::ranges::all_of(*window_ordering, [&](const ir::OrderKey& key) {
+                    return projected->find(key.name) != nullptr;
+                })) {
+                projected->ordering = std::move(window_ordering);
             }
             result = std::move(projected);
         }

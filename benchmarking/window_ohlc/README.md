@@ -131,20 +131,31 @@ tuning knob: the first version of this suite inherited `--duckdb-threads 8` for
 DuckDB and ClickHouse while Polars and Ibex took the whole box, i.e. it
 handicapped two engines threefold and called the output a comparison.
 
-Findings, 5M rows, i7-13700, matched threads (min ms):
+Findings, 5M rows, i7-13700, ~100 ticks/bar, matched threads (min ms):
 
 | threads | symbols | Ibex | Polars | DuckDB | ClickHouse |
 |---------|---------|------|--------|--------|------------|
-| 4       | 20      | **45.9** | 328.8 | 134.8 | 46.3 |
-| 4       | 100     | **59.3** | 459.6 | 143.3 | 60.7 |
-| 8       | 20      | 47.2 | 190.3 | 72.8 | **28.7** |
-| 8       | 100     | 60.5 | 249.1 | 81.1 | **38.6** |
+| 4       | 3       | **29.7** | 178.0 | 129.4 | 44.5 |
+| 4       | 20      | **27.7** | 328.2 | 134.6 | 47.0 |
+| 4       | 100     | **28.8** | 471.5 | 144.2 | 58.7 |
+| 8       | 3       | 30.7 | 131.9 | 72.5 | **27.6** |
+| 8       | 20      | **28.2** | 201.7 | 78.3 | 31.1 |
+| 8       | 100     | **29.0** | 261.4 | 78.0 | 42.1 |
 
-**Ibex's resample is serial.** 61.4 / 60.2 / 60.8 / 60.3 ms at 1 / 2 / 4 / 8
-threads — perfectly flat, while every other engine roughly halves from 4 to 8.
-So it wins at low thread counts and loses at high ones, and ClickHouse's lead is
-parallelism Ibex is not using rather than throughput it does not have. Ibex
-beats DuckDB and Polars *while single-threaded*.
+**Ibex's resample is still SERIAL** -- flat across thread budgets, where every
+other engine roughly halves from 4 to 8. It wins 5 of 6 cells anyway, on one
+core against their four or eight; ClickHouse holds only 3-symbol/8-thread, by
+3ms. The parallel work is therefore unspent headroom, not a fix for a deficit:
+bar boundaries are contiguous row ranges, so a range split gives each worker
+whole bars, no partial aggregates, no merge, and a bitwise-identical result.
+
+Getting there took the grouped vectorised path (`resample_table`, window.cpp),
+which took the same query from 58.9ms to 28.5ms single-threaded. It skips the
+generic path's `_bucket` column and composite hashing, factorizes the group key
+once, and accumulates into a dense per-bucket array -- no `AggSlot`, whose
+move/copy/growth alone was ~15% of profile. `first`/`last` become gathers over
+the ~50k output rows instead of scans over 5M input rows, so an OHLC query makes
+three passes over the data rather than five (5.8ms -> 1.4ms per aggregate).
 
 ## Notes / gotchas
 

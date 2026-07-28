@@ -240,7 +240,7 @@ def main() -> None:
         sys.exit(1 if failures else 0)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    out_rows = ["engine\trows\tsymbols\tmin_ms\tmedian_ms\tstatus"]
+    out_rows = ["engine\tthreads\trows\tsymbols\tmin_ms\tmedian_ms\tstatus"]
     print(f"{'engine':11} {'rows':>9} {'sym':>4} {'min_ms':>9} {'med_ms':>9} status",
           file=sys.stderr)
     for rows in args.rows:
@@ -251,7 +251,7 @@ def main() -> None:
                 status = "over_budget" if over else "ok"
                 print(f"{eng:11} {rows:>9} {nsym:>4} {mn:9.1f} {md:9.1f} {status}",
                       file=sys.stderr)
-                out_rows.append(f"{eng}\t{rows}\t{nsym}\t{mn:.3f}\t{md:.3f}\t{status}")
+                out_rows.append(f"{eng}\t{THREADS}t\t{rows}\t{nsym}\t{mn:.3f}\t{md:.3f}\t{status}")
     args.out.write_text("\n".join(out_rows) + "\n")
     print(f"\nwrote {args.out}", file=sys.stderr)
 

@@ -63,12 +63,21 @@ void run_task(Task& task) {
 
 }  // namespace
 
+// Apple's libc++ (macOS clang-werror leg) doesn't ship std::jthread yet.
+// jthread buys nothing here beyond auto-join on destruction (no stop_token
+// use), so std::thread with an explicit join in ~WorkerPool is equivalent.
+#ifdef __cpp_lib_jthread
+using PoolThread = std::jthread;
+#else
+using PoolThread = std::thread;
+#endif
+
 struct WorkerPool::Impl {
     std::mutex mutex;
     std::condition_variable work;
     std::deque<Task> queue;
     bool stopping = false;
-    std::vector<std::jthread> threads;
+    std::vector<PoolThread> threads;
 };
 
 // Declared rather than included: `invariant_violation` lives in the
@@ -123,7 +132,15 @@ WorkerPool::~WorkerPool() {
         impl_->stopping = true;
     }
     impl_->work.notify_all();
+#ifdef __cpp_lib_jthread
     // ~jthread joins; queued work drains first so no batch is left unsettled.
+#else
+    for (auto& thread : impl_->threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+#endif
 }
 
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {

@@ -157,6 +157,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Full history so the diff-gate step below can resolve a merge-base
+          # against the PR's target branch (or the previous commit on push).
+          fetch-depth: 0
 
       - name: Install tools
         run: |
@@ -178,15 +182,59 @@ jobs:
             -DCMAKE_C_COMPILER=$CC \
             -DCMAKE_CXX_COMPILER=$CXX
 
-      - name: Run clang-tidy
+      - name: Run clang-tidy (repo-wide, advisory)
         run: |
           if command -v clang-tidy-20 >/dev/null 2>&1; then TIDY=clang-tidy-20; else TIDY=clang-tidy-18; fi
           # Run one clang-tidy process per core. Analyze only our .cpp TUs;
           # headers are covered transitively via the TUs that include them, so
           # tidying *.hpp standalone is redundant (and was a big chunk of the
           # runtime). -n1 so each file is its own job for -P to parallelize.
+          #
+          # Non-gating on purpose: .clang-tidy opts into whole check families
+          # (bugprone-*, cppcoreguidelines-*, misc-*, modernize-*, readability-*)
+          # and the repo carries a five-figure pre-existing warning count under
+          # that net. This step is here for visibility/trend-watching only —
+          # the step below is what actually gates the build.
           find src -name '*.cpp' -print0 | \
-            xargs -0 -P "$(nproc)" -n1 "$TIDY" -p build
+            xargs -0 -P "$(nproc)" -n1 "$TIDY" -p build || true
+
+      - name: Determine diff base
+        id: diff_base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="HEAD~1"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Run clang-tidy on changed lines (gating)
+        run: |
+          if command -v clang-tidy-20 >/dev/null 2>&1; then VER=20; else VER=18; fi
+          TIDY="clang-tidy-$VER"
+          DIFF_SCRIPT="$(command -v "clang-tidy-diff-$VER.py" || true)"
+          if [ -z "$DIFF_SCRIPT" ]; then
+            DIFF_SCRIPT="$(find /usr -iname 'clang-tidy-diff*.py' 2>/dev/null | head -1)"
+          fi
+          # Gate on the DIFF rather than the whole tree: the pre-existing
+          # backlog (see the advisory step above) makes a repo-wide
+          # --warnings-as-errors impractical right now, but new/changed lines
+          # should never add to it. Restricted to src/*.cpp — same scope as
+          # the advisory step, and clang-tidy-diff needs a compile command for
+          # whatever it tidies, which compile_commands.json only has for TUs.
+          #
+          # misc-include-cleaner is excluded here (but still runs, non-gating,
+          # in the advisory step above): it was the single biggest source of
+          # warnings in the repo-wide sweep, and for a brand-new file every
+          # line is "new" — so it would fail the gate on IWYU-style pedantry
+          # rather than an actual bug.
+          git diff -U0 "${{ steps.diff_base.outputs.base }}"...HEAD -- src \
+            | python3 "$DIFF_SCRIPT" -p1 -path build -clang-tidy-binary "$TIDY" \
+                -iregex '.*\.cpp$' -checks='-misc-include-cleaner' \
+                -warnings-as-errors='*' -quiet
 
   format-check:
     runs-on: ubuntu-24.04

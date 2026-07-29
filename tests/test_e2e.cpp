@@ -2157,13 +2157,13 @@ auto make_wide_island_table(std::size_t rows) -> runtime::TableRegistry {
 TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e][parallel]") {
     auto tables = make_wide_island_table(1000);
 
+    // A select/rename above a filter rides in the filter's island, which is why
+    // Project and Rename stay ParallelMap even though a chain of only those is
+    // refused.
     const char* cases[] = {
         "t[filter price > 350];",
         "t[filter price > 350, select { price, qty }];",
         "t[filter qty > 2, select { price, notional = price * qty }];",
-        // A select/rename above a filter rides in the filter's island, which is
-        // why Project and Rename stay ParallelMap even though a chain of only
-        // those is refused.
         "t[filter price > 150][rename px = price];",
         "t[filter price > 150][select { price, qty }];",
         "t[filter price > 995];",  // very selective: most morsels are empty

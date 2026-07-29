@@ -5,6 +5,7 @@
 // really waits, an escaping exception is reported deterministically rather than
 // terminating the process, and a Batch never outlives its bodies.
 
+#include <ibex/runtime/env.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -150,9 +151,9 @@ TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
         }
         ~EnvGuard() {
             if (saved.has_value()) {
-                ::setenv("IBEX_PARALLEL", saved->c_str(), 1);
+                runtime::set_env("IBEX_PARALLEL", *saved);
             } else {
-                ::unsetenv("IBEX_PARALLEL");
+                runtime::unset_env("IBEX_PARALLEL");
             }
         }
         EnvGuard(const EnvGuard&) = delete;
@@ -162,13 +163,13 @@ TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
     } const guard;
 
     SECTION("unset leaves the caller's choice alone") {
-        ::unsetenv("IBEX_PARALLEL");
+        runtime::unset_env("IBEX_PARALLEL");
         CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
     }
 
     SECTION("true-ish values ask for on") {
         for (const char* value : {"1", "on", "true", "yes"}) {
-            ::setenv("IBEX_PARALLEL", value, 1);
+            runtime::set_env("IBEX_PARALLEL", value);
             CAPTURE(value);
             REQUIRE(runtime::parallel_enabled_from_env().has_value());
             CHECK(runtime::parallel_enabled_from_env().value());
@@ -177,7 +178,7 @@ TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
 
     SECTION("false-ish values ask for off") {
         for (const char* value : {"0", "off", "false", "no"}) {
-            ::setenv("IBEX_PARALLEL", value, 1);
+            runtime::set_env("IBEX_PARALLEL", value);
             CAPTURE(value);
             REQUIRE(runtime::parallel_enabled_from_env().has_value());
             CHECK_FALSE(runtime::parallel_enabled_from_env().value());
@@ -185,7 +186,7 @@ TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
     }
 
     SECTION("an unrecognized value leaves the choice alone rather than guessing") {
-        ::setenv("IBEX_PARALLEL", "maybe", 1);
+        runtime::set_env("IBEX_PARALLEL", "maybe");
         CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
     }
 }

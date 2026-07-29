@@ -189,7 +189,16 @@ inline void or_bits_into_word(std::uint64_t* words, std::size_t index, std::uint
         return;
     }
     if (shared.contains(index)) {
+#ifdef __cpp_lib_atomic_ref
         std::atomic_ref<std::uint64_t>(words[index]).fetch_or(bits, std::memory_order_relaxed);
+#else
+        // Apple's libc++ (macOS clang-werror leg) doesn't ship std::atomic_ref yet.
+        // std::atomic<uint64_t> is a lock-free integral specialization and therefore
+        // layout-compatible with a plain uint64_t, so a reinterpret_cast view gives
+        // the same fetch-OR without needing atomic_ref.
+        reinterpret_cast<std::atomic<std::uint64_t>*>(&words[index])
+            ->fetch_or(bits, std::memory_order_relaxed);
+#endif
     } else {
         words[index] |= bits;
     }

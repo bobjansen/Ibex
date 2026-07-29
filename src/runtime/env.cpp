@@ -1,0 +1,23 @@
+#include <ibex/runtime/env.hpp>
+
+#include <cstdlib>
+
+namespace ibex::runtime {
+
+void set_env(const std::string& name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name.c_str(), value.c_str());
+#else
+    ::setenv(name.c_str(), value.c_str(), 1);  // NOLINT(concurrency-mt-unsafe)
+#endif
+}
+
+void unset_env(const std::string& name) {
+#ifdef _WIN32
+    _putenv_s(name.c_str(), "");
+#else
+    ::unsetenv(name.c_str());  // NOLINT(concurrency-mt-unsafe)
+#endif
+}
+
+}  // namespace ibex::runtime

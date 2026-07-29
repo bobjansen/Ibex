@@ -1,7 +1,7 @@
 # Ibex
 
-A statically typed DSL for columnar DataFrame manipulation, with a fast
-interpreter and transpiliable to C++23.
+A statically typed DSL for columnar DataFrame and time-series manipulation,
+with a fast parallel interpreter and transpilation to C++23.
 
 See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
 information.
@@ -14,6 +14,10 @@ Notable language features:
 - `DataFrame<{...}>` contracts for minimum required columns on table arguments
 - grouped `rank(...)` inside `update`, including `rank(order { ... })` for
   multi-key tie-breaking
+- `TimeFrame`s with rolling, aligned, and resampled time windows
+- null-aware expressions, reshaping, and inner/outer/semi/anti/as-of/theta joins
+- parallel execution for sufficiently large eligible filters, updates, sorts,
+  and grouped window operations (set `IBEX_PARALLEL=0` to disable it)
 
 ```
 import "csv";
@@ -725,7 +729,7 @@ polars-st      112      3.006      26.84      0.98x
 pandas          35      3.034      86.70      3.17x
 ```
 
-## TimeFrame Benchmark
+## TimeFrame Benchmark (historical single-thread baseline)
 
 Rolling-window operations on 1 M rows (1-second uniform spacing).
 Ibex release build (`-O2 -march=native`), Clang 20, WSL2.
@@ -743,17 +747,23 @@ Notes:
 - Ibex uses variable-width time-based rolling windows (two-pointer O(n)); Polars
   uses the same semantics (`rolling_sum_by`); data.table uses fixed-width row
   windows (`frollsum`/`frollmean`, n=60/300 rows — equivalent for uniform 1s data).
-- Polars and data.table run multi-threaded on all cores; Ibex is single-threaded.
+- This snapshot predates Ibex's parallel runtime. It compares the former
+  single-threaded Ibex path with multi-threaded Polars and data.table.
 - Sort fast-path: ibex detects already-sorted input in O(n) without extracting keys
   into a temporary buffer; Polars detects via a pre-set `is_sorted` flag (O(1)).
 - Rolling fast-path: ibex accesses the Timestamp column directly via pointer cast,
   avoiding an 8 MB copy; result column allocation is the only dynamic allocation
   per call.
-- Resample: ibex floors timestamps into int64 bucket keys and delegates to the
-  standard single-threaded aggregation path. Polars uses `group_by_dynamic`
-  (parallel); data.table uses integer-key `by=` (parallel). The multi-threaded
-  advantage inverts the result here — ibex is 1.7× behind Polars and 1.2× behind
-  data.table on this query.
+- Resample: this historical path floors timestamps into int64 bucket keys and
+  delegates to the standard aggregation path. Polars uses `group_by_dynamic`
+  and data.table uses integer-key `by=`.
+
+For current time-window results, including matched one-thread and default
+parallel runs against Polars, DuckDB, and ClickHouse, see
+[`benchmarking/window_ohlc/README.md`](benchmarking/window_ohlc/README.md).
+The 5M-row matched-thread suite currently has Ibex fastest in 10 of 12 cases;
+the exception is a three-symbol sliding window, whose available parallelism is
+limited by its three groups.
 
 ## Architecture
 
@@ -1170,8 +1180,10 @@ Fully restart VS Code after copying. `.ibex` files will be highlighted automatic
 
 ## Roadmap
 
-- [ ] Query optimizer (predicate pushdown, projection pruning)
+- [x] Query optimization: predicate/projection pushdown, lazy Parquet scans,
+  late materialization, repeated-subplan sharing, and costed inner-join ordering
 - [x] Python `pyarrow` bridge and IPython/Jupyter magics
-- [ ] R bindings (Rcpp)
+- [x] Experimental R package and knitr engine
 - [x] Arrow C Data Interface export (zero-copy interop)
-- [ ] REPL tab completion and history
+- [x] REPL exploration commands (`:schema`, `:head`, `:describe`, `:scalars`,
+  `:tables`, and `:load`), history, and readline support

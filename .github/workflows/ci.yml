@@ -231,10 +231,20 @@ jobs:
           # warnings in the repo-wide sweep, and for a brand-new file every
           # line is "new" — so it would fail the gate on IWYU-style pedantry
           # rather than an actual bug.
+          #
+          # -warnings-as-errors isn't supported by every clang-tidy-diff.py
+          # vintage (clang-tidy-20's rejects it as an unrecognized argument),
+          # so gate by grepping the output for a diagnostic line instead of
+          # relying on that flag/exit code.
+          set -o pipefail
           git diff -U0 "${{ steps.diff_base.outputs.base }}"...HEAD -- src \
             | python3 "$DIFF_SCRIPT" -p1 -path build -clang-tidy-binary "$TIDY" \
-                -iregex '.*\.cpp$' -checks='-misc-include-cleaner' \
-                -warnings-as-errors='*' -quiet
+                -iregex '.*\.cpp$' -checks='-misc-include-cleaner' -quiet \
+            | tee /tmp/clang-tidy-diff.out
+          if grep -qE ': (warning|error): ' /tmp/clang-tidy-diff.out; then
+            echo "::error::clang-tidy found issues in changed lines" >&2
+            exit 1
+          fi
 
   format-check:
     runs-on: ubuntu-24.04

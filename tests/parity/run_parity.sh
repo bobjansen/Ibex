@@ -37,7 +37,10 @@ if ! std_expected_works; then
     CONCEPTS_WORKAROUND=(-D__cpp_concepts=202002L -Wno-builtin-macro-redefined)
 fi
 
-EXTRA_CXXFLAGS=("${CONCEPTS_WORKAROUND[@]}")
+EXTRA_CXXFLAGS=()
+if ((${#CONCEPTS_WORKAROUND[@]})); then
+    EXTRA_CXXFLAGS+=("${CONCEPTS_WORKAROUND[@]}")
+fi
 if [[ -n "$PARITY_CXXFLAGS" ]]; then
     # shellcheck disable=SC2206
     EXTRA_CXXFLAGS+=($PARITY_CXXFLAGS)

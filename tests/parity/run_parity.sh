@@ -22,10 +22,25 @@ detect_cxx_std_flag() {
 
 CXX_STD_FLAG="$(detect_cxx_std_flag)"
 
-EXTRA_CXXFLAGS=()
+# Some upstream Clang + libstdc++ combinations (e.g. clang-18 in the
+# clang-werror CI job) reject <expected> unless __cpp_concepts is forced to
+# 202002L. CMake's ibex_compiler_options target carries this workaround (see
+# cmake/CompilerOptions.cmake), but this script compiles standalone via a raw
+# $CXX invocation, so it has to detect and apply it independently.
+std_expected_works() {
+    printf '#include <expected>\nint main() { std::expected<int, int> x = 1; return *x; }\n' \
+        | "$CXX" -x c++ -std="$CXX_STD_FLAG" - -o /dev/null >/dev/null 2>&1
+}
+
+CONCEPTS_WORKAROUND=()
+if ! std_expected_works; then
+    CONCEPTS_WORKAROUND=(-D__cpp_concepts=202002L -Wno-builtin-macro-redefined)
+fi
+
+EXTRA_CXXFLAGS=("${CONCEPTS_WORKAROUND[@]}")
 if [[ -n "$PARITY_CXXFLAGS" ]]; then
     # shellcheck disable=SC2206
-    EXTRA_CXXFLAGS=($PARITY_CXXFLAGS)
+    EXTRA_CXXFLAGS+=($PARITY_CXXFLAGS)
 fi
 
 EXTRA_LDFLAGS=()

@@ -1509,7 +1509,16 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
 /// commutative and associative, so the interleaving cannot matter.
 inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     const std::uint64_t mask = ~(std::uint64_t{1} << (bit % 64));
+#ifdef __cpp_lib_atomic_ref
     std::atomic_ref<std::uint64_t>(words[bit / 64]).fetch_and(mask, std::memory_order_relaxed);
+#else
+    // Apple's libc++ (macOS clang-werror leg) doesn't ship std::atomic_ref yet.
+    // std::atomic<uint64_t> is a lock-free integral specialization and therefore
+    // layout-compatible with a plain uint64_t, so a reinterpret_cast view gives
+    // the same fetch-AND without needing atomic_ref.
+    reinterpret_cast<std::atomic<std::uint64_t>*>(&words[bit / 64])
+        ->fetch_and(mask, std::memory_order_relaxed);
+#endif
 }
 
 /// How many workers should split the per-row bucketing loop, or 0 for serial.

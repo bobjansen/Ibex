@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # run_bench.sh — time TPC-H/PDS-H queries: Ibex, this tree's Polars implementation,
 # and the upstream Polars PDS-H Polars + DuckDB implementations.
-# (multi-threaded, matching Polars' default/published numbers) vs.
-# polars-st (single-threaded, the fair apples-to-apples comparison since
-# Ibex has no multithreading yet).
+# Every engine is run in both its default multi-threaded configuration and a
+# one-thread configuration. Ibex's parallel islands are enabled explicitly for
+# the MT row and disabled for the ST row, making the comparison reproducible
+# even when the caller has ambient IBEX_* settings.
 #
 # Prerequisite (once per scale factor):
 #   ./gen_data.sh <scale> && ./gen_parquet.sh <scale>
@@ -54,9 +55,15 @@ echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
 # Results are suffixed by scale so runs at different scales do not clobber.
 SUFFIX="_sf${SCALE}"
 
-echo "=== ibex ==="
-python3 "$SCRIPT_DIR/bench_ibex.py" --warmup "$WARMUP" --iters "$ITERS" \
+echo "=== ibex (multi-threaded, $(nproc) cores) ==="
+IBEX_THREADS=auto IBEX_PARALLEL=1 python3 "$SCRIPT_DIR/bench_ibex.py" --warmup "$WARMUP" --iters "$ITERS" \
     --out "$RESULTS/ibex${SUFFIX}.tsv"
+
+echo "=== ibex-st (single-threaded) ==="
+IBEX_THREADS=1 IBEX_PARALLEL=0 python3 "$SCRIPT_DIR/bench_ibex.py" --warmup "$WARMUP" --iters "$ITERS" \
+    --out "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
+sed 's/^ibex\t/ibex-st\t/' "$RESULTS/ibex_st${SUFFIX}.tsv.tmp" > "$RESULTS/ibex_st${SUFFIX}.tsv"
+rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 
 echo "=== polars (multi-threaded, $(nproc) cores) ==="
 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_polars.py" --warmup "$WARMUP" --iters "$ITERS" \

@@ -69,7 +69,7 @@ git push
 ./benchmarking/aws/run-tpch.sh --on-demand --sf 1 --warmup 1 --iters 5
 ```
 
-This runs Ibex, this repository's Polars implementation in default and
+This runs Ibex and this repository's Polars implementation in default and
 single-threaded modes, plus the upstream Polars PDS-H Polars implementation in
 both modes and its DuckDB SQL. The runner pins the upstream PDS-H revision and
 downloads `benchmarking/results/tpch_aws_<timestamp>.tar.gz`; extract it to get

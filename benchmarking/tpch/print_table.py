@@ -11,7 +11,7 @@ import sys
 from collections import defaultdict
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-FRAMEWORK_ORDER = ["ibex", "polars", "polars-st", "pdsh-polars", "pdsh-polars-st", "pdsh-duckdb", "pdsh-duckdb-st"]
+FRAMEWORK_ORDER = ["ibex", "ibex-st", "polars", "polars-st", "pdsh-polars", "pdsh-polars-st", "pdsh-duckdb", "pdsh-duckdb-st"]
 QUERY_ORDER = ["q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
 
 
@@ -60,16 +60,17 @@ def main():
 
     print()
     for fw in present_fw:
-        if fw == "ibex":
+        if fw in ("ibex", "ibex-st"):
             continue
+        ibex_fw = "ibex-st" if fw.endswith("-st") else "ibex"
         ratios = [
-            avg_data[q]["ibex"] / avg_data[q][fw]
+            avg_data[q][ibex_fw] / avg_data[q][fw]
             for q in present_queries
-            if "ibex" in avg_data[q] and fw in avg_data[q] and avg_data[q][fw] > 0
+            if ibex_fw in avg_data[q] and fw in avg_data[q] and avg_data[q][fw] > 0
         ]
         if ratios:
             gm = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-            print(f"{fw} is {gm:.1f}x faster than ibex (geomean over {len(ratios)} queries)")
+            print(f"{fw} is {gm:.1f}x faster than {ibex_fw} (geomean over {len(ratios)} queries)")
 
 
 if __name__ == "__main__":

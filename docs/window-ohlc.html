@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ibex &mdash; Window-OHLC benchmark vs Polars, DuckDB and ClickHouse</title>
+<meta name="description" content="Rolling OHLCV benchmark: Ibex vs Polars, DuckDB and ClickHouse on a 32-core box.">
+<style>
+  html,body{margin:0;padding:0;}
+  body{background:#fcfcfb;}
+  @media (prefers-color-scheme:dark){
+    :root:where(:not([data-theme="light"])) body{background:#1a1a19;}
+  }
+  :root[data-theme="dark"] body{background:#1a1a19;}
+
+  .viz-root{
+    color-scheme:light;
+    --surface-1:#fcfcfb; --surface-2:#f3f3f0; --border:#e0e0da;
+    --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#8a8983;
+    --ibex:#2a78d6; --polars:#008300; --duckdb:#e87ba4; --ch:#c26a1f; --win:#008300;
+    --track:#e4e4de;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--surface-1); color:var(--text-primary);
+    max-width:1080px; margin:0 auto; padding:36px 24px 64px; line-height:1.5;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:where(:not([data-theme="light"])) .viz-root{
+      color-scheme:dark;
+      --surface-1:#1a1a19; --surface-2:#242423; --border:#3a3a37;
+      --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
+      --ibex:#3987e5; --polars:#00a80a; --duckdb:#d55181; --ch:#e2963f;
+      --track:#33332f;
+    }
+  }
+  :root[data-theme="dark"] .viz-root{
+    color-scheme:dark;
+    --surface-1:#1a1a19; --surface-2:#242423; --border:#3a3a37;
+    --text-primary:#ffffff; --text-secondary:#c3c2b7; --text-muted:#8f8e85;
+    --ibex:#3987e5; --polars:#00a80a; --duckdb:#d55181; --ch:#e2963f;
+      --track:#33332f;
+  }
+  .viz-root h1{font-size:34px; margin:0 0 10px; letter-spacing:-.025em; line-height:1.15; text-wrap:balance;}
+  .viz-root h2{font-size:20px; margin:44px 0 2px; letter-spacing:-.015em;}
+  .viz-root .sub{color:var(--text-secondary); font-size:14.5px; margin:0 0 8px; max-width:74ch;}
+  .viz-root p{color:var(--text-secondary); font-size:14.5px; max-width:72ch;}
+  .viz-root code{background:var(--surface-2); padding:1px 5px; border-radius:4px; font-size:.88em;}
+  .lede{font-size:16.5px; color:var(--text-secondary); max-width:64ch; margin:0 0 4px;}
+  .lede b{color:var(--text-primary);}
+  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:26px 0 4px;}
+  @media(max-width:720px){ .stats{grid-template-columns:1fr;} }
+  .stat{background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:18px 18px 16px;}
+  .stat .big{font-size:38px; font-weight:700; letter-spacing:-.03em; color:var(--ibex);
+             font-variant-numeric:tabular-nums; line-height:1;}
+  .stat .lab{font-size:13px; color:var(--text-primary); font-weight:600; margin-top:8px;}
+  .stat .fine{font-size:11.5px; color:var(--text-muted); margin-top:3px;}
+  .legend{display:flex; gap:18px; flex-wrap:wrap; margin:14px 0 8px; font-size:13px;}
+  .legend span{display:inline-flex; align-items:center; gap:6px; color:var(--text-secondary);}
+  .swatch{width:12px; height:12px; border-radius:3px; display:inline-block;}
+  .grid{display:grid; grid-template-columns:repeat(3,1fr); gap:14px 18px; margin-top:12px;}
+  .grid.four{grid-template-columns:repeat(4,1fr);}
+  @media(max-width:900px){ .grid.four{grid-template-columns:repeat(2,1fr);} }
+  @media(max-width:720px){ .grid,.grid.four{grid-template-columns:1fr;} }
+  .panel{background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:12px 14px;}
+  .panel .ptitle{font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:2px;}
+  .panel .pnote{font-size:11.5px; color:var(--text-muted); margin-bottom:10px;}
+  .panel .pnote b{color:var(--ibex);}
+  .row{display:flex; align-items:center; gap:8px; margin:5px 0;}
+  .row .name{width:68px; font-size:11.5px; color:var(--text-secondary); flex:none;}
+  .track{flex:1; position:relative; height:16px; background:var(--track); border-radius:3px;}
+  /* display:block is load-bearing -- a bare <span> is inline, so width/height are
+     ignored and an empty bar collapses to nothing at all. */
+  .bar{display:block; height:16px; border-radius:0 3px 3px 0; min-width:2px;}
+  .row .val{font-size:11.5px; color:var(--text-primary); flex:none; width:72px;
+            text-align:right; font-variant-numeric:tabular-nums;}
+  .row.best .val{font-weight:700;}
+  .row.best .name{color:var(--text-primary); font-weight:600;}
+  .row.na .val{color:var(--text-muted); font-style:italic; width:auto; white-space:nowrap;}
+  .crown{color:var(--win); font-weight:700;}
+  .chartgrid{display:grid; grid-template-columns:repeat(2,1fr); gap:16px; margin-top:12px;}
+  @media(max-width:800px){ .chartgrid{grid-template-columns:1fr;} }
+  .chart{background:var(--surface-2); border:1px solid var(--border); border-radius:10px; padding:14px 14px 10px;}
+  .chart .ctitle{font-size:13px; font-weight:600; color:var(--text-primary);}
+  .chart .cnote{font-size:11.5px; color:var(--text-muted); margin-bottom:6px;}
+  .chart svg{width:100%; height:auto; display:block; overflow:visible;}
+  .ax{stroke:var(--border); stroke-width:1;}
+  .axlab{fill:var(--text-muted); font-size:10px;}
+  .slope{font-size:10.5px; font-weight:600;}
+  .refline{stroke:var(--text-muted); stroke-width:1; stroke-dasharray:3 3; opacity:.55;}
+  .reflab{fill:var(--text-muted); font-size:9.5px; font-style:italic;}
+  .dot{stroke:var(--surface-2); stroke-width:2;}
+  .qgrid{display:grid; grid-template-columns:repeat(2,1fr); gap:16px; margin-top:14px;}
+  @media(max-width:800px){ .qgrid{grid-template-columns:1fr;} }
+  .qcard{background:var(--surface-2); border:1px solid var(--border); border-radius:10px;
+         padding:12px 14px 14px; min-width:0;}
+  .qhead{display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600;
+         color:var(--text-primary); margin-bottom:8px;}
+  .qcard pre{margin:0; overflow-x:auto; font-size:11.5px; line-height:1.55;
+             color:var(--text-secondary); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  .qsub{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+        color:var(--text-muted); margin:0 0 10px;}
+  .ctarow{display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin:22px 0 4px;}
+  .cta{display:inline-block; background:var(--ibex); color:#fff; text-decoration:none;
+       font-size:14.5px; font-weight:600; padding:11px 20px; border-radius:8px;
+       border:1px solid transparent;}
+  .cta:hover{filter:brightness(1.08);}
+  .cta:focus-visible{outline:2px solid var(--text-primary); outline-offset:2px;}
+  .ctanote{font-size:13.5px; color:var(--text-muted);}
+  .why{display:grid; grid-template-columns:repeat(2,1fr); gap:14px 20px; margin-top:14px;}
+  @media(max-width:720px){ .why{grid-template-columns:1fr;} }
+  .why .item{background:var(--surface-2); border:1px solid var(--border);
+             border-radius:10px; padding:13px 16px;}
+  .why .item h3{margin:0 0 4px; font-size:13.5px; color:var(--text-primary); letter-spacing:-.01em;}
+  .why .item p{margin:0; font-size:13px; color:var(--text-secondary); max-width:none;}
+  .closing{background:var(--surface-2); border:1px solid var(--border); border-radius:12px;
+           padding:22px 24px; margin-top:26px;}
+  .closing h3{margin:0 0 6px; font-size:19px; color:var(--text-primary); letter-spacing:-.015em;}
+  .closing p{margin:0 0 14px; font-size:14.5px;}
+  .tablewrap{overflow-x:auto;}
+  table{border-collapse:collapse; width:100%; font-size:12.5px; margin-top:10px;}
+  th,td{border:1px solid var(--border); padding:5px 9px; text-align:right;
+        font-variant-numeric:tabular-nums; white-space:nowrap;}
+  th:first-child,td:first-child{text-align:left;}
+  th{background:var(--surface-2); color:var(--text-secondary); font-weight:600;}
+  td.w{color:var(--win); font-weight:700;}
+  details{margin-top:18px;}
+  summary{cursor:pointer; font-size:13px; color:var(--text-secondary);}
+  .kbox{border-left:3px solid var(--ibex); background:var(--surface-2); padding:12px 16px;
+        border-radius:0 8px 8px 0; margin:16px 0; font-size:14.5px; color:var(--text-secondary);}
+  .kbox b{color:var(--text-primary);}
+  .kbox.warn{border-left-color:var(--ch);}
+  .tag{font-size:11px; color:var(--text-muted); font-weight:400;}
+  .foot{margin-top:30px; padding-top:16px; border-top:1px solid var(--border);
+        font-size:12.5px; color:var(--text-muted); max-width:80ch;}
+  .foot b{color:var(--text-secondary);}
+</style>
+</head>
+<body>
+
+<!-- ===================================================================== -->
+<!--  BENCHMARK DATA  -- edit numbers here; layout below never needs it.    -->
+<!--                                                                       -->
+<!--  Every `label` is the figure exactly as measured and reported. Bar     -->
+<!--  widths are DERIVED from `ms` (percentage of the largest bar in the    -->
+<!--  same panel) so you only ever update `ms` + `label` together.          -->
+<!--  `note` strings are prose containing ratios; if you change timings,    -->
+<!--  recompute the ratios in the note yourself.                            -->
+<!-- ===================================================================== -->
+<script>
+var BENCH = {
+
+  // Three headline tiles at the top of the page.
+  stats: [
+    { big: "5.8–12.3×", lab: "faster than DuckDB, aligned windows",
+      fine: "every row count, symbol count and core count tested — 18/18 configurations" },
+    { big: "up to 55×", lab: "faster than DuckDB, sliding windows",
+      fine: "1.83 s vs 100.8 s at 20M rows, 8 cores, both fully measured (5-run min) — DuckDB's cost grows superlinearly with table size on this workload, Ibex's stays linear" },
+    { big: "up to 9.5×", lab: "faster than Polars, once the book is real",
+      fine: "at 100 symbols; Polars leads at 3–8 symbols, and the crossover falls somewhere between 8 and 20 symbols in this dataset — see below" }
+  ],
+
+  // "Every scale, both window types" -- 3 symbols, 32 cores.
+  scaleGrid: [
+    { title: "5M rows &middot; aligned &middot; 32 cores",
+      note: "Ibex <b>2.1&times;</b> vs polars &middot; <b>12.3&times;</b> vs duckdb &middot; <b>9.1&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 92.8,   label: "92.8 ms",  best: true },
+        { name: "polars",     ms: 190.8,  label: "190.8 ms" },
+        { name: "duckdb",     ms: 1140,   label: "1.14 s" },
+        { name: "clickhouse", ms: 849.2,  label: "849.2 ms" }
+      ] },
+    { title: "5M rows &middot; sliding &middot; 32 cores",
+      note: "Ibex <b>0.4&times;</b> vs polars &middot; <b>11.0&times;</b> vs duckdb &middot; <b>5.4&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 481.3,  label: "481.3 ms" },
+        { name: "polars",     ms: 186.1,  label: "186.1 ms", best: true },
+        { name: "duckdb",     ms: 5280,   label: "5.28 s" },
+        { name: "clickhouse", ms: 2590,   label: "2.59 s" }
+      ] },
+    { title: "20M rows &middot; aligned &middot; 32 cores",
+      note: "Ibex <b>2.3&times;</b> vs polars &middot; <b>10.3&times;</b> vs duckdb &middot; <b>8.8&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 381.9,  label: "381.9 ms", best: true },
+        { name: "polars",     ms: 873.1,  label: "873.1 ms" },
+        { name: "duckdb",     ms: 3930,   label: "3.93 s" },
+        { name: "clickhouse", ms: 3360,   label: "3.36 s" }
+      ] },
+    { title: "20M rows &middot; sliding &middot; 32 cores",
+      note: "Ibex <b>0.5&times;</b> vs polars &middot; <b>25.0&times;</b> vs duckdb &middot; <b>5.7&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 1820,   label: "1.82 s" },
+        { name: "polars",     ms: 845.6,  label: "845.6 ms", best: true },
+        { name: "duckdb",     ms: 45420,  label: "45.42 s" },
+        { name: "clickhouse", ms: 10280,  label: "10.28 s" }
+      ] },
+    { title: "50M rows &middot; aligned &middot; 32 cores",
+      note: "Ibex <b>2.4&times;</b> vs polars &middot; <b>9.5&times;</b> vs duckdb &middot; <b>8.8&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 976.5,  label: "976.5 ms", best: true },
+        { name: "polars",     ms: 2350,   label: "2.35 s" },
+        { name: "duckdb",     ms: 9300,   label: "9.30 s" },
+        { name: "clickhouse", ms: 8600,   label: "8.60 s" }
+      ] },
+    { title: "50M rows &middot; sliding &middot; 32 cores",
+      note: "Ibex <b>0.4&times;</b> vs polars &middot; <b>47.1&times;</b> vs duckdb &middot; <b>5.5&times;</b> vs clickhouse",
+      rows: [
+        { name: "ibex",       ms: 4810,   label: "4.81 s" },
+        { name: "polars",     ms: 2090,   label: "2.09 s", best: true },
+        { name: "duckdb",     ms: 226660, label: "226.66 s*" },
+        { name: "clickhouse", ms: 26420,  label: "26.42 s" }
+      ] }
+  ],
+
+  // Sliding window, 20M rows, 32 cores -- the Ibex/Polars crossover.
+  slidingBySymbol: [
+    { title: "3 symbols", note: "<b>Polars 2.15&times; faster</b> here",
+      rows: [
+        { name: "ibex",       ms: 1820,   label: "1.82 s" },
+        { name: "polars",     ms: 845.6,  label: "845.6 ms", best: true },
+        { name: "duckdb",     ms: 45420,  label: "45.42 s" },
+        { name: "clickhouse", ms: 10280,  label: "10.28 s" }
+      ] },
+    { title: "8 symbols", note: "<b>Polars 1.09&times; faster</b> here",
+      rows: [
+        { name: "ibex",       ms: 916.9,  label: "916.9 ms" },
+        { name: "polars",     ms: 842.2,  label: "842.2 ms", best: true },
+        { name: "duckdb",     ms: 27240,  label: "27.24 s" },
+        { name: "clickhouse", ms: 4760,   label: "4.76 s" }
+      ] },
+    { title: "20 symbols", note: "Ibex <b>6.4&times;</b> faster than Polars",
+      rows: [
+        { name: "ibex",       ms: 553.1,  label: "553.1 ms", best: true },
+        { name: "polars",     ms: 3550,   label: "3.55 s" },
+        { name: "duckdb",     ms: 16270,  label: "16.27 s" },
+        { name: "clickhouse", ms: 5040,   label: "5.04 s" }
+      ] },
+    { title: "100 symbols", note: "Ibex <b>7.6&times;</b> faster than Polars",
+      rows: [
+        { name: "ibex",       ms: 452.5,  label: "452.5 ms", best: true },
+        { name: "polars",     ms: 3460,   label: "3.46 s" },
+        { name: "duckdb",     ms: 8210,   label: "8.21 s" },
+        { name: "clickhouse", ms: 4220,   label: "4.22 s" }
+      ] }
+  ],
+
+  // Aligned window, 20M rows, 32 cores.
+  alignedBySymbol: [
+    { title: "3 symbols", note: "Ibex <b>2.3&times;</b> vs Polars &middot; <b>10.3&times;</b> vs DuckDB",
+      rows: [
+        { name: "ibex",       ms: 381.9,  label: "381.9 ms", best: true },
+        { name: "polars",     ms: 873.1,  label: "873.1 ms" },
+        { name: "duckdb",     ms: 3930,   label: "3.93 s" },
+        { name: "clickhouse", ms: 3360,   label: "3.36 s" }
+      ] },
+    { title: "8 symbols", note: "Ibex <b>2.3&times;</b> vs Polars &middot; <b>8.5&times;</b> vs DuckDB",
+      rows: [
+        { name: "ibex",       ms: 394.2,  label: "394.2 ms", best: true },
+        { name: "polars",     ms: 900.7,  label: "900.7 ms" },
+        { name: "duckdb",     ms: 3340,   label: "3.34 s" },
+        { name: "clickhouse", ms: 3460,   label: "3.46 s" }
+      ] },
+    { title: "20 symbols", note: "Ibex <b>2.7&times;</b> vs Polars &middot; <b>7.9&times;</b> vs DuckDB",
+      rows: [
+        { name: "ibex",       ms: 386.5,  label: "386.5 ms", best: true },
+        { name: "polars",     ms: 1030,   label: "1.03 s" },
+        { name: "duckdb",     ms: 3040,   label: "3.04 s" },
+        { name: "clickhouse", ms: 3540,   label: "3.54 s" }
+      ] },
+    { title: "100 symbols", note: "Ibex <b>3.0&times;</b> vs Polars &middot; <b>6.7&times;</b> vs DuckDB",
+      rows: [
+        { name: "ibex",       ms: 438.2,  label: "438.2 ms", best: true },
+        { name: "polars",     ms: 1320,   label: "1.32 s" },
+        { name: "duckdb",     ms: 2930,   label: "2.93 s" },
+        { name: "clickhouse", ms: 3650,   label: "3.65 s" }
+      ] }
+  ],
+
+  // Core scaling -- 3 symbols, aligned window. All bars are Ibex.
+  cores: [
+    { title: "5M rows", note: "8 &rarr; 32 cores: <b>1.49&times; faster</b>", color: "--ibex",
+      rows: [
+        { name: "8 cores",  ms: 137.9, label: "137.9 ms" },
+        { name: "16 cores", ms: 102.2, label: "102.2 ms" },
+        { name: "32 cores", ms: 92.8,  label: "92.8 ms", best: true }
+      ] },
+    { title: "20M rows", note: "8 &rarr; 32 cores: <b>1.47&times; faster</b>", color: "--ibex",
+      rows: [
+        { name: "8 cores",  ms: 561.7, label: "561.7 ms" },
+        { name: "16 cores", ms: 405.9, label: "405.9 ms" },
+        { name: "32 cores", ms: 381.9, label: "381.9 ms", best: true }
+      ] },
+    { title: "50M rows", note: "8 &rarr; 32 cores: <b>1.52&times; faster</b>", color: "--ibex",
+      rows: [
+        { name: "8 cores",  ms: 1480,  label: "1.48 s" },
+        { name: "16 cores", ms: 1080,  label: "1.08 s" },
+        { name: "32 cores", ms: 976.5, label: "976.5 ms", best: true }
+      ] }
+  ],
+
+  // Resample workload -- 20M rows, 32 cores, by symbol count.
+  resampleBySymbol: [
+    { title: "3 symbols", note: "<b>duckdb</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 180.6, label: "180.6 ms" },
+        { name: "polars",     ms: 465.2, label: "465.2 ms" },
+        { name: "duckdb",     ms: 139.7, label: "139.7 ms", best: true },
+        { name: "clickhouse", ms: 179.3, label: "179.3 ms" }
+      ] },
+    { title: "8 symbols", note: "<b>duckdb</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 175.3, label: "175.3 ms" },
+        { name: "polars",     ms: 587.7, label: "587.7 ms" },
+        { name: "duckdb",     ms: 144.8, label: "144.8 ms", best: true },
+        { name: "clickhouse", ms: 222.7, label: "222.7 ms" }
+      ] },
+    { title: "20 symbols", note: "<b>duckdb</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 173.5, label: "173.5 ms" },
+        { name: "polars",     ms: 598.1, label: "598.1 ms" },
+        { name: "duckdb",     ms: 147.1, label: "147.1 ms", best: true },
+        { name: "clickhouse", ms: 241.8, label: "241.8 ms" }
+      ] },
+    { title: "100 symbols", note: "<b>ibex</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 176.4, label: "176.4 ms", best: true },
+        { name: "polars",     ms: 884.9, label: "884.9 ms" },
+        { name: "duckdb",     ms: 178.7, label: "178.7 ms" },
+        { name: "clickhouse", ms: 222.5, label: "222.5 ms" }
+      ] }
+  ],
+
+  // Resample workload -- 3 symbols, 32 cores, by row count.
+  resampleByRows: [
+    { title: "5M rows", note: "<b>ibex</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 41.0,  label: "41.0 ms", best: true },
+        { name: "polars",     ms: 107.9, label: "107.9 ms" },
+        { name: "duckdb",     ms: 45.8,  label: "45.8 ms" },
+        { name: "clickhouse", ms: 157.8, label: "157.8 ms" }
+      ] },
+    { title: "20M rows", note: "<b>duckdb</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 180.6, label: "180.6 ms" },
+        { name: "polars",     ms: 465.2, label: "465.2 ms" },
+        { name: "duckdb",     ms: 139.7, label: "139.7 ms", best: true },
+        { name: "clickhouse", ms: 179.3, label: "179.3 ms" }
+      ] },
+    { title: "50M rows", note: "<b>clickhouse</b> fastest here",
+      rows: [
+        { name: "ibex",       ms: 447.2, label: "447.2 ms" },
+        { name: "polars",     ms: 1260,  label: "1.26 s" },
+        { name: "duckdb",     ms: 315.6, label: "315.6 ms" },
+        { name: "clickhouse", ms: 239.8, label: "239.8 ms", best: true }
+      ] }
+  ],
+
+  // Log-log scaling chart -- sliding window, 3 symbols, 8 cores.
+  // `k` is the fitted scaling exponent, reported as measured.
+  scaling: {
+    rowCounts: [ { m: 5, label: "5M rows" }, { m: 20, label: "20M rows" }, { m: 50, label: "50M rows" } ],
+    series: [
+      { name: "ibex", color: "--ibex", k: "k=1.02", points: [
+        { ms: 458,    label: "458 ms" },
+        { ms: 1830,   label: "1.83 s" },
+        { ms: 4830,   label: "4.83 s" } ] },
+      { name: "polars", color: "--polars", k: "k=1.07", points: [
+        { ms: 200,    label: "200 ms" },
+        { ms: 909,    label: "909 ms" },
+        { ms: 2360,   label: "2.36 s" } ] },
+      { name: "clickhouse", color: "--ch", k: "k=0.98", points: [
+        { ms: 2480,   label: "2.48 s" },
+        { ms: 9840,   label: "9.84 s" },
+        { ms: 23800,  label: "23.8 s" } ] },
+      { name: "duckdb", color: "--duckdb", k: "k=1.64", points: [
+        { ms: 11700,  label: "11.7 s" },
+        { ms: 100800, label: "100.8 s" },
+        { ms: 519100, label: "519.1 s (over budget)" } ] }
+    ]
+  },
+
+  // Full window results -- 36 configurations. `w` is the 0-based index of the
+  // winning engine within [Ibex, Polars, DuckDB, ClickHouse].
+  windowTable: [
+    { rows: "5M",  sym: 3,   win: "aligned", cores: 8,  t: ["137.9 ms", "252.3 ms", "1.51 s",     "904.9 ms"], w: 0 },
+    { rows: "5M",  sym: 3,   win: "sliding", cores: 8,  t: ["458.3 ms", "200.0 ms", "11.69 s",    "2.48 s"],   w: 1 },
+    { rows: "20M", sym: 3,   win: "aligned", cores: 8,  t: ["561.7 ms", "1.13 s",   "6.07 s",     "3.65 s"],   w: 0 },
+    { rows: "20M", sym: 3,   win: "sliding", cores: 8,  t: ["1.83 s",   "908.8 ms", "100.84 s",   "9.84 s"],   w: 1 },
+    { rows: "20M", sym: 8,   win: "aligned", cores: 8,  t: ["751.6 ms", "1.44 s",   "4.72 s",     "3.80 s"],   w: 0 },
+    { rows: "20M", sym: 8,   win: "sliding", cores: 8,  t: ["931.0 ms", "891.9 ms", "50.19 s",    "4.59 s"],   w: 1 },
+    { rows: "20M", sym: 20,  win: "aligned", cores: 8,  t: ["654.9 ms", "1.68 s",   "4.19 s",     "3.93 s"],   w: 0 },
+    { rows: "20M", sym: 20,  win: "sliding", cores: 8,  t: ["774.9 ms", "4.49 s",   "32.99 s",    "4.84 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "aligned", cores: 8,  t: ["575.0 ms", "2.15 s",   "3.92 s",     "4.03 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "sliding", cores: 8,  t: ["654.2 ms", "4.41 s",   "15.50 s",    "4.25 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "aligned", cores: 8,  t: ["1.48 s",   "3.32 s",   "15.00 s",    "8.83 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "sliding", cores: 8,  t: ["4.83 s",   "2.36 s",   "519.09 s*",  "23.83 s"],  w: 1 },
+    { rows: "5M",  sym: 3,   win: "aligned", cores: 16, t: ["102.2 ms", "192.3 ms", "996.7 ms",   "814.5 ms"], w: 0 },
+    { rows: "5M",  sym: 3,   win: "sliding", cores: 16, t: ["445.8 ms", "181.5 ms", "6.35 s",     "2.42 s"],   w: 1 },
+    { rows: "20M", sym: 3,   win: "aligned", cores: 16, t: ["405.9 ms", "816.4 ms", "3.98 s",     "3.30 s"],   w: 0 },
+    { rows: "20M", sym: 3,   win: "sliding", cores: 16, t: ["1.77 s",   "830.7 ms", "52.81 s",    "10.11 s"],  w: 1 },
+    { rows: "20M", sym: 8,   win: "aligned", cores: 16, t: ["419.5 ms", "1.04 s",   "3.25 s",     "3.40 s"],   w: 0 },
+    { rows: "20M", sym: 8,   win: "sliding", cores: 16, t: ["858.6 ms", "829.3 ms", "32.18 s",    "4.35 s"],   w: 1 },
+    { rows: "20M", sym: 20,  win: "aligned", cores: 16, t: ["534.2 ms", "1.05 s",   "3.09 s",     "3.43 s"],   w: 0 },
+    { rows: "20M", sym: 20,  win: "sliding", cores: 16, t: ["622.1 ms", "4.32 s",   "24.25 s",    "4.66 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "aligned", cores: 16, t: ["435.2 ms", "1.35 s",   "3.02 s",     "3.53 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "sliding", cores: 16, t: ["478.0 ms", "4.56 s",   "9.58 s",     "4.08 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "aligned", cores: 16, t: ["1.08 s",   "2.46 s",   "10.53 s",    "8.55 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "sliding", cores: 16, t: ["4.86 s",   "2.23 s",   "316.65 s*",  "26.09 s"],  w: 1 },
+    { rows: "5M",  sym: 3,   win: "aligned", cores: 32, t: ["92.8 ms",  "190.8 ms", "1.14 s",     "849.2 ms"], w: 0 },
+    { rows: "5M",  sym: 3,   win: "sliding", cores: 32, t: ["481.3 ms", "186.1 ms", "5.28 s",     "2.59 s"],   w: 1 },
+    { rows: "20M", sym: 3,   win: "aligned", cores: 32, t: ["381.9 ms", "873.1 ms", "3.93 s",     "3.36 s"],   w: 0 },
+    { rows: "20M", sym: 3,   win: "sliding", cores: 32, t: ["1.82 s",   "845.6 ms", "45.42 s",    "10.28 s"],  w: 1 },
+    { rows: "20M", sym: 8,   win: "aligned", cores: 32, t: ["394.2 ms", "900.7 ms", "3.34 s",     "3.46 s"],   w: 0 },
+    { rows: "20M", sym: 8,   win: "sliding", cores: 32, t: ["916.9 ms", "842.2 ms", "27.24 s",    "4.76 s"],   w: 1 },
+    { rows: "20M", sym: 20,  win: "aligned", cores: 32, t: ["386.5 ms", "1.03 s",   "3.04 s",     "3.54 s"],   w: 0 },
+    { rows: "20M", sym: 20,  win: "sliding", cores: 32, t: ["553.1 ms", "3.55 s",   "16.27 s",    "5.04 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "aligned", cores: 32, t: ["438.2 ms", "1.32 s",   "2.93 s",     "3.65 s"],   w: 0 },
+    { rows: "20M", sym: 100, win: "sliding", cores: 32, t: ["452.5 ms", "3.46 s",   "8.21 s",     "4.22 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "aligned", cores: 32, t: ["976.5 ms", "2.35 s",   "9.30 s",     "8.60 s"],   w: 0 },
+    { rows: "50M", sym: 3,   win: "sliding", cores: 32, t: ["4.81 s",   "2.09 s",   "226.66 s*",  "26.42 s"],  w: 1 }
+  ],
+
+  // Full resample results -- 18 configurations.
+  resampleTable: [
+    { rows: "5M",  sym: 3,   cores: 8,  t: ["39.7 ms",  "157.9 ms", "97.4 ms",  "29.6 ms"],  w: 3 },
+    { rows: "20M", sym: 3,   cores: 8,  t: ["174.0 ms", "675.7 ms", "338.6 ms", "103.7 ms"], w: 3 },
+    { rows: "20M", sym: 8,   cores: 8,  t: ["167.7 ms", "833.2 ms", "353.4 ms", "105.3 ms"], w: 3 },
+    { rows: "20M", sym: 20,  cores: 8,  t: ["166.9 ms", "992.4 ms", "362.6 ms", "125.1 ms"], w: 3 },
+    { rows: "20M", sym: 100, cores: 8,  t: ["181.7 ms", "1.50 s",   "386.8 ms", "232.9 ms"], w: 0 },
+    { rows: "50M", sym: 3,   cores: 8,  t: ["442.1 ms", "1.79 s",   "813.2 ms", "255.3 ms"], w: 3 },
+    { rows: "5M",  sym: 3,   cores: 16, t: ["46.1 ms",  "130.8 ms", "59.6 ms",  "196.7 ms"], w: 0 },
+    { rows: "20M", sym: 3,   cores: 16, t: ["183.1 ms", "520.0 ms", "199.9 ms", "217.7 ms"], w: 0 },
+    { rows: "20M", sym: 8,   cores: 16, t: ["178.7 ms", "643.8 ms", "211.1 ms", "177.8 ms"], w: 3 },
+    { rows: "20M", sym: 20,  cores: 16, t: ["188.8 ms", "806.2 ms", "217.1 ms", "230.3 ms"], w: 0 },
+    { rows: "20M", sym: 100, cores: 16, t: ["183.1 ms", "1.16 s",   "249.2 ms", "304.8 ms"], w: 0 },
+    { rows: "50M", sym: 3,   cores: 16, t: ["457.3 ms", "1.49 s",   "462.1 ms", "279.3 ms"], w: 3 },
+    { rows: "5M",  sym: 3,   cores: 32, t: ["41.0 ms",  "107.9 ms", "45.8 ms",  "157.8 ms"], w: 0 },
+    { rows: "20M", sym: 3,   cores: 32, t: ["180.6 ms", "465.2 ms", "139.7 ms", "179.3 ms"], w: 2 },
+    { rows: "20M", sym: 8,   cores: 32, t: ["175.3 ms", "587.7 ms", "144.8 ms", "222.7 ms"], w: 2 },
+    { rows: "20M", sym: 20,  cores: 32, t: ["173.5 ms", "598.1 ms", "147.1 ms", "241.8 ms"], w: 2 },
+    { rows: "20M", sym: 100, cores: 32, t: ["176.4 ms", "884.9 ms", "178.7 ms", "222.5 ms"], w: 0 },
+    { rows: "50M", sym: 3,   cores: 32, t: ["447.2 ms", "1.26 s",   "315.6 ms", "239.8 ms"], w: 3 }
+  ]
+};
+</script>
+<!-- ===================== end of benchmark data ========================== -->
+
+<div class="viz-root">
+  <h1>Ibex computes rolling OHLCV<br>up to 12&times; faster than DuckDB.</h1>
+  <p class="lede"><b>Ibex</b> is a statically typed query language for columnar time-series data that compiles to native code. This is its core workload: running open / high / low / close / volume over a time window, per symbol, updated at every tick &mdash; the query at the centre of every market-data pipeline. Benchmarked against <b>Polars</b>, <b>DuckDB</b> and <b>ClickHouse</b> on a 32-core cloud box, identical data, outputs checked row-by-row against documented exceptions, at 8, 16 and 32 cores.</p>
+
+  <div class="stats" id="mount-stats"></div>
+
+  <div class="ctarow">
+    <a class="cta" href="https://bobjansen.github.io/Ibex/">Get started with Ibex &rarr;</a>
+    <span class="ctanote">Docs, language reference and install instructions</span>
+  </div>
+
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--ibex)"></i> Ibex</span>
+    <span><i class="swatch" style="background:var(--polars)"></i> Polars</span>
+    <span><i class="swatch" style="background:var(--duckdb)"></i> DuckDB</span>
+    <span><i class="swatch" style="background:var(--ch)"></i> ClickHouse</span>
+    <span><span class="crown">&#10003;</span> fastest</span>
+  </div>
+
+  <h2>Every scale, both window types <span class="tag">&mdash; 3 symbols, 32 cores</span></h2>
+  <p class="sub">Bars are wall-clock time; shorter is faster. Ibex wins aligned windows outright. On sliding windows Polars edges ahead at 3&ndash;8 symbols &mdash; the section below explains why, and where that flips.</p>
+  <div class="grid" id="mount-scale-grid"></div>
+
+  <h2>What each engine runs</h2>
+  <p class="qsub">running OHLCV within a 10-second window, per symbol, ordered by symbol &middot; identical Parquet, output checked row-by-row against documented exceptions</p>
+  <p class="sub">Each engine gets the query written the way that engine wants it &mdash; no translation penalty, no deliberately awkward SQL. Input is pre-loaded into memory and only compute plus full materialisation is timed, so Parquet reading is excluded for all four.</p>
+  <p class="sub"><b>Output is grouped by symbol</b>, as a downstream per-symbol stage needs it &mdash; that is why every query carries an ordering clause, and all four engines pay for it. We tried four other ways to get Polars there (sort first, lazy pipeline, <code>partition_by</code>, sorting on both keys); the one shown below was the fastest, so it is the one we run. It is also the most generous: it orders on <code>symbol</code> alone, while Ibex delivers <code>symbol</code> <i>and</i> ascending time within each symbol.</p>
+  <p class="sub"><b>One output row per input tick, not one per finished bar.</b> Every engine reports the open / high / low / close / volume <i>as of</i> each tick, so all four return the same value in the same row and the outputs can be compared cell by cell. It also means the result frame is as tall as the input &mdash; at 50M ticks each engine materialises 50M rows &times; 8 columns, and that full materialisation is inside the clock.</p>
+  <div class="qgrid"><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--ibex)"></i>Ibex</div><pre>t[ select {
+     price = price,
+     open = first(price),
+     high = max(price),
+     low = min(price),
+     close = last(price),
+     volume_sum = sum(volume),
+     window_start = window_start() },
+   by symbol,
+   window 10s aligned,
+   order symbol ];</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--polars)"></i>Polars</div><pre>part = ["symbol", "window_start"]
+
+(df.with_columns(
+     pl.col("timestamp").dt.truncate("10s")
+       .alias("window_start"))
+   .with_columns(
+     pl.col("price").first().over(part).alias("open"),
+     pl.col("price").cum_max().over(part).alias("high"),
+     pl.col("price").cum_min().over(part).alias("low"),
+     pl.col("price").alias("close"),
+     pl.col("volume").cum_sum().over(part)
+       .alias("volume_sum"))
+   .sort("symbol"))</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--duckdb)"></i>DuckDB</div><pre>SELECT timestamp, symbol, price,
+       first_value(price) OVER w AS open, max(price) OVER w AS high,
+       min(price) OVER w AS low, price AS close,
+       sum(volume) OVER w AS volume_sum,
+       time_bucket(INTERVAL '10s', timestamp) AS window_start
+FROM t
+WINDOW w AS (PARTITION BY symbol, time_bucket(INTERVAL '10s', timestamp)
+             ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+ORDER BY symbol</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--ch)"></i>ClickHouse</div><pre>SELECT timestamp, symbol, price,
+       first_value(price) OVER w AS open, max(price) OVER w AS high,
+       min(price) OVER w AS low, price AS close,
+       sum(volume) OVER w AS volume_sum
+FROM t
+WINDOW w AS (PARTITION BY symbol
+             ORDER BY toUnixTimestamp64Micro(timestamp)
+             RANGE BETWEEN 10000000 PRECEDING AND CURRENT ROW)
+ORDER BY symbol</pre></div></div>
+  <p>The <b>sliding</b> flavour replaces the tumbling bucket with a window ending at each tick. Ibex drops <code>aligned</code>; Polars switches to <code>df.rolling(index_column="timestamp", period="10s", group_by="symbol")</code>, which does not preserve input order, so the result is sorted back to <code>(symbol, timestamp)</code> and stacked positionally onto the original frame &mdash; not a join; DuckDB switches to <code>RANGE BETWEEN INTERVAL '10s' PRECEDING AND CURRENT ROW</code>; ClickHouse's <code>RANGE</code> offset must fit a 32-bit int, so it orders by microseconds instead of nanoseconds &mdash; the closest faithful expression it accepts.</p>
+  <p class="sub"><b>"Checked row-by-row against documented exceptions" does not mean identical.</b> Two things cause real, expected divergence, and <code>run.py --verify</code> checks that every mismatch is one of them rather than assuming there are none. First, tied timestamps: any two ticks within the same engine-specific precision (nanoseconds for Ibex, microseconds for ClickHouse) are peers, and which peer an engine picks as "first" or "last" is an ordering detail, not a bug &mdash; this affects both window flavours. Second, and specific to <b>sliding</b> windows: Ibex's frame is position-bounded (this tick and everything strictly before it within the window), while SQL <code>RANGE</code> is peer-inclusive at both ends, so a row can legitimately admit a later tick that shares its timestamp under Polars, DuckDB or ClickHouse and not under Ibex. Both exceptions are counted and reported by the verifier, not silently ignored; on this dataset they touch a small fraction of rows (single digits per million) and never occur on <b>aligned</b> windows outside of tied timestamps. Whether Ibex's sliding-window boundary is the right default is an open language question, tracked separately from this benchmark.</p>
+
+  <h2>Where Ibex loses on sliding windows &mdash; and where that flips <span class="tag">&mdash; 20M rows, 32 cores</span></h2>
+  <p class="sub">At 3 and 8 symbols, Polars is faster; by 20 symbols the gap has reopened in Ibex's favour and grows from there. Ibex is known to parallelise across symbols, which plausibly explains why its lead grows with symbol count &mdash; but we have not profiled Polars internals, so any specific claim about <i>why</i> it wins at low cardinality would be a guess dressed up as a fact. The exact crossover point wasn't measured either, since only these four symbol counts were tested; "somewhere between 8 and 20" is the honest resolution, not a precise threshold.</p>
+  <div class="grid four" id="mount-sliding-symbols"></div>
+  <p>DuckDB and ClickHouse are slower than Ibex at every symbol count shown here &mdash; this section is specifically about the Ibex/Polars crossover.</p>
+
+  <h2>Ibex stays linear. DuckDB doesn't. <span class="tag">&mdash; sliding window, 3 symbols, 8 cores</span></h2>
+  <p class="sub">Cost against data volume, <b>both axes logarithmic</b> &mdash; so a straight line is a power law and its <i>slope</i> is the scaling exponent <i>k</i>. Ibex, Polars and ClickHouse run close to the dashed &ldquo;linear&rdquo; reference: double the rows, double the work. DuckDB climbs away from it, because its cost tracks rows <i>inside each window frame</i>, not just rows in the table.</p>
+  <div class="chart"><div class="ctitle">Sliding window, cost vs. row count</div><div class="cnote">3 symbols, 8 cores &mdash; every engine but DuckDB scales linearly, k &asymp; 1</div><div id="mount-chart"></div></div>
+  <div class="kbox">
+    <b>DuckDB is superlinear on sliding windows.</b> At 5M rows it's already 25&times; slower than Ibex; by 50M rows (8 cores) it needs <b>8 minutes 39 seconds</b> and only completed once before hitting the run budget. Ibex needs 4.83&nbsp;s for the same query.
+  </div>
+
+  <h2>Aligned windows: the lead widens with symbol count <span class="tag">&mdash; 20M rows, 32 cores</span></h2>
+  <p class="sub">This benchmark goes up to 100 symbols. Ibex's time barely moves as symbol count climbs; the field doesn't stay as flat.</p>
+  <div class="grid four" id="mount-aligned-symbols"></div>
+
+  <h2>More cores help, even on a handful of symbols <span class="tag">&mdash; 3 symbols, aligned window</span></h2>
+  <p class="sub">Ibex speeds up 1.47&ndash;1.52&times; going from 8 to 32 cores here, even with only three symbol groups to split &mdash; because aligned windows are also split at bucket boundaries within a group. We didn't measure CPU utilisation directly, so this is evidence of real parallel work beyond the three symbol groups, not a claim that the box is saturated.</p>
+  <div class="grid" id="mount-cores"></div>
+
+  <h2>A second workload: finished bars (resample)</h2>
+  <p class="sub">The window suite above answers "what is the bar as of this tick", emitting one row per input tick. A resample query instead answers "give me the finished bar", emitting one row per (symbol, bucket). This is a more even race: Ibex always beats Polars, but DuckDB and ClickHouse are competitive and sometimes faster.</p>
+  <div class="qgrid"><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--ibex)"></i>Ibex</div><pre>t[ resample 10s,
+   select { open = first(price),
+            high = max(price),
+            low = min(price),
+            close = last(price),
+            volume_sum = sum(volume) },
+   by symbol ];</pre></div><div class="qcard"><div class="qhead"><i class="swatch" style="background:var(--duckdb)"></i>DuckDB</div><pre>SELECT symbol,
+       time_bucket(INTERVAL '10s', timestamp)
+         AS window_start,
+       arg_min(price, timestamp) AS open,
+       max(price)                AS high,
+       min(price)                AS low,
+       arg_max(price, timestamp) AS close,
+       sum(volume)                AS volume_sum
+FROM t
+GROUP BY symbol, window_start</pre></div></div>
+  <p>Ibex beats Polars on every one of the 18 resample configurations tested &mdash; <b>2.6&times; to 8.3&times;</b>, 8 to 32 cores. Against DuckDB and ClickHouse there's no clean overall pattern: across the nine 20M-row, low-cardinality cells (3&ndash;20 symbols &times; 8/16/32 cores), DuckDB wins 3, ClickHouse 4, and Ibex 2. The one place a clear symbol-count crossover does show up is the 32-core panel below &mdash; DuckDB wins at 3&ndash;20 symbols, Ibex regains the lead at 100 &mdash; but that pattern is specific to 32 cores, not the whole matrix.</p>
+  <h3 style="font-size:14px;margin:20px 0 4px;color:var(--text-primary)">By symbol count <span class="tag" style="font-weight:400">&mdash; 20M rows, 32 cores</span></h3>
+  <div class="grid four" id="mount-resample-symbols"></div>
+  <h3 style="font-size:14px;margin:20px 0 4px;color:var(--text-primary)">By row count <span class="tag" style="font-weight:400">&mdash; 3 symbols, 32 cores</span></h3>
+  <div class="grid" id="mount-resample-rows"></div>
+
+  <div class="kbox warn">
+    <b>Caveat, to be filled in later:</b> ClickHouse's resample numbers are not well-behaved across core counts on this workload. The same 5M-row/3-symbol cell runs <b>29.6 ms</b> at 8 cores, jumps to <b>196.7&ndash;262.5 ms</b> at 16 cores, then settles at <b>157.8 ms</b> at 32 cores &mdash; non-monotonic in core count on identical data, and the 16-core min/median gap (66 ms, ~34%) is far wider than the &lt;5% seen everywhere else in this suite. It looks like chdb thread-pool overhead dominating a job too small to amortise it rather than a real scaling curve, but that is a guess, not a finding. Every ClickHouse number in the resample tables above and below should be treated as provisional until this cell is rerun several times to separate signal from noise.
+  </div>
+
+  <h2>Why it's fast</h2>
+  <p class="sub">Nothing exotic &mdash; it is what you get when the window operator is designed for time series from the start rather than added to a general query engine.</p>
+  <div class="why">
+    <div class="item">
+      <h3>A running window, not a re-aggregation</h3>
+      <p>Ibex advances one running accumulator per group as it sweeps the rows, by design independent of how many ticks fall inside a window &mdash; this benchmark fixes the window at 10 seconds throughout, so that property itself isn't what's measured here. What <i>is</i> measured is cost scaling linearly in row count: k&nbsp;=&nbsp;1.02 in the curve above, versus k&nbsp;=&nbsp;1.64 for DuckDB, whose cost grows superlinearly with table size on this workload.</p>
+    </div>
+    <div class="item">
+      <h3>Time order is part of the type</h3>
+      <p>A time-series frame carries its time index in the type system. In this benchmark the input is already ordered before timing starts, so once a TimeFrame has established its time ordering, the window operator reuses it rather than re-proving it on every query. (Ibex can also sort an unordered input when asked &mdash; that path just isn't inside the timed region here.)</p>
+    </div>
+    <div class="item">
+      <h3>Parallel across symbols &mdash; and inside them</h3>
+      <p>Groups run concurrently, one per core. For aligned windows each group is split further at bucket boundaries, since a row can only depend on its own bucket &mdash; so three symbols can still put more than three cores to work, rather than leaving most of the box idle (measured: 1.47&ndash;1.52&times; from 8 to 32 cores at 3 symbols, aligned; we didn't measure CPU utilisation directly, so this is evidence of parallel work, not of saturation). On sliding windows, Polars is faster at the measured 3- and 8-symbol points and slower at 20 and 100; we haven't profiled Polars closely enough to say why with confidence, only that the crossover is real and repeatable in this data.</p>
+    </div>
+    <div class="item">
+      <h3>Static types, columnar kernels</h3>
+      <p>Every column's type is known before the query runs, so the inner loop is a typed kernel over contiguous memory rather than a dispatch over boxed values. Grouping and ordering take integer fast paths &mdash; symbols are ranked once through their dictionary, not hashed per row.</p>
+    </div>
+  </div>
+
+  <div class="closing">
+    <h3>Try it on your own data</h3>
+    <p>The benchmark suite, the queries above and the generator for the tick data are all in the repository &mdash; you can reproduce every number on this page, or point it at your own.</p>
+    <div class="ctarow" style="margin:0">
+      <a class="cta" href="https://bobjansen.github.io/Ibex/">Read the docs &rarr;</a>
+      <span class="ctanote">bobjansen.github.io/Ibex</span>
+    </div>
+  </div>
+
+  <details>
+    <summary>Full window results &mdash; all 36 configurations &times; 4 engines, 8/16/32 cores (min of 5 runs; * = single run, budget-capped)</summary>
+    <div class="tablewrap" id="mount-window-table"></div>
+  </details>
+
+  <details>
+    <summary>Full resample results &mdash; all 18 configurations &times; 4 engines, 8/16/32 cores (min of 5 runs)</summary>
+    <div class="tablewrap" id="mount-resample-table"></div>
+  </details>
+
+  <div class="foot">
+    <b>Method.</b> AWS <code>m7i.8xlarge</code> (32 vCPU, 128 GiB), 2026-07-28. Every engine reads the same Parquet files, is pinned to the same cores with <code>taskset</code>, and is given the same thread budget (<code>POLARS_MAX_THREADS</code>, DuckDB <code>PRAGMA threads</code>, ClickHouse <code>max_threads</code>). Input is preloaded; only compute and full materialisation are timed. Each figure is the best of 5 runs after a discarded warmup, except cells marked <code>*</code> which hit the 120&ndash;300&nbsp;s per-execution budget on their first run and are reported as a single-sample result rather than being cut off entirely &mdash; that single completed run is a real observation, not a bound, and an unmeasured 5-run minimum for that cell could as easily be lower as higher. All four engines are checked row by row before any timing runs, and every mismatch is required to be explained by tied-timestamp ordering or, on sliding windows, a documented <code>RANGE</code>-frame difference (see above) &mdash; a benchmark reporting four timings for four different, unexplained answers is worth nothing. Tick interval 1&nbsp;ms (dense enough that a 10-second bar holds real work, not a near-1:1 grouping). Polars 1.42.1, DuckDB 1.5.4, ClickHouse via chdb 26.1.0.<br><br>
+    <b>Missing cells:</b> DuckDB sliding-window at 50M rows / 3 symbols exceeded the run budget at all three core counts (519&nbsp;s at 8 cores, 317&nbsp;s at 16, 227&nbsp;s at 32) and is reported as a single completed run rather than a 5-run minimum. Suites: <code>benchmarking/window_ohlc/run.py</code> (window) and <code>benchmarking/window_ohlc/resample_run.py</code> (resample).
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var COLOR = { ibex: "--ibex", polars: "--polars", duckdb: "--duckdb", clickhouse: "--ch" };
+  var CROWN = ' <span class="crown">&#10003;</span>';
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+
+  // Bar width is derived: percentage of the largest bar in the same panel.
+  function renderPanel(p) {
+    var max = 0, i;
+    for (i = 0; i < p.rows.length; i++) { if (p.rows[i].ms > max) max = p.rows[i].ms; }
+
+    var html = '<div class="panel"><div class="ptitle">' + p.title + '</div>' +
+               '<div class="pnote">' + p.note + '</div>';
+    for (i = 0; i < p.rows.length; i++) {
+      var r = p.rows[i];
+      var pct = max > 0 ? (r.ms / max * 100).toFixed(1) : "0.0";
+      var color = p.color || COLOR[r.name] || "--ibex";
+      html += '<div class="row' + (r.best ? " best" : "") + '" title="' + esc(r.name + ": " + r.label) + '">' +
+                '<span class="name">' + esc(r.name) + (r.best ? CROWN : "") + '</span>' +
+                '<span class="track"><span class="bar" style="width:' + pct + '%;background:var(' + color + ')"></span></span>' +
+                '<span class="val">' + esc(r.label) + '</span>' +
+              '</div>';
+    }
+    return html + "</div>";
+  }
+
+  function renderPanels(mountId, panels) {
+    var out = "", i;
+    for (i = 0; i < panels.length; i++) { out += renderPanel(panels[i]); }
+    el(mountId).innerHTML = out;
+  }
+
+  function renderStats() {
+    var out = "", i;
+    for (i = 0; i < BENCH.stats.length; i++) {
+      var s = BENCH.stats[i];
+      out += '<div class="stat"><div class="big">' + esc(s.big) + '</div>' +
+             '<div class="lab">' + esc(s.lab) + '</div>' +
+             '<div class="fine">' + esc(s.fine) + '</div></div>';
+    }
+    el("mount-stats").innerHTML = out;
+  }
+
+  // ---- log-log scaling chart -------------------------------------------
+  // x: 84.6px at the first row count, 315.4px per decade of rows.
+  // y: 250.6px at 100 ms, 60.6333px per decade of time (upward).
+  var X0 = 84.6, XDEC = 315.4, Y0 = 250.6, YDEC = 60.6333;
+
+  function renderChart() {
+    var c = BENCH.scaling;
+    var rowsBase = Math.log(c.rowCounts[0].m) / Math.LN10;
+    function xOf(m) { return X0 + XDEC * (Math.log(m) / Math.LN10 - rowsBase); }
+    function yOf(ms) { return Y0 - YDEC * (Math.log(ms) / Math.LN10 - 2); }
+
+    var svg = '<svg viewBox="0 0 520 300" role="img" aria-label="Log-log cost curve, sliding window">';
+
+    // horizontal decade gridlines, 100 ms .. 100 s
+    var grid = [ { ms: 100, t: "100 ms" }, { ms: 1000, t: "1 s" }, { ms: 10000, t: "10 s" }, { ms: 100000, t: "100 s" } ];
+    for (var g = 0; g < grid.length; g++) {
+      var gy = yOf(grid[g].ms).toFixed(1);
+      svg += '<line class="ax" x1="54" y1="' + gy + '" x2="436" y2="' + gy + '"/>' +
+             '<text class="axlab" x="46" y="' + (parseFloat(gy) + 3.5).toFixed(1) + '" text-anchor="end">' + grid[g].t + '</text>';
+    }
+
+    // x axis labels
+    for (var r = 0; r < c.rowCounts.length; r++) {
+      svg += '<text class="axlab" x="' + xOf(c.rowCounts[r].m).toFixed(1) + '" y="280" text-anchor="middle">' + c.rowCounts[r].label + '</text>';
+    }
+
+    // dashed linear reference: slope of exactly k = 1 across the plot area
+    var refSlope = YDEC / XDEC;
+    svg += '<line class="refline" x1="54.0" y1="216.4" x2="436.0" y2="' + (216.4 - refSlope * (436 - 54)).toFixed(1) + '"/>' +
+           '<text class="reflab" x="440.0" y="' + (216.4 - refSlope * (436 - 54) + 3.0).toFixed(1) + '">linear</text>';
+
+    for (var s = 0; s < c.series.length; s++) {
+      var se = c.series[s], d = "", last = null, i;
+      for (i = 0; i < se.points.length; i++) {
+        var px = xOf(c.rowCounts[i].m), py = yOf(se.points[i].ms);
+        d += (i === 0 ? "M" : " L") + px.toFixed(1) + " " + py.toFixed(1);
+        last = py;
+      }
+      svg += '<path d="' + d + '" fill="none" stroke="var(' + se.color + ')" stroke-width="2" stroke-linejoin="round"/>';
+      for (i = 0; i < se.points.length; i++) {
+        svg += '<circle class="dot" cx="' + xOf(c.rowCounts[i].m).toFixed(1) + '" cy="' + yOf(se.points[i].ms).toFixed(1) + '" r="4.5" fill="var(' + se.color + ')">' +
+               '<title>' + esc(se.name + " at " + c.rowCounts[i].label.replace(/ rows$/, " rows") + ": " + se.points[i].label) + '</title></circle>';
+      }
+      svg += '<text class="slope" x="409.0" y="' + (last + 3.5).toFixed(1) + '" fill="var(' + se.color + ')">' + esc(se.name) + '</text>' +
+             '<text class="axlab" x="409.0" y="' + (last + 15).toFixed(1) + '">' + esc(se.k) + '</text>';
+    }
+
+    el("mount-chart").innerHTML = svg + "</svg>";
+  }
+
+  // ---- full-result tables ----------------------------------------------
+  function renderTable(mountId, data, withWindowCol) {
+    var head = '<tr><th>rows</th><th>symbols</th>' + (withWindowCol ? '<th>window</th>' : '') +
+               '<th>cores</th><th>Ibex</th><th>Polars</th><th>DuckDB</th><th>ClickHouse</th></tr>';
+    var body = "", i, j;
+    for (i = 0; i < data.length; i++) {
+      var d = data[i];
+      body += '<tr><td>' + esc(d.rows) + '</td><td>' + esc(d.sym) + '</td>' +
+              (withWindowCol ? '<td style="text-align:left">' + esc(d.win) + '</td>' : '') +
+              '<td>' + esc(d.cores) + '</td>';
+      for (j = 0; j < d.t.length; j++) {
+        body += '<td class="' + (j === d.w ? "w" : "") + '">' + esc(d.t[j]) + '</td>';
+      }
+      body += '</tr>';
+    }
+    el(mountId).innerHTML = '<table><thead>' + head + '</thead><tbody>' + body + '</tbody></table>';
+  }
+
+  renderStats();
+  renderPanels("mount-scale-grid", BENCH.scaleGrid);
+  renderPanels("mount-sliding-symbols", BENCH.slidingBySymbol);
+  renderPanels("mount-aligned-symbols", BENCH.alignedBySymbol);
+  renderPanels("mount-cores", BENCH.cores);
+  renderPanels("mount-resample-symbols", BENCH.resampleBySymbol);
+  renderPanels("mount-resample-rows", BENCH.resampleByRows);
+  renderChart();
+  renderTable("mount-window-table", BENCH.windowTable, true);
+  renderTable("mount-resample-table", BENCH.resampleTable, false);
+})();
+</script>
+
+</body>
+</html>

@@ -1162,8 +1162,7 @@ guarantee changes.
 
 ## Phase 3a — First-party Parquet and Arrow-compatible storage
 
-**STATUS (2026-07-31): primitive, validity, Bool, UTF-8, Categorical, Date,
-and Timestamp storage slices landed.** Generic primitive and temporal columns,
+**STATUS (2026-07-31): complete.** Generic primitive and temporal columns,
 `ValidityBitmap`, bit-packed Bool, flat UTF-8, and dictionary-encoded
 Categorical columns can retain an immutable external owner plus base buffers,
 logical offsets, and length, detaching only the mutated storage into owned
@@ -1175,7 +1174,7 @@ dictionary offsets; the copying importer remains available. ADBC adopts its
 owned record batches, and the Python bridge uses `__arrow_c_array__` for
 single-batch PyArrow inputs (combining fragmented tables first).
 Address/offset, release lifetime, failure ownership, empty buffers, filtering,
-and copy-on-write behavior are asserted in C++ and Python tests. The Parquet
+and copy-on-write behavior are asserted in C++, Python, and R tests. The Parquet
 implementation is now owned by `Ibex::parquet`; the CLI, REPL, and Python hosts
 register it directly, `import "parquet"` skips dynamic loading in those hosts,
 and the compatibility plugin is a thin delegate to the same backend. Lazy
@@ -1183,9 +1182,16 @@ sources now acquire reader products through a runtime-defined factory, and each
 Parquet product owns an independent mutable `FileReader` while sharing the
 immutable input, schema, name index, and footer metadata. Successful products
 return to a source-local idle pool: sequential stages avoid reader setup, while
-simultaneous worker acquisitions receive distinct products. R remains on the
-borrowing/copying path until its nanoarrow externalptr lock/ownership protocol
-is explicit; that protocol is the remaining Phase-3a ownership slice.
+simultaneous worker acquisitions receive distinct products. The R binding now
+uses `nanoarrow_pointer_export()` to create a fresh self-contained Arrow C Data
+lease, adopts that lease without invalidating the caller's external pointer,
+and relies on the runtime query lease plus Arrow's immutable-buffer contract
+for cooperating mutation coordination. Host release before execution,
+canonical parent-offset struct slices, nanoarrow's unspecified dictionary
+indices in null slots, session retention, result-after-session lifetime,
+repeated round trips, buffer addresses, and copy-on-write mutation are covered
+explicitly. Phase 3a is complete; Phase 3b is the next runtime-multithreading
+phase.
 
 Prepare the storage and ownership foundation before adding source concurrency.
 Parquet is no longer an ordinary opaque table plugin: it supplies schemas and
@@ -1258,7 +1264,7 @@ Implement this as vertical slices rather than replacing every column at once:
    decoder/reader factory to the host runtime. Each factory product owns
    independent mutable Arrow reader state; no callback closes over one shared
    `FileReader`.
-6. Remove redundant Python/R marshalling on supported Arrow inputs and add
+6. **Landed:** remove redundant Python/R marshalling on supported Arrow inputs and add
    cross-language ownership tests: host release during a query, Ibex result
    surviving its session, repeated import/export without copies, sliced arrays,
    nullable data, strings, categoricals, and copy-on-write mutation.

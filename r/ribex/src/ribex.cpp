@@ -8,11 +8,13 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -46,9 +48,9 @@ struct PluginLoadResult {
 
 struct SessionState {
     ibex::runtime::TableRegistry tables;
-    std::unordered_map<std::string, std::vector<std::string>> compile_time_lists;
-    std::unordered_set<std::string> table_externs;
-    std::unordered_set<std::string> sink_externs;
+    robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists;
+    robin_hood::unordered_set<std::string> table_externs;
+    robin_hood::unordered_set<std::string> sink_externs;
     ibex::runtime::ExternRegistry externs;
     std::unordered_set<std::string> loaded_plugins;
     std::vector<std::string> plugin_paths;
@@ -470,6 +472,9 @@ auto build_runtime_table_from_r(SEXP table_obj)
                 if (array == nullptr || schema == nullptr) {
                     return std::unexpected("invalid Arrow payload table binding");
                 }
+                if (Rf_inherits(table_obj, "ribex_arrow_export")) {
+                    return ibex::interop::adopt_table_from_arrow(array, *schema);
+                }
                 return ibex::interop::import_table_from_arrow(*array, *schema);
             }
         }
@@ -834,7 +839,47 @@ auto session_from_sexp(SEXP session_sexp) -> std::expected<SessionState*, std::s
     return session;
 }
 
+void collect_buffer_addresses(const ArrowArray& array, const std::string& path,
+                              std::vector<std::pair<std::string, std::string>>& out) {
+    for (std::int64_t i = 0; i < array.n_buffers; ++i) {
+        std::ostringstream address;
+        address << "0x" << std::hex << reinterpret_cast<std::uintptr_t>(array.buffers[i]);
+        out.emplace_back(path + ".buffer" + std::to_string(i), address.str());
+    }
+    for (std::int64_t i = 0; i < array.n_children; ++i) {
+        if (array.children[i] != nullptr) {
+            collect_buffer_addresses(*array.children[i], path + ".child" + std::to_string(i), out);
+        }
+    }
+    if (array.dictionary != nullptr) {
+        collect_buffer_addresses(*array.dictionary, path + ".dictionary", out);
+    }
+}
+
 }  // namespace
+
+extern "C" SEXP ribex_c_arrow_buffer_addresses(SEXP array_sexp) {
+    if (TYPEOF(array_sexp) != EXTPTRSXP || !Rf_inherits(array_sexp, "nanoarrow_array")) {
+        Rf_error("'array' must be a nanoarrow_array");
+    }
+    auto* array = static_cast<ArrowArray*>(R_ExternalPtrAddr(array_sexp));
+    if (array == nullptr || array->release == nullptr) {
+        Rf_error("'array' must point to a live ArrowArray");
+    }
+
+    std::vector<std::pair<std::string, std::string>> addresses;
+    collect_buffer_addresses(*array, "root", addresses);
+
+    SEXP result = PROTECT(Rf_allocVector(STRSXP, static_cast<R_xlen_t>(addresses.size())));
+    SEXP names = PROTECT(Rf_allocVector(STRSXP, static_cast<R_xlen_t>(addresses.size())));
+    for (R_xlen_t i = 0; i < static_cast<R_xlen_t>(addresses.size()); ++i) {
+        SET_STRING_ELT(result, i, Rf_mkChar(addresses[static_cast<std::size_t>(i)].second.c_str()));
+        SET_STRING_ELT(names, i, Rf_mkChar(addresses[static_cast<std::size_t>(i)].first.c_str()));
+    }
+    Rf_setAttrib(result, R_NamesSymbol, names);
+    UNPROTECT(2);
+    return result;
+}
 
 extern "C" SEXP ribex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
                                   SEXP scalars_sexp) {

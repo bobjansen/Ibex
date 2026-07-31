@@ -4,7 +4,9 @@
 #include <Rinternals.h>
 
 SEXP ribex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp, SEXP scalars_sexp);
-SEXP ribex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp, SEXP scalars_sexp);
+SEXP ribex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
+                       SEXP scalars_sexp);
+SEXP ribex_c_arrow_buffer_addresses(SEXP array_sexp);
 SEXP ribex_c_create_session(SEXP plugin_paths_sexp);
 SEXP ribex_c_reset_session(SEXP session_sexp);
 SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,
@@ -13,6 +15,7 @@ SEXP ribex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_se
                                SEXP scalars_sexp);
 
 static const R_CallMethodDef call_methods[] = {
+    {"ribex_c_arrow_buffer_addresses", (DL_FUNC)&ribex_c_arrow_buffer_addresses, 1},
     {"ribex_c_create_session", (DL_FUNC)&ribex_c_create_session, 1},
     {"ribex_c_eval_file", (DL_FUNC)&ribex_c_eval_file, 4},
     {"ribex_c_eval_ibex", (DL_FUNC)&ribex_c_eval_ibex, 4},

@@ -2602,6 +2602,83 @@ TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][g
     }
 }
 
+// --- row-order guard for order-dependent functions ----------------------------
+// A grouped op leaves the table group-major, which breaks the time index into
+// per-group runs. An unpartitioned lag/lead then reads across a group boundary
+// into another group's rows — right everywhere except the boundaries.
+
+namespace {
+
+// ts is group-major (0,1,2 for A then 0,1,2 for B) — exactly what a `by symbol`
+// step upstream leaves behind, and non-monotonic as a result.
+auto group_major_timeframe() -> runtime::Table {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B", "B"});
+    table.add_column("val", Column<double>{10.0, 11.0, 12.0, 500.0, 501.0, 502.0});
+    table.time_index = "ts";
+    return table;
+}
+
+}  // namespace
+
+TEST_CASE("unpartitioned lead over a group-major TimeFrame is refused", "[interpreter][roworder]") {
+    runtime::TableRegistry registry;
+    registry.emplace("data", group_major_timeframe());
+
+    auto ir = require_ir("data[update { nx = lead(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    // Names the function, the column, and both remedies.
+    CHECK(result.error().find("lead") != std::string::npos);
+    CHECK(result.error().find("not in time order") != std::string::npos);
+    CHECK(result.error().find("`by` clause") != std::string::npos);
+    CHECK(result.error().find("order ts") != std::string::npos);
+}
+
+TEST_CASE("the same lead partitioned by the group key is accepted", "[interpreter][roworder]") {
+    runtime::TableRegistry registry;
+    registry.emplace("data", group_major_timeframe());
+
+    auto ir = require_ir("data[by symbol, update { nx = lead(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* nx = std::get_if<Column<double>>(result->find("nx"));
+    REQUIRE(nx != nullptr);
+    // The group edge yields null rather than the next symbol's first value.
+    CHECK((*nx)[0] == Catch::Approx(11.0));
+    CHECK((*nx)[1] == Catch::Approx(12.0));
+    CHECK(runtime::is_null(*result->find_entry("nx"), 2));
+    CHECK((*nx)[3] == Catch::Approx(501.0));
+}
+
+TEST_CASE("a monotonically descending TimeFrame still allows lag", "[interpreter][roworder]") {
+    // `order ts desc` is a deliberate order, not a lost one — the guard must
+    // fire on non-monotonic, not on non-ascending.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(2), ts_from_nanos(1), ts_from_nanos(0)});
+    table.add_column("val", Column<double>{3.0, 2.0, 1.0});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { prev = lag(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("a row-local field over a group-major TimeFrame is unaffected",
+          "[interpreter][roworder]") {
+    // The guard must not tax expressions that never read a neighbouring row.
+    runtime::TableRegistry registry;
+    registry.emplace("data", group_major_timeframe());
+
+    auto ir = require_ir("data[update { doubled = val * 2.0 }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+}
+
 // --- rolling aggregate tests --------------------------------------------------
 // Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
 // Window 2ns: (t-2, t]

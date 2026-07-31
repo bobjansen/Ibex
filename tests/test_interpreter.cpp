@@ -2668,6 +2668,51 @@ TEST_CASE("a monotonically descending TimeFrame still allows lag", "[interpreter
     REQUIRE(result.has_value());
 }
 
+TEST_CASE("group-major provenance is caught even when the time index stays monotonic",
+          "[interpreter][roworder]") {
+    // The groups occupy disjoint, increasing time ranges ("a" 0-2ns, "b" 3-5ns),
+    // so `window + by` lays the rows out group-major while leaving the time
+    // index globally ascending. The monotonicity scan sees nothing; only the
+    // provenance recorded by the window operator catches this.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3), ts_from_nanos(4), ts_from_nanos(5)});
+    table.add_column("sym", Column<std::string>{"a", "a", "a", "b", "b", "b"});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0, 100.0, 200.0, 300.0});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // Sanity: the fixture really is monotonic, so the backstop cannot fire.
+    auto plain = require_ir("data[update { nx = lead(val, 1) }];");
+    REQUIRE(runtime::interpret(*plain, registry).has_value());
+
+    auto ir = require_ir(
+        "data[window 5ns, by sym, update { rm = rolling_mean(val) }]"
+        "[update { nx = lead(val, 1) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("lead") != std::string::npos);
+    CHECK(result.error().find("`by sym`") != std::string::npos);
+}
+
+TEST_CASE("a single-group window leaves an unpartitioned lead alone", "[interpreter][roworder]") {
+    // One group means no boundary to read across, so claiming group-major would
+    // reject a correct query.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("sym", Column<std::string>{"a", "a", "a"});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[window 5ns, by sym, update { rm = rolling_mean(val) }]"
+        "[update { nx = lead(val, 1) }];");
+    REQUIRE(runtime::interpret(*ir, registry).has_value());
+}
+
 TEST_CASE("a row-local field over a group-major TimeFrame is unaffected",
           "[interpreter][roworder]") {
     // The guard must not tax expressions that never read a neighbouring row.

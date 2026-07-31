@@ -22,6 +22,13 @@ namespace ibex::runtime {
 struct TableProperties {
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
+    /// Non-empty when the rows are laid out group-major by these keys: every
+    /// group occupies one contiguous run, and adjacent rows straddle a group
+    /// boundary at each run's end. `window` + `by` is the only operator that
+    /// produces this. It makes an *unpartitioned* order-dependent call
+    /// (lag/lead/cum*/rolling_*) read across a boundary into another group's
+    /// rows — see check_row_order in update.cpp.
+    std::vector<std::string> group_major_by;
 };
 
 }  // namespace ibex::runtime

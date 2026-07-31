@@ -266,6 +266,10 @@ struct Table {
     robin_hood::unordered_map<std::string, std::size_t> index;
     std::optional<std::vector<ir::OrderKey>> ordering;
     std::optional<std::string> time_index;
+    /// Non-empty when the rows are group-major by these keys — see
+    /// TableProperties::group_major_by. Set by `window` + `by`, which lays each
+    /// group out as one contiguous run.
+    std::vector<std::string> group_major_by;
     /// Logical row count for a column-less frame (e.g. produced by `Table(n)`).
     /// Only consulted by `rows()` when `columns` is empty; once any column is
     /// added the count is derived from the columns as usual.

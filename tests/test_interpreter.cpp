@@ -2609,8 +2609,8 @@ TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][g
 
 namespace {
 
-// ts is group-major (0,1,2 for A then 0,1,2 for B) — exactly what a `by symbol`
-// step upstream leaves behind, and non-monotonic as a result.
+// Two symbols with their own time runs — the input every grouped operator
+// below starts from.
 auto group_major_timeframe() -> runtime::Table {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
@@ -2623,18 +2623,42 @@ auto group_major_timeframe() -> runtime::Table {
 
 }  // namespace
 
-TEST_CASE("unpartitioned lead over a group-major TimeFrame is refused", "[interpreter][roworder]") {
+TEST_CASE("unpartitioned lead after resample + by is refused", "[interpreter][roworder]") {
+    // `resample` + `by` emits time-major bars with the groups INTERLEAVED, so an
+    // unpartitioned lead reads the other symbol on every row, not just at a
+    // boundary. The time index is non-decreasing throughout, so nothing in the
+    // data betrays this — only the recorded grouping does.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3), ts_from_nanos(4), ts_from_nanos(5)});
+    table.add_column("symbol", Column<std::string>{"A", "B", "A", "B", "A", "B"});
+    table.add_column("val", Column<double>{10.0, 500.0, 11.0, 501.0, 12.0, 502.0});
+    table.time_index = "ts";
     runtime::TableRegistry registry;
-    registry.emplace("data", group_major_timeframe());
+    registry.emplace("data", table);
 
-    auto ir = require_ir("data[update { nx = lead(val, 1) }];");
+    auto ir = require_ir(
+        "data[resample 2ns, by symbol, select { close = last(val) }]"
+        "[update { nx = lead(close, 1) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE_FALSE(result.has_value());
-    // Names the function, the column, and both remedies.
     CHECK(result.error().find("lead") != std::string::npos);
-    CHECK(result.error().find("not in time order") != std::string::npos);
-    CHECK(result.error().find("`by` clause") != std::string::npos);
-    CHECK(result.error().find("order ts") != std::string::npos);
+    CHECK(result.error().find("`by symbol`") != std::string::npos);
+}
+
+TEST_CASE("resample without by leaves an unpartitioned lead alone", "[interpreter][roworder]") {
+    // One row per bucket, nothing interleaved — the lead is correct.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("val", Column<double>{10.0, 11.0, 12.0, 13.0});
+    table.time_index = "ts";
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[resample 2ns, select { close = last(val) }][update { nx = lead(close, 1) }];");
+    REQUIRE(runtime::interpret(*ir, registry).has_value());
 }
 
 TEST_CASE("the same lead partitioned by the group key is accepted", "[interpreter][roworder]") {
@@ -2653,9 +2677,10 @@ TEST_CASE("the same lead partitioned by the group key is accepted", "[interprete
     CHECK((*nx)[3] == Catch::Approx(501.0));
 }
 
-TEST_CASE("a monotonically descending TimeFrame still allows lag", "[interpreter][roworder]") {
-    // `order ts desc` is a deliberate order, not a lost one — the guard must
-    // fire on non-monotonic, not on non-ascending.
+TEST_CASE("a frame with no grouping upstream still allows lag", "[interpreter][roworder]") {
+    // No `by` anywhere, so nothing claims these rows are partitioned and the
+    // guard must stay out of the way. Descending on purpose, to pin that the
+    // rule keys on a recorded grouping and not on the shape of the data.
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(2), ts_from_nanos(1), ts_from_nanos(0)});
     table.add_column("val", Column<double>{3.0, 2.0, 1.0});

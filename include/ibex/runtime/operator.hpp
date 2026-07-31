@@ -31,7 +31,7 @@ struct Chunk {
     std::optional<std::string> time_index;
     /// Non-empty when the rows are group-major by these keys; see the matching
     /// field on `Table`. Chunk-preserving operators must copy it through.
-    std::vector<std::string> group_major_by;
+    std::vector<std::string> grouped_by;
     /// Logical row count for a column-less chunk (e.g. from `Table(n)`); see
     /// the matching field on `Table`. Only consulted by `rows()` when `columns`
     /// is empty.
@@ -121,7 +121,7 @@ class TableSourceOperator final : public Operator {
         chunk.columns = std::move(table_.columns);
         chunk.ordering = std::move(table_.ordering);
         chunk.time_index = std::move(table_.time_index);
-        chunk.group_major_by = std::move(table_.group_major_by);
+        chunk.grouped_by = std::move(table_.grouped_by);
         // logical_rows is only meaningful for a column-less frame.
         if (chunk.columns.empty()) {
             chunk.logical_rows = table_.logical_rows;
@@ -199,7 +199,7 @@ class MaterializeOperator {
         }
         result.ordering = std::move(first.ordering);
         result.time_index = std::move(first.time_index);
-        result.group_major_by = std::move(first.group_major_by);
+        result.grouped_by = std::move(first.grouped_by);
         // logical_rows is only meaningful for a column-less frame.
         if (result.columns.empty()) {
             result.logical_rows = first.logical_rows;

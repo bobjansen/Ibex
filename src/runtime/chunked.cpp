@@ -65,7 +65,7 @@ auto chunk_to_table(Chunk chunk) -> Table {
     }
     t.ordering = std::move(chunk.ordering);
     t.time_index = std::move(chunk.time_index);
-    t.group_major_by = std::move(chunk.group_major_by);
+    t.grouped_by = std::move(chunk.grouped_by);
     if (t.columns.empty()) {  // logical_rows is only meaningful when column-less
         t.logical_rows = chunk.logical_rows;
     }
@@ -77,7 +77,7 @@ auto table_to_chunk(Table table) -> Chunk {
     c.columns = std::move(table.columns);
     c.ordering = std::move(table.ordering);
     c.time_index = std::move(table.time_index);
-    c.group_major_by = std::move(table.group_major_by);
+    c.grouped_by = std::move(table.grouped_by);
     if (c.columns.empty()) {  // logical_rows is only meaningful when column-less
         c.logical_rows = table.logical_rows;
     }
@@ -625,11 +625,11 @@ class ChunkedRenameOperator final : public Operator {
         // rule as the serial `rename_table`, so a renamed sort key / time index
         // is relabeled here too rather than left carrying its old column name.
         if (chunk.ordering.has_value() || chunk.time_index.has_value() ||
-            !chunk.group_major_by.empty()) {
+            !chunk.grouped_by.empty()) {
             auto props =
                 derive_table_properties(TableProperties{.ordering = chunk.ordering,
                                                         .time_index = chunk.time_index,
-                                                        .group_major_by = chunk.group_major_by},
+                                                        .grouped_by = chunk.grouped_by},
                                         [&](const std::string& name) -> std::optional<std::string> {
                                             for (const auto& spec : *renames_) {
                                                 if (spec.old_name == name) {
@@ -640,7 +640,7 @@ class ChunkedRenameOperator final : public Operator {
                                         });
             chunk.ordering = std::move(props.ordering);
             chunk.time_index = std::move(props.time_index);
-            chunk.group_major_by = std::move(props.group_major_by);
+            chunk.grouped_by = std::move(props.grouped_by);
         }
         return std::optional<Chunk>{std::move(chunk)};
     }

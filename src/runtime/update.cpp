@@ -1458,9 +1458,9 @@ auto add_computed_column(Table& table, const std::string& alias, ComputedColumn 
 // Narrow by design: it cannot see a reordering that happens to leave the time
 // index monotonic. That case needs order provenance tracked through the plan.
 // The O(n) scan runs only when a field really does contain such a call.
-auto check_time_index_ordering(const Table& input, const std::vector<ir::FieldSpec>& fields)
+auto check_row_order(const Table& input, const std::vector<ir::FieldSpec>& fields)
     -> std::expected<void, std::string> {
-    if (!input.time_index.has_value() || input.rows() < 2) {
+    if (input.rows() < 2) {
         return {};
     }
     std::string fn;
@@ -1471,6 +1471,29 @@ auto check_time_index_ordering(const Table& input, const std::vector<ir::FieldSp
         }
     }
     if (fn.empty()) {
+        return {};
+    }
+    // Provenance first: an upstream `window` + `by` recorded the exact keys it
+    // laid the rows out by. This is the precise signal, and unlike the time
+    // index scan below it still fires when the groups happen to occupy
+    // disjoint, increasing time ranges — which leaves the index monotonic and
+    // the layout every bit as group-major.
+    if (!input.group_major_by.empty()) {
+        std::string keys;
+        for (const auto& key : input.group_major_by) {
+            if (!keys.empty()) {
+                keys += ", ";
+            }
+            keys += key;
+        }
+        return std::unexpected(
+            fn + ": depends on the row order, but an upstream `by " + keys +
+            "` laid the rows out one group at a time, so the adjacent row can belong to a "
+            "different group. Add `by " +
+            keys + "` here so " + fn + " stops at the group edge, or `order` the table first to " +
+            "state the order you intend.");
+    }
+    if (!input.time_index.has_value()) {
         return {};
     }
     const auto* tcv = input.find(*input.time_index);
@@ -1528,7 +1551,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     if (!output.time_index.has_value()) {
         return std::unexpected("window: requires a TimeFrame");
     }
-    if (auto ok = check_time_index_ordering(output, fields); !ok) {
+    if (auto ok = check_row_order(output, fields); !ok) {
         return std::unexpected(ok.error());
     }
     // Reject mutation of the time index column
@@ -2460,6 +2483,20 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     if (true_ordering.has_value()) {
         output.ordering = std::move(true_ordering);
     }
+    // Record the group-major layout for the same reason the ordering is
+    // restored above: the rows are one contiguous run per group, so an
+    // unpartitioned lag/lead downstream would read across a boundary. This
+    // holds whether or not the permutation ran -- skipping it means the input
+    // was ALREADY group-major, which is the same hazard. The condition is the
+    // group count: a single group has no boundary to read across, and claiming
+    // group-major there would reject a correct unpartitioned lead.
+    if (tasks.size() > 1) {
+        output.group_major_by.clear();
+        output.group_major_by.reserve(group_by.size());
+        for (const auto& key : group_by) {
+            output.group_major_by.push_back(key.name);
+        }
+    }
     return output;
 }
 
@@ -2600,7 +2637,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ExecutionContext& exec) -> std::expected<Table, std::string> {
     Table output = std::move(input);
     if (output.time_index.has_value()) {
-        if (auto ok = check_time_index_ordering(output, fields); !ok) {
+        if (auto ok = check_row_order(output, fields); !ok) {
             return std::unexpected(ok.error());
         }
         for (const auto& field : fields) {

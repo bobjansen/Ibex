@@ -47,6 +47,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
@@ -756,6 +757,37 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
 
     auto properties = parquet::default_arrow_reader_properties();
     for (int col : dictionary_column_indices(*builder.raw_reader()->metadata())) {
+        properties.set_read_dictionary(col, true);
+    }
+    builder.properties(properties);
+    builder.memory_pool(arrow::default_memory_pool());
+
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    status = builder.Build(&reader);
+    if (!status.ok()) {
+        throw std::runtime_error("read_parquet: failed to open: " + path + " (" +
+                                 status.ToString() + ")");
+    }
+    return reader;
+}
+
+/// Build another independent reader while reusing footer metadata that was
+/// already parsed at bind time. This avoids a second footer read/deserialization
+/// for every factory product without sharing any mutable decoder state.
+inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> input,
+                                const std::string& path,
+                                const std::shared_ptr<parquet::FileMetaData>& metadata,
+                                const std::vector<int>& dictionary_columns)
+    -> std::unique_ptr<parquet::arrow::FileReader> {
+    parquet::arrow::FileReaderBuilder builder;
+    auto status = builder.Open(std::move(input), parquet::default_reader_properties(), metadata);
+    if (!status.ok()) {
+        throw std::runtime_error("read_parquet: failed to read: " + path + " (" +
+                                 status.ToString() + ")");
+    }
+
+    auto properties = parquet::default_arrow_reader_properties();
+    for (int col : dictionary_columns) {
         properties.set_read_dictionary(col, true);
     }
     builder.properties(properties);
@@ -1786,70 +1818,57 @@ inline auto filtered_key_selection_impl(parquet::arrow::FileReader& reader, int 
     return selected;
 }
 
-inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
-    std::string path_string{path};
-    auto input = open_parquet_input(path);
+/// One independent Parquet decoder product. The Arrow schema and name index are
+/// immutable and shared by every product; the FileReader is deliberately not.
+/// Its page readers and decode cursors are mutable, so sharing it would serialize
+/// or race once the runtime assigns source work to multiple workers.
+class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
+   public:
+    ParquetLazySourceReader(std::unique_ptr<parquet::arrow::FileReader> reader,
+                            std::shared_ptr<const std::map<std::string, int>> indices,
+                            std::shared_ptr<arrow::Schema> schema, std::size_t rows,
+                            std::string path)
+        : reader_(std::move(reader)),
+          indices_(std::move(indices)),
+          schema_(std::move(schema)),
+          rows_(rows),
+          path_(std::move(path)) {}
 
-    // Shared rather than unique: the decode callback below outlives this scope
-    // and each call reads from the same open file.
-    std::shared_ptr<parquet::arrow::FileReader> reader =
-        make_parquet_reader(std::move(input), path_string);
-
-    std::shared_ptr<arrow::Schema> arrow_schema;
-    auto st = reader->GetSchema(&arrow_schema);
-    if (!st.ok()) {
-        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
-                                 st.ToString() + ")");
-    }
-
-    const auto rows = static_cast<std::size_t>(reader->parquet_reader()->metadata()->num_rows());
-
-    // Column name -> field index, so a demand expressed in names can be turned
-    // into the indices Arrow's selective read wants.
-    auto indices = std::make_shared<std::map<std::string, int>>();
-    for (int i = 0; i < arrow_schema->num_fields(); ++i) {
-        indices->emplace(arrow_schema->field(i)->name(), i);
-    }
-
-    auto decode = [reader, indices, arrow_schema, rows, path_string](
-                      const std::vector<std::string>& names,
-                      const ibex::runtime::Selection* selection)
-        -> std::expected<ibex::runtime::Table, std::string> {
+    auto decode(const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+        -> std::expected<ibex::runtime::Table, std::string> override {
         std::vector<int> column_indices;
         column_indices.reserve(names.size());
         for (const auto& name : names) {
-            auto it = indices->find(name);
-            if (it == indices->end()) {
-                return std::unexpected("read_parquet: no column '" + name + "' in " + path_string);
+            auto it = indices_->find(name);
+            if (it == indices_->end()) {
+                return std::unexpected("read_parquet: no column '" + name + "' in " + path_);
             }
             column_indices.push_back(it->second);
         }
 
         try {
-            return direct_decode_table(*reader, *arrow_schema, column_indices, selection, rows);
+            return direct_decode_table(*reader_, *schema_, column_indices, selection, rows_);
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: failed to read columns from " + path_string +
-                                   " (" + e.what() + ")");
+            return std::unexpected("read_parquet: failed to read columns from " + path_ + " (" +
+                                   e.what() + ")");
         }
-    };
+    }
 
-    auto key_filter_scan = [reader, indices, arrow_schema, path_string](
-                               const std::string& key,
-                               const ibex::runtime::DynamicScanFilter& filter)
-        -> std::expected<std::optional<ibex::runtime::Selection>, std::string> {
-        auto it = indices->find(key);
-        if (it == indices->end()) {
-            return std::unexpected("read_parquet: no column '" + key + "' in " + path_string);
+    auto key_filter_scan(const std::string& key, const ibex::runtime::DynamicScanFilter& filter)
+        -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
+        auto it = indices_->find(key);
+        if (it == indices_->end()) {
+            return std::unexpected("read_parquet: no column '" + key + "' in " + path_);
         }
         // Only types whose ordinary decode is the identity/sign-extension
         // into int64 — the fused filter must see exactly the values the
         // materialized column would hold. (Zero-extended unsigned widths
         // would need their own conversion; join keys are never those.)
-        const auto id = arrow_schema->field(it->second)->type()->id();
+        const auto id = schema_->field(it->second)->type()->id();
         const bool fusable = id == arrow::Type::INT8 || id == arrow::Type::INT16 ||
                              id == arrow::Type::INT32 || id == arrow::Type::INT64 ||
                              id == arrow::Type::UINT64;
-        const auto& manifest = reader->manifest();
+        const auto& manifest = reader_->manifest();
         if (!fusable || it->second >= static_cast<int>(manifest.schema_fields.size()) ||
             !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
             return std::optional<ibex::runtime::Selection>{};
@@ -1857,25 +1876,117 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
         const int leaf_index =
             manifest.schema_fields[static_cast<std::size_t>(it->second)].column_index;
         try {
-            const auto physical =
-                reader->parquet_reader()->metadata()->schema()->Column(leaf_index)->physical_type();
+            const auto physical = reader_->parquet_reader()
+                                      ->metadata()
+                                      ->schema()
+                                      ->Column(leaf_index)
+                                      ->physical_type();
             if (physical == parquet::Type::INT64) {
-                return filtered_key_selection_impl<parquet::Int64Type>(*reader, leaf_index, filter);
+                return filtered_key_selection_impl<parquet::Int64Type>(*reader_, leaf_index,
+                                                                       filter);
             }
             if (physical == parquet::Type::INT32) {
-                return filtered_key_selection_impl<parquet::Int32Type>(*reader, leaf_index, filter);
+                return filtered_key_selection_impl<parquet::Int32Type>(*reader_, leaf_index,
+                                                                       filter);
             }
             return std::optional<ibex::runtime::Selection>{};
         } catch (const std::exception& e) {
-            return std::unexpected("read_parquet: fused key filter scan failed on " + path_string +
+            return std::unexpected("read_parquet: fused key filter scan failed on " + path_ + " (" +
+                                   e.what() + ")");
+        }
+    }
+
+   private:
+    std::unique_ptr<parquet::arrow::FileReader> reader_;
+    std::shared_ptr<const std::map<std::string, int>> indices_;
+    std::shared_ptr<arrow::Schema> schema_;
+    std::size_t rows_;
+    std::string path_;
+};
+
+/// Immutable reader construction inputs plus the bind-time reader. The first
+/// consumer takes that already-open reader; later (including concurrent)
+/// consumers build independent readers from the shared, already-parsed footer.
+class ParquetLazyReaderFactoryState {
+   public:
+    ParquetLazyReaderFactoryState(std::shared_ptr<arrow::io::RandomAccessFile> input,
+                                  std::shared_ptr<parquet::FileMetaData> metadata,
+                                  std::unique_ptr<parquet::arrow::FileReader> first_reader,
+                                  std::string path)
+        : input_(std::move(input)),
+          metadata_(std::move(metadata)),
+          first_reader_(std::move(first_reader)),
+          path_(std::move(path)) {}
+
+    auto make_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
+        {
+            std::lock_guard lock(first_reader_mutex_);
+            if (first_reader_ != nullptr) {
+                return std::move(first_reader_);
+            }
+        }
+        std::call_once(dictionary_columns_once_,
+                       [&] { dictionary_columns_ = dictionary_column_indices(*metadata_); });
+        return make_parquet_reader(input_, path_, metadata_, dictionary_columns_);
+    }
+
+   private:
+    std::shared_ptr<arrow::io::RandomAccessFile> input_;
+    std::shared_ptr<parquet::FileMetaData> metadata_;
+    std::vector<int> dictionary_columns_;
+    std::once_flag dictionary_columns_once_;
+    std::unique_ptr<parquet::arrow::FileReader> first_reader_;
+    std::string path_;
+    std::mutex first_reader_mutex_;
+};
+
+inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
+    std::string path_string{path};
+    auto input = open_parquet_input(path);
+
+    // This reader exists only long enough to bind immutable metadata. Decode
+    // work receives fresh readers from the factory below.
+    auto metadata_reader = make_parquet_reader(input, path_string);
+
+    std::shared_ptr<arrow::Schema> arrow_schema;
+    auto st = metadata_reader->GetSchema(&arrow_schema);
+    if (!st.ok()) {
+        throw std::runtime_error("read_parquet: failed to read schema: " + path_string + " (" +
+                                 st.ToString() + ")");
+    }
+
+    const auto rows =
+        static_cast<std::size_t>(metadata_reader->parquet_reader()->metadata()->num_rows());
+    auto parquet_metadata = metadata_reader->parquet_reader()->metadata();
+
+    // Column name -> field index, so a demand expressed in names can be turned
+    // into the indices Arrow's selective read wants.
+    auto indices = std::make_shared<const std::map<std::string, int>>([&arrow_schema] {
+        std::map<std::string, int> result;
+        for (int i = 0; i < arrow_schema->num_fields(); ++i) {
+            result.emplace(arrow_schema->field(i)->name(), i);
+        }
+        return result;
+    }());
+
+    auto factory_state = std::make_shared<ParquetLazyReaderFactoryState>(
+        std::move(input), parquet_metadata, std::move(metadata_reader), path_string);
+    ibex::runtime::LazySourceReaderFactory reader_factory =
+        [factory_state, indices, arrow_schema, rows,
+         path_string]() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
+        try {
+            auto reader = factory_state->make_reader();
+            return std::make_unique<ParquetLazySourceReader>(std::move(reader), indices,
+                                                             arrow_schema, rows, path_string);
+        } catch (const std::exception& e) {
+            return std::unexpected("read_parquet: failed to create reader for " + path_string +
                                    " (" + e.what() + ")");
         }
     };
 
     return std::make_shared<ibex::runtime::LazyTable>(
-        schema_table_from_arrow(*arrow_schema), rows, std::move(decode),
-        read_column_stats(*reader->parquet_reader()->metadata(), *arrow_schema),
-        std::move(key_filter_scan));
+        schema_table_from_arrow(*arrow_schema), rows, std::move(reader_factory),
+        read_column_stats(*parquet_metadata, *arrow_schema));
 }
 
 inline auto read_parquet(std::string_view path) -> ibex::runtime::Table {

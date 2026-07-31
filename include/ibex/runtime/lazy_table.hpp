@@ -34,6 +34,28 @@ using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
 using KeyFilterScanFn = std::function<std::expected<std::optional<Selection>, std::string>(
     const std::string&, const DynamicScanFilter&)>;
 
+/// One independently mutable reader/decoder for a lazy source.
+///
+/// Implementations may share immutable file handles and schema metadata, but
+/// each product owns its decoder cursor and other mutable backend state.
+class LazySourceReader {
+   public:
+    virtual ~LazySourceReader() = default;
+
+    [[nodiscard]] virtual auto decode(const std::vector<std::string>& names,
+                                      const Selection* selection)
+        -> std::expected<Table, std::string> = 0;
+
+    [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
+                                               const DynamicScanFilter& /*filter*/)
+        -> std::expected<std::optional<Selection>, std::string> {
+        return std::optional<Selection>{};
+    }
+};
+
+using LazySourceReaderPtr = std::unique_ptr<LazySourceReader>;
+using LazySourceReaderFactory = std::function<std::expected<LazySourceReaderPtr, std::string>()>;
+
 /// What a source's metadata says about one column before anything is decoded.
 ///
 /// Parquet footers carry min/max and a null count per column chunk. They do
@@ -75,6 +97,11 @@ class LazyTable {
     /// fused dynamic-filter scan; sources without one leave it empty.
     LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats = {},
               KeyFilterScanFn key_filter_scan = {});
+    /// Factory-backed sources keep successful products in a local idle pool.
+    /// Sequential stages reuse a reader; simultaneous acquisitions create
+    /// distinct products, so mutable decoder state is never shared by workers.
+    LazyTable(Table schema, std::size_t rows, LazySourceReaderFactory reader_factory,
+              SourceColumnStats stats = {});
 
     /// Column names and types, with no rows. Cheap: known from metadata alone.
     [[nodiscard]] auto schema() const noexcept -> const Table& { return schema_; }
@@ -136,15 +163,26 @@ class LazyTable {
     [[nodiscard]] auto materialize() -> std::expected<Table, std::string>;
 
    private:
+    class ReaderPool;
+
     /// Decode the referenced columns whole-file into `cache_` (they are
     /// legitimate whole-column entries) and return them as a table.
     [[nodiscard]] auto decode_whole_columns(
         const robin_hood::unordered_set<std::string>& referenced)
         -> std::expected<Table, std::string>;
+    [[nodiscard]] auto decode_columns(const std::vector<std::string>& names,
+                                      const Selection* selection)
+        -> std::expected<Table, std::string>;
+    [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter)
+        -> std::expected<std::optional<Selection>, std::string>;
+    [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
+    void release_reader(LazySourceReaderPtr reader);
 
     Table schema_;
     std::size_t rows_ = 0;
     ColumnDecodeFn decode_;
+    LazySourceReaderFactory reader_factory_;
+    std::shared_ptr<ReaderPool> reader_pool_;
     SourceColumnStats stats_;
     KeyFilterScanFn key_filter_scan_;
     robin_hood::unordered_map<std::string, ColumnEntry> cache_;

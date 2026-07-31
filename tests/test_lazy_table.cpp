@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -62,6 +63,47 @@ struct FakeSource {
     }
 };
 
+struct ReaderFactoryState {
+    std::size_t products = 0;
+    std::vector<std::size_t> decode_products;
+};
+
+class TrackingReader final : public runtime::LazySourceReader {
+   public:
+    TrackingReader(std::shared_ptr<ReaderFactoryState> state, std::size_t product)
+        : state_(std::move(state)), product_(product) {}
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection)
+        -> std::expected<runtime::Table, std::string> override {
+        state_->decode_products.push_back(product_);
+        const runtime::Selection all{0, 1, 2};
+        const auto& rows = selection == nullptr ? all : *selection;
+        runtime::Table out;
+        for (const auto& name : names) {
+            std::vector<std::int64_t> values;
+            values.reserve(rows.size());
+            for (auto row : rows) {
+                values.push_back(static_cast<std::int64_t>(row + 1));
+            }
+            out.add_column(name, Column<std::int64_t>{std::move(values)});
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+   private:
+    std::shared_ptr<ReaderFactoryState> state_;
+    std::size_t product_;
+};
+
+auto tracking_reader_factory(const std::shared_ptr<ReaderFactoryState>& state)
+    -> runtime::LazySourceReaderFactory {
+    return [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+        const auto product = state->products++;
+        return runtime::LazySourceReaderPtr{std::make_unique<TrackingReader>(state, product)};
+    };
+}
+
 auto make_lazy(FakeSource& source) -> runtime::LazyTable {
     return runtime::LazyTable{
         source.schema(), 3,
@@ -94,6 +136,30 @@ auto names_of(const runtime::Table& table) -> std::vector<std::string> {
 }
 
 }  // namespace
+
+TEST_CASE("LazyTable: reader factory products own independent decoder state",
+          "[runtime][lazy_table]") {
+    auto state = std::make_shared<ReaderFactoryState>();
+    auto factory = tracking_reader_factory(state);
+
+    // A scheduler may keep one product per worker. Products must remain
+    // distinct while alive, rather than aliasing one mutable decoder.
+    auto first = factory();
+    auto second = factory();
+    REQUIRE(first);
+    REQUIRE(second);
+    CHECK(first->get() != second->get());
+
+    runtime::Table schema;
+    schema.add_column("a", Column<std::int64_t>{});
+    schema.add_column("b", Column<std::int64_t>{});
+    runtime::LazyTable lazy{std::move(schema), 3, factory};
+
+    REQUIRE(lazy.project({"a"}));
+    REQUIRE(lazy.project({"b"}));
+    CHECK(state->decode_products == std::vector<std::size_t>{2, 2});
+    CHECK(state->products == 3);
+}
 
 TEST_CASE("LazyTable: the schema is known without decoding anything", "[runtime][lazy_table]") {
     FakeSource source;

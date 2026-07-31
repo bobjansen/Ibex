@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -15,6 +16,12 @@
 
 namespace ibex::runtime {
 
+class LazyTable::ReaderPool {
+   public:
+    std::mutex mutex;
+    std::vector<LazySourceReaderPtr> available;
+};
+
 LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, SourceColumnStats stats,
                      KeyFilterScanFn key_filter_scan)
     : schema_(std::move(schema)),
@@ -22,6 +29,70 @@ LazyTable::LazyTable(Table schema, std::size_t rows, ColumnDecodeFn decode, Sour
       decode_(std::move(decode)),
       stats_(std::move(stats)),
       key_filter_scan_(std::move(key_filter_scan)) {}
+
+LazyTable::LazyTable(Table schema, std::size_t rows, LazySourceReaderFactory reader_factory,
+                     SourceColumnStats stats)
+    : schema_(std::move(schema)),
+      rows_(rows),
+      reader_factory_(std::move(reader_factory)),
+      reader_pool_(std::make_shared<ReaderPool>()),
+      stats_(std::move(stats)) {}
+
+auto LazyTable::decode_columns(const std::vector<std::string>& names, const Selection* selection)
+    -> std::expected<Table, std::string> {
+    if (reader_factory_) {
+        auto reader = acquire_reader();
+        if (!reader) {
+            return std::unexpected(reader.error());
+        }
+        auto result = (*reader)->decode(names, selection);
+        if (result) {
+            release_reader(std::move(*reader));
+        }
+        return result;
+    }
+    return decode_(names, selection);
+}
+
+auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter)
+    -> std::expected<std::optional<Selection>, std::string> {
+    if (reader_factory_) {
+        auto reader = acquire_reader();
+        if (!reader) {
+            return std::unexpected(reader.error());
+        }
+        auto result = (*reader)->key_filter_scan(key, filter);
+        if (result) {
+            release_reader(std::move(*reader));
+        }
+        return result;
+    }
+    return key_filter_scan_(key, filter);
+}
+
+auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
+    {
+        std::lock_guard lock(reader_pool_->mutex);
+        if (!reader_pool_->available.empty()) {
+            auto reader = std::move(reader_pool_->available.back());
+            reader_pool_->available.pop_back();
+            return reader;
+        }
+    }
+    auto reader = reader_factory_();
+    if (!reader) {
+        return std::unexpected(reader.error());
+    }
+    if (*reader == nullptr) {
+        return std::unexpected("lazy source reader factory returned null");
+    }
+    return reader;
+}
+
+void LazyTable::release_reader(LazySourceReaderPtr reader) {
+    std::lock_guard lock(reader_pool_->mutex);
+    reader_pool_->available.push_back(std::move(reader));
+}
 
 auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Table, std::string> {
     std::vector<std::string> missing;
@@ -32,7 +103,7 @@ auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Tab
     }
 
     if (!missing.empty()) {
-        auto decoded = decode_(missing, nullptr);
+        auto decoded = decode_columns(missing, nullptr);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -179,9 +250,9 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     // so the key column is never materialized whole-file. Only worth taking
     // when nothing else needs that column densely — a cached key means the
     // in-memory filter pass below is cheaper than re-reading pages.
-    if (membership && conjuncts.empty() && key_filter_scan_ != nullptr &&
+    if (membership && conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(*dynamic_key)) {
-        auto scan = key_filter_scan_(*dynamic_key, *dynamic);
+        auto scan = scan_key_filter(*dynamic_key, *dynamic);
         if (!scan) {
             return std::unexpected(scan.error());
         }
@@ -195,7 +266,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
                 }
             }
             if (!wanted.empty()) {
-                auto decoded = decode_(wanted, all_rows ? nullptr : &selected);
+                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected);
                 if (!decoded) {
                     return std::unexpected(decoded.error());
                 }
@@ -267,7 +338,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
 
     Table decoded_remaining;
     if (!remaining.empty()) {
-        auto decoded = decode_(remaining, all_rows ? nullptr : &*selected);
+        auto decoded = decode_columns(remaining, all_rows ? nullptr : &*selected);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -342,7 +413,7 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
         }
     }
     if (!missing.empty()) {
-        auto decoded = decode_(missing, nullptr);
+        auto decoded = decode_columns(missing, nullptr);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -387,7 +458,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
     }
     Table decoded;
     if (!missing.empty()) {
-        auto res = decode_(missing, all_rows ? nullptr : &selected);
+        auto res = decode_columns(missing, all_rows ? nullptr : &selected);
         if (!res) {
             return std::unexpected(res.error());
         }
@@ -443,8 +514,9 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // Fused path, same conditions as project_where: the source computes the
     // selection during the key column's decode, then only the surviving key
     // values are decoded at all.
-    if (conjuncts.empty() && key_filter_scan_ != nullptr && !cache_.contains(key_name)) {
-        auto scan = key_filter_scan_(key_name, dynamic);
+    if (conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
+        !cache_.contains(key_name)) {
+        auto scan = scan_key_filter(key_name, dynamic);
         if (!scan) {
             return std::unexpected(scan.error());
         }

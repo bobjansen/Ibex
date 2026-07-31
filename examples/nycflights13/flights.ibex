@@ -2,23 +2,19 @@
 //  Ibex + R · nycflights13 — the query half
 //
 //  Sourced by examples/nycflights13/flights.R through session_eval_file().
-//  R binds the four nycflights13 tables and the scalar `min_flights` for the
-//  duration of that call; every `let` below survives it, so R can then pull any
-//  named result out of the same session with a one-line `session_eval()`.
+//  R binds the tables and the scalar for the duration of that call.
 //
 //  Bound by the caller:
 //    flights, airlines, planes, weather  — tables
 //    min_flights                         — Int scalar
+//    the_year                            — Int scalar
 //
 //  Produced for the caller:
 //    carriers, hourly, daily, by_age, by_visib, origin_counts
 //
-//  One `let` per published result. Clauses compose inside a bracket and
-//  brackets chain, so an intermediate only earns a name when it is reused or
-//  when the language forces the break.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── 1. Carrier leaderboard ───────────────────────────────────────────────────
+// ── 1. Carrier delay ranking ─────────────────────────────────────────────────
 //   `min_flights` is an R value bound as a scalar, so the cutoff is chosen in R
 //   while the predicate that applies it runs inside the engine.
 let carriers = (flights[filter arr_delay is not null,

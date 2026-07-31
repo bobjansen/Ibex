@@ -2251,8 +2251,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         auto* out_bm = ensure_validity(f_idx);
         const auto& sub_bm = *sub_entry->validity;
         auto* words = out_bm->words_data();
+        const auto* validity_bytes = sub_bm.buffer_data();
+        const std::size_t validity_offset = sub_bm.buffer_offset();
         for (std::size_t i = 0; i < indices.size(); ++i) {
-            if (!sub_bm[i]) {
+            const std::size_t bit = validity_offset + i;
+            if (((validity_bytes[bit / 8] >> (bit % 8)) & 0x01U) == 0U) {
                 clear_validity_bit(words, indices[i]);
             }
         }
@@ -3020,8 +3023,11 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
         const auto& sub_bm = *sub_entry->validity;
         auto& out_bm = *output_validity[f_idx];
+        const auto* validity_bytes = sub_bm.buffer_data();
+        const std::size_t validity_offset = sub_bm.buffer_offset();
         for (std::size_t i = 0; i < indices.size(); ++i) {
-            if (!sub_bm[i]) {
+            const std::size_t bit = validity_offset + i;
+            if (((validity_bytes[bit / 8] >> (bit % 8)) & 0x01U) == 0U) {
                 out_bm.set(indices[i], false);
             }
         }

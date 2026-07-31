@@ -206,6 +206,19 @@ def main() -> int:
         "avg_px": [10.5, 20.75],
     }
 
+    sliced_px = pa.array([0.0, 10.5, None, 21.5]).slice(1, 3)
+    sliced_orders = pa.table({"px": sliced_px})
+    projected_slice = ibex_pyarrow.eval_table(
+        "orders[select px];",
+        tables={"orders": sliced_orders},
+    )
+    input_buffers = sliced_px.buffers()
+    output_buffers = projected_slice.column("px").chunk(0).buffers()
+    assert projected_slice.to_pydict() == {"px": [10.5, None, 21.5]}
+    assert output_buffers[0].address == input_buffers[0].address
+    assert output_buffers[1].address == input_buffers[1].address
+    assert projected_slice.column("px").chunk(0).offset == sliced_px.offset
+
     pandas_quotes = pd.DataFrame(
         {
             "venue": ["XNAS", "BATS", "XNAS"],

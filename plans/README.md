@@ -17,12 +17,12 @@ complete enough to move under `plans/done/`.
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [multiway-join-chain-perf-plan.md](multiway-join-chain-perf-plan.md) | Investigation complete | Probe-order-preserving joins landed (82c391f): q05 -7%, q18 -4.2%, q09 -3.9%, q07 -3.4%. All three follow-ups resolved 2026-07-18: q05 stage profile (residual = lineitem decode 67ms + raw hash-probe throughput 59ms, NOT inter-stage materialization); q11's `german_supply` confirmed materialized once (shared-binding gate, lower.cpp:1347); DuckDB EXPLAIN ANALYZE shows its 2.7x q05 win is dynamic filter pushdown (`l_orderkey IN BF` in the lineitem scan → 3.3% of rows emitted). Probe-side Bloom tried + reverted (−3.4% isolated, wash end-to-end). Successor: [dynamic-filter-pushdown-plan.md](dynamic-filter-pushdown-plan.md) |
 | [dynamic-filter-pushdown-plan.md](dynamic-filter-pushdown-plan.md) | COMPLETE (stage 4 uncommitted) | Sideways information passing: a join's build keys become {Bloom, exact IN-list, min/max} pushed into the probe side's parquet scan. Stage 2 (Bloom + IN-list + sampled escape hatch): **suite geomean 0.895** — q08 −47%, q17 −45%, q09 −40%; lineitem prunes to 0.9-16% of rows, q18 to 399 rows. Stage 4 (fused `KeyFilterScanFn` in the parquet decoder, row-group skipping, in-decoder escape hatch): further **geomean 0.984**, q17 −16%, q08 −8%, q05 −5%; cumulative ≈ −12%. 22/22 answers identical throughout; hit-heavy neutral. GOTCHAS: the Bloom must front even an exact IN-list (bare binary_search cost q17 +80%); LazyTable grew a member — stale plugin .so segfaults (ABI rebuild rule). Residual: q10 +5% (agg-dominated, conjunct-carrying scans stay on the stage-2 path — folding static conjuncts into the decoder is decode-fusion Stage 4). Key constraint: filtering must gate materialization, not the hash lookup |
+| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Phases 1–2 landed | Next is Phase 3a: first-party `Ibex::parquet`, Arrow-compatible shared buffer ownership, and zero-copy Python/R adoption. Phase 3b adds bounded parallel source/decode morsels and lifts the lazy-source gate; Phase 4 adds parallel barriers. |
 
 ## Proposed — no implementation yet
 
 | Plan | Notes |
 |---|---|
-| [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Query-scoped, morsel-driven execution: ordered parallel row-local pipeline first; nullable chunks, deterministic RNG, safe lazy/extern boundaries, then parallel barriers. `IBEX_THREADS=1` default. No code yet. **Gated on two Phase-0 prerequisites below.** |
 | [execution-plan-seam-plan.md](execution-plan-seam-plan.md) | **Prerequisite groundwork landed.** Option B designates `build_operator()` as the parallel-island seam; one serial-only eligibility analysis replaced the test-only `PipelinePlan`. It is activated only when Phase 1 adds runtime executor options, so the current serial path has no extra analysis cost. |
 | [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md) | **Prereq for runtime-multithreading, before its Phase 0.** The master plan's parity gate needs schema/metadata/validity/categorical-backing comparison; the current `run_parity.sh` only `diff`s stdout and can see none of that. Build an in-process structured `Table`-vs-`Table` comparator + case matrix. |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |
@@ -58,12 +58,13 @@ complete enough to move under `plans/done/`.
   project_execution_roadmap).
 - **runtime-multithreading** is the answer to the remaining polars
   multi-thread gaps in **benchmark-perf-priorities** (single-thread ibex
-  already wins 37/41 vs polars-st). Its execution-plan seam prerequisite is
-  complete; **serial-parity-comparator** remains the Phase-0 gate (the parity
-  gate needs structural comparison the stdout-diff harness cannot do). A third
-  gap — a partition/merge metadata contract for `ordering`/`time_index`/
-  `logical_rows` — is being handled directly in the master plan by the user, not
-  as a separate plan.
+  already wins 37/41 vs polars-st). Its execution-plan seam and first parallel
+  islands are complete. Phase 3a now deliberately precedes parallel I/O:
+  promote Parquet to a first-party backend and make Ibex storage adopt
+  Arrow-compatible buffers, so Python/R and source morsels share ownership
+  rather than marshal. Phase 3b then implements the LazyTable synchronization
+  contract and parallel decode; Phase 4 follows with aggregate/join/sort
+  barriers.
 - **bigger-than-ram** builds directly on **chunked-execution**: every
   "materializing" row in that plan's coverage table (unsorted `Order`/
   `AsTimeframe`, non-streaming `Tail`, general `Join`) is a target phase

@@ -130,7 +130,7 @@ deliberately small and boring:
 **Thread count vs. core count.** Default the pool to hardware concurrency for
 the compute-bound row-local island (`IBEX_THREADS=auto`), where oversubscription
 only adds context-switch and cache-thrash overhead. But size it independently
-of core count where that helps: an I/O- or decode-heavy stage (Phase 3 parquet/
+of core count where that helps: an I/O- or decode-heavy stage (Phase 3b parquet/
 CSV scans, and any future path where workers block on reads) can sensibly run
 **more threads than cores**, since blocked workers free a core for others.
 Treat pool size as a tunable per workload class, not a hardwired
@@ -229,7 +229,8 @@ worker failure/cancellation determinism, and item 7 (extern eligibility pass)
 `classify_node` island-role layer yet. That layer *is* the Phase 0→1 boundary,
 so those residuals are Phase 1's foundation, not independently completable
 Phase-0 work. Item 5's LazyTable Synchronization Contract is written (design)
-but unimplemented; Phase 3 lifts the interim ineligibility gate.
+but unimplemented; Phase 3b lifts the interim ineligibility gate after Phase 3a
+establishes the source and buffer-ownership foundation.
 
 **Sequencing risk — complete and bake this phase before adding any parallel
 execution code.** Phase 0 is not setup that can be folded into the first
@@ -476,7 +477,7 @@ is a gate the executor's single eligibility pass records, not a property of
 not be treated as the answer: excluding lazy sources permanently would restrict
 parallelism to fully-materialized in-memory tables — the small cases — while the
 large memory-bound scans that parallelize best stay serial, inverting the
-payoff. Lifting the gate is a Phase 3/4 obligation, not optional.
+payoff. Lifting the gate is a Phase 3b/4 obligation, not optional.
 
 **The contract — immutable-after-build.** `LazyTable` has two lifecycle phases
 per query:
@@ -1159,20 +1160,148 @@ current expression evaluation still reaches thread-local engines and
 Update `SPEC.md`, `README.md`, and `docs/index.html` when the user-visible RNG
 guarantee changes.
 
-## Phase 3 — Sources and I/O
+## Phase 3a — First-party Parquet and Arrow-compatible storage
 
-- Make parquet/CSV scans issue stable morsels (row groups or row ranges) with
-  bounded read/decode concurrency.
+**STATUS (2026-07-30): first primitive/validity slice landed.** Generic
+primitive columns and `ValidityBitmap` can now retain an immutable external
+owner plus base pointer, logical offset, and length, detaching into owned
+storage on first mutable access. `adopt_table_from_arrow` consumes an
+`ArrowArray` only after successful validation and keeps Int64/Double payload
+and validity buffers zero-copy, including non-zero sliced offsets; the
+copying importer remains available. ADBC adopts its owned record batches, and
+the Python bridge uses `__arrow_c_array__` for single-batch PyArrow inputs
+(combining fragmented tables first). Address/offset, release lifetime,
+failure ownership, and copy-on-write behavior are asserted in C++ and Python
+tests. R remains on the borrowing/copying path until its nanoarrow externalptr
+lock/ownership protocol is explicit. Bool, UTF-8, temporal, categorical,
+first-party Parquet relocation, and reader factories remain Phase-3a work.
+
+Prepare the storage and ownership foundation before adding source concurrency.
+Parquet is no longer an ordinary opaque table plugin: it supplies schemas and
+statistics to planning, participates in projection/predicate and dynamic-filter
+pushdown, performs late materialization, and must hand stable morsels to the
+host executor. Treat it as a first-party backend while keeping the dependency
+direction clean:
+
+```text
+Ibex::runtime  <-  Ibex::parquet  <-  ibex / embedding host
+```
+
+`Ibex::runtime` continues to define the source, table, and execution contracts
+without including Arrow C++ headers. `Ibex::parquet` privately depends on Arrow
+and Parquet, is linked and registered by the host, and is scheduled only by the
+host runtime. `import "parquet"` remains the language-level activation and
+portability boundary; it need not imply loading a DSO. A thin compatibility
+plugin may remain for standalone/plugin deployments, but it must delegate to
+the same backend implementation and must never own a second worker pool or
+mutable query state.
+
+Moving the backend is not sufficient by itself. Ibex's current columns have
+Arrow-like layouts, and Arrow C Data export can retain an Ibex table for
+zero-copy output, but Arrow import copies values, validity, strings, and
+dictionary storage into owning `std::vector`s. Replace that resemblance with an
+Arrow-compatible buffer ownership model:
+
+- Represent primitive values, bit-packed booleans, validity, UTF-8
+  offsets/bytes, and dictionary indices/values as `(owner, data, offset,
+  length)` storage that can either own Ibex-allocated memory or adopt an
+  external Arrow C Data allocation. The in-memory layout and offset semantics
+  must be directly exportable through the Arrow C Data Interface.
+- Keep Arrow C++ types out of public core/runtime storage. The Arrow C Data
+  Interface is the cross-language ABI; `Ibex::parquet` may use Arrow C++
+  privately to produce the same buffers.
+- Make imported buffers immutable shared inputs. Mutation follows the existing
+  table copy-on-write rule: an operation that writes a shared, sliced, or
+  externally owned column first detaches into writable Ibex storage. Read-only
+  projection/rename/filter inputs retain the external owner without copying.
+- Add a consuming/adopting Arrow import API whose shared owner invokes the
+  producer's release callback exactly once. Keep an explicit copying import for
+  callers that cannot transfer ownership or cannot promise immutability.
+- Treat lifetime and mutation coordination separately. A shared owner/lease
+  prevents Python/R from freeing memory during an Ibex query; the query/session
+  lock prevents concurrent mutation through cooperating Ibex bindings. Neither
+  can make an arbitrary foreign writer safe. Python/R inputs advertised as
+  writable or not protected by the binding's ownership protocol must be copied
+  before execution.
+- Preserve sliced Arrow arrays without rebasing/copying where kernels can
+  consume offsets. Kernels that require zero-based contiguous output must make
+  that materialization explicit rather than hiding it in import.
+- Give every escaping output buffer one owner independent of a worker's scratch
+  arena. Ordered merge may assemble chunk metadata/views without copying data;
+  a later mutating consumer detaches only the affected buffers.
+
+Implement this as vertical slices rather than replacing every column at once:
+
+1. Introduce the shared buffer/view and mutability contract for primitive
+   columns and validity; port the central filter/project/join/aggregate reads
+   and output builders.
+2. Make Arrow C Data primitive and validity import/export genuinely zero-copy,
+   including non-zero offsets and release/lifetime tests.
+3. Extend the contract to UTF-8, bit-packed Bool, Date/Timestamp, and
+   dictionary-encoded Categorical columns, with deterministic dictionary
+   ownership/remapping.
+4. Split the bundled Parquet implementation into `Ibex::parquet` plus an
+   optional thin plugin shim; register the built-in backend in the REPL, CLI,
+   Python, and R hosts while preserving `import "parquet"`.
+5. Decode Parquet directly into the new buffers and expose a decoder/reader
+   factory to the host runtime. Each factory product owns independent mutable
+   Arrow reader state; no callback closes over one shared `FileReader`.
+6. Remove redundant Python/R marshalling on supported Arrow inputs and add
+   cross-language ownership tests: host release during a query, Ibex result
+   surviving its session, repeated import/export without copies, sliced arrays,
+   nullable data, strings, categoricals, and copy-on-write mutation.
+
+Phase 3a is complete when supported PyArrow/nanoarrow inputs can be adopted by
+Ibex and returned through Arrow C Data without copying their payload or
+validity buffers; Parquet is host-registered as a first-party backend; and a
+reader-factory test proves that two worker slots receive distinct decoder
+instances. Record buffer addresses in tests so "zero-copy" is asserted rather
+than inferred from equal values. Because this refactors every hot column path,
+each storage slice also runs the structured serial-parity matrix, Python and R
+round trips, the normal runtime/e2e suite, and an interleaved
+`benchmarking/compare_ibex_git.sh` release comparison over the affected core,
+scalar, pipeline, and PDS-H workloads. A zero-copy result that regresses
+ordinary Ibex execution is not an acceptable migration.
+
+## Phase 3b — Parallel Sources and I/O
+
+Build bounded source concurrency on the Phase 3a ownership and backend
+contracts:
+
+- Make Parquet/CSV scans issue stable morsels (row groups or row ranges) with
+  bounded read/decode concurrency. SF-1 has too few row groups to use a full
+  machine on row groups alone, so Parquet scheduling must be able to partition
+  independent columns and row ranges as well as row groups.
+- Have the host executor, never a plugin-owned runtime copy, schedule decoder
+  factory instances. Respect the query thread budget, cancellation, and
+  lowest-morsel deterministic error rule; avoid nested submissions to the same
+  worker pool.
+- Decode into disjoint final buffer ranges or independently owned Arrow chunks
+  that the ordered merger can assemble without a serial payload copy.
 - Keep projection/predicate pushdown in the source; parallel decoding must not
   defeat late materialization or dynamic filter pushdown.
 - Implement the [LazyTable Synchronization Contract](#lazytable-synchronization-contract)
-  and lift the Phase 0 lazy/deferred-source ineligibility gate: immutable-after-build
-  `cache_` (coordinated pre-fan-out decode preferred, per-slot synchronized fills
-  otherwise; never duplicate uncoordinated decodes), with the selective paths
-  left lazy and per-worker.
-- Publish dynamic Bloom/IN-list filters with acquire/release synchronization and
-  an explicit build-before-probe dependency asserted in the executor, per that
-  contract. Do not rely on the current same-thread timing.
+  and lift the Phase 0 lazy/deferred-source ineligibility gate:
+  immutable-after-build `cache_` (coordinated pre-fan-out decode preferred,
+  per-slot synchronized fills otherwise; never duplicate uncoordinated
+  decodes), with selective payload paths left lazy and per-worker.
+- Keep fused dynamic-key selection as serial phase A initially, then fan out
+  phase-B projected payload decoding through the survivor selection. Publish
+  dynamic Bloom/IN-list filters with acquire/release synchronization and assert
+  the build-before-probe dependency in the executor; do not rely on current
+  same-thread timing.
+- Bound reader count independently from morsel count. Local files, remote
+  HTTP/S3 objects, and many-column scans have different useful concurrency and
+  resource costs; the source reports available partitions while the host owns
+  the budget.
+
+Phase 3b acceptance requires identical results and metadata under 1, 2, and N
+threads; active-reader and source-morsel counters proving the parallel path ran;
+TSAN coverage for cache publication, reader isolation, cancellation, and
+foreign-buffer lifetimes; and release-path measurements of scan-heavy Q06/Q19
+plus the complete PDS-H SF-1 suite against the Phase 3a single-thread baseline.
+Report decode-only and end-to-end speedup so barrier time is not mistaken for a
+source regression.
 
 ## Phase 4 — Parallel Barriers
 

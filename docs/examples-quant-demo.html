@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Example: quant demo</title>
+  <meta name="description" content="A worked Ibex example: resample ticks to OHLC bars, asof-join a reference table, build rolling features, fit a ridge regression, and write the results" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <style>
+    /* Output blocks: same monospace frame as source, visibly "returned" not "written". */
+    .out {
+      background: #12181a;
+      border-left: 3px solid var(--accent);
+      color: #d9e6e4;
+    }
+    .out-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      font-weight: 700;
+      color: var(--muted);
+      margin: 1rem 0 0.35rem;
+    }
+    .io-pair { display: grid; gap: 0.2rem; }
+    .schema-table { border-collapse: collapse; font-size: 0.85rem; width: 100%; margin-top: 0.8rem; }
+    .schema-table th, .schema-table td {
+      text-align: left; padding: 0.4rem 0.7rem; border-bottom: 1px solid var(--line);
+    }
+    .schema-table th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .schema-table td code { font-size: 0.85em; }
+  </style>
+</head>
+<body>
+<main class="page">
+
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./getting-started.html">Getting started</a>
+      <a class="nav-link active" href="./examples-quant-demo.html">Example</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <p class="eyebrow">Worked example</p>
+    <h1>A quant pipeline, start to finish</h1>
+    <p class="lead">
+      <code>examples/quant_demo/quant_demo.ibex</code> takes a raw tick file and
+      ends with a fitted model and three CSVs. It exercises the parts of Ibex
+      that only matter together: time-bucketed resampling, an asof join,
+      per-group rolling state, and a regression.
+    </p>
+    <div class="cta-row">
+      <a class="button primary" href="#run">Run it</a>
+      <a class="button" href="#resample">Resample</a>
+      <a class="button" href="#join">Asof join</a>
+      <a class="button" href="#model">Model</a>
+      <a class="button" href="#full-script">Full script</a>
+    </div>
+  </section>
+
+  <section class="section" id="pipeline">
+    <p class="section-label">Shape of the job</p>
+    <h2>Five stages, one script</h2>
+    <p>
+      The pipeline, each table expression uses the previous one.
+    </p>
+<pre><code>ticks.csv  ─┐
+            ├─► resample 1m by symbol  (OHLC bars + size aggregates)
+            ├─► asof-join reference    (sector / vol_regime per symbol)
+            ├─► feature engineering    (spread, range, log-mid)
+            ├─► fit ridge regression   (close ~ open + range + vol_regime)
+            └─► save coefficients + fitted predictions to CSV</code></pre>
+    <p class="note">
+      The same <code>transform</code> block (resample + asof + features) can
+      reused in a streaming variant. Only the source and sink change,
+      the feature engineering is identical, this removes the
+      train/serve skew that separate batch and live pipelines accumulate.
+    </p>
+  </section>
+
+  <section class="section" id="input">
+    <p class="section-label">Input</p>
+    <h2>Two CSVs: a tick stream and a reference table</h2>
+    <p>
+      <code>gen_data.py</code> writes a synthetic session: six symbols, one
+      trading day, roughly 100k ticks. Timestamps are nanoseconds from midnight.
+    </p>
+
+    <div class="tour">
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">ticks.csv</span>
+          <h3>Raw trades</h3>
+          <p>One row per print: timestamp, symbol, price, size.</p>
+        </div>
+        <div class="tour-code">
+<pre><code>ts,symbol,price,size
+34200008416027,NVDA,1098.4186,111
+34200265666471,NVDA,1096.9076,53</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">reference.csv</span>
+          <h3>Per-symbol static data</h3>
+          <p>
+            Sector and an assumed-stationary volatility regime. One row per
+            symbol, stamped at the session open so the asof join has something
+            to match backwards to.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code>ts,symbol,sector,vol_regime
+34200000000000,AAPL,tech,0.001200
+34200000000000,MSFT,tech,0.001100
+34200000000000,GOOG,tech,0.001400
+34200000000000,AMZN,consumer,0.001700
+34200000000000,META,tech,0.001900
+34200000000000,NVDA,semis,0.002800</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <p>
+      Both are promoted to TimeFrames before the join, which is what makes the
+      asof join type-checked. Discpline and sticking to a convention is nice,
+      being sure that bugs are caught is better.
+    </p>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="kw">let</span> ticks         = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
+<span class="kw">let</span> reference_raw = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
+
+<span class="cm">// Promote both to TimeFrames so the asof join is type-checked.</span>
+<span class="kw">let</span> tick_stream = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+<span class="kw">let</span> reference   = <span class="fn-name">as_timeframe</span>(reference_raw, <span class="str">"ts"</span>);</code></pre>
+  </section>
+
+  <section class="section" id="resample">
+    <p class="section-label">Stage 1</p>
+    <h2>Resample ticks into 1-minute OHLC bars</h2>
+    <p>
+      <code>resample 1m</code> buckets on the time index; <code>by symbol</code>
+      keeps each instrument's bars separate. The same expression drives the
+      streaming variant, where <code>resample</code> triggers the TimeBucket
+      stream kind that emits one row per closed minute.
+    </p>
+<pre><code><span class="kw">let</span> bars = tick_stream[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">by</span> symbol, <span class="kw">select</span> {
+    open     = <span class="fn-name">first</span>(price),
+    high     = <span class="fn-name">max</span>(price),
+    low      = <span class="fn-name">min</span>(price),
+    close    = <span class="fn-name">last</span>(price),
+    bar_size = <span class="fn-name">sum</span>(size)
+}];
+bars;</code></pre>
+    <p class="out-label">Output</p>
+<pre class="out"><code>rows: 2340
++-------------------------------+--------+----------+----------+----------+----------+----------+
+| ts                            | symbol | open     | high     | low      | close    | bar_size |
++-------------------------------+--------+----------+----------+----------+----------+----------+
+| 1970-01-01 09:30:00.000000000 | "NVDA" | 1098.419 | 1140.921 | 1094.391 | 1140.253 | 6639     |
+| 1970-01-01 09:30:00.000000000 | "META" | 510.8402 | 529.7588 | 509.1604 | 524.5037 | 5988     |
+| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5456     |
+| 1970-01-01 09:30:00.000000000 | "MSFT" | 415.9642 | 415.9642 | 411.1852 | 412.9627 | 8378     |
+| 1970-01-01 09:30:00.000000000 | "GOOG" | 174.9884 | 176.5965 | 174.9884 | 175.2895 | 7394     |
+| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.8546 | 186.7257 | 183.4501 | 183.4501 | 8481     |
+| 1970-01-01 09:31:00.000000000 | "NVDA" | 1135.08  | 1146.716 | 1121.75  | 1138.652 | 6710     |
+| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6621     |
+| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.3678 | 176.0018 | 174.1589 | 175.23   | 9462     |
+| 1970-01-01 09:31:00.000000000 | "META" | 525.0089 | 529.2634 | 525.0089 | 526.6617 | 6217     |
++-------------------------------+--------+----------+----------+----------+----------+----------+
+... (2330 more rows)</code></pre>
+    <p class="note">
+      2340 bars = 6 symbols &times; 390 minutes, a full 09:30&ndash;16:00 session
+      with no gaps. Bars come out time-major (all six symbols at 09:30, then all
+      six at 09:31), which matters later &mdash; see stage&nbsp;3.
+    </p>
+  </section>
+
+  <section class="section" id="join">
+    <p class="section-label">Stage 2</p>
+    <h2>Asof-join the reference table</h2>
+    <p>
+      An asof join matches each bar to the most recent reference row at or
+      before its timestamp, keyed on <code>symbol</code>. Because both sides are
+      TimeFrames, the time column is part of the type and the join does not need
+      to be told which column to order on.
+    </p>
+<pre><code><span class="kw">let</span> enriched = bars <span class="kw">asof join</span> reference <span class="kw">on</span> {ts, symbol};
+enriched;</code></pre>
+    <p class="out-label">Output</p>
+<pre class="out"><code>rows: 2340
++-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
+| ts                            | symbol | open     | high     | low      | close    | bar_size | sector     | vol_regime |
++-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
+| 1970-01-01 09:30:00.000000000 | "NVDA" | 1098.419 | 1140.921 | 1094.391 | 1140.253 | 6639     | "semis"    | 0.0028     |
+| 1970-01-01 09:30:00.000000000 | "META" | 510.8402 | 529.7588 | 509.1604 | 524.5037 | 5988     | "tech"     | 0.0019     |
+| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5456     | "tech"     | 0.0012     |
+| 1970-01-01 09:30:00.000000000 | "MSFT" | 415.9642 | 415.9642 | 411.1852 | 412.9627 | 8378     | "tech"     | 0.0011     |
+| 1970-01-01 09:30:00.000000000 | "GOOG" | 174.9884 | 176.5965 | 174.9884 | 175.2895 | 7394     | "tech"     | 0.0014     |
+| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.8546 | 186.7257 | 183.4501 | 183.4501 | 8481     | "consumer" | 0.0017     |
+| 1970-01-01 09:31:00.000000000 | "NVDA" | 1135.08  | 1146.716 | 1121.75  | 1138.652 | 6710     | "semis"    | 0.0028     |
+| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6621     | "tech"     | 0.0012     |
+| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.3678 | 176.0018 | 174.1589 | 175.23   | 9462     | "tech"     | 0.0014     |
+| 1970-01-01 09:31:00.000000000 | "META" | 525.0089 | 529.2634 | 525.0089 | 526.6617 | 6217     | "tech"     | 0.0019     |
++-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
+... (2330 more rows)</code></pre>
+    <p class="note">
+      Row count is unchanged at 2340 &mdash; an asof join enriches, it does not
+      fan out. Two columns appear on the right: <code>sector</code> and
+      <code>vol_regime</code>.
+    </p>
+  </section>
+
+  <section class="section" id="features">
+    <p class="section-label">Stage 3</p>
+    <h2>Rolling state, then bar-level features</h2>
+    <p>
+      Two <code>update</code> blocks. The first carries a windowed rolling mean
+      partitioned by symbol; the second builds ordinary row-wise features on top
+      of it. Splitting them is what lets the rolling buffer be per-group while
+      the arithmetic stays vectorised.
+    </p>
+<pre><code><span class="cm">// Per-symbol rolling features (5-bar window). `update + by symbol + window`</span>
+<span class="cm">// partitions the rolling buffer per group, so AAPL's mean never includes</span>
+<span class="cm">// NVDA bars.</span>
+<span class="kw">let</span> with_rolling = enriched[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">by</span> symbol, <span class="kw">update</span> {
+    rmean5 = <span class="fn-name">rolling_mean</span>(close)
+}];
+
+<span class="cm">// Bar-level features built on top of the rolling state.</span>
+<span class="kw">let</span> features = with_rolling[<span class="kw">update</span> {
+    spread     = high - low,
+    range      = (high - low) / open,
+    log_mid    = <span class="fn-name">log</span>((high + low) / <span class="num">2.0</span>),
+    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>),
+    next_close = <span class="fn-name">lead</span>(close, <span class="num">1</span>)
+}];</code></pre>
+    <p>
+      Neither statement is printed, so there is no stdout here. The resulting
+      schema is visible in <code>features.csv</code>, written at the end:
+    </p>
+    <p class="out-label">features.csv &mdash; header and first two rows</p>
+<pre class="out"><code>ts,symbol,open,high,low,close,bar_size,sector,vol_regime,rmean5,spread,range,log_mid,z5,next_close
+34200000000000,NVDA,1098.4186,1140.9208,1094.3907,1140.2528,6639,semis,0.0028,1140.2528,46.530100000000175,0.04236099060959107,7.018988690377915,0,1138.6519
+34260000000000,NVDA,1135.08,1146.7161,1121.7498,1138.6519,6710,semis,0.0028,1139.45235,24.966300000000047,0.021995189766360123,7.0337118864716475,-0.0007024865320180366,1115.3558</code></pre>
+    <p class="note">
+      Note the row order changed: the CSV is symbol-major (all 390 NVDA bars,
+      then all 390 META bars, &hellip;), while <code>bars</code> printed
+      time-major. The <code>by symbol</code> grouping in the window step
+      reorders the table. <code>lead(close, 1)</code> in the following block
+      reads the next row <em>of the reordered table</em>, which is what makes it
+      a same-symbol lookahead almost everywhere.
+    </p>
+  </section>
+
+  <section class="section" id="model">
+    <p class="section-label">Stage 4</p>
+    <h2>Fit a ridge regression</h2>
+    <p>
+      <code>model { … }</code> takes an R-style formula, a method and its
+      hyperparameters. The label is next bar's close, so the last row,
+      which has no successor to look ahead to, is dropped first.
+    </p>
+<pre><code><span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close &gt; <span class="num">0.0</span>];
+<span class="kw">let</span> fit = labelled[<span class="kw">model</span> { next_close ~ open + range + log_mid + z5 + vol_regime,
+                           method = ridge,
+                           lambda = <span class="num">0.1</span> }];
+
+<span class="kw">let</span> coefficients = <span class="fn-name">model_coef</span>(fit);
+coefficients;</code></pre>
+    <p class="out-label">Output</p>
+<pre class="out"><code>rows: 6
++---------------+-----------+
+| term          | estimate  |
++---------------+-----------+
+| "(intercept)" | -1.515462 |
+| "open"        | 0.9965846 |
+| "range"       | -45.30402 |
+| "log_mid"     | 0.5703387 |
+| "z5"          | 286.4642  |
+| "vol_regime"  | 3.596474  |
++---------------+-----------+</code></pre>
+    <p>
+      The fit is dominated by <code>open</code> at a coefficient of 0.997
+      &mdash; next bar's close is, unsurprisingly, almost this bar's price. The
+      remaining terms are corrections on a much smaller scale, with
+      <code>z5</code> carrying a large coefficient because it is a
+      near-zero-centred ratio.
+    </p>
+    <p class="note">
+      <code>filter next_close &gt; 0.0</code> removes exactly one row of 2340
+      &mdash; the final row of the table, where <code>lead</code> has no
+      successor and returns 0. 2339 rows reach the fit.
+    </p>
+  </section>
+
+  <section class="section" id="output">
+    <p class="section-label">Stage 5</p>
+    <h2>Write the results</h2>
+    <p>
+      Three CSVs: the coefficients, the labelled feature matrix, and the fitted
+      values in row order. <code>write_csv</code> returns the number of rows it
+      wrote, which is why three bare integers close out the script's stdout.
+    </p>
+<pre><code><span class="kw">let</span> predictions = <span class="fn-name">model_fitted</span>(fit);
+
+<span class="fn-name">write_csv</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
+<span class="fn-name">write_csv</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
+<span class="fn-name">write_csv</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
+    <p class="out-label">Output</p>
+<pre class="out"><code>6
+2339
+2339</code></pre>
+
+    <table class="schema-table">
+      <thead>
+        <tr><th>File</th><th>Rows</th><th>Contents</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>coefficients.csv</code></td><td>6</td><td>One row per model term, full double precision</td></tr>
+        <tr><td><code>features.csv</code></td><td>2339</td><td>The labelled design matrix, 15 columns</td></tr>
+        <tr><td><code>predictions.csv</code></td><td>2339</td><td>A single <code>fitted</code> column, aligned row-for-row with <code>features.csv</code></td></tr>
+      </tbody>
+    </table>
+
+    <p class="out-label">coefficients.csv &mdash; written at full precision</p>
+<pre class="out"><code>term,estimate
+(intercept),-1.5154617663002243
+open,0.9965846078668821
+range,-45.30401969039845
+log_mid,0.5703386832616693
+z5,286.4641980487256
+vol_regime,3.59647366542265</code></pre>
+
+    <p class="out-label">predictions.csv &mdash; header and first three rows</p>
+<pre class="out"><code>fitted
+1095.2457557294692
+1132.5117552819718
+1132.6044169846202</code></pre>
+
+    <p class="note">
+      Predictions are handed back as a row-aligned column rather than spliced
+      into the feature table. Reattaching them per row becomes a one-liner once
+      Ibex grows horizontal concat; today the consumer gets the aligned pair.
+    </p>
+  </section>
+
+  <section class="section" id="run">
+    <p class="section-label">Reproducing it</p>
+    <h2>Run the demo</h2>
+    <p>
+      The generator is deterministic, so the numbers on this page are the
+      numbers you will get.
+    </p>
+<pre><code>python3 examples/quant_demo/gen_data.py
+
+./build-release/tools/ibex_eval \
+    --plugin-path build-release/tools \
+    examples/quant_demo/quant_demo.ibex</code></pre>
+    <p>
+      <code>examples/quant_demo/run.sh</code> wraps both steps, then runs the
+      equivalent Polars + scikit-learn pipeline
+      (<code>quant_demo_polars.py</code>) and prints a term-by-term coefficient
+      diff, so the Ibex fit can be checked against a reference implementation.
+    </p>
+<pre><code>./examples/quant_demo/run.sh</code></pre>
+  </section>
+
+  <section class="section" id="full-script">
+    <p class="section-label">The whole thing</p>
+    <h2>quant_demo.ibex</h2>
+    <p>
+      Forty lines of actual code, five easy to read and write stages and no glue.
+    </p>
+<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
+
+<span class="kw">let</span> ticks         = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/ticks.csv"</span>);
+<span class="kw">let</span> reference_raw = <span class="fn-name">read_csv</span>(<span class="str">"examples/quant_demo/data/reference.csv"</span>);
+
+<span class="cm">// Promote both to TimeFrames so the asof join is type-checked.</span>
+<span class="kw">let</span> tick_stream = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+<span class="kw">let</span> reference   = <span class="fn-name">as_timeframe</span>(reference_raw, <span class="str">"ts"</span>);
+
+<span class="cm">// ── 1. Resample ticks to 1-minute OHLC + traded size ────────────────────</span>
+<span class="kw">let</span> bars = tick_stream[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">by</span> symbol, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    high  = <span class="fn-name">max</span>(price),
+    low   = <span class="fn-name">min</span>(price),
+    close = <span class="fn-name">last</span>(price),
+    bar_size = <span class="fn-name">sum</span>(size)
+}];
+bars;
+
+<span class="cm">// ── 2. Asof-join the per-symbol reference table ─────────────────────────</span>
+<span class="kw">let</span> enriched = bars <span class="kw">asof join</span> reference <span class="kw">on</span> {ts, symbol};
+enriched;
+
+<span class="cm">// ── 3a. Per-symbol rolling features (5-bar window) ──────────────────────</span>
+<span class="kw">let</span> with_rolling = enriched[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">by</span> symbol, <span class="kw">update</span> {
+    rmean5 = <span class="fn-name">rolling_mean</span>(close)
+}];
+
+<span class="cm">// ── 3b. Bar-level features built on top of the rolling state ────────────</span>
+<span class="kw">let</span> features = with_rolling[<span class="kw">update</span> {
+    spread     = high - low,
+    range      = (high - low) / open,
+    log_mid    = <span class="fn-name">log</span>((high + low) / <span class="num">2.0</span>),
+    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>),
+    next_close = <span class="fn-name">lead</span>(close, <span class="num">1</span>)
+}];
+
+<span class="cm">// ── 4. Train: fit a ridge regression of close on the bar features ───────</span>
+<span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close &gt; <span class="num">0.0</span>];
+<span class="kw">let</span> fit = labelled[<span class="kw">model</span> { next_close ~ open + range + log_mid + z5 + vol_regime,
+                            method = ridge,
+                            lambda = <span class="num">0.1</span> }];
+
+<span class="kw">let</span> coefficients = <span class="fn-name">model_coef</span>(fit);
+coefficients;
+
+<span class="cm">// ── 5. Score: persist features + fitted predictions in row order ────────</span>
+<span class="kw">let</span> predictions = <span class="fn-name">model_fitted</span>(fit);
+
+<span class="fn-name">write_csv</span>(coefficients, <span class="str">"examples/quant_demo/data/coefficients.csv"</span>);
+<span class="fn-name">write_csv</span>(labelled,     <span class="str">"examples/quant_demo/data/features.csv"</span>);
+<span class="fn-name">write_csv</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
+  </section>
+
+  <footer class="footer">
+    <p>
+      Source: <code>examples/quant_demo/quant_demo.ibex</code>. Output captured
+      with <code>build-release/tools/ibex_eval</code>.
+    </p>
+  </footer>
+
+</main>
+</body>
+</html>

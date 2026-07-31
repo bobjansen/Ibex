@@ -2559,8 +2559,8 @@ TEST_CASE("windowed update keeps validity on plain computed fields",
 }
 
 TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][grouped]") {
-    // Symbol A: ts = {1,2,3} val = {10,20,30}; window 1ns -> mean = {10, 15, 25}
-    // Symbol B: ts = {1,2,3} val = {100,200,300}; window 1ns -> mean = {100, 150, 250}
+    // Symbol A: ts = {1,2,3} val = {10,20,30}; window 2ns -> mean = {10, 15, 25}
+    // Symbol B: ts = {1,2,3} val = {100,200,300}; window 2ns -> mean = {100, 150, 250}
     // Rows are interleaved in the time-sorted output (A, B, A, B, A, B).
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(2), ts_from_nanos(3),
@@ -2572,7 +2572,7 @@ TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][g
     registry.emplace("data", table);
 
     auto ir = require_ir(
-        "as_timeframe(data, \"ts\")[window 1ns, by symbol, "
+        "as_timeframe(data, \"ts\")[window 2ns, by symbol, "
         "update { m = rolling_mean(val), n = rolling_count() }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
@@ -2604,12 +2604,12 @@ TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][g
 
 // --- rolling aggregate tests --------------------------------------------------
 // Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
-// Window 1ns: [t-1, t]
-//   row 0 (t=0): [0-1,0]=[-1,0] -> only row 0
-//   row 1 (t=1): [0,1]          -> rows 0,1
-//   row 2 (t=2): [1,2]          -> rows 1,2
+// Window 2ns: (t-2, t]
+//   row 0 (t=0): (-2,0] -> only row 0
+//   row 1 (t=1): (-1,1] -> rows 0,1
+//   row 2 (t=2): (0,2]  -> rows 1,2
 
-TEST_CASE("rolling_sum with 1ns window") {
+TEST_CASE("rolling_sum with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -2618,7 +2618,7 @@ TEST_CASE("rolling_sum with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { s = rolling_sum(val) }];");
+    auto ir = require_ir("data[window 2ns, update { s = rolling_sum(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     REQUIRE(*result->time_index == "ts");
@@ -2630,7 +2630,7 @@ TEST_CASE("rolling_sum with 1ns window") {
     REQUIRE((*s)[2] == 50);  // rows 1+2
 }
 
-TEST_CASE("rolling_mean with 1ns window") {
+TEST_CASE("rolling_mean with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -2639,7 +2639,7 @@ TEST_CASE("rolling_mean with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { m = rolling_mean(val) }];");
+    auto ir = require_ir("data[window 2ns, update { m = rolling_mean(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -2702,8 +2702,8 @@ TEST_CASE("per-call duration window matches the `window` block form", "[rolling]
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    // rolling_mean(val, 1ns) as a per-call arg must equal `window 1ns`.
-    auto ir = require_ir("data[update { m = rolling_mean(val, 1ns) }];");
+    // rolling_mean(val, 2ns) as a per-call arg must equal `window 2ns`.
+    auto ir = require_ir("data[update { m = rolling_mean(val, 2ns) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     const auto* m = std::get_if<Column<double>>(result->find("m"));
@@ -2874,7 +2874,7 @@ TEST_CASE("grouped windowed rolling carries per-group input validity", "[rolling
     CHECK((*m)[3] == Catch::Approx(40.0));
 }
 
-TEST_CASE("rolling_count with 1ns window") {
+TEST_CASE("rolling_count with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -2883,7 +2883,7 @@ TEST_CASE("rolling_count with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { c = rolling_count() }];");
+    auto ir = require_ir("data[window 2ns, update { c = rolling_count() }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -2894,7 +2894,7 @@ TEST_CASE("rolling_count with 1ns window") {
     REQUIRE((*c)[2] == 2);
 }
 
-TEST_CASE("rolling_min and rolling_max with 1ns window") {
+TEST_CASE("rolling_min and rolling_max with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{30, 10, 20});
@@ -2903,7 +2903,7 @@ TEST_CASE("rolling_min and rolling_max with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir_min = require_ir("data[window 1ns, update { mn = rolling_min(val) }];");
+    auto ir_min = require_ir("data[window 2ns, update { mn = rolling_min(val) }];");
     auto res_min = runtime::interpret(*ir_min, registry);
     REQUIRE(res_min.has_value());
     const auto* mn = std::get_if<Column<std::int64_t>>(res_min->find("mn"));
@@ -2912,7 +2912,7 @@ TEST_CASE("rolling_min and rolling_max with 1ns window") {
     REQUIRE((*mn)[1] == 10);  // min(30,10)
     REQUIRE((*mn)[2] == 10);  // min(10,20)
 
-    auto ir_max = require_ir("data[window 1ns, update { mx = rolling_max(val) }];");
+    auto ir_max = require_ir("data[window 2ns, update { mx = rolling_max(val) }];");
     auto res_max = runtime::interpret(*ir_max, registry);
     REQUIRE(res_max.has_value());
     const auto* mx = std::get_if<Column<std::int64_t>>(res_max->find("mx"));
@@ -3192,7 +3192,7 @@ TEST_CASE("resample error on non-timeframe") {
 }
 
 TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
-    // ts: 0,1,2,3 ns   price: 10,30,5,20   window 2ns -> [t-2, t]
+    // ts: 0,1,2,3 ns   price: 10,30,5,20   window 3ns -> (t-3, t]
     //   row 0: {10}          open=10 high=10 low=10 close=10
     //   row 1: {10,30}       open=10 high=30 low=10 close=30
     //   row 2: {10,30,5}     open=10 high=30 low=5  close=5
@@ -3208,7 +3208,7 @@ TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
 
     auto ir = require_ir(
         "data[select { open = first(price), high = max(price), low = min(price), "
-        "close = last(price) }, window 2ns];");
+        "close = last(price) }, window 3ns];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     // Row-preserving and still a TimeFrame.
@@ -3356,7 +3356,7 @@ TEST_CASE("window + select + by keeps windows within each group") {
     registry.emplace("data", table);
 
     auto ir = require_ir(
-        "data[select { open = first(price), close = last(price) }, by symbol, window 2ns];");
+        "data[select { open = first(price), close = last(price) }, by symbol, window 3ns];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 4);
@@ -3451,12 +3451,12 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
 // --- rolling_median / rolling_std / rolling_ewma -----------------------------
 // Same 3-row, 1ns-window setup used by the other rolling tests:
 //   ts: 0ns, 1ns, 2ns   val: 10, 20, 30
-//   window 1ns -> [t-1, t]
+//   window 2ns -> (t-2, t]
 //     row 0: only row 0      -> {10}
 //     row 1: rows 0..1       -> {10,20}
 //     row 2: rows 1..2       -> {20,30}
 
-TEST_CASE("rolling_median with 1ns window") {
+TEST_CASE("rolling_median with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
@@ -3465,7 +3465,7 @@ TEST_CASE("rolling_median with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { m = rolling_median(val) }];");
+    auto ir = require_ir("data[window 2ns, update { m = rolling_median(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -3480,7 +3480,7 @@ TEST_CASE("rolling_median with 1ns window") {
 }
 
 TEST_CASE("rolling_median odd window size") {
-    // 5 timestamps, window 2ns -> row 2 sees {10,20,30} (odd count)
+    // 5 timestamps, window 3ns -> row 2 sees {10,20,30} (odd count)
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
@@ -3490,7 +3490,7 @@ TEST_CASE("rolling_median odd window size") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 2ns, update { m = rolling_median(val) }];");
+    auto ir = require_ir("data[window 3ns, update { m = rolling_median(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -3502,7 +3502,7 @@ TEST_CASE("rolling_median odd window size") {
     CHECK((*m)[3] == Catch::Approx(30.0));
 }
 
-TEST_CASE("rolling_std with 1ns window") {
+TEST_CASE("rolling_std with 2ns window") {
     // row 0: {10}      -> n<2, stddev = 0.0
     // row 1: {10,20}   -> mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)~7.071
     // row 2: {20,30}   -> mean=25, M2=50, sample std = sqrt(50/1)=sqrt(50)~7.071
@@ -3514,7 +3514,7 @@ TEST_CASE("rolling_std with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { s = rolling_std(val) }];");
+    auto ir = require_ir("data[window 2ns, update { s = rolling_std(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -3539,8 +3539,8 @@ TEST_CASE("rolling_std larger window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    // window 2ns: row 2 sees {0,2,4}
-    auto ir = require_ir("data[window 2ns, update { s = rolling_std(val) }];");
+    // window 3ns: row 2 sees {0,2,4}
+    auto ir = require_ir("data[window 3ns, update { s = rolling_std(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -3550,7 +3550,7 @@ TEST_CASE("rolling_std larger window") {
     CHECK((*s)[2] == Catch::Approx(2.0));
 }
 
-TEST_CASE("rolling_ewma with 1ns window") {
+TEST_CASE("rolling_ewma with 2ns window") {
     // alpha = 0.5
     // row 0: window {10}     -> ewma = 10
     // row 1: window {10,20}  -> ewma starts 10, then 0.5*20 + 0.5*10 = 15
@@ -3563,7 +3563,7 @@ TEST_CASE("rolling_ewma with 1ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 1ns, update { e = rolling_ewma(val, 0.5) }];");
+    auto ir = require_ir("data[window 2ns, update { e = rolling_ewma(val, 0.5) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -3575,7 +3575,7 @@ TEST_CASE("rolling_ewma with 1ns window") {
 }
 
 TEST_CASE("rolling_ewma larger window") {
-    // window 2ns, alpha = 0.5
+    // window 3ns, alpha = 0.5
     // row 0 (t=0): {10}            -> ewma = 10
     // row 1 (t=1): {10, 20}        -> 10 -> 0.5*20+0.5*10 = 15
     // row 2 (t=2): {10, 20, 30}    -> 10 -> 15 -> 0.5*30+0.5*15 = 22.5
@@ -3589,7 +3589,7 @@ TEST_CASE("rolling_ewma larger window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 2ns, update { e = rolling_ewma(val, 0.5) }];");
+    auto ir = require_ir("data[window 3ns, update { e = rolling_ewma(val, 0.5) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -4579,7 +4579,7 @@ TEST_CASE("Interpret kurtosis too few values is null") {
 
 // --- rolling_quantile / rolling_skew / rolling_kurtosis -----------------------
 
-TEST_CASE("rolling_quantile with 1ns window") {
+TEST_CASE("rolling_quantile with 2ns window") {
     runtime::Table table;
     // {10, 20, 30} - 1ns window = each row sees only itself
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
@@ -4591,7 +4591,7 @@ TEST_CASE("rolling_quantile with 1ns window") {
 
     // 1ns window includes boundary: row 1 sees {10,20}, row 2 sees {20,30}
     // p=0.5: row0->10, row1->15, row2->25
-    auto ir = require_ir("data[window 1ns, update { q = rolling_quantile(val, 0.5) }];");
+    auto ir = require_ir("data[window 2ns, update { q = rolling_quantile(val, 0.5) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 
@@ -4605,7 +4605,7 @@ TEST_CASE("rolling_quantile with 1ns window") {
     CHECK((*qv)[2] == Catch::Approx(25.0));
 }
 
-TEST_CASE("rolling_quantile with 2ns window") {
+TEST_CASE("rolling_quantile with 3ns window") {
     runtime::Table table;
     // {10, 20, 30, 40} with 2ns window (threshold = t - 2, lo advances when ts < threshold)
     // row 0 (t=0): window {10}        -> p=0.25 -> 10.0
@@ -4620,7 +4620,7 @@ TEST_CASE("rolling_quantile with 2ns window") {
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
-    auto ir = require_ir("data[window 2ns, update { q = rolling_quantile(val, 0.25) }];");
+    auto ir = require_ir("data[window 3ns, update { q = rolling_quantile(val, 0.25) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
 

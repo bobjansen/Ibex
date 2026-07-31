@@ -2494,13 +2494,24 @@ tf[window 5m, update { avg_5m = rolling_mean(price) }]
 ```
 
 **Semantics.** For each row at time `t`, the window defines the range
-`[t - duration, t]` (inclusive on both ends) — a *trailing* window whose left
-edge tracks each row's own timestamp. Rolling functions operate on the subset of
-rows within this range.
+`(t - duration, t]` — half-open on the left, closed on the right — a *trailing*
+window whose left edge tracks each row's own timestamp. Rolling functions
+operate on the subset of rows within this range.
+
+The left edge is exclusive so that a duration means the same thing to `window`
+as it does to `resample`: over a regular grid of spacing `s`, both `window k·s`
+and a `resample k·s` bucket span exactly `k` rows. A closed left edge would make
+the window span `k + 1` and give consecutive windows an overlapping endpoint.
+Note this differs from SQL's `RANGE BETWEEN INTERVAL … PRECEDING AND CURRENT
+ROW`, which is closed on both ends; it matches the pandas and Polars default
+(`closed="right"`).
 
 **`aligned`.** Adding `aligned` snaps the window to a fixed epoch-aligned grid
 instead: for a row at time `t` the range becomes `[floor(t / duration) · duration,
-t]`, so the window **resets on each grid boundary** (`…:00.000, :00.010, …` for a
+t]`. Its left edge *is* closed, unlike the sliding form above — a row landing
+exactly on a bucket boundary belongs to that bucket, which is what makes the
+range agree with `resample`'s `[start, start + duration)`. The window
+**resets on each grid boundary** (`…:00.000, :00.010, …` for a
 `10ms` window) rather than sliding continuously. This is the bar-in-progress
 view — combined with `select`, each row is the OHLC accumulated since the current
 bucket opened, and the last row of each bucket equals that bucket's `resample`

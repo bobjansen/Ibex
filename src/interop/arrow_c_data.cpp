@@ -505,7 +505,13 @@ auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schem
         }
     }
 
+    const auto* validity = static_cast<const std::uint8_t*>(array.buffers[0]);
     for (std::int64_t i = 0; i < array.length; ++i) {
+        if (validity != nullptr && !read_bitmap_bit(validity, array.offset + i)) {
+            // Arrow leaves payload bytes at null positions unspecified. In
+            // particular, nanoarrow's factor converter writes INT32_MIN here.
+            continue;
+        }
         const auto code = codes[array.offset + i];
         if (code < 0 || code >= dictionary.length) {
             return std::unexpected("Arrow dictionary column has an out-of-range index");
@@ -998,11 +1004,19 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
         if (child_schema == nullptr || child_array == nullptr) {
             return std::unexpected("Arrow table import encountered a null child");
         }
-        if (child_array->length != array.length) {
-            return std::unexpected(
-                "Arrow table import requires every column to match table length");
+        ArrowArray child_view = *child_array;
+        if (child_view.length != array.length) {
+            // A canonical sliced struct keeps full-length children and applies
+            // the struct offset to each child logically. Also accept already-
+            // sliced children for producers that materialize that view.
+            if (array.offset < 0 || child_view.length < array.offset + array.length) {
+                return std::unexpected(
+                    "Arrow table import requires every column to cover the table slice");
+            }
+            child_view.offset += array.offset;
+            child_view.length = array.length;
         }
-        auto imported = import_column(*child_array, *child_schema, owner);
+        auto imported = import_column(child_view, *child_schema, owner);
         if (!imported) {
             return std::unexpected(imported.error());
         }

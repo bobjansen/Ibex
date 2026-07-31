@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <robin_hood.h>
 #include <string>
@@ -370,10 +371,7 @@ TEST_CASE("Arrow C Data adoption keeps sliced temporal buffers zero-copy until m
         static_cast<const ibex::Timestamp*>(array.children[1]->buffers[1]);
 
     array.length = 2;
-    for (std::int64_t i = 0; i < array.n_children; ++i) {
-        array.children[i]->length = 2;
-        array.children[i]->offset = 1;
-    }
+    array.offset = 1;
 
     auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
     REQUIRE(imported.has_value());
@@ -460,10 +458,7 @@ TEST_CASE("Arrow C Data adoption keeps sliced bool, utf8, and categorical buffer
         static_cast<const char*>(array.children[2]->dictionary->buffers[2]);
 
     array.length = 2;
-    for (std::int64_t i = 0; i < array.n_children; ++i) {
-        array.children[i]->length = 2;
-        array.children[i]->offset = 1;
-    }
+    array.offset = 1;
 
     auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
     REQUIRE(imported.has_value());
@@ -618,6 +613,39 @@ TEST_CASE("Arrow C Data adoption retains and releases producer ownership",
     }
 
     REQUIRE(source_lifetime.expired());
+    schema.release(&schema);
+}
+
+TEST_CASE("Arrow C Data adoption ignores dictionary indices in null slots",
+          "[interop][arrow][adopt][categorical]") {
+    ibex::runtime::Table source;
+    ibex::Column<ibex::Categorical> symbols;
+    symbols.push_back("A");
+    symbols.push_back("B");
+    symbols.push_back("A");
+    source.add_column("symbol", std::move(symbols),
+                      ibex::runtime::ValidityBitmap{true, false, true});
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+    auto* codes = const_cast<ibex::Column<ibex::Categorical>::code_type*>(
+        static_cast<const ibex::Column<ibex::Categorical>::code_type*>(
+            array.children[0]->buffers[1]));
+    codes[1] = std::numeric_limits<ibex::Column<ibex::Categorical>::code_type>::min();
+    const auto* source_codes = codes;
+
+    auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+    REQUIRE(imported.has_value());
+    const auto& borrowed = std::as_const(*imported);
+    const auto* categorical = std::get_if<ibex::Column<ibex::Categorical>>(borrowed.find("symbol"));
+    REQUIRE(categorical != nullptr);
+    REQUIRE(categorical->codes_are_external());
+    CHECK(categorical->codes_buffer_data() == source_codes);
+    REQUIRE(borrowed.columns[0].validity.has_value());
+    CHECK_FALSE((*borrowed.columns[0].validity)[1]);
+
     schema.release(&schema);
 }
 

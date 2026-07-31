@@ -1,5 +1,6 @@
 CXX_STD = CXX23
-PKG_CPPFLAGS = -I@IBEX_ROOT@/include
+PKG_CPPFLAGS = -I@IBEX_ROOT@/include \
+	-I@IBEX_BUILD_DIR@/_deps/robin_hood-src/src/include
 PKG_LIBS = @IBEX_BUILD_DIR@/src/parser/libibex_parser.a \
 	@IBEX_BUILD_DIR@/src/runtime/libibex_runtime.a \
 	@IBEX_BUILD_DIR@/src/interop/libibex_interop.a \

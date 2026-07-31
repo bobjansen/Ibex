@@ -49,18 +49,32 @@ as_ribex_result <- function(payload, format) {
 }
 
 normalize_table_binding <- function(value) {
-    if (is.null(value) || inherits(value, "data.frame") || inherits(value, "nanoarrow_array")) {
+    if (is.null(value) || inherits(value, "data.frame")) {
         return(value)
     }
 
-    if (requireNamespace("nanoarrow", quietly = TRUE)) {
+    if (!inherits(value, "nanoarrow_array")) {
         converted <- tryCatch(nanoarrow::as_nanoarrow_array(value), error = function(e) NULL)
-        if (!is.null(converted)) {
-            return(converted)
+        if (is.null(converted)) {
+            return(value)
         }
+        value <- converted
     }
 
-    value
+    # Export a fresh Arrow C Data shell rather than moving from the caller's
+    # external pointer. nanoarrow's export callback keeps the R-owned buffers
+    # alive without copying them and is safe for a non-R consumer to release.
+    # The schema export is a small metadata-only deep copy.
+    schema <- nanoarrow::infer_nanoarrow_schema(value)
+    array_export <- nanoarrow::nanoarrow_allocate_array()
+    schema_export <- nanoarrow::nanoarrow_allocate_schema()
+    nanoarrow::nanoarrow_pointer_export(value, array_export)
+    nanoarrow::nanoarrow_pointer_export(schema, schema_export)
+
+    structure(
+        list(array = array_export, schema = schema_export),
+        class = "ribex_arrow_export"
+    )
 }
 
 normalize_table_bindings <- function(tables) {

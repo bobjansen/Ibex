@@ -348,6 +348,88 @@ TEST_CASE("Arrow C Data adoption keeps sliced primitive buffers zero-copy until 
     schema.release(&schema);
 }
 
+TEST_CASE("Arrow C Data adoption keeps sliced temporal buffers zero-copy until mutation",
+          "[interop][arrow][adopt]") {
+    ibex::runtime::Table source;
+    const ibex::runtime::ValidityBitmap validity{true, false, true, true};
+    source.add_column(
+        "day",
+        ibex::Column<ibex::Date>{ibex::Date{10}, ibex::Date{11}, ibex::Date{12}, ibex::Date{13}},
+        validity);
+    source.add_column("ts",
+                      ibex::Column<ibex::Timestamp>{ibex::Timestamp{100}, ibex::Timestamp{200},
+                                                    ibex::Timestamp{300}, ibex::Timestamp{400}},
+                      validity);
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+    const auto* date_values = static_cast<const ibex::Date*>(array.children[0]->buffers[1]);
+    const auto* timestamp_values =
+        static_cast<const ibex::Timestamp*>(array.children[1]->buffers[1]);
+
+    array.length = 2;
+    for (std::int64_t i = 0; i < array.n_children; ++i) {
+        array.children[i]->length = 2;
+        array.children[i]->offset = 1;
+    }
+
+    auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(array.release == nullptr);
+
+    const auto& borrowed = std::as_const(*imported);
+    const auto* dates = std::get_if<ibex::Column<ibex::Date>>(borrowed.find("day"));
+    const auto* timestamps = std::get_if<ibex::Column<ibex::Timestamp>>(borrowed.find("ts"));
+    REQUIRE(dates != nullptr);
+    REQUIRE(timestamps != nullptr);
+
+    REQUIRE(dates->is_external());
+    REQUIRE(dates->buffer_data() == date_values);
+    REQUIRE(dates->buffer_offset() == 1);
+    CHECK((*dates)[0] == ibex::Date{11});
+    CHECK((*dates)[1] == ibex::Date{12});
+
+    REQUIRE(timestamps->is_external());
+    REQUIRE(timestamps->buffer_data() == timestamp_values);
+    REQUIRE(timestamps->buffer_offset() == 1);
+    CHECK((*timestamps)[0] == ibex::Timestamp{200});
+    CHECK((*timestamps)[1] == ibex::Timestamp{300});
+
+    for (const auto& entry : borrowed.columns) {
+        REQUIRE(entry.validity.has_value());
+        REQUIRE(entry.validity->is_external());
+        REQUIRE(entry.validity->buffer_offset() == 1);
+    }
+
+    ArrowArray roundtrip_array{};
+    ArrowSchema roundtrip_schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(borrowed, &roundtrip_array, &roundtrip_schema)
+                .has_value());
+    REQUIRE(roundtrip_array.children[0]->offset == 1);
+    REQUIRE(roundtrip_array.children[0]->buffers[1] == date_values);
+    REQUIRE(roundtrip_array.children[1]->offset == 1);
+    REQUIRE(roundtrip_array.children[1]->buffers[1] == timestamp_values);
+    roundtrip_schema.release(&roundtrip_schema);
+    roundtrip_array.release(&roundtrip_array);
+
+    auto& mutable_dates = std::get<ibex::Column<ibex::Date>>(imported->mutable_column(0));
+    mutable_dates[0] = ibex::Date{99};
+    REQUIRE_FALSE(mutable_dates.is_external());
+    CHECK(std::as_const(mutable_dates)[0] == ibex::Date{99});
+    CHECK(date_values[1] == ibex::Date{11});
+
+    auto& mutable_timestamps = std::get<ibex::Column<ibex::Timestamp>>(imported->mutable_column(1));
+    mutable_timestamps.push_back(ibex::Timestamp{500});
+    REQUIRE_FALSE(mutable_timestamps.is_external());
+    CHECK(std::as_const(mutable_timestamps)[0] == ibex::Timestamp{200});
+    CHECK(std::as_const(mutable_timestamps)[2] == ibex::Timestamp{500});
+    CHECK(timestamp_values[1] == ibex::Timestamp{200});
+
+    schema.release(&schema);
+}
+
 TEST_CASE("Arrow C Data adoption keeps sliced bool, utf8, and categorical buffers zero-copy",
           "[interop][arrow][adopt]") {
     ibex::runtime::Table source;
@@ -466,11 +548,13 @@ TEST_CASE("Arrow C Data adoption keeps sliced bool, utf8, and categorical buffer
     schema.release(&schema);
 }
 
-TEST_CASE("Arrow C Data adoption accepts empty bool and zero-byte string buffers",
+TEST_CASE("Arrow C Data adoption accepts empty and zero-byte value buffers",
           "[interop][arrow][adopt]") {
     SECTION("zero rows") {
         ibex::runtime::Table source;
         source.add_column("flag", ibex::Column<bool>{});
+        source.add_column("day", ibex::Column<ibex::Date>{});
+        source.add_column("ts", ibex::Column<ibex::Timestamp>{});
         source.add_column("name", ibex::Column<std::string>{});
         source.add_column("symbol", ibex::Column<ibex::Categorical>{});
 

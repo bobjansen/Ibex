@@ -1162,23 +1162,23 @@ guarantee changes.
 
 ## Phase 3a — First-party Parquet and Arrow-compatible storage
 
-**STATUS (2026-07-31): primitive, validity, Bool, UTF-8, and Categorical
-storage slices landed.** Generic primitive columns, `ValidityBitmap`,
-bit-packed Bool, flat UTF-8, and dictionary-encoded Categorical columns can
-retain an immutable external owner plus base buffers, logical offsets, and
-length, detaching only the mutated storage into owned buffers. Categorical
-codes and dictionary storage detach independently. `adopt_table_from_arrow`
-consumes an `ArrowArray` only after successful validation and keeps
-Int64/Double/Bool/UTF-8/Categorical payload and validity buffers zero-copy,
-including non-zero sliced offsets and UTF-8 dictionary offsets; the copying
-importer remains available. ADBC adopts its owned record batches, and the
-Python bridge uses `__arrow_c_array__` for single-batch PyArrow inputs
-(combining fragmented tables first). Address/offset, release lifetime,
-failure ownership, empty buffers, filtering, and copy-on-write behavior are
-asserted in C++ and Python tests. R remains on the borrowing/copying path until
-its nanoarrow externalptr lock/ownership protocol is explicit. Temporal
-storage, first-party Parquet relocation, reader factories, and the R ownership
-protocol remain Phase-3a work.
+**STATUS (2026-07-31): primitive, validity, Bool, UTF-8, Categorical, Date,
+and Timestamp storage slices landed.** Generic primitive and temporal columns,
+`ValidityBitmap`, bit-packed Bool, flat UTF-8, and dictionary-encoded
+Categorical columns can retain an immutable external owner plus base buffers,
+logical offsets, and length, detaching only the mutated storage into owned
+buffers. Categorical codes and dictionary storage detach independently.
+`adopt_table_from_arrow` consumes an `ArrowArray` only after successful
+validation and keeps Int64/Double/Bool/UTF-8/Categorical/Date/Timestamp payload
+and validity buffers zero-copy, including non-zero sliced offsets and UTF-8
+dictionary offsets; the copying importer remains available. ADBC adopts its
+owned record batches, and the Python bridge uses `__arrow_c_array__` for
+single-batch PyArrow inputs (combining fragmented tables first).
+Address/offset, release lifetime, failure ownership, empty buffers, filtering,
+and copy-on-write behavior are asserted in C++ and Python tests. R remains on
+the borrowing/copying path until its nanoarrow externalptr lock/ownership
+protocol is explicit. First-party Parquet relocation, reader factories, and
+the R ownership protocol remain Phase-3a work.
 
 Prepare the storage and ownership foundation before adding source concurrency.
 Parquet is no longer an ordinary opaque table plugin: it supplies schemas and

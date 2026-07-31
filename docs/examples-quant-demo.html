@@ -106,8 +106,8 @@
         </div>
         <div class="tour-code">
 <pre><code>ts,symbol,price,size
-34200008416027,NVDA,1098.4186,111
-34200265666471,NVDA,1096.9076,53</code></pre>
+34200635196792,AAPL,179.6452,452
+34200731699373,META,510.4185,127</code></pre>
         </div>
       </div>
 
@@ -170,16 +170,16 @@ bars;</code></pre>
 +-------------------------------+--------+----------+----------+----------+----------+----------+
 | ts                            | symbol | open     | high     | low      | close    | bar_size |
 +-------------------------------+--------+----------+----------+----------+----------+----------+
-| 1970-01-01 09:30:00.000000000 | "NVDA" | 1098.419 | 1140.921 | 1094.391 | 1140.253 | 6639     |
-| 1970-01-01 09:30:00.000000000 | "META" | 510.8402 | 529.7588 | 509.1604 | 524.5037 | 5988     |
-| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5456     |
-| 1970-01-01 09:30:00.000000000 | "MSFT" | 415.9642 | 415.9642 | 411.1852 | 412.9627 | 8378     |
-| 1970-01-01 09:30:00.000000000 | "GOOG" | 174.9884 | 176.5965 | 174.9884 | 175.2895 | 7394     |
-| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.8546 | 186.7257 | 183.4501 | 183.4501 | 8481     |
-| 1970-01-01 09:31:00.000000000 | "NVDA" | 1135.08  | 1146.716 | 1121.75  | 1138.652 | 6710     |
-| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6621     |
-| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.3678 | 176.0018 | 174.1589 | 175.23   | 9462     |
-| 1970-01-01 09:31:00.000000000 | "META" | 525.0089 | 529.2634 | 525.0089 | 526.6617 | 6217     |
+| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5639     |
+| 1970-01-01 09:30:00.000000000 | "META" | 510.4185 | 530.6324 | 510.231  | 526.518  | 6735     |
+| 1970-01-01 09:30:00.000000000 | "GOOG" | 175.5003 | 176.5177 | 175.0689 | 175.7573 | 7571     |
+| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.7709 | 186.346  | 183.0771 | 183.2741 | 7768     |
+| 1970-01-01 09:30:00.000000000 | "MSFT" | 414.808  | 414.9505 | 410.2321 | 411.8708 | 7985     |
+| 1970-01-01 09:30:00.000000000 | "NVDA" | 1099.453 | 1139.953 | 1094.948 | 1125.336 | 6716     |
+| 1970-01-01 09:31:00.000000000 | "META" | 526.1279 | 530.1362 | 524.7472 | 524.7472 | 5620     |
+| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.7237 | 175.9283 | 174.0812 | 175.4403 | 9502     |
+| 1970-01-01 09:31:00.000000000 | "MSFT" | 412.0055 | 412.5384 | 409.0638 | 411.1072 | 6221     |
+| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6639     |
 +-------------------------------+--------+----------+----------+----------+----------+----------+
 ... (2330 more rows)</code></pre>
     <p class="note">
@@ -205,16 +205,16 @@ enriched;</code></pre>
 +-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
 | ts                            | symbol | open     | high     | low      | close    | bar_size | sector     | vol_regime |
 +-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
-| 1970-01-01 09:30:00.000000000 | "NVDA" | 1098.419 | 1140.921 | 1094.391 | 1140.253 | 6639     | "semis"    | 0.0028     |
-| 1970-01-01 09:30:00.000000000 | "META" | 510.8402 | 529.7588 | 509.1604 | 524.5037 | 5988     | "tech"     | 0.0019     |
-| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5456     | "tech"     | 0.0012     |
-| 1970-01-01 09:30:00.000000000 | "MSFT" | 415.9642 | 415.9642 | 411.1852 | 412.9627 | 8378     | "tech"     | 0.0011     |
-| 1970-01-01 09:30:00.000000000 | "GOOG" | 174.9884 | 176.5965 | 174.9884 | 175.2895 | 7394     | "tech"     | 0.0014     |
-| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.8546 | 186.7257 | 183.4501 | 183.4501 | 8481     | "consumer" | 0.0017     |
-| 1970-01-01 09:31:00.000000000 | "NVDA" | 1135.08  | 1146.716 | 1121.75  | 1138.652 | 6710     | "semis"    | 0.0028     |
-| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6621     | "tech"     | 0.0012     |
-| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.3678 | 176.0018 | 174.1589 | 175.23   | 9462     | "tech"     | 0.0014     |
-| 1970-01-01 09:31:00.000000000 | "META" | 525.0089 | 529.2634 | 525.0089 | 526.6617 | 6217     | "tech"     | 0.0019     |
+| 1970-01-01 09:30:00.000000000 | "AAPL" | 179.6452 | 179.992  | 178.5976 | 178.5976 | 5639     | "tech"     | 0.0012     |
+| 1970-01-01 09:30:00.000000000 | "META" | 510.4185 | 530.6324 | 510.231  | 526.518  | 6735     | "tech"     | 0.0019     |
+| 1970-01-01 09:30:00.000000000 | "GOOG" | 175.5003 | 176.5177 | 175.0689 | 175.7573 | 7571     | "tech"     | 0.0014     |
+| 1970-01-01 09:30:00.000000000 | "AMZN" | 184.7709 | 186.346  | 183.0771 | 183.2741 | 7768     | "consumer" | 0.0017     |
+| 1970-01-01 09:30:00.000000000 | "MSFT" | 414.808  | 414.9505 | 410.2321 | 411.8708 | 7985     | "tech"     | 0.0011     |
+| 1970-01-01 09:30:00.000000000 | "NVDA" | 1099.453 | 1139.953 | 1094.948 | 1125.336 | 6716     | "semis"    | 0.0028     |
+| 1970-01-01 09:31:00.000000000 | "META" | 526.1279 | 530.1362 | 524.7472 | 524.7472 | 5620     | "tech"     | 0.0019     |
+| 1970-01-01 09:31:00.000000000 | "GOOG" | 175.7237 | 175.9283 | 174.0812 | 175.4403 | 9502     | "tech"     | 0.0014     |
+| 1970-01-01 09:31:00.000000000 | "MSFT" | 412.0055 | 412.5384 | 409.0638 | 411.1072 | 6221     | "tech"     | 0.0011     |
+| 1970-01-01 09:31:00.000000000 | "AAPL" | 178.4962 | 178.4962 | 175.8907 | 176.7439 | 6639     | "tech"     | 0.0012     |
 +-------------------------------+--------+----------+----------+----------+----------+----------+------------+------------+
 ... (2330 more rows)</code></pre>
     <p class="note">
@@ -245,7 +245,11 @@ enriched;</code></pre>
     spread     = high - low,
     range      = (high - low) / open,
     log_mid    = <span class="fn-name">log</span>((high + low) / <span class="num">2.0</span>),
-    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>),
+    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>)
+}];
+
+<span class="cm">// The label: next bar's close. `by symbol` is load-bearing &mdash; see below.</span>
+<span class="kw">let</span> features = features[<span class="kw">by</span> symbol, <span class="kw">update</span> {
     next_close = <span class="fn-name">lead</span>(close, <span class="num">1</span>)
 }];</code></pre>
     <p>
@@ -254,15 +258,26 @@ enriched;</code></pre>
     </p>
     <p class="out-label">features.csv &mdash; header and first two rows</p>
 <pre class="out"><code>ts,symbol,open,high,low,close,bar_size,sector,vol_regime,rmean5,spread,range,log_mid,z5,next_close
-34200000000000,NVDA,1098.4186,1140.9208,1094.3907,1140.2528,6639,semis,0.0028,1140.2528,46.530100000000175,0.04236099060959107,7.018988690377915,0,1138.6519
-34260000000000,NVDA,1135.08,1146.7161,1121.7498,1138.6519,6710,semis,0.0028,1139.45235,24.966300000000047,0.021995189766360123,7.0337118864716475,-0.0007024865320180366,1115.3558</code></pre>
+34200000000000,AAPL,179.6452,179.992,178.5976,178.5976,5639,tech,0.0012,178.5976,1.3943999999999903,0.0077619663648123656,5.189031378517357,0,176.7439
+34260000000000,AAPL,178.4962,178.4962,175.8907,176.7439,6639,tech,0.0012,177.67075,2.605499999999978,0.014596949402844308,5.17724207360518,-0.0052166689133304744,177.0972</code></pre>
     <p class="note">
-      Note the row order changed: the CSV is symbol-major (all 390 NVDA bars,
+      Note the row order changed: the CSV is symbol-major (all 390 AAPL bars,
       then all 390 META bars, &hellip;), while <code>bars</code> printed
-      time-major. The <code>by symbol</code> grouping in the window step
-      reorders the table. <code>lead(close, 1)</code> in the following block
-      reads the next row <em>of the reordered table</em>, which is what makes it
-      a same-symbol lookahead almost everywhere.
+      time-major &mdash; the <code>by symbol</code> grouping in the window step
+      reorders the table.
+    </p>
+    <p class="note">
+      That reordering is exactly why <code>next_close</code> gets its own
+      <code>by symbol</code> block. An unpartitioned <code>lead(close, 1)</code>
+      reads the adjacent row <em>of the whole table</em>, and on a symbol-major
+      table that is a correct same-symbol lookahead everywhere <em>except</em>
+      the five symbol boundaries, where it silently returns the next
+      instrument's first close. It is wrong on 6 rows out of 2340 &mdash; small
+      enough to survive review, and precisely the train/serve skew this demo
+      exists to argue against. The leak is symmetric: an unpartitioned
+      <code>lag</code> would push each symbol's last close forward into the next
+      symbol's first row. <code>by symbol</code> stops the lookahead at the group
+      edge and emits null there, and the grouped update preserves row order.
     </p>
   </section>
 
@@ -271,10 +286,10 @@ enriched;</code></pre>
     <h2>Fit a ridge regression</h2>
     <p>
       <code>model { … }</code> takes an R-style formula, a method and its
-      hyperparameters. The label is next bar's close, so the last row,
-      which has no successor to look ahead to, is dropped first.
+      hyperparameters. The label is next bar's close, so the last bar of each
+      symbol, which has no successor to look ahead to, is dropped first.
     </p>
-<pre><code><span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close &gt; <span class="num">0.0</span>];
+<pre><code><span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close <span class="kw">is not null</span>];
 <span class="kw">let</span> fit = labelled[<span class="kw">model</span> { next_close ~ open + range + log_mid + z5 + vol_regime,
                            method = ridge,
                            lambda = <span class="num">0.1</span> }];
@@ -286,24 +301,25 @@ coefficients;</code></pre>
 +---------------+-----------+
 | term          | estimate  |
 +---------------+-----------+
-| "(intercept)" | -1.515462 |
-| "open"        | 0.9965846 |
-| "range"       | -45.30402 |
-| "log_mid"     | 0.5703387 |
-| "z5"          | 286.4642  |
-| "vol_regime"  | 3.596474  |
+| "(intercept)" | -13.81263 |
+| "open"        | 0.9929705 |
+| "range"       | -8.52681  |
+| "log_mid"     | 2.916274  |
+| "z5"          | 322.8143  |
+| "vol_regime"  | 4.463433  |
 +---------------+-----------+</code></pre>
     <p>
-      The fit is dominated by <code>open</code> at a coefficient of 0.997
+      The fit is dominated by <code>open</code> at a coefficient of 0.993
       &mdash; next bar's close is, unsurprisingly, almost this bar's price. The
       remaining terms are corrections on a much smaller scale, with
       <code>z5</code> carrying a large coefficient because it is a
       near-zero-centred ratio.
     </p>
     <p class="note">
-      <code>filter next_close &gt; 0.0</code> removes exactly one row of 2340
-      &mdash; the final row of the table, where <code>lead</code> has no
-      successor and returns 0. 2339 rows reach the fit.
+      <code>filter next_close is not null</code> removes exactly six rows of
+      2340 &mdash; the last bar of each of the six symbols, where the
+      partitioned <code>lead</code> has no successor within its group. 2334
+      rows reach the fit, 389 per symbol.
     </p>
   </section>
 
@@ -322,8 +338,8 @@ coefficients;</code></pre>
 <span class="fn-name">write_csv</span>(predictions,  <span class="str">"examples/quant_demo/data/predictions.csv"</span>);</code></pre>
     <p class="out-label">Output</p>
 <pre class="out"><code>6
-2339
-2339</code></pre>
+2334
+2334</code></pre>
 
     <table class="schema-table">
       <thead>
@@ -331,25 +347,25 @@ coefficients;</code></pre>
       </thead>
       <tbody>
         <tr><td><code>coefficients.csv</code></td><td>6</td><td>One row per model term, full double precision</td></tr>
-        <tr><td><code>features.csv</code></td><td>2339</td><td>The labelled design matrix, 15 columns</td></tr>
-        <tr><td><code>predictions.csv</code></td><td>2339</td><td>A single <code>fitted</code> column, aligned row-for-row with <code>features.csv</code></td></tr>
+        <tr><td><code>features.csv</code></td><td>2334</td><td>The labelled design matrix, 15 columns</td></tr>
+        <tr><td><code>predictions.csv</code></td><td>2334</td><td>A single <code>fitted</code> column, aligned row-for-row with <code>features.csv</code></td></tr>
       </tbody>
     </table>
 
     <p class="out-label">coefficients.csv &mdash; written at full precision</p>
 <pre class="out"><code>term,estimate
-(intercept),-1.5154617663002243
-open,0.9965846078668821
-range,-45.30401969039845
-log_mid,0.5703386832616693
-z5,286.4641980487256
-vol_regime,3.59647366542265</code></pre>
+(intercept),-13.812625458710277
+open,0.992970507483574
+range,-8.52681044215418
+log_mid,2.9162741433821786
+z5,322.8143305389048
+vol_regime,4.463433023176217</code></pre>
 
     <p class="out-label">predictions.csv &mdash; header and first three rows</p>
 <pre class="out"><code>fitted
-1095.2457557294692
-1132.5117552819718
-1132.6044169846202</code></pre>
+179.64156929442348
+176.72396924860047
+175.65092898530014</code></pre>
 
     <p class="note">
       Predictions are handed back as a row-aligned column rather than spliced
@@ -418,12 +434,19 @@ enriched;
     spread     = high - low,
     range      = (high - low) / open,
     log_mid    = <span class="fn-name">log</span>((high + low) / <span class="num">2.0</span>),
-    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>),
+    z5         = (close - rmean5) / (rmean5 + <span class="num">0.0001</span>)
+}];
+
+<span class="cm">// ── 3c. The label: next bar's close, per symbol ─────────────────────────</span>
+<span class="cm">//   `by symbol` is load-bearing. Without it `lead` looks at the next row</span>
+<span class="cm">//   of the whole table, and at each symbol boundary that row belongs to</span>
+<span class="cm">//   the *next* symbol.</span>
+<span class="kw">let</span> features = features[<span class="kw">by</span> symbol, <span class="kw">update</span> {
     next_close = <span class="fn-name">lead</span>(close, <span class="num">1</span>)
 }];
 
 <span class="cm">// ── 4. Train: fit a ridge regression of close on the bar features ───────</span>
-<span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close &gt; <span class="num">0.0</span>];
+<span class="kw">let</span> labelled = features[<span class="kw">filter</span> next_close <span class="kw">is not null</span>];
 <span class="kw">let</span> fit = labelled[<span class="kw">model</span> { next_close ~ open + range + log_mid + z5 + vol_regime,
                             method = ridge,
                             lambda = <span class="num">0.1</span> }];

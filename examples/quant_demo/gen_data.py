@@ -69,12 +69,24 @@ def main() -> None:
         log_prices = np.log(START_PRICE[symbol]) + np.cumsum(log_rets)
         prices = np.exp(log_prices)
 
-        # Tick times: monotonic within symbol, jittered around even spacing.
+        # Tick times: strictly increasing within symbol, jittered around even
+        # spacing. The random walk of gaps overshoots the session about half the
+        # time, so it is rescaled to land inside the day. It must not be clipped
+        # instead: clipping piled every overshooting tick onto the same final
+        # nanosecond (190 of them for META), which left `first`/`last` within the
+        # closing bar dependent on row order rather than on time.
         even_step = day_length_ns // n
-        ts = market_open_ns + np.cumsum(rng.integers(1, 2 * even_step, size=n))
-        # Cap at end-of-day so timestamps stay sortable.
-        ts = np.minimum(ts, market_open_ns + day_length_ns - 1)
-        ts = np.sort(ts)
+        gaps = rng.integers(1, 2 * even_step, size=n)
+        offsets = np.cumsum(gaps).astype(np.float64)
+        # Stop a random slice short of the bell so the symbols don't all print
+        # their closing tick on one shared nanosecond.
+        slack = int(rng.integers(0, 30 * 1_000_000_000))
+        offsets *= (day_length_ns - 1 - n - slack) / offsets[-1]
+        # Flooring can tie adjacent ticks; += arange restores a strict order
+        # while keeping the shift (< n ns) far below one-minute bar resolution.
+        ts = market_open_ns + offsets.astype(np.int64) + np.arange(n)
+        assert np.all(np.diff(ts) > 0), "tick timestamps must be strictly increasing"
+        assert ts[-1] < market_open_ns + day_length_ns
 
         # Lognormal share size with the heavy right tail you'd see on a tape.
         sizes = rng.lognormal(mean=4.5, sigma=0.9, size=n).astype(np.int64)

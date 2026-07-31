@@ -59,14 +59,23 @@ let features = with_rolling[update {
     spread     = high - low,
     range      = (high - low) / open,
     log_mid    = log((high + low) / 2.0),
-    z5         = (close - rmean5) / (rmean5 + 0.0001),
+    z5         = (close - rmean5) / (rmean5 + 0.0001)
+}];
+
+// ── 3c. The label: next bar's close, per symbol ─────────────────────────────
+//   `by symbol` is load-bearing. Without it `lead` looks at the next row of the
+//   whole table, and at each symbol boundary that row belongs to the *next*
+//   symbol — so the last bar of every symbol gets silently mislabelled with
+//   another instrument's price. `by symbol` makes lead stop at the group edge
+//   and emit null there instead. (Row order is preserved by the grouped update.)
+let features = features[by symbol, update {
     next_close = lead(close, 1)
 }];
 
-// ── 4. Train: fit a ridge regression of close on the bar features ──────────
-//   `lead(close, 1)` returns 0 for the last bar per symbol; drop those rows so
+// ── 4. Train: fit a ridge regression of close on the bar features ───────────
+//   `lead(close, 1)` is null for the last bar per symbol; drop those rows so
 //   the fit matches what a `shift(-1) → drop_nulls` step would do in Polars.
-let labelled = features[filter next_close > 0.0];
+let labelled = features[filter next_close is not null];
 let fit = labelled[model { next_close ~ open + range + log_mid + z5 + vol_regime,
                             method = ridge,
                             lambda = 0.1 }];

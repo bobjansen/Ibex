@@ -39,10 +39,12 @@ let bars = tick_stream[resample 1m, by symbol, select {
     close = last(price),
     bar_size = sum(size)
 }];
+bars;
 
 // ── 2. Asof-join the per-symbol reference table ─────────────────────────────
 //   Every bar gets its symbol's sector and (assumed-stationary) vol regime.
 let enriched = bars asof join reference on {ts, symbol};
+enriched;
 
 // ── 3a. Per-symbol rolling features (5-bar window) ─────────────────────────
 //   `update + by symbol + window` partitions the rolling buffer per group, so

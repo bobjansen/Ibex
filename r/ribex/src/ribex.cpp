@@ -705,6 +705,24 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         auto runtime_registry = merge_registries(session.tables, extra_tables);
         auto runtime_scalars = merge_scalars({}, extra_scalars);
 
+        // Carry every in-scope name into the lowerer, exactly as the REPL does.
+        // The static column-ref check treats a bare name in a filter or update
+        // expression as a column unless it is listed here, so without this a
+        // bound scalar is rejected as a missing column the moment the input
+        // schema is statically known -- which is precisely what happens when
+        // clauses are chained instead of split across intermediate `let`s.
+        for (const auto& entry : runtime_registry) {
+            context.lexical_names.insert(entry.first);
+        }
+        for (const auto& entry : runtime_scalars) {
+            context.lexical_names.insert(entry.first);
+        }
+        for (const auto& entry : session.compile_time_lists) {
+            context.lexical_names.insert(entry.first);
+        }
+        context.lexical_names.insert(session.table_externs.begin(), session.table_externs.end());
+        context.lexical_names.insert(session.sink_externs.begin(), session.sink_externs.end());
+
         if (const auto* let_stmt = std::get_if<ibex::parser::LetStmt>(&stmt)) {
             if (auto string_list = extract_compile_time_string_list(*let_stmt->value);
                 string_list.has_value()) {

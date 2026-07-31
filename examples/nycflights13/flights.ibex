@@ -1,0 +1,79 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ibex + R · nycflights13 — the query half
+//
+//  Sourced by examples/nycflights13/flights.R through session_eval_file().
+//  R binds the four nycflights13 tables and the scalar `min_flights` for the
+//  duration of that call; every `let` below survives it, so R can then pull any
+//  named result out of the same session with a one-line `session_eval()`.
+//
+//  Bound by the caller:
+//    flights, airlines, planes, weather  — tables
+//    min_flights                         — Int scalar
+//
+//  Produced for the caller:
+//    carriers, hourly, daily, by_age, by_visib, origin_counts
+//
+//  One `let` per published result. Clauses compose inside a bracket and
+//  brackets chain, so an intermediate only earns a name when it is reused or
+//  when the language forces the break.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Every other binding here is consumed within this file, so the caller's
+// tables need not outlive the call. `fl` is the exception: naming it keeps the
+// flights table in the session for ad-hoc follow-up queries from R.
+let fl = flights;
+
+// ── 1. Carrier leaderboard ───────────────────────────────────────────────────
+//   `min_flights` is an R value bound as a scalar, so the cutoff is chosen in R
+//   while the predicate that applies it runs inside the engine.
+let carriers = (fl[filter arr_delay is not null,
+                   select { flights = count(), avg_arr_delay = mean(arr_delay) },
+                   by carrier]
+                  [filter flights >= min_flights]
+                join airlines on carrier)
+               [order { avg_arr_delay desc }];
+
+// ── 2. Hourly departure profile per origin ───────────────────────────────────
+//   Multi-key group-by: one row per (airport, scheduled departure hour).
+let hourly = fl[filter dep_delay is not null,
+                select { flights = count(), avg_dep_delay = mean(dep_delay) },
+                by { origin, hour },
+                order { origin, hour }];
+
+// ── 3. Daily delays with a trailing 7-day mean ───────────────────────────────
+//   as_timeframe promotes time_hour to the time index (sorting if needed).
+//   `resample 1d` collapses 336k rows to one bar per calendar day; the next
+//   bracket runs a trailing mean over those bars.
+let daily = as_timeframe(fl[filter dep_delay is not null,
+                            select { time_hour, dep_delay }], "time_hour")
+              [resample 1d, select {
+                  flights = count(),
+                  avg_dep_delay = mean(dep_delay)
+              }]
+              [window 7d, update { rolling_7d = rolling_mean(avg_dep_delay) }];
+
+// ── 4. Aircraft age vs. arrival delay ────────────────────────────────────────
+//   `planes` also has a `year` column, which would collide with flights.year
+//   after the join, so it is relabelled on the way in.
+//
+//   This is the one place the language forces a name: `update` and `select` are
+//   mutually exclusive within a bracket, and the aggregate below groups by the
+//   column the `update` derives.
+let aged = (fl[filter arr_delay is not null && tailnum is not null]
+            join planes[rename plane_year = year] on tailnum)
+           [filter plane_year is not null, update { age = 2013 - plane_year }];
+
+let by_age = aged[select { flights = count(), avg_arr_delay = mean(arr_delay) },
+                  by age]
+                 [filter flights >= 500, order age];
+
+// ── 5. Departure delay against visibility ────────────────────────────────────
+//   A two-key join against the hourly weather observations.
+let by_visib = (fl[filter dep_delay is not null] join weather on { origin, time_hour })
+               [filter visib is not null,
+                select { flights = count(), avg_dep_delay = mean(dep_delay) },
+                by visib,
+                order visib];
+
+// ── 6. A small result for the raw Arrow handle demo ──────────────────────────
+let origin_counts = fl[select { flights = count() }, by origin, order origin];

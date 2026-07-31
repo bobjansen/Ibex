@@ -1178,10 +1178,14 @@ Address/offset, release lifetime, failure ownership, empty buffers, filtering,
 and copy-on-write behavior are asserted in C++ and Python tests. The Parquet
 implementation is now owned by `Ibex::parquet`; the CLI, REPL, and Python hosts
 register it directly, `import "parquet"` skips dynamic loading in those hosts,
-and the compatibility plugin is a thin delegate to the same backend. R remains
-on the borrowing/copying path until its nanoarrow externalptr lock/ownership
-protocol is explicit. Independent reader factories and the R ownership
-protocol remain Phase-3a work.
+and the compatibility plugin is a thin delegate to the same backend. Lazy
+sources now acquire reader products through a runtime-defined factory, and each
+Parquet product owns an independent mutable `FileReader` while sharing the
+immutable input, schema, name index, and footer metadata. Successful products
+return to a source-local idle pool: sequential stages avoid reader setup, while
+simultaneous worker acquisitions receive distinct products. R remains on the
+borrowing/copying path until its nanoarrow externalptr lock/ownership protocol
+is explicit; that protocol is the remaining Phase-3a ownership slice.
 
 Prepare the storage and ownership foundation before adding source concurrency.
 Parquet is no longer an ordinary opaque table plugin: it supplies schemas and
@@ -1250,9 +1254,10 @@ Implement this as vertical slices rather than replacing every column at once:
 4. Split the bundled Parquet implementation into `Ibex::parquet` plus an
    optional thin plugin shim; register the built-in backend in the REPL, CLI,
    Python, and R hosts while preserving `import "parquet"`.
-5. Decode Parquet directly into the new buffers and expose a decoder/reader
-   factory to the host runtime. Each factory product owns independent mutable
-   Arrow reader state; no callback closes over one shared `FileReader`.
+5. **Landed:** decode Parquet directly into the new buffers and expose a
+   decoder/reader factory to the host runtime. Each factory product owns
+   independent mutable Arrow reader state; no callback closes over one shared
+   `FileReader`.
 6. Remove redundant Python/R marshalling on supported Arrow inputs and add
    cross-language ownership tests: host release during a query, Ibex result
    surviving its session, repeated import/export without copies, sliced arrays,

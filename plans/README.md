@@ -62,9 +62,10 @@ complete enough to move under `plans/done/`.
   islands are complete. Phase 3a now deliberately precedes parallel I/O:
   promote Parquet to a first-party backend and make Ibex storage adopt
   Arrow-compatible buffers, so Python/R and source morsels share ownership
-  rather than marshal. Phase 3b then implements the LazyTable synchronization
-  contract and parallel decode; Phase 4 follows with aggregate/join/sort
-  barriers.
+  rather than marshal. First-party Parquet and the independent reader-product
+  factory have landed; the R nanoarrow ownership/lock protocol is the remaining
+  Phase 3a slice. Phase 3b then implements the LazyTable synchronization
+  contract and parallel decode; Phase 4 follows with aggregate/join/sort barriers.
 - **bigger-than-ram** builds directly on **chunked-execution**: every
   "materializing" row in that plan's coverage table (unsorted `Order`/
   `AsTimeframe`, non-streaming `Tail`, general `Join`) is a target phase

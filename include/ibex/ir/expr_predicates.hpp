@@ -33,6 +33,12 @@ enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };
 struct BuiltinFunctionInfo {
     FnKind kind;
     bool rolling = false;
+    /// True if the function's result at row i depends on rows other than i —
+    /// it reads neighbours (lag/lead/rolling), accumulates along the row order
+    /// (cumsum/cumprod), or propagates through it (fill_forward/fill_backward).
+    /// Such a function is only meaningful when the rows are in a meaningful
+    /// order, which is what `check_time_index_ordering` enforces.
+    bool order_dependent = false;
 };
 
 /// Returns metadata for a built-in function, or nullptr for an unknown name.
@@ -44,6 +50,15 @@ struct BuiltinFunctionInfo {
 
 /// True for built-in aggregate functions.
 [[nodiscard]] auto is_aggregate_func(std::string_view name) -> bool;
+
+/// True for built-ins whose result depends on the row order (see
+/// BuiltinFunctionInfo::order_dependent).
+[[nodiscard]] auto is_order_dependent_func(std::string_view name) -> bool;
+
+/// Returns the name of the first order-dependent call found anywhere in
+/// `expr`, or empty if there is none. Used to name the offending function in
+/// the row-order diagnostic.
+[[nodiscard]] auto find_order_dependent_call(const Expr& expr) -> std::string;
 
 /// Classify a known built-in by name. Unknown names have no classification.
 /// The runtime builtin registry (builtins() in src/runtime/expr.cpp) checks at

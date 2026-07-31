@@ -851,21 +851,46 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
     const auto& metadata = *reader.parquet_reader()->metadata();
     const bool optional = metadata.schema()->Column(leaf_index)->max_definition_level() != 0;
     if (selection != nullptr || (optional && !groups_have_no_nulls(metadata, groups, leaf_index))) {
-        return decode_physical_column<DType>(
+        std::size_t output_rows = groups.rows;
+        if (selection != nullptr) {
+            const auto first =
+                std::lower_bound(selection->begin(), selection->end(), groups.source_start);
+            const auto last =
+                std::lower_bound(first, selection->end(), groups.source_start + groups.rows);
+            output_rows = static_cast<std::size_t>(std::distance(first, last));
+        }
+        const std::size_t output_start = out.size();
+        if constexpr (std::is_trivially_default_constructible_v<Out>) {
+            out.resize_for_overwrite(output_start + output_rows);
+        } else {
+            out.resize(output_start + output_rows);
+        }
+        Out* const output_data = out.span().data() + output_start;
+        std::size_t output_pos = 0;
+        const auto emitted = decode_physical_column<DType>(
             reader, leaf_index, selection, groups, [&](const Raw* value) {
                 validity.append(value != nullptr);
-                out.push_back(value == nullptr ? Out{} : convert(*value));
+                output_data[output_pos++] = value == nullptr ? Out{} : convert(*value);
             });
+        if (output_pos != output_rows || emitted != output_rows) {
+            throw std::runtime_error("read_parquet: selected decoder emitted the wrong row count");
+        }
+        return emitted;
     }
 
     std::size_t emitted = 0;
     const std::size_t output_start = out.size();
-    std::unique_ptr<Raw[]> converted_values;
-    if constexpr (SameLayout) {
-        static_assert(std::is_same_v<Raw, Out>);
+    if constexpr (std::is_trivially_default_constructible_v<Out>) {
         out.resize_for_overwrite(output_start + groups.rows);
     } else {
+        out.resize(output_start + groups.rows);
+    }
+    Out* const output_data = out.span().data() + output_start;
+    std::unique_ptr<Raw[]> converted_values;
+    if constexpr (!SameLayout) {
         converted_values.reset(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    } else {
+        static_assert(std::is_same_v<Raw, Out>);
     }
     std::unique_ptr<std::int16_t[]> definitions;
     if (optional) {
@@ -886,7 +911,7 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
             std::int64_t values_read = 0;
             Raw* destination = nullptr;
             if constexpr (SameLayout) {
-                destination = out.span().data() + output_start + emitted;
+                destination = output_data + emitted;
             } else {
                 destination = converted_values.get();
             }
@@ -901,7 +926,7 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
             const auto count = static_cast<std::size_t>(values_read);
             if constexpr (!SameLayout) {
                 for (std::size_t i = 0; i < count; ++i) {
-                    out.push_back(convert(converted_values[i]));
+                    output_data[emitted + i] = convert(converted_values[i]);
                 }
             }
             validity.append_valid(count);

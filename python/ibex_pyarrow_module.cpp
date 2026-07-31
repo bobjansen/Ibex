@@ -912,8 +912,126 @@ auto normalize_table_like_to_column_dict(PyObject* table_like)
         "unsupported table binding object; expected dict, pyarrow table-like, or pandas DataFrame");
 }
 
+auto try_build_runtime_table_from_arrow(PyObject* table_like)
+    -> std::expected<std::optional<ibex::runtime::Table>, std::string> {
+    OwnedPyObject arrow_source;
+    Py_INCREF(table_like);
+    arrow_source = OwnedPyObject(table_like);
+
+    int has_array_protocol = PyObject_HasAttrString(arrow_source.get(), "__arrow_c_array__");
+    if (has_array_protocol < 0) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message);
+    }
+
+    if (has_array_protocol == 0) {
+        const int has_batches = PyObject_HasAttrString(table_like, "to_batches");
+        if (has_batches < 0) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        if (has_batches == 0) {
+            return std::optional<ibex::runtime::Table>{};
+        }
+
+        OwnedPyObject combined;
+        const int has_combine = PyObject_HasAttrString(table_like, "combine_chunks");
+        if (has_combine < 0) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        if (has_combine != 0) {
+            combined = OwnedPyObject(PyObject_CallMethod(table_like, "combine_chunks", nullptr));
+            if (!combined) {
+                auto message = current_python_error_message();
+                PyErr_Clear();
+                return std::unexpected(message);
+            }
+        } else {
+            Py_INCREF(table_like);
+            combined = OwnedPyObject(table_like);
+        }
+
+        OwnedPyObject batches(PyObject_CallMethod(combined.get(), "to_batches", nullptr));
+        if (!batches) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        OwnedPyObject fast_batches(
+            PySequence_Fast(batches.get(), "Arrow table to_batches() must return a sequence"));
+        if (!fast_batches) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        if (PySequence_Fast_GET_SIZE(fast_batches.get()) != 1) {
+            // Preserve the existing conversion path for empty or unusual
+            // multi-batch providers until chunked Arrow adoption lands.
+            return std::optional<ibex::runtime::Table>{};
+        }
+
+        PyObject* batch = PySequence_Fast_GET_ITEM(fast_batches.get(), 0);
+        Py_INCREF(batch);
+        arrow_source = OwnedPyObject(batch);
+        has_array_protocol = PyObject_HasAttrString(arrow_source.get(), "__arrow_c_array__");
+        if (has_array_protocol < 0) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        if (has_array_protocol == 0) {
+            return std::optional<ibex::runtime::Table>{};
+        }
+    }
+
+    OwnedPyObject capsules(PyObject_CallMethod(arrow_source.get(), "__arrow_c_array__", nullptr));
+    if (!capsules) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message);
+    }
+    OwnedPyObject fast_capsules(
+        PySequence_Fast(capsules.get(), "Arrow C array protocol must return two capsules"));
+    if (!fast_capsules || PySequence_Fast_GET_SIZE(fast_capsules.get()) != 2) {
+        if (PyErr_Occurred()) {
+            auto message = current_python_error_message();
+            PyErr_Clear();
+            return std::unexpected(message);
+        }
+        return std::unexpected("Arrow C array protocol must return schema and array capsules");
+    }
+
+    PyObject* schema_capsule = PySequence_Fast_GET_ITEM(fast_capsules.get(), 0);
+    PyObject* array_capsule = PySequence_Fast_GET_ITEM(fast_capsules.get(), 1);
+    auto* schema = static_cast<ArrowSchema*>(PyCapsule_GetPointer(schema_capsule, "arrow_schema"));
+    auto* array = static_cast<ArrowArray*>(PyCapsule_GetPointer(array_capsule, "arrow_array"));
+    if (schema == nullptr || array == nullptr) {
+        auto message = current_python_error_message();
+        PyErr_Clear();
+        return std::unexpected(message);
+    }
+
+    auto imported = ibex::interop::adopt_table_from_arrow(array, *schema);
+    if (!imported) {
+        return std::unexpected(imported.error());
+    }
+    return std::optional<ibex::runtime::Table>{std::move(*imported)};
+}
+
 auto build_runtime_table_from_python(PyObject* table_like)
     -> std::expected<ibex::runtime::Table, std::string> {
+    auto arrow_table = try_build_runtime_table_from_arrow(table_like);
+    if (!arrow_table) {
+        return std::unexpected(arrow_table.error());
+    }
+    if (arrow_table->has_value()) {
+        return std::move(**arrow_table);
+    }
+
     auto maybe_dict = normalize_table_like_to_column_dict(table_like);
     if (!maybe_dict.has_value()) {
         return std::unexpected(maybe_dict.error());

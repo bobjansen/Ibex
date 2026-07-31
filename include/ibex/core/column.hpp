@@ -86,18 +86,23 @@ concept ColumnElement = std::regular<T> && std::totally_ordered<T>;
 /// Tag type for dictionary-encoded categorical columns.
 struct Categorical {};
 
-/// A typed, owning columnar storage container.
+/// A typed contiguous column.
 ///
-/// Column<T> owns a contiguous vector of homogeneously typed values
-/// and exposes span-based access for zero-copy interop.
+/// Ordinarily Column<T> owns a vector. It can also adopt an immutable external
+/// buffer together with a shared lifetime owner (Arrow C Data is the first
+/// caller). Reads stay zero-copy; the first mutable access detaches into owned
+/// storage. That keeps the existing value-like API while making foreign,
+/// sliced primitive arrays safe under the runtime's copy-on-write invariant.
 template <typename T>
 class Column {
    public:
     using value_type = T;
     using size_type = std::size_t;
     using storage_type = std::vector<T, detail::NoInitAllocator<T>>;
-    using iterator = typename storage_type::iterator;
-    using const_iterator = typename storage_type::const_iterator;
+    using iterator = T*;
+    using const_iterator = const T*;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
     static_assert(ColumnElement<T>,
                   "Column<T> requires T to satisfy ColumnElement (regular + totally ordered).");
@@ -107,146 +112,345 @@ class Column {
     Column() = default;
 
     explicit Column(std::vector<T> data)
-        : data_(std::make_move_iterator(data.begin()), std::make_move_iterator(data.end())) {}
+        : data_(std::make_move_iterator(data.begin()), std::make_move_iterator(data.end())) {
+        sync_owned_view();
+    }
 
-    Column(std::initializer_list<T> init) : data_(init) {}
+    Column(std::initializer_list<T> init) : data_(init) { sync_owned_view(); }
+
+    Column(const Column& other)
+        : data_(other.is_external() ? storage_type{} : other.data_),
+          external_owner_(other.external_owner_),
+          external_data_(other.is_external() ? other.external_data_ : data_.data()),
+          external_offset_(other.external_offset_),
+          external_size_(other.external_size_) {}
+
+    Column(Column&& other) noexcept
+        : data_(std::move(other.data_)),
+          external_owner_(std::move(other.external_owner_)),
+          external_data_(external_owner_ ? other.external_data_ : data_.data()),
+          external_offset_(other.external_offset_),
+          external_size_(other.external_size_) {
+        other.external_data_ = nullptr;
+        other.external_offset_ = 0;
+        other.external_size_ = 0;
+    }
+
+    auto operator=(const Column& other) -> Column& {
+        if (this != &other) {
+            Column copy(other);
+            swap(copy);
+        }
+        return *this;
+    }
+
+    auto operator=(Column&& other) noexcept -> Column& {
+        if (this != &other) {
+            Column moved(std::move(other));
+            swap(moved);
+        }
+        return *this;
+    }
+
+    void swap(Column& other) noexcept {
+        data_.swap(other.data_);
+        external_owner_.swap(other.external_owner_);
+        std::swap(external_data_, other.external_data_);
+        std::swap(external_offset_, other.external_offset_);
+        std::swap(external_size_, other.external_size_);
+    }
+
+    /// Adopt an immutable contiguous buffer. `owner` must keep every element in
+    /// `[values, values + size)` alive. The pointer may already include an
+    /// Arrow array's logical offset, so slices do not need rebasing.
+    [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner, const T* values,
+                                            size_type size) -> Column {
+        return from_external(std::move(owner), values, 0, size);
+    }
+
+    /// Adopt a slice of an immutable contiguous buffer while retaining its
+    /// original element offset for Arrow C Data round trips.
+    [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner, const T* values,
+                                            size_type offset, size_type size) -> Column {
+        if (!owner) {
+            throw std::invalid_argument("external column requires a lifetime owner");
+        }
+        if (values == nullptr) {
+            throw std::invalid_argument("external column requires a data buffer");
+        }
+        Column column;
+        column.external_owner_ = std::move(owner);
+        column.external_data_ = values + offset;
+        column.external_offset_ = offset;
+        column.external_size_ = size;
+        return column;
+    }
+
+    /// Whether reads currently refer to adopted storage rather than `data_`.
+    [[nodiscard]] auto is_external() const noexcept -> bool {
+        return static_cast<bool>(external_owner_);
+    }
+
+    /// Base storage pointer and logical element offset. Most callers should use
+    /// `data()`; these accessors exist for zero-copy Arrow C Data export.
+    [[nodiscard]] auto buffer_data() const noexcept -> const T* {
+        return is_external() ? external_data_ - external_offset_ : external_data_;
+    }
+    [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
+        return is_external() ? external_offset_ : 0;
+    }
 
     /// Number of elements.
-    [[nodiscard]] auto size() const noexcept -> size_type { return data_.size(); }
+    [[nodiscard]] auto size() const noexcept -> size_type { return external_size_; }
 
     /// Immutable element access (bounds-checked).
-    [[nodiscard]] auto at(size_type idx) const -> const T& { return data_.at(idx); }
+    [[nodiscard]] auto at(size_type idx) const -> const T& {
+        if (idx >= size()) {
+            throw std::out_of_range("Column::at");
+        }
+        return data_ptr()[idx];
+    }
 
     /// Mutable element access (bounds-checked).
-    [[nodiscard]] auto at(size_type idx) -> T& { return data_.at(idx); }
+    [[nodiscard]] auto at(size_type idx) -> T& {
+        detach_external();
+        return data_.at(idx);
+    }
 
     /// Unchecked element access.
-    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const T& { return data_[idx]; }
+    [[nodiscard]] auto operator[](size_type idx) const noexcept -> const T& {
+        return data_ptr()[idx];
+    }
 
     /// Unchecked mutable element access.
-    [[nodiscard]] auto operator[](size_type idx) noexcept -> T& { return data_[idx]; }
+    [[nodiscard]] auto operator[](size_type idx) -> T& {
+        detach_external();
+        return data_[idx];
+    }
 
     /// Zero-copy immutable view of the underlying data.
-    [[nodiscard]] auto span() const noexcept -> std::span<const T> {
+    [[nodiscard]] auto span() const noexcept -> std::span<const T> { return {data_ptr(), size()}; }
+
+    /// Mutable view, detaching adopted storage first.
+    [[nodiscard]] auto span() -> std::span<T> {
+        detach_external();
         return {data_.data(), data_.size()};
     }
 
-    /// Zero-copy mutable view of the underlying data.
-    [[nodiscard]] auto span() noexcept -> std::span<T> { return {data_.data(), data_.size()}; }
-
     /// Append a value.
-    void push_back(const T& value) { data_.push_back(value); }
-    void push_back(T&& value) { data_.push_back(std::move(value)); }
+    void push_back(const T& value) {
+        detach_external();
+        data_.push_back(value);
+        sync_owned_view();
+    }
+    void push_back(T&& value) {
+        detach_external();
+        data_.push_back(std::move(value));
+        sync_owned_view();
+    }
 
     /// Construct a value in-place.
     template <typename... Args>
         requires std::constructible_from<T, Args...>
     auto emplace_back(Args&&... args) -> T& {
-        return data_.emplace_back(std::forward<Args>(args)...);
+        detach_external();
+        data_.emplace_back(std::forward<Args>(args)...);
+        sync_owned_view();
+        return data_.back();
     }
 
-    auto emplace_back() -> T& { return data_.emplace_back(T{}); }
+    auto emplace_back() -> T& {
+        detach_external();
+        data_.emplace_back(T{});
+        sync_owned_view();
+        return data_.back();
+    }
 
     /// Assign from count and value.
-    void assign(size_type count, const T& value) { data_.assign(count, value); }
+    void assign(size_type count, const T& value) {
+        drop_external();
+        data_.assign(count, value);
+        sync_owned_view();
+    }
 
     /// Assign from range.
     template <typename InputIt>
         requires std::input_iterator<InputIt>
     void assign(InputIt first, InputIt last) {
-        data_.assign(first, last);
+        storage_type assigned(first, last);
+        drop_external();
+        data_ = std::move(assigned);
+        sync_owned_view();
     }
     /// Assign from initializer list.
-    void assign(std::initializer_list<T> init) { data_.assign(init); }
+    void assign(std::initializer_list<T> init) {
+        drop_external();
+        data_.assign(init);
+        sync_owned_view();
+    }
 
     /// Insert value before position.
     [[nodiscard]] auto insert(const_iterator pos, const T& value) -> iterator {
-        return data_.insert(pos, value);
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), value);
+        sync_owned_view();
+        return iterator_at(offset);
     }
     [[nodiscard]] auto insert(const_iterator pos, T&& value) -> iterator {
-        return data_.insert(pos, std::move(value));
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), std::move(value));
+        sync_owned_view();
+        return iterator_at(offset);
     }
 
     /// Insert count copies of value.
     [[nodiscard]] auto insert(const_iterator pos, size_type count, const T& value) -> iterator {
-        return data_.insert(pos, count, value);
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), count, value);
+        sync_owned_view();
+        return iterator_at(offset);
     }
 
     /// Insert range.
     template <typename InputIt>
         requires std::input_iterator<InputIt>
     [[nodiscard]] auto insert(const_iterator pos, InputIt first, InputIt last) -> iterator {
-        return data_.insert(pos, first, last);
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), first, last);
+        sync_owned_view();
+        return iterator_at(offset);
     }
 
     /// Insert initializer list.
     [[nodiscard]] auto insert(const_iterator pos, std::initializer_list<T> init) -> iterator {
-        return data_.insert(pos, init);
+        return insert(pos, init.begin(), init.end());
     }
 
     /// Emplace value before position.
     template <typename... Args>
         requires std::constructible_from<T, Args...>
     [[nodiscard]] auto emplace(const_iterator pos, Args&&... args) -> iterator {
-        return data_.emplace(pos, std::forward<Args>(args)...);
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.emplace(data_.begin() + static_cast<std::ptrdiff_t>(offset),
+                      std::forward<Args>(args)...);
+        sync_owned_view();
+        return iterator_at(offset);
     }
 
     /// Erase element at position.
-    [[nodiscard]] auto erase(const_iterator pos) -> iterator { return data_.erase(pos); }
+    [[nodiscard]] auto erase(const_iterator pos) -> iterator {
+        const auto offset = iterator_offset(pos);
+        detach_external();
+        data_.erase(data_.begin() + static_cast<std::ptrdiff_t>(offset));
+        const auto next = std::min(offset, data_.size());
+        sync_owned_view();
+        return iterator_at(next);
+    }
     /// Erase range.
     [[nodiscard]] auto erase(const_iterator first, const_iterator last) -> iterator {
-        return data_.erase(first, last);
+        const auto first_offset = iterator_offset(first);
+        const auto last_offset = iterator_offset(last);
+        detach_external();
+        data_.erase(data_.begin() + static_cast<std::ptrdiff_t>(first_offset),
+                    data_.begin() + static_cast<std::ptrdiff_t>(last_offset));
+        const auto next = std::min(first_offset, data_.size());
+        sync_owned_view();
+        return iterator_at(next);
     }
 
     /// Reserve capacity.
-    void reserve(size_type capacity) { data_.reserve(capacity); }
+    void reserve(size_type capacity) {
+        detach_external();
+        data_.reserve(capacity);
+        sync_owned_view();
+    }
 
     /// Current capacity.
-    [[nodiscard]] auto capacity() const noexcept -> size_type { return data_.capacity(); }
+    [[nodiscard]] auto capacity() const noexcept -> size_type {
+        return is_external() ? external_size_ : data_.capacity();
+    }
 
     /// Remove all elements.
-    void clear() noexcept { data_.clear(); }
+    void clear() noexcept {
+        drop_external();
+        data_.clear();
+        sync_owned_view();
+    }
 
     /// Resize the column (value-initialize new elements).
-    void resize(size_type count) { data_.resize(count, T{}); }
+    void resize(size_type count) {
+        detach_external();
+        data_.resize(count, T{});
+        sync_owned_view();
+    }
 
     /// Resize the column (copy-initialize new elements with value).
-    void resize(size_type count, const T& value) { data_.resize(count, value); }
+    void resize(size_type count, const T& value) {
+        detach_external();
+        data_.resize(count, value);
+        sync_owned_view();
+    }
 
     /// Resize without value-initializing new slots. Callers must overwrite every element.
     void resize_for_overwrite(size_type count)
         requires std::is_trivially_default_constructible_v<T>
     {
+        // Existing values must survive `resize` when count is smaller or when
+        // the caller grows relative to an adopted slice.
+        detach_external();
         data_.resize(count);
+        sync_owned_view();
     }
 
     /// Reduce capacity to fit size.
-    void shrink_to_fit() { data_.shrink_to_fit(); }
+    void shrink_to_fit() {
+        detach_external();
+        data_.shrink_to_fit();
+        sync_owned_view();
+    }
 
     /// Remove the last element.
-    void pop_back() { data_.pop_back(); }
+    void pop_back() {
+        detach_external();
+        data_.pop_back();
+        sync_owned_view();
+    }
 
     /// Whether the column is empty.
-    [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size() == 0; }
 
     /// Max size supported by the allocator.
     [[nodiscard]] auto max_size() const noexcept -> size_type { return data_.max_size(); }
 
     /// Raw data access.
-    [[nodiscard]] auto data() noexcept -> T* { return data_.data(); }
-    [[nodiscard]] auto data() const noexcept -> const T* { return data_.data(); }
+    [[nodiscard]] auto data() -> T* {
+        detach_external();
+        return data_.data();
+    }
+    [[nodiscard]] auto data() const noexcept -> const T* { return data_ptr(); }
 
     /// First and last elements.
-    [[nodiscard]] auto front() const -> const T& { return data_.front(); }
-    [[nodiscard]] auto front() -> T& { return data_.front(); }
-    [[nodiscard]] auto back() const -> const T& { return data_.back(); }
-    [[nodiscard]] auto back() -> T& { return data_.back(); }
+    [[nodiscard]] auto front() const -> const T& { return *data_ptr(); }
+    [[nodiscard]] auto front() -> T& {
+        detach_external();
+        return data_.front();
+    }
+    [[nodiscard]] auto back() const -> const T& { return data_ptr()[size() - 1]; }
+    [[nodiscard]] auto back() -> T& {
+        detach_external();
+        return data_.back();
+    }
 
     /// Apply a predicate and return a filtered column.
     template <std::predicate<const T&> Pred>
     [[nodiscard]] auto filter(Pred pred) const -> Column<T> {
         std::vector<T> result;
-        std::ranges::copy_if(data_, std::back_inserter(result), pred);
+        std::ranges::copy_if(span(), std::back_inserter(result), pred);
         return Column<T>{std::move(result)};
     }
 
@@ -256,27 +460,82 @@ class Column {
     [[nodiscard]] auto transform(F func) const -> Column<std::invoke_result_t<F, const T&>> {
         using U = std::invoke_result_t<F, const T&>;
         std::vector<U> result;
-        result.reserve(data_.size());
-        std::ranges::transform(data_, std::back_inserter(result), func);
+        result.reserve(size());
+        std::ranges::transform(span(), std::back_inserter(result), func);
         return Column<U>{std::move(result)};
     }
 
     // Iterator support
-    [[nodiscard]] auto begin() noexcept { return data_.begin(); }
-    [[nodiscard]] auto end() noexcept { return data_.end(); }
-    [[nodiscard]] auto begin() const noexcept { return data_.cbegin(); }
-    [[nodiscard]] auto end() const noexcept { return data_.cend(); }
-    [[nodiscard]] auto cbegin() const noexcept { return data_.cbegin(); }
-    [[nodiscard]] auto cend() const noexcept { return data_.cend(); }
-    [[nodiscard]] auto rbegin() noexcept { return data_.rbegin(); }
-    [[nodiscard]] auto rend() noexcept { return data_.rend(); }
-    [[nodiscard]] auto rbegin() const noexcept { return data_.crbegin(); }
-    [[nodiscard]] auto rend() const noexcept { return data_.crend(); }
-    [[nodiscard]] auto crbegin() const noexcept { return data_.crbegin(); }
-    [[nodiscard]] auto crend() const noexcept { return data_.crend(); }
+    [[nodiscard]] auto begin() -> iterator {
+        detach_external();
+        return data_.data();
+    }
+    [[nodiscard]] auto end() -> iterator {
+        detach_external();
+        return iterator_at(external_size_);
+    }
+    [[nodiscard]] auto begin() const noexcept -> const_iterator { return data_ptr(); }
+    [[nodiscard]] auto end() const noexcept -> const_iterator {
+        return empty() ? data_ptr() : data_ptr() + size();
+    }
+    [[nodiscard]] auto cbegin() const noexcept -> const_iterator { return begin(); }
+    [[nodiscard]] auto cend() const noexcept -> const_iterator { return end(); }
+    [[nodiscard]] auto rbegin() -> reverse_iterator { return reverse_iterator{end()}; }
+    [[nodiscard]] auto rend() -> reverse_iterator { return reverse_iterator{begin()}; }
+    [[nodiscard]] auto rbegin() const noexcept -> const_reverse_iterator {
+        return const_reverse_iterator{end()};
+    }
+    [[nodiscard]] auto rend() const noexcept -> const_reverse_iterator {
+        return const_reverse_iterator{begin()};
+    }
+    [[nodiscard]] auto crbegin() const noexcept -> const_reverse_iterator { return rbegin(); }
+    [[nodiscard]] auto crend() const noexcept -> const_reverse_iterator { return rend(); }
 
    private:
+    [[nodiscard]] auto data_ptr() const noexcept -> const T* { return external_data_; }
+
+    [[nodiscard]] auto iterator_offset(const_iterator pos) const noexcept -> size_type {
+        const auto* first = data_ptr();
+        if (pos == first) {
+            return 0;
+        }
+        return static_cast<size_type>(pos - first);
+    }
+
+    void drop_external() noexcept {
+        external_owner_.reset();
+        external_offset_ = 0;
+    }
+
+    void detach_external() {
+        if (!is_external()) {
+            return;
+        }
+        storage_type owned;
+        owned.reserve(external_size_);
+        if (external_size_ != 0) {
+            owned.insert(owned.end(), external_data_, external_data_ + external_size_);
+        }
+        data_ = std::move(owned);
+        drop_external();
+        sync_owned_view();
+    }
+
+    void sync_owned_view() noexcept {
+        external_data_ = data_.data();
+        external_size_ = data_.size();
+        external_offset_ = 0;
+    }
+
+    [[nodiscard]] auto iterator_at(size_type offset) noexcept -> iterator {
+        return external_size_ == 0 ? data_.data() : data_.data() + offset;
+    }
+
     storage_type data_;
+    std::shared_ptr<const void> external_owner_;
+    const T* external_data_ = nullptr;
+    size_type external_offset_ = 0;
+    size_type external_size_ = 0;
 };
 
 /// Specialization for categorical columns (dictionary-encoded strings).

@@ -3,8 +3,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <memory>
 #include <robin_hood.h>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -275,6 +277,116 @@ TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[i
     REQUIRE((*symbols)[0] == "AAPL");
     REQUIRE((*symbols)[1] == "MSFT");
     REQUIRE((*symbols)[2] == "AAPL");
+
+    schema.release(&schema);
+    array.release(&array);
+}
+
+TEST_CASE("Arrow C Data adoption keeps sliced primitive buffers zero-copy until mutation",
+          "[interop][arrow][adopt]") {
+    ibex::runtime::Table source;
+    source.add_column("id", ibex::Column<std::int64_t>{10, 20, 30, 40},
+                      ibex::runtime::ValidityBitmap{true, false, true, true});
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(source, &array, &schema);
+    REQUIRE(exported.has_value());
+
+    const auto* exported_values = static_cast<const std::int64_t*>(array.children[0]->buffers[1]);
+    const auto* exported_validity = static_cast<const std::uint8_t*>(array.children[0]->buffers[0]);
+    array.length = 2;
+    array.children[0]->length = 2;
+    array.children[0]->offset = 1;
+
+    auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(array.release == nullptr);
+
+    const auto& borrowed_table = std::as_const(*imported);
+    const auto* borrowed_values =
+        std::get_if<ibex::Column<std::int64_t>>(borrowed_table.find("id"));
+    REQUIRE(borrowed_values != nullptr);
+    REQUIRE(borrowed_values->is_external());
+    REQUIRE(borrowed_values->data() == exported_values + 1);
+    REQUIRE((*borrowed_values)[0] == 20);
+    REQUIRE((*borrowed_values)[1] == 30);
+    const auto* borrowed_entry = borrowed_table.find_entry("id");
+    REQUIRE(borrowed_entry != nullptr);
+    REQUIRE(borrowed_entry->validity.has_value());
+    REQUIRE(borrowed_entry->validity->is_external());
+    REQUIRE(borrowed_entry->validity->buffer_data() == exported_validity);
+    REQUIRE(borrowed_entry->validity->buffer_offset() == 1);
+    REQUIRE_FALSE((*borrowed_entry->validity)[0]);
+    REQUIRE((*borrowed_entry->validity)[1]);
+
+    ArrowArray roundtrip_array{};
+    ArrowSchema roundtrip_schema{};
+    auto roundtrip_export =
+        ibex::interop::export_table_to_arrow(borrowed_table, &roundtrip_array, &roundtrip_schema);
+    REQUIRE(roundtrip_export.has_value());
+    REQUIRE(roundtrip_array.children[0]->offset == 1);
+    REQUIRE(roundtrip_array.children[0]->buffers[0] == exported_validity);
+    REQUIRE(roundtrip_array.children[0]->buffers[1] == exported_values);
+    roundtrip_schema.release(&roundtrip_schema);
+    roundtrip_array.release(&roundtrip_array);
+
+    auto& mutable_values = std::get<ibex::Column<std::int64_t>>(imported->mutable_column(0));
+    mutable_values[0] = 200;
+
+    REQUIRE_FALSE(mutable_values.is_external());
+    REQUIRE(std::as_const(mutable_values).data() != exported_values + 1);
+    REQUIRE(std::as_const(mutable_values)[0] == 200);
+    REQUIRE(exported_values[1] == 20);
+
+    auto& mutable_validity = *imported->columns[0].validity;
+    mutable_validity.set(0, true);
+    REQUIRE_FALSE(mutable_validity.is_external());
+    REQUIRE(mutable_validity[0]);
+    REQUIRE_FALSE((source.columns[0].validity.value())[1]);
+
+    schema.release(&schema);
+}
+
+TEST_CASE("Arrow C Data adoption retains and releases producer ownership",
+          "[interop][arrow][adopt]") {
+    auto source = std::make_shared<ibex::runtime::Table>();
+    source->add_column("value", ibex::Column<double>{1.5, 2.5});
+    std::weak_ptr<ibex::runtime::Table> source_lifetime = source;
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(
+        std::static_pointer_cast<const ibex::runtime::Table>(source), &array, &schema);
+    REQUIRE(exported.has_value());
+    source.reset();
+
+    {
+        auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+        REQUIRE(imported.has_value());
+        REQUIRE_FALSE(source_lifetime.expired());
+    }
+
+    REQUIRE(source_lifetime.expired());
+    schema.release(&schema);
+}
+
+TEST_CASE("Arrow C Data adoption leaves ownership with caller on failure",
+          "[interop][arrow][adopt]") {
+    ibex::runtime::Table source;
+    source.add_column("id", ibex::Column<std::int64_t>{10, 20});
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(source, &array, &schema);
+    REQUIRE(exported.has_value());
+
+    ArrowSchema invalid_schema = schema;
+    invalid_schema.format = "l";
+    auto imported = ibex::interop::adopt_table_from_arrow(&array, invalid_schema);
+
+    REQUIRE_FALSE(imported.has_value());
+    REQUIRE(array.release != nullptr);
 
     schema.release(&schema);
     array.release(&array);

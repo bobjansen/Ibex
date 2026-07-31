@@ -198,7 +198,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
             auto batch_guard = std::unique_ptr<::ArrowArray, void (*)(::ArrowArray*)>(
                 &batch, ibex::interop::release_arrow_array);
 
-            auto imported = ibex::interop::import_table_from_arrow(batch, schema_);
+            auto imported = ibex::interop::adopt_table_from_arrow(&batch, schema_);
             if (!imported) {
                 finished_ = true;
                 return std::unexpected("ADBC stream batch import failed: " + imported.error());

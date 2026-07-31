@@ -379,7 +379,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     const auto* src_entry = table.find_entry(col_ref->name);
     const ValidityBitmap* sv =
         (src_entry != nullptr && src_entry->validity.has_value()) ? &*src_entry->validity : nullptr;
-    auto valid_at = [sv](std::size_t j) noexcept -> bool { return sv == nullptr || (*sv)[j]; };
+    const auto* validity_bytes = sv == nullptr ? nullptr : sv->buffer_data();
+    const std::size_t validity_offset = sv == nullptr ? 0 : sv->buffer_offset();
+    auto valid_at = [validity_bytes, validity_offset](std::size_t j) noexcept -> bool {
+        if (validity_bytes == nullptr) {
+            return true;
+        }
+        const std::size_t bit = validity_offset + j;
+        return ((validity_bytes[bit / 8] >> (bit % 8)) & 0x01U) != 0U;
+    };
 
     if (call.callee == "rolling_mean") {
         return std::visit(
@@ -388,14 +396,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_mean: column must be numeric (Int or Float)");
                 } else {
+                    const auto* values = col.data();
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
                     if (sv == nullptr) {
                         double sum = 0.0;
                         std::size_t val_cnt = 0;
                         std::size_t nan_cnt = 0;
                         auto add = [&](std::size_t j) {
-                            auto v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(values[j]);
                             if (std::isnan(v)) {
                                 ++nan_cnt;
                             } else {
@@ -404,7 +414,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             }
                         };
                         auto drop = [&](std::size_t j) {
-                            auto v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(values[j]);
                             if (std::isnan(v)) {
                                 --nan_cnt;
                             } else {
@@ -419,8 +429,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 drop(lo);
                                 ++lo;
                             }
-                            result[i] = nan_cnt > 0 ? std::numeric_limits<double>::quiet_NaN()
-                                                    : sum / static_cast<double>(val_cnt);
+                            result_values[i] = nan_cnt > 0
+                                                   ? std::numeric_limits<double>::quiet_NaN()
+                                                   : sum / static_cast<double>(val_cnt);
                         }
                         return ComputedColumn{.column = std::move(result),
                                               .validity = std::nullopt};
@@ -433,7 +444,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;  // NULL: skip, payload undefined
-                        auto v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(values[j]);
                         if (std::isnan(v)) {
                             ++nan_cnt;
                         } else {
@@ -444,7 +455,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(values[j]);
                         if (std::isnan(v)) {
                             --nan_cnt;
                         } else {
@@ -460,11 +471,11 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             ++lo;
                         }
                         if (nan_cnt > 0) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                         } else if (val_cnt > 0) {
-                            result[i] = sum / static_cast<double>(val_cnt);
+                            result_values[i] = sum / static_cast<double>(val_cnt);
                         } else {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);

@@ -88,7 +88,19 @@ auto release_arrow_stream(ArrowArrayStream* stream) noexcept -> void;
 /// The importer currently supports the Arrow layouts Ibex exports itself:
 /// int64, double, bool, utf8, dictionary-encoded utf8 categoricals, Date, and
 /// Timestamp, plus top-level table metadata for time index and ordering.
+///
+/// This overload borrows the Arrow descriptors and copies every column.
 [[nodiscard]] auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string>;
+
+/// Adopt an Arrow C Data struct array as an Ibex table.
+///
+/// On success, ownership is moved from `array` into the returned table and
+/// `array->release` is cleared. Int64 and double payloads remain in their Arrow
+/// buffers and detach on the first mutable Column access; other layouts are
+/// currently copied. The schema is borrowed only for the duration of the call.
+/// On failure, `array` is left untouched and remains owned by the caller.
+[[nodiscard]] auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
     -> std::expected<runtime::Table, std::string>;
 
 }  // namespace ibex::interop

@@ -99,16 +99,36 @@ auto derive_table_properties(const TableProperties& input, const KeyColumnFate& 
             out.ordering = std::move(kept);
         }
     }
+    // Group-major layout survives anything row-preserving or row-removing: the
+    // runs stay contiguous. It only survives here if every key column does —
+    // once a key is dropped or renamed away we can no longer name the grouping
+    // in a diagnostic, so drop the claim rather than report a stale key.
+    if (!input.group_major_by.empty()) {
+        std::vector<std::string> kept;
+        kept.reserve(input.group_major_by.size());
+        for (const auto& key : input.group_major_by) {
+            auto mapped = fate(key);
+            if (!mapped.has_value()) {
+                kept.clear();
+                break;
+            }
+            kept.push_back(std::move(*mapped));
+        }
+        out.group_major_by = std::move(kept);
+    }
     return out;
 }
 
 auto table_properties_of(const Table& table) -> TableProperties {
-    return TableProperties{.ordering = table.ordering, .time_index = table.time_index};
+    return TableProperties{.ordering = table.ordering,
+                           .time_index = table.time_index,
+                           .group_major_by = table.group_major_by};
 }
 
 auto apply_table_properties(Table& table, const TableProperties& props) -> void {
     table.ordering = props.ordering;
     table.time_index = props.time_index;
+    table.group_major_by = props.group_major_by;
     normalize_time_index(table);
 }
 

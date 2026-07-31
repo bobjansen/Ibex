@@ -685,7 +685,8 @@ class ResampleNode final : public Node {
 /// See SPEC.md Section 8 (TimeFrame Extensions).
 ///
 /// Valid only on TimeFrame operands. The duration defines the lookback
-/// range [t - duration, t] for each row at time t.
+/// range (t - duration, t] for each row at time t — half-open on the left, so
+/// a k*s duration over a grid of spacing s spans k rows, matching `resample`.
 class WindowNode final : public Node {
    public:
     WindowNode(NodeId id, Duration duration) : Node(NodeKind::Window, id), duration_(duration) {}

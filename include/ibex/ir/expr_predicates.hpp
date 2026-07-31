@@ -90,7 +90,7 @@ struct BuiltinFunctionInfo {
 /// `bucket_start`). Everything else — `lag`, `diff`, `cumsum`, a bare
 /// Aggregate, an extern — is refused, because it reads across buckets.
 ///
-/// Only meaningful for `aligned`: a trailing window spans `[t - dur, t]`, which
+/// Only meaningful for `aligned`: a trailing window spans `(t - dur, t]`, which
 /// straddles any boundary we might pick.
 [[nodiscard]] auto is_bucket_local_window_expr(const Expr& expr) -> bool;
 

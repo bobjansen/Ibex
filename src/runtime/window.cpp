@@ -37,7 +37,12 @@ namespace ibex::runtime {
 
 namespace {
 
-// Find the first row index lo in [0, row] where time[lo] >= time[row] - duration.
+// Find the first row index lo in [0, row] where time[lo] > time[row] - duration.
+// The trailing window is half-open, (t - duration, t], so that a duration means
+// the same thing here as it does to `resample`: on a regular grid of spacing s,
+// a k*s window holds k rows, not k+1. The `aligned` variant is closed on the
+// left instead — see win_lo — because a row sitting exactly on a bucket boundary
+// belongs to that bucket, matching resample's [start, start + duration).
 // The time index column must be Timestamp or Date and sorted ascending.
 auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration duration) -> std::size_t {
     if (const auto* ts_col = std::get_if<Column<Timestamp>>(&time_col)) {
@@ -46,7 +51,7 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
         std::size_t hi = row;
         while (lo < hi) {
             const std::size_t mid = lo + ((hi - lo) / 2);
-            if ((*ts_col)[mid].nanos < threshold) {
+            if ((*ts_col)[mid].nanos <= threshold) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -63,7 +68,7 @@ auto window_lo(const ColumnValue& time_col, std::size_t row, ir::Duration durati
     std::size_t hi = row;
     while (lo < hi) {
         const std::size_t mid = lo + ((hi - lo) / 2);
-        if (date_col[mid].days < threshold) {
+        if (date_col[mid].days <= threshold) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -266,7 +271,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     std::size_t rows = table.rows();
 
     // A count window spans the last `count_n` rows and needs no time index.
-    // A duration window spans [t - dur, t] and requires a TimeFrame.
+    // A duration window spans (t - dur, t] and requires a TimeFrame.
     const bool is_count = std::holds_alternative<CountWindow>(spec);
     const std::size_t count_n =
         is_count ? static_cast<std::size_t>(std::get<CountWindow>(spec).n) : 0;
@@ -326,7 +331,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             return (i - lo) >= count_n;
         if (aligned_dur)
             return time_vals[lo] < bucket_start(i);
-        return time_vals[lo] < time_vals[i] - dur_val;
+        // Trailing window is half-open on the left: (t - dur, t].
+        return time_vals[lo] <= time_vals[i] - dur_val;
     };
     // win_lo(i): the first in-window row index for the window ending at `i`.
     auto win_lo = [&](std::size_t i) -> std::size_t {

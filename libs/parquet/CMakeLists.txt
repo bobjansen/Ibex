@@ -175,6 +175,8 @@ if(WIN32 AND TARGET parquet_shared)
     set_target_properties(parquet_shared PROPERTIES OUTPUT_NAME arrow_parquet)
 endif()
 
+add_library(ibex_parquet STATIC backend.cpp)
+add_library(Ibex::parquet ALIAS ibex_parquet)
 add_library(ibex_parquet_plugin SHARED parquet.cpp)
 
 # -Wno-missing-designated-field-initializers only exists from Clang 19
@@ -182,9 +184,9 @@ add_library(ibex_parquet_plugin SHARED parquet.cpp)
 # back to the older, broader -Wno-missing-field-initializers there instead of
 # erroring on an unknown flag under -Werror.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
-    target_compile_options(ibex_parquet_plugin PRIVATE -Wno-missing-designated-field-initializers)
+    target_compile_options(ibex_parquet PRIVATE -Wno-missing-designated-field-initializers)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
-    target_compile_options(ibex_parquet_plugin PRIVATE -Wno-missing-field-initializers)
+    target_compile_options(ibex_parquet PRIVATE -Wno-missing-field-initializers)
 endif()
 
 set_target_properties(ibex_parquet_plugin PROPERTIES
@@ -194,20 +196,28 @@ set_target_properties(ibex_parquet_plugin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${_ibex_parquet_output_dir}"
 )
 
-target_include_directories(ibex_parquet_plugin
+target_include_directories(ibex_parquet
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${IBEX_ROOT}/include"
 )
 
-target_include_directories(ibex_parquet_plugin
+target_include_directories(ibex_parquet
     SYSTEM PRIVATE
         "${arrow_SOURCE_DIR}/cpp/src"
         "${arrow_SOURCE_DIR}/cpp/src/generated"
         "${arrow_BINARY_DIR}/src"
 )
 
+target_include_directories(ibex_parquet_plugin PRIVATE "${IBEX_ROOT}/include")
+
 if(IBEX_PARQUET_STANDALONE)
+    target_include_directories(ibex_parquet
+        PRIVATE
+            "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
+            "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"
+            "${IBEX_BUILD_DIR}/_deps/robin_hood-src/src/include"
+    )
     target_include_directories(ibex_parquet_plugin
         PRIVATE
             "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
@@ -224,7 +234,7 @@ if(IBEX_PARQUET_STANDALONE)
         set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlogd.a")
     endif()
 
-    target_link_libraries(ibex_parquet_plugin
+    target_link_libraries(ibex_parquet
         PRIVATE
             ${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a
             ${IBEX_BUILD_DIR}/src/ir/libibex_ir.a
@@ -233,19 +243,21 @@ if(IBEX_PARQUET_STANDALONE)
             ${_ibex_spdlog_lib}
     )
 else()
-    target_link_libraries(ibex_parquet_plugin
+    target_link_libraries(ibex_parquet
         PRIVATE
             Ibex::runtime
             Ibex::CompilerOptions
     )
+    target_link_libraries(ibex_parquet_plugin PRIVATE Ibex::runtime Ibex::CompilerOptions)
 
     if(TARGET Ibex::Sanitizers)
+        target_link_libraries(ibex_parquet PRIVATE Ibex::Sanitizers)
         target_link_libraries(ibex_parquet_plugin PRIVATE Ibex::Sanitizers)
     endif()
 endif()
 
 if(TARGET arrow_shared AND TARGET parquet_shared)
-    target_link_libraries(ibex_parquet_plugin PRIVATE arrow_shared parquet_shared CURL::libcurl)
+    target_link_libraries(ibex_parquet PRIVATE arrow_shared parquet_shared CURL::libcurl)
     set(_ibex_arrow_shared_targets arrow_shared parquet_shared)
     if(TARGET arrow_ipc_shared)
         # On some configs (observed on Windows) arrow_ipc_shared exists as a
@@ -307,6 +319,8 @@ if(TARGET arrow_shared AND TARGET parquet_shared)
 else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
+
+target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet)
 
 set(_ibex_parquet_stub "${_ibex_parquet_output_dir}/parquet.ibex")
 add_custom_command(

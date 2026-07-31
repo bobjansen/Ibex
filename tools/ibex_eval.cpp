@@ -8,6 +8,10 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+#include <ibex/parquet/backend.hpp>
+#endif
+
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
 
@@ -84,6 +88,9 @@ auto main(int argc, char** argv) -> int {
     try {
         const std::string source = read_file(script_path);
         ibex::runtime::ExternRegistry registry;
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+        ibex::parquet::register_backend(registry);
+#endif
         return ibex::repl::execute_script(source, registry, config) ? 0 : 1;
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << '\n';

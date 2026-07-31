@@ -2957,8 +2957,10 @@ additional functions, but the recommended path for custom functionality is
 
 ### 12.1 I/O Functions
 
-I/O is provided exclusively via `extern fn` plugins rather than built-ins.
-The bundled I/O plugins are:
+I/O functions are registered as `extern fn` implementations rather than core
+built-ins. A host may link a first-party backend directly or load an optional
+plugin; `import` is the portable language-level activation boundary. The
+bundled I/O backends are:
 
 | Plugin | Reader | Writer | Format |
 |--------|--------|--------|--------|
@@ -2983,11 +2985,13 @@ let iris = read_csv("iris.csv");
 `read_csv` infers column types from the input file (Int64, Float64, or String
 per column). The resulting schema is implementation-defined.
 
-The bundled Parquet plugin accepts local file paths, HTTPS URLs, and S3 object
-URIs in `read_parquet`. HTTPS URLs require no cloud credentials and are suitable
-for public objects, presigned S3 URLs, and CDN-hosted files. S3 credentials and
-profiles are resolved by the AWS SDK through the usual environment, config-file,
-and instance-metadata mechanisms; URI query parameters such as `region` and
+The standard CLI, REPL, and Python hosts link the first-party Parquet backend
+directly; an optional thin compatibility plugin delegates to that same backend.
+It accepts local file paths, HTTPS URLs, and S3 object URIs in `read_parquet`.
+HTTPS URLs require no cloud credentials and are suitable for public objects,
+presigned S3 URLs, and CDN-hosted files. S3 credentials and profiles are
+resolved by the AWS SDK through the usual environment, config-file, and
+instance-metadata mechanisms; URI query parameters such as `region` and
 `endpoint_override` are passed to Arrow's S3 filesystem.
 
 ```
@@ -3975,9 +3979,13 @@ points are provided:
 - `eval_table(source, tables=None, scalars=None)` evaluates an in-memory Ibex source string
 - `eval_file(path, tables=None, scalars=None)` evaluates a `.ibex` file from disk
 
-The optional `tables` binding map copies Python-side table data into owned Ibex
-tables before evaluation. An optional `scalars` binding map passes Python
-scalars through Ibex’s existing scalar registry. The first implementation supports:
+The optional `tables` binding map adopts supported single-batch PyArrow buffers
+through Arrow C Data and retains their producer ownership; fragmented inputs
+are combined first, and unsupported Python table shapes use the copying path.
+An optional `scalars` binding map passes Python scalars through Ibex’s existing
+scalar registry. The bridge also accepts `import "parquet"` without a plugin
+path because the Python host links that backend directly. The implementation
+supports:
 
 - plain Python column dictionaries
 - `pyarrow.Table` inputs

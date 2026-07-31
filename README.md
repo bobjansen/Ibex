@@ -883,8 +883,8 @@ that behavior.
 ## Plugins
 
 Ibex data-source functions (e.g. `read_csv`, `read_json`, `read_parquet`) are
-**plugins** — shared libraries loaded at runtime when a script declares an
-`extern fn`.
+**I/O backends** — host-linked implementations or shared plugins registered
+with the runtime when a script imports their library declarations.
 
 When the REPL encounters:
 
@@ -895,9 +895,14 @@ extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
 it looks for `csv.so` in the plugin search path and calls its
 `ibex_register(ExternRegistry*)` entry point to register the function.
 
-**Bundled plugins:**
+Parquet is linked directly into the standard CLI, REPL, and Python hosts as a
+first-party backend. `import "parquet"` remains the portable activation
+boundary; a thin `parquet.so` compatibility shim is also built for embedding
+hosts that use dynamic plugins.
 
-| Plugin | Functions | Format |
+**Bundled backends:**
+
+| Backend | Functions | Format |
 |--------|-----------|--------|
 | `csv`  | `read_csv`, `write_csv` | RFC 4180 CSV with type inference |
 | `json` | `read_json`, `write_json` | JSON array-of-objects, JSON-Lines, single object |

@@ -259,6 +259,16 @@ class ExternRegistry {
     /// Number of registered functions.
     [[nodiscard]] auto size() const noexcept -> std::size_t { return registry_.size(); }
 
+    /// Mark a first-party or dynamically loaded library as registered.
+    ///
+    /// Import loaders use this to avoid loading a compatibility DSO when the
+    /// embedding host already linked the same backend directly.
+    void register_library(std::string name) { libraries_.insert(std::move(name)); }
+
+    [[nodiscard]] auto contains_library(const std::string& name) const -> bool {
+        return libraries_.contains(name);
+    }
+
     /// Register a model method (the `method =` value, e.g. "lightgbm").
     void register_model(std::string name, ModelOps ops) {
         models_.insert_or_assign(std::move(name), std::move(ops));
@@ -275,6 +285,7 @@ class ExternRegistry {
    private:
     robin_hood::unordered_map<std::string, ExternFunction> registry_;
     robin_hood::unordered_map<std::string, ModelOps> models_;
+    robin_hood::unordered_set<std::string> libraries_;
     RngBridge rng_;
 };
 

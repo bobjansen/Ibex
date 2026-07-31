@@ -3716,7 +3716,8 @@ struct PluginLoadResult {
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      robin_hood::unordered_set<std::string>& loaded_plugins,
                      runtime::ExternRegistry& externs) -> PluginLoadResult {
-    if (loaded_plugins.contains(stem)) {
+    if (loaded_plugins.contains(stem) || externs.contains_library(stem)) {
+        loaded_plugins.insert(stem);
         return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
 #ifdef _WIN32

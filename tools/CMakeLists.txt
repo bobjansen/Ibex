@@ -17,6 +17,11 @@ target_link_libraries(ibex_repl_bin
         spdlog::spdlog
 )
 
+if(TARGET Ibex::parquet)
+    target_link_libraries(ibex_repl_bin PRIVATE Ibex::parquet)
+    target_compile_definitions(ibex_repl_bin PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
+endif()
+
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_repl_bin PRIVATE Ibex::Sanitizers)
 endif()
@@ -225,6 +230,11 @@ target_link_libraries(ibex_eval_bin
         CLI11::CLI11
         spdlog::spdlog
 )
+
+if(TARGET Ibex::parquet)
+    target_link_libraries(ibex_eval_bin PRIVATE Ibex::parquet)
+    target_compile_definitions(ibex_eval_bin PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
+endif()
 
 if(TARGET Ibex::Sanitizers)
     target_link_libraries(ibex_eval_bin PRIVATE Ibex::Sanitizers)

@@ -38,6 +38,7 @@ save_plot <- function(plot, file, width = 8, height = 5) {
 #   `tables` and `scalars` are visible for the duration of this one call. The
 #   `let` bindings that flights.ibex creates from them outlive it, so the 336k
 #   -row flights table is handed to the engine once rather than once per query.
+the_year <- 2013L
 min_flights <- 1000L
 
 sess <- create_session()
@@ -49,7 +50,7 @@ session_eval_file(
         planes   = as.data.frame(planes),
         weather  = as.data.frame(weather)
     ),
-    scalars = list(min_flights = min_flights)
+    scalars = list(min_flights = min_flights, the_year = the_year)
 )
 
 # ── Collect the results ──────────────────────────────────────────────────────

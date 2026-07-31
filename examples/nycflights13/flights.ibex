@@ -61,7 +61,7 @@ let daily = as_timeframe(fl[filter dep_delay is not null,
 //   column the `update` derives.
 let aged = (fl[filter arr_delay is not null && tailnum is not null]
             join planes[rename plane_year = year] on tailnum)
-           [filter plane_year is not null, update { age = 2013 - plane_year }];
+           [filter plane_year is not null, update { age = the_year - plane_year }];
 
 let by_age = aged[select { flights = count(), avg_arr_delay = mean(arr_delay) },
                   by age]

@@ -348,6 +348,172 @@ TEST_CASE("Arrow C Data adoption keeps sliced primitive buffers zero-copy until 
     schema.release(&schema);
 }
 
+TEST_CASE("Arrow C Data adoption keeps sliced bool, utf8, and categorical buffers zero-copy",
+          "[interop][arrow][adopt]") {
+    ibex::runtime::Table source;
+    const ibex::runtime::ValidityBitmap validity{true, false, true, true};
+    source.add_column("flag", ibex::Column<bool>{false, true, false, true}, validity);
+    source.add_column("name", ibex::Column<std::string>{"zero", "one", "two", "three"}, validity);
+
+    ibex::Column<ibex::Categorical> symbols;
+    symbols.push_back("A");
+    symbols.push_back("B");
+    symbols.push_back("A");
+    symbols.push_back("C");
+    source.add_column("symbol", std::move(symbols), validity);
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(source, &array, &schema);
+    REQUIRE(exported.has_value());
+
+    const auto* flag_bits = static_cast<const std::uint8_t*>(array.children[0]->buffers[1]);
+    const auto* name_offsets = static_cast<const std::uint32_t*>(array.children[1]->buffers[1]);
+    const auto* name_chars = static_cast<const char*>(array.children[1]->buffers[2]);
+    const auto* symbol_codes = static_cast<const ibex::Column<ibex::Categorical>::code_type*>(
+        array.children[2]->buffers[1]);
+    const auto* dictionary_offsets =
+        static_cast<const std::uint32_t*>(array.children[2]->dictionary->buffers[1]);
+    const auto* dictionary_chars =
+        static_cast<const char*>(array.children[2]->dictionary->buffers[2]);
+
+    array.length = 2;
+    for (std::int64_t i = 0; i < array.n_children; ++i) {
+        array.children[i]->length = 2;
+        array.children[i]->offset = 1;
+    }
+
+    auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(array.release == nullptr);
+
+    const auto& borrowed = std::as_const(*imported);
+    const auto* flags = std::get_if<ibex::Column<bool>>(borrowed.find("flag"));
+    const auto* names = std::get_if<ibex::Column<std::string>>(borrowed.find("name"));
+    const auto* cats = std::get_if<ibex::Column<ibex::Categorical>>(borrowed.find("symbol"));
+    REQUIRE(flags != nullptr);
+    REQUIRE(names != nullptr);
+    REQUIRE(cats != nullptr);
+
+    REQUIRE(flags->is_external());
+    REQUIRE(flags->buffer_data() == flag_bits);
+    REQUIRE(flags->buffer_offset() == 1);
+    CHECK((*flags)[0]);
+    CHECK_FALSE((*flags)[1]);
+
+    REQUIRE(names->is_external());
+    REQUIRE(names->offsets_buffer_data() == name_offsets);
+    REQUIRE(names->chars_buffer_data() == name_chars);
+    REQUIRE(names->buffer_offset() == 1);
+    CHECK((*names)[0] == "one");
+    CHECK((*names)[1] == "two");
+
+    REQUIRE(cats->codes_are_external());
+    REQUIRE(cats->dictionary_is_external());
+    REQUIRE(cats->codes_buffer_data() == symbol_codes);
+    REQUIRE(cats->buffer_offset() == 1);
+    REQUIRE(cats->dictionary_offsets_buffer_data() == dictionary_offsets);
+    REQUIRE(cats->dictionary_chars_buffer_data() == dictionary_chars);
+    CHECK((*cats)[0] == "B");
+    CHECK((*cats)[1] == "A");
+
+    for (const auto& entry : borrowed.columns) {
+        REQUIRE(entry.validity.has_value());
+        REQUIRE(entry.validity->is_external());
+        REQUIRE(entry.validity->buffer_offset() == 1);
+    }
+
+    ArrowArray roundtrip_array{};
+    ArrowSchema roundtrip_schema{};
+    auto roundtrip =
+        ibex::interop::export_table_to_arrow(borrowed, &roundtrip_array, &roundtrip_schema);
+    REQUIRE(roundtrip.has_value());
+    REQUIRE(roundtrip_array.children[0]->offset == 1);
+    REQUIRE(roundtrip_array.children[0]->buffers[1] == flag_bits);
+    REQUIRE(roundtrip_array.children[1]->offset == 1);
+    REQUIRE(roundtrip_array.children[1]->buffers[1] == name_offsets);
+    REQUIRE(roundtrip_array.children[1]->buffers[2] == name_chars);
+    REQUIRE(roundtrip_array.children[2]->offset == 1);
+    REQUIRE(roundtrip_array.children[2]->buffers[1] == symbol_codes);
+    REQUIRE(roundtrip_array.children[2]->dictionary->buffers[1] == dictionary_offsets);
+    REQUIRE(roundtrip_array.children[2]->dictionary->buffers[2] == dictionary_chars);
+    roundtrip_schema.release(&roundtrip_schema);
+    roundtrip_array.release(&roundtrip_array);
+
+    auto& mutable_flags = std::get<ibex::Column<bool>>(imported->mutable_column(0));
+    mutable_flags.set(0, false);
+    REQUIRE_FALSE(mutable_flags.is_external());
+    CHECK_FALSE(std::as_const(mutable_flags)[0]);
+    CHECK((flag_bits[0] & 0x02U) != 0U);
+
+    auto& mutable_names = std::get<ibex::Column<std::string>>(imported->mutable_column(1));
+    mutable_names.push_back("tail");
+    REQUIRE_FALSE(mutable_names.is_external());
+    CHECK(std::as_const(mutable_names)[0] == "one");
+    CHECK(std::as_const(mutable_names)[2] == "tail");
+    CHECK(name_offsets[1] == 4);
+
+    auto& mutable_cats = std::get<ibex::Column<ibex::Categorical>>(imported->mutable_column(2));
+    mutable_cats.push_code(1);
+    REQUIRE_FALSE(mutable_cats.codes_are_external());
+    REQUIRE(mutable_cats.dictionary_is_external());
+    mutable_cats.push_back("NEW");
+    REQUIRE_FALSE(mutable_cats.is_external());
+    CHECK(std::as_const(mutable_cats)[0] == "B");
+    CHECK(std::as_const(mutable_cats)[3] == "NEW");
+    CHECK(symbol_codes[1] == 1);
+
+    schema.release(&schema);
+}
+
+TEST_CASE("Arrow C Data adoption accepts empty bool and zero-byte string buffers",
+          "[interop][arrow][adopt]") {
+    SECTION("zero rows") {
+        ibex::runtime::Table source;
+        source.add_column("flag", ibex::Column<bool>{});
+        source.add_column("name", ibex::Column<std::string>{});
+        source.add_column("symbol", ibex::Column<ibex::Categorical>{});
+
+        ArrowArray array{};
+        ArrowSchema schema{};
+        REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+        auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+        REQUIRE(imported.has_value());
+        REQUIRE(imported->rows() == 0);
+        REQUIRE(array.release == nullptr);
+        schema.release(&schema);
+    }
+
+    SECTION("non-empty columns whose string payload buffers have zero bytes") {
+        ibex::runtime::Table source;
+        source.add_column("flag", ibex::Column<bool>{false, true});
+        source.add_column("name", ibex::Column<std::string>{"", ""});
+        ibex::Column<ibex::Categorical> symbols;
+        symbols.push_back("");
+        symbols.push_back("");
+        source.add_column("symbol", std::move(symbols));
+
+        ArrowArray array{};
+        ArrowSchema schema{};
+        REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+        auto imported = ibex::interop::adopt_table_from_arrow(&array, schema);
+        REQUIRE(imported.has_value());
+        const auto& borrowed = std::as_const(*imported);
+        const auto* names = std::get_if<ibex::Column<std::string>>(borrowed.find("name"));
+        const auto* cats = std::get_if<ibex::Column<ibex::Categorical>>(borrowed.find("symbol"));
+        REQUIRE(names != nullptr);
+        REQUIRE(cats != nullptr);
+        CHECK((*names)[0].empty());
+        CHECK((*names)[1].empty());
+        CHECK((*cats)[0].empty());
+        CHECK((*cats)[1].empty());
+        REQUIRE(array.release == nullptr);
+        schema.release(&schema);
+    }
+}
+
 TEST_CASE("Arrow C Data adoption retains and releases producer ownership",
           "[interop][arrow][adopt]") {
     auto source = std::make_shared<ibex::runtime::Table>();

@@ -341,13 +341,19 @@ auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_in
     return runtime::ColumnValue{std::move(*column)};
 }
 
-auto import_bool_column(const ArrowArray& array)
+auto import_bool_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
-    if (array.buffers == nullptr || array.n_buffers < 2 || array.buffers[1] == nullptr) {
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
         return std::unexpected("Arrow bool array is missing a data buffer");
     }
 
     const auto* bitmap = static_cast<const std::uint8_t*>(array.buffers[1]);
+    if (owner) {
+        return runtime::ColumnValue{
+            Column<bool>::from_external(owner, bitmap, static_cast<std::size_t>(array.offset),
+                                        static_cast<std::size_t>(array.length))};
+    }
     Column<bool> column;
     column.reserve(static_cast<std::size_t>(array.length));
     for (std::int64_t i = 0; i < array.length; ++i) {
@@ -356,18 +362,22 @@ auto import_bool_column(const ArrowArray& array)
     return runtime::ColumnValue{std::move(column)};
 }
 
-auto import_string_column(const ArrowArray& array)
+auto import_string_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
-    if (array.buffers == nullptr || array.n_buffers < 3 || array.buffers[1] == nullptr ||
-        array.buffers[2] == nullptr) {
+    if (array.buffers == nullptr || array.n_buffers < 3 || array.buffers[1] == nullptr) {
         return std::unexpected("Arrow utf8 array is missing offsets or char buffers");
     }
 
     const auto* offsets = static_cast<const std::int32_t*>(array.buffers[1]);
     const auto* chars = static_cast<const char*>(array.buffers[2]);
     const auto start_base = offsets[array.offset];
+    if (start_base < 0) {
+        return std::unexpected("Arrow utf8 array has invalid offsets");
+    }
+    if (chars == nullptr && offsets[array.offset + array.length] != 0) {
+        return std::unexpected("Arrow utf8 array is missing a character buffer");
+    }
 
-    Column<std::string> column;
     std::size_t total_chars = 0;
     for (std::int64_t i = 0; i < array.length; ++i) {
         const auto start = offsets[array.offset + i];
@@ -377,12 +387,22 @@ auto import_string_column(const ArrowArray& array)
         }
         total_chars += static_cast<std::size_t>(end - start);
     }
+
+    if (owner) {
+        return runtime::ColumnValue{Column<std::string>::from_external(
+            owner, reinterpret_cast<const std::uint32_t*>(offsets), chars,
+            static_cast<std::size_t>(array.offset), static_cast<std::size_t>(array.length))};
+    }
+
+    Column<std::string> column;
     column.reserve(static_cast<std::size_t>(array.length), total_chars);
 
     for (std::int64_t i = 0; i < array.length; ++i) {
         const auto start = offsets[array.offset + i];
         const auto end = offsets[array.offset + i + 1];
-        column.push_back(std::string_view(chars + start, static_cast<std::size_t>(end - start)));
+        column.push_back(
+            start == end ? std::string_view{}
+                         : std::string_view(chars + start, static_cast<std::size_t>(end - start)));
     }
     return runtime::ColumnValue{std::move(column)};
 }
@@ -390,12 +410,15 @@ auto import_string_column(const ArrowArray& array)
 auto import_dictionary_strings(const ArrowArray& dictionary)
     -> std::expected<std::vector<std::string>, std::string> {
     if (dictionary.buffers == nullptr || dictionary.n_buffers < 3 ||
-        dictionary.buffers[1] == nullptr || dictionary.buffers[2] == nullptr) {
+        dictionary.buffers[1] == nullptr) {
         return std::unexpected("Arrow dictionary array is missing utf8 buffers");
     }
 
     const auto* offsets = static_cast<const std::int32_t*>(dictionary.buffers[1]);
     const auto* chars = static_cast<const char*>(dictionary.buffers[2]);
+    if (chars == nullptr && offsets[dictionary.offset + dictionary.length] != 0) {
+        return std::unexpected("Arrow dictionary array is missing a character buffer");
+    }
     std::vector<std::string> values;
     values.reserve(static_cast<std::size_t>(dictionary.length));
     for (std::int64_t i = 0; i < dictionary.length; ++i) {
@@ -404,12 +427,17 @@ auto import_dictionary_strings(const ArrowArray& dictionary)
         if (end < start) {
             return std::unexpected("Arrow dictionary utf8 array has invalid offsets");
         }
-        values.emplace_back(chars + start, chars + end);
+        if (start == end) {
+            values.emplace_back();
+        } else {
+            values.emplace_back(chars + start, chars + end);
+        }
     }
     return values;
 }
 
-auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema)
+auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema,
+                               const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
     if (schema.dictionary == nullptr || array.dictionary == nullptr) {
         return std::unexpected("Arrow dictionary column is missing dictionary storage");
@@ -418,23 +446,57 @@ auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schem
         "u") {
         return std::unexpected("Arrow dictionary column currently requires utf8 dictionary values");
     }
-    auto dict_values = import_dictionary_strings(*array.dictionary);
-    if (!dict_values.has_value()) {
-        return std::unexpected(dict_values.error());
-    }
-
-    if (array.buffers == nullptr || array.n_buffers < 2 || array.buffers[1] == nullptr) {
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
         return std::unexpected("Arrow dictionary column is missing indices");
     }
     const auto* codes = static_cast<const std::int32_t*>(array.buffers[1]);
+
+    const ArrowArray& dictionary = *array.dictionary;
+    if (dictionary.buffers == nullptr || dictionary.n_buffers < 3 ||
+        dictionary.buffers[1] == nullptr) {
+        return std::unexpected("Arrow dictionary array is missing utf8 buffers");
+    }
+    const auto* dict_offsets = static_cast<const std::int32_t*>(dictionary.buffers[1]);
+    const auto* dict_chars = static_cast<const char*>(dictionary.buffers[2]);
+    if (dict_chars == nullptr && dict_offsets[dictionary.offset + dictionary.length] != 0) {
+        return std::unexpected("Arrow dictionary array is missing a character buffer");
+    }
+    if (dict_offsets[dictionary.offset] < 0) {
+        return std::unexpected("Arrow dictionary utf8 array has invalid offsets");
+    }
+    for (std::int64_t i = 0; i < dictionary.length; ++i) {
+        const auto start = dict_offsets[dictionary.offset + i];
+        const auto end = dict_offsets[dictionary.offset + i + 1];
+        if (start < 0 || end < start) {
+            return std::unexpected("Arrow dictionary utf8 array has invalid offsets");
+        }
+    }
+
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        const auto code = codes[array.offset + i];
+        if (code < 0 || code >= dictionary.length) {
+            return std::unexpected("Arrow dictionary column has an out-of-range index");
+        }
+    }
+
+    if (owner) {
+        return runtime::ColumnValue{Column<Categorical>::from_external(
+            owner, codes, static_cast<std::size_t>(array.offset),
+            static_cast<std::size_t>(array.length),
+            reinterpret_cast<const std::uint32_t*>(dict_offsets), dict_chars,
+            static_cast<std::size_t>(dictionary.offset),
+            static_cast<std::size_t>(dictionary.length))};
+    }
+
+    auto dict_values = import_dictionary_strings(dictionary);
+    if (!dict_values.has_value()) {
+        return std::unexpected(dict_values.error());
+    }
     Column<Categorical> column(std::move(*dict_values));
     column.reserve(static_cast<std::size_t>(array.length));
     for (std::int64_t i = 0; i < array.length; ++i) {
-        const auto code = codes[array.offset + i];
-        if (code < 0 || static_cast<std::size_t>(code) >= column.dictionary().size()) {
-            return std::unexpected("Arrow dictionary column has an out-of-range index");
-        }
-        column.push_code(code);
+        column.push_code(codes[array.offset + i]);
     }
     return runtime::ColumnValue{std::move(column)};
 }
@@ -457,7 +519,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     } else if (format == "g") {
         column = import_primitive_column<double>(array, 1, owner);
     } else if (format == "b") {
-        column = import_bool_column(array);
+        column = import_bool_column(array, owner);
     } else if (format == "tdD") {
         auto raw = import_plain_column<std::int32_t>(array, 1);
         if (!raw) {
@@ -481,18 +543,19 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         }
         column = runtime::ColumnValue{std::move(ts)};
     } else if (format == "u") {
-        column = import_string_column(array);
+        column = import_string_column(array, owner);
     } else if (format == "i") {
-        column = import_categorical_column(array, schema);
+        column = import_categorical_column(array, schema, owner);
     }
 
     if (!column) {
         return std::unexpected(column.error());
     }
-    const bool primitive_adopted = owner && (format == "l" || format == "g");
+    const bool buffer_adopted = owner && (format == "l" || format == "g" || format == "b" ||
+                                          format == "u" || format == "i");
     return std::pair{
         std::move(*column),
-        import_validity(array, primitive_adopted ? owner : std::shared_ptr<const void>{})};
+        import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};
 }
 
 auto build_dictionary_strings(const Column<Categorical>& col)
@@ -637,19 +700,24 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
                                null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                if (entry.validity.has_value() &&
+                    entry.validity->buffer_offset() != col.buffer_offset()) {
+                    return std::unexpected(
+                        "Arrow export requires bool value and validity offsets to match");
+                }
                 auto state = std::make_unique<ArrayExportState>();
                 state->buffers_storage = {
                     entry.validity.has_value()
                         ? static_cast<const void*>(entry.validity->buffer_data())
                         : nullptr,
-                    static_cast<const void*>(col.words_data())};
+                    static_cast<const void*>(col.buffer_data())};
                 state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
                 for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
                     state->buffers[i] = state->buffers_storage[i];
                 }
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                 auto state = std::make_unique<ArrayExportState>();
                 state->buffers_storage = {
@@ -679,52 +747,74 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                if (entry.validity.has_value() &&
+                    entry.validity->buffer_offset() != col.buffer_offset()) {
+                    return std::unexpected(
+                        "Arrow export requires string value and validity offsets to match");
+                }
                 auto state = std::make_unique<ArrayExportState>();
                 state->table_owner = std::move(owner);
                 state->buffers_storage = {
                     entry.validity.has_value()
                         ? static_cast<const void*>(entry.validity->buffer_data())
                         : nullptr,
-                    static_cast<const void*>(col.offsets_data()),
-                    static_cast<const void*>(col.chars_data())};
+                    static_cast<const void*>(col.offsets_buffer_data()),
+                    static_cast<const void*>(col.chars_buffer_data())};
                 state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
                 for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
                     state->buffers[i] = state->buffers_storage[i];
                 }
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                if (entry.validity.has_value() &&
+                    entry.validity->buffer_offset() != col.buffer_offset()) {
+                    return std::unexpected(
+                        "Arrow export requires categorical value and validity offsets to match");
+                }
                 auto state = std::make_unique<ArrayExportState>();
                 state->table_owner = owner;
                 state->buffers_storage = {
                     entry.validity.has_value()
                         ? static_cast<const void*>(entry.validity->buffer_data())
                         : nullptr,
-                    static_cast<const void*>(col.codes_data())};
+                    static_cast<const void*>(col.codes_buffer_data())};
                 state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
                 for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
                     state->buffers[i] = state->buffers_storage[i];
                 }
 
-                auto dict_backing = build_dictionary_strings(col);
                 auto dict_array = std::make_unique<ArrowArray>();
                 clear_array(dict_array.get());
                 auto dict_state = std::make_unique<ArrayExportState>();
-                dict_state->extra_owner = dict_backing;
-                dict_state->buffers_storage = {
-                    nullptr, static_cast<const void*>(dict_backing->offsets.data()),
-                    static_cast<const void*>(dict_backing->chars.data())};
+                std::int64_t dictionary_offset = 0;
+                std::int64_t dictionary_length = 0;
+                if (col.dictionary_is_external()) {
+                    dict_state->table_owner = owner;
+                    dict_state->buffers_storage = {
+                        nullptr, static_cast<const void*>(col.dictionary_offsets_buffer_data()),
+                        static_cast<const void*>(col.dictionary_chars_buffer_data())};
+                    dictionary_offset = static_cast<std::int64_t>(col.dictionary_buffer_offset());
+                    dictionary_length = static_cast<std::int64_t>(col.dictionary_size());
+                } else {
+                    auto dict_backing = build_dictionary_strings(col);
+                    dictionary_length = static_cast<std::int64_t>(dict_backing->offsets.size() - 1);
+                    dict_state->extra_owner = dict_backing;
+                    dict_state->buffers_storage = {
+                        nullptr, static_cast<const void*>(dict_backing->offsets.data()),
+                        static_cast<const void*>(dict_backing->chars.data())};
+                }
                 dict_state->buffers =
                     std::make_unique<const void*[]>(dict_state->buffers_storage.size());
                 for (std::size_t i = 0; i < dict_state->buffers_storage.size(); ++i) {
                     dict_state->buffers[i] = dict_state->buffers_storage[i];
                 }
-                finalize_array(dict_array.get(), std::move(dict_state),
-                               static_cast<std::int64_t>(dict_backing->offsets.size() - 1), 0);
+                finalize_array(dict_array.get(), std::move(dict_state), dictionary_length, 0,
+                               dictionary_offset);
                 state->dictionary = std::move(dict_array);
 
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else {
                 return std::unexpected("unsupported column type for Arrow array export");
             }

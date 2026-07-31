@@ -2389,8 +2389,6 @@ void gather_selection_into(Table& output, const Table& input,
                     });
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     auto* dst_words = out->words_data();
-                    const auto* __restrict src_words = src.words_data();
-                    const std::size_t src_words_n = (src.size() + 63) / 64;
                     const auto shared = SharedBitWords::of_run(dst.row, sel.kept);
                     std::size_t out_bit = dst.row;
                     for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
@@ -2403,11 +2401,22 @@ void gather_selection_into(Table& output, const Table& input,
                         // source when the range starts on a word boundary.
                         // Otherwise the 64 source bits straddle two words.
                         const std::size_t src_bit = rows.begin + (w * 64);
-                        const std::size_t sw = src_bit / 64;
-                        const auto shift = static_cast<unsigned>(src_bit % 64);
-                        std::uint64_t src_bits = src_words[sw] >> shift;
-                        if (shift != 0 && sw + 1 < src_words_n) {
-                            src_bits |= src_words[sw + 1] << (64 - shift);
+                        std::uint64_t src_bits = 0;
+                        if (!src.is_external()) {
+                            const auto* __restrict src_words = src.words_data();
+                            const std::size_t src_words_n = (src.size() + 63) / 64;
+                            const std::size_t sw = src_bit / 64;
+                            const auto shift = static_cast<unsigned>(src_bit % 64);
+                            src_bits = src_words[sw] >> shift;
+                            if (shift != 0 && sw + 1 < src_words_n) {
+                                src_bits |= src_words[sw + 1] << (64 - shift);
+                            }
+                        } else {
+                            const std::size_t count =
+                                std::min<std::size_t>(64, src.size() - src_bit);
+                            for (std::size_t bit = 0; bit < count; ++bit) {
+                                src_bits |= static_cast<std::uint64_t>(src[src_bit + bit]) << bit;
+                            }
                         }
                         const std::uint64_t packed = pack_selected_bool_bits(src_bits, select);
                         append_packed_bool_bits(packed,

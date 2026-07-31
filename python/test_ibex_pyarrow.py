@@ -219,6 +219,62 @@ def main() -> int:
     assert output_buffers[1].address == input_buffers[1].address
     assert projected_slice.column("px").chunk(0).offset == sliced_px.offset
 
+    sliced_flag = pa.array([False, True, None, False, True]).slice(1, 3)
+    sliced_name = pa.array(["zero", "one", None, "three", "four"]).slice(1, 3)
+    symbol_dictionary = pa.array(["A", "B", "C"])
+    sliced_symbol = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None, 2, 0], type=pa.int32()),
+        symbol_dictionary,
+    ).slice(1, 3)
+    sliced_mixed = pa.table(
+        {
+            "flag": sliced_flag,
+            "name": sliced_name,
+            "symbol": sliced_symbol,
+        }
+    )
+    projected_mixed = ibex_pyarrow.eval_table(
+        "items[select { flag, name, symbol }];",
+        tables={"items": sliced_mixed},
+    )
+    assert projected_mixed.to_pydict() == {
+        "flag": [True, None, False],
+        "name": ["one", None, "three"],
+        "symbol": ["B", None, "C"],
+    }
+
+    output_flag = projected_mixed.column("flag").chunk(0)
+    output_name = projected_mixed.column("name").chunk(0)
+    output_symbol = projected_mixed.column("symbol").chunk(0)
+    for input_array, output_array in (
+        (sliced_flag, output_flag),
+        (sliced_name, output_name),
+        (sliced_symbol, output_symbol),
+    ):
+        assert output_array.offset == input_array.offset
+        for input_buffer, output_buffer in zip(input_array.buffers(), output_array.buffers()):
+            if input_buffer is None:
+                assert output_buffer is None
+            else:
+                assert output_buffer.address == input_buffer.address
+    for input_buffer, output_buffer in zip(
+        sliced_symbol.dictionary.buffers(),
+        output_symbol.dictionary.buffers(),
+    ):
+        if input_buffer is None:
+            assert output_buffer is None
+        else:
+            assert output_buffer.address == input_buffer.address
+
+    filtered_mixed = ibex_pyarrow.eval_table(
+        "items[filter flag, select { name, symbol }];",
+        tables={"items": sliced_mixed},
+    )
+    assert filtered_mixed.to_pydict() == {
+        "name": ["one"],
+        "symbol": ["B"],
+    }
+
     pandas_quotes = pd.DataFrame(
         {
             "venue": ["XNAS", "BATS", "XNAS"],

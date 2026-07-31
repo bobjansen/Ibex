@@ -19,6 +19,11 @@ target_link_libraries(ibex_pyarrow
         Python3::Module
 )
 
+if(TARGET Ibex::parquet)
+    target_link_libraries(ibex_pyarrow PRIVATE Ibex::parquet)
+    target_compile_definitions(ibex_pyarrow PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
+endif()
+
 target_include_directories(ibex_pyarrow
     PRIVATE
         "${PROJECT_SOURCE_DIR}/include"

@@ -87,7 +87,8 @@
         <h3>Build from source</h3>
         <p>
           Use a release build for interactive examples and benchmarks. The
-          bundled CSV and Parquet plugins are built with the normal CMake build.
+          bundled CSV plugin and first-party Parquet backend are built with the
+          normal CMake build.
         </p>
 <pre><code>cmake -B build-release -S . -G Ninja \
   -DCMAKE_C_COMPILER=clang \

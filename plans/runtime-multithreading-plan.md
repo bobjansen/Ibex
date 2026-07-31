@@ -1175,10 +1175,13 @@ dictionary offsets; the copying importer remains available. ADBC adopts its
 owned record batches, and the Python bridge uses `__arrow_c_array__` for
 single-batch PyArrow inputs (combining fragmented tables first).
 Address/offset, release lifetime, failure ownership, empty buffers, filtering,
-and copy-on-write behavior are asserted in C++ and Python tests. R remains on
-the borrowing/copying path until its nanoarrow externalptr lock/ownership
-protocol is explicit. First-party Parquet relocation, reader factories, and
-the R ownership protocol remain Phase-3a work.
+and copy-on-write behavior are asserted in C++ and Python tests. The Parquet
+implementation is now owned by `Ibex::parquet`; the CLI, REPL, and Python hosts
+register it directly, `import "parquet"` skips dynamic loading in those hosts,
+and the compatibility plugin is a thin delegate to the same backend. R remains
+on the borrowing/copying path until its nanoarrow externalptr lock/ownership
+protocol is explicit. Independent reader factories and the R ownership
+protocol remain Phase-3a work.
 
 Prepare the storage and ownership foundation before adding source concurrency.
 Parquet is no longer an ordinary opaque table plugin: it supplies schemas and

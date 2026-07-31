@@ -58,11 +58,13 @@
         </p>
       </article>
       <article class="card">
-        <h3>Parquet plugin</h3>
+        <h3>First-party Parquet backend</h3>
         <p>
           Read and write Apache Parquet for typed batch storage. This is the
           right default when you want a compact columnar format, better type
-          preservation, and faster reloads than CSV.
+          preservation, and faster reloads than CSV. The standard hosts link
+          this backend directly; <code>import "parquet"</code> does not require
+          loading a shared plugin.
         </p>
       </article>
       <article class="card">
@@ -87,10 +89,10 @@
 
   <section class="section">
     <p class="section-label">Import pattern</p>
-    <h2>Import bundled I/O plugins</h2>
+    <h2>Import bundled I/O backends</h2>
     <article class="card">
       <p>
-        The common pattern is to import the bundled plugin modules you need and
+        The common pattern is to import the bundled backend modules you need and
         then call their functions directly.
       </p>
 <pre><code><span class="kw">import</span> <span class="str">"csv"</span>;

@@ -74,9 +74,9 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
-    echo "▸ REPL smoke (parquet plugin)"
+    echo "▸ REPL smoke (first-party parquet backend)"
     repl_out="$(mktemp)"
-    printf ":load tests/data/parquet_smoke.ibex\n:quit\n" \
+    printf ":load tests/data/parquet_builtin_smoke.ibex\n:quit\n" \
         | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
     if rg -n "error:" "$repl_out" >/dev/null; then
         cat "$repl_out" >&2

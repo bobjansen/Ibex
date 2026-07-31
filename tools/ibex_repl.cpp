@@ -1,6 +1,10 @@
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+#include <ibex/parquet/backend.hpp>
+#endif
+
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
 
@@ -67,6 +71,9 @@ auto main(int argc, char** argv) -> int {
     }
 
     ibex::runtime::ExternRegistry registry;
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+    ibex::parquet::register_backend(registry);
+#endif
 
     ibex::repl::ReplConfig config;
     config.verbose = verbose;

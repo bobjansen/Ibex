@@ -1,4 +1,7 @@
 #include <ibex/interop/arrow_c_data.hpp>
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+#include <ibex/parquet/backend.hpp>
+#endif
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
@@ -21,6 +24,14 @@
 #include <vector>
 
 namespace {
+
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+void register_first_party_backends(ibex::runtime::ExternRegistry& externs) {
+    ibex::parquet::register_backend(externs);
+}
+#else
+void register_first_party_backends(ibex::runtime::ExternRegistry& /*externs*/) {}
+#endif
 
 enum class ImportedColumnKind : std::uint8_t {
     Bool,
@@ -82,6 +93,8 @@ struct ExportedArrowCapsules {
 };
 
 struct SessionState {
+    SessionState() { register_first_party_backends(externs); }
+
     ibex::runtime::TableRegistry tables;
     robin_hood::unordered_set<std::string> table_externs;
     robin_hood::unordered_set<std::string> sink_externs;
@@ -89,6 +102,37 @@ struct SessionState {
     robin_hood::unordered_set<std::string> loaded_plugins;
     std::vector<std::string> plugin_paths;
 };
+
+auto expand_first_party_imports(ibex::parser::Program program)
+    -> std::expected<ibex::parser::Program, std::string> {
+    ibex::parser::Program expanded;
+    expanded.statements.reserve(program.statements.size() + 2);
+    for (auto& statement : program.statements) {
+        const auto* import = std::get_if<ibex::parser::ImportDecl>(&statement);
+        if (import == nullptr) {
+            expanded.statements.push_back(std::move(statement));
+            continue;
+        }
+#if defined(IBEX_HAS_PARQUET_BACKEND)
+        if (import->name == "parquet") {
+            auto declarations = ibex::parser::parse(
+                "extern fn read_parquet(path: String) -> DataFrame from \"parquet.hpp\";"
+                "extern fn write_parquet(df: DataFrame, path: String) -> Int from "
+                "\"parquet.hpp\";");
+            if (!declarations.has_value()) {
+                return std::unexpected(declarations.error().format());
+            }
+            for (auto& declaration : declarations->statements) {
+                expanded.statements.push_back(std::move(declaration));
+            }
+            continue;
+        }
+#endif
+        return std::unexpected("import declarations are not supported by ibex_pyarrow: " +
+                               import->name);
+    }
+    return expanded;
+}
 
 auto set_python_error_from_message(PyObject* exc_type, const std::string& message) -> PyObject* {
     PyErr_SetString(exc_type, message.c_str());
@@ -250,7 +294,8 @@ struct PluginLoadResult {
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      robin_hood::unordered_set<std::string>& loaded_plugins,
                      ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
-    if (loaded_plugins.contains(stem)) {
+    if (loaded_plugins.contains(stem) || externs.contains_library(stem)) {
+        loaded_plugins.insert(stem);
         return {PluginLoadStatus::Loaded, ""};
     }
 
@@ -371,23 +416,27 @@ auto eval_table_impl(const std::string& source, const ibex::runtime::TableRegist
     if (!parsed.has_value()) {
         return std::unexpected(format_ibex_pyarrow_error("parse error", parsed.error().format()));
     }
+    auto expanded = expand_first_party_imports(std::move(*parsed));
+    if (!expanded.has_value()) {
+        return std::unexpected(format_ibex_pyarrow_error("import error", expanded.error()));
+    }
 
     ibex::runtime::ExternRegistry externs;
+    register_first_party_backends(externs);
     if (!plugin_search_paths.empty()) {
-        auto loaded = load_source_plugins(*parsed, plugin_search_paths, externs);
+        auto loaded = load_source_plugins(*expanded, plugin_search_paths, externs);
         if (!loaded.has_value()) {
             return std::unexpected(format_ibex_pyarrow_error("plugin load error", loaded.error()));
         }
     }
 
-    auto lowered = ibex::parser::lower(*parsed);
+    auto lowered = ibex::parser::lower(*expanded);
     if (!lowered.has_value()) {
         return std::unexpected(
             format_ibex_pyarrow_error("lowering error", lowered.error().message));
     }
 
-    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, &scalars,
-                                              plugin_search_paths.empty() ? nullptr : &externs);
+    auto evaluated = ibex::runtime::interpret(*lowered.value(), registry, &scalars, &externs);
     if (!evaluated.has_value()) {
         return std::unexpected(format_ibex_pyarrow_error("runtime error", evaluated.error()));
     }
@@ -421,9 +470,13 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
     if (!parsed.has_value()) {
         return std::unexpected(format_ibex_pyarrow_error("parse error", parsed.error().format()));
     }
+    auto expanded = expand_first_party_imports(std::move(*parsed));
+    if (!expanded.has_value()) {
+        return std::unexpected(format_ibex_pyarrow_error("import error", expanded.error()));
+    }
 
     std::shared_ptr<const ibex::runtime::Table> last_table;
-    for (const auto& stmt : parsed->statements) {
+    for (const auto& stmt : expanded->statements) {
         if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             auto registered = register_extern_decl(*decl, session);
             if (!registered.has_value()) {
@@ -431,12 +484,6 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
                     format_ibex_pyarrow_error("plugin load error", registered.error()));
             }
             continue;
-        }
-        if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
-            return std::unexpected(format_ibex_pyarrow_error(
-                "session error",
-                "import declarations are not supported in ibex_pyarrow sessions; use explicit "
-                "extern fn declarations"));
         }
         if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
             return std::unexpected(format_ibex_pyarrow_error(
@@ -1155,6 +1202,7 @@ PyObject* py_reset_session(PyObject* /*self*/, PyObject* args, PyObject* kwargs)
     (*session)->table_externs.clear();
     (*session)->sink_externs.clear();
     (*session)->externs = ibex::runtime::ExternRegistry{};
+    register_first_party_backends((*session)->externs);
     (*session)->loaded_plugins.clear();
     Py_RETURN_NONE;
 }

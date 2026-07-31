@@ -49,6 +49,9 @@ class ValidityBitmap {
 
     std::vector<word_type> words_;
     size_type size_bits_ = 0;
+    std::shared_ptr<const void> external_owner_;
+    const std::uint8_t* external_data_ = nullptr;
+    size_type external_offset_ = 0;
 
     static constexpr auto word_index(size_type bit) noexcept -> size_type {
         return bit / kBitsPerWord;
@@ -83,6 +86,28 @@ class ValidityBitmap {
         words_.back() &= low_bits_mask(rem);
     }
 
+    auto drop_external() noexcept -> void {
+        external_owner_.reset();
+        external_data_ = nullptr;
+        external_offset_ = 0;
+    }
+
+    auto detach_external() -> void {
+        if (!external_owner_) {
+            return;
+        }
+        std::vector<word_type> owned(words_for_bits(size_bits_), 0);
+        for (size_type i = 0; i < size_bits_; ++i) {
+            const size_type source_bit = external_offset_ + i;
+            const auto byte = external_data_[source_bit / 8];
+            if (((byte >> (source_bit % 8)) & 0x01U) != 0U) {
+                owned[word_index(i)] |= bit_mask(i);
+            }
+        }
+        words_ = std::move(owned);
+        drop_external();
+    }
+
    public:
     ValidityBitmap() = default;
 
@@ -102,15 +127,45 @@ class ValidityBitmap {
         }
     }
 
+    /// Adopt an immutable Arrow-compatible bitmap slice. `owner` keeps
+    /// `data` alive; `offset` and `count` are measured in bits.
+    [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner,
+                                            const std::uint8_t* data, size_type offset,
+                                            size_type count) -> ValidityBitmap {
+        if (!owner) {
+            throw std::invalid_argument("external validity requires a lifetime owner");
+        }
+        if (count != 0 && data == nullptr) {
+            throw std::invalid_argument("non-empty external validity requires a bitmap buffer");
+        }
+        ValidityBitmap bitmap;
+        bitmap.size_bits_ = count;
+        bitmap.external_owner_ = std::move(owner);
+        bitmap.external_data_ = data;
+        bitmap.external_offset_ = offset;
+        return bitmap;
+    }
+
+    [[nodiscard]] auto is_external() const noexcept -> bool {
+        return static_cast<bool>(external_owner_);
+    }
+
     [[nodiscard]] auto size() const noexcept -> size_type { return size_bits_; }
     [[nodiscard]] auto empty() const noexcept -> bool { return size_bits_ == 0; }
-    [[nodiscard]] auto word_count() const noexcept -> size_type { return words_.size(); }
+    [[nodiscard]] auto word_count() const noexcept -> size_type {
+        return words_for_bits(size_bits_);
+    }
 
     [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
+        if (is_external()) {
+            const size_type source_bit = external_offset_ + idx;
+            return ((external_data_[source_bit / 8] >> (source_bit % 8)) & 0x01U) != 0U;
+        }
         return (words_[word_index(idx)] & bit_mask(idx)) != 0;
     }
 
-    auto set(size_type idx, bool value) noexcept -> void {
+    auto set(size_type idx, bool value) -> void {
+        detach_external();
         auto& w = words_[word_index(idx)];
         const word_type m = bit_mask(idx);
         if (value) {
@@ -121,6 +176,7 @@ class ValidityBitmap {
     }
 
     auto push_back(bool value) -> void {
+        detach_external();
         const size_type idx = size_bits_;
         if (bit_offset(idx) == 0) {
             words_.push_back(0);
@@ -131,11 +187,15 @@ class ValidityBitmap {
         ++size_bits_;
     }
 
-    auto reserve(size_type count_bits) -> void { words_.reserve(words_for_bits(count_bits)); }
+    auto reserve(size_type count_bits) -> void {
+        detach_external();
+        words_.reserve(words_for_bits(count_bits));
+    }
 
     auto resize(size_type count_bits) -> void { resize(count_bits, false); }
 
     auto resize(size_type count_bits, bool value) -> void {
+        detach_external();
         if (count_bits <= size_bits_) {
             size_bits_ = count_bits;
             words_.resize(words_for_bits(count_bits));
@@ -155,13 +215,32 @@ class ValidityBitmap {
     }
 
     auto assign(size_type count_bits, bool value) -> void {
+        drop_external();
         size_bits_ = count_bits;
         words_.assign(words_for_bits(count_bits), value ? ~word_type{0} : word_type{0});
         clear_unused_tail_bits();
     }
 
-    [[nodiscard]] auto words_data() noexcept -> word_type* { return words_.data(); }
-    [[nodiscard]] auto words_data() const noexcept -> const word_type* { return words_.data(); }
+    /// Base Arrow-compatible bitmap pointer and logical bit offset.
+    [[nodiscard]] auto buffer_data() const noexcept -> const std::uint8_t* {
+        if (is_external()) {
+            return external_data_;
+        }
+        return reinterpret_cast<const std::uint8_t*>(words_.data());
+    }
+    [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
+        return is_external() ? external_offset_ : 0;
+    }
+
+    /// Word access is zero-based. Mutable access detaches an external slice;
+    /// const callers must consult `buffer_offset()` before bulk word reads.
+    [[nodiscard]] auto words_data() -> word_type* {
+        detach_external();
+        return words_.data();
+    }
+    [[nodiscard]] auto words_data() const noexcept -> const word_type* {
+        return reinterpret_cast<const word_type*>(buffer_data());
+    }
 };
 
 struct ColumnEntry {

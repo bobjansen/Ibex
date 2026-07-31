@@ -56,6 +56,22 @@ struct ArrayExportState {
     std::unique_ptr<ArrowArray> dictionary;
 };
 
+struct AdoptedArrayOwner {
+    ArrowArray array{};
+    bool owns = false;
+
+    explicit AdoptedArrayOwner(const ArrowArray& source) : array(source) {}
+
+    AdoptedArrayOwner(const AdoptedArrayOwner&) = delete;
+    auto operator=(const AdoptedArrayOwner&) -> AdoptedArrayOwner& = delete;
+
+    ~AdoptedArrayOwner() {
+        if (owns && array.release != nullptr) {
+            array.release(&array);
+        }
+    }
+};
+
 auto clear_schema(ArrowSchema* schema) noexcept -> void {
     if (schema == nullptr) {
         return;
@@ -99,6 +115,14 @@ auto clear_stream(ArrowArrayStream* stream) noexcept -> void {
 }
 
 auto count_nulls(const runtime::ValidityBitmap& validity) noexcept -> std::int64_t {
+    if (validity.buffer_offset() != 0) {
+        std::size_t valid_count = 0;
+        for (std::size_t i = 0; i < validity.size(); ++i) {
+            valid_count += validity[i] ? 1U : 0U;
+        }
+        return static_cast<std::int64_t>(validity.size() - valid_count);
+    }
+
     const std::size_t n = validity.size();
     const std::size_t word_bits = sizeof(runtime::ValidityBitmap::word_type) * 8;
     const std::size_t full_words = n / word_bits;
@@ -241,10 +265,17 @@ auto read_bitmap_bit(const std::uint8_t* bytes, std::int64_t index) -> bool {
     return ((bytes[byte_index] >> bit_index) & 0x01U) != 0U;
 }
 
-auto import_validity(const ArrowArray& array) -> std::optional<runtime::ValidityBitmap> {
+auto import_validity(const ArrowArray& array, const std::shared_ptr<const void>& owner)
+    -> std::optional<runtime::ValidityBitmap> {
     if (array.null_count == 0 || array.buffers == nullptr || array.n_buffers < 1 ||
         array.buffers[0] == nullptr) {
         return std::nullopt;
+    }
+
+    if (owner) {
+        return runtime::ValidityBitmap::from_external(
+            owner, static_cast<const std::uint8_t*>(array.buffers[0]),
+            static_cast<std::size_t>(array.offset), static_cast<std::size_t>(array.length));
     }
 
     runtime::ValidityBitmap validity(static_cast<std::size_t>(array.length), false);
@@ -288,8 +319,21 @@ auto import_plain_column(const ArrowArray& array, std::size_t data_buffer_index)
 }
 
 template <typename T>
-auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_index)
+auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_index,
+                             const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
+    if (owner) {
+        if (array.buffers == nullptr ||
+            array.n_buffers <= static_cast<std::int64_t>(data_buffer_index) ||
+            array.buffers[data_buffer_index] == nullptr) {
+            return std::unexpected("Arrow array is missing a primitive data buffer");
+        }
+        const auto* values = static_cast<const T*>(array.buffers[data_buffer_index]);
+        return runtime::ColumnValue{
+            Column<T>::from_external(owner, values, static_cast<std::size_t>(array.offset),
+                                     static_cast<std::size_t>(array.length))};
+    }
+
     auto column = import_plain_column<T>(array, data_buffer_index);
     if (!column) {
         return std::unexpected(column.error());
@@ -395,7 +439,8 @@ auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schem
     return runtime::ColumnValue{std::move(column)};
 }
 
-auto import_column(const ArrowArray& array, const ArrowSchema& schema)
+auto import_column(const ArrowArray& array, const ArrowSchema& schema,
+                   const std::shared_ptr<const void>& owner)
     -> std::expected<std::pair<runtime::ColumnValue, std::optional<runtime::ValidityBitmap>>,
                      std::string> {
     auto ready = validate_child(array, schema, "Arrow column import");
@@ -408,9 +453,9 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema)
         std::unexpected("unsupported Arrow column format");
 
     if (format == "l") {
-        column = import_primitive_column<std::int64_t>(array, 1);
+        column = import_primitive_column<std::int64_t>(array, 1, owner);
     } else if (format == "g") {
-        column = import_primitive_column<double>(array, 1);
+        column = import_primitive_column<double>(array, 1, owner);
     } else if (format == "b") {
         column = import_bool_column(array);
     } else if (format == "tdD") {
@@ -444,7 +489,10 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema)
     if (!column) {
         return std::unexpected(column.error());
     }
-    return std::pair{std::move(*column), import_validity(array)};
+    const bool primitive_adopted = owner && (format == "l" || format == "g");
+    return std::pair{
+        std::move(*column),
+        import_validity(array, primitive_adopted ? owner : std::shared_ptr<const void>{})};
 }
 
 auto build_dictionary_strings(const Column<Categorical>& col)
@@ -479,10 +527,10 @@ auto finalize_schema(ArrowSchema* out, std::unique_ptr<SchemaExportState> state)
 
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto finalize_array(ArrowArray* out, std::unique_ptr<ArrayExportState> state, std::int64_t length,
-                    std::int64_t null_count) -> void {
+                    std::int64_t null_count, std::int64_t offset = 0) -> void {
     out->length = length;
     out->null_count = null_count;
-    out->offset = 0;
+    out->offset = offset;
     out->n_buffers = static_cast<std::int64_t>(state->buffers_storage.size());
     out->n_children = static_cast<std::int64_t>(state->children_storage.size());
     out->buffers = state->buffers.get();
@@ -544,14 +592,19 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
 }
 
 template <typename T>
-auto primitive_buffers(const runtime::ColumnEntry& entry, const T* values)
-    -> std::unique_ptr<ArrayExportState> {
+auto primitive_buffers(const runtime::ColumnEntry& entry, const Column<T>& column)
+    -> std::expected<std::unique_ptr<ArrayExportState>, std::string> {
+    if (entry.validity.has_value() && entry.validity->buffer_offset() != column.buffer_offset()) {
+        return std::unexpected(
+            "Arrow export requires primitive value and validity offsets to match");
+    }
+
     auto state = std::make_unique<ArrayExportState>();
     state->buffers_storage.reserve(2);
     state->buffers_storage.push_back(entry.validity.has_value()
-                                         ? static_cast<const void*>(entry.validity->words_data())
+                                         ? static_cast<const void*>(entry.validity->buffer_data())
                                          : nullptr);
-    state->buffers_storage.push_back(static_cast<const void*>(values));
+    state->buffers_storage.push_back(static_cast<const void*>(column.buffer_data()));
     state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
     for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
         state->buffers[i] = state->buffers_storage[i];
@@ -568,31 +621,60 @@ auto export_column_array(const runtime::ColumnEntry& entry,
             std::int64_t null_count = entry.validity.has_value() ? count_nulls(*entry.validity) : 0;
 
             if constexpr (std::is_same_v<ColT, Column<std::int64_t>>) {
-                auto state = primitive_buffers(entry, col.data());
-                state->table_owner = std::move(owner);
-                finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                auto state = primitive_buffers(entry, col);
+                if (!state) {
+                    return std::unexpected(state.error());
+                }
+                (*state)->table_owner = std::move(owner);
+                finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<double>>) {
-                auto state = primitive_buffers(entry, col.data());
-                state->table_owner = std::move(owner);
-                finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                auto state = primitive_buffers(entry, col);
+                if (!state) {
+                    return std::unexpected(state.error());
+                }
+                (*state)->table_owner = std::move(owner);
+                finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                auto state = primitive_buffers(entry, col.words_data());
+                auto state = std::make_unique<ArrayExportState>();
+                state->buffers_storage = {
+                    entry.validity.has_value()
+                        ? static_cast<const void*>(entry.validity->buffer_data())
+                        : nullptr,
+                    static_cast<const void*>(col.words_data())};
+                state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
+                for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
+                    state->buffers[i] = state->buffers_storage[i];
+                }
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
-                auto state = primitive_buffers(
-                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                    entry, reinterpret_cast<const std::int32_t*>(col.data()));
+                auto state = std::make_unique<ArrayExportState>();
+                state->buffers_storage = {
+                    entry.validity.has_value()
+                        ? static_cast<const void*>(entry.validity->buffer_data())
+                        : nullptr,
+                    static_cast<const void*>(col.data())};
+                state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
+                for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
+                    state->buffers[i] = state->buffers_storage[i];
+                }
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
-                auto state = primitive_buffers(
-                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                    entry, reinterpret_cast<const std::int64_t*>(col.data()));
+                auto state = std::make_unique<ArrayExportState>();
+                state->buffers_storage = {
+                    entry.validity.has_value()
+                        ? static_cast<const void*>(entry.validity->buffer_data())
+                        : nullptr,
+                    static_cast<const void*>(col.data())};
+                state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
+                for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
+                    state->buffers[i] = state->buffers_storage[i];
+                }
                 state->table_owner = std::move(owner);
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count);
@@ -601,7 +683,7 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 state->table_owner = std::move(owner);
                 state->buffers_storage = {
                     entry.validity.has_value()
-                        ? static_cast<const void*>(entry.validity->words_data())
+                        ? static_cast<const void*>(entry.validity->buffer_data())
                         : nullptr,
                     static_cast<const void*>(col.offsets_data()),
                     static_cast<const void*>(col.chars_data())};
@@ -616,7 +698,7 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 state->table_owner = owner;
                 state->buffers_storage = {
                     entry.validity.has_value()
-                        ? static_cast<const void*>(entry.validity->words_data())
+                        ? static_cast<const void*>(entry.validity->buffer_data())
                         : nullptr,
                     static_cast<const void*>(col.codes_data())};
                 state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
@@ -796,7 +878,8 @@ auto export_table_to_arrow(const std::shared_ptr<const runtime::Table>& table,
     return export_table_impl(table, out_array, out_schema);
 }
 
-auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
+auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
+                       const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::Table, std::string> {
     auto ready = validate_child(array, schema, "Arrow table import");
     if (!ready) {
@@ -826,7 +909,7 @@ auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
             return std::unexpected(
                 "Arrow table import requires every column to match table length");
         }
-        auto imported = import_column(*child_array, *child_schema);
+        auto imported = import_column(*child_array, *child_schema, owner);
         if (!imported) {
             return std::unexpected(imported.error());
         }
@@ -860,6 +943,28 @@ auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
     }
 
     return table;
+}
+
+auto import_table_from_arrow(const ArrowArray& array, const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string> {
+    return import_table_impl(array, schema, {});
+}
+
+auto adopt_table_from_arrow(ArrowArray* array, const ArrowSchema& schema)
+    -> std::expected<runtime::Table, std::string> {
+    if (array == nullptr) {
+        return std::unexpected("Arrow table adoption requires a non-null array");
+    }
+
+    auto owner = std::make_shared<AdoptedArrayOwner>(*array);
+    auto imported = import_table_impl(owner->array, schema, owner);
+    if (!imported) {
+        return std::unexpected(imported.error());
+    }
+
+    owner->owns = true;
+    clear_array(array);
+    return imported;
 }
 
 }  // namespace ibex::interop

@@ -106,6 +106,14 @@ auto merge_validity(const ValidityBitmap* a, std::size_t a_off, const ValidityBi
     if (a == b)
         return ValidityBitmap(*a);
     ValidityBitmap out(*a);
+    if (b->buffer_offset() != 0) {
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!(*b)[i]) {
+                out.set(i, false);
+            }
+        }
+        return out;
+    }
     constexpr std::size_t kBitsPerWord = sizeof(ValidityBitmap::word_type) * 8;
     const auto full_words = n / kBitsPerWord;
     const auto tail_bits = n % kBitsPerWord;

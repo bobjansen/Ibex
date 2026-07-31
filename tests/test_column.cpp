@@ -2,6 +2,24 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <memory>
+#include <utility>
+
+namespace {
+
+struct ExternalOwner {
+    bool* released = nullptr;
+
+    ~ExternalOwner() {
+        if (released != nullptr) {
+            *released = true;
+        }
+    }
+};
+
+}  // namespace
+
 TEST_CASE("Column<int> basic operations", "[core][column]") {
     ibex::Column<int> col{1, 2, 3, 4, 5};
 
@@ -63,6 +81,32 @@ TEST_CASE("Column default-constructs empty", "[core][column]") {
 
     REQUIRE(col.empty());
     REQUIRE(col.size() == 0);
+}
+
+TEST_CASE("Column adopts immutable external storage and detaches on mutation",
+          "[core][column][external]") {
+    bool released = false;
+    const std::array values{10, 20, 30, 40};
+    auto owner = std::make_shared<ExternalOwner>();
+    owner->released = &released;
+    const int* external_values = values.data() + 1;
+    auto col = ibex::Column<int>::from_external(owner, external_values, 2);
+    owner.reset();
+
+    const auto& borrowed = std::as_const(col);
+    REQUIRE(col.is_external());
+    REQUIRE(borrowed.data() == external_values);
+    REQUIRE(borrowed[0] == 20);
+    REQUIRE(borrowed[1] == 30);
+    REQUIRE_FALSE(released);
+
+    col[0] = 200;
+
+    REQUIRE_FALSE(col.is_external());
+    REQUIRE(std::as_const(col).data() != external_values);
+    REQUIRE(std::as_const(col)[0] == 200);
+    REQUIRE(external_values[0] == 20);
+    REQUIRE(released);
 }
 
 TEST_CASE("Column range-for iteration", "[core][column]") {

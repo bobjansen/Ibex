@@ -891,8 +891,10 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, const std::
                         dst->set(pos, src[static_cast<std::size_t>(idx[pos])]);
                     }
                 } else {
+                    auto* dp = dst->data();
+                    const auto* sp = src.data();
                     for (std::size_t pos = lo; pos < hi; ++pos) {
-                        (*dst)[pos] = src[static_cast<std::size_t>(idx[pos])];
+                        dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
                     }
                 }
             }
@@ -905,8 +907,18 @@ void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, const std::
 template <typename Idx>
 void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
                            const std::vector<Idx>& idx, std::size_t lo, std::size_t hi) {
+    auto* dst_words = dst.words_data();
+    const auto* src_bytes = src.buffer_data();
+    const std::size_t src_offset = src.buffer_offset();
     for (std::size_t pos = lo; pos < hi; ++pos) {
-        dst.set(pos, src[static_cast<std::size_t>(idx[pos])]);
+        const std::size_t source_bit = src_offset + static_cast<std::size_t>(idx[pos]);
+        const bool valid = ((src_bytes[source_bit / 8] >> (source_bit % 8)) & 0x01U) != 0U;
+        const auto mask = ValidityBitmap::word_type{1} << (pos % 64);
+        if (valid) {
+            dst_words[pos / 64] |= mask;
+        } else {
+            dst_words[pos / 64] &= ~mask;
+        }
     }
 }
 

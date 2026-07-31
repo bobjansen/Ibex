@@ -175,12 +175,12 @@ class Column {
         if (!owner) {
             throw std::invalid_argument("external column requires a lifetime owner");
         }
-        if (values == nullptr) {
+        if (values == nullptr && size != 0) {
             throw std::invalid_argument("external column requires a data buffer");
         }
         Column column;
         column.external_owner_ = std::move(owner);
-        column.external_data_ = values + offset;
+        column.external_data_ = values == nullptr ? nullptr : values + offset;
         column.external_offset_ = offset;
         column.external_size_ = size;
         return column;
@@ -194,7 +194,8 @@ class Column {
     /// Base storage pointer and logical element offset. Most callers should use
     /// `data()`; these accessors exist for zero-copy Arrow C Data export.
     [[nodiscard]] auto buffer_data() const noexcept -> const T* {
-        return is_external() ? external_data_ - external_offset_ : external_data_;
+        return is_external() && external_data_ != nullptr ? external_data_ - external_offset_
+                                                          : external_data_;
     }
     [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
         return is_external() ? external_offset_ : 0;

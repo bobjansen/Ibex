@@ -220,6 +220,26 @@ def main() -> int:
     assert projected_slice.column("px").chunk(0).offset == sliced_px.offset
 
     sliced_flag = pa.array([False, True, None, False, True]).slice(1, 3)
+    sliced_day = pa.array(
+        [
+            dt.date(2024, 1, 1),
+            dt.date(2024, 1, 2),
+            None,
+            dt.date(2024, 1, 4),
+            dt.date(2024, 1, 5),
+        ],
+        type=pa.date32(),
+    ).slice(1, 3)
+    sliced_ts = pa.array(
+        [
+            dt.datetime(2024, 1, 1, 1),
+            dt.datetime(2024, 1, 2, 2),
+            None,
+            dt.datetime(2024, 1, 4, 4),
+            dt.datetime(2024, 1, 5, 5),
+        ],
+        type=pa.timestamp("ns"),
+    ).slice(1, 3)
     sliced_name = pa.array(["zero", "one", None, "three", "four"]).slice(1, 3)
     symbol_dictionary = pa.array(["A", "B", "C"])
     sliced_symbol = pa.DictionaryArray.from_arrays(
@@ -229,25 +249,33 @@ def main() -> int:
     sliced_mixed = pa.table(
         {
             "flag": sliced_flag,
+            "day": sliced_day,
+            "ts": sliced_ts,
             "name": sliced_name,
             "symbol": sliced_symbol,
         }
     )
     projected_mixed = ibex_pyarrow.eval_table(
-        "items[select { flag, name, symbol }];",
+        "items[select { flag, day, ts, name, symbol }];",
         tables={"items": sliced_mixed},
     )
     assert projected_mixed.to_pydict() == {
         "flag": [True, None, False],
+        "day": [dt.date(2024, 1, 2), None, dt.date(2024, 1, 4)],
+        "ts": [dt.datetime(2024, 1, 2, 2), None, dt.datetime(2024, 1, 4, 4)],
         "name": ["one", None, "three"],
         "symbol": ["B", None, "C"],
     }
 
     output_flag = projected_mixed.column("flag").chunk(0)
+    output_day = projected_mixed.column("day").chunk(0)
+    output_ts = projected_mixed.column("ts").chunk(0)
     output_name = projected_mixed.column("name").chunk(0)
     output_symbol = projected_mixed.column("symbol").chunk(0)
     for input_array, output_array in (
         (sliced_flag, output_flag),
+        (sliced_day, output_day),
+        (sliced_ts, output_ts),
         (sliced_name, output_name),
         (sliced_symbol, output_symbol),
     ):

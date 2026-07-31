@@ -341,6 +341,38 @@ auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_in
     return runtime::ColumnValue{std::move(*column)};
 }
 
+template <typename Temporal, typename Raw>
+auto import_temporal_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    static_assert(std::is_trivially_copyable_v<Temporal>);
+    static_assert(std::is_standard_layout_v<Temporal>);
+    static_assert(sizeof(Temporal) == sizeof(Raw));
+    static_assert(alignof(Temporal) == alignof(Raw));
+
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
+        return std::unexpected("Arrow temporal array is missing a data buffer");
+    }
+
+    const auto* values = static_cast<const Raw*>(array.buffers[1]);
+    if (owner) {
+        return runtime::ColumnValue{Column<Temporal>::from_external(
+            owner, reinterpret_cast<const Temporal*>(values),
+            static_cast<std::size_t>(array.offset), static_cast<std::size_t>(array.length))};
+    }
+
+    Column<Temporal> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        if constexpr (std::is_same_v<Temporal, Date>) {
+            column.push_back(Date{values[array.offset + i]});
+        } else {
+            column.push_back(Timestamp{values[array.offset + i]});
+        }
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
 auto import_bool_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
     if (array.buffers == nullptr || array.n_buffers < 2 ||
@@ -521,27 +553,9 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     } else if (format == "b") {
         column = import_bool_column(array, owner);
     } else if (format == "tdD") {
-        auto raw = import_plain_column<std::int32_t>(array, 1);
-        if (!raw) {
-            return std::unexpected(raw.error());
-        }
-        Column<Date> dates;
-        dates.reserve(raw->size());
-        for (std::size_t i = 0; i < raw->size(); ++i) {
-            dates.push_back(Date{(*raw)[i]});
-        }
-        column = runtime::ColumnValue{std::move(dates)};
+        column = import_temporal_column<Date, std::int32_t>(array, owner);
     } else if (format == "tsn:") {
-        auto raw = import_plain_column<std::int64_t>(array, 1);
-        if (!raw) {
-            return std::unexpected(raw.error());
-        }
-        Column<Timestamp> ts;
-        ts.reserve(raw->size());
-        for (std::size_t i = 0; i < raw->size(); ++i) {
-            ts.push_back(Timestamp{(*raw)[i]});
-        }
-        column = runtime::ColumnValue{std::move(ts)};
+        column = import_temporal_column<Timestamp, std::int64_t>(array, owner);
     } else if (format == "u") {
         column = import_string_column(array, owner);
     } else if (format == "i") {
@@ -551,8 +565,9 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     if (!column) {
         return std::unexpected(column.error());
     }
-    const bool buffer_adopted = owner && (format == "l" || format == "g" || format == "b" ||
-                                          format == "u" || format == "i");
+    const bool buffer_adopted =
+        owner && (format == "l" || format == "g" || format == "b" || format == "tdD" ||
+                  format == "tsn:" || format == "u" || format == "i");
     return std::pair{
         std::move(*column),
         import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};
@@ -719,33 +734,21 @@ auto export_column_array(const runtime::ColumnEntry& entry,
                 finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
                                null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
-                auto state = std::make_unique<ArrayExportState>();
-                state->buffers_storage = {
-                    entry.validity.has_value()
-                        ? static_cast<const void*>(entry.validity->buffer_data())
-                        : nullptr,
-                    static_cast<const void*>(col.data())};
-                state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
-                for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
-                    state->buffers[i] = state->buffers_storage[i];
+                auto state = primitive_buffers(entry, col);
+                if (!state) {
+                    return std::unexpected(state.error());
                 }
-                state->table_owner = std::move(owner);
-                finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                (*state)->table_owner = std::move(owner);
+                finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
-                auto state = std::make_unique<ArrayExportState>();
-                state->buffers_storage = {
-                    entry.validity.has_value()
-                        ? static_cast<const void*>(entry.validity->buffer_data())
-                        : nullptr,
-                    static_cast<const void*>(col.data())};
-                state->buffers = std::make_unique<const void*[]>(state->buffers_storage.size());
-                for (std::size_t i = 0; i < state->buffers_storage.size(); ++i) {
-                    state->buffers[i] = state->buffers_storage[i];
+                auto state = primitive_buffers(entry, col);
+                if (!state) {
+                    return std::unexpected(state.error());
                 }
-                state->table_owner = std::move(owner);
-                finalize_array(out_array, std::move(state), static_cast<std::int64_t>(col.size()),
-                               null_count);
+                (*state)->table_owner = std::move(owner);
+                finalize_array(out_array, std::move(*state), static_cast<std::int64_t>(col.size()),
+                               null_count, static_cast<std::int64_t>(col.buffer_offset()));
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 if (entry.validity.has_value() &&
                     entry.validity->buffer_offset() != col.buffer_offset()) {

@@ -53,3 +53,6 @@ benchmarking/aws/.config
 .codex
 
 examples/measurements*.txt
+
+# Generated example output
+examples/nycflights13/plots/

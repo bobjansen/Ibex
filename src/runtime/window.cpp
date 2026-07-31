@@ -1132,9 +1132,9 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         *src);
 }
 
-auto resample_table(const Table& input, ir::Duration bucket_dur,
-                    const std::vector<ir::ColumnRef>& extra_group_by,
-                    const std::vector<ir::AggSpec>& aggregations)
+auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
+                         const std::vector<ir::ColumnRef>& extra_group_by,
+                         const std::vector<ir::AggSpec>& aggregations)
     -> std::expected<Table, std::string> {
     if (!input.time_index.has_value())
         return std::unexpected("resample requires a TimeFrame — use as_timeframe() first");
@@ -1615,6 +1615,53 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     out.time_index = ts_name;
 
     return out;
+}
+
+/// Public entry: run the resample, then tag the result with the grouping.
+///
+/// The tag lives here rather than inside the implementation because that
+/// function has three separate table-returning exits (an ungrouped fast path, a
+/// grouped fast path, and the generic aggregate). Tagging at each is one `return`
+/// away from a silent gap -- which is exactly how the first attempt at this
+/// missed the grouped fast path.
+auto resample_table(const Table& input, ir::Duration bucket_dur,
+                    const std::vector<ir::ColumnRef>& extra_group_by,
+                    const std::vector<ir::AggSpec>& aggregations)
+    -> std::expected<Table, std::string> {
+    auto result = resample_table_impl(input, bucket_dur, extra_group_by, aggregations);
+    if (!result.has_value() || extra_group_by.empty()) {
+        return result;
+    }
+    Table& out = result.value();
+    // Record that `extra_group_by` partitions these rows. Unlike a grouped
+    // window this output is time-major with the groups INTERLEAVED, so an
+    // unpartitioned lag/lead downstream reads into another group on every row
+    // rather than only at a run boundary -- the more destructive of the two
+    // shapes, and the easier to reach by accident since resampling is usually
+    // the first thing a pipeline does.
+    //
+    // Only claim it when two rows actually share a bucket timestamp. With a
+    // single group the output is one row per bucket, nothing interleaves, and
+    // an unpartitioned lead over it is correct.
+    if (!out.time_index.has_value() || out.rows() < 2) {
+        return result;
+    }
+    const auto* ts = out.find(*out.time_index);
+    const auto* stamps = ts != nullptr ? std::get_if<Column<Timestamp>>(ts) : nullptr;
+    if (stamps == nullptr) {
+        return result;
+    }
+    for (std::size_t i = 1; i < stamps->size(); ++i) {
+        if ((*stamps)[i].nanos == (*stamps)[i - 1].nanos) {
+            out.grouped_by.clear();
+            out.grouped_by.reserve(extra_group_by.size());
+            for (const auto& key : extra_group_by) {
+                out.grouped_by.push_back(key.name);
+            }
+            break;
+        }
+    }
+    return result;
 }
 
 }  // namespace ibex::runtime

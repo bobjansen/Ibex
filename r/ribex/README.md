@@ -10,13 +10,29 @@ Current shape:
 - `register_knitr_engines()` adds a `{ibex}` knitr engine for R Markdown.
 - `knitr_session(name)` returns the named engine-backed session for mixed R / Ibex notebooks.
 - `tables = list(name = data.frame(...))` binds R tables into Ibex by copy.
-- `tables = list(name = nanoarrow_array)` binds Arrow-backed tables through the
-  Arrow C Data Interface, and other Arrow-ish R objects are normalized through
-  `nanoarrow` when possible.
+- `tables = list(name = nanoarrow_array)` binds supported Arrow-backed tables
+  zero-copy through the Arrow C Data Interface. Other Arrow-ish R objects are
+  normalized through `nanoarrow` when possible.
 - `scalars = list(x = 1L, flag = TRUE, day = as.Date(...), ts = as.POSIXct(...))`
   binds R scalars into Ibex by copy.
 - results return as a `data.frame` by default for immediate `ggplot2` use
 - `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
+
+Nanoarrow inputs use `nanoarrow_pointer_export()` to create an independent,
+thread-safe ownership lease. Ibex adopts that lease, not the caller's external
+pointer, so the original R object remains valid and an Ibex session may retain
+its buffers after the call returns. Results likewise own their buffers
+independently of the session that produced them. Primitive Int64/Double, Bool,
+Date/Timestamp, UTF-8, and dictionary-encoded UTF-8 categorical columns retain
+their payload and validity buffers, including nullable slices; a mutation in
+Ibex detaches the affected storage first.
+
+Arrow C Data buffers are immutable while shared. The lease prevents R garbage
+collection from releasing them and Ibex serializes cooperating query access,
+but it cannot protect against native code that writes to the same allocation
+outside either binding. Copy such writable foreign data to a `data.frame`
+before binding it. Descriptor-only nanoarrow operations such as creating a
+shallow slice do not mutate the shared buffers.
 
 Install from the repo checkout with an existing `build-release`:
 

@@ -2,7 +2,9 @@ Package: ribex
 Type: Package
 Title: R Interface for Ibex
 Version: 0.0.1
-Authors@R: c(person("Ibex", "Developers", email = "ibex@example.invalid", role = c("aut", "cre")))
+Authors@R: c(person("Bob", "Jansen", email = "bobjansen@hey.com", role = c("aut", "cre")))
+Author: Bob Jansen [aut, cre]
+Maintainer: Ibex Developers <ibex@example.invalid>
 Description: Pure-R bindings for the Ibex dataframe DSL. Queries are parsed and
     executed by the Ibex C++ runtime and results are imported into R through the
     Arrow C Data Interface using nanoarrow. Results can be returned as a nanoarrow
@@ -11,7 +13,9 @@ Depends: R (>= 4.4)
 Imports:
     nanoarrow
 Suggests:
-    knitr
+    knitr,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
 SystemRequirements: C++23, an existing Ibex build tree
 License: file LICENSE
 Encoding: UTF-8

@@ -1,5 +1,6 @@
 CXX_STD = CXX23
-PKG_CPPFLAGS = -I/home/brj/ibex/include
+PKG_CPPFLAGS = -I/home/brj/ibex/include \
+	-I/home/brj/ibex/build-release/_deps/robin_hood-src/src/include
 PKG_LIBS = /home/brj/ibex/build-release/src/parser/libibex_parser.a \
 	/home/brj/ibex/build-release/src/runtime/libibex_runtime.a \
 	/home/brj/ibex/build-release/src/interop/libibex_interop.a \

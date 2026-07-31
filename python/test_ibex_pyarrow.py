@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def repo_root() -> Path:
@@ -401,14 +402,26 @@ def main() -> int:
         raise AssertionError("expected plugin-backed read_json() to fail for a missing JSON path")
 
     if plugin_available("parquet"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            parquet_path = Path(tmpdir) / "tiny.parquet"
+            pq.write_table(pa.table({"x": [1, 2, 3]}), parquet_path)
+            parquet_session = ibex_pyarrow.create_session()
+            parquet_result = ibex_pyarrow.session_eval_table(
+                parquet_session,
+                f"""
+                import "parquet";
+                read_parquet("{parquet_path}")[select total = count()];
+                """,
+            )
+            assert parquet_result.to_pydict() == {"total": [3]}
+
         try:
             ibex_pyarrow.eval_table(
                 f"""
-                extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+                import "parquet";
 
                 read_parquet("{missing_parquet}")[select total = count()];
-                """,
-                plugin_paths=default_plugin_paths(),
+                """
             )
         except RuntimeError as exc:
             message = str(exc)
@@ -417,7 +430,7 @@ def main() -> int:
             assert str(missing_parquet) in message
         else:
             raise AssertionError(
-                "expected plugin-backed read_parquet() to fail for a missing Parquet path"
+                "expected built-in read_parquet() to fail for a missing Parquet path"
             )
 
     return 0

@@ -55,4 +55,4 @@ benchmarking/aws/.config
 examples/measurements*.txt
 
 # Generated example output
-examples/nycflights13/plots/
+examples/nycflights13/plots*/

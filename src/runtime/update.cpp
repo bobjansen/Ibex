@@ -1442,6 +1442,83 @@ auto add_computed_column(Table& table, const std::string& alias, ComputedColumn 
 
 // Like update_table but passes the window clause's duration to the shared
 // field evaluator, so rolling aggregates without a per-call window use it.
+// An order-dependent field (lag/lead/cum*/rolling_*/fill_*) reads rows other
+// than its own, so it only means anything when the rows are in a meaningful
+// order. The quiet way to lose that is an upstream `by` clause: grouping
+// leaves the table group-major, which chops a TimeFrame's ascending time index
+// into per-group runs. An unpartitioned lag/lead then reads straight across a
+// group boundary into another group's rows — correct everywhere except the
+// boundaries, which is what makes it survive review.
+//
+// Detect exactly that: a TimeFrame whose time index is non-monotonic. Grouped
+// evaluation slices per group before reaching here and each slice is ordered,
+// so this fires only on the unpartitioned case. A deliberately descending
+// TimeFrame (`order ts desc`) is monotonic and stays legal.
+//
+// Narrow by design: it cannot see a reordering that happens to leave the time
+// index monotonic. That case needs order provenance tracked through the plan.
+// The O(n) scan runs only when a field really does contain such a call.
+auto check_time_index_ordering(const Table& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::expected<void, std::string> {
+    if (!input.time_index.has_value() || input.rows() < 2) {
+        return {};
+    }
+    std::string fn;
+    for (const auto& field : fields) {
+        fn = ir::find_order_dependent_call(field.expr);
+        if (!fn.empty()) {
+            break;
+        }
+    }
+    if (fn.empty()) {
+        return {};
+    }
+    const auto* tcv = input.find(*input.time_index);
+    if (tcv == nullptr) {
+        return {};
+    }
+    // Non-monotonic == both an ascent and a descent somewhere. Report the first
+    // step that establishes the second direction: that is the boundary row.
+    const std::size_t rows = input.rows();
+    bool up = false;
+    bool down = false;
+    std::size_t at = 0;
+    auto scan = [&](auto&& value_at) {
+        for (std::size_t i = 1; i < rows; ++i) {
+            const auto prev = value_at(i - 1);
+            const auto cur = value_at(i);
+            if (cur > prev) {
+                up = true;
+            } else if (cur < prev) {
+                down = true;
+            } else {
+                continue;
+            }
+            if (up && down) {
+                at = i;
+                return;
+            }
+        }
+    };
+    if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
+        scan([&](std::size_t i) { return (*ts)[i].nanos; });
+    } else if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
+        scan([&](std::size_t i) { return (*dt)[i].days; });
+    } else {
+        return {};
+    }
+    if (!(up && down)) {
+        return {};
+    }
+    return std::unexpected(
+        fn + ": depends on the row order, but the rows are not in time order — '" +
+        *input.time_index + "' changes direction at row " + std::to_string(at) +
+        ". A `by` clause upstream leaves the table grouped, so the adjacent row can belong to a "
+        "different group. Add the same `by` clause here so " +
+        fn + " stops at the group edge, or `order " + *input.time_index +
+        "` first to state the order you intend.");
+}
+
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                            ir::Duration duration, const ScalarRegistry* scalars,
                            const ExternRegistry* externs, const ExecutionContext& exec,
@@ -1450,6 +1527,9 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     const std::size_t rows = output.rows();
     if (!output.time_index.has_value()) {
         return std::unexpected("window: requires a TimeFrame");
+    }
+    if (auto ok = check_time_index_ordering(output, fields); !ok) {
+        return std::unexpected(ok.error());
     }
     // Reject mutation of the time index column
     for (const auto& field : fields) {
@@ -2520,6 +2600,9 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ExecutionContext& exec) -> std::expected<Table, std::string> {
     Table output = std::move(input);
     if (output.time_index.has_value()) {
+        if (auto ok = check_time_index_ordering(output, fields); !ok) {
+            return std::unexpected(ok.error());
+        }
         for (const auto& field : fields) {
             if (field.alias == *output.time_index) {
                 return std::unexpected("cannot update time index column: " + field.alias);

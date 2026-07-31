@@ -20,25 +20,25 @@ using Info = BuiltinFunctionInfo;
 // whose shape affects lowering/planning need an entry. `builtins()` validates
 // its executable entries against this table at startup.
 constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, Info>>({
-    {"rolling_sum", {FnKind::Transform, true}},
-    {"rolling_mean", {FnKind::Transform, true}},
-    {"rolling_min", {FnKind::Transform, true}},
-    {"rolling_max", {FnKind::Transform, true}},
-    {"rolling_count", {FnKind::Transform, true}},
-    {"rolling_median", {FnKind::Transform, true}},
-    {"rolling_std", {FnKind::Transform, true}},
-    {"rolling_ewma", {FnKind::Transform, true}},
-    {"rolling_quantile", {FnKind::Transform, true}},
-    {"rolling_skew", {FnKind::Transform, true}},
-    {"rolling_kurtosis", {FnKind::Transform, true}},
-    {"rolling_first", {FnKind::Transform, true}},
-    {"rolling_last", {FnKind::Transform, true}},
-    {"cumsum", {FnKind::Transform}},
-    {"cumprod", {FnKind::Transform}},
-    {"lag", {FnKind::Transform}},
-    {"lead", {FnKind::Transform}},
-    {"fill_forward", {FnKind::Transform}},
-    {"fill_backward", {FnKind::Transform}},
+    {"rolling_sum", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_mean", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_min", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_max", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_count", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_median", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_std", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_ewma", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_quantile", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_skew", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_kurtosis", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_first", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"rolling_last", {.kind = FnKind::Transform, .rolling = true, .order_dependent = true}},
+    {"cumsum", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"cumprod", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"lag", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"lead", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"fill_forward", {.kind = FnKind::Transform, .order_dependent = true}},
+    {"fill_backward", {.kind = FnKind::Transform, .order_dependent = true}},
     {"window_start", {FnKind::Transform}},
     {"window_end", {FnKind::Transform}},
     {"rand_uniform", {FnKind::Generator}},
@@ -129,6 +129,11 @@ auto is_aggregate_func(std::string_view name) -> bool {
     return info != nullptr && info->kind == FnKind::Aggregate;
 }
 
+auto is_order_dependent_func(std::string_view name) -> bool {
+    const auto* info = builtin_function_info(name);
+    return info != nullptr && info->order_dependent;
+}
+
 auto fn_kind(std::string_view name) -> std::optional<FnKind> {
     const auto* info = builtin_function_info(name);
     return info != nullptr ? std::optional{info->kind} : std::nullopt;
@@ -204,6 +209,19 @@ auto is_group_parallel_safe_expr(const Expr& expr) -> bool {
     // is most of what this needs; Generator is the one classified kind that is
     // unsafe to run concurrently.
     return no_call_of_kind(expr, [](FnKind k) { return k == FnKind::Generator; });
+}
+
+auto find_order_dependent_call(const Expr& expr) -> std::string {
+    std::string found;
+    // `every_call` short-circuits on the first `false`, so returning
+    // `found.empty()` stops the walk as soon as one is named.
+    every_call(expr, [&](const CallExpr& call) {
+        if (is_order_dependent_func(call.callee)) {
+            found = call.callee;
+        }
+        return found.empty();
+    });
+    return found;
 }
 
 auto is_bucket_local_window_expr(const Expr& expr) -> bool {

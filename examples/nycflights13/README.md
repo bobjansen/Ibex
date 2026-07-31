@@ -10,6 +10,17 @@ real project would split it:
 No Ibex source is embedded in the R script, so the queries stay readable, stay
 diffable, and can be run on their own in the REPL.
 
+The same six results are also written idiomatically in two other dialects, so
+the query styles can be read side by side:
+
+- [`flights_dplyr.R`](flights_dplyr.R) — pipes, `summarise(.by =)`, `inner_join`,
+  and `slider::slide_index_dbl` for the trailing window.
+- [`flights_datatable.R`](flights_datatable.R) — chained `[`, `.N`, `by =`,
+  `X[Y, on =]` joins, and an adaptive `frollmean`.
+- [`plots.R`](plots.R) — the ggplot layer, shared by all three, so each script
+  is query code and nothing else.
+- [`compare.R`](compare.R) — runs all three and checks every result agrees.
+
 ## Running it
 
 ```sh
@@ -21,15 +32,19 @@ cmake --build build-release
 IBEX_ROOT=$PWD IBEX_BUILD_DIR=$PWD/build-release R CMD INSTALL r/ribex
 
 # 3. the R-side dependencies
-R -e 'install.packages(c("nycflights13", "ggplot2"))'
+R -e 'install.packages(c("nycflights13", "ggplot2", "dplyr", "slider", "data.table"))'
 
 # 4. run, from the repository root
 Rscript examples/nycflights13/flights.R
+Rscript examples/nycflights13/flights_dplyr.R
+Rscript examples/nycflights13/flights_datatable.R
+Rscript examples/nycflights13/compare.R
 ```
 
-Plots land in `examples/nycflights13/plots/`; set `IBEX_EXAMPLE_OUT` to write
-them somewhere else. `ribex` finds the runtime through `IBEX_BUILD_DIR`, or by
-falling back to `build-release/tools` and `build/tools` under the working
+Plots land in `plots/`, `plots-dplyr/`, and `plots-datatable/` under the example
+directory; set `IBEX_EXAMPLE_OUT` to write them somewhere else.
+
+`ribex` finds the runtime through `IBEX_BUILD_DIR`, or by falling back to `build-release/tools` and `build/tools` under the working
 directory — which is why the script is meant to be run from the repository
 root.
 
@@ -57,10 +72,64 @@ carriers <- session_eval(sess, "carriers;")
 and `origin_counts`.
 
 The file is written as one `let` per published result. Clauses compose inside a
-bracket and brackets chain, so an intermediate earns a name only when it is
-reused (`fl`) or when the language forces the break (`aged`, because `update`
-and `select` are mutually exclusive and the aggregate groups by the derived
-column).
+bracket and brackets chain, so an intermediate earns a name only where the
+language forces the break — `aged`, because `update` and `select` are mutually
+exclusive and the aggregate groups by the column the `update` derives.
+
+## The same query in three dialects
+
+Step 1, side by side. Ibex:
+
+```
+let carriers = (flights[filter arr_delay is not null,
+                        select { flights = count(), avg_arr_delay = mean(arr_delay) },
+                        by carrier]
+                  [filter flights >= min_flights]
+                join airlines on carrier)
+               [order { avg_arr_delay desc }];
+```
+
+dplyr:
+
+```r
+carriers <- flights |>
+    filter(!is.na(arr_delay)) |>
+    summarise(flights = n(), avg_arr_delay = mean(arr_delay), .by = carrier) |>
+    filter(flights >= min_flights) |>
+    inner_join(airlines, by = "carrier") |>
+    arrange(desc(avg_arr_delay))
+```
+
+data.table:
+
+```r
+carriers <- fl[!is.na(arr_delay), .(flights = .N, avg_arr_delay = mean(arr_delay)), by = carrier
+             ][flights >= min_flights
+             ][al, on = "carrier", nomatch = NULL
+             ][order(-avg_arr_delay)]
+```
+
+Ibex sits closer to data.table than to dplyr: both apply clause blocks to a
+table in brackets and chain them, and both keep the filter, the aggregate, and
+the grouping in one block rather than as separate pipeline stages.
+
+Two places where the dialects genuinely differ rather than just reading
+differently:
+
+- **The trailing window.** Ibex's `resample 1d` + `window 7d` is time-indexed:
+  the window is seven *days*, not seven rows. dplyr reaches that with
+  `slider::slide_index_dbl(..., .before = 6)`; data.table needs an adaptive
+  `frollmean` with lengths `1, 2, ... 7` to reproduce the partial leading
+  window, since a plain `frollmean(x, 7)` starts with six `NA`s. The daily
+  series here is gapless, so all three agree — on a series with missing days
+  they would not.
+- **Day bucketing.** `as.Date()` on a POSIXct buckets in UTC, which is what
+  Ibex's `resample 1d` does to the underlying instant. Bucketing in
+  `America/New_York` instead would give 365 days rather than 366, and every
+  daily figure would shift.
+
+`compare.R` runs all three and asserts they agree column by column, so the claim
+is checked rather than asserted.
 
 ## What each step demonstrates
 

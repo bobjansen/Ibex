@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -341,6 +342,43 @@ auto import_primitive_column(const ArrowArray& array, std::size_t data_buffer_in
     return runtime::ColumnValue{std::move(*column)};
 }
 
+/// An Arrow timestamp type, decomposed. The format string is
+/// `ts{s|m|u|n}:{zone}` -- a unit letter and an optional IANA zone.
+struct TimestampFormat {
+    /// Nanoseconds per stored unit: 1e9 (s), 1e6 (ms), 1e3 (us), 1 (ns).
+    std::int64_t nanos_per_unit = 1;
+    /// The IANA zone, empty when the producer supplied none.
+    std::string zone;
+};
+
+/// Recognize any Arrow timestamp, at any resolution, zoned or not.
+///
+/// The value needs no adjustment for the zone: an Arrow timestamp is
+/// UTC-relative whenever a zone is present, and Ibex's `Timestamp` is an
+/// instant (SPEC 2.4). The zone is still carried, because it says which wall
+/// clock a reader should render that instant on, and losing it would hand a
+/// producer back its own data relabelled UTC. A zone-less Arrow timestamp is
+/// nominally a naive wall clock; Ibex reads it as UTC, which is the same rule
+/// the rest of the language follows.
+auto parse_timestamp_format(std::string_view format) -> std::optional<TimestampFormat> {
+    if (format.size() < 4 || !format.starts_with("ts") || format[3] != ':') {
+        return std::nullopt;
+    }
+    std::string zone(format.substr(4));
+    switch (format[2]) {
+        case 's':
+            return TimestampFormat{.nanos_per_unit = 1'000'000'000, .zone = std::move(zone)};
+        case 'm':
+            return TimestampFormat{.nanos_per_unit = 1'000'000, .zone = std::move(zone)};
+        case 'u':
+            return TimestampFormat{.nanos_per_unit = 1'000, .zone = std::move(zone)};
+        case 'n':
+            return TimestampFormat{.nanos_per_unit = 1, .zone = std::move(zone)};
+        default:
+            return std::nullopt;
+    }
+}
+
 template <typename Temporal, typename Raw>
 auto import_temporal_column(const ArrowArray& array, const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -369,6 +407,48 @@ auto import_temporal_column(const ArrowArray& array, const std::shared_ptr<const
         } else {
             column.push_back(Timestamp{values[array.offset + i]});
         }
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
+/// Import a timestamp column at any Arrow resolution, rescaling to nanoseconds.
+///
+/// Nanosecond input is the only resolution whose buffer can be adopted as-is;
+/// every other unit has to be multiplied, so it materializes owned storage. The
+/// caller must therefore not treat a rescaled column as buffer-adopting.
+///
+/// Payload bytes at null positions are unspecified in Arrow, so they are read
+/// as zero rather than multiplied -- otherwise a null slot holding garbage
+/// could trip the range check below and reject an otherwise valid array.
+auto import_timestamp_column(const ArrowArray& array, std::int64_t nanos_per_unit,
+                             const std::shared_ptr<const void>& owner)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    if (nanos_per_unit == 1) {
+        return import_temporal_column<Timestamp, std::int64_t>(array, owner);
+    }
+
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
+        return std::unexpected("Arrow temporal array is missing a data buffer");
+    }
+
+    const auto* values = static_cast<const std::int64_t*>(array.buffers[1]);
+    const auto* validity = static_cast<const std::uint8_t*>(array.buffers[0]);
+    const std::int64_t limit = std::numeric_limits<std::int64_t>::max() / nanos_per_unit;
+
+    Column<Timestamp> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        if (validity != nullptr && !read_bitmap_bit(validity, array.offset + i)) {
+            column.push_back(Timestamp{0});
+            continue;
+        }
+        const std::int64_t value = values[array.offset + i];
+        if (value > limit || value < -limit) {
+            return std::unexpected(
+                "Arrow timestamp column does not fit in nanoseconds since the epoch");
+        }
+        column.push_back(Timestamp{value * nanos_per_unit});
     }
     return runtime::ColumnValue{std::move(column)};
 }
@@ -552,6 +632,10 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     std::expected<runtime::ColumnValue, std::string> column =
         std::unexpected("unsupported Arrow column format");
 
+    // Any timestamp resolution is accepted; only nanoseconds can be adopted
+    // without a rescaling copy.
+    const std::optional<TimestampFormat> timestamp = parse_timestamp_format(format);
+
     if (format == "l") {
         column = import_primitive_column<std::int64_t>(array, 1, owner);
     } else if (format == "g") {
@@ -560,8 +644,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         column = import_bool_column(array, owner);
     } else if (format == "tdD") {
         column = import_temporal_column<Date, std::int32_t>(array, owner);
-    } else if (format == "tsn:") {
-        column = import_temporal_column<Timestamp, std::int64_t>(array, owner);
+    } else if (timestamp.has_value()) {
+        column = import_timestamp_column(array, timestamp->nanos_per_unit, owner);
     } else if (format == "u") {
         column = import_string_column(array, owner);
     } else if (format == "i") {
@@ -573,7 +657,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     }
     const bool buffer_adopted =
         owner && (format == "l" || format == "g" || format == "b" || format == "tdD" ||
-                  format == "tsn:" || format == "u" || format == "i");
+                  (timestamp.has_value() && timestamp->nanos_per_unit == 1) || format == "u" ||
+                  format == "i");
     return std::pair{
         std::move(*column),
         import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};
@@ -654,7 +739,9 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
             } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
                 set_format("tdD");
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
-                set_format("tsn:");
+                // Nanoseconds, plus the column's zone when it has one, so a
+                // zoned producer gets its own wall clock back rather than UTC.
+                set_format(entry.timezone.has_value() ? "tsn:" + *entry.timezone : "tsn:");
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 set_format("u");
             } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
@@ -1029,6 +1116,15 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
             table.add_column(name, std::move(column), std::move(*validity));
         } else {
             table.add_column(name, std::move(column));
+        }
+
+        // Carry the producer's zone. The instant already needed no adjustment;
+        // this is what stops a round trip from relabelling the column UTC.
+        const std::string_view child_format =
+            child_schema->format != nullptr ? child_schema->format : "";
+        if (const auto timestamp = parse_timestamp_format(child_format);
+            timestamp.has_value() && !timestamp->zone.empty()) {
+            table.columns[table.index.at(name)].timezone = timestamp->zone;
         }
     }
 

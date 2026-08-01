@@ -626,18 +626,19 @@ class ChunkedRenameOperator final : public Operator {
         // is relabeled here too rather than left carrying its old column name.
         if (chunk.ordering.has_value() || chunk.time_index.has_value() ||
             !chunk.grouped_by.empty()) {
-            auto props =
-                derive_table_properties(TableProperties{.ordering = chunk.ordering,
-                                                        .time_index = chunk.time_index,
-                                                        .grouped_by = chunk.grouped_by},
-                                        [&](const std::string& name) -> std::optional<std::string> {
-                                            for (const auto& spec : *renames_) {
-                                                if (spec.old_name == name) {
-                                                    return spec.new_name;
-                                                }
-                                            }
-                                            return name;
-                                        });
+            auto props = derive_table_properties(
+                TableProperties{.ordering = chunk.ordering,
+                                .time_index = chunk.time_index,
+                                .grouped_by = chunk.grouped_by},
+                [&](const std::string& name) -> std::optional<std::string> {
+                    for (const auto& spec : *renames_) {
+                        if (spec.old_name == name) {
+                            return spec.new_name;
+                        }
+                    }
+                    return name;
+                },
+                RowTransform::Preserve);
             chunk.ordering = std::move(props.ordering);
             chunk.time_index = std::move(props.time_index);
             chunk.grouped_by = std::move(props.grouped_by);
@@ -6623,7 +6624,8 @@ class TwoPhaseFilterOperator final : public Operator {
                                     return (!fused_project_ || layout_.output.index.contains(name))
                                                ? std::optional<std::string>{name}
                                                : std::nullopt;
-                                }));
+                                },
+                                RowTransform::Subset));
 
         // Metadata-only operators above the filter run ONCE over the finished
         // output rather than per morsel. `project_table` / `rename_table` build

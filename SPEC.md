@@ -256,6 +256,27 @@ Timestamps are parsed as instants in UTC and stored as signed nanoseconds since
 `1970-01-01T00:00:00Z`. Fractional seconds are truncated to nanosecond
 precision.
 
+A `Timestamp` carries no time zone. It is an instant, and every calendar-boundary
+operation over it — `resample` above all — therefore cuts on UTC boundaries. A
+zone is a property of a *column*, not of a row, so where per-row zones are needed
+the zone belongs in an ordinary column beside the instant.
+
+A column may nonetheless *carry* a zone, as metadata beside the instants. The
+value needs no adjustment for it — the stored number is an instant either way —
+and no operation reads it yet; it records which wall clock a reader should
+render the column on, so that data crossing a boundary is not handed back
+relabelled UTC. `nullopt` means UTC.
+
+This fixes what crossing the Arrow boundary means. Arrow timestamps come at four
+resolutions and may carry an IANA zone (`ts{s|m|u|n}:{zone}`); all four are
+accepted and rescaled to nanoseconds, and the zone is kept on the column and
+re-emitted on export. No adjustment of the instant is needed in either
+direction: an Arrow timestamp value is UTC-relative whenever a zone is present.
+A zone-*less* Arrow timestamp is nominally a naive wall clock, and Ibex reads it
+as UTC, which is the same rule stated above. Only nanosecond input can be
+adopted zero-copy; the other three resolutions must be rescaled into owned
+storage.
+
 ### 2.5 Operators
 
 **Binary (in precedence order, lowest first):**

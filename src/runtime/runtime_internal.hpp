@@ -67,17 +67,54 @@ auto normalize_time_index(Table& table) -> void;
 /// (project/filter), overwrite (update), and renaming (rename).
 using KeyColumnFate = std::function<std::optional<std::string>(const std::string&)>;
 
-/// Derive an operator's output ordering + time_index from its input, applying
-/// `fate` to each ordering key and the time index. Ordering is all-or-nothing:
-/// cleared unless every key survives (rename-mapped, un-overwritten). Losing the
-/// time index also clears ordering — a by-time ordering is void without its
-/// column (for a TimeFrame the sole key *is* the time index, so this is already
-/// implied, but it keeps the rule self-contained for non-TimeFrame callers).
+/// What an operator did to the *rows*, as opposed to what `KeyColumnFate` says
+/// it did to the columns. Both are needed: `fate` alone cannot distinguish a
+/// filter (every surviving key still describes the output) from a sort (the
+/// columns are untouched, the ordering claim is not).
+///
+/// Stating this is mandatory rather than defaulted on purpose. An operator
+/// whose case is not described by the derivation is the one most likely to
+/// hand-roll its metadata and get it wrong, so every caller is made to say
+/// which of the four it is.
+enum class RowTransform : std::uint8_t {
+    /// Same rows, same order: update, project, rename, ascribe.
+    Preserve,
+    /// Rows removed, survivors keep their relative order: filter, head, tail,
+    /// distinct, semi/anti join. Dropping rows cannot merge two partitions or
+    /// unsort a sorted column, so this derives exactly like `Preserve`.
+    Subset,
+    /// Same rows, new order: order/sort. The input's ordering claim is void and
+    /// the operator states the new one itself — it knows the keys it sorted by,
+    /// and `derive` cannot infer them.
+    Reorder,
+    /// Rows built from groups or from more than one input: aggregate, join,
+    /// resample, melt/dcast. No claim about the input's row layout survives, so
+    /// everything is cleared and the operator sets what it establishes afresh
+    /// (`resample` its time index, a `by` clause its grouping).
+    Recombine,
+};
+
+/// Derive an operator's output metadata from its input, applying `fate` to each
+/// ordering key, the time index, and each grouping key, then narrowing the
+/// result by what `transform` says happened to the rows.
+///
+/// Ordering is all-or-nothing: cleared unless every key survives (rename-mapped,
+/// un-overwritten). Losing the time index also clears ordering — a by-time
+/// ordering is void without its column (for a TimeFrame the sole key *is* the
+/// time index, so this is already implied, but it keeps the rule self-contained
+/// for non-TimeFrame callers).
+///
+/// `grouped_by` survives every transform but `Recombine`, including `Reorder`.
+/// That is deliberate: it is a hazard flag, not a capability. It records that a
+/// `by` upstream made adjacent rows potentially cross a partition, and a sort
+/// that reshuffles the rows does not make an order-dependent call over them any
+/// safer. Clearing it there would disarm the guard in `check_row_order`.
+///
 /// This is the extracted, shared form of the rules previously inlined at each
 /// serial site; the future parallel merger derives island metadata through it
 /// too, so serial and parallel cannot disagree.
-[[nodiscard]] auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate)
-    -> TableProperties;
+[[nodiscard]] auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate,
+                                           RowTransform transform) -> TableProperties;
 
 /// Extract the order-sensitive metadata from a materialized table.
 [[nodiscard]] auto table_properties_of(const Table& table) -> TableProperties;

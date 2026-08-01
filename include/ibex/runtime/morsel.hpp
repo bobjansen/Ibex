@@ -101,7 +101,9 @@ struct TableRangeMorsel {
         chunk.columns.push_back(ColumnEntry{
             .name = entry.name,
             .column = std::make_shared<ColumnValue>(gather_range(*entry.column, begin, end)),
-            .validity = gather_validity(entry.validity, begin, end)});
+            .validity = gather_validity(entry.validity, begin, end),
+            // A morsel is a row range of the same column: same data, same zone.
+            .timezone = entry.timezone});
     }
     if (input.columns.empty()) {
         chunk.logical_rows = end - begin;

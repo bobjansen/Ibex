@@ -27,6 +27,21 @@ Date/Timestamp, UTF-8, and dictionary-encoded UTF-8 categorical columns retain
 their payload and validity buffers, including nullable slices; a mutation in
 Ibex detaches the affected storage first.
 
+An R `POSIXct` arrives as an Arrow timestamp in microseconds with an IANA zone
+(`tsu:America/New_York`). Every Arrow timestamp resolution is accepted and
+rescaled to the nanoseconds Ibex stores, and the zone is carried on the column
+and re-emitted, so a `POSIXct` comes back in the zone it was handed over in
+rather than relabelled UTC. The instant is exact in both directions: an Arrow
+timestamp is UTC-relative whenever a zone is present. Only nanosecond input can
+be adopted zero-copy — the other resolutions are rescaled into owned storage, so
+a `POSIXct` column is copied rather than borrowed.
+
+The zone is metadata in transit. No operation interprets it yet: calendar
+boundaries, `resample` above all, still cut on UTC. It also does not yet survive
+a query — an operator rebuilds its output columns and the zone is not among the
+metadata they propagate, so a result that has been through `filter` or `select`
+comes back labelled UTC.
+
 Arrow C Data buffers are immutable while shared. The lease prevents R garbage
 collection from releasing them and Ibex serializes cooperating query access,
 but it cannot protect against native code that writes to the same allocation

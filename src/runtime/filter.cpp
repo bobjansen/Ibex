@@ -2519,13 +2519,14 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     // A row-local filter preserves order and time index; a fused projection
     // keeps each only when its column survives the selection.
     apply_table_properties(
-        layout->output,
-        derive_table_properties(
-            table_properties_of(input), [&](const std::string& name) -> std::optional<std::string> {
-                return (project == nullptr || layout->output.index.contains(name))
-                           ? std::optional<std::string>{name}
-                           : std::nullopt;
-            }));
+        layout->output, derive_table_properties(
+                            table_properties_of(input),
+                            [&](const std::string& name) -> std::optional<std::string> {
+                                return (project == nullptr || layout->output.index.contains(name))
+                                           ? std::optional<std::string>{name}
+                                           : std::nullopt;
+                            },
+                            RowTransform::Subset));
     return std::move(layout->output);
 }
 

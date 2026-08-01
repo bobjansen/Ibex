@@ -100,50 +100,53 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
 /// One std::visit per column, not per row — much faster for large gathers.
 [[nodiscard]] inline auto gather_column(const ColumnValue& src, const std::size_t* indices,
                                         std::size_t n) -> ColumnValue {
-    return std::visit(
-        [&](const auto& col) -> ColumnValue {
-            using ColT = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                std::vector<Column<Categorical>::code_type> codes(n);
-                const auto* sp = col.codes_data();
-                for (std::size_t i = 0; i < n; ++i)
-                    codes[i] = sp[indices[i]];
-                return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(), std::move(codes));
-            } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                const auto* src_off = col.offsets_data();
-                const char* src_char = col.chars_data();
-                std::size_t total_chars = 0;
-                for (std::size_t i = 0; i < n; ++i)
-                    total_chars += src_off[indices[i] + 1] - src_off[indices[i]];
-                ColT dst;
-                dst.resize_for_gather(n, total_chars);
-                auto* dst_off = dst.offsets_data();
-                char* dst_char = dst.chars_data();
-                dst_off[0] = 0;
-                std::uint32_t cur = 0;
-                for (std::size_t i = 0; i < n; ++i) {
-                    std::uint32_t len = src_off[indices[i] + 1] - src_off[indices[i]];
-                    ::memcpy(dst_char + cur, src_char + src_off[indices[i]], len);
-                    cur += len;
-                    dst_off[i + 1] = cur;
+    return with_meta_of(
+        std::visit(
+            [&](const auto& col) -> ColumnValue {
+                using ColT = std::decay_t<decltype(col)>;
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    std::vector<Column<Categorical>::code_type> codes(n);
+                    const auto* sp = col.codes_data();
+                    for (std::size_t i = 0; i < n; ++i)
+                        codes[i] = sp[indices[i]];
+                    return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
+                                               std::move(codes));
+                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                    const auto* src_off = col.offsets_data();
+                    const char* src_char = col.chars_data();
+                    std::size_t total_chars = 0;
+                    for (std::size_t i = 0; i < n; ++i)
+                        total_chars += src_off[indices[i] + 1] - src_off[indices[i]];
+                    ColT dst;
+                    dst.resize_for_gather(n, total_chars);
+                    auto* dst_off = dst.offsets_data();
+                    char* dst_char = dst.chars_data();
+                    dst_off[0] = 0;
+                    std::uint32_t cur = 0;
+                    for (std::size_t i = 0; i < n; ++i) {
+                        std::uint32_t len = src_off[indices[i] + 1] - src_off[indices[i]];
+                        ::memcpy(dst_char + cur, src_char + src_off[indices[i]], len);
+                        cur += len;
+                        dst_off[i + 1] = cur;
+                    }
+                    return dst;
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    ColT dst;
+                    dst.resize(n);
+                    for (std::size_t i = 0; i < n; ++i)
+                        dst.set(i, col[indices[i]]);
+                    return dst;
+                } else {
+                    ColT dst;
+                    dst.resize(n);
+                    auto* dp = dst.data();
+                    const auto* sp = col.data();
+                    for (std::size_t i = 0; i < n; ++i)
+                        dp[i] = sp[indices[i]];
+                    return dst;
                 }
-                return dst;
-            } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                ColT dst;
-                dst.resize(n);
-                for (std::size_t i = 0; i < n; ++i)
-                    dst.set(i, col[indices[i]]);
-                return dst;
-            } else {
-                ColT dst;
-                dst.resize(n);
-                auto* dp = dst.data();
-                const auto* sp = col.data();
-                for (std::size_t i = 0; i < n; ++i)
-                    dp[i] = sp[indices[i]];
-                return dst;
-            }
-        },
+            },
+            src),
         src);
 }
 
@@ -157,7 +160,7 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
                                                    std::size_t kNull)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
     // NOLINTEND(bugprone-easily-swappable-parameters)
-    return std::visit(
+    auto gathered = std::visit(
         [&](const auto& col) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
             using ColT = std::decay_t<decltype(col)>;
             bool has_null = false;
@@ -234,6 +237,9 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
             }
         },
         src);
+    // The values keep their meaning through a gather; only the rows changed.
+    gathered.first = with_meta_of(std::move(gathered.first), src);
+    return gathered;
 }
 
 /// Append a default (zero / empty) value to a type-erased column.
@@ -280,15 +286,17 @@ inline auto append_defaults(ColumnValue& col, std::size_t count) -> void {
 }
 
 [[nodiscard]] inline auto make_empty_like(const ColumnValue& src) -> ColumnValue {
-    return std::visit(
-        [](const auto& col) -> ColumnValue {
-            using ColType = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
-                return Column<Categorical>{col.dictionary_ptr(), col.index_ptr(), {}};
-            }
-            return ColType{};
-        },
-        src);
+    return with_meta_of(std::visit(
+                            [](const auto& col) -> ColumnValue {
+                                using ColType = std::decay_t<decltype(col)>;
+                                if constexpr (std::is_same_v<ColType, Column<Categorical>>) {
+                                    return Column<Categorical>{
+                                        col.dictionary_ptr(), col.index_ptr(), {}};
+                                }
+                                return ColType{};
+                            },
+                            src),
+                        src);
 }
 
 }  // namespace ibex::runtime

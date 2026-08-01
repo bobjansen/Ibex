@@ -3769,7 +3769,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
             out_names.insert(name);
             if (share_right) {
-                output.add_column_shared(std::move(name), rc.column, rc.validity);
+                output.add_column_from(std::move(name), rc);
                 continue;
             }
             auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri);

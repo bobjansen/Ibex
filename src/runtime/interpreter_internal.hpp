@@ -815,22 +815,24 @@ inline auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
 /// A `Column<std::string>` cannot be sized without first totalling its bytes,
 /// so it comes back empty and is built whole by the gather itself.
 inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> ColumnValue {
-    return std::visit(
-        [&](const auto& col) -> ColumnValue {
-            using ColT = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                // Shares the source dictionary; only the codes are gathered.
-                return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
-                                           std::vector<Column<Categorical>::code_type>(rows));
-            } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                return ColT{};
-            } else {
-                ColT dst;
-                dst.resize(rows);
-                return dst;
-            }
-        },
-        src);
+    return with_meta_of(std::visit(
+                            [&](const auto& col) -> ColumnValue {
+                                using ColT = std::decay_t<decltype(col)>;
+                                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                                    // Shares the source dictionary; only the codes are gathered.
+                                    return Column<Categorical>(
+                                        col.dictionary_ptr(), col.index_ptr(),
+                                        std::vector<Column<Categorical>::code_type>(rows));
+                                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                                    return ColT{};
+                                } else {
+                                    ColT dst;
+                                    dst.resize(rows);
+                                    return dst;
+                                }
+                            },
+                            src),
+                        src);
 }
 
 /// Copy output rows `[lo, hi)` from `src` through `idx` into an already-sized

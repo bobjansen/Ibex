@@ -146,7 +146,7 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
         // Share the column's shared_ptr instead of deep-copying its data. The
         // projected table is a read-only selection; under copy-on-write any
         // later mutation reseats a fresh column, so sharing is safe.
-        output.add_column_shared(col.name, entry->column, entry->validity);
+        output.add_column_from(col.name, *entry);
     }
     // A key or the time index survives only if its column survives the
     // selection; a dropped time index also voids the ordering.
@@ -245,11 +245,11 @@ auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& r
     Table out;
     for (const auto& field : scan.lazy->schema().columns) {
         if (field.name == scan.key_column) {
-            out.add_column_shared(key_column.name, key_column.column, key_column.validity);
+            out.add_column_from(key_column.name, key_column);
             continue;
         }
         if (const auto* entry = rest->find_entry(field.name); entry != nullptr) {
-            out.add_column_shared(entry->name, entry->column, entry->validity);
+            out.add_column_from(entry->name, *entry);
         }
     }
     out.logical_rows = rows.size();
@@ -275,7 +275,7 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
         auto it = rename_map.find(entry.name);
         const std::string& out_name = (it != rename_map.end()) ? it->second : entry.name;
         // Rename only relabels columns; share the data rather than copying it.
-        output.add_column_shared(out_name, entry.column, entry.validity);
+        output.add_column_from(out_name, entry);
     }
 
     // Rename never drops a column, it relabels it; rewrite each key and the
@@ -1353,7 +1353,6 @@ void Table::add_column(std::string name, ColumnValue column) {
         columns[it->second].validity.reset();
         // New storage under an existing name is a new column, not an edit of
         // the old one: its zone (if any) is the caller's to set afresh.
-        columns[it->second].timezone.reset();
         return;
     }
     const std::size_t pos = columns.size();
@@ -1361,7 +1360,6 @@ void Table::add_column(std::string name, ColumnValue column) {
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
         .validity = std::nullopt,
-        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }
@@ -1370,7 +1368,6 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
     if (auto it = index.find(name); it != index.end()) {
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity = std::move(validity);
-        columns[it->second].timezone.reset();
         return;
     }
     const std::size_t pos = columns.size();
@@ -1378,7 +1375,6 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
         .validity = std::move(validity),
-        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }
@@ -1412,6 +1408,10 @@ auto Table::mutable_column(std::size_t pos) -> ColumnValue& {
     return *column;
 }
 
+void Table::add_column_from(std::string name, const ColumnEntry& source) {
+    add_column_shared(std::move(name), source.column, source.validity);
+}
+
 void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
                               std::optional<ValidityBitmap> validity) {
     if (auto it = index.find(name); it != index.end()) {
@@ -1424,7 +1424,6 @@ void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> col
         .name = std::move(name),
         .column = std::move(column),
         .validity = std::move(validity),
-        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }

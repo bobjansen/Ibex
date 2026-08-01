@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <interpreter_internal.hpp>
 #include <limits>
 #include <memory>
 #include <robin_hood.h>
@@ -46,6 +47,16 @@ auto string_at(const ArrowArray& array, std::int64_t index) -> std::string {
     const auto start = static_cast<std::size_t>(offsets[index]);
     const auto end = static_cast<std::size_t>(offsets[index + 1]);
     return std::string(chars + start, chars + end);
+}
+
+/// The zone of a table's first column, as a name.
+auto zone_of(const ibex::runtime::Table& table, std::size_t col = 0) -> std::optional<std::string> {
+    const auto& zone =
+        std::get<ibex::Column<ibex::Timestamp>>(*table.columns[col].column).meta().zone;
+    if (!zone.has_value()) {
+        return std::nullopt;
+    }
+    return ibex::zone_name(*zone);
 }
 
 struct FakeArrowStreamState {
@@ -860,8 +871,7 @@ TEST_CASE("Arrow C Data round-trips a timestamp column's zone", "[interop][arrow
     auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
     REQUIRE(imported.has_value());
     REQUIRE(imported->columns.size() == 1);
-    REQUIRE(imported->columns[0].timezone.has_value());
-    CHECK(*imported->columns[0].timezone == "America/New_York");
+    CHECK(zone_of(*imported) == std::optional<std::string>{"America/New_York"});
 
     ArrowArray out_array{};
     ArrowSchema out_schema{};
@@ -875,7 +885,7 @@ TEST_CASE("A zone-less timestamp column stays zone-less", "[interop][arrow][time
     RelabelledTimestamps source({ibex::Timestamp{5}}, "tsn:");
     auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
     REQUIRE(imported.has_value());
-    CHECK_FALSE(imported->columns[0].timezone.has_value());
+    CHECK_FALSE(zone_of(*imported).has_value());
 
     ArrowArray out_array{};
     ArrowSchema out_schema{};
@@ -885,17 +895,31 @@ TEST_CASE("A zone-less timestamp column stays zone-less", "[interop][arrow][time
     out_array.release(&out_array);
 }
 
-TEST_CASE("Replacing a column's storage clears its zone", "[interop][arrow][timestamp]") {
-    // add_column under an existing name installs a *new* column rather than
-    // editing the old one, so a zone inherited from unrelated data would be a
-    // lie about the new storage.
+TEST_CASE("A zone belongs to the column, not to the name", "[interop][arrow][timestamp]") {
+    // Metadata that describes the DATA has to travel with the data. Installing
+    // different storage under the same name is a different column, and it
+    // carries its own (absent) zone rather than inheriting one that described
+    // values it never held.
     RelabelledTimestamps source({ibex::Timestamp{5}}, "tsu:Europe/Amsterdam");
     auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
     REQUIRE(imported.has_value());
-    REQUIRE(imported->columns[0].timezone.has_value());
+    REQUIRE(zone_of(*imported) == std::optional<std::string>{"Europe/Amsterdam"});
 
-    imported->add_column("ts", ibex::Column<std::int64_t>{1});
-    CHECK_FALSE(imported->columns[0].timezone.has_value());
+    imported->add_column("ts", ibex::Column<ibex::Timestamp>{ibex::Timestamp{1}});
+    CHECK_FALSE(zone_of(*imported).has_value());
+}
+
+TEST_CASE("A gathered column keeps its zone", "[interop][arrow][timestamp]") {
+    // The single reason this design was chosen over carrying the zone on the
+    // table: every helper that builds one column out of another routes through
+    // `with_meta_of`, so a row gather cannot silently strip it.
+    RelabelledTimestamps source({ibex::Timestamp{5}, ibex::Timestamp{6}}, "tsu:Europe/Amsterdam");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+
+    const std::vector<std::size_t> idx{1};
+    auto gathered = ibex::runtime::gather_rows(*imported, idx);
+    CHECK(zone_of(gathered) == std::optional<std::string>{"Europe/Amsterdam"});
 }
 
 TEST_CASE("Arrow C Data round-trips the group-major claim", "[interop][arrow][properties]") {

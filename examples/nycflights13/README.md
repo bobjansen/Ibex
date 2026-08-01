@@ -113,20 +113,31 @@ Ibex sits closer to data.table than to dplyr: both apply clause blocks to a
 table in brackets and chain them, and both keep the filter, the aggregate, and
 the grouping in one block rather than as separate pipeline stages.
 
-Two places where the dialects genuinely differ rather than just reading
-differently:
+Two places worth dwelling on, for opposite reasons.
 
-- **The trailing window.** Ibex's `resample 1d` + `window 7d` is time-indexed:
-  the window is seven *days*, not seven rows. dplyr reaches that with
-  `slider::slide_index_dbl(..., .before = 6)`; data.table needs an adaptive
-  `frollmean` with lengths `1, 2, ... 7` to reproduce the partial leading
-  window, since a plain `frollmean(x, 7)` starts with six `NA`s. The daily
-  series here is gapless, so all three agree — on a series with missing days
-  they would not.
-- **Day bucketing.** `as.Date()` on a POSIXct buckets in UTC, which is what
-  Ibex's `resample 1d` does to the underlying instant. Bucketing in
-  `America/New_York` instead would give 365 days rather than 366, and every
-  daily figure would shift.
+**The trailing window — Ibex is the one that is right.** `resample 1d` +
+`window 7d` is time-indexed: the window is seven *days*, not seven rows.
+dplyr expresses the same thing with `slider::slide_index_dbl(..., .before = 6)`,
+which also indexes by date. data.table's `frollmean(x, 7)` is row-based and is
+only equivalent because this daily series happens to be gapless; it also opens
+with six `NA`s, so the script uses an adaptive `frollmean` with lengths
+`1, 2, ... 7` to reproduce Ibex's partial leading window. Insert a day with no
+flights and the row-based version silently starts averaging across a longer
+span than it claims.
+
+**Day bucketing — this one is an Ibex limitation.** All three scripts bucket in
+UTC, and they agree, but UTC is not obviously the right answer for flights out
+of New York: a departure at 23:30 local on 31 December lands in the following
+year's first bucket. It is not a rounding detail: 37,037 of the 328,521 scored
+departures — 11% — fall in a different calendar day under `America/New_York`
+than under UTC, and the year has 365 local days against 366 UTC ones. The other
+two dialects can bucket in any zone
+(`as.Date(time_hour, tz = "America/New_York")`, `lubridate::floor_date`); Ibex
+cannot. `Timestamp` is a bare instant — nanoseconds since the epoch with no
+zone attached — so `resample 1d` always cuts on UTC midnight, and no argument
+exists to say otherwise. Shifting the instants by a fixed offset first is not a
+workaround, because the offset changes at the two DST transitions inside 2013.
+See [Timestamps carry no time zone](#timestamps-carry-no-time-zone) below.
 
 `compare.R` runs all three and asserts they agree column by column, so the claim
 is checked rather than asserted.
@@ -165,6 +176,15 @@ to interpolate towards.
 - **`update` and `select` cannot share one bracket.** Step 4 computes `age` in
   its own `let` and aggregates it in the next.
 - **Boolean conjunction is `&&`, not `and`**, inside a `filter` predicate.
+- **Timestamps are instants; the zone is metadata.** `Timestamp` is
+  `{int64_t nanos}`. A column may carry an IANA zone beside its instants, and a
+  `POSIXct` bound through the Arrow path comes back in the zone it arrived in,
+  but nothing in the engine interprets that zone yet: calendar boundaries —
+  `resample` above all — still cut on UTC. That a zone is a property of a
+  *column* rather than of a row is deliberate (SPEC 2.4); per-row zones belong
+  in a column of their own beside the instant. The zone also does not yet
+  survive a query, so results that have been through an operator come back
+  labelled UTC.
 - **`count()` returns `Int64`.** Converting a result containing Int64 or
   Timestamp columns to a data.frame can emit a nanoarrow warning about possible
   loss of precision in the conversion to `double`. It is expected here; the

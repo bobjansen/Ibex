@@ -150,13 +150,14 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     }
     // A key or the time index survives only if its column survives the
     // selection; a dropped time index also voids the ordering.
-    apply_table_properties(
-        output, derive_table_properties(table_properties_of(input),
-                                        [&](const std::string& name) -> std::optional<std::string> {
-                                            return output.index.contains(name)
-                                                       ? std::optional<std::string>{name}
-                                                       : std::nullopt;
-                                        }));
+    apply_table_properties(output, derive_table_properties(
+                                       table_properties_of(input),
+                                       [&](const std::string& name) -> std::optional<std::string> {
+                                           return output.index.contains(name)
+                                                      ? std::optional<std::string>{name}
+                                                      : std::nullopt;
+                                       },
+                                       RowTransform::Preserve));
     return output;
 }
 
@@ -280,12 +281,13 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
 
     // Rename never drops a column, it relabels it; rewrite each key and the
     // time index to its new name.
-    apply_table_properties(
-        output, derive_table_properties(table_properties_of(input),
-                                        [&](const std::string& name) -> std::optional<std::string> {
-                                            auto it = rename_map.find(name);
-                                            return it != rename_map.end() ? it->second : name;
-                                        }));
+    apply_table_properties(output, derive_table_properties(
+                                       table_properties_of(input),
+                                       [&](const std::string& name) -> std::optional<std::string> {
+                                           auto it = rename_map.find(name);
+                                           return it != rename_map.end() ? it->second : name;
+                                       },
+                                       RowTransform::Preserve));
     return output;
 }
 
@@ -1347,6 +1349,9 @@ void Table::add_column(std::string name, ColumnValue column) {
         // Reseat the shared_ptr rather than mutating shared data (copy-on-write).
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity.reset();
+        // New storage under an existing name is a new column, not an edit of
+        // the old one: its zone (if any) is the caller's to set afresh.
+        columns[it->second].timezone.reset();
         return;
     }
     const std::size_t pos = columns.size();
@@ -1354,6 +1359,7 @@ void Table::add_column(std::string name, ColumnValue column) {
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
         .validity = std::nullopt,
+        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }
@@ -1362,6 +1368,7 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
     if (auto it = index.find(name); it != index.end()) {
         columns[it->second].column = std::make_shared<ColumnValue>(std::move(column));
         columns[it->second].validity = std::move(validity);
+        columns[it->second].timezone.reset();
         return;
     }
     const std::size_t pos = columns.size();
@@ -1369,6 +1376,7 @@ void Table::add_column(std::string name, ColumnValue column, ValidityBitmap vali
         .name = std::move(name),
         .column = std::make_shared<ColumnValue>(std::move(column)),
         .validity = std::move(validity),
+        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }
@@ -1414,6 +1422,7 @@ void Table::add_column_shared(std::string name, std::shared_ptr<ColumnValue> col
         .name = std::move(name),
         .column = std::move(column),
         .validity = std::move(validity),
+        .timezone = std::nullopt,
     });
     index[columns.back().name] = pos;
 }

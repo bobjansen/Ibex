@@ -69,9 +69,14 @@ auto normalize_time_index(Table& table) -> void {
     table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
 }
 
-auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate)
-    -> TableProperties {
+auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate,
+                             RowTransform transform) -> TableProperties {
     TableProperties out;
+    if (transform == RowTransform::Recombine) {
+        // Rows built from groups or several inputs: no claim about the input's
+        // layout carries over. The operator states what it establishes itself.
+        return out;
+    }
     // Time index first: whether it survives gates the ordering rule below.
     bool time_index_lost = false;
     if (input.time_index.has_value()) {
@@ -81,7 +86,10 @@ auto derive_table_properties(const TableProperties& input, const KeyColumnFate& 
             time_index_lost = true;
         }
     }
-    if (input.ordering.has_value()) {
+    // A reorder voids the input's ordering outright: the columns are all still
+    // there, so `fate` would happily map every key, but the rows they described
+    // have moved. The operator sets the new ordering after this returns.
+    if (input.ordering.has_value() && transform != RowTransform::Reorder) {
         std::vector<ir::OrderKey> kept;
         kept.reserve(input.ordering->size());
         bool preserved = !time_index_lost;  // lose the time index -> lose ordering

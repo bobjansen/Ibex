@@ -98,3 +98,20 @@ test_that("a zoned index resamples on local days, not UTC days", {
     expect_equal(nrow(utc), 366L)
     expect_equal(nrow(local), 365L)
 })
+
+test_that("an R integer column binds through the Arrow path", {
+    skip_if_no_nanoarrow()
+
+    # R integers are Arrow int32, which is spelled "i" -- the same as the usual
+    # dictionary index type. Reading that as "always categorical" used to reject
+    # every integer column with a complaint about missing dictionary storage.
+    df <- data.frame(i = c(1L, 2L, NA_integer_), v = c(1.5, 2.5, 3.5),
+                     f = factor(c("a", "b", "a")))
+    out <- suppressWarnings(
+        eval_ibex("src;", tables = list(src = nanoarrow::as_nanoarrow_array(df)))
+    )
+
+    expect_equal(out$i, c(1, 2, NA))
+    # The factor is also "i", but with dictionary storage: still a categorical.
+    expect_equal(out$f, c("a", "b", "a"))
+})

@@ -581,6 +581,30 @@ auto import_dictionary_strings(const ArrowArray& dictionary)
     return values;
 }
 
+/// Import a narrower integer column, widening to the Int64 Ibex stores.
+///
+/// Every width handled here (8/16/32-bit signed, 8/16/32-bit unsigned) fits in
+/// an Int64 exactly, so the conversion is lossless and needs no range check --
+/// including at null positions, whose payload Arrow leaves unspecified. The
+/// widening is a real conversion, so unlike a native Int64 column this cannot
+/// adopt the producer's buffer.
+template <typename Raw>
+auto import_widened_int_column(const ArrowArray& array)
+    -> std::expected<runtime::ColumnValue, std::string> {
+    static_assert(sizeof(Raw) <= 4, "widening import is only lossless below 64 bits");
+    if (array.buffers == nullptr || array.n_buffers < 2 ||
+        (array.buffers[1] == nullptr && array.length != 0)) {
+        return std::unexpected("Arrow integer array is missing a data buffer");
+    }
+    const auto* values = static_cast<const Raw*>(array.buffers[1]);
+    Column<std::int64_t> column;
+    column.reserve(static_cast<std::size_t>(array.length));
+    for (std::int64_t i = 0; i < array.length; ++i) {
+        column.push_back(static_cast<std::int64_t>(values[array.offset + i]));
+    }
+    return runtime::ColumnValue{std::move(column)};
+}
+
 auto import_categorical_column(const ArrowArray& array, const ArrowSchema& schema,
                                const std::shared_ptr<const void>& owner)
     -> std::expected<runtime::ColumnValue, std::string> {
@@ -669,6 +693,29 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     // without a rescaling copy.
     const std::optional<TimestampFormat> timestamp = parse_timestamp_format(format);
 
+    // Arrow spells int32 and the usual dictionary INDEX type identically ("i").
+    // Only the presence of dictionary storage tells them apart, and reading "i"
+    // as "always categorical" is why a plain int32 column -- an ordinary R
+    // integer, among others -- failed with a complaint about missing dictionary
+    // storage rather than being imported.
+    using NarrowIntImport = std::expected<runtime::ColumnValue, std::string> (*)(const ArrowArray&);
+    std::optional<NarrowIntImport> narrow_int;
+    if (schema.dictionary == nullptr) {
+        if (format == "c") {
+            narrow_int = &import_widened_int_column<std::int8_t>;
+        } else if (format == "s") {
+            narrow_int = &import_widened_int_column<std::int16_t>;
+        } else if (format == "i") {
+            narrow_int = &import_widened_int_column<std::int32_t>;
+        } else if (format == "C") {
+            narrow_int = &import_widened_int_column<std::uint8_t>;
+        } else if (format == "S") {
+            narrow_int = &import_widened_int_column<std::uint16_t>;
+        } else if (format == "I") {
+            narrow_int = &import_widened_int_column<std::uint32_t>;
+        }
+    }
+
     if (format == "l") {
         column = import_primitive_column<std::int64_t>(array, 1, owner);
     } else if (format == "g") {
@@ -681,6 +728,8 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
         column = import_timestamp_column(array, timestamp->nanos_per_unit, owner);
     } else if (format == "u") {
         column = import_string_column(array, owner);
+    } else if (narrow_int.has_value()) {
+        column = (*narrow_int)(array);
     } else if (format == "i") {
         column = import_categorical_column(array, schema, owner);
     }
@@ -691,7 +740,7 @@ auto import_column(const ArrowArray& array, const ArrowSchema& schema,
     const bool buffer_adopted =
         owner && (format == "l" || format == "g" || format == "b" || format == "tdD" ||
                   (timestamp.has_value() && timestamp->nanos_per_unit == 1) || format == "u" ||
-                  format == "i");
+                  (format == "i" && !narrow_int.has_value()));
     return std::pair{
         std::move(*column),
         import_validity(array, buffer_adopted ? owner : std::shared_ptr<const void>{})};

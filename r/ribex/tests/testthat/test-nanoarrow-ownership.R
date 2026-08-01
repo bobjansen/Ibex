@@ -133,7 +133,13 @@ test_that("mutation detaches only the written external column", {
 })
 
 test_that("failed adoption leaves the caller's nanoarrow array valid", {
-    input <- nanoarrow::as_nanoarrow_array(data.frame(value = 1:3))
+    # Needs a type Ibex genuinely cannot import. An integer column used to serve
+    # here; it is supported now, so this uses uint64, which cannot be widened
+    # into Ibex's Int64 without losing values.
+    input <- nanoarrow::as_nanoarrow_array(
+        data.frame(value = 1:3),
+        schema = nanoarrow::na_struct(list(value = nanoarrow::na_uint64()))
+    )
 
     expect_error(
         eval_ibex("input;", tables = list(input = input)),

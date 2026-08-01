@@ -262,13 +262,8 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
     // Finalisation must match the serial gather exactly, `else` branch included
     // — a dropped ordering here would be invisible in the values and wrong in
     // the metadata.
-    if (ordering != nullptr) {
-        output.ordering = *ordering;
-    } else {
-        output.ordering = input.ordering;
-    }
-    output.time_index = input.time_index;
-    normalize_time_index(output);
+    output.set_properties(ordering != nullptr ? input.properties().with_ordering(*ordering)
+                                              : input.properties());
     return output;
 }
 
@@ -318,9 +313,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
     std::size_t rows = input.rows();
     if (rows <= 1 || input.columns.empty()) {
         Table output = input;
-        output.ordering = resolved_keys;
-        output.time_index = input.time_index;
-        normalize_time_index(output);
+        output.set_properties(input.properties().with_ordering(resolved_keys));
         return output;
     }
 
@@ -363,9 +356,7 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                 *column);
             if (already_sorted) {
                 Table output = input;
-                output.ordering = resolved_keys;
-                output.time_index = input.time_index;
-                normalize_time_index(output);
+                output.set_properties(input.properties().with_ordering(resolved_keys));
                 return output;
             }
         }
@@ -722,12 +713,8 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
 
 auto permute_table_rows(const Table& input, const std::vector<std::size_t>& perm,
                         std::vector<ir::OrderKey> ordering, const ExecutionContext& exec) -> Table {
-    // `nullptr` ordering, then overwritten: the gather's own finalisation runs
-    // `normalize_time_index`, which resets `ordering` to time-only. `order_table`
-    // restores the true multi-key order the same way, after the fact.
     Table output = gather_rows_parallel(input, perm, nullptr, exec);
-    output.time_index = input.time_index;
-    output.ordering = std::move(ordering);
+    output.set_properties(input.properties().with_ordering(std::move(ordering)));
     return output;
 }
 
@@ -744,18 +731,18 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
     // here after the sort.
     bool relaxed_timeframe = false;
     std::vector<ir::OrderKey> ordering_out;  // empty = same as the keys we sort by
-    if (input.time_index.has_value()) {
+    if (input.time_index().has_value()) {
         const bool time_only =
-            keys.size() == 1 && keys[0].name == *input.time_index && keys[0].ascending;
+            keys.size() == 1 && keys[0].name == *input.time_index() && keys[0].ascending;
         if (!time_only) {
             if (keys.empty()) {
                 return std::unexpected("order on TimeFrame must be by time index ascending");
             }
             relaxed_timeframe = true;
             if (std::ranges::none_of(resolved_keys, [&](const ir::OrderKey& k) {
-                    return k.name == *input.time_index;
+                    return k.name == *input.time_index();
                 })) {
-                const ir::OrderKey time_key{.name = *input.time_index, .ascending = true};
+                const ir::OrderKey time_key{.name = *input.time_index(), .ascending = true};
                 // The resulting order IS (leading keys..., time) either way — that
                 // is what the metadata below records.
                 ordering_out = resolved_keys;
@@ -772,7 +759,7 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
                 // Skipping it turns `order symbol` on a TimeFrame from a two-key
                 // radix — including a full 64-bit pass over every timestamp —
                 // into a single-key sort, which was half the cost of the sort.
-                if (!column_is_non_decreasing(input, *input.time_index)) {
+                if (!column_is_non_decreasing(input, *input.time_index())) {
                     resolved_keys.push_back(time_key);
                 }
             }
@@ -780,9 +767,8 @@ auto order_table(const Table& input, const std::vector<ir::OrderKey>& keys,
     }
     auto result = order_table_resolved(input, resolved_keys, exec);
     if (result.has_value() && relaxed_timeframe) {
-        result->time_index = input.time_index;
-        result->ordering =
-            ordering_out.empty() ? std::move(resolved_keys) : std::move(ordering_out);
+        result->set_properties(input.properties().with_ordering(
+            ordering_out.empty() ? std::move(resolved_keys) : std::move(ordering_out)));
     }
     return result;
 }
@@ -794,9 +780,7 @@ auto head_table(const Table& input, std::size_t count, const std::vector<ir::Col
         for (const auto& entry : input.columns) {
             output.add_column(entry.name, make_empty_like(*entry.column));
         }
-        output.ordering = input.ordering;
-        output.time_index = input.time_index;
-        normalize_time_index(output);
+        output.set_properties(input.properties());
         return output;
     }
 
@@ -848,9 +832,7 @@ auto tail_table(const Table& input, std::size_t count, const std::vector<ir::Col
         for (const auto& entry : input.columns) {
             output.add_column(entry.name, make_empty_like(*entry.column));
         }
-        output.ordering = input.ordering;
-        output.time_index = input.time_index;
-        normalize_time_index(output);
+        output.set_properties(input.properties());
         return output;
     }
 

@@ -178,6 +178,39 @@ auto ordering_metadata(const std::optional<std::vector<ir::OrderKey>>& ordering)
     return out;
 }
 
+/// Comma-separated grouping keys, mirroring `ordering_metadata`. Without this
+/// an export drops the group-major claim, and the re-import then sees an empty
+/// grouping -- so the scan's `normalize_time_index` rewrites the (correct)
+/// multi-key ordering to "time index ascending", which is false for those rows.
+auto grouped_by_metadata(const std::vector<std::string>& grouped_by) -> std::string {
+    std::string out;
+    for (std::size_t i = 0; i < grouped_by.size(); ++i) {
+        if (i != 0) {
+            out.push_back(',');
+        }
+        out.append(grouped_by[i]);
+    }
+    return out;
+}
+
+auto parse_grouped_by(std::string_view text) -> std::vector<std::string> {
+    std::vector<std::string> keys;
+    std::size_t pos = 0;
+    while (pos <= text.size() && !text.empty()) {
+        const std::size_t next = text.find(',', pos);
+        const std::string_view item =
+            next == std::string_view::npos ? text.substr(pos) : text.substr(pos, next - pos);
+        if (!item.empty()) {
+            keys.emplace_back(item);
+        }
+        if (next == std::string_view::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+    return keys;
+}
+
 auto read_i32_le(const char* p) -> std::int32_t {
     return static_cast<std::int32_t>(static_cast<unsigned char>(p[0])) |
            (static_cast<std::int32_t>(static_cast<unsigned char>(p[1])) << 8) |
@@ -942,11 +975,14 @@ auto export_table_impl(const std::shared_ptr<const runtime::Table>& table, Arrow
     auto schema_state = std::make_unique<SchemaExportState>();
     schema_state->format = "+s";
     std::vector<std::pair<std::string, std::string>> metadata;
-    if (table->time_index.has_value()) {
-        metadata.emplace_back("ibex.time_index", *table->time_index);
+    if (table->time_index().has_value()) {
+        metadata.emplace_back("ibex.time_index", *table->time_index());
     }
-    if (auto ord = ordering_metadata(table->ordering); !ord.empty()) {
+    if (auto ord = ordering_metadata(table->ordering()); !ord.empty()) {
         metadata.emplace_back("ibex.ordering", std::move(ord));
+    }
+    if (auto grouped = grouped_by_metadata(table->grouped_by()); !grouped.empty()) {
+        metadata.emplace_back("ibex.grouped_by", std::move(grouped));
     }
     schema_state->metadata = encode_metadata(metadata);
     schema_state->children_storage.reserve(table->columns.size());
@@ -1132,18 +1168,29 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
     if (!metadata) {
         return std::unexpected(metadata.error());
     }
-    if (auto time_index = find_metadata_value(*metadata, "ibex.time_index");
-        time_index.has_value()) {
-        table.time_index = *time_index;
-    }
+    // Restore the producer's claim. The grouping matters as much as the other
+    // two: the scan that reads this table runs `normalize_time_index`, which
+    // rewrites the ordering to "time index ascending" unless the rows are
+    // group-major. Dropping the grouping here would therefore not just lose the
+    // row-order hazard flag, it would silently replace a correct multi-key
+    // ordering with a false one on the way back in.
+    std::optional<std::vector<ir::OrderKey>> ordering;
     if (auto ordering_text = find_metadata_value(*metadata, "ibex.ordering");
         ordering_text.has_value()) {
-        auto ordering = parse_ordering(*ordering_text);
-        if (!ordering) {
-            return std::unexpected(ordering.error());
+        auto parsed = parse_ordering(*ordering_text);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
         }
-        table.ordering = std::move(*ordering);
+        ordering = std::move(*parsed);
     }
+    std::vector<std::string> grouped_by;
+    if (auto grouped_text = find_metadata_value(*metadata, "ibex.grouped_by");
+        grouped_text.has_value()) {
+        grouped_by = parse_grouped_by(*grouped_text);
+    }
+    table.set_properties(runtime::TableProperties::recovered(
+        std::move(ordering), find_metadata_value(*metadata, "ibex.time_index"),
+        std::move(grouped_by)));
 
     return table;
 }

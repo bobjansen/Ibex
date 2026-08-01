@@ -598,8 +598,7 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
                 *entry.column);
             dst.add_column(entry.name, std::move(empty));
         }
-        dst.time_index = src.time_index;
-        dst.ordering = src.ordering;
+        dst.set_properties(src.properties());
     }
 
     for (std::size_t ci = 0; ci < src.columns.size() && ci < dst.columns.size(); ++ci) {
@@ -628,9 +627,9 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 }
 
 auto stream_get_ts_ns(const runtime::Table& t, std::size_t row) -> std::optional<std::int64_t> {
-    if (!t.time_index.has_value())
+    if (!t.time_index().has_value())
         return std::nullopt;
-    const auto* col = t.find(*t.time_index);
+    const auto* col = t.find(*t.time_index());
     if (col == nullptr)
         return std::nullopt;
     return std::visit(

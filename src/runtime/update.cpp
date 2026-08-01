@@ -1470,9 +1470,9 @@ auto check_row_order(const Table& input, const std::vector<ir::FieldSpec>& field
     if (fn.empty()) {
         return {};
     }
-    if (!input.grouped_by.empty()) {
+    if (!input.grouped_by().empty()) {
         std::string keys;
-        for (const auto& key : input.grouped_by) {
+        for (const auto& key : input.grouped_by()) {
             if (!keys.empty()) {
                 keys += ", ";
             }
@@ -1493,7 +1493,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                            bool aligned) -> std::expected<Table, std::string> {
     Table output = std::move(input);
     const std::size_t rows = output.rows();
-    if (!output.time_index.has_value()) {
+    if (!output.time_index().has_value()) {
         return std::unexpected("window: requires a TimeFrame");
     }
     if (auto ok = check_row_order(output, fields); !ok) {
@@ -1501,7 +1501,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     }
     // Reject mutation of the time index column
     for (const auto& field : fields) {
-        if (field.alias == *output.time_index) {
+        if (field.alias == *output.time_index()) {
             return std::unexpected("cannot update time index column: " + field.alias);
         }
     }
@@ -1599,7 +1599,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
 [[nodiscard]] auto grouped_window_worker_count(const ExecutionContext& exec,
                                                std::size_t remaining_groups, std::size_t rows,
                                                const Table& first_sub,
-                                               const std::vector<std::string>& new_field_names,
+                                               const std::vector<std::string>& written_field_names,
                                                const std::vector<ir::FieldSpec>& fields)
     -> std::size_t {
     // `run_group` is reached from a worker only through this function, but the
@@ -1622,7 +1622,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     // two groups writing one word would lose bits. Validity has the same shape
     // but is monotone and handled atomically; a bool VALUE is not monotone, so
     // it is refused instead. Rolling/aggregate fields are numeric in practice.
-    for (const auto& fname : new_field_names) {
+    for (const auto& fname : written_field_names) {
         const auto* sample = first_sub.find(fname);
         if (sample != nullptr && std::holds_alternative<Column<bool>>(*sample)) {
             return 0;
@@ -1827,7 +1827,7 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
     constexpr std::size_t kMinSplitRows = 32768;
     const std::size_t target = std::max(rows / (workers * 4), kMinSplitRows);
 
-    const auto* tcv = input.find(*input.time_index);
+    const auto* tcv = input.find(*input.time_index());
     std::vector<std::span<const std::size_t>> split;
     // Each piece holds at least `target` rows, so this bound is never exceeded.
     split.reserve((rows / target) + tasks.size());
@@ -1877,11 +1877,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         return windowed_update_table(std::move(input), fields, duration, scalars, externs, exec,
                                      aligned);
     }
-    if (!input.time_index.has_value()) {
+    if (!input.time_index().has_value()) {
         return std::unexpected("window: requires a TimeFrame");
     }
     for (const auto& field : fields) {
-        if (field.alias == *input.time_index) {
+        if (field.alias == *input.time_index()) {
             return std::unexpected("cannot update time index column: " + field.alias);
         }
     }
@@ -2100,8 +2100,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         for (const auto& key : group_by) {
             ordering.push_back(ir::OrderKey{.name = key.name, .ascending = true});
         }
-        if (input.time_index.has_value()) {
-            ordering.push_back(ir::OrderKey{.name = *input.time_index, .ascending = true});
+        if (input.time_index().has_value()) {
+            ordering.push_back(ir::OrderKey{.name = *input.time_index(), .ascending = true});
         }
         permuted = permute_table_rows(input, perm, std::move(ordering), exec);
     }
@@ -2133,8 +2133,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     //     slice and the field appends instead, which would then add a DUPLICATE
     //     to `output` -- it already carries every input column.
     robin_hood::unordered_set<std::string> needed;
-    if (input.time_index.has_value()) {
-        needed.insert(*input.time_index);
+    if (input.time_index().has_value()) {
+        needed.insert(*input.time_index());
     }
     for (const auto& field : fields) {
         ir::collect_expr_column_refs(field.expr, needed);
@@ -2168,7 +2168,13 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 sub.add_column(entry.name, std::move(gathered));
             }
         }
-        sub.time_index = input.time_index;
+        // A per-group slice: it inherits the time index, but deliberately NOT
+        // the grouping -- a single group has no boundary to read across, and
+        // claiming one would make the row-order guard reject a correct
+        // unpartitioned call inside the slice.
+        if (input.time_index().has_value()) {
+            sub.set_properties(TableProperties::time_frame(*input.time_index()));
+        }
         return windowed_update_table(std::move(sub), fields, duration, scalars, externs, exec,
                                      aligned);
     };
@@ -2184,10 +2190,10 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     if (first->columns.size() <= first_new_idx) {
         return std::unexpected("window: grouped update produced no new columns");
     }
-    std::vector<std::string> new_field_names;
-    new_field_names.reserve(first->columns.size() - first_new_idx);
+    std::vector<std::string> written_field_names;
+    written_field_names.reserve(first->columns.size() - first_new_idx);
     for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
-        new_field_names.push_back(first->columns[c].name);
+        written_field_names.push_back(first->columns[c].name);
     }
 
     // Allocate output's new columns at full size, with the same types as the
@@ -2230,7 +2236,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             },
             sample);
     };
-    for (const auto& fname : new_field_names) {
+    for (const auto& fname : written_field_names) {
         const auto* sample = first->find(fname);
         if (sample == nullptr) {
             return std::unexpected("window: missing new column '" + fname + "' in sub-result");
@@ -2276,7 +2282,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // laziness is what decides the OUTPUT REPRESENTATION (bitmap vs no
     // bitmap), so it has to survive parallelism unchanged rather than being
     // traded for a simpler eager allocation.
-    std::vector<std::optional<ValidityBitmap>> output_validity(new_field_names.size());
+    std::vector<std::optional<ValidityBitmap>> output_validity(written_field_names.size());
 
     // Allocation happens at most once per field, so a mutex around just that is
     // uncontended in practice; the bit writes then proceed outside it. The
@@ -2292,7 +2298,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
                                 std::span<const std::size_t> indices) {
-        const auto* sub_entry = sub_table.find_entry(new_field_names[f_idx]);
+        const auto* sub_entry = sub_table.find_entry(written_field_names[f_idx]);
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
         }
@@ -2312,8 +2318,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Resolved once: `find` walks a hash map, and every group would otherwise
     // repeat that per field.
     std::vector<ColumnValue*> dst_columns;
-    dst_columns.reserve(new_field_names.size());
-    for (const auto& fname : new_field_names) {
+    dst_columns.reserve(written_field_names.size());
+    for (const auto& fname : written_field_names) {
         dst_columns.push_back(output.find(fname));
     }
 
@@ -2322,10 +2328,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // rows, which is exactly what makes them independent of each other.
     auto scatter_group = [&](const Table& sub,
                              std::span<const std::size_t> indices) -> std::optional<std::string> {
-        for (std::size_t f = 0; f < new_field_names.size(); ++f) {
-            const auto* src = sub.find(new_field_names[f]);
+        for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+            const auto* src = sub.find(written_field_names[f]);
             if (src == nullptr) {
-                return "window: missing column '" + new_field_names[f] + "' in grouped sub-result";
+                return "window: missing column '" + written_field_names[f] +
+                       "' in grouped sub-result";
             }
             if (auto err = scatter_into(*dst_columns[f], *src, indices)) {
                 return err;
@@ -2339,8 +2346,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         return std::unexpected(*err);
     }
 
-    const std::size_t workers =
-        grouped_window_worker_count(exec, tasks.size() - 1, rows, *first, new_field_names, fields);
+    const std::size_t workers = grouped_window_worker_count(exec, tasks.size() - 1, rows, *first,
+                                                            written_field_names, fields);
     if (workers < 2) {
         for (std::size_t g = 1; g < tasks.size(); ++g) {
             auto sub = run_group(out_slot(g));
@@ -2408,40 +2415,55 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     }
 
     // Attach the lazy validity bitmaps to their output column entries.
-    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
         if (!output_validity[f].has_value()) {
             continue;
         }
-        auto idx_it = output.index.find(new_field_names[f]);
+        auto idx_it = output.index.find(written_field_names[f]);
         if (idx_it != output.index.end()) {
             output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }
     }
 
-    // `normalize_time_index` rewrites any ordering to "time index ascending"
-    // whenever a time index survives, which for group-major rows is simply
-    // FALSE -- and not cosmetically so, since sort elision reads `ordering` and
-    // would drop a downstream `order <time index>` as a no-op. Restore what the
-    // rows actually are, the same way `order_table` does after its own gather.
-    auto true_ordering = needs_permute ? permuted.ordering : input.ordering;
-    normalize_time_index(output);
-    if (true_ordering.has_value()) {
-        output.ordering = std::move(true_ordering);
-    }
-    // Record the grouping for the same reason the ordering is restored above:
-    // the rows are one contiguous run per group, so an unpartitioned lag/lead
-    // downstream would read across a boundary. This holds whether or not the
-    // permutation ran -- skipping it means the input was ALREADY group-major,
-    // which is the same hazard. The condition is the group count: a single
-    // group has no boundary to read across, and claiming a grouping there
-    // would reject a correct unpartitioned lead.
+    // State what the rows actually are: one contiguous run per group, ordered
+    // (group keys..., time). The permuting branch asserted exactly that when it
+    // built `permuted`; skipping the permutation means the input was ALREADY
+    // group-major, so its own ordering stands.
+    //
+    // The grouping claim matters for the same reason: an unpartitioned lag/lead
+    // downstream would read across a run boundary. It holds whether or not the
+    // permutation ran. The condition is the group count -- a single group has no
+    // boundary to read across, and claiming a grouping there would reject a
+    // correct unpartitioned lead.
+    //
+    // Both land through `apply_table_properties`, which sets `grouped_by` before
+    // `normalize_time_index` consults it, so the ordering asserted here survives
+    // instead of being rewritten to "time index ascending" (false for
+    // group-major rows).
+    std::vector<std::string> grouping;
     if (tasks.size() > 1) {
-        output.grouped_by.clear();
-        output.grouped_by.reserve(group_by.size());
+        grouping.reserve(group_by.size());
         for (const auto& key : group_by) {
-            output.grouped_by.push_back(key.name);
+            grouping.push_back(key.name);
         }
     }
+    // The fate applies the overwrite rule, exactly as the ungrouped update
+    // does: a field that rewrites a column's values leaves it present but no
+    // longer a valid key, so any ordering naming it is void. `Preserve` is the
+    // ROW story (an update adds no rows, removes none, moves none); the column
+    // story is the fate's, and stating only the first would let a stale key
+    // survive its own overwrite.
+    apply_table_properties(
+        output,
+        TableProperties::derive(
+            TableProperties::recovered(needs_permute ? permuted.ordering() : input.ordering(),
+                                       output.time_index(), std::move(grouping)),
+            [&](const std::string& name) -> KeyFate {
+                const bool overwritten = std::ranges::any_of(
+                    fields, [&](const ir::FieldSpec& f) { return f.alias == name; });
+                return overwritten ? KeyFate::overwritten() : KeyFate::kept(name);
+            },
+            RowTransform::Preserve));
     return output;
 }
 
@@ -2581,12 +2603,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                   const ExecutionContext& exec) -> std::expected<Table, std::string> {
     Table output = std::move(input);
-    if (output.time_index.has_value()) {
+    if (output.time_index().has_value()) {
         if (auto ok = check_row_order(output, fields); !ok) {
             return std::unexpected(ok.error());
         }
         for (const auto& field : fields) {
-            if (field.alias == *output.time_index) {
+            if (field.alias == *output.time_index()) {
                 return std::unexpected("cannot update time index column: " + field.alias);
             }
         }
@@ -2641,12 +2663,12 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     // cannot be updated (rejected above), so it always survives. The column loop
     // never touches the metadata fields, so `output` still carries the input's.
     apply_table_properties(
-        output, derive_table_properties(
+        output, TableProperties::derive(
                     table_properties_of(output),
-                    [&](const std::string& name) -> std::optional<std::string> {
+                    [&](const std::string& name) -> KeyFate {
                         const bool overwritten = std::ranges::any_of(
                             fields, [&](const ir::FieldSpec& f) { return f.alias == name; });
-                        return overwritten ? std::nullopt : std::optional<std::string>{name};
+                        return overwritten ? KeyFate::overwritten() : KeyFate::kept(name);
                     },
                     RowTransform::Preserve));
     return output;
@@ -2895,9 +2917,9 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     if (group_by.empty()) {
         return update_table(std::move(input), fields, scalars, externs, exec);
     }
-    if (input.time_index.has_value()) {
+    if (input.time_index().has_value()) {
         for (const auto& field : fields) {
-            if (field.alias == *input.time_index) {
+            if (field.alias == *input.time_index()) {
                 return std::unexpected("cannot update time index column: " + field.alias);
             }
         }
@@ -2957,7 +2979,13 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 sub.add_column(entry.name, std::move(gathered));
             }
         }
-        sub.time_index = input.time_index;
+        // A per-group slice: it inherits the time index, but deliberately NOT
+        // the grouping -- a single group has no boundary to read across, and
+        // claiming one would make the row-order guard reject a correct
+        // unpartitioned call inside the slice.
+        if (input.time_index().has_value()) {
+            sub.set_properties(TableProperties::time_frame(*input.time_index()));
+        }
 
         std::vector<ir::FieldSpec> pending_row_fields;
         auto flush_pending = [&] -> std::expected<void, std::string> {
@@ -3006,10 +3034,10 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     if (first->columns.size() <= first_new_idx) {
         return std::unexpected("update: grouped update produced no new columns");
     }
-    std::vector<std::string> new_field_names;
-    new_field_names.reserve(first->columns.size() - first_new_idx);
+    std::vector<std::string> written_field_names;
+    written_field_names.reserve(first->columns.size() - first_new_idx);
     for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
-        new_field_names.push_back(first->columns[c].name);
+        written_field_names.push_back(first->columns[c].name);
     }
 
     Table output = input;
@@ -3033,7 +3061,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             },
             sample);
     };
-    for (const auto& fname : new_field_names) {
+    for (const auto& fname : written_field_names) {
         const auto* sample = first->find(fname);
         if (sample == nullptr) {
             return std::unexpected("update: missing new column '" + fname + "' in sub-result");
@@ -3076,11 +3104,11 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     // Same lazy validity scatter as `grouped_windowed_update_table` —
     // ordered ops like `lag(c, 1)` produce a per-group validity bitmap with
     // the first `n` rows marked null; we OR those into the output's column.
-    std::vector<std::optional<ValidityBitmap>> output_validity(new_field_names.size());
+    std::vector<std::optional<ValidityBitmap>> output_validity(written_field_names.size());
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
                                 const std::vector<std::size_t>& indices) {
-        const auto* sub_entry = sub_table.find_entry(new_field_names[f_idx]);
+        const auto* sub_entry = sub_table.find_entry(written_field_names[f_idx]);
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
         }
@@ -3099,8 +3127,8 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
     };
 
-    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
-        const auto& fname = new_field_names[f];
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+        const auto& fname = written_field_names[f];
         auto* dst = output.find(fname);
         const auto* src = first->find(fname);
         if (auto err = scatter_into(*dst, *src, group_rows[0])) {
@@ -3114,8 +3142,8 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         if (!sub.has_value()) {
             return std::unexpected(sub.error());
         }
-        for (std::size_t f = 0; f < new_field_names.size(); ++f) {
-            const auto& fname = new_field_names[f];
+        for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+            const auto& fname = written_field_names[f];
             auto* dst = output.find(fname);
             const auto* src = sub->find(fname);
             if (src == nullptr) {
@@ -3128,11 +3156,11 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             scatter_validity(f, *sub, group_rows[g]);
         }
     }
-    for (std::size_t f = 0; f < new_field_names.size(); ++f) {
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
         if (!output_validity[f].has_value()) {
             continue;
         }
-        auto idx_it = output.index.find(new_field_names[f]);
+        auto idx_it = output.index.find(written_field_names[f]);
         if (idx_it != output.index.end()) {
             output.columns[idx_it->second].validity = std::move(output_validity[f]);
         }

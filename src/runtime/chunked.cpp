@@ -63,9 +63,7 @@ auto chunk_to_table(Chunk chunk) -> Table {
     for (std::size_t i = 0; i < t.columns.size(); ++i) {
         t.index[t.columns[i].name] = i;
     }
-    t.ordering = std::move(chunk.ordering);
-    t.time_index = std::move(chunk.time_index);
-    t.grouped_by = std::move(chunk.grouped_by);
+    t.set_properties(chunk.properties());
     if (t.columns.empty()) {  // logical_rows is only meaningful when column-less
         t.logical_rows = chunk.logical_rows;
     }
@@ -75,9 +73,7 @@ auto chunk_to_table(Chunk chunk) -> Table {
 auto table_to_chunk(Table table) -> Chunk {
     Chunk c;
     c.columns = std::move(table.columns);
-    c.ordering = std::move(table.ordering);
-    c.time_index = std::move(table.time_index);
-    c.grouped_by = std::move(table.grouped_by);
+    c.set_properties(table.properties());
     if (c.columns.empty()) {  // logical_rows is only meaningful when column-less
         c.logical_rows = table.logical_rows;
     }
@@ -624,24 +620,21 @@ class ChunkedRenameOperator final : public Operator {
         // Rewrite the chunk's order-sensitive metadata through the same shared
         // rule as the serial `rename_table`, so a renamed sort key / time index
         // is relabeled here too rather than left carrying its old column name.
-        if (chunk.ordering.has_value() || chunk.time_index.has_value() ||
-            !chunk.grouped_by.empty()) {
-            auto props = derive_table_properties(
-                TableProperties{.ordering = chunk.ordering,
-                                .time_index = chunk.time_index,
-                                .grouped_by = chunk.grouped_by},
-                [&](const std::string& name) -> std::optional<std::string> {
+        if (chunk.ordering().has_value() || chunk.time_index().has_value() ||
+            !chunk.grouped_by().empty()) {
+            auto props = TableProperties::derive(
+                TableProperties::recovered(chunk.ordering(), chunk.time_index(),
+                                           chunk.grouped_by()),
+                [&](const std::string& name) -> KeyFate {
                     for (const auto& spec : *renames_) {
                         if (spec.old_name == name) {
-                            return spec.new_name;
+                            return KeyFate::kept(spec.new_name);
                         }
                     }
-                    return name;
+                    return KeyFate::kept(name);
                 },
                 RowTransform::Preserve);
-            chunk.ordering = std::move(props.ordering);
-            chunk.time_index = std::move(props.time_index);
-            chunk.grouped_by = std::move(props.grouped_by);
+            chunk.set_properties(props);
         }
         return std::optional<Chunk>{std::move(chunk)};
     }
@@ -1268,7 +1261,7 @@ class ChunkedOrderOperator final : public Operator {
                 return std::optional<Chunk>{};
             }
             Chunk out = std::move(buffered_[emit_idx_++]);
-            out.ordering = resolved_keys_;
+            out.set_properties(out.properties().with_ordering(resolved_keys_));
             return std::optional<Chunk>{std::move(out)};
         }
         if (mode_ == Mode::EmitUnsorted) {
@@ -1306,7 +1299,7 @@ class ChunkedOrderOperator final : public Operator {
                 // the rows (the still-sorted check below then fails, so the EOF
                 // fallback routes through `order_table`, which appends the time
                 // index as an implicit tiebreaker and keeps the TimeFrame).
-                if (chunk.time_index.has_value() && keys_->empty()) {
+                if (chunk.time_index().has_value() && keys_->empty()) {
                     return std::unexpected("order on TimeFrame must be by time index ascending");
                 }
                 auto resolved = resolve_keys(chunk);
@@ -1507,7 +1500,7 @@ class ChunkedOrderOperator final : public Operator {
         // Carry the TimeFrame designation into the concatenated table so the
         // `order_table` fallback can honor the TimeFrame ordering policy
         // (keeping the index, appending it as an implicit tiebreaker).
-        out.time_index = first.time_index;
+        out.set_properties(first.properties());
         out.columns = std::move(first.columns);
         for (std::size_t i = 0; i < out.columns.size(); ++i) {
             out.index[out.columns[i].name] = i;
@@ -1588,8 +1581,8 @@ class ChunkedAsTimeframeOperator final : public Operator {
                 return std::optional<Chunk>{};
             }
             Chunk out = std::move(buffered_[emit_idx_++]);
-            out.time_index = column_;
-            out.ordering = std::vector<ir::OrderKey>{{.name = column_, .ascending = true}};
+            // as_timeframe: the index and the ascending order it implies.
+            out.set_properties(TableProperties::time_frame(column_));
             return std::optional<Chunk>{std::move(out)};
         }
         if (mode_ == Mode::EmitSorted) {
@@ -1728,8 +1721,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
         if (!sorted.has_value()) {
             return std::unexpected(std::move(sorted.error()));
         }
-        sorted->time_index = column_;
-        normalize_time_index(*sorted);
+        sorted->set_properties(TableProperties::time_frame(column_));
         sorted_result_ = std::move(*sorted);
         mode_ = Mode::EmitSorted;
         return {};
@@ -2089,8 +2081,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
             }
         }
 
-        out.ordering = *keys_;
-        normalize_time_index(out);
+        out.set_properties(out.properties().with_ordering(*keys_));
         return out;
     }
 
@@ -2124,8 +2115,10 @@ class ChunkedDistinctOperator final : public Operator {
 
             Table t = chunk_to_table(std::move(*chunk_res.value()));
             if (t.columns.empty()) {
-                t.ordering.reset();
-                t.time_index.reset();
+                // `distinct` keeps the first occurrence of each row in input order and
+                // this operator is stateful, so its chunks arrive in order too: a
+                // `RowTransform::Subset`, under which every claim the input made still
+                // holds. The metadata therefore rides through untouched.
                 return std::optional<Chunk>{table_to_chunk(std::move(t))};
             }
 
@@ -2217,8 +2210,10 @@ class ChunkedDistinctOperator final : public Operator {
                 continue;
             }
 
-            t.ordering.reset();
-            t.time_index.reset();
+            // `distinct` keeps the first occurrence of each row in input order and
+            // this operator is stateful, so its chunks arrive in order too: a
+            // `RowTransform::Subset`, under which every claim the input made still
+            // holds. The metadata therefore rides through untouched.
             if (idx.size() == rows) {
                 return std::optional<Chunk>{table_to_chunk(std::move(t))};
             }
@@ -2242,8 +2237,10 @@ class ChunkedDistinctOperator final : public Operator {
         if (idx.empty()) {
             return std::nullopt;
         }
-        t.ordering.reset();
-        t.time_index.reset();
+        // `distinct` keeps the first occurrence of each row in input order and
+        // this operator is stateful, so its chunks arrive in order too: a
+        // `RowTransform::Subset`, under which every claim the input made still
+        // holds. The metadata therefore rides through untouched.
         if (idx.size() == rows) {
             return t;
         }
@@ -2267,8 +2264,10 @@ class ChunkedDistinctOperator final : public Operator {
         if (idx.empty()) {
             return std::nullopt;
         }
-        t.ordering.reset();
-        t.time_index.reset();
+        // `distinct` keeps the first occurrence of each row in input order and
+        // this operator is stateful, so its chunks arrive in order too: a
+        // `RowTransform::Subset`, under which every claim the input made still
+        // holds. The metadata therefore rides through untouched.
         if (idx.size() == rows) {
             return t;
         }
@@ -2293,8 +2292,10 @@ class ChunkedDistinctOperator final : public Operator {
             if (idx.empty()) {
                 return std::nullopt;
             }
-            t.ordering.reset();
-            t.time_index.reset();
+            // `distinct` keeps the first occurrence of each row in input order and
+            // this operator is stateful, so its chunks arrive in order too: a
+            // `RowTransform::Subset`, under which every claim the input made still
+            // holds. The metadata therefore rides through untouched.
             if (idx.size() == rows) {
                 return t;
             }
@@ -2316,8 +2317,10 @@ class ChunkedDistinctOperator final : public Operator {
         if (idx.empty()) {
             return std::nullopt;
         }
-        t.ordering.reset();
-        t.time_index.reset();
+        // `distinct` keeps the first occurrence of each row in input order and
+        // this operator is stateful, so its chunks arrive in order too: a
+        // `RowTransform::Subset`, under which every claim the input made still
+        // holds. The metadata therefore rides through untouched.
         if (idx.size() == rows) {
             return t;
         }
@@ -2444,8 +2447,10 @@ class ChunkedDistinctOperator final : public Operator {
         if (idx.empty()) {
             return std::nullopt;
         }
-        t.ordering.reset();
-        t.time_index.reset();
+        // `distinct` keeps the first occurrence of each row in input order and
+        // this operator is stateful, so its chunks arrive in order too: a
+        // `RowTransform::Subset`, under which every claim the input made still
+        // holds. The metadata therefore rides through untouched.
         if (idx.size() == rows) {
             return t;
         }
@@ -5159,10 +5164,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (group_by_->empty()) {
             return false;  // global aggregate: let the hash path handle it
         }
-        if (!chunk.ordering.has_value() || chunk.ordering->size() < group_by_->size()) {
+        if (!chunk.ordering().has_value() || chunk.ordering()->size() < group_by_->size()) {
             return false;
         }
-        const auto& ordering = *chunk.ordering;
+        const auto& ordering = *chunk.ordering();
         for (std::size_t i = 0; i < group_by_->size(); ++i) {
             bool in_group = false;
             for (const auto& g : *group_by_) {
@@ -5238,10 +5243,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         // Capture the leading ordering keys so emitted chunks can advertise the
         // group-sorted order they preserve (lets a downstream `order` skip work).
-        if (first.ordering.has_value()) {
+        if (first.ordering().has_value()) {
             out_ordering_.assign(
-                first.ordering->begin(),
-                first.ordering->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
+                first.ordering()->begin(),
+                first.ordering()->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
         }
         cur_slots_.assign(n_aggs_, AggSlot{});
         reset_output();
@@ -5611,7 +5616,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         Chunk out;
         out.columns = std::move(out_columns_);
         if (!out_ordering_.empty()) {
-            out.ordering = out_ordering_;
+            out.set_properties(TableProperties::sorted_by(out_ordering_));
         }
         reset_output();
         return out;
@@ -6618,12 +6623,12 @@ class TwoPhaseFilterOperator final : public Operator {
         // order and time index; a fused projection keeps each only when its
         // column survives.
         apply_table_properties(
-            layout_.output, derive_table_properties(
+            layout_.output, TableProperties::derive(
                                 table_properties_of(*input_),
-                                [&](const std::string& name) -> std::optional<std::string> {
+                                [&](const std::string& name) -> KeyFate {
                                     return (!fused_project_ || layout_.output.index.contains(name))
-                                               ? std::optional<std::string>{name}
-                                               : std::nullopt;
+                                               ? KeyFate::kept(name)
+                                               : KeyFate::dropped();
                                 },
                                 RowTransform::Subset));
 
@@ -7529,7 +7534,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         if (!source.has_value()) {
             return std::unexpected(std::move(source.error()));
         }
-        if (!source->time_index.has_value()) {
+        if (!source->time_index().has_value()) {
             return std::unexpected(
                 "window requires a TimeFrame — use as_timeframe() to designate a timestamp column");
         }
@@ -7553,8 +7558,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     keep.push_back(ir::ColumnRef{.name = name});
                 }
             };
-            if (result->time_index.has_value()) {
-                keep_col(*result->time_index);
+            if (result->time_index().has_value()) {
+                keep_col(*result->time_index());
             }
             for (const auto& key : update_node.group_by()) {
                 keep_col(key.name);
@@ -7562,22 +7567,15 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             for (const auto& field : update_node.fields()) {
                 keep_col(field.alias);
             }
-            // `project_table` runs `normalize_time_index`, which rewrites the
-            // ordering to "time index ascending" whenever a time index
-            // survives. For a grouped window that is FALSE -- the rows are
-            // group-major -- and sort elision reads `ordering`, so a downstream
-            // `order <time index>` would be dropped as a no-op and hand back
-            // unsorted rows. Restore what the window actually produced.
-            auto window_ordering = result->ordering;
+            // A grouped window leaves the rows group-major, and `project_table`
+            // preserves that: it derives with `RowTransform::Preserve`, which
+            // carries `grouped_by` through and drops the ordering only if the
+            // projection removes one of its keys, and the TimeFrame invariant
+            // leaves a group-major ordering alone rather than rewriting it to
+            // the (false) "time index ascending".
             auto projected = project_table(result.value(), keep);
             if (!projected.has_value()) {
                 return std::unexpected(std::move(projected.error()));
-            }
-            if (window_ordering.has_value() &&
-                std::ranges::all_of(*window_ordering, [&](const ir::OrderKey& key) {
-                    return projected->find(key.name) != nullptr;
-                })) {
-                projected->ordering = std::move(window_ordering);
             }
             result = std::move(projected);
         }

@@ -220,13 +220,13 @@ TEST_CASE("join: asof join matches latest right row at-or-before left time", "[j
     lhs.add_column("ts", Column<Timestamp>{Timestamp{10}, Timestamp{20}, Timestamp{30}});
     lhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
     lhs.add_column("lval", Column<std::int64_t>{1, 2, 3});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{20}, Timestamp{25}});
     rhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
     rhs.add_column("rval", Column<std::int64_t>{50, 200, 250});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -235,8 +235,8 @@ TEST_CASE("join: asof join matches latest right row at-or-before left time", "[j
     auto out = interpret_expr("lhs asof join rhs on {ts, symbol};", tables);
 
     CHECK(out.rows() == 3);
-    REQUIRE(out.time_index.has_value());
-    CHECK(*out.time_index == "ts");
+    REQUIRE(out.time_index().has_value());
+    CHECK(*out.time_index() == "ts");
     CHECK(col_ts_nanos(out, "ts") == std::vector<std::int64_t>{10, 20, 30});
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250});
 }
@@ -247,13 +247,13 @@ TEST_CASE("join: asof join time-only key (no equality keys)", "[join][asof]") {
     lhs.add_column("ts",
                    Column<Timestamp>{Timestamp{10}, Timestamp{20}, Timestamp{30}, Timestamp{40}});
     lhs.add_column("lval", Column<std::int64_t>{1, 2, 3, 4});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     // Right times: 5, 20, 25 — note row at 40 has no right strictly... at-or-before.
     rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{20}, Timestamp{25}});
     rhs.add_column("rval", Column<std::int64_t>{50, 200, 250});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -262,8 +262,8 @@ TEST_CASE("join: asof join time-only key (no equality keys)", "[join][asof]") {
     auto out = interpret_expr("lhs asof join rhs on ts;", tables);
 
     CHECK(out.rows() == 4);
-    REQUIRE(out.time_index.has_value());
-    CHECK(*out.time_index == "ts");
+    REQUIRE(out.time_index().has_value());
+    CHECK(*out.time_index() == "ts");
     CHECK(col_ts_nanos(out, "ts") == std::vector<std::int64_t>{10, 20, 30, 40});
     // ts=10 -> latest right <=10 is 5 (50); ts=20 -> 20 (200);
     // ts=30 -> 25 (250); ts=40 -> 25 (250).
@@ -277,12 +277,12 @@ TEST_CASE("join: asof join time-only key with an Int time index", "[join][asof]"
     runtime::Table lhs;
     lhs.add_column("ts", Column<std::int64_t>{10, 20, 30, 40});
     lhs.add_column("lval", Column<std::int64_t>{1, 2, 3, 4});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<std::int64_t>{5, 20, 25});
     rhs.add_column("rval", Column<std::int64_t>{50, 200, 250});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -291,8 +291,8 @@ TEST_CASE("join: asof join time-only key with an Int time index", "[join][asof]"
     auto out = interpret_expr("lhs asof join rhs on ts;", tables);
 
     CHECK(out.rows() == 4);
-    REQUIRE(out.time_index.has_value());
-    CHECK(*out.time_index == "ts");
+    REQUIRE(out.time_index().has_value());
+    CHECK(*out.time_index() == "ts");
     CHECK(col_i64(out, "ts") == std::vector<std::int64_t>{10, 20, 30, 40});
     // Same at-or-before semantics as the Timestamp case.
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{50, 200, 250, 250});
@@ -303,12 +303,12 @@ TEST_CASE("join: asof join time-only key, left before all right rows fills defau
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{100}});
     lhs.add_column("lval", Column<std::int64_t>{7, 8});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{50}});
     rhs.add_column("rval", Column<std::int64_t>{99});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -329,14 +329,14 @@ TEST_CASE("join: asof join two equality keys (generic grouped path)", "[join][as
     lhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
     lhs.add_column("venue", Column<std::string>{"X", "Y", "X"});
     lhs.add_column("lval", Column<std::int64_t>{1, 2, 3});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{5}, Timestamp{8}, Timestamp{20}});
     rhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
     rhs.add_column("venue", Column<std::string>{"X", "Y", "X"});
     rhs.add_column("rval", Column<std::int64_t>{50, 80, 200});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -354,13 +354,13 @@ TEST_CASE("join: asof join preserves left rows and fills right defaults", "[join
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}});
     lhs.add_column("symbol", Column<std::string>{"A", "B"});
     lhs.add_column("lval", Column<std::int64_t>{10, 20});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{2}});
     rhs.add_column("symbol", Column<std::string>{"A"});
     rhs.add_column("rval", Column<std::int64_t>{99});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -377,12 +377,12 @@ TEST_CASE("join: asof join requires time index key in on-list", "[join]") {
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
     lhs.add_column("symbol", Column<std::string>{"A"});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
     rhs.add_column("symbol", Column<std::string>{"A"});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -405,7 +405,7 @@ TEST_CASE("join: asof error names which side is a DataFrame and suggests as_time
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
     rhs.add_column("symbol", Column<std::string>{"A"});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -443,12 +443,12 @@ TEST_CASE("join: asof error names mismatched time indexes", "[join][asof][diagno
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
     lhs.add_column("symbol", Column<std::string>{"A"});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("event_time", Column<Timestamp>{Timestamp{1}});
     rhs.add_column("symbol", Column<std::string>{"A"});
-    rhs.time_index = "event_time";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("event_time"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
@@ -464,12 +464,12 @@ TEST_CASE("join: asof error names which side is unsorted", "[join][asof][diagnos
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{3}, Timestamp{1}, Timestamp{2}});
     lhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
-    lhs.time_index = "ts";
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table rhs;
     rhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{2}, Timestamp{3}});
     rhs.add_column("symbol", Column<std::string>{"A", "A", "A"});
-    rhs.time_index = "ts";
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));

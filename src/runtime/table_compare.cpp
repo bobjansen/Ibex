@@ -109,11 +109,11 @@ auto compare_tables(const Table& expected, const Table& actual) -> std::optional
     if (expected.columns.size() != actual.columns.size())
         return mismatch("schema column count", std::to_string(expected.columns.size()),
                         std::to_string(actual.columns.size()));
-    if (!same_ordering(expected.ordering, actual.ordering))
+    if (!same_ordering(expected.ordering(), actual.ordering()))
         return mismatch("ordering", "different ordering", "different ordering");
-    if (expected.time_index != actual.time_index)
-        return mismatch("time_index", expected.time_index.value_or("<none>"),
-                        actual.time_index.value_or("<none>"));
+    if (expected.time_index() != actual.time_index())
+        return mismatch("time_index", expected.time_index().value_or("<none>"),
+                        actual.time_index().value_or("<none>"));
     if (expected.columns.empty() && expected.logical_rows != actual.logical_rows)
         return mismatch("logical_rows", std::to_string(expected.logical_rows.value_or(0)),
                         std::to_string(actual.logical_rows.value_or(0)));

@@ -1664,8 +1664,8 @@ TEST_CASE("as_timeframe on Timestamp column sets time_index and sorts ascending"
     auto ir = require_ir(R"(as_timeframe(data, "ts");)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
 
     const auto* ts_col = std::get_if<Column<Timestamp>>(result->find("ts"));
     REQUIRE(ts_col != nullptr);
@@ -1685,8 +1685,8 @@ TEST_CASE("as_timeframe on Date column sets time_index and sorts ascending") {
     auto ir = require_ir(R"(as_timeframe(data, "day");)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "day");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "day");
 
     const auto* day_col = std::get_if<Column<Date>>(result->find("day"));
     REQUIRE(day_col != nullptr);
@@ -1733,7 +1733,7 @@ TEST_CASE("as_timeframe on Int column treats values as nanoseconds") {
     auto ir = require_ir(R"(as_timeframe(data, "ts");)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index == "ts");
+    REQUIRE(result->time_index() == "ts");
     REQUIRE(result->rows() == 3);
     // ts column should now be Timestamp
     REQUIRE(result->find("ts") != nullptr);
@@ -1745,7 +1745,7 @@ TEST_CASE("Filter on TimeFrame preserves time_index") {
     table.add_column("ts",
                      Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200), ts_from_nanos(300)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1753,8 +1753,8 @@ TEST_CASE("Filter on TimeFrame preserves time_index") {
     auto ir = require_ir("data[filter val > 15];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     REQUIRE(result->rows() == 2);
 }
 
@@ -1762,7 +1762,7 @@ TEST_CASE("Project keeping timestamp col preserves time_index") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.add_column("val", Column<std::int64_t>{10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1770,15 +1770,15 @@ TEST_CASE("Project keeping timestamp col preserves time_index") {
     auto ir = require_ir("data[select { ts, val }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
 }
 
 TEST_CASE("Project dropping timestamp col clears time_index") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.add_column("val", Column<std::int64_t>{10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1786,14 +1786,14 @@ TEST_CASE("Project dropping timestamp col clears time_index") {
     auto ir = require_ir("data[select { val }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE_FALSE(result->time_index.has_value());
+    REQUIRE_FALSE(result->time_index().has_value());
 }
 
 TEST_CASE("Order by non-time-col on TimeFrame sorts and stays a TimeFrame") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.add_column("val", Column<std::int64_t>{10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1804,25 +1804,25 @@ TEST_CASE("Order by non-time-col on TimeFrame sorts and stays a TimeFrame") {
     auto ir = require_ir("data[order val desc];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     const auto* val = std::get_if<Column<std::int64_t>>(result->find("val"));
     REQUIRE(val != nullptr);
     REQUIRE((*val)[0] == 20);
     REQUIRE((*val)[1] == 10);
     // ordering metadata reflects the true multi-key order, not just the time index.
-    REQUIRE(result->ordering.has_value());
-    REQUIRE(result->ordering->size() == 2);
-    REQUIRE(result->ordering->front().name == "val");
-    REQUIRE_FALSE(result->ordering->front().ascending);
-    REQUIRE(result->ordering->back().name == "ts");
+    REQUIRE(result->ordering().has_value());
+    REQUIRE(result->ordering()->size() == 2);
+    REQUIRE(result->ordering()->front().name == "val");
+    REQUIRE_FALSE(result->ordering()->front().ascending);
+    REQUIRE(result->ordering()->back().name == "ts");
 }
 
 TEST_CASE("Bare order on TimeFrame still errors") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
     table.add_column("val", Column<std::int64_t>{10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1850,7 +1850,7 @@ TEST_CASE("Window on plain DataFrame returns TimeFrame error") {
 TEST_CASE("Window with no update clause returns unsupported error") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(100), ts_from_nanos(200)});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1868,7 +1868,7 @@ TEST_CASE("lag(val, 1) on TimeFrame shifts values and fills default at start") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1888,7 +1888,7 @@ TEST_CASE("lead(val, 1) on TimeFrame shifts values and fills default at end") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1908,7 +1908,7 @@ TEST_CASE("lag(val, 0) is identity") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1)});
     table.add_column("val", Column<std::int64_t>{42, 99});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1930,7 +1930,7 @@ TEST_CASE("lag nested in arithmetic in one update field", "[lag][nested]") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("close", Column<double>{10.0, 11.0, 12.0, 13.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -1957,7 +1957,7 @@ TEST_CASE("scalar function wrapping lag preserves the null", "[lag][nested]") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("c", Column<double>{-5.0, 10.0, -3.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2001,7 +2001,7 @@ TEST_CASE("lag on bool column preserves packed values", "[lag][bool]") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("flag", Column<bool>{true, false, true});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2204,7 +2204,7 @@ TEST_CASE("cumsum on TimeFrame works without window clause") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2237,7 +2237,7 @@ TEST_CASE("rolling_sum outside window clause returns error") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1)});
     table.add_column("val", Column<std::int64_t>{10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2617,7 +2617,7 @@ auto group_major_timeframe() -> runtime::Table {
                                              ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("symbol", Column<std::string>{"A", "A", "A", "B", "B", "B"});
     table.add_column("val", Column<double>{10.0, 11.0, 12.0, 500.0, 501.0, 502.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     return table;
 }
 
@@ -2633,7 +2633,7 @@ TEST_CASE("unpartitioned lead after resample + by is refused", "[interpreter][ro
                                              ts_from_nanos(3), ts_from_nanos(4), ts_from_nanos(5)});
     table.add_column("symbol", Column<std::string>{"A", "B", "A", "B", "A", "B"});
     table.add_column("val", Column<double>{10.0, 500.0, 11.0, 501.0, 12.0, 502.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2652,7 +2652,7 @@ TEST_CASE("resample without by leaves an unpartitioned lead alone", "[interprete
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("val", Column<double>{10.0, 11.0, 12.0, 13.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2684,7 +2684,7 @@ TEST_CASE("a frame with no grouping upstream still allows lag", "[interpreter][r
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(2), ts_from_nanos(1), ts_from_nanos(0)});
     table.add_column("val", Column<double>{3.0, 2.0, 1.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2704,7 +2704,7 @@ TEST_CASE("group-major provenance is caught even when the time index stays monot
                                              ts_from_nanos(3), ts_from_nanos(4), ts_from_nanos(5)});
     table.add_column("sym", Column<std::string>{"a", "a", "a", "b", "b", "b"});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0, 100.0, 200.0, 300.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2728,7 +2728,7 @@ TEST_CASE("a single-group window leaves an unpartitioned lead alone", "[interpre
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("sym", Column<std::string>{"a", "a", "a"});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2760,7 +2760,7 @@ TEST_CASE("rolling_sum with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2768,7 +2768,7 @@ TEST_CASE("rolling_sum with 2ns window") {
     auto ir = require_ir("data[window 2ns, update { s = rolling_sum(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(*result->time_index() == "ts");
 
     const auto* s = std::get_if<Column<std::int64_t>>(result->find("s"));
     REQUIRE(s != nullptr);
@@ -2781,7 +2781,7 @@ TEST_CASE("rolling_mean with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -2845,7 +2845,7 @@ TEST_CASE("per-call duration window matches the `window` block form", "[rolling]
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2889,7 +2889,7 @@ TEST_CASE("rolling_mean skips NULL elements; their payload is never read", "[rol
     // val[1] is NULL — its payload (a poison value) must be ignored, not summed.
     table.add_column("val", Column<double>{10.0, 1e300, 30.0, 40.0},
                      runtime::ValidityBitmap{true, false, true, true});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2910,7 +2910,7 @@ TEST_CASE("rolling_mean: a window of only NULLs yields a NULL result", "[rolling
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10)});
     table.add_column("val", Column<double>{7.0, 20.0}, runtime::ValidityBitmap{false, true});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2936,7 +2936,7 @@ TEST_CASE("rolling_mean: a real NaN propagates within its window, then recovers 
                                              ts_from_nanos(30)});
     const double nan = std::numeric_limits<double>::quiet_NaN();
     table.add_column("val", Column<double>{10.0, nan, 30.0, 40.0});  // all valid
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2961,7 +2961,7 @@ TEST_CASE("rolling_sum/std/min skip NULLs consistently", "[rolling][null]") {
                      runtime::ValidityBitmap{true, false, true});
     table.add_column("vd", Column<double>{5.0, 1e300, 2.0},
                      runtime::ValidityBitmap{true, false, true});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -2999,7 +2999,7 @@ TEST_CASE("grouped windowed rolling carries per-group input validity", "[rolling
                                              ts_from_nanos(30)});
     table.add_column("val", Column<double>{1e300, 1e300, 30.0, 40.0},
                      runtime::ValidityBitmap{false, false, true, true});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -3025,7 +3025,7 @@ TEST_CASE("rolling_count with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{10, 20, 30});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3045,7 +3045,7 @@ TEST_CASE("rolling_min and rolling_max with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{30, 10, 20});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3074,7 +3074,7 @@ TEST_CASE("rolling_min and rolling_max handle sparse and full time windows", "[r
     sparse.add_column("ts",
                       Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10), ts_from_nanos(20)});
     sparse.add_column("val", Column<std::int64_t>{30, 10, 20});
-    sparse.time_index = "ts";
+    sparse.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::Table full;
     Column<Timestamp> ts;
@@ -3085,7 +3085,7 @@ TEST_CASE("rolling_min and rolling_max handle sparse and full time windows", "[r
     }
     full.add_column("ts", std::move(ts));
     full.add_column("val", std::move(val));
-    full.time_index = "ts";
+    full.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("sparse", sparse);
@@ -3125,7 +3125,7 @@ TEST_CASE("rolling_min and rolling_max return null for all-null time windows",
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(10)});
     table.add_column("val", Column<double>{1e300, 2e300}, runtime::ValidityBitmap{false, false});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3192,7 +3192,7 @@ TEST_CASE("resample basic OHLC - 3 two-minute buckets") {
                                              ts_from_nanos(2 * min_ns), ts_from_nanos(3 * min_ns),
                                              ts_from_nanos(4 * min_ns), ts_from_nanos(5 * min_ns)});
     table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0, 50.0, 60.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("tf", table);
@@ -3203,8 +3203,8 @@ TEST_CASE("resample basic OHLC - 3 two-minute buckets") {
     REQUIRE(result.has_value());
     // 3 buckets: [0..1], [2..3], [4..5]
     REQUIRE(result->rows() == 3);
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
 
     const auto* open_col = result->find("open");
     const auto* close_col = result->find("close");
@@ -3241,7 +3241,7 @@ TEST_CASE("resample count/sum/mean (fast path, numeric reducers)") {
                                              ts_from_nanos(2 * min_ns), ts_from_nanos(3 * min_ns),
                                              ts_from_nanos(4 * min_ns)});
     table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0, 50.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("tf", table);
@@ -3274,7 +3274,7 @@ TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
                                              ts_from_nanos(0), ts_from_nanos(1 * min_ns)});
     table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
     table.add_column("symbol", Column<std::string>{"A", "A", "B", "B"});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("tf", table);
@@ -3295,7 +3295,7 @@ TEST_CASE("resample + order sorts the bars by a non-time key, keeps TimeFrame") 
                                              ts_from_nanos(0), ts_from_nanos(1 * min_ns)});
     table.add_column("price", Column<double>{10.0, 20.0, 30.0, 40.0});
     table.add_column("symbol", Column<std::string>{"B", "B", "A", "A"});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("tf", table);
@@ -3308,8 +3308,8 @@ TEST_CASE("resample + order sorts the bars by a non-time key, keeps TimeFrame") 
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 4);
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     const auto* sym = std::get_if<Column<std::string>>(result->find("symbol"));
     REQUIRE(sym != nullptr);
     // All "A" bars precede all "B" bars, ts-ascending within each symbol.
@@ -3348,7 +3348,7 @@ TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("price", Column<double>{10.0, 30.0, 5.0, 20.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3360,8 +3360,8 @@ TEST_CASE("window + select computes rolling OHLC, keeps only listed fields") {
     REQUIRE(result.has_value());
     // Row-preserving and still a TimeFrame.
     REQUIRE(result->rows() == 4);
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     // Only [ts, open, high, low, close] — the source `price` column is dropped.
     REQUIRE(result->find("price") == nullptr);
     REQUIRE(result->find("ts") != nullptr);
@@ -3398,7 +3398,7 @@ TEST_CASE("window + select aligned resets on the epoch grid") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(3), ts_from_nanos(7), ts_from_nanos(13),
                                              ts_from_nanos(17)});
     table.add_column("price", Column<double>{1.0, 2.0, 3.0, 4.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3409,7 +3409,7 @@ TEST_CASE("window + select aligned resets on the epoch grid") {
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 4);
-    REQUIRE(result->time_index.has_value());
+    REQUIRE(result->time_index().has_value());
     const auto* open = std::get_if<Column<double>>(result->find("open"));
     const auto* high = std::get_if<Column<double>>(result->find("high"));
     const auto* low = std::get_if<Column<double>>(result->find("low"));
@@ -3439,7 +3439,7 @@ TEST_CASE("window_start / window_end expose the nominal window bounds") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(3), ts_from_nanos(7), ts_from_nanos(13),
                                              ts_from_nanos(17)});
     table.add_column("price", Column<double>{1.0, 2.0, 3.0, 4.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3497,7 +3497,7 @@ TEST_CASE("window + select + by keeps windows within each group") {
                                              ts_from_nanos(3)});
     table.add_column("symbol", Column<std::string>{"A", "B", "A", "B"});
     table.add_column("price", Column<double>{10.0, 99.0, 20.0, 88.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3540,7 +3540,7 @@ TEST_CASE("grouped window emits group-major rows and records that ordering") {
                                              ts_from_nanos(3)});
     table.add_column("symbol", Column<std::string>{"A", "B", "A", "B"});
     table.add_column("price", Column<double>{10.0, 99.0, 20.0, 88.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     runtime::TableRegistry registry;
     registry.emplace("data", table);
 
@@ -3567,11 +3567,11 @@ TEST_CASE("grouped window emits group-major rows and records that ordering") {
     CHECK((*ts)[1].nanos > (*ts)[2].nanos);
 
     // And the metadata says so, rather than silently claiming time order.
-    REQUIRE(result->ordering.has_value());
-    REQUIRE(result->ordering->size() == 2);
-    CHECK((*result->ordering)[0].name == "symbol");
-    CHECK((*result->ordering)[1].name == "ts");
-    CHECK(result->time_index.has_value());
+    REQUIRE(result->ordering().has_value());
+    REQUIRE(result->ordering()->size() == 2);
+    CHECK((*result->ordering())[0].name == "symbol");
+    CHECK((*result->ordering())[1].name == "ts");
+    CHECK(result->time_index().has_value());
 }
 
 TEST_CASE("rolling_sum preserves other columns and time_index") {
@@ -3579,7 +3579,7 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<std::int64_t>{1, 2, 3});
     table.add_column("label", Column<std::string>{"a", "b", "c"});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3587,8 +3587,8 @@ TEST_CASE("rolling_sum preserves other columns and time_index") {
     auto ir = require_ir("data[window 1ns, update { s = rolling_sum(val) }];");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     // original columns still present
     REQUIRE(result->find("val") != nullptr);
     REQUIRE(result->find("label") != nullptr);
@@ -3607,7 +3607,7 @@ TEST_CASE("rolling_median with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3632,7 +3632,7 @@ TEST_CASE("rolling_median odd window size") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
     table.add_column("val", Column<double>{10.0, 30.0, 20.0, 40.0, 50.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3656,7 +3656,7 @@ TEST_CASE("rolling_std with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3681,7 +3681,7 @@ TEST_CASE("rolling_std larger window") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
     table.add_column("val", Column<double>{0.0, 2.0, 4.0, 6.0, 8.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3705,7 +3705,7 @@ TEST_CASE("rolling_ewma with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -3731,7 +3731,7 @@ TEST_CASE("rolling_ewma larger window") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4731,7 +4731,7 @@ TEST_CASE("rolling_quantile with 2ns window") {
     // {10, 20, 30} - 1ns window = each row sees only itself
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4762,7 +4762,7 @@ TEST_CASE("rolling_quantile with 3ns window") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3)});
     table.add_column("val", Column<double>{10.0, 20.0, 30.0, 40.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4784,7 +4784,7 @@ TEST_CASE("rolling_skew with 1ns window (single element -> 0)") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4807,7 +4807,7 @@ TEST_CASE("rolling_skew with wide window (symmetric -> 0)") {
     // {1,2,3} fully in window by row 2 - symmetric -> skew=0
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4827,7 +4827,7 @@ TEST_CASE("rolling_kurtosis with 1ns window (n<4 -> 0)") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -4850,7 +4850,7 @@ TEST_CASE("rolling_kurtosis wide window") {
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
                                              ts_from_nanos(3), ts_from_nanos(4)});
     table.add_column("val", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("data", table);
@@ -6633,8 +6633,8 @@ TEST_CASE("TimeFrame from Table constructor via as_timeframe") {
         R"(as_timeframe(Table { ts = [1000, 2000, 3000], price = [10, 20, 30] }, "ts");)");
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
-    REQUIRE(result->time_index.has_value());
-    REQUIRE(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    REQUIRE(*result->time_index() == "ts");
     REQUIRE(result->rows() == 3);
 }
 
@@ -8037,8 +8037,8 @@ TEST_CASE("rbind: two TimeFrames interleave by time index and stay a TimeFrame",
     REQUIRE(result->rows() == 4);
 
     // Result remains a TimeFrame indexed on "ts".
-    REQUIRE(result->time_index.has_value());
-    CHECK(*result->time_index == "ts");
+    REQUIRE(result->time_index().has_value());
+    CHECK(*result->time_index() == "ts");
 
     // Rows from both operands interleave into ascending time order.
     const auto& ts = std::get<Column<Timestamp>>(*result->find("ts"));
@@ -8101,7 +8101,7 @@ TEST_CASE("rbind: a TimeFrame with a plain DataFrame yields a plain DataFrame",
     auto result = runtime::interpret(*ir, registry);
     REQUIRE(result.has_value());
     REQUIRE(result->rows() == 3);
-    CHECK_FALSE(result->time_index.has_value());
+    CHECK_FALSE(result->time_index().has_value());
 
     const auto& ts = std::get<Column<Timestamp>>(*result->find("ts"));
     CHECK(ts[0].nanos == 100);
@@ -8798,9 +8798,9 @@ TEST_CASE("Sorted aggregate streams groups in key order with correct values") {
     REQUIRE((*av)[2] == Catch::Approx(5.0));
 
     // The streamed output is sorted by the group key, and says so.
-    REQUIRE(result->ordering.has_value());
-    REQUIRE(result->ordering->size() == 1);
-    REQUIRE((*result->ordering)[0].name == "sym");
+    REQUIRE(result->ordering().has_value());
+    REQUIRE(result->ordering()->size() == 1);
+    REQUIRE((*result->ordering())[0].name == "sym");
 }
 
 TEST_CASE("Sorted aggregate matches hash aggregate on the same data") {
@@ -8859,8 +8859,8 @@ TEST_CASE("Sorted aggregate merges a group spanning a chunk boundary") {
         auto c0 = make_str_int_chunk("sym", {"A", "A", "B"}, "v", {1, 2, 10});
         auto c1 = make_str_int_chunk("sym", {"B", "B", "C"}, "v", {20, 30, 4});
         const std::vector<ir::OrderKey> ord{ir::OrderKey{.name = "sym", .ascending = true}};
-        c0.ordering = ord;
-        c1.ordering = ord;
+        c0.set_properties(ibex::runtime::TableProperties::sorted_by(ord));
+        c1.set_properties(ibex::runtime::TableProperties::sorted_by(ord));
         chunks.push_back(std::move(c0));
         chunks.push_back(std::move(c1));
         return std::expected<runtime::OperatorPtr, std::string>{
@@ -9178,7 +9178,8 @@ TEST_CASE("Streaming stddev accumulates moments across chunk boundaries") {
             xc.push_back(v);
         }
         chunk.columns.push_back(std::move(xe));
-        chunk.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "g", .ascending = true}};
+        chunk.set_properties(ibex::runtime::TableProperties::sorted_by(
+            std::vector<ir::OrderKey>{ir::OrderKey{.name = "g", .ascending = true}}));
         return chunk;
     };
 
@@ -9267,8 +9268,8 @@ TEST_CASE("Sorted first/last carries state across a chunk boundary") {
         auto c0 = make_str_int_chunk("sym", {"A", "A", "B"}, "v", {1, 2, 10});
         auto c1 = make_str_int_chunk("sym", {"B", "B", "C"}, "v", {20, 30, 4});
         const std::vector<ir::OrderKey> ord{ir::OrderKey{.name = "sym", .ascending = true}};
-        c0.ordering = ord;
-        c1.ordering = ord;
+        c0.set_properties(ibex::runtime::TableProperties::sorted_by(ord));
+        c1.set_properties(ibex::runtime::TableProperties::sorted_by(ord));
         chunks.push_back(std::move(c0));
         chunks.push_back(std::move(c1));
         return std::expected<runtime::OperatorPtr, std::string>{
@@ -9774,7 +9775,7 @@ TEST_CASE("Interpret resampled aggregation survives a Cartesian cell overflow") 
         values.push_back(static_cast<double>(row) + 1.0);
     }
     table.add_column("v", Column<double>{std::move(values)});
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("tf", std::move(table));
@@ -10720,34 +10721,34 @@ TEST_CASE("Table properties: update overwriting a sort key clears ordering",
     // values are rewritten, so it is no longer a valid sort key. A presence-only
     // check would wrongly keep the ordering here.
     auto out = metadata_of("t[order { k asc }][update { k = k + 100 }];");
-    REQUIRE_FALSE(out.ordering.has_value());
+    REQUIRE_FALSE(out.ordering().has_value());
 }
 
 TEST_CASE("Table properties: update leaving the sort key alone preserves ordering",
           "[runtime][metadata]") {
     auto out = metadata_of("t[order { k asc }][update { w = v + 1 }];");
-    REQUIRE(out.ordering.has_value());
-    REQUIRE(out.ordering->size() == 1);
-    REQUIRE((*out.ordering)[0].name == "k");
-    REQUIRE((*out.ordering)[0].ascending);
+    REQUIRE(out.ordering().has_value());
+    REQUIRE(out.ordering()->size() == 1);
+    REQUIRE((*out.ordering())[0].name == "k");
+    REQUIRE((*out.ordering())[0].ascending);
 }
 
 TEST_CASE("Table properties: projecting away the sort key clears ordering (presence rule)",
           "[runtime][metadata]") {
     auto dropped = metadata_of("t[order { k asc }][select { v }];");
-    REQUIRE_FALSE(dropped.ordering.has_value());
+    REQUIRE_FALSE(dropped.ordering().has_value());
 
     auto kept = metadata_of("t[order { k asc }][select { k, v }];");
-    REQUIRE(kept.ordering.has_value());
-    REQUIRE((*kept.ordering)[0].name == "k");
+    REQUIRE(kept.ordering().has_value());
+    REQUIRE((*kept.ordering())[0].name == "k");
 }
 
 TEST_CASE("Table properties: rename rewrites the sort key name", "[runtime][metadata]") {
     auto out = metadata_of("t[order { k asc }][rename kk = k];");
-    REQUIRE(out.ordering.has_value());
-    REQUIRE(out.ordering->size() == 1);
-    REQUIRE((*out.ordering)[0].name == "kk");
-    REQUIRE((*out.ordering)[0].ascending);
+    REQUIRE(out.ordering().has_value());
+    REQUIRE(out.ordering()->size() == 1);
+    REQUIRE((*out.ordering())[0].name == "kk");
+    REQUIRE((*out.ordering())[0].ascending);
 }
 
 TEST_CASE("Table properties: fused filter+update overwriting the sort key clears ordering",
@@ -10755,7 +10756,7 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
     // Exercises the metadata rule through the filter+update path: the sort key
     // survives the filter but is overwritten by the update, so ordering is gone.
     auto out = metadata_of("t[order { k asc }][filter v > 5, update { k = k * 2 }];");
-    REQUIRE_FALSE(out.ordering.has_value());
+    REQUIRE_FALSE(out.ordering().has_value());
 }
 
 // The parallel-island seam must keep a query that reads a lazy/deferred source
@@ -10921,7 +10922,7 @@ TEST_CASE("Interpret order on a TimeFrame keeps each group time-ascending",
         runtime::Table t;
         t.add_column("ts", std::move(ts));
         t.add_column("symbol", std::move(sym));
-        t.time_index = "ts";
+        t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
         runtime::TableRegistry reg;
         reg.emplace("t", std::move(t));
         return reg;
@@ -10953,10 +10954,10 @@ TEST_CASE("Interpret order on a TimeFrame keeps each group time-ascending",
         check_grouped_time_ascending(*result);
         // The order IS (symbol, ts) whether or not ts was sorted on, so the
         // metadata has to say so — a downstream window relies on it.
-        REQUIRE(result->ordering.has_value());
-        REQUIRE(result->ordering->size() == 2);
-        CHECK((*result->ordering)[0].name == "symbol");
-        CHECK((*result->ordering)[1].name == "ts");
+        REQUIRE(result->ordering().has_value());
+        REQUIRE(result->ordering()->size() == 2);
+        CHECK((*result->ordering())[0].name == "symbol");
+        CHECK((*result->ordering())[1].name == "ts");
     }
 
     SECTION("not time-ascending: the tiebreaker still has work to do") {
@@ -11159,7 +11160,7 @@ TEST_CASE("aligned grouped window splits a group at bucket boundaries",
     table.add_column("sym", std::move(sym));
     table.add_column("val", std::move(val));
     table.columns[2].validity = std::move(val_valid);
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("t", table);
@@ -11239,7 +11240,7 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
     table.add_column("ts", std::move(ts));
     table.add_column("sym", std::move(sym));
     table.add_column("val", std::move(val));
-    table.time_index = "ts";
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry registry;
     registry.emplace("t", table);

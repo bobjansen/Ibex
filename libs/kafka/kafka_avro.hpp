@@ -516,7 +516,7 @@ inline auto table_from_avro_record(const avro::GenericDatum& datum,
     }
 
     if (time_index.has_value()) {
-        table.time_index = std::move(*time_index);
+        table.set_properties(ibex::runtime::TableProperties::time_frame(std::move(*time_index)));
     }
     return table;
 }

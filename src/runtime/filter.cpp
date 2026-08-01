@@ -2519,12 +2519,12 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     // A row-local filter preserves order and time index; a fused projection
     // keeps each only when its column survives the selection.
     apply_table_properties(
-        layout->output, derive_table_properties(
+        layout->output, TableProperties::derive(
                             table_properties_of(input),
-                            [&](const std::string& name) -> std::optional<std::string> {
+                            [&](const std::string& name) -> KeyFate {
                                 return (project == nullptr || layout->output.index.contains(name))
-                                           ? std::optional<std::string>{name}
-                                           : std::nullopt;
+                                           ? KeyFate::kept(name)
+                                           : KeyFate::dropped();
                             },
                             RowTransform::Subset));
     return std::move(layout->output);

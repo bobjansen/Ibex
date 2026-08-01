@@ -57,72 +57,23 @@ struct Mask {
 
 [[nodiscard]] auto is_simple_identifier(std::string_view name) -> bool;
 [[nodiscard]] auto format_columns(const Table& table) -> std::string;
+/// Re-establish the TimeFrame ordering invariant: a table with a time index and
+/// no grouping is ordered by that index ascending. A group-major table (any
+/// `by` upstream, recorded in `grouped_by`) is left alone -- its ordering is the
+/// operator's to state. Callers must therefore set `grouped_by` BEFORE calling
+/// this, which `apply_table_properties` does by construction.
 auto normalize_time_index(Table& table) -> void;
 
-/// Where a sort key or the time-index column ends up after one operator: its
-/// name in the output, or `nullopt` when it no longer carries that ordering
-/// guarantee — either dropped (projected away) or present with **rewritten
-/// values** (an update field overwrote it in place; still a column, no longer a
-/// valid key). One hook unifies the three serial metadata rules: presence
-/// (project/filter), overwrite (update), and renaming (rename).
-using KeyColumnFate = std::function<std::optional<std::string>(const std::string&)>;
-
-/// What an operator did to the *rows*, as opposed to what `KeyColumnFate` says
-/// it did to the columns. Both are needed: `fate` alone cannot distinguish a
-/// filter (every surviving key still describes the output) from a sort (the
-/// columns are untouched, the ordering claim is not).
-///
-/// Stating this is mandatory rather than defaulted on purpose. An operator
-/// whose case is not described by the derivation is the one most likely to
-/// hand-roll its metadata and get it wrong, so every caller is made to say
-/// which of the four it is.
-enum class RowTransform : std::uint8_t {
-    /// Same rows, same order: update, project, rename, ascribe.
-    Preserve,
-    /// Rows removed, survivors keep their relative order: filter, head, tail,
-    /// distinct, semi/anti join. Dropping rows cannot merge two partitions or
-    /// unsort a sorted column, so this derives exactly like `Preserve`.
-    Subset,
-    /// Same rows, new order: order/sort. The input's ordering claim is void and
-    /// the operator states the new one itself — it knows the keys it sorted by,
-    /// and `derive` cannot infer them.
-    Reorder,
-    /// Rows built from groups or from more than one input: aggregate, join,
-    /// resample, melt/dcast. No claim about the input's row layout survives, so
-    /// everything is cleared and the operator sets what it establishes afresh
-    /// (`resample` its time index, a `by` clause its grouping).
-    Recombine,
-};
-
-/// Derive an operator's output metadata from its input, applying `fate` to each
-/// ordering key, the time index, and each grouping key, then narrowing the
-/// result by what `transform` says happened to the rows.
-///
-/// Ordering is all-or-nothing: cleared unless every key survives (rename-mapped,
-/// un-overwritten). Losing the time index also clears ordering — a by-time
-/// ordering is void without its column (for a TimeFrame the sole key *is* the
-/// time index, so this is already implied, but it keeps the rule self-contained
-/// for non-TimeFrame callers).
-///
-/// `grouped_by` survives every transform but `Recombine`, including `Reorder`.
-/// That is deliberate: it is a hazard flag, not a capability. It records that a
-/// `by` upstream made adjacent rows potentially cross a partition, and a sort
-/// that reshuffles the rows does not make an order-dependent call over them any
-/// safer. Clearing it there would disarm the guard in `check_row_order`.
-///
-/// This is the extracted, shared form of the rules previously inlined at each
-/// serial site; the future parallel merger derives island metadata through it
-/// too, so serial and parallel cannot disagree.
-[[nodiscard]] auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate,
-                                           RowTransform transform) -> TableProperties;
-
-/// Extract the order-sensitive metadata from a materialized table.
+/// Extract the order-sensitive metadata from a materialized table, so it can be
+/// fed to `TableProperties::derive`.
 [[nodiscard]] auto table_properties_of(const Table& table) -> TableProperties;
 
 /// Write derived `props` onto `table` (setting or clearing `ordering` /
 /// `time_index`) and re-establish the TimeFrame invariant via
 /// `normalize_time_index`. The single place metadata lands on a table, so the
-/// serial operators and the merger apply it identically.
+/// serial operators and the merger apply it identically — an operator that
+/// assigns `table.ordering()` / `table.time_index()` / `table.grouped_by()` directly
+/// is bypassing every rule in `TableProperties` and will drift from them.
 auto apply_table_properties(Table& table, const TableProperties& props) -> void;
 [[nodiscard]] auto int64_to_date_checked(std::int64_t value) -> Date;
 [[nodiscard]] auto scalar_from_column(const ColumnValue& column, std::size_t row) -> ScalarValue;

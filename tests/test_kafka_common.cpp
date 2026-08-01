@@ -115,8 +115,8 @@ TEST_CASE("Kafka JSON payload converts to a typed one-row table") {
     REQUIRE(std::string(get_cat(*table, "venue")[0]) == "XNAS");
     REQUIRE(get_date(*table, "day")[0].days == 20123);
     REQUIRE(get_ts(*table, "ts")[0].nanos == 123456789);
-    REQUIRE(table->time_index.has_value());
-    REQUIRE(*table->time_index == "day");
+    REQUIRE(table->time_index().has_value());
+    REQUIRE(*table->time_index() == "day");
 }
 
 TEST_CASE("Kafka JSON payload rejects missing required fields") {

@@ -338,8 +338,8 @@ TEST_CASE("ws_recv: schema-driven receive skips malformed messages and honours e
     CHECK((*symbol)[0] == "AAPL");
     CHECK((*price)[0] == Catch::Approx(101.5));
     CHECK((*volume)[0] == 42);
-    REQUIRE(row.time_index.has_value());
-    CHECK(*row.time_index == "ts");
+    REQUIRE(row.time_index().has_value());
+    CHECK(*row.time_index() == "ts");
 }
 
 // --- ws_connect end-to-end ----------------------------------------------------

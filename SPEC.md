@@ -263,9 +263,29 @@ the zone belongs in an ordinary column beside the instant.
 
 A column may nonetheless *carry* a zone, as metadata beside the instants. The
 value needs no adjustment for it — the stored number is an instant either way —
-and no operation reads it yet; it records which wall clock a reader should
-render the column on, so that data crossing a boundary is not handed back
-relabelled UTC. `nullopt` means UTC.
+and it records which wall clock a reader should render the column on, so that
+data crossing a boundary is not handed back relabelled UTC. Absent means UTC.
+
+The zone travels with the column, not with the table: any operator that copies,
+gathers, or projects a column preserves it, because none of those change what a
+value means.
+
+Two operations read it.
+
+**`with_timezone(ts, "Zone")`** reinterprets a Timestamp column's values as wall
+clocks in `Zone`, converts them to the instants they denote, and tags the result
+with the zone. It is the cast for data that was never UTC: the numbers are right
+and the reading was wrong. The shift uses the offset in force *at that local
+time*, so it stays correct across a DST boundary where a fixed offset does not.
+A local time that occurs twice (clocks going back) resolves to the earlier
+instant; one that never occurs (clocks going forward) yields null, since there is
+no instant it names.
+
+**`resample`** cuts on local boundaries when its time index carries a zone, and
+on the UTC grid when it does not. A day is not 86400 seconds everywhere — the
+two DST days are 23 and 25 hours long, and several zones sit at :30 or :45
+offsets, so even an hourly grid differs from the UTC one. Where local midnight
+does not exist, the bucket begins at the transition instant.
 
 This fixes what crossing the Arrow boundary means. Arrow timestamps come at four
 resolutions and may carry an IANA zone (`ts{s|m|u|n}:{zone}`); all four are

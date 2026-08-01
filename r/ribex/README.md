@@ -27,6 +27,11 @@ Date/Timestamp, UTF-8, and dictionary-encoded UTF-8 categorical columns retain
 their payload and validity buffers, including nullable slices; a mutation in
 Ibex detaches the affected storage first.
 
+Narrower integers (8/16/32-bit, signed or unsigned) are accepted and widened to
+the Int64 Ibex stores, so an ordinary R `integer` column crosses the boundary.
+Widening is a conversion, so those columns are copied rather than borrowed.
+`uint64` is not accepted: it does not fit in an Int64.
+
 An R `POSIXct` arrives as an Arrow timestamp in microseconds with an IANA zone
 (`tsu:America/New_York`). Every Arrow timestamp resolution is accepted and
 rescaled to the nanoseconds Ibex stores, and the zone is carried on the column

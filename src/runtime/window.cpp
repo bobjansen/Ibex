@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1132,6 +1133,58 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         *src);
 }
 
+/// Start of the `dur_ns` bucket containing `nanos`, cut on LOCAL boundaries in
+/// `zone`.
+///
+/// A day is not 86400 seconds everywhere: the two DST days are 23 and 25 hours
+/// long, and several zones sit at :30 or :45 offsets, so even an hourly grid
+/// differs from the UTC one. Bucketing on the UTC grid over zoned data
+/// therefore answers a different question than the one asked -- for nycflights13
+/// it moves 11% of departures into a different calendar day.
+///
+/// Converting the local boundary back uses `choose::earliest`, which resolves
+/// the case where local midnight does not exist (Brazil used to start DST at
+/// midnight, so the day began at 01:00) to the transition instant -- the moment
+/// the day actually started.
+///
+/// The caches are `thread_local` rather than captured state because the
+/// resample paths are threaded. Offsets change twice a year and consecutive
+/// rows share a bucket, so both hit on nearly every row of sorted input.
+[[nodiscard]] auto zoned_bucket_start(const std::chrono::time_zone* zone, std::int64_t nanos,
+                                      std::int64_t dur_ns) -> std::int64_t {
+    thread_local const std::chrono::time_zone* cached_zone = nullptr;
+    thread_local std::int64_t cached_begin = 0;
+    thread_local std::int64_t cached_end = 0;
+    thread_local std::int64_t cached_offset = 0;
+
+    if (zone != cached_zone || nanos < cached_begin || nanos >= cached_end) {
+        const std::chrono::sys_time<std::chrono::nanoseconds> instant{
+            std::chrono::nanoseconds{nanos}};
+        const std::chrono::sys_info info = zone->get_info(instant);
+        cached_zone = zone;
+        cached_offset = std::chrono::duration_cast<std::chrono::nanoseconds>(info.offset).count();
+        cached_begin = info.begin.time_since_epoch() <= std::chrono::nanoseconds::min()
+                           ? std::numeric_limits<std::int64_t>::min()
+                           : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 info.begin.time_since_epoch())
+                                 .count();
+        cached_end =
+            info.end.time_since_epoch() >= std::chrono::nanoseconds::max()
+                ? std::numeric_limits<std::int64_t>::max()
+                : std::chrono::duration_cast<std::chrono::nanoseconds>(info.end.time_since_epoch())
+                      .count();
+    }
+
+    const std::int64_t local = nanos + cached_offset;
+    std::int64_t q = local / dur_ns;
+    if (local < 0 && local % dur_ns != 0) {
+        --q;
+    }
+    const std::chrono::local_time<std::chrono::nanoseconds> boundary{
+        std::chrono::nanoseconds{q * dur_ns}};
+    return zone->to_sys(boundary, std::chrono::choose::earliest).time_since_epoch().count();
+}
+
 auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                          const std::vector<ir::ColumnRef>& extra_group_by,
                          const std::vector<ir::AggSpec>& aggregations)
@@ -1151,9 +1204,25 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     if (dur_ns <= 0)
         return std::unexpected("resample: duration must be positive");
 
+    // A zoned time index buckets on LOCAL boundaries; an unzoned one is an
+    // instant with no wall clock attached, so it keeps the UTC grid (SPEC 2.4).
+    const std::chrono::time_zone* zone = nullptr;
+    if (const auto& zone_id = ts_col->meta().zone; zone_id.has_value()) {
+        const std::string& name = zone_name(*zone_id);
+        try {
+            zone = std::chrono::locate_zone(name);
+        } catch (const std::exception&) {
+            return std::unexpected("resample: unknown time zone '" + name + "' on time index '" +
+                                   ts_name + "'");
+        }
+    }
+
     const auto rows = input.rows();
     const auto bucket_of = [&](std::size_t i) -> std::int64_t {
         const std::int64_t nanos = (*ts_col)[i].nanos;
+        if (zone != nullptr) {
+            return zoned_bucket_start(zone, nanos, dur_ns);
+        }
         std::int64_t q = nanos / dur_ns;
         if (nanos < 0 && nanos % dur_ns != 0)
             --q;  // floor for negative timestamps
@@ -1220,6 +1289,8 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         ts_out.reserve(ng);
         for (std::int64_t b : bvals)
             ts_out.push_back(Timestamp{b});
+        // Bucket starts are instants in the same zone as the index they came from.
+        ts_out.set_meta(ts_col->meta());
         out.add_column(ts_name, std::move(ts_out));
 
         for (const auto& agg : aggregations) {
@@ -1469,6 +1540,8 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
         for (const std::int64_t b : out_ts) {
             ts_out.push_back(Timestamp{b});
         }
+        // Bucket starts are instants in the same zone as the index they came from.
+        ts_out.set_meta(ts_col->meta());
         out.add_column(ts_name, std::move(ts_out));
 
         // Rebuild the key column in its ORIGINAL type -- the generic path emits
@@ -1615,6 +1688,8 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
     ts_out.reserve(i64_col.size());
     for (auto v : i64_col)
         ts_out.push_back(Timestamp{v});
+    // Bucket starts are instants in the same zone as the index they came from.
+    ts_out.set_meta(ts_col->meta());
 
     out.rename_column(pos, ts_name);
     out.replace_column(pos, ColumnValue{std::move(ts_out)});

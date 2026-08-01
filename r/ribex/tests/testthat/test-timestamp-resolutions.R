@@ -72,3 +72,29 @@ test_that("a POSIXct comes back in the zone it was handed over in", {
     # Same wall clock the caller supplied, not the UTC rendering of it.
     expect_equal(format(out$t), format(stamps))
 })
+
+test_that("a zoned index resamples on local days, not UTC days", {
+    skip_if_no_nanoarrow()
+    skip_if_not_installed("nycflights13")
+
+    f <- as.data.frame(nycflights13::flights)[c("time_hour", "dep_delay")]
+    f <- f[!is.na(f$dep_delay), ]
+    query <- paste(
+        'let tf = as_timeframe(src, "time_hour");',
+        "tf[resample 1d, select { n = count() }];"
+    )
+
+    # The data.frame path drops `tzone`, so the instants bucket on the UTC grid.
+    utc <- suppressWarnings(eval_ibex(query, tables = list(src = f)))
+    # The Arrow path keeps the zone, so the buckets are New York calendar days.
+    local <- suppressWarnings(
+        eval_ibex(query, tables = list(src = nanoarrow::as_nanoarrow_array(f)))
+    )
+
+    expect_equal(nrow(utc), length(unique(as.Date(f$time_hour))))
+    expect_equal(nrow(local),
+                 length(unique(as.Date(f$time_hour, tz = "America/New_York"))))
+    # 2013 has 366 UTC days' worth of NYC departures but only 365 local ones.
+    expect_equal(nrow(utc), 366L)
+    expect_equal(nrow(local), 365L)
+})

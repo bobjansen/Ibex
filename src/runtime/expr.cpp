@@ -188,6 +188,117 @@ struct LikeArg {
     std::string_view scalar;  // meaningful only when neither column is set
 };
 
+/// `with_timezone(ts, "Zone")` -- reinterpret a Timestamp column's values as
+/// wall-clock readings in `Zone`, convert them to the instants they denote, and
+/// tag the column with the zone.
+///
+/// This is the cast for "these timestamps were never UTC". Ibex stores an
+/// instant (SPEC 2.4), so a column loaded from a source that recorded local
+/// wall clocks holds the right NUMBERS interpreted the wrong way; this shifts
+/// them by the zone's offset AT THAT LOCAL TIME, which is what makes it correct
+/// across a DST boundary where a fixed offset is not.
+///
+/// The two irregular local times are handled rather than rejected wholesale:
+///   * Ambiguous (the hour repeated when clocks go back) resolves to the
+///     earlier instant, which is the conventional reading of a bare wall clock.
+///   * Nonexistent (the hour skipped when clocks go forward) yields NULL. That
+///     wall clock never happened, so there is no instant to name -- and failing
+///     the whole query over one bad row would be worse than saying so per row.
+auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
+    -> std::expected<ComputedColumn, std::string> {
+    if (call.args.size() != 2) {
+        return std::unexpected("with_timezone: expected 2 arguments (column, zone)");
+    }
+    const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node);
+    const auto* zone_text = lit != nullptr ? std::get_if<std::string>(&lit->value) : nullptr;
+    if (zone_text == nullptr) {
+        return std::unexpected("with_timezone: the zone must be a String literal");
+    }
+
+    const std::chrono::time_zone* zone = nullptr;
+    try {
+        zone = std::chrono::locate_zone(*zone_text);
+    } catch (const std::exception&) {
+        return std::unexpected("with_timezone: unknown time zone '" + *zone_text + "'");
+    }
+
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (col_ref == nullptr) {
+        return std::unexpected("with_timezone: first argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (entry == nullptr) {
+        return std::unexpected("with_timezone: unknown column '" + col_ref->name + "'");
+    }
+    const auto* stamps = std::get_if<Column<Timestamp>>(entry->column.get());
+    if (stamps == nullptr) {
+        return std::unexpected("with_timezone: '" + col_ref->name + "' is not a Timestamp column");
+    }
+
+    Column<Timestamp> out;
+    out.reserve(stamps->size());
+    std::optional<ValidityBitmap> validity = entry->validity;
+
+    // `to_sys` with a `choose` resolves a nonexistent local time instead of
+    // reporting it, so the classification comes from `get_info` directly. It
+    // also avoids exception machinery on the hot path.
+    //
+    // The offset only changes at a transition -- twice a year for most zones --
+    // so the last answer is cached and reused while the value still falls inside
+    // the local interval it covers. Timestamp columns are usually sorted, which
+    // makes that nearly every row.
+    std::chrono::nanoseconds cached_offset{};
+    std::chrono::local_time<std::chrono::nanoseconds> cache_begin{};
+    std::chrono::local_time<std::chrono::nanoseconds> cache_end{};
+    bool cache_valid = false;
+
+    for (std::size_t row = 0; row < stamps->size(); ++row) {
+        const std::chrono::local_time<std::chrono::nanoseconds> wall{
+            std::chrono::nanoseconds{(*stamps)[row].nanos}};
+
+        if (cache_valid && wall >= cache_begin && wall < cache_end) {
+            out.push_back(Timestamp{(wall.time_since_epoch() - cached_offset).count()});
+            continue;
+        }
+
+        const std::chrono::local_info info = zone->get_info(wall);
+        if (info.result == std::chrono::local_info::nonexistent) {
+            // That wall clock never happened, so there is no instant it names.
+            if (!validity.has_value()) {
+                validity = ValidityBitmap(stamps->size(), true);
+            }
+            validity->set(row, false);
+            out.push_back(Timestamp{0});
+            cache_valid = false;
+            continue;
+        }
+
+        // `first` is the interval in effect before any transition at this local
+        // time, so for an ambiguous reading it is the earlier of the two
+        // instants -- the conventional reading of a bare wall clock.
+        const auto offset = std::chrono::duration_cast<std::chrono::nanoseconds>(info.first.offset);
+        out.push_back(Timestamp{(wall.time_since_epoch() - offset).count()});
+
+        if (info.result == std::chrono::local_info::unique) {
+            cached_offset = offset;
+            cache_begin = std::chrono::local_time<std::chrono::nanoseconds>{
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    info.first.begin.time_since_epoch()) +
+                offset};
+            cache_end = std::chrono::local_time<std::chrono::nanoseconds>{
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    info.first.end.time_since_epoch()) +
+                offset};
+            cache_valid = true;
+        } else {
+            cache_valid = false;
+        }
+    }
+    out.set_meta(ColumnMeta{.zone = intern_zone(*zone_text)});
+
+    return ComputedColumn{.column = ColumnValue{std::move(out)}, .validity = std::move(validity)};
+}
+
 auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
     -> std::expected<LikeArg, std::string> {
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
@@ -1025,6 +1136,25 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                       }},
                   });
         m.emplace("lead", m.at("lag"));
+
+        m.emplace("with_timezone",
+                  BuiltinFn{
+                      .min_args = 2,
+                      .max_args = 2,
+                      .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                          if (a.size() != 2) {
+                              return std::unexpected(std::string(name) +
+                                                     ": expected 2 arguments (column, zone)");
+                          }
+                          return ExprType::Timestamp;
+                      },
+                      .exec = TransformExec{.column_eval = [](const ir::CallExpr& call,
+                                                              const Table& input, std::size_t,
+                                                              const ColumnEvalCtx&)
+                                                -> std::expected<ComputedColumn, std::string> {
+                          return eval_with_timezone(call, input);
+                      }},
+                  });
 
         m.emplace(
             "cumsum",

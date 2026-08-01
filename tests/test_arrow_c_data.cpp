@@ -708,3 +708,192 @@ TEST_CASE("Arrow C release wrappers handle foreign arrays and schemas", "[intero
     REQUIRE(array.private_data == nullptr);
     REQUIRE(schema.private_data == nullptr);
 }
+
+// ── Timestamp resolutions ───────────────────────────────────────────────────
+//
+// Arrow timestamps come in four resolutions and may carry an IANA zone, so the
+// format string is `ts{s|m|u|n}:{zone}`. Ibex stores an instant in nanoseconds
+// (SPEC 2.4), so every resolution is accepted and rescaled, and the zone is
+// dropped -- an Arrow value is UTC-relative whenever a zone is present, so the
+// instant survives. R is the motivating producer: it emits `tsu:UTC` or
+// `tsu:America/New_York` for a POSIXct and nothing else.
+
+namespace {
+
+/// Export one Timestamp column, then relabel its Arrow type. The exported
+/// schema owns its state through `private_data`; `format` is only ever read, so
+/// pointing it at a literal is safe until release.
+struct RelabelledTimestamps {
+    ArrowArray array{};
+    ArrowSchema schema{};
+
+    RelabelledTimestamps(std::initializer_list<ibex::Timestamp> values, const char* format,
+                         const ibex::runtime::ValidityBitmap* validity = nullptr) {
+        ibex::runtime::Table source;
+        if (validity != nullptr) {
+            source.add_column("ts", ibex::Column<ibex::Timestamp>{values}, *validity);
+        } else {
+            source.add_column("ts", ibex::Column<ibex::Timestamp>{values});
+        }
+        REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+        schema.children[0]->format = format;
+    }
+
+    ~RelabelledTimestamps() {
+        if (schema.release != nullptr) {
+            schema.release(&schema);
+        }
+        if (array.release != nullptr) {
+            array.release(&array);
+        }
+    }
+
+    RelabelledTimestamps(const RelabelledTimestamps&) = delete;
+    auto operator=(const RelabelledTimestamps&) -> RelabelledTimestamps& = delete;
+};
+
+auto imported_nanos(const ibex::runtime::Table& table, std::size_t index) -> std::int64_t {
+    const auto* column = std::get_if<ibex::Column<ibex::Timestamp>>(table.find("ts"));
+    REQUIRE(column != nullptr);
+    return (*column)[index].nanos;
+}
+
+}  // namespace
+
+TEST_CASE("Arrow C Data import rescales every timestamp resolution to nanoseconds",
+          "[interop][arrow][timestamp]") {
+    SECTION("seconds") {
+        RelabelledTimestamps source({ibex::Timestamp{1}, ibex::Timestamp{-2}}, "tss:");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        CHECK(imported_nanos(*imported, 0) == 1'000'000'000);
+        CHECK(imported_nanos(*imported, 1) == -2'000'000'000);
+    }
+
+    SECTION("milliseconds") {
+        RelabelledTimestamps source({ibex::Timestamp{1}}, "tsm:");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        CHECK(imported_nanos(*imported, 0) == 1'000'000);
+    }
+
+    SECTION("microseconds") {
+        RelabelledTimestamps source({ibex::Timestamp{1}}, "tsu:");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        CHECK(imported_nanos(*imported, 0) == 1'000);
+    }
+
+    SECTION("nanoseconds pass through") {
+        RelabelledTimestamps source({ibex::Timestamp{1}}, "tsn:");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        CHECK(imported_nanos(*imported, 0) == 1);
+    }
+}
+
+TEST_CASE("Arrow C Data import keeps the instant of a zoned timestamp",
+          "[interop][arrow][timestamp]") {
+    // An Arrow timestamp with a zone is already UTC-relative, so the zone is
+    // metadata about rendering and the instant needs no adjustment. This is
+    // exactly the type R hands over for a POSIXct.
+    RelabelledTimestamps source({ibex::Timestamp{1'357'000'000'000'000}}, "tsu:America/New_York");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    CHECK(imported_nanos(*imported, 0) == 1'357'000'000'000'000'000);
+}
+
+TEST_CASE("Arrow C Data adoption is zero-copy only at nanosecond resolution",
+          "[interop][arrow][timestamp][adopt]") {
+    SECTION("nanoseconds adopt the producer buffer") {
+        RelabelledTimestamps source({ibex::Timestamp{7}}, "tsn:");
+        auto imported = ibex::interop::adopt_table_from_arrow(&source.array, source.schema);
+        REQUIRE(imported.has_value());
+        const auto* column =
+            std::get_if<ibex::Column<ibex::Timestamp>>(std::as_const(*imported).find("ts"));
+        REQUIRE(column != nullptr);
+        CHECK(column->is_external());
+    }
+
+    SECTION("a rescaled resolution must materialize") {
+        RelabelledTimestamps source({ibex::Timestamp{7}}, "tsu:");
+        auto imported = ibex::interop::adopt_table_from_arrow(&source.array, source.schema);
+        REQUIRE(imported.has_value());
+        const auto* column =
+            std::get_if<ibex::Column<ibex::Timestamp>>(std::as_const(*imported).find("ts"));
+        REQUIRE(column != nullptr);
+        CHECK_FALSE(column->is_external());
+        CHECK((*column)[0].nanos == 7'000);
+    }
+}
+
+TEST_CASE("Arrow C Data import rejects a timestamp that cannot be held in nanoseconds",
+          "[interop][arrow][timestamp]") {
+    RelabelledTimestamps source({ibex::Timestamp{std::numeric_limits<std::int64_t>::max() / 2}},
+                                "tss:");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE_FALSE(imported.has_value());
+    CHECK(imported.error().find("nanoseconds") != std::string::npos);
+}
+
+TEST_CASE("Arrow C Data import ignores payload bytes in null timestamp slots",
+          "[interop][arrow][timestamp]") {
+    // Arrow leaves the payload at a null position unspecified. A rescaling
+    // import must not range-check that garbage, or a valid array with a null in
+    // it would be rejected.
+    const ibex::runtime::ValidityBitmap validity{true, false};
+    RelabelledTimestamps source(
+        {ibex::Timestamp{1}, ibex::Timestamp{std::numeric_limits<std::int64_t>::max()}},
+        "tss:", &validity);
+
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    CHECK(imported_nanos(*imported, 0) == 1'000'000'000);
+    REQUIRE(imported->columns[0].validity.has_value());
+    CHECK_FALSE((*imported->columns[0].validity)[1]);
+}
+
+TEST_CASE("Arrow C Data round-trips a timestamp column's zone", "[interop][arrow][timestamp]") {
+    // The zone is what tells a reader which wall clock to render the instant
+    // on. Losing it hands a zoned producer back its own data relabelled UTC.
+    RelabelledTimestamps source({ibex::Timestamp{1'357'000'000'000'000}}, "tsu:America/New_York");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(imported->columns.size() == 1);
+    REQUIRE(imported->columns[0].timezone.has_value());
+    CHECK(*imported->columns[0].timezone == "America/New_York");
+
+    ArrowArray out_array{};
+    ArrowSchema out_schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(*imported, &out_array, &out_schema).has_value());
+    CHECK(std::string(out_schema.children[0]->format) == "tsn:America/New_York");
+    out_schema.release(&out_schema);
+    out_array.release(&out_array);
+}
+
+TEST_CASE("A zone-less timestamp column stays zone-less", "[interop][arrow][timestamp]") {
+    RelabelledTimestamps source({ibex::Timestamp{5}}, "tsn:");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    CHECK_FALSE(imported->columns[0].timezone.has_value());
+
+    ArrowArray out_array{};
+    ArrowSchema out_schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(*imported, &out_array, &out_schema).has_value());
+    CHECK(std::string(out_schema.children[0]->format) == "tsn:");
+    out_schema.release(&out_schema);
+    out_array.release(&out_array);
+}
+
+TEST_CASE("Replacing a column's storage clears its zone", "[interop][arrow][timestamp]") {
+    // add_column under an existing name installs a *new* column rather than
+    // editing the old one, so a zone inherited from unrelated data would be a
+    // lie about the new storage.
+    RelabelledTimestamps source({ibex::Timestamp{5}}, "tsu:Europe/Amsterdam");
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+    REQUIRE(imported->columns[0].timezone.has_value());
+
+    imported->add_column("ts", ibex::Column<std::int64_t>{1});
+    CHECK_FALSE(imported->columns[0].timezone.has_value());
+}

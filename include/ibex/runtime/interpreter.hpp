@@ -249,6 +249,16 @@ struct ColumnEntry {
     // Validity bitmap: true = valid (not null), false = null.
     // nullopt means every row is valid — the common case, with zero overhead.
     std::optional<ValidityBitmap> validity;
+    // IANA zone for a Timestamp column, e.g. "America/New_York". A zone is a
+    // property of a column, not of a row (SPEC 2.4): the stored value is always
+    // an instant, and the zone says which wall clock a reader should render it
+    // on. nullopt means UTC, which is also what a zone-less producer means.
+    //
+    // Carried so a zoned producer's data survives a round trip instead of
+    // coming back relabelled UTC. Nothing in the engine interprets it yet —
+    // calendar-boundary operations still cut on UTC — so it is metadata in
+    // transit, not a behaviour switch.
+    std::optional<std::string> timezone;
 };
 
 /// Returns true if row `row` of `entry` is null.

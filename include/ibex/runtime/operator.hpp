@@ -57,7 +57,8 @@ struct Chunk {
                     std::optional<ValidityBitmap> validity = std::nullopt) {
         columns.push_back(ColumnEntry{.name = std::move(name),
                                       .column = std::make_shared<ColumnValue>(std::move(column)),
-                                      .validity = std::move(validity)});
+                                      .validity = std::move(validity),
+                                      .timezone = std::nullopt});
     }
 
     void replace_column(std::size_t pos, ColumnValue column) {

@@ -2647,7 +2647,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                         const bool overwritten = std::ranges::any_of(
                             fields, [&](const ir::FieldSpec& f) { return f.alias == name; });
                         return overwritten ? std::nullopt : std::optional<std::string>{name};
-                    }));
+                    },
+                    RowTransform::Preserve));
     return output;
 }
 

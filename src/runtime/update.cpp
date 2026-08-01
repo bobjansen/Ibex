@@ -1595,6 +1595,31 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
 /// Parallelism here is across GROUPS, not row ranges: each group's rolling
 /// buffer must not cross a group boundary, so a group is the natural
 /// indivisible unit. That also caps the speedup at the group count, which is
+/// The columns a grouped update must scatter back into its full-size output.
+///
+/// A field introducing a NEW column is appended to the sub-result, so it sits
+/// past `first_new_idx`. A field OVERWRITING an existing column mutates it in
+/// place inside the slice instead, so it never appears there. Collecting only
+/// the appended ones is why an overwrite used to be computed, made visible to
+/// later fields in the same block, and then silently dropped from the result --
+/// while the ungrouped paths applied it.
+[[nodiscard]] auto written_field_names_for(const Table& first, std::size_t first_new_idx,
+                                           const std::vector<ir::FieldSpec>& fields)
+    -> std::vector<std::string> {
+    std::vector<std::string> names;
+    names.reserve(fields.size());
+    for (std::size_t c = first_new_idx; c < first.columns.size(); ++c) {
+        names.push_back(first.columns[c].name);
+    }
+    for (const auto& field : fields) {
+        const bool appended = std::ranges::find(names, field.alias) != names.end();
+        if (!appended && first.find(field.alias) != nullptr) {
+            names.push_back(field.alias);
+        }
+    }
+    return names;
+}
+
 /// why a two-symbol table gains nothing however many cores are free.
 [[nodiscard]] auto grouped_window_worker_count(const ExecutionContext& exec,
                                                std::size_t remaining_groups, std::size_t rows,
@@ -2187,13 +2212,9 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // The slice carries only `slice_columns`, so that -- not the full input
     // width -- is where the appended fields begin.
     const std::size_t first_new_idx = slice_columns.size();
-    if (first->columns.size() <= first_new_idx) {
-        return std::unexpected("window: grouped update produced no new columns");
-    }
-    std::vector<std::string> written_field_names;
-    written_field_names.reserve(first->columns.size() - first_new_idx);
-    for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
-        written_field_names.push_back(first->columns[c].name);
+    auto written_field_names = written_field_names_for(*first, first_new_idx, fields);
+    if (written_field_names.empty()) {
+        return std::unexpected("window: grouped update produced no columns");
     }
 
     // Allocate output's new columns at full size, with the same types as the
@@ -3031,13 +3052,9 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         return std::unexpected(first.error());
     }
     const std::size_t first_new_idx = input.columns.size();
-    if (first->columns.size() <= first_new_idx) {
-        return std::unexpected("update: grouped update produced no new columns");
-    }
-    std::vector<std::string> written_field_names;
-    written_field_names.reserve(first->columns.size() - first_new_idx);
-    for (std::size_t c = first_new_idx; c < first->columns.size(); ++c) {
-        written_field_names.push_back(first->columns[c].name);
+    auto written_field_names = written_field_names_for(*first, first_new_idx, fields);
+    if (written_field_names.empty()) {
+        return std::unexpected("update: grouped update produced no columns");
     }
 
     Table output = input;

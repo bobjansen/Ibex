@@ -2861,6 +2861,65 @@ TEST_CASE("E2E: a bit-packed output column is gathered into concurrently", "[e2e
     }
 }
 
+// A grouped update used to collect only the columns its fields APPENDED, so a
+// field overwriting an existing column was evaluated -- and visible to later
+// fields in the same block -- but never written back to the result. The
+// ungrouped paths applied it, so the three disagreed on the same source text.
+TEST_CASE("E2E: a grouped update writes back overwritten columns", "[e2e][update][by]") {
+    runtime::Table t;
+    t.add_column("sym", Column<std::string>{"a", "a", "b", "b"});
+    t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
+    runtime::TableRegistry tables{{"t", t}};
+
+    SECTION("overwrite alongside a new column") {
+        auto out = run("t[update { p = 99.0, r = cumsum(p) }, by sym];", tables);
+        CHECK(col_dbl(out, "p") == std::vector<double>{99.0, 99.0, 99.0, 99.0});
+        // The new column saw the overwritten value, which is what made the
+        // dropped write so easy to miss: `r` looked right while `p` did not.
+        CHECK(col_dbl(out, "r") == std::vector<double>{99.0, 198.0, 99.0, 198.0});
+    }
+
+    SECTION("an update of only existing columns is legal") {
+        // This used to fail outright with "produced no new columns".
+        auto out = run("t[update { p = p * 10.0 }, by sym];", tables);
+        CHECK(col_dbl(out, "p") == std::vector<double>{10.0, 20.0, 30.0, 40.0});
+    }
+
+    SECTION("the ungrouped path agrees") {
+        auto grouped = run("t[update { p = p * 10.0 }, by sym];", tables);
+        auto ungrouped = run("t[update { p = p * 10.0 }];", tables);
+        CHECK(col_dbl(grouped, "p") == col_dbl(ungrouped, "p"));
+    }
+}
+
+TEST_CASE("E2E: a grouped windowed update writes back overwritten columns",
+          "[e2e][update][by][window]") {
+    runtime::Table t;
+    t.add_column("sym", Column<std::string>{"a", "a", "b", "b"});
+    t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
+                                         Timestamp{60'000'000'000}});
+    t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
+    runtime::TableRegistry tables{{"t", t}};
+
+    SECTION("overwrite alongside a new column") {
+        auto out =
+            run("let tf = as_timeframe(t, \"ts\");\n"
+                "tf[window 5m, by sym, update { p = 99.0, r = rolling_mean(p) }];",
+                tables);
+        CHECK(col_dbl(out, "p") == std::vector<double>{99.0, 99.0, 99.0, 99.0});
+        CHECK(col_dbl(out, "r") == std::vector<double>{99.0, 99.0, 99.0, 99.0});
+    }
+
+    SECTION("a rolling result may overwrite its own source column") {
+        auto out =
+            run("let tf = as_timeframe(t, \"ts\");\n"
+                "tf[window 5m, by sym, update { p = rolling_mean(p) }];",
+                tables);
+        // Per group: first row is its own mean, second is the mean of both.
+        CHECK(col_dbl(out, "p") == std::vector<double>{1.0, 1.5, 3.0, 3.5});
+    }
+}
+
 // `grouped_by` is a hazard flag: it records that adjacent rows may belong to
 // different groups, so an unpartitioned order-dependent call would read across a
 // boundary. Overwriting a grouping key's VALUES does not move any row, so the

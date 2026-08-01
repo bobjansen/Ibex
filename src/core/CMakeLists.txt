@@ -1,5 +1,6 @@
 add_library(ibex_core STATIC
     column.cpp
+    time_zone.cpp
 )
 add_library(Ibex::core ALIAS ibex_core)
 

@@ -127,7 +127,7 @@ auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Tab
             continue;
         }
         const auto& entry = cache_.at(field.name);
-        out.add_column_shared(entry.name, entry.column, entry.validity);
+        out.add_column_from(entry.name, entry);
     }
     // A plan may need the row count without needing any column — `count()` over
     // an unfiltered scan, say. Carry it so such a projection stays empty rather
@@ -281,7 +281,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
                         return std::unexpected("lazy source did not produce requested column '" +
                                                name + "'");
                     }
-                    out.add_column_shared(entry->name, entry->column, entry->validity);
+                    out.add_column_from(entry->name, *entry);
                 }
                 out.logical_rows = selected.size();
                 return out;
@@ -435,7 +435,7 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
             continue;
         }
         const auto& entry = cache_.at(field.name);
-        out.add_column_shared(entry.name, entry.column, entry.validity);
+        out.add_column_from(entry.name, entry);
     }
     out.logical_rows = rows_;
     if (!out.columns.empty() && out.rows() != rows_) {
@@ -476,7 +476,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
         if (const auto cached = cache_.find(field.name); cached != cache_.end()) {
             const auto& entry = cached->second;
             if (all_rows) {
-                out.add_column_shared(entry.name, entry.column, entry.validity);
+                out.add_column_from(entry.name, entry);
             } else {
                 auto column = std::make_shared<ColumnValue>(
                     gather_column(*entry.column, selected.data(), selected.size()));
@@ -497,7 +497,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
             return std::unexpected("lazy source did not produce requested column '" + field.name +
                                    "'");
         }
-        out.add_column_shared(entry->name, entry->column, entry->validity);
+        out.add_column_from(entry->name, *entry);
     }
     out.logical_rows = selected.size();
     return out;

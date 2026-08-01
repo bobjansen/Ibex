@@ -38,6 +38,19 @@ using ColumnValue =
                  Column<Date>, Column<Timestamp>, Column<bool>>;
 using ScalarValue = std::variant<std::int64_t, double, bool, std::string, Date, Timestamp>;
 
+/// Copy the value-metadata of `src` onto a column derived from it.
+///
+/// The single place a derived column inherits what its values mean. Every
+/// helper that builds one column out of another routes through it, so an
+/// operator that gathers, copies, or empties a column cannot silently strip its
+/// time zone -- the alternative is remembering to carry it at ~40 call sites,
+/// which is how the table-metadata bugs happened.
+[[nodiscard]] inline auto with_meta_of(ColumnValue out, const ColumnValue& src) -> ColumnValue {
+    const ColumnMeta meta = std::visit([](const auto& col) { return col.meta(); }, src);
+    std::visit([&](auto& col) { col.set_meta(meta); }, out);
+    return out;
+}
+
 /// Packed validity bitmap (1 bit per row): true = valid, false = null.
 /// Designed for row-validity propagation where bulk bitwise ops dominate.
 class ValidityBitmap {
@@ -250,16 +263,6 @@ struct ColumnEntry {
     // Validity bitmap: true = valid (not null), false = null.
     // nullopt means every row is valid — the common case, with zero overhead.
     std::optional<ValidityBitmap> validity;
-    // IANA zone for a Timestamp column, e.g. "America/New_York". A zone is a
-    // property of a column, not of a row (SPEC 2.4): the stored value is always
-    // an instant, and the zone says which wall clock a reader should render it
-    // on. nullopt means UTC, which is also what a zone-less producer means.
-    //
-    // Carried so a zoned producer's data survives a round trip instead of
-    // coming back relabelled UTC. Nothing in the engine interprets it yet —
-    // calendar-boundary operations still cut on UTC — so it is metadata in
-    // transit, not a behaviour switch.
-    std::optional<std::string> timezone;
 };
 
 /// Returns true if row `row` of `entry` is null.
@@ -327,6 +330,11 @@ struct Table {
     /// Used by zero-copy projection/rename to avoid deep-copying key columns.
     void add_column_shared(std::string name, std::shared_ptr<ColumnValue> column,
                            std::optional<ValidityBitmap> validity = std::nullopt);
+    /// Share `source`'s storage and validity under `name`. Takes the entry
+    /// whole rather than its parts, so the two cannot be mismatched at a call
+    /// site. Column metadata needs no help here -- it lives on the column
+    /// itself, so sharing the storage shares it.
+    void add_column_from(std::string name, const ColumnEntry& source);
     [[nodiscard]] auto find(const std::string& name) -> ColumnValue*;
     [[nodiscard]] auto find(const std::string& name) const -> const ColumnValue*;
     [[nodiscard]] auto find_entry(const std::string& name) const -> const ColumnEntry*;

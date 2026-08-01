@@ -3,6 +3,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -274,12 +275,28 @@ struct ColumnEntry {
 struct Table {
     std::vector<ColumnEntry> columns;
     robin_hood::unordered_map<std::string, std::size_t> index;
-    std::optional<std::vector<ir::OrderKey>> ordering;
-    std::optional<std::string> time_index;
-    /// Non-empty when the rows are group-major by these keys — see
-    /// TableProperties::grouped_by. Set by `window` + `by`, which lays each
-    /// group out as one contiguous run.
-    std::vector<std::string> grouped_by;
+
+    /// Order-sensitive metadata. Private because assembling it field by field is
+    /// what produced the bugs `TableProperties` exists to prevent: an operator
+    /// that copies `time_index` through and forgets that its rows moved has
+    /// written something false, and nothing in a plain struct stops it. Read it
+    /// here; replace it wholesale through `set_properties`.
+    [[nodiscard]] auto properties() const noexcept -> const TableProperties& { return props_; }
+    [[nodiscard]] auto ordering() const noexcept
+        -> const std::optional<std::vector<ir::OrderKey>>& {
+        return props_.ordering();
+    }
+    [[nodiscard]] auto time_index() const noexcept -> const std::optional<std::string>& {
+        return props_.time_index();
+    }
+    [[nodiscard]] auto grouped_by() const noexcept -> const std::vector<std::string>& {
+        return props_.grouped_by();
+    }
+
+    /// The single mutator. Applies the TimeFrame invariant on the way in, so a
+    /// caller cannot land a half-stated claim.
+    void set_properties(const TableProperties& props) { props_ = props.normalized(); }
+
     /// Logical row count for a column-less frame (e.g. produced by `Table(n)`).
     /// Only consulted by `rows()` when `columns` is empty; once any column is
     /// added the count is derived from the columns as usual.
@@ -297,6 +314,11 @@ struct Table {
                         std::optional<ValidityBitmap> validity);
     /// Rename an existing column and keep the index map in sync.
     void rename_column(std::size_t pos, std::string name);
+
+   private:
+    TableProperties props_;
+
+   public:
     /// Return a mutable column after detaching shared storage if necessary.
     [[nodiscard]] auto mutable_column(std::size_t pos) -> ColumnValue&;
     /// Share an existing column without copying its data. Safe under the

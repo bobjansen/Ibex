@@ -389,7 +389,7 @@ auto make_timeframe_table(std::size_t rows, std::size_t n_symbols, std::int64_t 
     t.add_column("ts", std::move(ts_col));
     t.add_column("symbol", std::move(symbol_col));
     t.add_column("price", std::move(price_col));
-    t.time_index = "ts";
+    t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
     return t;
 }
 
@@ -1053,7 +1053,7 @@ int main(int argc, char** argv) {
         ref_table.add_column("ts", std::move(*ref.find("ts")));
         ref_table.add_column("symbol", std::move(*ref.find("symbol")));
         ref_table.add_column("ref_price", std::move(*ref.find("price")));
-        ref_table.time_index = "ts";
+        ref_table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
         ibex::runtime::TableRegistry reg;
         reg.emplace("quotes", std::move(quotes));

@@ -276,21 +276,22 @@ auto format_keys(const std::vector<std::string>& keys) -> std::string {
 /// column on a failing side — suggests the precise `as_timeframe(...)` call
 /// that would fix the call site.
 auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::string {
-    const bool left_bad = !left.time_index.has_value();
-    const bool right_bad = !right.time_index.has_value();
+    const bool left_bad = !left.time_index().has_value();
+    const bool right_bad = !right.time_index().has_value();
 
     std::string msg = "asof join requires both sides to be TimeFrame";
     if (left_bad && right_bad) {
         msg.append("; neither side has been promoted with as_timeframe()");
     } else if (left_bad) {
-        msg.append("; left side is a DataFrame (right is TimeFrame on '" + *right.time_index +
+        msg.append("; left side is a DataFrame (right is TimeFrame on '" + *right.time_index() +
                    "')");
     } else {
-        msg.append("; right side is a DataFrame (left is TimeFrame on '" + *left.time_index + "')");
+        msg.append("; right side is a DataFrame (left is TimeFrame on '" + *left.time_index() +
+                   "')");
     }
 
     auto add_side_hint = [&](const Table& side, const char* label) {
-        if (side.time_index.has_value()) {
+        if (side.time_index().has_value()) {
             return;
         }
         msg.append("\n  ");
@@ -326,19 +327,19 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // not "your types don't match".
     std::optional<std::size_t> asof_time_key_pos;
     if (kind == ir::JoinKind::Asof) {
-        if (!left.time_index.has_value() || !right.time_index.has_value()) {
+        if (!left.time_index().has_value() || !right.time_index().has_value()) {
             return std::unexpected(asof_not_timeframe_error(left, right));
         }
-        if (*left.time_index != *right.time_index) {
+        if (*left.time_index() != *right.time_index()) {
             return std::unexpected(
                 "asof join requires both TimeFrames to share the same time index column"
                 "\n  left  time index: '" +
-                *left.time_index + "'\n  right time index: '" + *right.time_index +
+                *left.time_index() + "'\n  right time index: '" + *right.time_index() +
                 "'\n  hint: re-promote one side with the matching name, e.g. "
                 "as_timeframe(<table>, \"" +
-                *left.time_index + "\")");
+                *left.time_index() + "\")");
         }
-        const std::string& time_key = *left.time_index;
+        const std::string& time_key = *left.time_index();
         for (std::size_t i = 0; i < keys.size(); ++i) {
             if (keys[i] == time_key) {
                 asof_time_key_pos = i;
@@ -1238,7 +1239,18 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         materialize_left_identity(right_idx);
-        output.time_index = left.time_index;
+        // One output row per left row, in left order: a `Preserve` with respect
+        // to the left input. So the left's ordering and group-major claim carry
+        // over too, not just its time index -- each surviving only if the column
+        // naming it is still present after the join's column merge.
+        apply_table_properties(output, TableProperties::derive(
+                                           table_properties_of(left),
+                                           [&](const std::string& name) -> KeyFate {
+                                               return output.index.contains(name)
+                                                          ? KeyFate::kept(name)
+                                                          : KeyFate::dropped();
+                                           },
+                                           RowTransform::Preserve));
         return output;
     }
 

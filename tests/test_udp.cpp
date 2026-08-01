@@ -85,8 +85,8 @@ TEST_CASE("udp_recv: schema-driven batch receive skips malformed and honours eof
             got_eof = true;
             break;
         }
-        REQUIRE(table.time_index.has_value());
-        CHECK(*table.time_index == "ts");
+        REQUIRE(table.time_index().has_value());
+        CHECK(*table.time_index() == "ts");
         const auto* ts = std::get_if<ibex::Column<ibex::Timestamp>>(table.find("ts"));
         const auto* symbol = std::get_if<ibex::Column<std::string>>(table.find("symbol"));
         const auto* price = std::get_if<ibex::Column<double>>(table.find("price"));

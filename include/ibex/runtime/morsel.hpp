@@ -108,8 +108,12 @@ struct TableRangeMorsel {
     if (input.columns.empty()) {
         chunk.logical_rows = end - begin;
     }
-    chunk.ordering = input.ordering;
-    chunk.time_index = input.time_index;
+    // A morsel is a contiguous row range: a `Subset`, under which all three
+    // properties survive. `grouped_by` in particular must come along — it is the
+    // hazard flag that stops an unpartitioned order-dependent call from reading
+    // across a group boundary, and slicing a group-major table into morsels does
+    // not make those boundaries go away.
+    chunk.set_properties(input.properties());
     chunk.sequence = sequence;
     chunk.row_offset = begin;
     return chunk;

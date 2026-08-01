@@ -24,6 +24,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -293,7 +294,9 @@ inline auto table_from_json_object(const nlohmann::json& object,
         }
     }
     if (time_index.has_value()) {
-        table.time_index = std::move(*time_index);
+        // A plugin-built source states its time index; the ascending ordering
+        // that a TimeFrame implies comes with it.
+        table.set_properties(runtime::TableProperties::time_frame(std::move(*time_index)));
     }
     return table;
 }
@@ -489,7 +492,9 @@ inline auto table_from_json_objects(const std::vector<nlohmann::json>& objects,
         }
     }
     if (time_index.has_value()) {
-        table.time_index = std::move(*time_index);
+        // A plugin-built source states its time index; the ascending ordering
+        // that a TimeFrame implies comes with it.
+        table.set_properties(runtime::TableProperties::time_frame(std::move(*time_index)));
     }
     return table;
 }

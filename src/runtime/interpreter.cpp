@@ -150,12 +150,11 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     }
     // A key or the time index survives only if its column survives the
     // selection; a dropped time index also voids the ordering.
-    apply_table_properties(output, derive_table_properties(
+    apply_table_properties(output, TableProperties::derive(
                                        table_properties_of(input),
-                                       [&](const std::string& name) -> std::optional<std::string> {
-                                           return output.index.contains(name)
-                                                      ? std::optional<std::string>{name}
-                                                      : std::nullopt;
+                                       [&](const std::string& name) -> KeyFate {
+                                           return output.index.contains(name) ? KeyFate::kept(name)
+                                                                              : KeyFate::dropped();
                                        },
                                        RowTransform::Preserve));
     return output;
@@ -281,13 +280,14 @@ auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames
 
     // Rename never drops a column, it relabels it; rewrite each key and the
     // time index to its new name.
-    apply_table_properties(output, derive_table_properties(
-                                       table_properties_of(input),
-                                       [&](const std::string& name) -> std::optional<std::string> {
-                                           auto it = rename_map.find(name);
-                                           return it != rename_map.end() ? it->second : name;
-                                       },
-                                       RowTransform::Preserve));
+    apply_table_properties(output,
+                           TableProperties::derive(
+                               table_properties_of(input),
+                               [&](const std::string& name) -> KeyFate {
+                                   auto it = rename_map.find(name);
+                                   return KeyFate::kept(it != rename_map.end() ? it->second : name);
+                               },
+                               RowTransform::Preserve));
     return output;
 }
 
@@ -321,11 +321,24 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     return ExprType::String;
 }
 
+/// `distinct` keeps the FIRST occurrence of each row and appends in input order,
+/// so it removes rows without moving the survivors: a `RowTransform::Subset`,
+/// under which every claim the input made still holds. A subset of a sorted
+/// sequence is sorted, the time index still indexes what is left, and dropping
+/// rows cannot merge two group-major runs. It also never drops a column, so no
+/// key can lose its name: `distinct { a, b }` projects first, in a separate node
+/// whose own derivation applies the presence rule, so by the time this runs no
+/// column is going anywhere and keep-all is the honest fate.
+auto distinct_properties(const Table& input) -> TableProperties {
+    return TableProperties::derive(
+        table_properties_of(input), [](const std::string& name) { return KeyFate::kept(name); },
+        RowTransform::Subset);
+}
+
 auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
     if (input.columns.empty()) {
         Table output = input;
-        output.ordering.reset();
-        output.time_index.reset();
+        apply_table_properties(output, distinct_properties(input));
         return output;
     }
     std::size_t rows = input.rows();
@@ -354,8 +367,7 @@ auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
             append_value(output.mutable_column(col), *input.columns[col].column, row);
         }
     }
-    output.ordering.reset();
-    output.time_index.reset();
+    apply_table_properties(output, distinct_properties(input));
     return output;
 }
 
@@ -605,7 +617,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!source.has_value()) {
                 return source;
             }
-            if (!source->time_index.has_value()) {
+            if (!source->time_index().has_value()) {
                 return std::unexpected(
                     "window requires a TimeFrame — use as_timeframe() to designate a timestamp "
                     "column");
@@ -630,8 +642,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     keep.push_back(ir::ColumnRef{.name = name});
                 }
             };
-            if (windowed->time_index.has_value()) {
-                keep_col(*windowed->time_index);
+            if (windowed->time_index().has_value()) {
+                keep_col(*windowed->time_index());
             }
             for (const auto& key : update_node.group_by()) {
                 keep_col(key.name);
@@ -639,25 +651,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             for (const auto& field : update_node.fields()) {
                 keep_col(field.alias);
             }
-            // `project_table` runs `normalize_time_index`, which rewrites any
-            // ordering to "time index, ascending" whenever a time index
-            // survives. For a grouped window that claim is FALSE -- the rows
-            // are group-major -- and it is not merely cosmetic: sort elision
-            // reads `ordering`, so a downstream `order <time index>` would be
-            // skipped as a no-op and hand back unsorted rows. Restore what the
-            // window actually produced, exactly as `order_table` does after its
-            // own gather.
-            auto ordering = windowed->ordering;
-            auto projected = project_table(windowed.value(), keep);
-            if (projected.has_value() && ordering.has_value()) {
-                const bool keeps_all = std::ranges::all_of(*ordering, [&](const ir::OrderKey& key) {
-                    return projected->find(key.name) != nullptr;
-                });
-                if (keeps_all) {
-                    projected->ordering = std::move(ordering);
-                }
-            }
-            return projected;
+            // A grouped window leaves the rows group-major, and `project_table`
+            // preserves that: it derives its metadata with `RowTransform::
+            // Preserve`, which carries `grouped_by` through and drops the
+            // ordering only if the projection removes one of its keys, and
+            // `normalize_time_index` leaves a group-major ordering alone rather
+            // than rewriting it to the (false) "time index ascending".
+            return project_table(windowed.value(), keep);
         }
         case ir::NodeKind::AsTimeframe: {
             const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
@@ -692,8 +692,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!sorted.has_value()) {
                 return sorted;
             }
-            sorted->time_index = atf.column();
-            normalize_time_index(*sorted);
+            sorted->set_properties(TableProperties::time_frame(atf.column()));
             return sorted;
         }
         case ir::NodeKind::Ascribe: {
@@ -876,10 +875,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             // already-sorted operands so the rows interleave in time order in a
             // single pass (SPEC §9.1 keeps TimeFrames sorted). Mixed/absent
             // indices yield a plain appended DataFrame.
-            std::optional<std::string> common_ti = operands.front().time_index;
+            std::optional<std::string> common_ti = operands.front().time_index();
             if (common_ti.has_value()) {
                 for (const Table& t : operands) {
-                    if (t.time_index != common_ti) {
+                    if (t.time_index() != common_ti) {
                         common_ti.reset();
                         break;
                     }
@@ -892,8 +891,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (common_ti.has_value()) {
                 // The merge already produced sorted rows, so just stamp the
                 // index and its ordering — no re-sort.
-                result->time_index = common_ti;
-                normalize_time_index(*result);
+                result->set_properties(TableProperties::time_frame(*common_ti));
             }
             return result;
         }
@@ -960,8 +958,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     for (const auto& entry : src.columns) {
                         dst.add_column(entry.name, make_empty_like(*entry.column));
                     }
-                    dst.time_index = src.time_index;
-                    dst.ordering = src.ordering;
+                    dst.set_properties(src.properties());
                 }
                 for (std::size_t row = 0; row < src.rows(); ++row) {
                     for (std::size_t col = 0; col < src.columns.size(); ++col) {
@@ -996,15 +993,20 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         out.columns.back().validity = ValidityBitmap{false};
                     }
                 }
-                out.time_index = src.time_index;
+                // A one-row slice inherits the time index only: a single row
+                // has no group boundary to read across, so claiming a grouping
+                // would arm the row-order guard against a correct call.
+                if (src.time_index().has_value()) {
+                    out.set_properties(TableProperties::time_frame(*src.time_index()));
+                }
                 return out;
             };
 
             // Get the nanosecond timestamp of the last row (for bucket detection).
             auto get_last_ts_ns = [&](const Table& t) -> std::optional<std::int64_t> {
-                if (t.rows() == 0 || !t.time_index.has_value())
+                if (t.rows() == 0 || !t.time_index().has_value())
                     return std::nullopt;
-                const auto* col = t.find(*t.time_index);
+                const auto* col = t.find(*t.time_index());
                 if (col == nullptr)
                     return std::nullopt;
                 std::size_t last = t.rows() - 1;

@@ -8,8 +8,8 @@ TEST_CASE("structured table comparator accepts identical nullable categorical ta
     runtime::Table expected;
     Column<Categorical> cat{{"a", "b"}, {0, 1, 0}};
     expected.add_column("kind", cat, runtime::ValidityBitmap{true, false, true});
-    expected.ordering = std::vector<ir::OrderKey>{{.name = "kind", .ascending = true}};
-    expected.time_index = "kind";
+    expected.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ir::OrderKey>{{.name = "kind", .ascending = true}}, "kind", {}));
     auto actual = expected;
     CHECK_FALSE(runtime::compare_tables(expected, actual).has_value());
 }

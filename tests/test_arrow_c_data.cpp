@@ -101,8 +101,8 @@ TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
     table.add_column("name", names);
     table.add_column("trade_date", dates);
     table.add_column("ts", ts);
-    table.time_index = "ts";
-    table.ordering = std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}};
+    table.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}}, "ts", {}));
 
     ArrowArray array{};
     ArrowSchema schema{};
@@ -201,8 +201,8 @@ TEST_CASE("Arrow C Data import round-trips values, validity, and table metadata"
                      ibex::Column<ibex::Date>{{ibex::Date{1}, ibex::Date{2}, ibex::Date{3}}});
     table.add_column("ts", ibex::Column<ibex::Timestamp>{
                                {ibex::Timestamp{100}, ibex::Timestamp{200}, ibex::Timestamp{300}}});
-    table.time_index = "ts";
-    table.ordering = std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}};
+    table.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}}, "ts", {}));
 
     ArrowArray array{};
     ArrowSchema schema{};
@@ -212,13 +212,13 @@ TEST_CASE("Arrow C Data import round-trips values, validity, and table metadata"
     auto imported = ibex::interop::import_table_from_arrow(array, schema);
     REQUIRE(imported.has_value());
 
-    REQUIRE(imported->time_index == table.time_index);
-    REQUIRE(imported->ordering.has_value());
-    REQUIRE(table.ordering.has_value());
-    REQUIRE(imported->ordering->size() == table.ordering->size());
-    for (std::size_t i = 0; i < imported->ordering->size(); ++i) {
-        CHECK((*imported->ordering)[i].name == (*table.ordering)[i].name);
-        CHECK((*imported->ordering)[i].ascending == (*table.ordering)[i].ascending);
+    REQUIRE(imported->time_index() == table.time_index());
+    REQUIRE(imported->ordering().has_value());
+    REQUIRE(table.ordering().has_value());
+    REQUIRE(imported->ordering()->size() == table.ordering()->size());
+    for (std::size_t i = 0; i < imported->ordering()->size(); ++i) {
+        CHECK((*imported->ordering())[i].name == (*table.ordering())[i].name);
+        CHECK((*imported->ordering())[i].ascending == (*table.ordering())[i].ascending);
     }
 
     const auto* ids = std::get_if<ibex::Column<std::int64_t>>(imported->find("id"));
@@ -896,4 +896,37 @@ TEST_CASE("Replacing a column's storage clears its zone", "[interop][arrow][time
 
     imported->add_column("ts", ibex::Column<std::int64_t>{1});
     CHECK_FALSE(imported->columns[0].timezone.has_value());
+}
+
+TEST_CASE("Arrow C Data round-trips the group-major claim", "[interop][arrow][properties]") {
+    // `grouped_by` is the flag that stops an unpartitioned lag/rolling call from
+    // reading across a group boundary. It also gates `normalize_time_index`, so
+    // losing it across the boundary does two things: it disarms the guard, and
+    // it lets the re-imported table have its true (group keys..., time) ordering
+    // rewritten to the false "time index ascending".
+    ibex::runtime::Table source;
+    source.add_column("symbol", ibex::Column<std::int64_t>{1, 1, 2, 2});
+    source.add_column("ts", ibex::Column<ibex::Timestamp>{ibex::Timestamp{1}, ibex::Timestamp{2},
+                                                          ibex::Timestamp{1}, ibex::Timestamp{2}});
+    source.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ibex::ir::OrderKey>{{.name = "symbol", .ascending = true},
+                                        {.name = "ts", .ascending = true}},
+        "ts", {"symbol"}));
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    REQUIRE(imported.has_value());
+
+    CHECK(imported->grouped_by() == std::vector<std::string>{"symbol"});
+    CHECK(imported->time_index() == std::optional<std::string>{"ts"});
+    REQUIRE(imported->ordering().has_value());
+    REQUIRE(imported->ordering()->size() == 2);
+    CHECK((*imported->ordering())[0].name == "symbol");
+    CHECK((*imported->ordering())[1].name == "ts");
+
+    schema.release(&schema);
+    array.release(&array);
 }

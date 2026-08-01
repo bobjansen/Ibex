@@ -222,9 +222,9 @@ auto check_sorted_aggregate_invariants(const ibex::runtime::TableRegistry& table
             ++failures;
             continue;
         }
-        const bool ordered = result->ordering.has_value() && !result->ordering->empty() &&
-                             result->ordering->front().name == invariant.group_key &&
-                             result->ordering->front().ascending;
+        const bool ordered = result->ordering().has_value() && !result->ordering()->empty() &&
+                             result->ordering()->front().name == invariant.group_key &&
+                             result->ordering()->front().ascending;
         fmt::print("{} {}: output {} ordered by group key — {}\n", ordered ? "PASS" : "FAIL",
                    invariant.name, ordered ? "is" : "is not",
                    "sorted aggregate must not fall back to hash");

@@ -70,8 +70,9 @@ TEST_CASE("MaterializeOperator preserves Table ordering and time_index") {
     runtime::Table input;
     input.add_column("ts", Column<std::int64_t>{1, 2, 3});
     input.add_column("value", Column<double>{1.5, 2.5, 3.5});
-    input.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}};
-    input.time_index = std::string{"ts"};
+    input.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}}, std::string{"ts"},
+        {}));
 
     auto source = std::make_unique<runtime::TableSourceOperator>(std::move(input));
     runtime::MaterializeOperator sink{std::move(source)};
@@ -80,11 +81,11 @@ TEST_CASE("MaterializeOperator preserves Table ordering and time_index") {
     REQUIRE(result.has_value());
 
     const auto& out = result.value();
-    REQUIRE(out.ordering.has_value());
-    REQUIRE(out.ordering->size() == 1);
-    REQUIRE((*out.ordering)[0].name == "ts");
-    REQUIRE(out.time_index.has_value());
-    REQUIRE(*out.time_index == "ts");
+    REQUIRE(out.ordering().has_value());
+    REQUIRE(out.ordering()->size() == 1);
+    REQUIRE((*out.ordering())[0].name == "ts");
+    REQUIRE(out.time_index().has_value());
+    REQUIRE(*out.time_index() == "ts");
 }
 
 namespace {
@@ -292,8 +293,8 @@ void require_roundtrip(const runtime::Table& input, std::size_t grain) {
             }
         }
     }
-    REQUIRE(out.ordering.has_value() == input.ordering.has_value());
-    REQUIRE(out.time_index.has_value() == input.time_index.has_value());
+    REQUIRE(out.ordering().has_value() == input.ordering().has_value());
+    REQUIRE(out.time_index().has_value() == input.time_index().has_value());
 }
 
 }  // namespace
@@ -331,17 +332,18 @@ TEST_CASE("PartitionedTableSource preserves ordering and time_index") {
     runtime::Table input;
     input.add_column("ts", Column<std::int64_t>{1, 2, 3, 4});
     input.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0});
-    input.ordering = std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}};
-    input.time_index = std::string{"ts"};
+    input.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ir::OrderKey>{ir::OrderKey{.name = "ts", .ascending = true}}, std::string{"ts"},
+        {}));
 
     runtime::MaterializeOperator sink{std::make_unique<runtime::PartitionedTableSource>(input, 2)};
     auto result = sink.run();
     REQUIRE(result.has_value());
     const auto& out = result.value();
-    REQUIRE(out.ordering.has_value());
-    REQUIRE((*out.ordering)[0].name == "ts");
-    REQUIRE(out.time_index.has_value());
-    REQUIRE(*out.time_index == "ts");
+    REQUIRE(out.ordering().has_value());
+    REQUIRE((*out.ordering())[0].name == "ts");
+    REQUIRE(out.time_index().has_value());
+    REQUIRE(*out.time_index() == "ts");
 }
 
 TEST_CASE("PartitionedTableSource emits one empty schema-carrier chunk for a zero-row table") {

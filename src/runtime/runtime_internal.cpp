@@ -59,17 +59,14 @@ auto format_columns(const Table& table) -> std::string {
 }
 
 auto normalize_time_index(Table& table) -> void {
-    if (!table.time_index.has_value()) {
-        return;
-    }
-    if (table.ordering.has_value() && table.ordering->size() == 1 &&
-        table.ordering->front().name == *table.time_index && table.ordering->front().ascending) {
-        return;
-    }
-    table.ordering = std::vector<ir::OrderKey>{{.name = *table.time_index, .ascending = true}};
+    // The rule itself lives in `TableProperties::normalized()`, which
+    // `set_properties` applies. Re-seating the table's own properties is
+    // therefore all this needs to do -- and the grouping is necessarily already
+    // known, so the old hazard of normalizing before it was set is gone.
+    table.set_properties(table.properties());
 }
 
-auto derive_table_properties(const TableProperties& input, const KeyColumnFate& fate,
+auto TableProperties::derive(const TableProperties& input, const KeyColumnFate& fate,
                              RowTransform transform) -> TableProperties {
     TableProperties out;
     if (transform == RowTransform::Recombine) {
@@ -77,11 +74,13 @@ auto derive_table_properties(const TableProperties& input, const KeyColumnFate& 
         // layout carries over. The operator states what it establishes itself.
         return out;
     }
-    // Time index first: whether it survives gates the ordering rule below.
+    // Time index first: whether it survives gates the ordering rule below. An
+    // overwritten time index counts as lost -- a column whose timestamps were
+    // rewritten no longer indexes anything, even though it is still there.
     bool time_index_lost = false;
-    if (input.time_index.has_value()) {
-        if (auto mapped = fate(*input.time_index); mapped.has_value()) {
-            out.time_index = std::move(*mapped);
+    if (input.time_index().has_value()) {
+        if (const KeyFate result = fate(*input.time_index()); result.is_kept()) {
+            out.time_index_ = result.name();
         } else {
             time_index_lost = true;
         }
@@ -89,55 +88,64 @@ auto derive_table_properties(const TableProperties& input, const KeyColumnFate& 
     // A reorder voids the input's ordering outright: the columns are all still
     // there, so `fate` would happily map every key, but the rows they described
     // have moved. The operator sets the new ordering after this returns.
-    if (input.ordering.has_value() && transform != RowTransform::Reorder) {
+    if (input.ordering().has_value() && transform != RowTransform::Reorder) {
         std::vector<ir::OrderKey> kept;
-        kept.reserve(input.ordering->size());
+        kept.reserve(input.ordering()->size());
         bool preserved = !time_index_lost;  // lose the time index -> lose ordering
         if (preserved) {
-            for (const auto& key : *input.ordering) {
-                auto mapped = fate(key.name);
-                if (!mapped.has_value()) {  // dropped or overwritten -> no ordering
+            for (const auto& key : *input.ordering()) {
+                // Dropped and overwritten are the same to an ordering: a key
+                // whose values were rewritten no longer describes the row order
+                // any more than a key that is gone.
+                const KeyFate result = fate(key.name);
+                if (!result.is_kept()) {
                     preserved = false;
                     break;
                 }
-                kept.push_back({.name = std::move(*mapped), .ascending = key.ascending});
+                kept.push_back({.name = result.name(), .ascending = key.ascending});
             }
         }
         if (preserved) {
-            out.ordering = std::move(kept);
+            out.ordering_ = std::move(kept);
         }
     }
     // The grouping outlives anything row-preserving or row-removing: dropping
-    // rows cannot merge two partitions. It only survives here if every key
-    // column does — once a key is dropped or renamed away we can no longer name
-    // the grouping in a diagnostic, so drop the claim rather than name a stale
-    // column.
-    if (!input.grouped_by.empty()) {
+    // rows cannot merge two partitions.
+    //
+    // Here is where `Overwritten` parts company with `Dropped`. A DROPPED key
+    // cannot be named, so the claim goes with it rather than naming a column
+    // that is not there. An OVERWRITTEN key is still a column, and the rows have
+    // not moved -- they sit in the same runs, so the boundary an unpartitioned
+    // lag/rolling would read across is still there. Voiding the claim would
+    // disarm `check_row_order` over a live hazard, so the claim stands under the
+    // old name. The name is then a slightly stale label on a real hazard, which
+    // is the better of the two failures.
+    if (!input.grouped_by().empty()) {
         std::vector<std::string> kept;
-        kept.reserve(input.grouped_by.size());
-        for (const auto& key : input.grouped_by) {
-            auto mapped = fate(key);
-            if (!mapped.has_value()) {
+        kept.reserve(input.grouped_by().size());
+        for (const auto& key : input.grouped_by()) {
+            const KeyFate result = fate(key);
+            if (result.is_overwritten()) {
+                kept.push_back(key);
+                continue;
+            }
+            if (result.is_dropped()) {
                 kept.clear();
                 break;
             }
-            kept.push_back(std::move(*mapped));
+            kept.push_back(result.name());
         }
-        out.grouped_by = std::move(kept);
+        out.grouped_by_ = std::move(kept);
     }
     return out;
 }
 
 auto table_properties_of(const Table& table) -> TableProperties {
-    return TableProperties{
-        .ordering = table.ordering, .time_index = table.time_index, .grouped_by = table.grouped_by};
+    return table.properties();
 }
 
 auto apply_table_properties(Table& table, const TableProperties& props) -> void {
-    table.ordering = props.ordering;
-    table.time_index = props.time_index;
-    table.grouped_by = props.grouped_by;
-    normalize_time_index(table);
+    table.set_properties(props);
 }
 
 auto int64_to_date_checked(std::int64_t value) -> Date {

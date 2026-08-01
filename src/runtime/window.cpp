@@ -219,7 +219,7 @@ auto rolling_window_spec(const ir::CallExpr& call, std::optional<ir::Duration> b
 auto window_bound_column(const Table& table, ir::Duration duration, bool aligned, bool want_end)
     -> std::expected<ComputedColumn, std::string> {
     const char* fn = want_end ? "window_end" : "window_start";
-    if (!table.time_index.has_value()) {
+    if (!table.time_index().has_value()) {
         return std::unexpected(std::string(fn) + ": requires a TimeFrame");
     }
     const std::int64_t dur = duration.count();
@@ -227,7 +227,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
         return std::unexpected(std::string(fn) + ": window duration must be positive");
     }
     const std::size_t rows = table.rows();
-    const auto* tcv = table.find(*table.time_index);
+    const auto* tcv = table.find(*table.time_index());
 
     // Nominal bound of the window containing time `t`, in `unit` steps. aligned:
     // start = floor(t/unit)*unit (grid boundary), end = start + unit. trailing:
@@ -286,14 +286,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     std::int64_t dur_val = 0;
     ir::Duration duration{0};
     if (!is_count) {
-        if (!table.time_index.has_value()) {
+        if (!table.time_index().has_value()) {
             return std::unexpected(call.callee +
                                    ": duration window requires a TimeFrame — use a count window "
                                    "(e.g. " +
                                    call.callee + "(col, 20)) or as_timeframe()");
         }
         duration = std::get<ir::Duration>(spec);
-        time_col_ptr = &*table.find(*table.time_index);
+        time_col_ptr = &*table.find(*table.time_index());
         if (const auto* ts_col = std::get_if<Column<Timestamp>>(time_col_ptr)) {
             // Timestamp is {int64_t nanos} — pointer-cast avoids an 8 MB copy.
             static_assert(sizeof(Timestamp) == sizeof(std::int64_t) &&
@@ -1136,10 +1136,10 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                          const std::vector<ir::ColumnRef>& extra_group_by,
                          const std::vector<ir::AggSpec>& aggregations)
     -> std::expected<Table, std::string> {
-    if (!input.time_index.has_value())
+    if (!input.time_index().has_value())
         return std::unexpected("resample requires a TimeFrame — use as_timeframe() first");
 
-    const std::string& ts_name = *input.time_index;
+    const std::string& ts_name = *input.time_index();
     const auto* ts_cv = input.find(ts_name);
     if (ts_cv == nullptr)
         return std::unexpected("resample: time index column '" + ts_name + "' not found");
@@ -1288,7 +1288,10 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                 },
                 cv);
         }
-        out.time_index = ts_name;
+        // Resample establishes the time index, and its bars come out in time
+        // order -- `time_frame` states both, so neither can be set without the
+        // other.
+        apply_table_properties(out, TableProperties::time_frame(ts_name));
         return std::expected<Table, std::string>{std::move(out)};
     };
     if (auto fast = simple_resample(); fast.has_value()) {
@@ -1565,7 +1568,10 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                 },
                 cv);
         }
-        out.time_index = ts_name;
+        // Resample establishes the time index, and its bars come out in time
+        // order -- `time_frame` states both, so neither can be set without the
+        // other.
+        apply_table_properties(out, TableProperties::time_frame(ts_name));
         return std::expected<Table, std::string>{std::move(out)};
     };
     if (auto fast = grouped_simple_resample(); fast.has_value()) {
@@ -1612,7 +1618,7 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
 
     out.rename_column(pos, ts_name);
     out.replace_column(pos, ColumnValue{std::move(ts_out)});
-    out.time_index = ts_name;
+    apply_table_properties(out, TableProperties::time_frame(ts_name));
 
     return out;
 }
@@ -1643,21 +1649,22 @@ auto resample_table(const Table& input, ir::Duration bucket_dur,
     // Only claim it when two rows actually share a bucket timestamp. With a
     // single group the output is one row per bucket, nothing interleaves, and
     // an unpartitioned lead over it is correct.
-    if (!out.time_index.has_value() || out.rows() < 2) {
+    if (!out.time_index().has_value() || out.rows() < 2) {
         return result;
     }
-    const auto* ts = out.find(*out.time_index);
+    const auto* ts = out.find(*out.time_index());
     const auto* stamps = ts != nullptr ? std::get_if<Column<Timestamp>>(ts) : nullptr;
     if (stamps == nullptr) {
         return result;
     }
     for (std::size_t i = 1; i < stamps->size(); ++i) {
         if ((*stamps)[i].nanos == (*stamps)[i - 1].nanos) {
-            out.grouped_by.clear();
-            out.grouped_by.reserve(extra_group_by.size());
+            std::vector<std::string> keys;
+            keys.reserve(extra_group_by.size());
             for (const auto& key : extra_group_by) {
-                out.grouped_by.push_back(key.name);
+                keys.push_back(key.name);
             }
+            out.set_properties(out.properties().with_grouping(std::move(keys)));
             break;
         }
     }

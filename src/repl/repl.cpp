@@ -2034,8 +2034,8 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
             total += column_bytes(entry);
         }
         fmt::print("  cols: {}  ~{}", table.columns.size(), format_bytes(total));
-        if (table.time_index.has_value()) {
-            fmt::print("  time_index: {}", *table.time_index);
+        if (table.time_index().has_value()) {
+            fmt::print("  time_index: {}", *table.time_index());
         }
     }
     fmt::print("\n");

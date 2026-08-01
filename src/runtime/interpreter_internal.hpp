@@ -942,13 +942,13 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
         }
     }
 
-    if (ordering != nullptr) {
-        output.ordering = *ordering;
-    } else {
-        output.ordering = input.ordering;
-    }
-    output.time_index = input.time_index;
-    normalize_time_index(output);
+    // A gather either subsets the rows or reorders them; under neither does a
+    // group boundary stop existing, so the whole claim rides along and only the
+    // ordering is restated when the caller imposed a new one. Dropping the
+    // grouping here would disarm the row-order guard for every operator built
+    // on a gather.
+    output.set_properties(ordering != nullptr ? input.properties().with_ordering(*ordering)
+                                              : input.properties());
     return output;
 }
 

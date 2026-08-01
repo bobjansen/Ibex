@@ -97,7 +97,7 @@ TEST_CASE("Kafka Avro payload decodes flat schema-registry-framed records") {
 
     REQUIRE(table);
     REQUIRE(table->rows() == 1);
-    REQUIRE(table->time_index == std::optional<std::string>{"ts"});
+    REQUIRE(table->time_index() == std::optional<std::string>{"ts"});
 
     const auto* ts = std::get_if<ibex::Column<ibex::Timestamp>>(table->find("ts"));
     const auto* symbol = std::get_if<ibex::Column<std::string>>(table->find("symbol"));

@@ -142,13 +142,13 @@ void require_tables_equal(const runtime::Table& a, const runtime::Table& b) {
     REQUIRE(a.columns.size() == b.columns.size());
     REQUIRE(a.rows() == b.rows());
     REQUIRE(a.logical_rows == b.logical_rows);
-    REQUIRE(a.time_index == b.time_index);
-    REQUIRE(a.ordering.has_value() == b.ordering.has_value());
-    if (a.ordering.has_value()) {
-        REQUIRE(a.ordering->size() == b.ordering->size());
-        for (std::size_t key = 0; key < a.ordering->size(); ++key) {
-            REQUIRE((*a.ordering)[key].name == (*b.ordering)[key].name);
-            REQUIRE((*a.ordering)[key].ascending == (*b.ordering)[key].ascending);
+    REQUIRE(a.time_index() == b.time_index());
+    REQUIRE(a.ordering().has_value() == b.ordering().has_value());
+    if (a.ordering().has_value()) {
+        REQUIRE(a.ordering()->size() == b.ordering()->size());
+        for (std::size_t key = 0; key < a.ordering()->size(); ++key) {
+            REQUIRE((*a.ordering())[key].name == (*b.ordering())[key].name);
+            REQUIRE((*a.ordering())[key].ascending == (*b.ordering())[key].ascending);
         }
     }
     for (std::size_t c = 0; c < a.columns.size(); ++c) {
@@ -1154,7 +1154,7 @@ TEST_CASE("Stream TimeBucket flushes at wall-clock bucket end", "[e2e][stream]")
                 runtime::Table t;
                 t.add_column("ts", Column<Timestamp>{Timestamp{0}});
                 t.add_column("price", Column<double>{100.0});
-                t.time_index = "ts";
+                t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
                 return runtime::ExternValue{t};
             }
             if (call_count == 2) {
@@ -1164,7 +1164,7 @@ TEST_CASE("Stream TimeBucket flushes at wall-clock bucket end", "[e2e][stream]")
                 // Data timestamp 5 ms - still inside bucket 0 by data time.
                 t.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
                 t.add_column("price", Column<double>{110.0});
-                t.time_index = "ts";
+                t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
                 return runtime::ExternValue{t};
             }
             return runtime::ExternValue{runtime::Table{}};  // EOF
@@ -1235,7 +1235,7 @@ TEST_CASE("Stream TimeBucket flushes via StreamTimeout during idle period", "[e2
                 runtime::Table t;
                 t.add_column("ts", Column<Timestamp>{Timestamp{0}});
                 t.add_column("price", Column<double>{99.0});
-                t.time_index = "ts";
+                t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
                 return runtime::ExternValue{t};
             }
             // Subsequent calls: return StreamTimeout until 30 ms have elapsed,
@@ -1331,7 +1331,7 @@ TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e
         runtime::Table t1;
         t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
         t1.add_column("price", Column<double>{200.0});
-        t1.time_index = "ts";
+        t1.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
         buf->write(t1);
 
         while (!consumer_ready_for_second_tick.load(std::memory_order_acquire)) {
@@ -1343,7 +1343,7 @@ TEST_CASE("StreamBuffered feeds a TimeBucket stream from a producer thread", "[e
         // Data timestamp still inside bucket 0, but wall clock has moved on.
         t2.add_column("ts", Column<Timestamp>{Timestamp{5'000'000LL}});
         t2.add_column("price", Column<double>{210.0});
-        t2.time_index = "ts";
+        t2.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
         buf->write(t2);
 
         buf->close();
@@ -1387,18 +1387,18 @@ TEST_CASE("make_buffered_source takes capacity from Ibex query argument", "[e2e]
 
         runtime::ExternRegistry registry;
 
-        registry.register_table("tick_src",
-                                runtime::make_buffered_source([&](runtime::StreamBuffered& buf) {
-                                    producer_started.store(true, std::memory_order_release);
+        registry.register_table(
+            "tick_src", runtime::make_buffered_source([&](runtime::StreamBuffered& buf) {
+                producer_started.store(true, std::memory_order_release);
 
-                                    runtime::Table t;
-                                    t.add_column("ts", Column<Timestamp>{Timestamp{0}});
-                                    t.add_column("price", Column<double>{300.0});
-                                    t.time_index = "ts";
-                                    buf.write(t);
+                runtime::Table t;
+                t.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                t.add_column("price", Column<double>{300.0});
+                t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+                buf.write(t);
 
-                                    buf.close();
-                                }));
+                buf.close();
+            }));
 
         registry.register_scalar_table_consumer(
             "tick_sink", runtime::ScalarKind::Int,
@@ -1434,22 +1434,22 @@ Stream {
 
         runtime::ExternRegistry registry;
 
-        registry.register_table("tick_src",
-                                runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
-                                    runtime::Table t1;
-                                    t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
-                                    t1.add_column("price", Column<double>{300.0});
-                                    t1.time_index = "ts";
-                                    buf.write(t1);
+        registry.register_table(
+            "tick_src", runtime::make_buffered_source([](runtime::StreamBuffered& buf) {
+                runtime::Table t1;
+                t1.add_column("ts", Column<Timestamp>{Timestamp{0}});
+                t1.add_column("price", Column<double>{300.0});
+                t1.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+                buf.write(t1);
 
-                                    runtime::Table t2;
-                                    t2.add_column("ts", Column<Timestamp>{Timestamp{1'000'000LL}});
-                                    t2.add_column("price", Column<double>{310.0});
-                                    t2.time_index = "ts";
-                                    buf.write(t2);
+                runtime::Table t2;
+                t2.add_column("ts", Column<Timestamp>{Timestamp{1'000'000LL}});
+                t2.add_column("price", Column<double>{310.0});
+                t2.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+                buf.write(t2);
 
-                                    buf.close();
-                                }));
+                buf.close();
+            }));
 
         registry.register_scalar_table_consumer(
             "tick_sink", runtime::ScalarKind::Int,
@@ -1534,7 +1534,7 @@ TEST_CASE("StreamBuffered: no packet loss under producer stress with jittery con
             t.add_column("ts",
                          Column<Timestamp>{Timestamp{static_cast<std::int64_t>(i) * 1'000'000LL}});
             t.add_column("val", Column<double>{static_cast<double>(i)});
-            t.time_index = "ts";
+            t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
             buf->write(t);  // yields on backpressure - never drops
         }
         buf->close();
@@ -2038,9 +2038,9 @@ TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered sc
     auto serial_metadata = run(metadata_query, tables);
     auto island_metadata = run_parallel(metadata_query, tables, 2);
     require_tables_equal(serial_metadata, island_metadata);
-    REQUIRE(island_metadata.time_index == "time");
-    REQUIRE(island_metadata.ordering.has_value());
-    REQUIRE((*island_metadata.ordering)[0].name == "time");
+    REQUIRE(island_metadata.time_index() == "time");
+    REQUIRE(island_metadata.ordering().has_value());
+    REQUIRE((*island_metadata.ordering())[0].name == "time");
 
     // Grain 2 produces three input morsels. Every one is rejected. The
     // serial-island validator requires one identified output morsel per input,
@@ -2272,8 +2272,8 @@ TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empt
     auto serial_metadata = run(metadata_query, tables);
     auto island_metadata = run_on_workers(metadata_query, tables, 8, 4);
     require_tables_equal(serial_metadata, island_metadata);
-    REQUIRE(island_metadata.time_index == "time");
-    REQUIRE(island_metadata.ordering.has_value());
+    REQUIRE(island_metadata.time_index() == "time");
+    REQUIRE(island_metadata.ordering().has_value());
 
     // Every morsel is empty: the merger must still see one output morsel per
     // input morsel and the result must keep the serial schema.
@@ -2627,7 +2627,7 @@ auto make_grouped_window_table(std::size_t rows, std::size_t groups) -> runtime:
     t.add_column("ts", std::move(ts));
     t.add_column("symbol", std::move(symbol));
     t.add_column("price", std::move(price));
-    t.time_index = "ts";
+    t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
 
     runtime::TableRegistry reg;
     reg.emplace("t", std::move(t));
@@ -2714,7 +2714,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         t.add_column("symbol", std::move(symbol));
         t.add_column("price", std::move(price));
         t.columns[1].validity = std::move(symbol_valid);
-        t.time_index = "ts";
+        t.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
         runtime::TableRegistry tables;
         tables.emplace("t", std::move(t));
 
@@ -2859,4 +2859,90 @@ TEST_CASE("E2E: a bit-packed output column is gathered into concurrently", "[e2e
             require_tables_equal(serial, island);
         }
     }
+}
+
+// `grouped_by` is a hazard flag: it records that adjacent rows may belong to
+// different groups, so an unpartitioned order-dependent call would read across a
+// boundary. Overwriting a grouping key's VALUES does not move any row, so the
+// boundaries are still there and the flag must stay armed. Treating an overwrite
+// like a dropped column (which cannot be named, so genuinely voids the claim)
+// silently re-admits the unsafe query.
+TEST_CASE("E2E: an overwritten grouping key keeps the row-order guard armed",
+          "[e2e][update][by][guard]") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
+                                         Timestamp{60'000'000'000}});
+    t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
+    runtime::TableRegistry tables{{"t", t}};
+
+    const std::string grouped =
+        "let tf = as_timeframe(t, \"ts\");\n"
+        "let g = tf[window 5m, by k, update { r = rolling_mean(p) }];\n";
+
+    SECTION("baseline: the guard refuses an unpartitioned lag") {
+        auto err = run_error(grouped + "g[window 5m, update { lagged = lag(p, 1) }];", tables);
+        CHECK(err.find("depends on the row order") != std::string::npos);
+    }
+
+    SECTION("after the grouping key is overwritten it still refuses") {
+        auto err = run_error(grouped +
+                                 "let o = g[window 5m, by k, update { k = 9, q = p * 2.0 }];\n"
+                                 "o[window 5m, update { lagged = lag(p, 1) }];",
+                             tables);
+        CHECK(err.find("depends on the row order") != std::string::npos);
+    }
+}
+
+// `distinct` keeps the first occurrence of each row in input order, so it
+// removes rows without moving the survivors. Every claim the input made
+// therefore still holds: a subset of a sorted sequence is sorted, the time index
+// still indexes what is left, and dropping rows cannot merge two group-major
+// runs. Three code paths used to disagree about this -- the serial main branch
+// dropped all three, its empty-columns branch kept the grouping, and the chunked
+// operator kept the grouping while dropping the rest.
+TEST_CASE("E2E: distinct preserves every claim its input made", "[e2e][distinct]") {
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{2, 1, 1, 3});
+    t.add_column("p", Column<double>{1.0, 2.0, 2.0, 4.0});
+    runtime::TableRegistry tables{{"t", t}};
+
+    SECTION("an ordering survives") {
+        auto out = run("t[order k][distinct { k }];", tables);
+        CHECK(col_i64(out, "k") == std::vector<std::int64_t>{1, 2, 3});
+        REQUIRE(out.ordering().has_value());
+        REQUIRE(out.ordering()->size() == 1);
+        CHECK(out.ordering()->front().name == "k");
+    }
+
+    SECTION("a time index survives") {
+        runtime::Table ts_table;
+        ts_table.add_column(
+            "ts", Column<Timestamp>{Timestamp{0}, Timestamp{0}, Timestamp{60'000'000'000}});
+        ts_table.add_column("p", Column<double>{1.0, 1.0, 2.0});
+        runtime::TableRegistry ts_tables{{"t", ts_table}};
+
+        auto out = run("let tf = as_timeframe(t, \"ts\");\ntf[distinct { ts, p }];", ts_tables);
+        CHECK(out.rows() == 2);
+        CHECK(out.time_index() == std::optional<std::string>{"ts"});
+    }
+}
+
+TEST_CASE("E2E: distinct keeps the row-order guard armed", "[e2e][distinct][guard]") {
+    // The grouping claim is a hazard flag about the row layout. Removing
+    // duplicate rows leaves the group-major runs exactly where they were, so an
+    // unpartitioned lag downstream is no safer than it was before.
+    runtime::Table t;
+    t.add_column("k", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
+                                         Timestamp{60'000'000'000}});
+    t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
+    runtime::TableRegistry tables{{"t", t}};
+
+    auto err = run_error(
+        "let tf = as_timeframe(t, \"ts\");\n"
+        "let g = tf[window 5m, by k, update { r = rolling_mean(p) }];\n"
+        "g[distinct { k, ts, p }][window 5m, update { lagged = lag(p, 1) }];",
+        tables);
+    CHECK(err.find("depends on the row order") != std::string::npos);
 }

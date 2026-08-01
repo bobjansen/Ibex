@@ -209,8 +209,7 @@ class AdbcSourceOperator final : public ibex::runtime::Operator {
 
             ibex::runtime::Chunk chunk;
             chunk.columns = std::move(imported->columns);
-            chunk.ordering = std::move(imported->ordering);
-            chunk.time_index = std::move(imported->time_index);
+            chunk.set_properties(imported->properties());
             return std::optional<ibex::runtime::Chunk>{std::move(chunk)};
         }
     }

@@ -265,6 +265,100 @@ TEST_CASE("Arrow C Data import round-trips values, validity, and table metadata"
     array.release(&array);
 }
 
+// ── Narrow integers ─────────────────────────────────────────────────────────
+//
+// Arrow spells int32 and the usual dictionary INDEX type identically ("i"), and
+// only the presence of dictionary storage tells them apart. Reading "i" as
+// "always categorical" made a plain int32 column -- an ordinary R integer among
+// others -- fail with a complaint about missing dictionary storage.
+
+namespace {
+
+/// A released Arrow object is one whose callback is null, so a hand-built array
+/// needs a no-op rather than nothing: the storage belongs to the fixture.
+inline void noop_release_array(ArrowArray* array) {
+    array->release = nullptr;
+}
+inline void noop_release_schema(ArrowSchema* schema) {
+    schema->release = nullptr;
+}
+
+/// A one-column struct array over caller-owned integer storage. Hand-built
+/// because Ibex has no narrow integer column to export from.
+template <typename Raw>
+struct ForeignIntColumn {
+    std::vector<Raw> values;
+    std::array<const void*, 2> child_buffers{};
+    std::array<ArrowArray*, 1> children{};
+    std::array<ArrowSchema*, 1> schema_children{};
+    ArrowArray child{};
+    ArrowArray array{};
+    ArrowSchema child_schema{};
+    ArrowSchema schema{};
+
+    ForeignIntColumn(std::initializer_list<Raw> init, const char* format) : values(init) {
+        child_buffers = {nullptr, values.data()};
+        child.length = static_cast<std::int64_t>(values.size());
+        child.null_count = 0;
+        child.n_buffers = 2;
+        child.buffers = child_buffers.data();
+        child.release = noop_release_array;
+        children = {&child};
+
+        array.length = child.length;
+        array.n_children = 1;
+        array.children = children.data();
+        array.release = noop_release_array;
+
+        child_schema.format = format;
+        child_schema.name = "n";
+        child_schema.release = noop_release_schema;
+        schema_children = {&child_schema};
+
+        schema.format = "+s";
+        schema.n_children = 1;
+        schema.children = schema_children.data();
+        schema.release = noop_release_schema;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("Arrow C Data imports a plain int32 column", "[interop][arrow][int]") {
+    ForeignIntColumn<std::int32_t> source({7, -3, 0}, "i");
+
+    auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+    REQUIRE(imported.has_value());
+
+    const auto* values = std::get_if<ibex::Column<std::int64_t>>(imported->find("n"));
+    REQUIRE(values != nullptr);
+    CHECK((*values)[0] == 7);
+    CHECK((*values)[1] == -3);
+    CHECK((*values)[2] == 0);
+}
+
+TEST_CASE("Arrow C Data widens every lossless integer width", "[interop][arrow][int]") {
+    SECTION("int8") {
+        ForeignIntColumn<std::int8_t> source({-128, 127}, "c");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        const auto* values = std::get_if<ibex::Column<std::int64_t>>(imported->find("n"));
+        REQUIRE(values != nullptr);
+        CHECK((*values)[0] == -128);
+        CHECK((*values)[1] == 127);
+    }
+
+    SECTION("uint32 uses its full range") {
+        // The value that would be negative if the width were read as signed.
+        ForeignIntColumn<std::uint32_t> source({4'294'967'295U}, "I");
+        auto imported = ibex::interop::import_table_from_arrow(source.array, source.schema);
+        REQUIRE(imported.has_value());
+        const auto* values = std::get_if<ibex::Column<std::int64_t>>(imported->find("n"));
+        REQUIRE(values != nullptr);
+        CHECK((*values)[0] == 4'294'967'295LL);
+    }
+}
+
 TEST_CASE("Arrow C Data import round-trips dictionary encoded categoricals", "[interop][arrow]") {
     ibex::runtime::Table table;
     ibex::Column<ibex::Categorical> cat;
@@ -950,6 +1044,33 @@ TEST_CASE("Arrow C Data round-trips the group-major claim", "[interop][arrow][pr
     REQUIRE(imported->ordering()->size() == 2);
     CHECK((*imported->ordering())[0].name == "symbol");
     CHECK((*imported->ordering())[1].name == "ts");
+
+    schema.release(&schema);
+    array.release(&array);
+}
+
+TEST_CASE("A dictionary-encoded index is still a categorical", "[interop][arrow][int]") {
+    // The regression guard for the fix above: "i" with dictionary storage must
+    // keep going to the categorical importer, not be read as a plain int32.
+    ibex::runtime::Table source;
+    ibex::Column<ibex::Categorical> symbols;
+    symbols.push_back("a");
+    symbols.push_back("b");
+    symbols.push_back("a");
+    source.add_column("sym", std::move(symbols));
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+    REQUIRE(std::string(schema.children[0]->format) == "i");
+    REQUIRE(schema.children[0]->dictionary != nullptr);
+
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    REQUIRE(imported.has_value());
+    const auto* codes = std::get_if<ibex::Column<ibex::Categorical>>(imported->find("sym"));
+    REQUIRE(codes != nullptr);
+    CHECK((*codes)[0] == "a");
+    CHECK((*codes)[1] == "b");
 
     schema.release(&schema);
     array.release(&array);

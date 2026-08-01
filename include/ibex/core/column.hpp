@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ibex/core/time_zone.hpp>
+
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
@@ -96,6 +98,12 @@ struct Categorical {};
 template <typename T>
 class Column {
    public:
+    /// What these values MEAN (e.g. the time zone of a Timestamp column), as
+    /// opposed to where the rows sit. It travels with the column: sharing,
+    /// copying, or gathering rows out of it all preserve it, because none of
+    /// those change what a value means. See `ColumnMeta`.
+    [[nodiscard]] auto meta() const noexcept -> const ColumnMeta& { return meta_; }
+    void set_meta(ColumnMeta meta) noexcept { meta_ = meta; }
     using value_type = T;
     using size_type = std::size_t;
     using storage_type = std::vector<T, detail::NoInitAllocator<T>>;
@@ -123,14 +131,16 @@ class Column {
           external_owner_(other.external_owner_),
           external_data_(other.is_external() ? other.external_data_ : data_.data()),
           external_offset_(other.external_offset_),
-          external_size_(other.external_size_) {}
+          external_size_(other.external_size_),
+          meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : data_(std::move(other.data_)),
           external_owner_(std::move(other.external_owner_)),
           external_data_(external_owner_ ? other.external_data_ : data_.data()),
           external_offset_(other.external_offset_),
-          external_size_(other.external_size_) {
+          external_size_(other.external_size_),
+          meta_(other.meta_) {
         other.external_data_ = nullptr;
         other.external_offset_ = 0;
         other.external_size_ = 0;
@@ -158,6 +168,7 @@ class Column {
         std::swap(external_data_, other.external_data_);
         std::swap(external_offset_, other.external_offset_);
         std::swap(external_size_, other.external_size_);
+        std::swap(meta_, other.meta_);
     }
 
     /// Adopt an immutable contiguous buffer. `owner` must keep every element in
@@ -537,12 +548,24 @@ class Column {
     const T* external_data_ = nullptr;
     size_type external_offset_ = 0;
     size_type external_size_ = 0;
+
+    /// See `meta()`. Declared last so the hand-written constructors can append
+    /// it to their member-init lists without tripping -Wreorder. Four bytes,
+    /// and trivially copyable -- deliberately, since a column is copied per
+    /// chunk in the chunked paths.
+    ColumnMeta meta_;
 };
 
 /// Specialization for categorical columns (dictionary-encoded strings).
 template <>
 class Column<Categorical> {
    public:
+    /// What these values MEAN (e.g. the time zone of a Timestamp column), as
+    /// opposed to where the rows sit. It travels with the column: sharing,
+    /// copying, or gathering rows out of it all preserve it, because none of
+    /// those change what a value means. See `ColumnMeta`.
+    [[nodiscard]] auto meta() const noexcept -> const ColumnMeta& { return meta_; }
+    void set_meta(ColumnMeta meta) noexcept { meta_ = meta; }
     using value_type = std::string_view;
     using size_type = std::size_t;
     using code_type = std::int32_t;
@@ -589,7 +612,8 @@ class Column<Categorical> {
           dict_chars_data_(other.dict_chars_data_),
           dict_offset_(other.dict_offset_),
           dict_size_(other.dict_size_),
-          dict_materialized_(other.dict_materialized_) {}
+          dict_materialized_(other.dict_materialized_),
+          meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : dict_(std::move(other.dict_)),
@@ -604,7 +628,8 @@ class Column<Categorical> {
           dict_chars_data_(other.dict_chars_data_),
           dict_offset_(other.dict_offset_),
           dict_size_(other.dict_size_),
-          dict_materialized_(other.dict_materialized_) {
+          dict_materialized_(other.dict_materialized_),
+          meta_(other.meta_) {
         other.codes_data_ = nullptr;
         other.codes_offset_ = 0;
         other.logical_size_ = 0;
@@ -645,6 +670,7 @@ class Column<Categorical> {
         std::swap(dict_offset_, other.dict_offset_);
         std::swap(dict_size_, other.dict_size_);
         std::swap(dict_materialized_, other.dict_materialized_);
+        std::swap(meta_, other.meta_);
     }
 
     [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner,
@@ -900,6 +926,12 @@ class Column<Categorical> {
     size_type dict_offset_ = 0;
     size_type dict_size_ = 0;
     mutable bool dict_materialized_ = true;
+
+    /// See `meta()`. Declared last so the hand-written constructors can append
+    /// it to their member-init lists without tripping -Wreorder. Four bytes,
+    /// and trivially copyable -- deliberately, since a column is copied per
+    /// chunk in the chunked paths.
+    ColumnMeta meta_;
 };
 
 /// Specialization for non-categorical strings using an Arrow-style flat buffer.
@@ -929,6 +961,12 @@ class Column<std::string> {
     std::size_t logical_size_ = 0;
 
    public:
+    /// What these values MEAN (e.g. the time zone of a Timestamp column), as
+    /// opposed to where the rows sit. It travels with the column: sharing,
+    /// copying, or gathering rows out of it all preserve it, because none of
+    /// those change what a value means. See `ColumnMeta`.
+    [[nodiscard]] auto meta() const noexcept -> const ColumnMeta& { return meta_; }
+    void set_meta(ColumnMeta meta) noexcept { meta_ = meta; }
     using value_type = std::string_view;
     using size_type = std::size_t;
 
@@ -966,7 +1004,8 @@ class Column<std::string> {
           offsets_data_(other.is_external() ? other.offsets_data_ : offsets_.data()),
           chars_data_(other.is_external() ? other.chars_data_ : chars_.data()),
           external_offset_(other.external_offset_),
-          logical_size_(other.logical_size_) {}
+          logical_size_(other.logical_size_),
+          meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : offsets_(std::move(other.offsets_)),
@@ -975,7 +1014,8 @@ class Column<std::string> {
           offsets_data_(external_owner_ ? other.offsets_data_ : offsets_.data()),
           chars_data_(external_owner_ ? other.chars_data_ : chars_.data()),
           external_offset_(other.external_offset_),
-          logical_size_(other.logical_size_) {
+          logical_size_(other.logical_size_),
+          meta_(other.meta_) {
         other.offsets_data_ = nullptr;
         other.chars_data_ = nullptr;
         other.external_offset_ = 0;
@@ -1006,6 +1046,7 @@ class Column<std::string> {
         std::swap(chars_data_, other.chars_data_);
         std::swap(external_offset_, other.external_offset_);
         std::swap(logical_size_, other.logical_size_);
+        std::swap(meta_, other.meta_);
     }
 
     [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner,
@@ -1226,6 +1267,12 @@ class Column<std::string> {
         logical_size_ = offsets_.empty() ? 0 : offsets_.size() - 1;
         external_offset_ = 0;
     }
+
+    /// See `meta()`. Declared last so the hand-written constructors can append
+    /// it to their member-init lists without tripping -Wreorder. Four bytes,
+    /// and trivially copyable -- deliberately, since a column is copied per
+    /// chunk in the chunked paths.
+    ColumnMeta meta_;
 };
 
 /// Explicit specialisation for bool.
@@ -1236,6 +1283,12 @@ class Column<std::string> {
 template <>
 class Column<bool> {
    public:
+    /// What these values MEAN (e.g. the time zone of a Timestamp column), as
+    /// opposed to where the rows sit. It travels with the column: sharing,
+    /// copying, or gathering rows out of it all preserve it, because none of
+    /// those change what a value means. See `ColumnMeta`.
+    [[nodiscard]] auto meta() const noexcept -> const ColumnMeta& { return meta_; }
+    void set_meta(ColumnMeta meta) noexcept { meta_ = meta; }
     using value_type = bool;
     using size_type = std::size_t;
     using word_type = std::uint64_t;
@@ -1336,7 +1389,8 @@ class Column<bool> {
           bytes_data_(other.is_external() ? other.bytes_data_
                                           : reinterpret_cast<const std::uint8_t*>(words_.data())),
           external_offset_(other.external_offset_),
-          size_bits_(other.size_bits_) {}
+          size_bits_(other.size_bits_),
+          meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : words_(std::move(other.words_)),
@@ -1344,7 +1398,8 @@ class Column<bool> {
           bytes_data_(external_owner_ ? other.bytes_data_
                                       : reinterpret_cast<const std::uint8_t*>(words_.data())),
           external_offset_(other.external_offset_),
-          size_bits_(other.size_bits_) {
+          size_bits_(other.size_bits_),
+          meta_(other.meta_) {
         other.bytes_data_ = nullptr;
         other.external_offset_ = 0;
         other.size_bits_ = 0;
@@ -1372,6 +1427,7 @@ class Column<bool> {
         std::swap(bytes_data_, other.bytes_data_);
         std::swap(external_offset_, other.external_offset_);
         std::swap(size_bits_, other.size_bits_);
+        std::swap(meta_, other.meta_);
     }
 
     [[nodiscard]] static auto from_external(std::shared_ptr<const void> owner,
@@ -1535,6 +1591,12 @@ class Column<bool> {
         bytes_data_ = reinterpret_cast<const std::uint8_t*>(words_.data());
         external_offset_ = 0;
     }
+
+    /// See `meta()`. Declared last so the hand-written constructors can append
+    /// it to their member-init lists without tripping -Wreorder. Four bytes,
+    /// and trivially copyable -- deliberately, since a column is copied per
+    /// chunk in the chunked paths.
+    ColumnMeta meta_;
 };
 
 }  // namespace ibex

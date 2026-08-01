@@ -1518,7 +1518,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
                 // column on a q03-shaped scan — the join-key alignment idiom
                 // (`select { o_orderkey = l_orderkey }`) hits this on nearly
                 // every query.
-                output.add_column_shared(field.alias, entry->column, entry->validity);
+                output.add_column_from(field.alias, *entry);
                 continue;
             }
             if (scalars != nullptr) {
@@ -2653,7 +2653,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                 // column on a q03-shaped scan — the join-key alignment idiom
                 // (`select { o_orderkey = l_orderkey }`) hits this on nearly
                 // every query.
-                output.add_column_shared(field.alias, entry->column, entry->validity);
+                output.add_column_from(field.alias, *entry);
                 continue;
             }
             if (scalars != nullptr) {
@@ -2824,7 +2824,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 Table subset_source;
                 for (const auto& entry : output.columns) {
                     if (subset_refs.contains(entry.name)) {
-                        subset_source.add_column_shared(entry.name, entry.column, entry.validity);
+                        subset_source.add_column_from(entry.name, entry);
                     }
                 }
                 if (subset_source.columns.empty()) {

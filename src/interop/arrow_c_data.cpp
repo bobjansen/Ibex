@@ -774,7 +774,10 @@ auto export_column_schema(const runtime::ColumnEntry& entry, ArrowSchema* out_sc
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                 // Nanoseconds, plus the column's zone when it has one, so a
                 // zoned producer gets its own wall clock back rather than UTC.
-                set_format(entry.timezone.has_value() ? "tsn:" + *entry.timezone : "tsn:");
+                {
+                    const auto& zone = std::get<Column<Timestamp>>(*entry.column).meta().zone;
+                    set_format(zone.has_value() ? "tsn:" + zone_name(*zone) : "tsn:");
+                }
             } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                 set_format("u");
             } else if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
@@ -1160,7 +1163,10 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
             child_schema->format != nullptr ? child_schema->format : "";
         if (const auto timestamp = parse_timestamp_format(child_format);
             timestamp.has_value() && !timestamp->zone.empty()) {
-            table.columns[table.index.at(name)].timezone = timestamp->zone;
+            auto& stored = *table.columns[table.index.at(name)].column;
+            if (auto* stamps = std::get_if<Column<Timestamp>>(&stored)) {
+                stamps->set_meta(ColumnMeta{.zone = intern_zone(timestamp->zone)});
+            }
         }
     }
 

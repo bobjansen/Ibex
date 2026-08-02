@@ -388,7 +388,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         return std::unexpected(call.callee + ": unknown column '" + col_ref->name + "'");
     }
     // Source validity: nullptr means every element is valid (the common case).
-    // valid_at(j) is false only for true NULLs — never read col[j] when false.
+    // valid_at(j) is false only for true NULLs — never read the value when false.
     const auto* src_entry = table.find_entry(col_ref->name);
     const ValidityBitmap* sv =
         (src_entry != nullptr && src_entry->validity.has_value()) ? &*src_entry->validity : nullptr;
@@ -511,6 +511,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     ColT result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     T sum{};
                     std::size_t val_cnt = 0;  // non-null, non-NaN elements in window
@@ -522,24 +524,24 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (!valid_at(j))
                             return;
                         if constexpr (std::is_floating_point_v<T>) {
-                            if (std::isnan(col[j])) {
+                            if (std::isnan(col_values[j])) {
                                 ++nan_cnt;
                                 return;
                             }
                         }
-                        sum += col[j];
+                        sum += col_values[j];
                         ++val_cnt;
                     };
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
                         if constexpr (std::is_floating_point_v<T>) {
-                            if (std::isnan(col[j])) {
+                            if (std::isnan(col_values[j])) {
                                 --nan_cnt;
                                 return;
                             }
                         }
-                        sum -= col[j];
+                        sum -= col_values[j];
                         --val_cnt;
                     };
                     std::size_t lo = 0;
@@ -552,11 +554,11 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (nan_cnt > 0) {
                             // Only reachable for Float columns (Int has no NaN).
                             if constexpr (std::is_floating_point_v<T>)
-                                result[i] = std::numeric_limits<T>::quiet_NaN();
+                                result_values[i] = std::numeric_limits<T>::quiet_NaN();
                         } else if (val_cnt > 0) {
-                            result[i] = sum;
+                            result_values[i] = sum;
                         } else {
-                            result[i] = T{};  // window of only nulls -> null
+                            result_values[i] = T{};  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
@@ -620,6 +622,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     std::size_t nan_cnt = 0;  // valid-but-NaN values in window
                     // Only finite, non-null values enter the multisets; NULLs are
@@ -628,7 +632,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
@@ -637,7 +641,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto v = static_cast<double>(col[j]);
+                        auto v = static_cast<double>(col_values[j]);
                         if (std::isnan(v))
                             --nan_cnt;
                         else
@@ -651,16 +655,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             ++lo_ptr;
                         }
                         if (nan_cnt > 0) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                         } else if (lo.empty() && hi.empty()) {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
                         } else {
-                            result[i] = (lo.size() > hi.size())
-                                            ? static_cast<double>(*lo.rbegin())
-                                            : (*lo.rbegin() + *hi.begin()) / 2.0;
+                            result_values[i] = (lo.size() > hi.size())
+                                                   ? static_cast<double>(*lo.rbegin())
+                                                   : (*lo.rbegin() + *hi.begin()) / 2.0;
                         }
                     }
                     return ComputedColumn{.column = std::move(result),
@@ -686,6 +690,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // so keeping it out of the recurrence lets it clear on exit).
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     double mean = 0.0;
                     double m2 = 0.0;
@@ -694,7 +700,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto x = static_cast<double>(col[j]);
+                        auto x = static_cast<double>(col_values[j]);
                         if (std::isnan(x)) {
                             ++nan_cnt;
                             return;
@@ -707,7 +713,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
-                        auto y = static_cast<double>(col[j]);
+                        auto y = static_cast<double>(col_values[j]);
                         if (std::isnan(y)) {
                             --nan_cnt;
                             return;
@@ -727,15 +733,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             ++lo;
                         }
                         if (nan_cnt > 0) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                         } else if (cnt == 0) {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
                         } else {
                             // Clamp away tiny negative m2 from floating-point drift.
-                            result[i] =
+                            result_values[i] =
                                 cnt < 2
                                     ? 0.0
                                     : std::sqrt(std::max(0.0, m2) / static_cast<double>(cnt - 1));
@@ -776,10 +782,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // `lo` is monotonic: each row enters once on the right and is
                     // dropped once on the left. The windowed EWMA restarts at each
                     // window's first element (the seed), which expands to
-                    //   result[i] = alpha*R_i + (1-alpha)*beta^(i-lo)*col[lo]
-                    // with R_i = sum_{j=lo..i} beta^(i-j)*col[j], maintained as
-                    //   add right:  R = beta*R + col[i]
-                    //   drop left:  R -= beta^(i-lo)*col[lo]
+                    //   result_values[i] = alpha*R_i + (1-alpha)*beta^(i-lo)*col_values[lo]
+                    // with R_i = sum_{j=lo..i} beta^(i-j)*col_values[j], maintained as
+                    //   add right:  R = beta*R + col_values[i]
+                    //   drop left:  R -= beta^(i-lo)*col_values[lo]
                     // reproducing the from-scratch O(n*w) recurrence in one pass.
                     // beta_pow caches beta^k (k bounded by the window width).
                     //
@@ -789,11 +795,13 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // payload is never read. (NaN still propagates through the
                     // recurrence; genuine NaNs in an EWMA input are out of scope.)
                     const double beta = 1.0 - alpha;
+                    const auto* col_values = col.data();
                     auto val = [&](std::size_t j) -> double {
-                        return valid_at(j) ? static_cast<double>(col[j]) : 0.0;
+                        return valid_at(j) ? static_cast<double>(col_values[j]) : 0.0;
                     };
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
                     std::vector<double> beta_pow{1.0};  // beta_pow[k] == beta^k
                     beta_pow.reserve(64);
                     auto bpow = [&](std::size_t k) -> double {
@@ -804,12 +812,12 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     double r = 0.0;
                     std::size_t lo = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        r = (beta * r) + val(i);  // add col[i] at weight 1
+                        r = (beta * r) + val(i);  // add col_values[i] at weight 1
                         while (lo < i && should_drop(lo, i)) {
                             r -= bpow(i - lo) * val(lo);
                             ++lo;
                         }
-                        result[i] = (alpha * r) + ((1.0 - alpha) * bpow(i - lo) * val(lo));
+                        result_values[i] = (alpha * r) + ((1.0 - alpha) * bpow(i - lo) * val(lo));
                     }
                     return ComputedColumn{.column = std::move(result), .validity = std::nullopt};
                 }
@@ -844,6 +852,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
@@ -854,18 +864,18 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            auto v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col_values[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
                                 window.push_back(v);
                         }
                         if (has_nan) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                             continue;
                         }
                         if (window.empty()) {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
@@ -877,7 +887,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         auto idx_lo = static_cast<std::size_t>(idx);
                         const std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
                         const double frac = idx - static_cast<double>(idx_lo);
-                        result[i] = window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
+                        result_values[i] =
+                            window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
                     }
                     return ComputedColumn{.column = std::move(result),
                                           .validity = std::move(out_valid)};
@@ -895,6 +906,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
@@ -904,18 +917,18 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            auto v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col_values[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
                                 window.push_back(v);
                         }
                         if (has_nan) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                             continue;
                         }
                         if (window.empty()) {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
@@ -923,7 +936,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         }
                         const std::size_t n = window.size();
                         if (n < 3) {
-                            result[i] = 0.0;
+                            result_values[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
@@ -938,10 +951,10 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             m3 += d * d * d;
                         }
                         if (m2 == 0.0) {
-                            result[i] = 0.0;
+                            result_values[i] = 0.0;
                         } else {
                             auto dn = static_cast<double>(n);
-                            result[i] =
+                            result_values[i] =
                                 (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
                         }
                     }
@@ -962,6 +975,8 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     Column<double> result;
                     result.resize(rows);
+                    auto* result_values = result.data();
+                    const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     std::vector<double> window;
                     for (std::size_t i = 0; i < rows; ++i) {
@@ -971,18 +986,18 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         for (std::size_t j = lo; j <= i; ++j) {
                             if (!valid_at(j))
                                 continue;
-                            auto v = static_cast<double>(col[j]);
+                            auto v = static_cast<double>(col_values[j]);
                             if (std::isnan(v))
                                 has_nan = true;
                             else
                                 window.push_back(v);
                         }
                         if (has_nan) {
-                            result[i] = std::numeric_limits<double>::quiet_NaN();
+                            result_values[i] = std::numeric_limits<double>::quiet_NaN();
                             continue;
                         }
                         if (window.empty()) {
-                            result[i] = 0.0;  // window of only nulls -> null
+                            result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
@@ -990,7 +1005,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         }
                         const std::size_t n = window.size();
                         if (n < 4) {
-                            result[i] = 0.0;
+                            result_values[i] = 0.0;
                             continue;
                         }
                         double mean = 0.0;
@@ -1006,12 +1021,13 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             m4 += d2 * d2;
                         }
                         if (m2 == 0.0) {
-                            result[i] = 0.0;
+                            result_values[i] = 0.0;
                         } else {
                             auto dn = static_cast<double>(n);
                             // Fisher excess kurtosis (unbiased, matches scipy/pandas):
-                            result[i] = (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
-                                        (((dn + 1.0) * dn * m4 / (m2 * m2)) - (3.0 * (dn - 1.0)));
+                            result_values[i] =
+                                (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+                                (((dn + 1.0) * dn * m4 / (m2 * m2)) - (3.0 * (dn - 1.0)));
                         }
                     }
                     return ComputedColumn{.column = std::move(result),
@@ -1076,6 +1092,21 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 ColT result;
                 result.resize(rows);
                 std::optional<ValidityBitmap> out_valid;
+                // Unlike the other rolling kernels this one also instantiates
+                // for `Column<bool>`, which is bit-packed and has no dense
+                // `data()`. The numeric instantiations still get the hoisted
+                // pointer; bool keeps the per-element path it has to use.
+                T* result_values = nullptr;
+                if constexpr (is_dense_column_v<ColT>) {
+                    result_values = result.data();
+                }
+                auto set_at = [&](std::size_t idx, T value) {
+                    if constexpr (is_dense_column_v<ColT>) {
+                        result_values[idx] = value;
+                    } else {
+                        result[idx] = value;
+                    }
+                };
                 // Array-backed monotonic deque of candidate-extremum row indices.
                 // It reuses expired front slots, so memory tracks the live window
                 // width instead of total input rows.
@@ -1120,11 +1151,11 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         }
                         if (nan_cnt > 0) {
                             if constexpr (std::is_floating_point_v<T>)
-                                result[i] = std::numeric_limits<T>::quiet_NaN();
+                                set_at(i, std::numeric_limits<T>::quiet_NaN());
                         } else if (!dq.empty()) {
-                            result[i] = col[dq.front()];
+                            set_at(i, col[dq.front()]);
                         } else {
-                            result[i] = T{};  // window of only nulls -> null
+                            set_at(i, T{});  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);

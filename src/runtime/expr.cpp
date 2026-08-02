@@ -2399,10 +2399,10 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
             const T fill_val = *maybe_fill;
 
             ColT result;
-            result.reserve(rows);
+            ColumnAppender<ColT> out(result, rows);
             for (std::size_t i = 0; i < rows; ++i) {
                 const bool is_null_row = has_validity && !(*entry->validity)[i];
-                result.push_back(is_null_row ? fill_val : col[i]);
+                out.push(is_null_row ? fill_val : col[i]);
             }
             // All rows are now valid (nulls replaced).
             return FillResult{std::move(result), std::nullopt};
@@ -2439,7 +2439,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
             using ColT = std::decay_t<decltype(col)>;
             using T = ColT::value_type;
             ColT result;
-            result.reserve(rows);
+            ColumnAppender<ColT> out(result, rows);
             std::optional<ValidityBitmap> out_validity;
 
             // carry: last seen valid value (safe for string_view: points into source col).
@@ -2448,14 +2448,14 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
 
             for (std::size_t i = 0; i < rows; ++i) {
                 if (validity[i]) {
-                    result.push_back(col[i]);
+                    out.push(col[i]);
                     carry = col[i];
                     have_carry = true;
                 } else if (have_carry) {
-                    result.push_back(carry);
+                    out.push(carry);
                 } else {
                     // Leading null — no value to carry; stays null.
-                    result.push_back(T{});
+                    out.push(T{});
                     if (!out_validity) {
                         out_validity.emplace(rows, true);
                     }
@@ -2520,11 +2520,11 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
                     out_validity->set(i, false);
                 }
             }
-            // Build the output column using push_back (safe for all column types).
+            // Build the output column, resolving its storage once.
             ColT result;
-            result.reserve(rows);
+            ColumnAppender<ColT> out(result, rows);
             for (std::size_t i = 0; i < rows; ++i) {
-                result.push_back(vals[i]);
+                out.push(vals[i]);
             }
             return FillResult{std::move(result), std::move(out_validity)};
         },

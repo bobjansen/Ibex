@@ -188,6 +188,76 @@ struct LikeArg {
     std::string_view scalar;  // meaningful only when neither column is set
 };
 
+/// The arguments common to the two zone casts, already validated and resolved.
+struct ZoneCallArgs {
+    const std::chrono::time_zone* zone = nullptr;
+    const std::string* zone_text = nullptr;  // borrowed from the literal in `call`
+    const ColumnEntry* entry = nullptr;
+    const Column<Timestamp>* stamps = nullptr;
+};
+
+/// Both zone casts take the same shape -- `f(timestamp_column, "Zone")` -- and
+/// differ only in what they do once the pieces are in hand, so the checking and
+/// the error wording live here once, parameterised by the caller's name.
+auto resolve_zone_call(std::string_view fn, const ir::CallExpr& call, const Table& input)
+    -> std::expected<ZoneCallArgs, std::string> {
+    const std::string prefix(fn);
+    if (call.args.size() != 2) {
+        return std::unexpected(prefix + ": expected 2 arguments (column, zone)");
+    }
+    const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node);
+    const auto* zone_text = lit != nullptr ? std::get_if<std::string>(&lit->value) : nullptr;
+    if (zone_text == nullptr) {
+        return std::unexpected(prefix + ": the zone must be a String literal");
+    }
+
+    const std::chrono::time_zone* zone = nullptr;
+    try {
+        zone = std::chrono::locate_zone(*zone_text);
+    } catch (const std::exception&) {
+        return std::unexpected(prefix + ": unknown time zone '" + *zone_text + "'");
+    }
+
+    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    if (col_ref == nullptr) {
+        return std::unexpected(prefix + ": first argument must be a column name");
+    }
+    const auto* entry = input.find_entry(col_ref->name);
+    if (entry == nullptr) {
+        return std::unexpected(prefix + ": unknown column '" + col_ref->name + "'");
+    }
+    const auto* stamps = std::get_if<Column<Timestamp>>(entry->column.get());
+    if (stamps == nullptr) {
+        return std::unexpected(prefix + ": '" + col_ref->name + "' is not a Timestamp column");
+    }
+    return ZoneCallArgs{.zone = zone, .zone_text = zone_text, .entry = entry, .stamps = stamps};
+}
+
+/// `in_timezone(ts, "Zone")` -- tag a Timestamp column with `Zone`, leaving every
+/// instant exactly as it was.
+///
+/// The sibling of `with_timezone`, and the two are worth keeping straight because
+/// they are opposites:
+///
+///   * `with_timezone` says the VALUES are wrong -- they are wall clocks that
+///     were mistaken for instants -- and shifts them.
+///   * `in_timezone` says the values are already right and only the RENDERING
+///     was missing, so it changes nothing but the label.
+///
+/// The label is not merely cosmetic: `resample` cuts on local boundaries once a
+/// zone is present, so relabelling a correct UTC column moves its day boundaries
+/// onto the zone's calendar without moving any of its data.
+auto eval_in_timezone(const ir::CallExpr& call, const Table& input)
+    -> std::expected<ComputedColumn, std::string> {
+    auto args = resolve_zone_call("in_timezone", call, input);
+    if (!args) {
+        return std::unexpected(args.error());
+    }
+    Column<Timestamp> out = *args->stamps;
+    out.set_meta(ColumnMeta{.zone = intern_zone(*args->zone_text)});
+    return ComputedColumn{.column = ColumnValue{std::move(out)}, .validity = args->entry->validity};
+}
+
 /// `with_timezone(ts, "Zone")` -- reinterpret a Timestamp column's values as
 /// wall-clock readings in `Zone`, convert them to the instants they denote, and
 /// tag the column with the zone.
@@ -206,34 +276,14 @@ struct LikeArg {
 ///     the whole query over one bad row would be worse than saying so per row.
 auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
     -> std::expected<ComputedColumn, std::string> {
-    if (call.args.size() != 2) {
-        return std::unexpected("with_timezone: expected 2 arguments (column, zone)");
+    auto args = resolve_zone_call("with_timezone", call, input);
+    if (!args) {
+        return std::unexpected(args.error());
     }
-    const auto* lit = std::get_if<ir::Literal>(&call.args[1]->node);
-    const auto* zone_text = lit != nullptr ? std::get_if<std::string>(&lit->value) : nullptr;
-    if (zone_text == nullptr) {
-        return std::unexpected("with_timezone: the zone must be a String literal");
-    }
-
-    const std::chrono::time_zone* zone = nullptr;
-    try {
-        zone = std::chrono::locate_zone(*zone_text);
-    } catch (const std::exception&) {
-        return std::unexpected("with_timezone: unknown time zone '" + *zone_text + "'");
-    }
-
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
-    if (col_ref == nullptr) {
-        return std::unexpected("with_timezone: first argument must be a column name");
-    }
-    const auto* entry = input.find_entry(col_ref->name);
-    if (entry == nullptr) {
-        return std::unexpected("with_timezone: unknown column '" + col_ref->name + "'");
-    }
-    const auto* stamps = std::get_if<Column<Timestamp>>(entry->column.get());
-    if (stamps == nullptr) {
-        return std::unexpected("with_timezone: '" + col_ref->name + "' is not a Timestamp column");
-    }
+    const std::chrono::time_zone* zone = args->zone;
+    const std::string* zone_text = args->zone_text;
+    const auto* entry = args->entry;
+    const auto* stamps = args->stamps;
 
     Column<Timestamp> out;
     out.reserve(stamps->size());
@@ -1153,6 +1203,25 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                                               const ColumnEvalCtx&)
                                                 -> std::expected<ComputedColumn, std::string> {
                           return eval_with_timezone(call, input);
+                      }},
+                  });
+
+        m.emplace("in_timezone",
+                  BuiltinFn{
+                      .min_args = 2,
+                      .max_args = 2,
+                      .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                          if (a.size() != 2) {
+                              return std::unexpected(std::string(name) +
+                                                     ": expected 2 arguments (column, zone)");
+                          }
+                          return ExprType::Timestamp;
+                      },
+                      .exec = TransformExec{.column_eval = [](const ir::CallExpr& call,
+                                                              const Table& input, std::size_t,
+                                                              const ColumnEvalCtx&)
+                                                -> std::expected<ComputedColumn, std::string> {
+                          return eval_in_timezone(call, input);
                       }},
                   });
 

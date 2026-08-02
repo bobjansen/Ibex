@@ -1612,4 +1612,64 @@ class Column<bool> {
     ColumnMeta meta_;
 };
 
+/// Whether `ColT` stores elements as a dense array of `value_type`, so a kernel
+/// can size it once and write through `data()`.
+///
+/// The three specializations are all false: `Column<bool>` bit-packs,
+/// `Column<Categorical>` stores codes against a dictionary, and
+/// `Column<std::string>` a flat character buffer with offsets — in none of them
+/// is `value_type` what is actually stored. `ColumnAppender` is the intended
+/// consumer; see it for why the distinction is worth making.
+template <typename ColT>
+inline constexpr bool is_dense_column_v = false;
+template <typename T>
+inline constexpr bool is_dense_column_v<Column<T>> = true;
+template <>
+inline constexpr bool is_dense_column_v<Column<bool>> = false;
+template <>
+inline constexpr bool is_dense_column_v<Column<Categorical>> = false;
+template <>
+inline constexpr bool is_dense_column_v<Column<std::string>> = false;
+
+/// Fills a column of known length front-to-back, resolving its storage once.
+///
+/// A `Column` may hold adopted (Arrow) storage, so `push_back` tests which
+/// storage is in use on every call. That check costs more than the append
+/// itself in a per-row kernel, and it cannot be hoisted by the compiler because
+/// the branch it guards may change the state it tests. Resolving it here, once,
+/// is what a hand-hoisted `data()` pointer does — but this also works in a
+/// kernel generic over every column type, which is why the fill and rolling
+/// kernels could not simply hoist.
+///
+/// The row count must be exact: dense columns are sized up front, so pushing
+/// more than `rows` writes out of bounds. Kernels that emit one value per input
+/// row (which is all of them here) satisfy that by construction.
+template <typename ColT>
+class ColumnAppender {
+   public:
+    using value_type = typename ColT::value_type;
+
+    ColumnAppender(ColT& column, std::size_t rows) : column_(&column) {
+        if constexpr (is_dense_column_v<ColT>) {
+            column_->resize(rows);
+            out_ = column_->data();
+        } else {
+            column_->reserve(rows);
+        }
+    }
+
+    void push(const value_type& value) {
+        if constexpr (is_dense_column_v<ColT>) {
+            out_[next_++] = value;
+        } else {
+            column_->push_back(value);
+        }
+    }
+
+   private:
+    ColT* column_;
+    value_type* out_ = nullptr;
+    std::size_t next_ = 0;
+};
+
 }  // namespace ibex

@@ -270,7 +270,13 @@ The zone travels with the column, not with the table: any operator that copies,
 gathers, or projects a column preserves it, because none of those change what a
 value means.
 
-Two operations read it.
+Three operations read it.
+
+**`in_timezone(ts, "Zone")`** tags a Timestamp column with `Zone` and leaves
+every value untouched. It is the cast for data that is already correct and merely
+unlabelled — instants imported without a zone, or computed ones. The label is not
+cosmetic: once a zone is present, `resample` cuts on that zone's calendar, so
+relabelling moves a column's day boundaries without moving any of its data.
 
 **`with_timezone(ts, "Zone")`** reinterprets a Timestamp column's values as wall
 clocks in `Zone`, converts them to the instants they denote, and tags the result
@@ -280,6 +286,11 @@ time*, so it stays correct across a DST boundary where a fixed offset does not.
 A local time that occurs twice (clocks going back) resolves to the earlier
 instant; one that never occurs (clocks going forward) yields null, since there is
 no instant it names.
+
+The two are opposites and easy to confuse, so: `in_timezone` changes the label,
+`with_timezone` changes the values. If the column already holds the right
+instants, it is always `in_timezone`. Only `with_timezone` can produce nulls,
+because only it has to name an instant for a wall clock that may not have one.
 
 **`resample`** cuts on local boundaries when its time index carries a zone, and
 on the UTC grid when it does not. A day is not 86400 seconds everywhere — the

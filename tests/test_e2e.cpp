@@ -3057,6 +3057,80 @@ TEST_CASE("E2E: with_timezone rejects an unknown zone", "[e2e][timezone]") {
     CHECK(err.find("unknown time zone") != std::string::npos);
 }
 
+// `in_timezone(ts, "Zone")` is the other half of the pair: it tags a column with
+// a zone and leaves every instant alone. The two are opposites, and the round
+// trip is the clearest statement of that -- `with_timezone` moves the values,
+// `in_timezone` moves nothing.
+TEST_CASE("E2E: in_timezone relabels without shifting", "[e2e][timezone]") {
+    runtime::Table t;
+    t.add_column("ts", Column<Timestamp>{
+                           Timestamp{1'357'083'000'000'000'000},  // January, zone is UTC-5
+                           Timestamp{1'372'929'300'000'000'000},  // July, zone is UTC-4
+                       });
+    runtime::TableRegistry tables{{"t", t}};
+
+    auto out =
+        run("t[update { tagged = in_timezone(ts, \"America/New_York\"),\n"
+            "           shifted = with_timezone(ts, \"America/New_York\") }];",
+            tables);
+
+    const auto* tagged = std::get_if<Column<Timestamp>>(out.find("tagged"));
+    REQUIRE(tagged != nullptr);
+    CHECK((*tagged)[0].nanos == 1'357'083'000'000'000'000);
+    CHECK((*tagged)[1].nanos == 1'372'929'300'000'000'000);
+    REQUIRE(tagged->meta().zone.has_value());
+    CHECK(zone_name(*tagged->meta().zone) == "America/New_York");
+
+    // Same zone, same input, different answer: that is the whole distinction.
+    const auto* shifted = std::get_if<Column<Timestamp>>(out.find("shifted"));
+    REQUIRE(shifted != nullptr);
+    CHECK((*shifted)[0].nanos != (*tagged)[0].nanos);
+}
+
+// Nothing about a DST transition is irregular for a relabel: the values are
+// already instants, and every instant exists in every zone. The wall clocks that
+// `with_timezone` has to reject or disambiguate are simply not consulted here.
+TEST_CASE("E2E: in_timezone is total across DST transitions", "[e2e][timezone]") {
+    runtime::Table t;
+    t.add_column("ts", Column<Timestamp>{
+                           Timestamp{1'362'882'600'000'000'000},  // 02:30 local, skipped that day
+                           Timestamp{1'383'442'200'000'000'000},  // 01:30 local, repeated that day
+                       });
+    runtime::TableRegistry tables{{"t", t}};
+
+    auto out = run("t[update { x = in_timezone(ts, \"America/New_York\") }];", tables);
+    const auto* entry = out.find_entry("x");
+    REQUIRE(entry != nullptr);
+    CHECK_FALSE(entry->validity.has_value());
+    const auto* x = std::get_if<Column<Timestamp>>(entry->column.get());
+    REQUIRE(x != nullptr);
+    CHECK((*x)[0].nanos == 1'362'882'600'000'000'000);
+    CHECK((*x)[1].nanos == 1'383'442'200'000'000'000);
+}
+
+TEST_CASE("E2E: in_timezone preserves nulls and rejects bad arguments", "[e2e][timezone]") {
+    runtime::ValidityBitmap ts_valid;
+    ts_valid.push_back(true);
+    ts_valid.push_back(false);
+
+    runtime::Table t;
+    t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{0}}, ts_valid);
+    t.add_column("n", Column<std::int64_t>{1, 2});
+    runtime::TableRegistry tables{{"t", t}};
+
+    auto out = run("t[update { x = in_timezone(ts, \"Europe/Amsterdam\") }];", tables);
+    const auto* entry = out.find_entry("x");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0]);
+    CHECK_FALSE((*entry->validity)[1]);
+
+    CHECK(run_error("t[update { x = in_timezone(ts, \"Mars/Olympus\") }];", tables)
+              .find("unknown time zone") != std::string::npos);
+    CHECK(run_error("t[update { x = in_timezone(n, \"UTC\") }];", tables)
+              .find("not a Timestamp column") != std::string::npos);
+}
+
 // A day is not 86400 seconds everywhere. Bucketing zoned data on the UTC grid
 // answers a different question than the one asked -- over nycflights13 it moves
 // 11% of departures into a different calendar day.
@@ -3080,14 +3154,19 @@ TEST_CASE("E2E: resample cuts on local boundaries for a zoned index", "[e2e][tim
     }
 
     SECTION("a zoned index cuts at local midnight") {
-        // `with_timezone` here only tags: these instants are already correct, so
-        // the fixture re-derives them from the local readings it wants.
+        // These instants are already correct, so the fixture only needs to say
+        // which calendar to cut them on -- that is `in_timezone`, not
+        // `with_timezone`, which would shift them.
         auto out =
-            run("let local = t[update { ts = with_timezone(ts, \"UTC\") }];\n"
-                "let tagged = local[update { ts = with_timezone(ts, \"America/New_York\") }];\n"
+            run("let tagged = t[update { ts = in_timezone(ts, \"America/New_York\") }];\n"
                 "let tf = as_timeframe(tagged, \"ts\");\n"
                 "tf[resample 1d, select { n = count() }];",
                 tables);
+        // Locally the four readings are 01-01 07:00, 01-01 20:00, 01-02 01:00
+        // and 01-02 07:00, so local midnight splits them 2/2 where UTC split
+        // them 1/3.
+        REQUIRE(out.rows() == 2);
+        CHECK(col_i64(out, "n") == std::vector<std::int64_t>{2, 2});
         // Every bucket boundary is a local midnight, i.e. 05:00 UTC in January.
         const auto* ts = std::get_if<Column<Timestamp>>(out.find("ts"));
         REQUIRE(ts != nullptr);

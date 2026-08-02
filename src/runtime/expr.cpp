@@ -2298,15 +2298,23 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
             using ColT = std::decay_t<decltype(col)>;
             using T = ColT::value_type;
             if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                // Both ends are hoisted out of the loop on purpose. A Column
+                // may hold adopted (Arrow) storage, so every `col[i]` and every
+                // `push_back` would otherwise re-test which storage is in use —
+                // two branches per row, against ~1 cycle of real work. Resolving
+                // the pointers once costs the same branch twice in total.
                 ColT result;
-                result.reserve(rows);
+                result.resize(rows);
+                const T* in = col.data();
+                T* out = result.data();
                 T acc = is_prod ? T{1} : T{0};
                 for (std::size_t i = 0; i < rows; ++i) {
-                    if (is_prod)
-                        acc *= col[i];
-                    else
-                        acc += col[i];
-                    result.push_back(acc);
+                    if (is_prod) {
+                        acc *= in[i];
+                    } else {
+                        acc += in[i];
+                    }
+                    out[i] = acc;
                 }
                 return result;
             } else {

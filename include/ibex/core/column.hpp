@@ -127,17 +127,17 @@ class Column {
     Column(const Column& other)
         : data_(other.is_external() ? storage_type{} : other.data_),
           external_owner_(other.external_owner_),
-          external_data_(other.is_external() ? other.external_data_ : data_.data()),
-          external_offset_(other.external_offset_),
-          external_size_(other.external_size_),
+          external_data_(other.is_external() ? other.external_data_ : nullptr),
+          external_offset_(other.is_external() ? other.external_offset_ : 0),
+          external_size_(other.is_external() ? other.external_size_ : 0),
           meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : data_(std::move(other.data_)),
           external_owner_(std::move(other.external_owner_)),
-          external_data_(external_owner_ ? other.external_data_ : data_.data()),
-          external_offset_(other.external_offset_),
-          external_size_(other.external_size_),
+          external_data_(external_owner_ ? other.external_data_ : nullptr),
+          external_offset_(external_owner_ ? other.external_offset_ : 0),
+          external_size_(external_owner_ ? other.external_size_ : 0),
           meta_(other.meta_) {
         other.external_data_ = nullptr;
         other.external_offset_ = 0;
@@ -587,15 +587,12 @@ class Column<Categorical> {
 
     Column()
         : dict_(std::make_shared<std::vector<std::string>>()),
-          index_(std::make_shared<index_map>()) {
-        sync_owned_codes();
-    }
+          index_(std::make_shared<index_map>()) {}
 
     explicit Column(std::vector<std::string> dict)
         : dict_(std::make_shared<std::vector<std::string>>(std::move(dict))),
           index_(std::make_shared<index_map>()) {
         rebuild_index();
-        sync_owned_codes();
     }
 
     Column(std::vector<std::string> dict, std::vector<code_type> codes)
@@ -603,23 +600,20 @@ class Column<Categorical> {
           index_(std::make_shared<index_map>()),
           codes_(std::move(codes)) {
         rebuild_index();
-        sync_owned_codes();
     }
 
     Column(std::shared_ptr<std::vector<std::string>> dict, std::shared_ptr<index_map> index,
            std::vector<code_type> codes = {})
-        : dict_(std::move(dict)), index_(std::move(index)), codes_(std::move(codes)) {
-        sync_owned_codes();
-    }
+        : dict_(std::move(dict)), index_(std::move(index)), codes_(std::move(codes)) {}
 
     Column(const Column& other)
         : dict_(other.dict_),
           index_(other.index_),
           codes_(other.codes_are_external() ? std::vector<code_type>{} : other.codes_),
           external_codes_owner_(other.external_codes_owner_),
-          codes_data_(other.codes_are_external() ? other.codes_data_ : codes_.data()),
-          codes_offset_(other.codes_offset_),
-          logical_size_(other.logical_size_),
+          codes_data_(other.codes_are_external() ? other.codes_data_ : nullptr),
+          codes_offset_(other.codes_are_external() ? other.codes_offset_ : 0),
+          logical_size_(other.codes_are_external() ? other.logical_size_ : 0),
           external_dict_owner_(other.external_dict_owner_),
           dict_offsets_data_(other.dict_offsets_data_),
           dict_chars_data_(other.dict_chars_data_),
@@ -633,9 +627,9 @@ class Column<Categorical> {
           index_(std::move(other.index_)),
           codes_(std::move(other.codes_)),
           external_codes_owner_(std::move(other.external_codes_owner_)),
-          codes_data_(external_codes_owner_ ? other.codes_data_ : codes_.data()),
-          codes_offset_(other.codes_offset_),
-          logical_size_(other.logical_size_),
+          codes_data_(external_codes_owner_ ? other.codes_data_ : nullptr),
+          codes_offset_(external_codes_owner_ ? other.codes_offset_ : 0),
+          logical_size_(external_codes_owner_ ? other.logical_size_ : 0),
           external_dict_owner_(std::move(other.external_dict_owner_)),
           dict_offsets_data_(other.dict_offsets_data_),
           dict_chars_data_(other.dict_chars_data_),
@@ -724,9 +718,11 @@ class Column<Categorical> {
     [[nodiscard]] auto is_external() const noexcept -> bool {
         return codes_are_external() || dictionary_is_external();
     }
-    [[nodiscard]] auto buffer_offset() const noexcept -> size_type { return codes_offset_; }
+    [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
+        return codes_are_external() ? codes_offset_ : 0;
+    }
     [[nodiscard]] auto codes_buffer_data() const noexcept -> const code_type* {
-        return codes_data_;
+        return codes_are_external() ? codes_data_ : codes_.data();
     }
     [[nodiscard]] auto dictionary_buffer_offset() const noexcept -> size_type {
         return dict_offset_;
@@ -741,8 +737,12 @@ class Column<Categorical> {
         return dictionary_is_external() ? dict_size_ : (dict_ == nullptr ? 0 : dict_->size());
     }
 
-    [[nodiscard]] auto size() const noexcept -> size_type { return logical_size_; }
-    [[nodiscard]] auto empty() const noexcept -> bool { return logical_size_ == 0; }
+    /// Reads resolve the storage in use rather than a mirror kept in step by
+    /// every mutation; see the same change on the primary template.
+    [[nodiscard]] auto size() const noexcept -> size_type {
+        return codes_are_external() ? logical_size_ : codes_.size();
+    }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size() == 0; }
 
     [[nodiscard]] auto operator[](size_type idx) const noexcept -> value_type {
         if (dictionary_size() == 0) {
@@ -752,13 +752,12 @@ class Column<Categorical> {
     }
 
     [[nodiscard]] auto code_at(size_type idx) const noexcept -> code_type {
-        return codes_data_[codes_offset_ + idx];
+        return codes_are_external() ? codes_data_[codes_offset_ + idx] : codes_[idx];
     }
 
     void push_code(code_type code) {
         detach_codes();
         codes_.push_back(code);
-        sync_owned_codes();
     }
 
     /// Bulk-append already-resolved codes (e.g. from another Column<Categorical>
@@ -769,7 +768,6 @@ class Column<Categorical> {
     void append_codes(InputIt first, InputIt last) {
         detach_codes();
         codes_.insert(codes_.end(), first, last);
-        sync_owned_codes();
     }
 
     void push_back(value_type value) {
@@ -777,24 +775,20 @@ class Column<Categorical> {
         detach_codes();
         auto code = find_or_insert(value);
         codes_.push_back(code);
-        sync_owned_codes();
     }
 
     void reserve(size_type capacity) {
         detach_codes();
         codes_.reserve(capacity);
-        sync_owned_codes();
     }
     void clear() noexcept {
         external_codes_owner_.reset();
         codes_.clear();
-        sync_owned_codes();
     }
 
     void resize(size_type count) {
         detach_codes();
         codes_.resize(count, 0);
-        sync_owned_codes();
     }
 
     [[nodiscard]] auto dictionary() const -> const std::vector<std::string>& {
@@ -822,6 +816,9 @@ class Column<Categorical> {
         return codes_.data();
     }
     [[nodiscard]] auto codes_data() const noexcept -> const code_type* {
+        if (!codes_are_external()) {
+            return codes_.data();
+        }
         return codes_data_ == nullptr ? nullptr : codes_data_ + codes_offset_;
     }
 
@@ -917,13 +914,6 @@ class Column<Categorical> {
         }
         materialize_codes_cache();
         external_codes_owner_.reset();
-        sync_owned_codes();
-    }
-
-    void sync_owned_codes() noexcept {
-        codes_data_ = codes_.data();
-        codes_offset_ = 0;
-        logical_size_ = codes_.size();
     }
 
     mutable std::shared_ptr<std::vector<std::string>> dict_;
@@ -984,10 +974,7 @@ class Column<std::string> {
     using size_type = std::size_t;
 
     // Default: empty column ready to receive push_backs.
-    Column() {
-        offsets_.push_back(0);
-        sync_owned_view();
-    }
+    Column() { offsets_.push_back(0); }
 
     // From vector<string> (used by CSV reader).
     explicit Column(const std::vector<std::string>& vals) {
@@ -1001,7 +988,6 @@ class Column<std::string> {
             chars_.insert(chars_.end(), s.begin(), s.end());
             offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
         }
-        sync_owned_view();
     }
 
     // Initializer list (used in REPL, tests); const char* → string_view is implicit.
@@ -1014,20 +1000,20 @@ class Column<std::string> {
         : offsets_(other.is_external() ? decltype(offsets_){} : other.offsets_),
           chars_(other.is_external() ? decltype(chars_){} : other.chars_),
           external_owner_(other.external_owner_),
-          offsets_data_(other.is_external() ? other.offsets_data_ : offsets_.data()),
-          chars_data_(other.is_external() ? other.chars_data_ : chars_.data()),
-          external_offset_(other.external_offset_),
-          logical_size_(other.logical_size_),
+          offsets_data_(other.is_external() ? other.offsets_data_ : nullptr),
+          chars_data_(other.is_external() ? other.chars_data_ : nullptr),
+          external_offset_(other.is_external() ? other.external_offset_ : 0),
+          logical_size_(other.is_external() ? other.logical_size_ : 0),
           meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : offsets_(std::move(other.offsets_)),
           chars_(std::move(other.chars_)),
           external_owner_(std::move(other.external_owner_)),
-          offsets_data_(external_owner_ ? other.offsets_data_ : offsets_.data()),
-          chars_data_(external_owner_ ? other.chars_data_ : chars_.data()),
-          external_offset_(other.external_offset_),
-          logical_size_(other.logical_size_),
+          offsets_data_(external_owner_ ? other.offsets_data_ : nullptr),
+          chars_data_(external_owner_ ? other.chars_data_ : nullptr),
+          external_offset_(external_owner_ ? other.external_offset_ : 0),
+          logical_size_(external_owner_ ? other.logical_size_ : 0),
           meta_(other.meta_) {
         other.offsets_data_ = nullptr;
         other.chars_data_ = nullptr;
@@ -1087,14 +1073,26 @@ class Column<std::string> {
     [[nodiscard]] auto is_external() const noexcept -> bool {
         return static_cast<bool>(external_owner_);
     }
-    [[nodiscard]] auto buffer_offset() const noexcept -> size_type { return external_offset_; }
-    [[nodiscard]] auto offsets_buffer_data() const noexcept -> const std::uint32_t* {
-        return offsets_data_;
+    [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
+        return is_external() ? external_offset_ : 0;
     }
-    [[nodiscard]] auto chars_buffer_data() const noexcept -> const char* { return chars_data_; }
+    [[nodiscard]] auto offsets_buffer_data() const noexcept -> const std::uint32_t* {
+        return is_external() ? offsets_data_ : offsets_.data();
+    }
+    [[nodiscard]] auto chars_buffer_data() const noexcept -> const char* {
+        return is_external() ? chars_data_ : chars_.data();
+    }
 
-    [[nodiscard]] auto size() const noexcept -> size_type { return logical_size_; }
-    [[nodiscard]] auto empty() const noexcept -> bool { return logical_size_ == 0; }
+    /// Reads resolve the storage in use rather than a mirror kept in step by
+    /// every mutation; see the same change on the primary template. Appending a
+    /// string wrote four members per call for the benefit of these reads.
+    [[nodiscard]] auto size() const noexcept -> size_type {
+        if (is_external()) {
+            return logical_size_;
+        }
+        return offsets_.empty() ? 0 : offsets_.size() - 1;
+    }
+    [[nodiscard]] auto empty() const noexcept -> bool { return size() == 0; }
 
     [[nodiscard]] auto operator[](size_type i) const noexcept -> std::string_view {
         const auto* offsets = offsets_data();
@@ -1103,7 +1101,7 @@ class Column<std::string> {
         if (start == end) {
             return {};
         }
-        return {chars_data_ + start, end - start};
+        return {chars_data() + start, end - start};
     }
 
     [[nodiscard]] auto at(size_type i) const -> std::string_view {
@@ -1116,7 +1114,6 @@ class Column<std::string> {
         detach_external();
         chars_.insert(chars_.end(), sv.begin(), sv.end());
         offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
-        sync_owned_view();
     }
 
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
@@ -1125,7 +1122,6 @@ class Column<std::string> {
         offsets_.reserve(n + 1);
         if (chars_hint)
             chars_.reserve(chars_hint);
-        sync_owned_view();
     }
 
     /// Bulk append through raw cursors, for producers that know an upper bound
@@ -1171,7 +1167,6 @@ class Column<std::string> {
         writer.chars_begin_ = chars_.data();
         writer.chars_ = chars_.data() + old_chars;
         writer.offsets_ = offsets_.data() + old_rows + 1;
-        sync_owned_view();
         return writer;
     }
 
@@ -1179,7 +1174,6 @@ class Column<std::string> {
         const auto written = static_cast<size_type>(writer.chars_ - writer.chars_begin_);
         chars_.resize(written);
         offsets_.resize(static_cast<size_type>(writer.offsets_ - offsets_.data()));
-        sync_owned_view();
     }
 
     void clear() noexcept {
@@ -1187,14 +1181,15 @@ class Column<std::string> {
         offsets_.clear();
         offsets_.push_back(0);
         chars_.clear();
-        sync_owned_view();
     }
 
     // Raw access for optimized gather in filter_table.
     [[nodiscard]] const std::uint32_t* offsets_data() const noexcept {
-        return offsets_data_ + buffer_offset();
+        return is_external() ? offsets_data_ + external_offset_ : offsets_.data();
     }
-    [[nodiscard]] const char* chars_data() const noexcept { return chars_data_; }
+    [[nodiscard]] const char* chars_data() const noexcept {
+        return is_external() ? chars_data_ : chars_.data();
+    }
     [[nodiscard]] std::uint32_t* offsets_data() {
         detach_external();
         return offsets_.data();
@@ -1217,7 +1212,6 @@ class Column<std::string> {
             chars_.insert(chars_.end(), fill.begin(), fill.end());
             offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
         }
-        sync_owned_view();
     }
 
     // Allocate output storage for a gather of n_rows rows with total_chars bytes.
@@ -1226,7 +1220,6 @@ class Column<std::string> {
         drop_external();
         offsets_.resize(n_rows + 1);
         chars_.resize(total_chars);
-        sync_owned_view();
     }
 
     // Iterator: yields string_view per row.
@@ -1271,14 +1264,6 @@ class Column<std::string> {
         offsets_ = std::move(owned_offsets);
         chars_ = std::move(owned_chars);
         drop_external();
-        sync_owned_view();
-    }
-
-    void sync_owned_view() noexcept {
-        offsets_data_ = offsets_.data();
-        chars_data_ = chars_.data();
-        logical_size_ = offsets_.empty() ? 0 : offsets_.size() - 1;
-        external_offset_ = 0;
     }
 
     /// See `meta()`. Declared last so the hand-written constructors can append
@@ -1380,7 +1365,7 @@ class Column<bool> {
         [[nodiscard]] operator bool() const { return (*word_ & mask_) != 0; }
     };
 
-    Column() { sync_owned_view(); }
+    Column() = default;
 
     explicit Column(size_type count, bool value = false) { assign(count, value); }
 
@@ -1399,18 +1384,16 @@ class Column<bool> {
     Column(const Column& other)
         : words_(other.is_external() ? std::vector<word_type>{} : other.words_),
           external_owner_(other.external_owner_),
-          bytes_data_(other.is_external() ? other.bytes_data_
-                                          : reinterpret_cast<const std::uint8_t*>(words_.data())),
-          external_offset_(other.external_offset_),
+          bytes_data_(other.is_external() ? other.bytes_data_ : nullptr),
+          external_offset_(other.is_external() ? other.external_offset_ : 0),
           size_bits_(other.size_bits_),
           meta_(other.meta_) {}
 
     Column(Column&& other) noexcept
         : words_(std::move(other.words_)),
           external_owner_(std::move(other.external_owner_)),
-          bytes_data_(external_owner_ ? other.bytes_data_
-                                      : reinterpret_cast<const std::uint8_t*>(words_.data())),
-          external_offset_(other.external_offset_),
+          bytes_data_(external_owner_ ? other.bytes_data_ : nullptr),
+          external_offset_(external_owner_ ? other.external_offset_ : 0),
           size_bits_(other.size_bits_),
           meta_(other.meta_) {
         other.bytes_data_ = nullptr;
@@ -1463,8 +1446,16 @@ class Column<bool> {
     [[nodiscard]] auto is_external() const noexcept -> bool {
         return static_cast<bool>(external_owner_);
     }
-    [[nodiscard]] auto buffer_data() const noexcept -> const std::uint8_t* { return bytes_data_; }
-    [[nodiscard]] auto buffer_offset() const noexcept -> size_type { return external_offset_; }
+    /// Reads resolve the storage in use rather than a mirror kept in step by
+    /// every mutation; see the same change on the primary template. `size_bits_`
+    /// is genuine state in both modes and stays a plain member.
+    [[nodiscard]] auto buffer_data() const noexcept -> const std::uint8_t* {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return is_external() ? bytes_data_ : reinterpret_cast<const std::uint8_t*>(words_.data());
+    }
+    [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
+        return is_external() ? external_offset_ : 0;
+    }
 
     [[nodiscard]] auto size() const noexcept -> size_type { return size_bits_; }
     [[nodiscard]] auto empty() const noexcept -> bool { return size_bits_ == 0; }
@@ -1474,7 +1465,7 @@ class Column<bool> {
 
     [[nodiscard]] auto operator[](size_type idx) const noexcept -> bool {
         const size_type bit = buffer_offset() + idx;
-        return ((bytes_data_[bit / 8] >> (bit % 8)) & 0x01U) != 0U;
+        return ((buffer_data()[bit / 8] >> (bit % 8)) & 0x01U) != 0U;
     }
     [[nodiscard]] auto operator[](size_type idx) -> Reference {
         detach_external();
@@ -1510,13 +1501,11 @@ class Column<bool> {
             words_.back() |= bit_mask(idx);
         }
         ++size_bits_;
-        sync_owned_view();
     }
 
     void reserve(size_type n) {
         detach_external();
         words_.reserve(words_for_bits(n));
-        sync_owned_view();
     }
 
     // zero-initialises (false) for resize-based fill in lag/lead paths
@@ -1535,11 +1524,11 @@ class Column<bool> {
             }
         }
         clear_unused_tail_bits();
-        sync_owned_view();
     }
 
     [[nodiscard]] auto words_data() const noexcept -> const word_type* {
-        return reinterpret_cast<const word_type*>(bytes_data_);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+        return is_external() ? reinterpret_cast<const word_type*>(bytes_data_) : words_.data();
     }
     [[nodiscard]] auto words_data() -> word_type* {
         detach_external();
@@ -1550,7 +1539,6 @@ class Column<bool> {
         drop_external();
         words_.clear();
         size_bits_ = 0;
-        sync_owned_view();
     }
 
     void assign(size_type count, bool value) {
@@ -1558,7 +1546,6 @@ class Column<bool> {
         words_.assign(words_for_bits(count), value ? ~word_type{0} : word_type{0});
         size_bits_ = count;
         clear_unused_tail_bits();
-        sync_owned_view();
     }
 
     struct Iterator {
@@ -1597,12 +1584,6 @@ class Column<bool> {
         }
         words_ = std::move(owned);
         drop_external();
-        sync_owned_view();
-    }
-
-    void sync_owned_view() noexcept {
-        bytes_data_ = reinterpret_cast<const std::uint8_t*>(words_.data());
-        external_offset_ = 0;
     }
 
     /// See `meta()`. Declared last so the hand-written constructors can append

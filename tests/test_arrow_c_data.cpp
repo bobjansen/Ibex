@@ -1049,6 +1049,47 @@ TEST_CASE("Arrow C Data round-trips the group-major claim", "[interop][arrow][pr
     array.release(&array);
 }
 
+// Export reaches for a column's raw buffer — `codes_buffer_data()` for a
+// categorical, `words_data()` for a bool. Both used to answer from a member
+// mirrored by every mutation; they now resolve the storage in use instead, and
+// a column built in Ibex (never adopted from Arrow) is the case that mirror was
+// hiding. Getting it wrong ships a stale or null pointer to the consumer, which
+// is silent corruption rather than a crash — and nothing covered it.
+TEST_CASE("Owned categorical and bool columns export their own buffers",
+          "[interop][arrow][export]") {
+    ibex::runtime::Table source;
+    ibex::Column<ibex::Categorical> tags;
+    tags.push_back("alpha");
+    tags.push_back("beta");
+    tags.push_back("alpha");
+    source.add_column("tag", std::move(tags));
+    source.add_column("flag", ibex::Column<bool>{true, false, true});
+
+    ArrowArray array{};
+    ArrowSchema schema{};
+    REQUIRE(ibex::interop::export_table_to_arrow(source, &array, &schema).has_value());
+
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    REQUIRE(imported.has_value());
+
+    const auto* tag = std::get_if<ibex::Column<ibex::Categorical>>(imported->find("tag"));
+    REQUIRE(tag != nullptr);
+    REQUIRE(tag->size() == 3);
+    CHECK((*tag)[0] == "alpha");
+    CHECK((*tag)[1] == "beta");
+    CHECK((*tag)[2] == "alpha");
+
+    const auto* flag = std::get_if<ibex::Column<bool>>(imported->find("flag"));
+    REQUIRE(flag != nullptr);
+    REQUIRE(flag->size() == 3);
+    CHECK((*flag)[0]);
+    CHECK_FALSE((*flag)[1]);
+    CHECK((*flag)[2]);
+
+    schema.release(&schema);
+    array.release(&array);
+}
+
 TEST_CASE("A dictionary-encoded index is still a categorical", "[interop][arrow][int]") {
     // The regression guard for the fix above: "i" with dictionary storage must
     // keep going to the categorical importer, not be read as a plain int32.

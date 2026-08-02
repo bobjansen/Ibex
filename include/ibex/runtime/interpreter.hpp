@@ -576,14 +576,22 @@ struct ExecutionContext {
 /// by default until Phase 1's acceptance measurements say otherwise.
 void configure_parallel_from_env(ExecutionContext& exec);
 
-/// True if the plan subtree `node` reads any lazy/deferred source — a `Scan`
-/// with no eager registry entry that resolves through `exec`'s deferred-scan
-/// registry (the parquet / build-narrowed-probe path). The runtime
-/// multithreading plan makes such queries ineligible for a parallel island
-/// until the LazyTable synchronization contract is implemented; the parallel
-/// seam in `build_operator()` consults this to fall back to the serial chain.
-[[nodiscard]] auto node_reads_deferred_source(const ir::Node& node, const TableRegistry& registry,
-                                              const ExecutionContext& exec) -> bool;
+/// A process-lifetime island counter when `IBEX_PARALLEL_STATS` is set in the
+/// environment, else null. `configure_parallel_from_env` installs it, and the
+/// accumulated totals are written to stderr at process exit.
+///
+/// This exists because the island decision is invisible from the outside: an
+/// island and the serial chain produce identical output by construction, so a
+/// benchmark cannot tell "ran in parallel" from "silently fell back to serial".
+/// Without it an A/B showing no difference has two indistinguishable readings —
+/// the parallelism did not pay, or it never happened. `ExecutionContext::
+/// parallel_stats` already answers that for one query in a test; this answers
+/// it for a whole process that a harness drives through stdin.
+///
+/// Accumulating across queries is the point rather than a limitation: a PDS-H
+/// run is 22 queries in one warm process, and the question worth asking is how
+/// many islands the *suite* formed.
+[[nodiscard]] auto process_island_stats() -> ParallelIslandStats*;
 
 /// Materialize a deferred scan now: static conjuncts plus whatever bounds its
 /// filter slot carries (if `ready`). The single decode path for deferred

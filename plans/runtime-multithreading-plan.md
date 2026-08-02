@@ -470,14 +470,35 @@ parallel late materialization of that source's projected output). For the
 Parquet source the realistic path is per-worker readers (open-per-morsel or a
 reader pool), since one `FileReader` cannot be shared across concurrent calls.
 
-**Interim gate (Phase 0).** Until the contract below is implemented, a query
-that reads any lazy/deferred source is ineligible for a parallel island. This
-is a gate the executor's single eligibility pass records, not a property of
-`LazyTable`. It costs nothing in Phase 0 (no parallel execution exists) and must
-not be treated as the answer: excluding lazy sources permanently would restrict
-parallelism to fully-materialized in-memory tables — the small cases — while the
-large memory-bound scans that parallelize best stay serial, inverting the
-payoff. Lifting the gate is a Phase 3b/4 obligation, not optional.
+**Interim gate (Phase 0) — LIFTED 2026-08-02.** The gate made a query that
+reads any lazy/deferred source ineligible for a parallel island. It was removed
+once it was established that no worker can reach a `LazyTable` under the current
+island construction: `build_parallel_island` executes its input subtree to an
+owned `Table` on the building thread, and every morsel source takes that
+finished table by reference. Both hazards below need a worker to touch the
+source, and none does. The invariant is documented at `build_parallel_island`
+and held by the morsel sources' signatures; a slice that streams a source's
+morsels straight into workers reintroduces both hazards and must re-establish
+eligibility (per-worker readers + a frozen cache) first.
+
+**What lifting it was worth: essentially nothing, and that is the useful part.**
+Measured on PDS-H SF-1 across all 22 queries, with `IBEX_PARALLEL_STATS=1`
+counting islands and the old gate restored behind a temporary env switch so both
+sides ran from the *same binary*:
+
+- Exactly **two** queries changed eligibility: q19 gained a parallel island (53
+  morsels) and q07 gained a *serial* island (no threading, so no effect).
+- q19's own time did not move: 61.3 / 63.7 / 62.5 ms lifted vs 62.8 / 62.6 /
+  64.6 ms gated, interleaved, pinned to 8 cores — inside the run-to-run spread.
+- Only 5 of 22 queries form a parallel island **at all** (q18, q19, q21×2, q22).
+
+The gate was not what kept PDS-H serial. Two structural reasons, both of which
+outlive this change: whole-script mode eagerly projects any source that is not a
+deferrable *probe* scan, so most scans were never deferred and were always
+eligible; and scan conjuncts are pushed into the decoder, which removes the
+row-local `Filter` an island would have been built from. What remains above the
+scans is joins, group-by and sort — barriers. **The PDS-H multithreading gap is
+Phase 4, not Phase 3b**, and no amount of source-side island work will move it.
 
 **The contract — immutable-after-build.** `LazyTable` has two lifecycle phases
 per query:

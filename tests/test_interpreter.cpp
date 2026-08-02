@@ -3,6 +3,7 @@
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/query_lease.hpp>
 #include <ibex/runtime/rng.hpp>
@@ -10759,33 +10760,80 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
     REQUIRE_FALSE(out.ordering().has_value());
 }
 
-// The parallel-island seam must keep a query that reads a lazy/deferred source
-// on the serial chain (the LazyTable synchronization contract's interim gate).
-// analyze_parallel_island() checks only the map chain's IR shape; the
-// lazy/deferred verdict is this source-node predicate, reported up to the seam.
-TEST_CASE("Parallel seam: lazy/deferred input is ineligible", "[runtime][parallel]") {
+// A lazy/deferred source used to disqualify a query from the parallel island
+// outright. Phase 3b lifted that gate, and this pins the reason it is safe:
+// `build_parallel_island` materializes its input subtree before it builds any
+// morsel source, so the source decodes exactly once, on the building thread,
+// and no worker ever reaches the `LazyTable`.
+//
+// The decode counter is the load-bearing assertion. Values alone cannot
+// distinguish "decoded once, serially" from "decoded concurrently by four
+// workers and happened to agree" — a shared `ColumnDecodeFn` closure (this
+// fixture, and the pre-factory Parquet path) is exactly what the contract's
+// second hazard boundary is about.
+TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
+          "[runtime][parallel]") {
+    constexpr std::size_t kRows = 4096;
+
+    std::atomic<int> decode_calls{0};
+    auto decode =
+        [&decode_calls](
+            const std::vector<std::string>& names,
+            const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+        decode_calls.fetch_add(1);
+        REQUIRE(selection == nullptr);
+        runtime::Table out;
+        for (const auto& name : names) {
+            REQUIRE(name == "x");
+            std::vector<std::int64_t> values;
+            values.reserve(kRows);
+            for (std::size_t row = 0; row < kRows; ++row) {
+                values.push_back(static_cast<std::int64_t>(row) - 2000);
+            }
+            out.add_column("x", Column<std::int64_t>{std::move(values)});
+        }
+        return out;
+    };
+
+    runtime::Table schema;
+    schema.add_column("x", Column<std::int64_t>{});
+
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace(
+        "df", runtime::DeferredScan{
+                  .lazy = std::make_shared<runtime::LazyTable>(std::move(schema), kRows, decode),
+                  .conjuncts = {},
+                  .demand = {"x"},
+                  .demand_all = false,
+                  .key_column = {},
+                  .filter = nullptr,
+              });
+
+    const runtime::TableRegistry empty;
     auto ir = require_ir("df[filter x > 0];");
 
-    // Eager registry table: not a deferred source, so the gate does not fire.
-    runtime::TableRegistry eager;
-    runtime::Table t;
-    t.add_column("x", Column<std::int64_t>{1, -1, 2});
-    eager.emplace("df", std::move(t));
-    const runtime::ExecutionContext no_deferred;
-    CHECK_FALSE(runtime::node_reads_deferred_source(*ir, eager, no_deferred));
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred};
+    exec.parallel = true;
+    exec.parallel_grain = 256;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
 
-    // Same plan, but `df` resolves only through the deferred-scan registry:
-    // no eager entry + a deferred entry => the gate fires. Presence is all the
-    // predicate inspects, so a default (null-lazy) DeferredScan suffices.
-    runtime::TableRegistry empty;
-    runtime::DeferredScanRegistry deferred;
-    deferred.emplace("df", runtime::DeferredScan{});
-    const runtime::ExecutionContext exec{.deferred_scans = &deferred};
-    CHECK(runtime::node_reads_deferred_source(*ir, empty, exec));
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
 
-    // An unknown source (neither eager nor deferred) is not treated as deferred;
-    // the serial builder reports the missing-table error as usual.
-    CHECK_FALSE(runtime::node_reads_deferred_source(*ir, empty, no_deferred));
+    // The island really formed over the deferred source -- without this the
+    // decode assertion below would hold trivially on a serial fallback.
+    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(decode_calls.load() == 1);
+
+    const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == kRows - 2001);
+    CHECK((*x)[0] == 1);
+    CHECK((*x)[x->size() - 1] == static_cast<std::int64_t>(kRows) - 2001);
 }
 
 // Ordering by a Categorical column ranks its DICTIONARY and maps each row's

@@ -15,6 +15,8 @@
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -5876,9 +5878,39 @@ auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t
     return std::clamp(rows / (threads * kMorselsPerThread), kMinGrain, kMaxGrain);
 }
 
+auto process_island_stats() -> ParallelIslandStats* {
+    // File-local, like the worker pool and the query lease: a bundled plugin
+    // statically links runtime code, so an inline header variable would give
+    // each plugin its own counter (the RTLD_LOCAL trap).
+    //
+    // The reporter is a separate static whose destructor runs at exit. It holds
+    // no reference to the counters it prints beyond the function-local statics
+    // above it, which outlive it by declaration order.
+    static const bool enabled = std::getenv("IBEX_PARALLEL_STATS") != nullptr;
+    static ParallelIslandStats stats;
+    struct Reporter {
+        ~Reporter() {
+            if (!enabled) {
+                return;
+            }
+            fmt::print(stderr,
+                       "island stats: parallel={} serial={} morsels={} range_heads={} "
+                       "two_phase={} parallel_fields={}\n",
+                       stats.parallel_islands.load(), stats.serial_islands.load(),
+                       stats.morsels.load(), stats.range_heads.load(),
+                       stats.two_phase_filters.load(), stats.parallel_fields.load());
+        }
+    };
+    static const Reporter reporter;
+    return enabled ? &stats : nullptr;
+}
+
 void configure_parallel_from_env(ExecutionContext& exec) {
     if (const auto want = parallel_enabled_from_env(); want.has_value()) {
         exec.parallel = *want;
+    }
+    if (exec.parallel_stats == nullptr) {
+        exec.parallel_stats = process_island_stats();
     }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
         exec.parallel_grain = grain;
@@ -5891,23 +5923,6 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     // sizes the process pool, and a zero budget means "use the pool", so the
     // environment reaches the island either way — while a caller that set its
     // own budget before calling this keeps it.
-}
-
-// True if any Scan in `node`'s subtree reads a lazy/deferred source: no eager
-// registry entry, but resolvable through the deferred-scan registry. See the
-// header declaration for why the parallel seam rejects these.
-auto node_reads_deferred_source(const ir::Node& node, const TableRegistry& registry,
-                                const ExecutionContext& exec) -> bool {
-    if (node.kind() == ir::NodeKind::Scan) {
-        const auto& name = static_cast<const ir::ScanNode&>(node).source_name();
-        return registry.find(name) == registry.end() && exec.deferred_scan(name) != nullptr;
-    }
-    for (const auto& child : node.children()) {
-        if (child != nullptr && node_reads_deferred_source(*child, registry, exec)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // One construction point for every row-local map operator that can live in a
@@ -6873,6 +6888,20 @@ class TwoPhaseFilterOperator final : public Operator {
 // the trivially ordered merger. Both stamp and check the same morsel identity,
 // so both are byte-identical to the plain serial chain — which is exactly what
 // lets the threshold move without changing an answer.
+//
+// LOAD-BEARING INVARIANT — materialize before fan-out. The input subtree is
+// executed to a `Table` here, on this thread, and every morsel source below
+// takes that finished table by reference. That is what makes a deferred/lazy
+// source safe in an island: its decode runs exactly once, serially, before any
+// worker exists, so neither `LazyTable::cache_` nor a plugin's `decode_`
+// closure is ever touched concurrently. It is why `build_operator`'s seam no
+// longer screens islands for deferred sources.
+//
+// The morsel sources all take `const Table&`, so the invariant is enforced by
+// their signatures rather than by a check. Streaming a source's morsels
+// directly into workers would mean handing them something other than a
+// finished table — at which point the LazyTable synchronization contract
+// applies in full and eligibility has to be re-established.
 auto build_parallel_island(const ParallelIslandCandidate& candidate, const TableRegistry& registry,
                            const ScalarRegistry* scalars, const ExternRegistry* externs,
                            const ExecutionContext& exec, ModelResult* model_out)
@@ -6989,18 +7018,23 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
     // separately (only the island's input subtree is), so there is no
     // re-analysis of the chain and no infinite recursion.
     //
-    // A query whose island input reads a lazy/deferred source stays on the
-    // serial chain. `analyze_parallel_island()` verifies only the map chain's
-    // IR shape and expressions; the lazy/deferred gate is a source-node check
-    // that needs the registry + ExecutionContext, so it is reported up to this
-    // single eligibility decision (the plan's item-7 pattern). The gate is
-    // required by the LazyTable synchronization contract and is an interim
-    // rule: it is safe-but-unnecessary in this serial slice (the input is
-    // materialized on a serial boundary before any fan-out), and a later phase
-    // lifts it deliberately once the contract is implemented.
+    // A lazy/deferred source in the island's input subtree used to disqualify
+    // it, per the LazyTable synchronization contract's interim gate. That gate
+    // is LIFTED (Phase 3b): `build_parallel_island` materializes its input
+    // subtree into an owned Table *before* constructing any morsel source, so
+    // every deferred decode happens on the single build thread and no worker
+    // ever reaches a `LazyTable`. The contract's hazards — concurrent `cache_`
+    // writes and concurrent `decode_` calls — need a worker to touch the source
+    // to arise, and none does.
+    //
+    // That is a claim about `build_parallel_island`'s structure, so it is
+    // asserted there rather than restated here. A future slice that streams a
+    // source's morsels straight into workers, instead of materializing first,
+    // reintroduces both hazards and must re-establish eligibility (per-worker
+    // readers + a frozen cache) before it removes that assertion.
     if (exec.parallel) {
         const auto island = analyze_parallel_island(node);
-        if (island.eligible() && !node_reads_deferred_source(*island.input, registry, exec)) {
+        if (island.eligible()) {
             return build_parallel_island(island, registry, scalars, externs, exec, model_out);
         }
     }

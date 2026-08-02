@@ -361,11 +361,17 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     if (call.callee == "rolling_count") {
         Column<std::int64_t> result;
         result.resize(rows);
+        // Write through a hoisted pointer, not `result[i]`. The mutable
+        // `operator[]` calls `detach_external()` on every element — a check the
+        // optimizer cannot hoist out, because the call it guards may change the
+        // very state it tests. Taking `data()` once pays that check once, and
+        // is what the other rolling kernels already do.
+        auto* result_values = result.data();
         std::size_t lo = 0;
         for (std::size_t i = 0; i < rows; ++i) {
             while (lo < i && should_drop(lo, i))
                 ++lo;
-            result[i] = static_cast<std::int64_t>(i - lo + 1);
+            result_values[i] = static_cast<std::int64_t>(i - lo + 1);
         }
         return ComputedColumn{.column = std::move(result), .validity = std::nullopt};
     }

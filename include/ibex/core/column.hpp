@@ -120,11 +120,9 @@ class Column {
     Column() = default;
 
     explicit Column(std::vector<T> data)
-        : data_(std::make_move_iterator(data.begin()), std::make_move_iterator(data.end())) {
-        sync_owned_view();
-    }
+        : data_(std::make_move_iterator(data.begin()), std::make_move_iterator(data.end())) {}
 
-    Column(std::initializer_list<T> init) : data_(init) { sync_owned_view(); }
+    Column(std::initializer_list<T> init) : data_(init) {}
 
     Column(const Column& other)
         : data_(other.is_external() ? storage_type{} : other.data_),
@@ -205,15 +203,19 @@ class Column {
     /// Base storage pointer and logical element offset. Most callers should use
     /// `data()`; these accessors exist for zero-copy Arrow C Data export.
     [[nodiscard]] auto buffer_data() const noexcept -> const T* {
-        return is_external() && external_data_ != nullptr ? external_data_ - external_offset_
-                                                          : external_data_;
+        if (!is_external()) {
+            return data_.data();
+        }
+        return external_data_ != nullptr ? external_data_ - external_offset_ : external_data_;
     }
     [[nodiscard]] auto buffer_offset() const noexcept -> size_type {
         return is_external() ? external_offset_ : 0;
     }
 
     /// Number of elements.
-    [[nodiscard]] auto size() const noexcept -> size_type { return external_size_; }
+    [[nodiscard]] auto size() const noexcept -> size_type {
+        return is_external() ? external_size_ : data_.size();
+    }
 
     /// Immutable element access (bounds-checked).
     [[nodiscard]] auto at(size_type idx) const -> const T& {
@@ -250,15 +252,29 @@ class Column {
     }
 
     /// Append a value.
-    void push_back(const T& value) {
-        detach_external();
+    ///
+    /// The copy-on-write check is spelled out here, rather than delegated to
+    /// `detach_external()`, so the body stays small enough for the inliner —
+    /// and then forced, because leaving it to the cost model was measurably not
+    /// enough. Kernels append a value per row, and once this stops being
+    /// inlined the call overhead alone costs more than the append: `cumsum`
+    /// over 1M rows spent a third of its time here as an out-of-line call, and
+    /// dropping the attribute moved the whole benchmark suite's geomean from
+    /// 1.048x to 1.076x of the pre-adoption baseline.
+    ///
+    /// Prefer `reserve` + a hoisted `data()` pointer in a hot kernel regardless:
+    /// that resolves the storage once instead of per row.
+    [[gnu::always_inline]] void push_back(const T& value) {
+        if (is_external()) [[unlikely]] {
+            detach_external_slow();
+        }
         data_.push_back(value);
-        sync_owned_view();
     }
-    void push_back(T&& value) {
-        detach_external();
+    [[gnu::always_inline]] void push_back(T&& value) {
+        if (is_external()) [[unlikely]] {
+            detach_external_slow();
+        }
         data_.push_back(std::move(value));
-        sync_owned_view();
     }
 
     /// Construct a value in-place.
@@ -267,14 +283,12 @@ class Column {
     auto emplace_back(Args&&... args) -> T& {
         detach_external();
         data_.emplace_back(std::forward<Args>(args)...);
-        sync_owned_view();
         return data_.back();
     }
 
     auto emplace_back() -> T& {
         detach_external();
         data_.emplace_back(T{});
-        sync_owned_view();
         return data_.back();
     }
 
@@ -282,7 +296,6 @@ class Column {
     void assign(size_type count, const T& value) {
         drop_external();
         data_.assign(count, value);
-        sync_owned_view();
     }
 
     /// Assign from range.
@@ -292,13 +305,11 @@ class Column {
         storage_type assigned(first, last);
         drop_external();
         data_ = std::move(assigned);
-        sync_owned_view();
     }
     /// Assign from initializer list.
     void assign(std::initializer_list<T> init) {
         drop_external();
         data_.assign(init);
-        sync_owned_view();
     }
 
     /// Insert value before position.
@@ -306,14 +317,12 @@ class Column {
         const auto offset = iterator_offset(pos);
         detach_external();
         data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), value);
-        sync_owned_view();
         return iterator_at(offset);
     }
     [[nodiscard]] auto insert(const_iterator pos, T&& value) -> iterator {
         const auto offset = iterator_offset(pos);
         detach_external();
         data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), std::move(value));
-        sync_owned_view();
         return iterator_at(offset);
     }
 
@@ -322,7 +331,6 @@ class Column {
         const auto offset = iterator_offset(pos);
         detach_external();
         data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), count, value);
-        sync_owned_view();
         return iterator_at(offset);
     }
 
@@ -333,7 +341,6 @@ class Column {
         const auto offset = iterator_offset(pos);
         detach_external();
         data_.insert(data_.begin() + static_cast<std::ptrdiff_t>(offset), first, last);
-        sync_owned_view();
         return iterator_at(offset);
     }
 
@@ -350,7 +357,6 @@ class Column {
         detach_external();
         data_.emplace(data_.begin() + static_cast<std::ptrdiff_t>(offset),
                       std::forward<Args>(args)...);
-        sync_owned_view();
         return iterator_at(offset);
     }
 
@@ -360,7 +366,6 @@ class Column {
         detach_external();
         data_.erase(data_.begin() + static_cast<std::ptrdiff_t>(offset));
         const auto next = std::min(offset, data_.size());
-        sync_owned_view();
         return iterator_at(next);
     }
     /// Erase range.
@@ -371,7 +376,6 @@ class Column {
         data_.erase(data_.begin() + static_cast<std::ptrdiff_t>(first_offset),
                     data_.begin() + static_cast<std::ptrdiff_t>(last_offset));
         const auto next = std::min(first_offset, data_.size());
-        sync_owned_view();
         return iterator_at(next);
     }
 
@@ -379,7 +383,6 @@ class Column {
     void reserve(size_type capacity) {
         detach_external();
         data_.reserve(capacity);
-        sync_owned_view();
     }
 
     /// Current capacity.
@@ -391,21 +394,18 @@ class Column {
     void clear() noexcept {
         drop_external();
         data_.clear();
-        sync_owned_view();
     }
 
     /// Resize the column (value-initialize new elements).
     void resize(size_type count) {
         detach_external();
         data_.resize(count, T{});
-        sync_owned_view();
     }
 
     /// Resize the column (copy-initialize new elements with value).
     void resize(size_type count, const T& value) {
         detach_external();
         data_.resize(count, value);
-        sync_owned_view();
     }
 
     /// Resize without value-initializing new slots. Callers must overwrite every element.
@@ -416,21 +416,18 @@ class Column {
         // the caller grows relative to an adopted slice.
         detach_external();
         data_.resize(count);
-        sync_owned_view();
     }
 
     /// Reduce capacity to fit size.
     void shrink_to_fit() {
         detach_external();
         data_.shrink_to_fit();
-        sync_owned_view();
     }
 
     /// Remove the last element.
     void pop_back() {
         detach_external();
         data_.pop_back();
-        sync_owned_view();
     }
 
     /// Whether the column is empty.
@@ -484,7 +481,7 @@ class Column {
     }
     [[nodiscard]] auto end() -> iterator {
         detach_external();
-        return iterator_at(external_size_);
+        return iterator_at(data_.size());
     }
     [[nodiscard]] auto begin() const noexcept -> const_iterator { return data_ptr(); }
     [[nodiscard]] auto end() const noexcept -> const_iterator {
@@ -504,7 +501,15 @@ class Column {
     [[nodiscard]] auto crend() const noexcept -> const_reverse_iterator { return rend(); }
 
    private:
-    [[nodiscard]] auto data_ptr() const noexcept -> const T* { return external_data_; }
+    /// Reads resolve the storage in use rather than reading a mirror kept in
+    /// step by every mutation. The branch is on a `shared_ptr` null check that
+    /// is constant for a column's whole lifetime, so it predicts perfectly;
+    /// eagerly mirroring instead cost three stores inside `push_back`, which
+    /// made appending to an owned column several times slower and dominated
+    /// profiles of every kernel that builds its output that way.
+    [[nodiscard]] auto data_ptr() const noexcept -> const T* {
+        return is_external() ? external_data_ : data_.data();
+    }
 
     [[nodiscard]] auto iterator_offset(const_iterator pos) const noexcept -> size_type {
         const auto* first = data_ptr();
@@ -544,17 +549,11 @@ class Column {
         }
         data_ = std::move(owned);
         drop_external();
-        sync_owned_view();
     }
 
-    void sync_owned_view() noexcept {
-        external_data_ = data_.data();
-        external_size_ = data_.size();
-        external_offset_ = 0;
-    }
-
+    /// Only ever called after `detach_external()`, so the storage is `data_`.
     [[nodiscard]] auto iterator_at(size_type offset) noexcept -> iterator {
-        return external_size_ == 0 ? data_.data() : data_.data() + offset;
+        return data_.empty() ? data_.data() : data_.data() + offset;
     }
 
     storage_type data_;

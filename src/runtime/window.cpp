@@ -525,51 +525,53 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
-                    T sum{};
-                    std::size_t val_cnt = 0;  // non-null, non-NaN elements in window
-                    // Mutated in add/drop below via a by-reference lambda capture; the
-                    // checker doesn't see through that.
-                    // NOLINTNEXTLINE(misc-const-correctness)
-                    std::size_t nan_cnt = 0;  // valid-but-NaN (Float only; Int never NaN)
-                    auto add = [&](std::size_t j) {
-                        if (!valid_at(j))
-                            return;
-                        if constexpr (std::is_floating_point_v<T>) {
-                            if (std::isnan(col_values[j])) {
-                                ++nan_cnt;
-                                return;
-                            }
-                        }
-                        sum += col_values[j];
-                        ++val_cnt;
-                    };
-                    auto drop = [&](std::size_t j) {
-                        if (!valid_at(j))
-                            return;
-                        if constexpr (std::is_floating_point_v<T>) {
-                            if (std::isnan(col_values[j])) {
-                                --nan_cnt;
-                                return;
-                            }
-                        }
-                        sum -= col_values[j];
-                        --val_cnt;
-                    };
-                    // The row loop is instantiated per window kind rather than
-                    // calling the general `should_drop`, which branches on
-                    // `is_count`/`aligned_dur` and keeps their captures live.
-                    // This loop is tight enough for that to matter: the running
-                    // sum spills to the stack, and specialising halves the spill
-                    // (18% of the kernel's samples down to 8%). Worth 2-13%
-                    // depending on how many rows a window holds. It does NOT
-                    // close the gap to pre-adoption -- see the note on
-                    // `apply_rolling_func`.
-                    auto run_rows = [&](auto drop_pred) {
+                    // One instantiation per (window kind x has-nulls).
+                    //
+                    // The accumulator state lives INSIDE this function rather
+                    // than being captured by reference from the enclosing
+                    // scope, and the null-free instantiation drops both the
+                    // validity test and the running `val_cnt`: with no nulls
+                    // the window is never empty, so the count is not needed at
+                    // all. Fewer values have to survive the row loop, which is
+                    // what was spilling the running sum to the stack.
+                    auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
+                        constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
+                        T sum{};
+                        std::size_t val_cnt = 0;  // non-null, non-NaN in window
+                        std::size_t nan_cnt = 0;  // valid-but-NaN (Float only)
                         std::size_t lo = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
-                            add(i);
+                            if (!kHasNulls || valid_at(i)) {
+                                const T v = col_values[i];
+                                bool is_nan = false;
+                                if constexpr (std::is_floating_point_v<T>) {
+                                    is_nan = std::isnan(v);
+                                }
+                                if (is_nan) {
+                                    ++nan_cnt;
+                                } else {
+                                    sum += v;
+                                    if constexpr (kHasNulls) {
+                                        ++val_cnt;
+                                    }
+                                }
+                            }
                             while (lo < i && drop_pred(lo, i)) {
-                                drop(lo);
+                                if (!kHasNulls || valid_at(lo)) {
+                                    const T w = col_values[lo];
+                                    bool is_nan = false;
+                                    if constexpr (std::is_floating_point_v<T>) {
+                                        is_nan = std::isnan(w);
+                                    }
+                                    if (is_nan) {
+                                        --nan_cnt;
+                                    } else {
+                                        sum -= w;
+                                        if constexpr (kHasNulls) {
+                                            --val_cnt;
+                                        }
+                                    }
+                                }
                                 ++lo;
                             }
                             if (nan_cnt > 0) {
@@ -581,24 +583,40 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 } else {
                                     result_values[i] = T{};
                                 }
+                            } else if constexpr (!kHasNulls) {
+                                // `lo <= i` always, so the window holds at least
+                                // row i: there is no empty-window case here.
+                                result_values[i] = sum;
                             } else if (val_cnt > 0) {
                                 result_values[i] = sum;
                             } else {
                                 result_values[i] = T{};  // window of only nulls -> null
-                                if (!out_valid)
+                                if (!out_valid) {
                                     out_valid.emplace(rows, true);
+                                }
                                 out_valid->set(i, false);
                             }
                         }
                     };
+                    // The window kind is resolved here too, rather than calling
+                    // the general `should_drop`, which branches on
+                    // `is_count`/`aligned_dur` and keeps their captures live.
+                    const bool has_nulls = sv != nullptr;
                     if (!is_count && !aligned_dur) {
                         const std::int64_t dur = dur_val;
                         const std::int64_t* times = time_vals;
-                        run_rows([times, dur](std::size_t l, std::size_t r) {
+                        auto pred = [times, dur](std::size_t l, std::size_t r) {
                             return times[l] <= times[r] - dur;
-                        });
+                        };
+                        if (has_nulls) {
+                            run_rows(pred, std::true_type{});
+                        } else {
+                            run_rows(pred, std::false_type{});
+                        }
+                    } else if (has_nulls) {
+                        run_rows(should_drop, std::true_type{});
                     } else {
-                        run_rows(should_drop);
+                        run_rows(should_drop, std::false_type{});
                     }
                     return ComputedColumn{std::move(result), std::move(out_valid)};
                 }
@@ -729,53 +747,56 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
-                    double mean = 0.0;
-                    double m2 = 0.0;
-                    std::size_t cnt = 0;      // finite, non-null values in window
-                    std::size_t nan_cnt = 0;  // valid-but-NaN values in window
-                    auto add = [&](std::size_t j) {
-                        if (!valid_at(j))
-                            return;
-                        auto x = static_cast<double>(col_values[j]);
-                        if (std::isnan(x)) {
-                            ++nan_cnt;
-                            return;
-                        }
-                        ++cnt;
-                        const double delta = x - mean;
-                        mean += delta / static_cast<double>(cnt);
-                        m2 += delta * (x - mean);
-                    };
-                    auto drop = [&](std::size_t j) {
-                        if (!valid_at(j))
-                            return;
-                        auto y = static_cast<double>(col_values[j]);
-                        if (std::isnan(y)) {
-                            --nan_cnt;
-                            return;
-                        }
-                        const double mean_old = mean;
-                        --cnt;
-                        mean = cnt == 0 ? 0.0
-                                        : (((static_cast<double>(cnt) + 1.0) * mean_old) - y) /
-                                              static_cast<double>(cnt);
-                        m2 -= (y - mean_old) * (y - mean);
-                    };
-                    // Specialised per window kind, as in `rolling_sum` above.
-                    auto run_rows = [&](auto drop_pred) {
+                    // Specialised per (window kind x has-nulls), as in
+                    // `rolling_sum`. Welford carries two doubles across the row
+                    // loop, so keeping the validity test and its two captures
+                    // out of the null-free instantiation matters more here, not
+                    // less.
+                    auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
+                        constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
+                        double mean = 0.0;
+                        double m2 = 0.0;
+                        std::size_t cnt = 0;      // finite, non-null in window
+                        std::size_t nan_cnt = 0;  // valid-but-NaN in window
                         std::size_t lo = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
-                            add(i);
+                            if (!kHasNulls || valid_at(i)) {
+                                const auto x = static_cast<double>(col_values[i]);
+                                if (std::isnan(x)) {
+                                    ++nan_cnt;
+                                } else {
+                                    ++cnt;
+                                    const double delta = x - mean;
+                                    mean += delta / static_cast<double>(cnt);
+                                    m2 += delta * (x - mean);
+                                }
+                            }
                             while (lo < i && drop_pred(lo, i)) {
-                                drop(lo);
+                                if (!kHasNulls || valid_at(lo)) {
+                                    const auto y = static_cast<double>(col_values[lo]);
+                                    if (std::isnan(y)) {
+                                        --nan_cnt;
+                                    } else {
+                                        const double mean_old = mean;
+                                        --cnt;
+                                        mean =
+                                            cnt == 0
+                                                ? 0.0
+                                                : (((static_cast<double>(cnt) + 1.0) * mean_old) -
+                                                   y) /
+                                                      static_cast<double>(cnt);
+                                        m2 -= (y - mean_old) * (y - mean);
+                                    }
+                                }
                                 ++lo;
                             }
                             if (nan_cnt > 0) {
                                 result_values[i] = std::numeric_limits<double>::quiet_NaN();
                             } else if (cnt == 0) {
                                 result_values[i] = 0.0;  // window of only nulls -> null
-                                if (!out_valid)
+                                if (!out_valid) {
                                     out_valid.emplace(rows, true);
+                                }
                                 out_valid->set(i, false);
                             } else {
                                 // Clamp away tiny negative m2 from floating-point drift.
@@ -786,14 +807,22 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             }
                         }
                     };
+                    const bool has_nulls = sv != nullptr;
                     if (!is_count && !aligned_dur) {
                         const std::int64_t dur = dur_val;
                         const std::int64_t* times = time_vals;
-                        run_rows([times, dur](std::size_t l, std::size_t r) {
+                        auto pred = [times, dur](std::size_t l, std::size_t r) {
                             return times[l] <= times[r] - dur;
-                        });
+                        };
+                        if (has_nulls) {
+                            run_rows(pred, std::true_type{});
+                        } else {
+                            run_rows(pred, std::false_type{});
+                        }
+                    } else if (has_nulls) {
+                        run_rows(should_drop, std::true_type{});
                     } else {
-                        run_rows(should_drop);
+                        run_rows(should_drop, std::false_type{});
                     }
                     return ComputedColumn{.column = std::move(result),
                                           .validity = std::move(out_valid)};

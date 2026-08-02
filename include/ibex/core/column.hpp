@@ -77,6 +77,17 @@ template <typename T, typename U>
 auto operator!=(const NoInitAllocator<T>&, const NoInitAllocator<U>&) noexcept -> bool {
     return false;
 }
+
+/// A vector whose `resize` does not value-initialize the new elements.
+///
+/// For row-sized buffers whose every element is written before it is read.
+/// `std::vector::resize` fills the whole range first, and for a buffer sized by
+/// row count that is a second full pass over the data. Callers owe the same
+/// obligation as `Column::resize_for_overwrite`: write every slot, or read
+/// garbage. Worth it only where the fill is a real fraction of the work — see
+/// the note in `Mask`.
+template <typename T>
+using NoInitVector = std::vector<T, NoInitAllocator<T>>;
 }  // namespace ibex::detail
 
 namespace ibex {

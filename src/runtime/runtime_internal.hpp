@@ -38,7 +38,13 @@ struct StringViewEq {
 };
 
 struct Mask {
-    std::vector<uint8_t> value;
+    /// One byte per row, and every filter kernel writes all of them — so the
+    /// buffer is left uninitialized rather than filled first. The fill is a
+    /// whole extra pass over the mask against a predicate that is often a
+    /// single compare, which measured 5-23% on the filter suite. Any new
+    /// producer must write every slot: an unwritten byte is garbage, and
+    /// garbage is usually truthy, so it selects a row it should not.
+    ibex::detail::NoInitVector<uint8_t> value;
     std::optional<std::vector<uint8_t>> valid;  // nullopt = all rows valid
 
     /// Adopt `v` as this mask's 3VL validity. `off` is the source offset — the

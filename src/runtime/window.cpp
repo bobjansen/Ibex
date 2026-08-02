@@ -267,17 +267,24 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
     return std::unexpected(std::string(fn) + ": time index must be a Timestamp or Date column");
 }
 
-// OPEN (2026-08-02): `rolling_sum` and `rolling_std` are ~20% slower than they
-// were before Arrow buffer adoption, and their kernel source is unchanged.
-// Bisected by elimination, not by build: the half-open window change and the
-// per-element storage hoists were each tested and are not the cause, and
-// `rolling_mean` -- same wrapper, same window machinery -- is unaffected.
-// `perf annotate` shows the difference is register allocation: the running
-// accumulator spills to the stack inside the row loop, which it did not before.
-// The plausible driver is `Column<T>` growing an adopted-buffer mode
-// (a12bf0f), inflating this function past what the allocator handles well.
-// Specialising the row loop below recovered part of it. Closing the rest needs
-// the live set shrunk further -- or the fat generic kernel split.
+// RESOLVED for `rolling_sum`, OPEN for `rolling_std` (2026-08-02).
+//
+// Both were ~20% slower than before Arrow buffer adoption with unchanged kernel
+// source. The cause for sum was register allocation -- the running accumulator
+// spilled to the stack inside the row loop -- driven by `Column<T>` growing an
+// adopted-buffer mode (a12bf0f) and inflating this function. Instantiating the
+// row loop per (window kind x has-nulls), giving it its own accumulator state
+// instead of by-reference captures, and dropping the validity test and running
+// count from the null-free case removed the spill: sum is now ~2x FASTER than
+// pre-adoption, not merely recovered.
+//
+// `rolling_std` did NOT respond to the same treatment (neutral, still ~1.2x).
+// Ruled out for it: register pressure (no spill dominates its profile), the
+// division (no `vdivsd` in the top samples), and `sqrt`'s errno guard
+// (replacing it changed nothing). Its profile concentrates on a `vucomisd`/`jb`
+// pair in the output expression, which may be sampling skid -- the next step is
+// a cycle-accurate profile, which this box cannot give (WSL2 has no hardware
+// counters).
 auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec spec, bool aligned)
     -> std::expected<ComputedColumn, std::string> {
     std::size_t rows = table.rows();

@@ -2755,17 +2755,34 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         Col out = old_col;
                         const auto& scalar_col = std::get<Col>(replacement);
                         const auto value = scalar_col[0];
+                        // Resolve the storage once. `out[i]` re-tests whether
+                        // the column holds adopted (Arrow) storage on every
+                        // element, which costs far more than the store it
+                        // guards — this loop is the whole of `where … update
+                        // { col = literal }`. `Column<bool>` reaches here too
+                        // and is bit-packed, so it keeps the indexed path.
+                        typename Col::value_type* out_values = nullptr;
+                        if constexpr (is_dense_column_v<Col>) {
+                            out_values = out.data();
+                        }
+                        auto set_at = [&](std::size_t idx) {
+                            if constexpr (is_dense_column_v<Col>) {
+                                out_values[idx] = value;
+                            } else {
+                                out[idx] = value;
+                            }
+                        };
                         if (mask->valid.has_value()) {
                             const auto& valid = *mask->valid;
                             for (std::size_t i = 0; i < n; ++i) {
                                 if (mask->value[i] != 0 && valid[i]) {
-                                    out[i] = value;
+                                    set_at(i);
                                 }
                             }
                         } else {
                             for (std::size_t i = 0; i < n; ++i) {
                                 if (mask->value[i] != 0) {
-                                    out[i] = value;
+                                    set_at(i);
                                 }
                             }
                         }
@@ -2867,13 +2884,27 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                               !std::is_same_v<Col, Column<Categorical>>) {
                     if (oldc != nullptr && old_valid == nullptr && !new_valid.has_value()) {
                         Col out = *oldc;
+                        // Resolve both ends once; see `ColumnAppender`. Only
+                        // `Column<bool>` reaches this branch without a dense
+                        // buffer, so it keeps the indexed path.
+                        typename Col::value_type* out_values = nullptr;
+                        if constexpr (is_dense_column_v<Col>) {
+                            out_values = out.data();
+                        }
+                        auto scatter = [&](std::size_t dst, std::size_t s) {
+                            if constexpr (is_dense_column_v<Col>) {
+                                out_values[dst] = src[s];
+                            } else {
+                                out[dst] = src[s];
+                            }
+                        };
                         if (subset) {
                             for (std::size_t k = 0; k < matched_idx.size(); ++k) {
-                                out[matched_idx[k]] = src[k];
+                                scatter(matched_idx[k], k);
                             }
                         } else {
                             for (const std::size_t i : matched_idx) {
-                                out[i] = src[i];
+                                scatter(i, i);
                             }
                         }
                         return {ColumnValue{std::move(out)}, std::nullopt};
@@ -2881,7 +2912,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 }
 
                 Col out;
-                out.reserve(n);
+                ColumnAppender<Col> appender(out, n);
                 ValidityBitmap valid(n, true);
                 bool any_invalid = false;
                 std::size_t k = 0;  // running index into `src` for the subset case
@@ -2890,20 +2921,20 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
                     if (matches) {
                         const std::size_t si = subset ? k++ : i;
-                        out.push_back(src[si]);
+                        appender.push(src[si]);
                         const bool v = !new_valid.has_value() || (*new_valid)[si];
                         valid.set(i, v);
                         any_invalid = any_invalid || !v;
                     } else if (oldc != nullptr) {
-                        out.push_back((*oldc)[i]);
+                        appender.push((*oldc)[i]);
                         const bool v = old_valid == nullptr || (*old_valid)[i];
                         valid.set(i, v);
                         any_invalid = any_invalid || !v;
                     } else {
                         if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                            out.push_back(std::string_view{});
+                            appender.push(std::string_view{});
                         } else {
-                            out.push_back(typename Col::value_type{});
+                            appender.push(typename Col::value_type{});
                         }
                         valid.set(i, false);
                         any_invalid = true;

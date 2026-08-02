@@ -2304,7 +2304,10 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
                 // two branches per row, against ~1 cycle of real work. Resolving
                 // the pointers once costs the same branch twice in total.
                 ColT result;
-                result.resize(rows);
+                // Every slot is written below, so skip the value-initialising
+                // fill `resize` would do — that fill is a second full pass over
+                // the output, as expensive as the computation itself.
+                result.resize_for_overwrite(rows);
                 const T* in = col.data();
                 T* out = result.data();
                 T acc = is_prod ? T{1} : T{0};

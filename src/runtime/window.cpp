@@ -371,7 +371,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 
     if (call.callee == "rolling_count") {
         Column<std::int64_t> result;
-        result.resize(rows);
+        result.resize_for_overwrite(rows);
         // Write through a hoisted pointer, not `result[i]`. The mutable
         // `operator[]` calls `detach_external()` on every element — a check the
         // optimizer cannot hoist out, because the call it guards may change the
@@ -422,7 +422,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 } else {
                     const auto* values = col.data();
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     if (sv == nullptr) {
                         double sum = 0.0;
@@ -521,7 +521,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     return std::unexpected("rolling_sum: column must be numeric (Int or Float)");
                 } else {
                     ColT result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -573,9 +573,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 ++lo;
                             }
                             if (nan_cnt > 0) {
-                                // Only reachable for Float columns (Int has no NaN).
-                                if constexpr (std::is_floating_point_v<T>)
+                                // Only reachable for Float columns (Int has no
+                                // NaN) -- but every arm must still write, since
+                                // the output is resized without initialisation.
+                                if constexpr (std::is_floating_point_v<T>) {
                                     result_values[i] = std::numeric_limits<T>::quiet_NaN();
+                                } else {
+                                    result_values[i] = T{};
+                                }
                             } else if (val_cnt > 0) {
                                 result_values[i] = sum;
                             } else {
@@ -652,7 +657,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     };
 
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -720,7 +725,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // NaNs counted separately (a NaN can't be inverse-Welford'd out,
                     // so keeping it out of the recurrence lets it clear on exit).
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -843,7 +848,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         return valid_at(j) ? static_cast<double>(col_values[j]) : 0.0;
                     };
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     std::vector<double> beta_pow{1.0};  // beta_pow[k] == beta^k
                     beta_pow.reserve(64);
@@ -894,7 +899,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         "rolling_quantile: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -948,7 +953,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     return std::unexpected("rolling_skew: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -1017,7 +1022,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         "rolling_kurtosis: column must be numeric (Int or Float)");
                 } else {
                     Column<double> result;
-                    result.resize(rows);
+                    result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
@@ -1133,7 +1138,13 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
             } else {
                 using T = ColT::value_type;
                 ColT result;
-                result.resize(rows);
+                // Unlike the other rolling kernels this one also instantiates for
+                // Date/Timestamp/bool, which have no uninitialised resize.
+                if constexpr (requires { result.resize_for_overwrite(rows); }) {
+                    result.resize_for_overwrite(rows);
+                } else {
+                    result.resize(rows);
+                }
                 std::optional<ValidityBitmap> out_valid;
                 // Unlike the other rolling kernels this one also instantiates
                 // for `Column<bool>`, which is bit-packed and has no dense
@@ -1193,8 +1204,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             ++lo;
                         }
                         if (nan_cnt > 0) {
-                            if constexpr (std::is_floating_point_v<T>)
+                            // See rolling_sum: unreachable for Int, but the arm
+                            // must write since the output is resized without
+                            // initialisation.
+                            if constexpr (std::is_floating_point_v<T>) {
                                 set_at(i, std::numeric_limits<T>::quiet_NaN());
+                            } else {
+                                set_at(i, T{});
+                            }
                         } else if (!dq.empty()) {
                             set_at(i, col[dq.front()]);
                         } else {

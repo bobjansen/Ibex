@@ -519,10 +519,24 @@ class Column {
         external_offset_ = 0;
     }
 
+    /// Copy-on-write hook, called by every mutating accessor.
+    ///
+    /// Split so the common case — an already-owned column — is a single
+    /// predictable branch the compiler will inline, with the copy out of line.
+    /// This matters more than it looks: mutable `operator[]` calls this, and a
+    /// kernel writing `result[i]` in a row loop was paying a real (unvectorized)
+    /// call per element once Arrow buffer adoption made the check necessary at
+    /// all. The optimizer cannot hoist the check itself, because the call it
+    /// guards may change the very state it tests.
     void detach_external() {
         if (!is_external()) {
             return;
         }
+        detach_external_slow();
+    }
+
+    // NOLINTNEXTLINE(readability-function-size)
+    [[gnu::noinline]] void detach_external_slow() {
         storage_type owned;
         owned.reserve(external_size_);
         if (external_size_ != 0) {

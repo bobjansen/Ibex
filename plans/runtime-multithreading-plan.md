@@ -1342,6 +1342,65 @@ plus the complete PDS-H SF-1 suite against the Phase 3a single-thread baseline.
 Report decode-only and end-to-end speedup so barrier time is not mistaken for a
 source regression.
 
+## Phase 4 status (2026-08-03)
+
+**Items 1 and 2 landed; 3b is deliberately deferred.** The ordering question was
+settled by measurement, not preference:
+
+- The Phase 3b first slice (lifting the lazy-source gate, f67583b) was a
+  measured NEGATIVE: eligibility changed on 2 of 22 PDS-H queries and q19 moved
+  62.5 -> 62.8ms. **Only 5 of 22 queries form a parallel island at all** — above
+  the scans everything is a barrier, so source parallelism has nowhere to flow.
+- PDS-H SF-1 runs at 85-123% CPU: essentially serial.
+- The website suite preloads its tables and times with `--no-include-parse`, so
+  scan/decode is OUTSIDE the timed region — Phase 3b cannot move a published
+  number at all.
+- Of 5.85s recoverable across the 21 threading-explained losses at 32M:
+  group-by/rank 3692ms (63%), join 1880ms (32%), row-wise map 215ms, sort 59ms.
+
+**Item 1 — ungrouped aggregate (fc8d10e).** 1M/6 aggs 13.4 -> 2.3ms; 6M/5 aggs
+45.6 -> 3.8ms. Two rules established for items 3-5:
+
+1. **Partition on ROW COUNT ALONE, never on thread count.** A float reduction's
+   value depends on where the range is cut, so a pool-size-derived partition
+   makes `sum`/`std` differ between a 4-core and a 24-core box. The first
+   version did that and the test caught it (stddev 35.96771761108 vs
+   ...60364). Keyed on data, the answer is machine- and schedule-independent.
+2. **Morsels few and large — do NOT reuse `island_grain`.** A reduction's
+   per-row cost is constant, so equal ranges finish together; there is no
+   imbalance to hedge and extra morsels are pure dispatch + merge overhead. The
+   4-per-thread island grain measured SLOWER THAN SERIAL at 1M (3.20 vs 2.89ms).
+
+**Item 2 — categorical group-by (956a4a4).** mean_by_symbol 1.54 -> 0.62ms,
+ohlc_by_symbol 3.35 -> 1.14ms. A Categorical code is already a dense dictionary
+index, so a worker needs no hash table — it accumulates into a private array
+indexed by code, bounding per-worker state by DICTIONARY SIZE. **Group order is
+the property to protect**: Ibex emits first-occurrence order, preserved because
+morsels are ascending row ranges and each records the codes it saw in the order
+it saw them. Test uses first occurrences D,C,A,B (not dictionary order);
+reversing the merge fails 50 assertions.
+
+Not covered by item 2: multi-key categorical, the string/int/generic hash
+paths, and `distinct` (a separate operator).
+
+**Prerequisite work that turned out to matter more than threading.** Three
+serial fixes found while sizing item 2, each larger than the parallel win:
+
+- `distinct { <categorical> }` hashed a code per row into a robin_hood set
+  instead of indexing an array: 8.95 -> 0.35ms (c1c6bc3).
+- The aggregate slot carried a `ScalarValue`, making it non-trivially
+  constructible. `alloc_group()` resizes once per NEW GROUP, so 100k groups
+  grew the array ~17 times and moved ~200k elements as string moves rather than
+  memcpy. Splitting AggSlotCore (POD) out: sum by user_id 11.80 -> 6.85ms
+  (28dfc3d). **Triviality, not size** — the scatter curve is smooth and
+  sublinear with no cache-line cliff, and alignment makes no difference.
+- `param` (per-aggregation) was stored per-group; it reads from the plan now
+  (98d477d).
+
+Remaining slot fat: `m3`/`m4` (16 bytes, only skew/kurtosis — could follow
+`text_value` into a side array, taking the core 48 -> 32). Lower value now that
+triviality is banked: ~16% of the scatter, no ctor/dtor gain left.
+
 ## Phase 4 — Parallel Barriers
 
 Add one operator family at a time using worker-local state and deterministic

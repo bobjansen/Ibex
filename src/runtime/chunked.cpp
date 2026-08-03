@@ -4127,7 +4127,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns(gids, agg_entries, rows);
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
     }
 
@@ -4196,7 +4196,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns(gids, agg_entries, rows);
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
     }
 
@@ -4258,7 +4258,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns(gids, agg_entries, rows);
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
     }
 
@@ -4350,6 +4350,11 @@ class ChunkedAggregateOperator final : public Operator {
         }
         const std::size_t n_keys = cat_cols.size();
         const bool single_key = n_keys == 1;
+
+        if (single_key && rows > 0 &&
+            try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
+            return std::nullopt;
+        }
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
@@ -4498,7 +4503,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
 
-        accumulate_columns(gids, agg_entries, rows);
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
     }
 
@@ -4531,20 +4536,30 @@ class ChunkedAggregateOperator final : public Operator {
             });
         }
 
-        accumulate_columns(gids, agg_entries, rows);
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
     }
 
-    void accumulate_columns(const std::uint32_t* gids,
-                            const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) {
-        AggSlot* fs = flat_slots_.data();
+    /// Scatter-accumulate rows [begin, end) into `base`, indexed by
+    /// `gids[row] * n_aggs_ + agg_i`. `base` is the caller's slot array —
+    /// `flat_slots_` for the serial path, a worker-private array for the
+    /// parallel one — and `GidT` covers both assigned gids (uint32_t) and raw
+    /// Categorical codes (int32_t), which are already dense indices.
+    template <typename GidT>
+    void accumulate_columns_into(const GidT* gids,
+                                 const std::vector<const ColumnEntry*>& agg_entries,
+                                 std::size_t begin, std::size_t end, AggSlot* base) {
+        AggSlot* fs = base;
+        const std::size_t rows = end;
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
-            const auto slot_for = [&](std::uint32_t g) -> AggSlot& {
+            // Takes GidT so a signed Categorical code indexes without an
+            // implicit narrowing conversion at each of the ~19 call sites.
+            const auto slot_for = [&](GidT g) -> AggSlot& {
                 return fs[(static_cast<std::size_t>(g) * n_aggs_) + agg_i];
             };
 
             if (plan_[agg_i].func == ir::AggFunc::Count) {
-                for (std::size_t row = 0; row < rows; ++row) {
+                for (std::size_t row = begin; row < rows; ++row) {
                     slot_for(gids[row]).count++;
                 }
                 continue;
@@ -4559,7 +4574,7 @@ class ChunkedAggregateOperator final : public Operator {
                 const double* data = std::get<Column<double>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4568,7 +4583,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Mean:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4578,7 +4593,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Min:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4588,7 +4603,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Max:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4598,7 +4613,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Stddev:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_stddev(slot_for(gids[row]), data[row]);
@@ -4606,14 +4621,14 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_moments(slot_for(gids[row]), data[row]);
                         }
                         break;
                     case ir::AggFunc::First:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4624,7 +4639,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Last:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4639,7 +4654,7 @@ class ChunkedAggregateOperator final : public Operator {
                 const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
                 switch (plan_[agg_i].func) {
                     case ir::AggFunc::Sum:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4648,7 +4663,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Mean:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4658,7 +4673,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Min:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4668,7 +4683,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Max:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4678,7 +4693,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Stddev:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_stddev(slot_for(gids[row]), static_cast<double>(data[row]));
@@ -4686,14 +4701,14 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             agg_update_moments(slot_for(gids[row]), static_cast<double>(data[row]));
                         }
                         break;
                     case ir::AggFunc::First:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4704,7 +4719,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Last:
-                        for (std::size_t row = 0; row < rows; ++row) {
+                        for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
@@ -4730,7 +4745,7 @@ class ChunkedAggregateOperator final : public Operator {
                     return std::string(std::get<Column<std::string>>(*entry.column)[row]);
                 };
                 if (plan_[agg_i].func == ir::AggFunc::First) {
-                    for (std::size_t row = 0; row < rows; ++row) {
+                    for (std::size_t row = begin; row < rows; ++row) {
                         if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
@@ -4740,7 +4755,7 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                     }
                 } else {
-                    for (std::size_t row = 0; row < rows; ++row) {
+                    for (std::size_t row = begin; row < rows; ++row) {
                         if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
@@ -4756,6 +4771,116 @@ class ChunkedAggregateOperator final : public Operator {
     /// (n_aggs_ entries, caller-owned). No gid indirection: the compiler sees
     /// a plain reduction over a contiguous range, which is also what lets a
     /// worker own a private copy.
+    /// Parallel single-key Categorical group-by. Returns false when the shape
+    /// is not eligible and the caller should run the serial path.
+    ///
+    /// A Categorical code is already a dense index into the dictionary, so a
+    /// worker needs no hash table at all: it accumulates into a private slot
+    /// array indexed by code. That bounds the partial state by DICTIONARY
+    /// SIZE, which is what makes per-worker group state affordable here and
+    /// keeps `by symbol` (a few hundred groups) cheap.
+    ///
+    /// Group order is Ibex's observed first-occurrence order, and the merge
+    /// preserves it exactly: morsels are contiguous ascending row ranges, and
+    /// merging them in ascending order while walking each morsel's own
+    /// first-seen code list visits codes in precisely the order a serial scan
+    /// would have met them.
+    auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
+                                       const std::vector<const ColumnEntry*>& agg_entries,
+                                       std::size_t rows) -> bool {
+        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows) {
+            return false;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (!agg_is_combinable(plan_[a].func)) {
+                return false;
+            }
+        }
+        const std::size_t dict_size = cat.dictionary().size();
+        if (dict_size == 0) {
+            return false;
+        }
+
+        // Same row-derived partition as the global aggregate, then bounded by
+        // what the per-worker slot arrays cost. Both inputs (row count and
+        // dictionary size) are properties of the DATA, so the partition — and
+        // therefore the float reduction order — is still independent of the
+        // machine and the schedule.
+        constexpr std::size_t kMinRowsPerMorsel = 65536;
+        constexpr std::size_t kMaxMorsels = 64;
+        constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
+        const std::size_t per_morsel_bytes = dict_size * n_aggs_ * sizeof(AggSlot);
+        if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
+            return false;  // one worker's state alone blows the budget
+        }
+        std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+        morsels = std::min(morsels, kPartialBudgetBytes / per_morsel_bytes);
+        if (morsels < 2) {
+            return false;
+        }
+
+        const auto* codes = cat.codes_data();
+        const std::size_t grain = (rows + morsels - 1) / morsels;
+        std::vector<AggSlot> partials(morsels * dict_size * n_aggs_);
+        // Per morsel, the codes it saw in first-occurrence order.
+        std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
+
+        auto& pool = process_worker_pool();
+        const std::size_t threads =
+            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(threads, [&](std::size_t) {
+            std::vector<std::uint8_t> local_seen(dict_size, 0);
+            while (true) {
+                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (m >= morsels) {
+                    return;
+                }
+                const std::size_t begin = m * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                if (begin >= end) {
+                    continue;
+                }
+                std::ranges::fill(local_seen, std::uint8_t{0});
+                auto& order = seen[m];
+                for (std::size_t row = begin; row < end; ++row) {
+                    const auto code = codes[row];
+                    if (local_seen[static_cast<std::size_t>(code)] == 0) {
+                        local_seen[static_cast<std::size_t>(code)] = 1;
+                        order.push_back(code);
+                    }
+                }
+                accumulate_columns_into(codes, agg_entries, begin, end,
+                                        &partials[m * dict_size * n_aggs_]);
+            }
+        });
+        batch.wait();
+
+        if (cat_dense_gid_.size() < dict_size) {
+            cat_dense_gid_.resize(dict_size, kNoGid);
+        }
+        for (std::size_t m = 0; m < morsels; ++m) {
+            const AggSlot* src = &partials[m * dict_size * n_aggs_];
+            for (const auto code : seen[m]) {
+                const auto idx = static_cast<std::size_t>(code);
+                std::uint32_t gid = cat_dense_gid_[idx];
+                if (gid == kNoGid) {
+                    gid = alloc_group();
+                    cat_dense_gid_[idx] = gid;
+                    cat_order_.push_back(code);
+                }
+                AggSlot* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+                }
+            }
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     void accumulate_ungrouped_range(const std::vector<const ColumnEntry*>& agg_entries,
                                     std::size_t begin, std::size_t end, AggSlot* slots) const {
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {

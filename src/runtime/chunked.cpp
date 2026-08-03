@@ -1930,19 +1930,35 @@ class ChunkedOrderedLimitOperator final : public Operator {
     // for a function call it doesn't need.
     auto resolve_group_heap(const Table& chunk, const std::vector<KeyCol>& group_key_cols,
                             std::size_t row) -> std::vector<Entry>* {
-        const std::uint32_t gid =
-            group_index_.find_or_insert(group_keys_, group_key_cols, row, [&] {
-                Key key;
-                key.values.reserve(group_by_->size());
-                for (const auto& ref : *group_by_) {
-                    const auto* entry = chunk.find_entry(ref.name);
-                    push_key_value(key, *entry, row);
+        // Fast path: single Categorical key, non-null row. A null carries no
+        // meaningful code, and the generic index already folds every null into
+        // one group, so nulls stay on the slow path rather than being memoed.
+        if (!cat_gid_memo_.empty() && !group_key_cols.front().is_null(row)) {
+            const auto code = static_cast<std::size_t>(group_key_cols.front().cat->code_at(row));
+            if (code < cat_gid_memo_.size()) {
+                std::uint32_t& slot = cat_gid_memo_[code];
+                if (slot == kNoCatGid) {
+                    slot = resolve_group_slow(chunk, group_key_cols, row);
                 }
-                group_keys_.push_back(std::move(key));
-                group_states_.push_back(GroupState{});
-                return static_cast<std::uint32_t>(group_states_.size() - 1);
-            });
-        return &group_states_[gid].heap;
+                return &group_states_[slot].heap;
+            }
+        }
+        return &group_states_[resolve_group_slow(chunk, group_key_cols, row)].heap;
+    }
+
+    auto resolve_group_slow(const Table& chunk, const std::vector<KeyCol>& group_key_cols,
+                            std::size_t row) -> std::uint32_t {
+        return group_index_.find_or_insert(group_keys_, group_key_cols, row, [&] {
+            Key key;
+            key.values.reserve(group_by_->size());
+            for (const auto& ref : *group_by_) {
+                const auto* entry = chunk.find_entry(ref.name);
+                push_key_value(key, *entry, row);
+            }
+            group_keys_.push_back(std::move(key));
+            group_states_.push_back(GroupState{});
+            return static_cast<std::uint32_t>(group_states_.size() - 1);
+        });
     }
 
     template <typename T>
@@ -2009,6 +2025,16 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 return "topk group-by column has unsupported type: " + ref.name;
             }
             group_key_cols.push_back(*col);
+        }
+
+        // `by <categorical>` is the common shape (`by symbol`), and the generic
+        // index answers it the expensive way: resolve the code to its
+        // dictionary string, hash the bytes, then memcmp on every probe — once
+        // per ROW, to rediscover one of a handful of groups. Within one chunk
+        // the dictionary is fixed, so code -> gid is a function; memo it.
+        cat_gid_memo_.clear();
+        if (group_key_cols.size() == 1 && group_key_cols.front().kind == KeyCol::Kind::Cat) {
+            cat_gid_memo_.assign(group_key_cols.front().cat->dictionary().size(), kNoCatGid);
         }
 
         std::vector<const ColumnValue*> key_columns;
@@ -2120,6 +2146,12 @@ class ChunkedOrderedLimitOperator final : public Operator {
     std::vector<GroupState> group_states_;
     KeyRowIndex group_index_;
     std::optional<Table> empty_template_;
+    /// Per-chunk memo for a single Categorical group key: dictionary code ->
+    /// gid. Empty when the fast path does not apply. Rebuilt every chunk
+    /// because a later chunk may carry a DIFFERENT dictionary, which would
+    /// make a retained code->gid mapping silently wrong.
+    std::vector<std::uint32_t> cat_gid_memo_;
+    static constexpr std::uint32_t kNoCatGid = std::numeric_limits<std::uint32_t>::max();
 };
 
 class ChunkedDistinctOperator final : public Operator {

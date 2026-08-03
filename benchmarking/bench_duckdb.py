@@ -358,12 +358,6 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "LAG(price) OVER (ORDER BY rowid) ELSE NULL END AS prev FROM prices"
         ).fetchnumpy(),
     )
-    run(
-        "rbind_two",
-        lambda: con.sql(
-            "SELECT * FROM prices UNION ALL SELECT * FROM prices"
-        ).fetchnumpy(),
-    )
 
     run(
         "rand_uniform",

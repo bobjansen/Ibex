@@ -325,8 +325,6 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         "where_update_window",
         lambda: df.assign(prev=df["price"].shift(1).where(df["price"] > 900.0)),
     )
-    run("rbind_two", lambda: pd.concat([df, df], ignore_index=True))
-
     run("cumsum_price", lambda: df.assign(cs=df["price"].cumsum()))
 
     run("cumprod_price", lambda: df.assign(cp=df["price"].cumprod()))
@@ -659,8 +657,6 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
             .alias("prev")
         ),
     )
-    run("rbind_two", lambda: pl.concat([df, df]))
-
     run("cumsum_price", lambda: df.with_columns(pl.col("price").cum_sum().alias("cs")))
 
     run(
@@ -1039,7 +1035,6 @@ def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         )
         .collect(),
     )
-    run("rbind_two", lambda: pl.concat([scan(), scan()]).collect())
     run(
         "cumsum_price",
         lambda: scan().with_columns(pl.col("price").cum_sum().alias("cs")).collect(),

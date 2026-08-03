@@ -4010,6 +4010,18 @@ class ChunkedAggregateOperator final : public Operator {
                 }
                 plan_.push_back(p);
             }
+            // Lay the scratch out once the plan is known. Skew/Kurtosis share
+            // one online recurrence that updates both higher moments, so each
+            // asks for the pair.
+            scratch_offset_.assign(n_aggs_, 0);
+            scratch_stride_ = 0;
+            for (std::size_t i = 0; i < n_aggs_; ++i) {
+                if (plan_[i].func == ir::AggFunc::Skew || plan_[i].func == ir::AggFunc::Kurtosis) {
+                    plan_[i].scratch_doubles = 2;
+                }
+                scratch_offset_[i] = static_cast<std::uint32_t>(scratch_stride_);
+                scratch_stride_ += plan_[i].scratch_doubles;
+            }
             group_templates_.reserve(group_entries.size());
             bool all_cat = true;
             for (const auto* e : group_entries) {
@@ -4132,7 +4144,7 @@ class ChunkedAggregateOperator final : public Operator {
                     str_index_.emplace(std::string(key), gid);
                     str_order_.emplace_back(key);
                     ++n_groups_;
-                    flat_slots_.resize(n_groups_ * n_aggs_);
+                    size_group_arrays();
                 } else {
                     gid = static_cast<std::uint32_t>(it->second);
                 }
@@ -4200,7 +4212,7 @@ class ChunkedAggregateOperator final : public Operator {
                     int_index_.emplace(key, gid);
                     int_order_.push_back(key);
                     ++n_groups_;
-                    flat_slots_.resize(n_groups_ * n_aggs_);
+                    size_group_arrays();
                 } else {
                     gid = it->second;
                 }
@@ -4262,7 +4274,7 @@ class ChunkedAggregateOperator final : public Operator {
                     pair_index_.emplace(key, gid);
                     pair_order_.emplace_back(a, b);
                     ++n_groups_;
-                    flat_slots_.resize(n_groups_ * n_aggs_);
+                    size_group_arrays();
                 } else {
                     gid = it->second;
                 }
@@ -4286,10 +4298,27 @@ class ChunkedAggregateOperator final : public Operator {
         return text_store_[slot_index];
     }
 
+    /// Scratch for one (group, aggregate). Only valid when that aggregate
+    /// declared scratch_doubles > 0.
+    [[nodiscard]] auto scratch_for(std::size_t gid, std::size_t agg_i) -> double* {
+        return scratch_.data() + (gid * scratch_stride_) + scratch_offset_[agg_i];
+    }
+
+    /// Size every per-group array to `n_groups_`. THE ONLY PLACE THAT RESIZES
+    /// THEM — the grouping fast paths used to call `flat_slots_.resize()`
+    /// directly, and adding a second per-group array (scratch) to just one of
+    /// those call sites left the others reading a null pointer.
+    void size_group_arrays() {
+        flat_slots_.resize(n_groups_ * n_aggs_);
+        if (scratch_stride_ != 0) {
+            scratch_.resize(n_groups_ * scratch_stride_, 0.0);
+        }
+    }
+
     auto alloc_group() -> std::uint32_t {
         auto gid = static_cast<std::uint32_t>(n_groups_);
         ++n_groups_;
-        flat_slots_.resize(n_groups_ * n_aggs_);
+        size_group_arrays();
         return gid;
     }
 
@@ -4648,7 +4677,8 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            agg_update_moments(slot_for(gids[row]), data[row]);
+                            double* scr = scratch_for(static_cast<std::size_t>(gids[row]), agg_i);
+                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], data[row]);
                         }
                         break;
                     case ir::AggFunc::First:
@@ -4728,7 +4758,9 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            agg_update_moments(slot_for(gids[row]), static_cast<double>(data[row]));
+                            double* scr = scratch_for(static_cast<std::size_t>(gids[row]), agg_i);
+                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1],
+                                               static_cast<double>(data[row]));
                         }
                         break;
                     case ir::AggFunc::First:
@@ -4983,7 +5015,8 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         each([&](std::size_t r) {
-                            agg_update_moments(slot, data[r]);
+                            double* scr = scratch_for(0, agg_i);
+                            agg_update_moments(slot, scr[0], scr[1], data[r]);
                             slot.has_value = true;
                         });
                         break;
@@ -5043,7 +5076,8 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         each([&](std::size_t r) {
-                            agg_update_moments(slot, static_cast<double>(data[r]));
+                            double* scr = scratch_for(0, agg_i);
+                            agg_update_moments(slot, scr[0], scr[1], static_cast<double>(data[r]));
                             slot.has_value = true;
                         });
                         break;
@@ -5347,10 +5381,10 @@ class ChunkedAggregateOperator final : public Operator {
                         append_scalar(column, agg_finalize_stddev(slot));
                         break;
                     case ir::AggFunc::Skew:
-                        append_scalar(column, agg_finalize_skew(slot));
+                        append_scalar(column, agg_finalize_skew(slot, scratch_for(g, i)[0]));
                         break;
                     case ir::AggFunc::Kurtosis:
-                        append_scalar(column, agg_finalize_kurtosis(slot));
+                        append_scalar(column, agg_finalize_kurtosis(slot, scratch_for(g, i)[1]));
                         break;
                     case ir::AggFunc::First:
                         if (plan_[i].kind == ExprType::Double) {
@@ -5408,6 +5442,13 @@ class ChunkedAggregateOperator final : public Operator {
         // from Column<std::string> for First/Last output construction, since
         // expr_type_for_column collapses both to ExprType::String.
         bool categorical = false;
+        /// Extra per-GROUP state this aggregate needs, in doubles. Zero for
+        /// almost everything, which is the point: state that only one
+        /// aggregate wants must not sit in AggSlotCore, where it would cost
+        /// every group of every query. Skew/Kurtosis declare 2 (the third and
+        /// fourth central moments); a future aggregate declares whatever it
+        /// needs without touching the slot.
+        std::uint32_t scratch_doubles = 0;
     };
 
     struct CatKey {
@@ -5462,6 +5503,16 @@ class ChunkedAggregateOperator final : public Operator {
     std::size_t n_groups_ = 0;
     std::vector<SlotPlan> plan_;
     std::vector<ColumnValue> group_templates_;
+
+    /// Per-group scratch for aggregates that declared `scratch_doubles`,
+    /// laid out group-major: `scratch_[gid * scratch_stride_ + offset[agg]]`.
+    /// Group-major so several small consumers in one group share a cache line.
+    /// Stays EMPTY when no aggregate asks for any — the same "pay only if used"
+    /// rule as text_store_, and `double` keeps it trivially copyable so growth
+    /// is a memcpy.
+    std::vector<double> scratch_;
+    std::size_t scratch_stride_ = 0;
+    std::vector<std::uint32_t> scratch_offset_;
 
     /// Boxed First/Last values for non-numeric columns, parallel to
     /// `flat_slots_` and indexed identically. Stays EMPTY — no allocation, no
@@ -5763,6 +5814,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 first.ordering()->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
         }
         cur_slots_.assign(n_aggs_, AggSlotCore{});
+        cur_scratch_.assign(n_aggs_ * 2, 0.0);
         reset_output();
         return std::nullopt;
     }
@@ -5901,6 +5953,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             open_key_.push_back(scalar_from_column(*col, row));
         }
         std::ranges::fill(cur_slots_, AggSlotCore{});
+        std::ranges::fill(cur_scratch_, 0.0);
         open_ = true;
     }
 
@@ -5954,18 +6007,23 @@ class ChunkedSortedAggregateOperator final : public Operator {
             const bool has_nulls = entry.validity.has_value();
             if (plan_[i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
-                accumulate_typed(slot, plan_[i].func, data, entry, has_nulls, start, end);
+                accumulate_typed(slot, &cur_scratch_[i * 2], plan_[i].func, data, entry, has_nulls,
+                                 start, end);
             } else {
                 const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
-                accumulate_typed(slot, plan_[i].func, data, entry, has_nulls, start, end);
+                accumulate_typed(slot, &cur_scratch_[i * 2], plan_[i].func, data, entry, has_nulls,
+                                 start, end);
             }
         }
     }
 
     template <typename T>
-    static void accumulate_typed(AggSlotCore& slot, ir::AggFunc func, const T* data,
-                                 const ColumnEntry& entry, bool has_nulls, std::size_t start,
-                                 std::size_t end) {
+    /// `scratch` is this aggregate's per-group scratch (2 doubles for the
+    /// higher moments); it stays a parameter so this helper remains static and
+    /// has no reach into operator state.
+    static void accumulate_typed(AggSlotCore& slot, double* scratch, ir::AggFunc func,
+                                 const T* data, const ColumnEntry& entry, bool has_nulls,
+                                 std::size_t start, std::size_t end) {
         const auto valid = [&](std::size_t row) { return !has_nulls || (*entry.validity)[row]; };
         switch (func) {
             case ir::AggFunc::Sum:
@@ -6035,7 +6093,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    agg_update_moments(slot, static_cast<double>(data[row]));
+                    agg_update_moments(slot, scratch[0], scratch[1],
+                                       static_cast<double>(data[row]));
                 }
                 break;
             case ir::AggFunc::First:
@@ -6094,10 +6153,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     append_scalar(column, ScalarValue{agg_finalize_stddev(slot)});
                     break;
                 case ir::AggFunc::Skew:
-                    append_scalar(column, ScalarValue{agg_finalize_skew(slot)});
+                    append_scalar(column,
+                                  ScalarValue{agg_finalize_skew(slot, cur_scratch_[i * 2])});
                     break;
                 case ir::AggFunc::Kurtosis:
-                    append_scalar(column, ScalarValue{agg_finalize_kurtosis(slot)});
+                    append_scalar(column, ScalarValue{agg_finalize_kurtosis(
+                                              slot, cur_scratch_[(i * 2) + 1])});
                     break;
                 default:  // Sum / Min / Max
                     if (plan_[i].kind == ExprType::Double) {
@@ -6157,6 +6218,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
 
     // Open-group state.
     std::vector<AggSlotCore> cur_slots_;
+    /// Scratch for the group currently being streamed — 2 doubles per
+    /// aggregate that declared any (see SlotPlan::scratch_doubles). This
+    /// operator holds one group at a time, so it needs one group's worth.
+    std::vector<double> cur_scratch_;
     std::vector<ScalarValue> open_key_;
 
     // Output buffers for closed groups awaiting emission.

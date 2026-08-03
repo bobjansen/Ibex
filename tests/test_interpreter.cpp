@@ -5613,6 +5613,49 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// Skew and kurtosis keep their higher moments in the operator's per-group
+// scratch region, not in the slot. Asking for BOTH in one select is what
+// exercises the offset arithmetic: they get distinct 2-double windows (offsets
+// 0 and 2), and each still runs its own online recurrence. A single
+// scratch-using aggregate would pass even if every offset collapsed to zero.
+TEST_CASE("skew and kurtosis get separate scratch windows", "[agg]") {
+    runtime::Table t;
+    // Two groups with deliberately different shapes so one group's moments
+    // cannot stand in for the other's.
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 1, 1, 2, 2, 2, 2, 2});
+    t.add_column("v", Column<double>{1.0, 2.0, 3.0, 4.0, 5.0,     // symmetric
+                                     1.0, 1.0, 1.0, 1.0, 20.0});  // right-skewed
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Baselines from each aggregate computed alone — if the scratch windows
+    // overlapped, the combined query would drift from these.
+    auto ir_skew = require_ir("t[select { s = skew(v) }, by g];");
+    auto ir_kurt = require_ir("t[select { k = kurtosis(v) }, by g];");
+    auto only_skew = runtime::interpret(*ir_skew, registry);
+    auto only_kurt = runtime::interpret(*ir_kurt, registry);
+    REQUIRE(only_skew.has_value());
+    REQUIRE(only_kurt.has_value());
+    const auto& s_alone = std::get<Column<double>>(*only_skew->find("s"));
+    const auto& k_alone = std::get<Column<double>>(*only_kurt->find("k"));
+
+    auto ir_both = require_ir("t[select { s = skew(v), k = kurtosis(v), c = count() }, by g];");
+    auto both = runtime::interpret(*ir_both, registry);
+    REQUIRE(both.has_value());
+    REQUIRE(both->rows() == 2);
+    const auto& s = std::get<Column<double>>(*both->find("s"));
+    const auto& k = std::get<Column<double>>(*both->find("k"));
+
+    for (std::size_t g = 0; g < 2; ++g) {
+        CHECK(s[g] == Catch::Approx(s_alone[g]));
+        CHECK(k[g] == Catch::Approx(k_alone[g]));
+    }
+    // A symmetric group really is ~0 skew, so the check above is not comparing
+    // two identically-broken values.
+    CHECK(s[0] == Catch::Approx(0.0).margin(1e-12));
+    CHECK(s[1] > 1.0);  // right-skewed
+}
+
 // EWMA's alpha is a property of the AGGREGATION, not the group, so it is read
 // from the plan rather than copied into every slot. Two ewma aggregates with
 // DIFFERENT alphas in one select is what catches a wrong plan index: with a

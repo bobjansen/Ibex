@@ -10,6 +10,7 @@ from collections import defaultdict
 
 FRAMEWORK_ORDER = [
     "ibex",
+    "ibex-st",
     "ibex+parse",
     "ibex-compiled",
     "polars",

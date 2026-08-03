@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
-#                        [--skip-ibex] [--skip-ibex-compiled]
+#                        [--skip-ibex] [--skip-ibex-st] [--skip-ibex-compiled]
 #                        [--skip-python] [--skip-r]
 #                        [--skip-duckdb] [--skip-duckdb-st] [--duckdb-all-sizes]
 #                        [--skip-datafusion] [--skip-datafusion-st]
@@ -78,6 +78,7 @@ SQLITE_MAX_ROWS="${SQLITE_MAX_ROWS:-4000000}"
 DUCKDB_SCALES="${DUCKDB_SCALES:-1000000,4000000,16000000}"
 SKIP_IBEX=0
 SKIP_IBEX_COMPILED=0
+SKIP_IBEX_ST=0
 SKIP_PYTHON=0
 SKIP_R=0
 SKIP_PANDAS=0
@@ -157,6 +158,7 @@ while [[ $# -gt 0 ]]; do
         --tf-rows)     TF_ROWS_OVERRIDE="$2"; shift 2 ;;
         --skip-ibex)   SKIP_IBEX=1; shift ;;
         --skip-ibex-compiled) SKIP_IBEX_COMPILED=1; shift ;;
+        --skip-ibex-st) SKIP_IBEX_ST=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift ;;
         --skip-r)      SKIP_R=1; shift ;;
         --skip-pandas) SKIP_PANDAS=1; shift ;;
@@ -423,6 +425,30 @@ for rows in "${SIZES[@]}"; do
                 --warmup "$WARMUP" --iters "$EFF_ITERS" \
                 --out "$size_result_dir/ibex.tsv" || engine_failed "ibex"
         append_tagged_results "$rows" "$size_result_dir/ibex.tsv"
+    fi
+
+    # Single-thread Ibex, the counterpart of polars-st / duckdb-st. Without it
+    # the table has no way to show what Ibex gains from threads while every
+    # rival shows exactly that, and `ibex` (threaded by default —
+    # ExecutionContext::parallel is true) ends up compared against `polars-st`
+    # as if it were single-threaded.
+    if [[ $SKIP_IBEX -eq 0 && $SKIP_IBEX_ST -eq 0 ]]; then
+        echo "  → ibex (single thread)"
+        ibex_st_raw="$size_result_dir/ibex_st_raw.tsv"
+        ibex_st_tsv="$size_result_dir/ibex_st.tsv"
+        IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
+            IBEX_PARALLEL=0 IBEX_FW_SUFFIX=-st \
+            bash "$SCRIPT_DIR/bench_ibex.sh" \
+                --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
+                --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \
+                --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
+                --warmup "$WARMUP" --iters "$EFF_ITERS" \
+                --out "$ibex_st_raw" || { engine_failed "ibex-st"; : > "$ibex_st_raw"; }
+        # Drop the parse rows: they measure parser overhead, not thread count,
+        # and would collide with the threaded run's ibex+parse cells.
+        awk 'BEGIN { FS=OFS="\t" } NR==1 { print; next } $1 != "ibex+parse" { print }' \
+            "$ibex_st_raw" > "$ibex_st_tsv"
+        append_tagged_results "$rows" "$ibex_st_tsv"
     fi
 
     if [[ $SKIP_IBEX_COMPILED -eq 0 ]]; then

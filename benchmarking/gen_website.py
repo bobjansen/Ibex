@@ -301,11 +301,14 @@ __BENCHMARK_NAV__
     <div class="tablewrap"><table class="bench" id="tbl"></table></div>
 
     <p class="bench-note" style="margin-top:1rem">
-      <strong>Threads.</strong> Ibex runs on a single core. Polars, DuckDB,
-      DataFusion and ClickHouse use all 8 — so they win the parallelisable cells
-      on core count, not per-core work. For a same-core comparison read Ibex
-      against <code>polars-st</code> (Polars pinned to one thread); Ibex is faster
-      on the large majority of queries there.
+      <strong>Threads.</strong> Every engine gets the same 8 vCPU. Ibex
+      parallelises some operators by default, so <code>ibex</code> is not a
+      single-core number; <code>ibex-st</code> is the same build run with
+      <code>IBEX_PARALLEL=0</code>, which makes <code>ibex</code> vs
+      <code>ibex-st</code> Ibex's own threading gain. <code>polars-st</code>,
+      <code>duckdb-st</code>, <code>datafusion-st</code> and
+      <code>clickhouse-st</code> are the equivalent single-thread runs of their
+      engines, so <code>ibex-st</code> against those is the per-core comparison.
     </p>
     <p class="bench-note">
       <strong>Memory.</strong> The memory metrics show absolute peak resident set
@@ -593,7 +596,9 @@ python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
       rolling-window frames are shown fully resolved (e.g. the
       <code>RANGE BETWEEN INTERVAL</code> vs <code>ROWS</code> clause) so the
       time-window comparison is auditable. <code>polars-st</code> runs identical
-      code to Polars with <code>POLARS_MAX_THREADS=1</code>; <code>ibex+parse</code>
+      code to Polars with <code>POLARS_MAX_THREADS=1</code>, and
+      <code>ibex-st</code> identical code to Ibex with
+      <code>IBEX_PARALLEL=0</code>; <code>ibex+parse</code>
       is the same Ibex query timed with parsing included.
     </p>
     <div class="codewrap">

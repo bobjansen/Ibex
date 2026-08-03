@@ -5691,6 +5691,105 @@ TEST_CASE("global aggregate is deterministic across thread counts", "[agg][paral
     }
 }
 
+// A single-key Categorical group-by fans out across workers, each accumulating
+// into a private slot array indexed by code, then merges in ascending row
+// order. The property that is easy to lose and invisible in a values-only
+// check is GROUP ORDER: Ibex emits groups in first-occurrence order, so the
+// merge must walk morsels in row order and, within a morsel, the codes it saw
+// in the order it saw them. A key whose first occurrences are deliberately not
+// in code order pins that.
+TEST_CASE("parallel categorical group-by keeps first-occurrence order", "[agg][parallel]") {
+    // Enough rows to clear the two-morsel minimum (65536 rows per morsel).
+    constexpr std::size_t kRows = 200'000;
+    // Dictionary order is A,B,C,D but the data first meets them D,C,A,B — so a
+    // merge that walked the dictionary, or sorted, would produce A,B,C,D and
+    // fail.
+    std::vector<std::string> dict{"A", "B", "C", "D"};
+    const std::array<int, 4> first_order{3, 2, 0, 1};
+    Column<Categorical> sym(dict);
+    Column<double> v;
+    Column<std::int64_t> w;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        // First four rows fix the first-occurrence order; the rest cycle.
+        const int code = r < 4 ? first_order[r] : first_order[(r * 7) % 4];
+        sym.push_code(static_cast<Column<Categorical>::code_type>(code));
+        v.push_back(1e6 + (static_cast<double>(r % 977) * 0.25));
+        w.push_back(static_cast<std::int64_t>(r % 31));
+    }
+    runtime::Table t;
+    t.add_column("sym", std::move(sym));
+    t.add_column("v", std::move(v));
+    t.add_column("w", std::move(w));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[select { n = count(), s = sum(v), a = mean(v), sd = std(v), "
+        "mn = min(v), mx = max(v), sw = sum(w) }, by sym];");
+
+    struct Row {
+        std::string key;
+        std::vector<double> vals;
+        auto operator==(const Row&) const -> bool = default;
+    };
+    const auto run = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto& keys = std::get<Column<Categorical>>(*out->find("sym"));
+        std::vector<Row> rows;
+        for (std::size_t i = 0; i < out->rows(); ++i) {
+            Row row;
+            row.key = std::string(keys.dictionary()[static_cast<std::size_t>(keys.code_at(i))]);
+            for (const char* name : {"n", "s", "a", "sd", "mn", "mx", "sw"}) {
+                const auto* col = out->find(name);
+                REQUIRE(col != nullptr);
+                if (const auto* d = std::get_if<Column<double>>(col)) {
+                    row.vals.push_back((*d)[i]);
+                } else {
+                    row.vals.push_back(
+                        static_cast<double>(std::get<Column<std::int64_t>>(*col)[i]));
+                }
+            }
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    };
+
+    const std::vector<Row> serial = run(false, 0);
+    REQUIRE(serial.size() == 4);
+    // The order the data actually presents them in, not the dictionary's.
+    CHECK(serial[0].key == "D");
+    CHECK(serial[1].key == "C");
+    CHECK(serial[2].key == "A");
+    CHECK(serial[3].key == "B");
+
+    std::vector<Row> first_parallel;
+    for (const std::size_t threads : {1U, 2U, 3U, 5U, 8U}) {
+        const std::vector<Row> got = run(true, threads);
+        REQUIRE(got.size() == serial.size());
+        if (first_parallel.empty()) {
+            first_parallel = got;
+        }
+        // Bit-identical at every thread count: the partition is derived from
+        // the data, never from the pool size.
+        CHECK(got == first_parallel);
+        for (std::size_t g = 0; g < got.size(); ++g) {
+            CHECK(got[g].key == serial[g].key);          // order AND membership
+            CHECK(got[g].vals[0] == serial[g].vals[0]);  // count: exact
+            CHECK(got[g].vals[4] == serial[g].vals[4]);  // min: exact
+            CHECK(got[g].vals[5] == serial[g].vals[5]);  // max: exact
+            CHECK(got[g].vals[6] == serial[g].vals[6]);  // int sum: exact
+            CHECK(got[g].vals[1] == Catch::Approx(serial[g].vals[1]).epsilon(1e-12));
+            CHECK(got[g].vals[2] == Catch::Approx(serial[g].vals[2]).epsilon(1e-12));
+            CHECK(got[g].vals[3] == Catch::Approx(serial[g].vals[3]).epsilon(1e-9));
+        }
+    }
+}
+
 // Collect-aggregates (median/quantile) group through the same per-chunk
 // code -> gid memo. Same coverage trap as the top-k case below: with a
 // string key this path is never reached, so folding every code onto one

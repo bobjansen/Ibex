@@ -102,7 +102,11 @@ mkdir -p "$(dirname "$OUT")"
 # --no-include-parse: queries[0,1] (mean_by_symbol, ohlc_by_symbol) measure
 #   pure execution only. queries[2,3] (parse_*) always include parse regardless.
 case "$MODE" in
-    memory) MODE_ARGS=(--no-include-parse); FW_TAG="ibex" ;;
+    # IBEX_FW_SUFFIX tags a variant run of the SAME code — currently "-st" for
+    # the IBEX_PARALLEL=0 single-thread pass. Same convention as
+    # bench_python.py / bench_clickhouse.py, so the suite can label a
+    # thread-count variant without a second harness.
+    memory) MODE_ARGS=(--no-include-parse); FW_TAG="ibex${IBEX_FW_SUFFIX:-}" ;;
     scan)   MODE_ARGS=(--include-read);     FW_TAG="ibex_scan" ;;
     *) echo "unknown --mode: $MODE (expected memory|scan)" >&2; exit 1 ;;
 esac

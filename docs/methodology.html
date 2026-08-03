@@ -114,7 +114,9 @@ python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
       rolling-window frames are shown fully resolved (e.g. the
       <code>RANGE BETWEEN INTERVAL</code> vs <code>ROWS</code> clause) so the
       time-window comparison is auditable. <code>polars-st</code> runs identical
-      code to Polars with <code>POLARS_MAX_THREADS=1</code>; <code>ibex+parse</code>
+      code to Polars with <code>POLARS_MAX_THREADS=1</code>, and
+      <code>ibex-st</code> identical code to Ibex with
+      <code>IBEX_PARALLEL=0</code>; <code>ibex+parse</code>
       is the same Ibex query timed with parsing included.
     </p>
     <div class="codewrap">

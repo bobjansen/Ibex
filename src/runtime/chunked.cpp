@@ -2335,13 +2335,28 @@ class ChunkedDistinctOperator final : public Operator {
         if (cat_dictionary_id_ == nullptr || cat_dictionary_id_ == dict_id) {
             cat_dictionary_id_ = dict_id;
             const std::size_t rows = t.rows();
+            const std::size_t dict_size = col.dictionary().size();
+            // A Categorical code is a dense index into the dictionary, so
+            // membership is an array read — hashing it was redundant work by
+            // construction, one probe per ROW to discover at most `dict_size`
+            // values. The flags stay across chunks (the dictionary only grows,
+            // and this branch already requires the same dictionary), so first
+            // occurrence is still decided over the whole input.
+            if (seen_cat_flags_.size() < dict_size) {
+                seen_cat_flags_.resize(dict_size, 0);
+            }
             std::vector<std::size_t> idx;
-            idx.reserve(rows);
+            // At most one row per dictionary entry can be a first occurrence,
+            // so this is an exact bound — `rows` reserved 8MB to hold a few
+            // hundred indices.
+            idx.reserve(std::min(rows, dict_size));
             const auto* codes = col.codes_data();
             for (std::size_t row = 0; row < rows; ++row) {
-                if (!seen_cat_codes_.insert(codes[row]).second) {
+                auto& flag = seen_cat_flags_[static_cast<std::size_t>(codes[row])];
+                if (flag != 0) {
                     continue;
                 }
+                flag = 1;
                 idx.push_back(row);
             }
             if (idx.empty()) {
@@ -2553,7 +2568,7 @@ class ChunkedDistinctOperator final : public Operator {
     robin_hood::unordered_flat_set<bool> seen_bool_;
     robin_hood::unordered_flat_set<Date> seen_date_;
     robin_hood::unordered_flat_set<Timestamp> seen_timestamp_;
-    robin_hood::unordered_flat_set<Column<Categorical>::code_type> seen_cat_codes_;
+    std::vector<std::uint8_t> seen_cat_flags_;
     robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
     std::deque<std::string> owned_strings_;
     const void* cat_dictionary_id_ = nullptr;

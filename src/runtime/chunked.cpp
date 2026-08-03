@@ -4880,6 +4880,17 @@ class ChunkedAggregateOperator final : public Operator {
         if (morsels < 2) {
             return false;
         }
+        // The merge costs one agg_combine per (morsel, dictionary entry), so it
+        // scales with GROUP COUNT while the scan it replaces scales with rows.
+        // Fanning out only pays when the merge stays small against the scan:
+        // `by symbol` (252 groups) merges ~4k slots against 1M rows, but
+        // `by user_id` (100k groups) would merge ~1M — more work than it saves,
+        // and measured as a 17% REGRESSION when a smaller slot let it through
+        // the memory gate.
+        constexpr std::size_t kMergeToScanRatio = 4;
+        if (morsels * dict_size > rows / kMergeToScanRatio) {
+            return false;
+        }
 
         const auto* codes = cat.codes_data();
         const std::size_t grain = (rows + morsels - 1) / morsels;

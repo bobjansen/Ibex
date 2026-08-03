@@ -20,6 +20,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -565,6 +566,125 @@ inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
     // Unbiased Fisher excess kurtosis (matches pandas/scipy default).
     return (n - 1.0) / ((n - 2.0) * (n - 3.0)) *
            (((n + 1.0) * n * slot.m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
+}
+
+/// Can this aggregate be computed as independent partials and merged?
+///
+/// Skew/Kurtosis are excluded deliberately. Their m3/m4 recurrences have a
+/// pairwise combine (Pébay), but it is numerically delicate and they are the
+/// rarest aggregates here — not worth the risk for the first parallel slice.
+/// Median/Quantile never reach these slots (the collect path owns them).
+[[nodiscard]] constexpr auto agg_is_combinable(ir::AggFunc func) noexcept -> bool {
+    switch (func) {
+        case ir::AggFunc::Count:
+        case ir::AggFunc::Sum:
+        case ir::AggFunc::Mean:
+        case ir::AggFunc::Min:
+        case ir::AggFunc::Max:
+        case ir::AggFunc::Stddev:
+        case ir::AggFunc::First:
+        case ir::AggFunc::Last:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// Merge `src` into `dst`, where `src` covers the row range immediately AFTER
+/// it. `func`/`kind` come from the caller's plan: AggSlot's own `func`/`kind`
+/// fields are left at their defaults by the flat-slot allocators, so reading
+/// them here would silently treat every aggregate as an Int Sum.
+/// `dst`'s. Order matters for First/Last, so callers must merge partials in
+/// ascending range order — which is also what makes the float results
+/// deterministic: the merge tree is fixed by row position, never by which
+/// worker happened to finish first.
+///
+/// NOTE the reduction order still differs from a serial left-to-right
+/// accumulation, so sums and stddev may differ from the serial path in the
+/// last ulps. That is inherent to any parallel float reduction; it is stable
+/// run-to-run, which is the property that matters.
+inline void agg_combine(AggSlot& dst, const AggSlot& src, ir::AggFunc func, ExprType kind) {
+    switch (func) {
+        case ir::AggFunc::Count:
+            dst.count += src.count;
+            return;
+        case ir::AggFunc::Sum:
+            if (kind == ExprType::Int) {
+                dst.int_value += src.int_value;
+            } else {
+                dst.double_value += src.double_value;
+            }
+            dst.has_value = dst.has_value || src.has_value;
+            return;
+        case ir::AggFunc::Mean:
+            dst.sum += src.sum;
+            dst.count += src.count;
+            dst.has_value = dst.has_value || src.has_value;
+            return;
+        case ir::AggFunc::Min:
+        case ir::AggFunc::Max:
+            if (!src.has_value) {
+                return;
+            }
+            if (!dst.has_value) {
+                dst.int_value = src.int_value;
+                dst.double_value = src.double_value;
+                dst.has_value = true;
+                return;
+            }
+            if (func == ir::AggFunc::Min) {
+                dst.int_value = std::min(dst.int_value, src.int_value);
+                dst.double_value = std::min(dst.double_value, src.double_value);
+            } else {
+                dst.int_value = std::max(dst.int_value, src.int_value);
+                dst.double_value = std::max(dst.double_value, src.double_value);
+            }
+            return;
+        case ir::AggFunc::Stddev: {
+            // Chan/Golub/LeVeque pairwise combine. `double_value` is the
+            // running mean and `m2` is Σ(x-mean)², matching agg_update_stddev.
+            if (src.count == 0) {
+                return;
+            }
+            if (dst.count == 0) {
+                dst.count = src.count;
+                dst.double_value = src.double_value;
+                dst.m2 = src.m2;
+                dst.has_value = dst.has_value || src.has_value;
+                return;
+            }
+            const auto na = static_cast<double>(dst.count);
+            const auto nb = static_cast<double>(src.count);
+            const double n = na + nb;
+            const double delta = src.double_value - dst.double_value;
+            dst.double_value += delta * (nb / n);
+            dst.m2 += src.m2 + (delta * delta * (na * nb / n));
+            dst.count += src.count;
+            dst.has_value = dst.has_value || src.has_value;
+            return;
+        }
+        case ir::AggFunc::First:
+            // Leftmost wins: `dst` is the earlier range.
+            if (!dst.has_value && src.has_value) {
+                dst.int_value = src.int_value;
+                dst.double_value = src.double_value;
+                dst.first_value = src.first_value;
+                dst.has_value = true;
+            }
+            return;
+        case ir::AggFunc::Last:
+            // Rightmost wins: `src` is the later range.
+            if (src.has_value) {
+                dst.int_value = src.int_value;
+                dst.double_value = src.double_value;
+                dst.last_value = src.last_value;
+                dst.has_value = true;
+            }
+            return;
+        default:
+            // agg_is_combinable() gates this; reaching here is a caller bug.
+            invariant_violation("agg_combine: aggregate is not combinable");
+    }
 }
 
 struct AggState {

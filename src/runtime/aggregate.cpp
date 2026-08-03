@@ -234,7 +234,6 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             AggSlot slot;
             slot.func = i.func;
             slot.kind = i.kind;
-            slot.param = i.param;
             state.slots.push_back(slot);
         }
         return state;
@@ -323,7 +322,13 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     slot.double_value = x;
                     slot.has_value = true;
                 } else {
-                    slot.double_value = (slot.param * x) + ((1.0 - slot.param) * slot.double_value);
+                    // The EWMA alpha is a property of the AGGREGATION, not of
+                    // the group — read it from the plan rather than storing a
+                    // copy in every slot of every group. A second such
+                    // parameter would otherwise cost another 8 bytes per group
+                    // per aggregate for a value that never varies.
+                    const double alpha = plan[i].param;
+                    slot.double_value = (alpha * x) + ((1.0 - alpha) * slot.double_value);
                 }
                 continue;
             }

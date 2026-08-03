@@ -518,11 +518,10 @@ struct AggSlotCore {
         std::int64_t int_value = 0;
         double double_value;
     };
-    double m2 = 0.0;     ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
-                         ///< doubles as the running mean for the moment aggs.
-    double m3 = 0.0;     ///< Σ(x-mean)³ (online), for skewness.
-    double m4 = 0.0;     ///< Σ(x-mean)⁴ (online), for kurtosis.
-    double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
+    double m2 = 0.0;  ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
+                      ///< doubles as the running mean for the moment aggs.
+    double m3 = 0.0;  ///< Σ(x-mean)³ (online), for skewness.
+    double m4 = 0.0;  ///< Σ(x-mean)⁴ (online), for kurtosis.
 };
 
 /// AggSlotCore plus the boxed value First/Last needs for a non-numeric column

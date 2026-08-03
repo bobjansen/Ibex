@@ -5613,6 +5613,84 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// A global aggregate (`select { … }` with no `by`) splits its row range across
+// workers and merges the partials. Two properties have to hold, and neither is
+// visible from a single run:
+//   1. the parallel answer matches the serial one, and
+//   2. it is the SAME answer at every thread count — the merge is ordered by
+//      row position, never by which worker finished first.
+// Floats make (1) non-trivial: a partial merge re-associates the additions, so
+// this pins how far it may drift, and pins (2) exactly.
+TEST_CASE("global aggregate is deterministic across thread counts", "[agg][parallel]") {
+    // Values chosen so a re-associated sum is genuinely at risk: a large
+    // running total with small increments loses low bits differently
+    // depending on where the range is cut.
+    constexpr std::size_t kRows = 300'000;
+    Column<double> v;
+    Column<std::int64_t> i;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        v.push_back(1e9 + (static_cast<double>(r % 997) * 0.125));
+        i.push_back(static_cast<std::int64_t>(r % 1013));
+    }
+    runtime::Table t;
+    t.add_column("v", std::move(v));
+    t.add_column("i", std::move(i));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[select { n = count(), s = sum(v), a = mean(v), sd = std(v), "
+        "mn = min(v), mx = max(v), si = sum(i), mi = min(i) }];");
+
+    const auto run = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == 1);
+        std::vector<double> got;
+        for (const char* name : {"n", "s", "a", "sd", "mn", "mx", "si", "mi"}) {
+            const auto* col = out->find(name);
+            REQUIRE(col != nullptr);
+            if (const auto* d = std::get_if<Column<double>>(col)) {
+                got.push_back((*d)[0]);
+            } else {
+                got.push_back(static_cast<double>(std::get<Column<std::int64_t>>(*col)[0]));
+            }
+        }
+        return got;
+    };
+
+    const std::vector<double> serial = run(false, 0);
+
+    // Integer aggregates and count/min/max are exact under any split.
+    CHECK(serial[0] == static_cast<double>(kRows));  // count
+    CHECK(serial[7] == 0.0);                         // min(i)
+    CHECK(serial[4] == 1e9);                         // min(v)
+
+    std::vector<double> first_parallel;
+    for (const std::size_t threads : {1U, 2U, 3U, 5U, 8U}) {
+        const std::vector<double> got = run(true, threads);
+        if (first_parallel.empty()) {
+            first_parallel = got;
+        }
+        // (2) identical at every thread count, bit for bit.
+        CHECK(got == first_parallel);
+        // Exact aggregates must also match serial exactly.
+        CHECK(got[0] == serial[0]);
+        CHECK(got[4] == serial[4]);
+        CHECK(got[5] == serial[5]);
+        CHECK(got[6] == serial[6]);
+        CHECK(got[7] == serial[7]);
+        // (1) the float reductions may re-associate, but only in the low bits.
+        CHECK(got[1] == Catch::Approx(serial[1]).epsilon(1e-12));  // sum
+        CHECK(got[2] == Catch::Approx(serial[2]).epsilon(1e-12));  // mean
+        CHECK(got[3] == Catch::Approx(serial[3]).epsilon(1e-9));   // stddev
+    }
+}
+
 // Collect-aggregates (median/quantile) group through the same per-chunk
 // code -> gid memo. Same coverage trap as the top-k case below: with a
 // string key this path is never reached, so folding every code onto one

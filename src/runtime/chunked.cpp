@@ -3902,8 +3902,12 @@ class ChunkedInnerJoinOperator final : public Operator {
 class ChunkedAggregateOperator final : public Operator {
    public:
     ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-                             const std::vector<ir::AggSpec>* aggregations)
-        : child_(std::move(child)), group_by_(group_by), aggregations_(aggregations) {}
+                             const std::vector<ir::AggSpec>* aggregations,
+                             const ExecutionContext& exec)
+        : child_(std::move(child)),
+          group_by_(group_by),
+          aggregations_(aggregations),
+          exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (emitted_) {
@@ -4059,6 +4063,14 @@ class ChunkedAggregateOperator final : public Operator {
 
         const std::size_t rows = chunk.rows();
 
+        // Global aggregate (`select { … }` with no `by`). Every row belongs to
+        // group 0, so the generic path below was running a hash probe per row
+        // against an EMPTY key just to rediscover that. Accumulate straight
+        // into the single group, and — since the groups are independent of row
+        // order — fan the row range out across workers.
+        if (group_entries.empty()) {
+            return process_rows_ungrouped(agg_entries, rows);
+        }
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
         }
@@ -4740,6 +4752,281 @@ class ChunkedAggregateOperator final : public Operator {
         }
     }
 
+    /// Accumulate rows [begin, end) of a global aggregate into `slots`
+    /// (n_aggs_ entries, caller-owned). No gid indirection: the compiler sees
+    /// a plain reduction over a contiguous range, which is also what lets a
+    /// worker own a private copy.
+    void accumulate_ungrouped_range(const std::vector<const ColumnEntry*>& agg_entries,
+                                    std::size_t begin, std::size_t end, AggSlot* slots) const {
+        for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
+            AggSlot& slot = slots[agg_i];
+            const auto func = plan_[agg_i].func;
+            if (func == ir::AggFunc::Count) {
+                slot.count += static_cast<std::int64_t>(end - begin);
+                continue;
+            }
+            const auto& entry = *agg_entries[agg_i];
+            const ValidityBitmap* validity =
+                entry.validity.has_value() ? &*entry.validity : nullptr;
+            const bool has_nulls = validity != nullptr;
+
+            // One generic driver per storage kind; `step` is the per-row body.
+            const auto each = [&](auto&& step) {
+                if (has_nulls) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        if (!(*validity)[row]) {
+                            continue;
+                        }
+                        step(row);
+                    }
+                } else {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        step(row);
+                    }
+                }
+            };
+
+            if (plan_[agg_i].kind == ExprType::Double) {
+                const double* data = std::get<Column<double>>(*entry.column).data();
+                switch (func) {
+                    case ir::AggFunc::Sum:
+                        // has_value must track "saw a non-null value", not
+                        // "the range was non-empty": sum over an all-null
+                        // column is NULL, not 0.
+                        each([&](std::size_t r) {
+                            slot.double_value += data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Mean:
+                        each([&](std::size_t r) {
+                            slot.sum += data[r];
+                            slot.count++;
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Min:
+                        each([&](std::size_t r) {
+                            slot.double_value =
+                                slot.has_value ? std::min(slot.double_value, data[r]) : data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Max:
+                        each([&](std::size_t r) {
+                            slot.double_value =
+                                slot.has_value ? std::max(slot.double_value, data[r]) : data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Stddev:
+                        each([&](std::size_t r) {
+                            agg_update_stddev(slot, data[r]);
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
+                        each([&](std::size_t r) {
+                            agg_update_moments(slot, data[r]);
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::First:
+                        each([&](std::size_t r) {
+                            if (!slot.has_value) {
+                                slot.double_value = data[r];
+                                slot.has_value = true;
+                            }
+                        });
+                        break;
+                    case ir::AggFunc::Last:
+                        each([&](std::size_t r) {
+                            slot.double_value = data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    default:
+                        break;
+                }
+            } else if (plan_[agg_i].kind == ExprType::Int) {
+                const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
+                switch (func) {
+                    case ir::AggFunc::Sum:
+                        each([&](std::size_t r) {
+                            slot.int_value += data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Mean:
+                        each([&](std::size_t r) {
+                            slot.sum += static_cast<double>(data[r]);
+                            slot.count++;
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Min:
+                        each([&](std::size_t r) {
+                            slot.int_value =
+                                slot.has_value ? std::min(slot.int_value, data[r]) : data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Max:
+                        each([&](std::size_t r) {
+                            slot.int_value =
+                                slot.has_value ? std::max(slot.int_value, data[r]) : data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Stddev:
+                        each([&](std::size_t r) {
+                            agg_update_stddev(slot, static_cast<double>(data[r]));
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::Skew:
+                    case ir::AggFunc::Kurtosis:
+                        each([&](std::size_t r) {
+                            agg_update_moments(slot, static_cast<double>(data[r]));
+                            slot.has_value = true;
+                        });
+                        break;
+                    case ir::AggFunc::First:
+                        each([&](std::size_t r) {
+                            if (!slot.has_value) {
+                                slot.int_value = data[r];
+                                slot.has_value = true;
+                            }
+                        });
+                        break;
+                    case ir::AggFunc::Last:
+                        each([&](std::size_t r) {
+                            slot.int_value = data[r];
+                            slot.has_value = true;
+                        });
+                        break;
+                    default:
+                        break;
+                }
+            } else {
+                // ExprType::String — First/Last only, same wire format as the
+                // grouped path (ScalarValue{std::string}).
+                const bool categorical = plan_[agg_i].categorical;
+                const auto value_at = [&](std::size_t row) -> std::string {
+                    if (categorical) {
+                        return std::string(std::get<Column<Categorical>>(*entry.column)[row]);
+                    }
+                    return std::string(std::get<Column<std::string>>(*entry.column)[row]);
+                };
+                if (func == ir::AggFunc::First) {
+                    each([&](std::size_t r) {
+                        if (!slot.has_value) {
+                            slot.first_value = value_at(r);
+                            slot.has_value = true;
+                        }
+                    });
+                } else {
+                    each([&](std::size_t r) {
+                        slot.last_value = value_at(r);
+                        slot.has_value = true;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Global aggregate over `rows`, optionally fanned out across workers.
+    auto process_rows_ungrouped(const std::vector<const ColumnEntry*>& agg_entries,
+                                std::size_t rows) -> std::optional<std::string> {
+        // An empty input must produce NO group, hence no output row — the
+        // generic path got that for free by only creating a group when a row
+        // arrived. Creating it up front turned `count()` over an empty table
+        // into a 1-row answer.
+        if (rows == 0) {
+            return std::nullopt;
+        }
+        if (n_groups_ == 0) {
+            // build_output_chunk() reads group_order_[g] for the generic key
+            // layout, so the single group still needs its (empty) Key — the
+            // generic path used to push one from its make_group lambda.
+            group_order_.emplace_back();
+            alloc_group();
+        }
+        AggSlot* dst = flat_slots_.data();
+
+        const std::size_t morsels = ungrouped_morsels(rows);
+        if (morsels < 2) {
+            accumulate_ungrouped_range(agg_entries, 0, rows, dst);
+            return std::nullopt;
+        }
+
+        // One private slot array per morsel, each written by exactly one
+        // worker. Merging them in ascending morsel order — never completion
+        // order — is what keeps First/Last correct and the float reduction
+        // reproducible run to run.
+        const std::size_t grain = (rows + morsels - 1) / morsels;
+        std::vector<AggSlot> partials(morsels * n_aggs_);
+
+        auto& pool = process_worker_pool();
+        const std::size_t threads =
+            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (m >= morsels) {
+                    return;
+                }
+                const std::size_t begin = m * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                if (begin < end) {
+                    accumulate_ungrouped_range(agg_entries, begin, end, &partials[(m * n_aggs_)]);
+                }
+            }
+        });
+        batch.wait();
+
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+        for (std::size_t m = 0; m < morsels; ++m) {
+            for (std::size_t a = 0; a < n_aggs_; ++a) {
+                agg_combine(dst[a], partials[(m * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// How many row-morsels to split a global aggregate into; 1 = stay serial.
+    [[nodiscard]] auto ungrouped_morsels(std::size_t rows) const -> std::size_t {
+        // Submitting from a pool thread would deadlock (WorkerPool::submit
+        // aborts rather than allow it), and a morsel is already one worker's
+        // share.
+        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows) {
+            return 1;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (!agg_is_combinable(plan_[a].func)) {
+                return 1;  // Skew/Kurtosis: no partial merge, stay serial.
+            }
+        }
+        // The partition is a function of the ROW COUNT ALONE — deliberately
+        // not of the thread count. A float reduction's result depends on where
+        // the range is cut, so deriving morsels from the pool size would make
+        // `sum`/`std` answers differ between a 4-core box and a 24-core one,
+        // and differ again under `--threads`. Keyed on rows, the answer depends
+        // only on the data: same input, same result, any machine, any schedule.
+        //
+        // Morsels are large because a reduction's per-row cost is constant —
+        // equal ranges finish together, so unlike a filter there is no
+        // imbalance to hedge against and every extra morsel is pure dispatch
+        // and merge overhead. The cap bounds the partial array.
+        constexpr std::size_t kMinRowsPerMorsel = 65536;
+        constexpr std::size_t kMaxMorsels = 64;
+        return std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+    }
+
     auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
         Chunk out;
         out.columns.reserve(group_by_->size() + aggregations_->size());
@@ -5004,6 +5291,7 @@ class ChunkedAggregateOperator final : public Operator {
     OperatorPtr child_;
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
+    const ExecutionContext* exec_;
     bool emitted_ = false;
 
     bool initialized_ = false;
@@ -5126,8 +5414,12 @@ class PrependChunkOperator final : public Operator {
 class ChunkedSortedAggregateOperator final : public Operator {
    public:
     ChunkedSortedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-                                   const std::vector<ir::AggSpec>* aggregations)
-        : child_(std::move(child)), group_by_(group_by), aggregations_(aggregations) {}
+                                   const std::vector<ir::AggSpec>* aggregations,
+                                   const ExecutionContext& exec)
+        : child_(std::move(child)),
+          group_by_(group_by),
+          aggregations_(aggregations),
+          exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (fallback_) {
@@ -5189,7 +5481,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 fallback_ = std::make_unique<ChunkedAggregateOperator>(
                     std::make_unique<PrependChunkOperator>(std::move(*schema_only),
                                                            std::move(child_)),
-                    group_by_, aggregations_);
+                    group_by_, aggregations_, *exec_);
                 return {};
             }
             done_ = true;
@@ -5199,7 +5491,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = std::make_unique<ChunkedAggregateOperator>(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
-                group_by_, aggregations_);
+                group_by_, aggregations_, *exec_);
             return {};
         }
         if (auto err = init_plan(first)) {
@@ -5680,6 +5972,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     OperatorPtr child_;
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
+    const ExecutionContext* exec_;
 
     bool decided_ = false;
     bool done_ = false;
@@ -7289,7 +7582,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             // first chunk into a hash ChunkedAggregateOperator — so it is safe
             // to route the whole streamable subset here.
             return std::make_unique<ChunkedSortedAggregateOperator>(
-                std::move(child_op.value()), &agg.group_by(), &agg.aggregations());
+                std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec);
         }
     }
 

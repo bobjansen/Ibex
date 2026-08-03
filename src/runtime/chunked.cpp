@@ -1949,9 +1949,27 @@ class ChunkedOrderedLimitOperator final : public Operator {
     auto process_single_key_chunk(const Table& chunk, const Column<T>& key_column, bool ascending,
                                   const std::vector<KeyCol>& group_key_cols)
         -> std::optional<std::string> {
-        for (std::size_t row = 0; row < chunk.rows(); ++row) {
+        // `chunk.rows()` is a std::visit over the column variant, and this loop
+        // runs once per input row — it measured as ~15% of a top-k query while
+        // sitting in the loop CONDITION. `key_column[row]` likewise re-tests
+        // for adopted (Arrow) storage on every element. Resolve both once.
+        const std::size_t rows = chunk.rows();
+        const T* key_values = nullptr;
+        if constexpr (is_dense_column_v<Column<T>>) {
+            key_values = key_column.data();
+        }
+        // `Column<bool>` is bit-packed and has no dense buffer, so it keeps the
+        // indexed read. Every T reaching here is trivially copyable.
+        auto key_at = [&](std::size_t r) -> T {
+            if constexpr (is_dense_column_v<Column<T>>) {
+                return key_values[r];
+            } else {
+                return key_column[r];
+            }
+        };
+        for (std::size_t row = 0; row < rows; ++row) {
             const std::size_t sequence = next_sequence_++;
-            const T& key = key_column[row];
+            const T key = key_at(row);
 
             std::vector<Entry>* heap = &heap_;
             if (!group_by_->empty()) {
@@ -2024,7 +2042,10 @@ class ChunkedOrderedLimitOperator final : public Operator {
             }
         }
 
-        for (std::size_t row = 0; row < chunk.rows(); ++row) {
+        // As above: `rows()` visits the column variant, so it does not belong
+        // in a per-row loop condition.
+        const std::size_t rows = chunk.rows();
+        for (std::size_t row = 0; row < rows; ++row) {
             std::vector<Entry>* heap = &heap_;
             if (!group_by_->empty()) {
                 heap = resolve_group_heap(chunk, group_key_cols, row);

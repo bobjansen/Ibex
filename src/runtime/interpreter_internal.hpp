@@ -502,16 +502,23 @@ struct AggSlot {
     ExprType kind = ExprType::Int;
     bool has_value = false;
     std::int64_t count = 0;
-    std::int64_t int_value = 0;
-    double double_value = 0.0;
-    double sum = 0.0;
+    /// A slot belongs to one aggregate and one column type, so the integer and
+    /// double accumulators are never both live — they share storage. Anything
+    /// that writes one and reads the other is a bug; `kind` says which is
+    /// active, and agg_combine() switches on it for exactly this reason.
+    union {
+        std::int64_t int_value = 0;
+        double double_value;
+    };
     double m2 = 0.0;     ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
                          ///< doubles as the running mean for the moment aggs.
     double m3 = 0.0;     ///< Σ(x-mean)³ (online), for skewness.
     double m4 = 0.0;     ///< Σ(x-mean)⁴ (online), for kurtosis.
     double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
-    ScalarValue first_value;
-    ScalarValue last_value;
+    /// First/Last on a String/Categorical column. One field, not two: a slot
+    /// belongs to exactly ONE aggregate, so first and last can never both be
+    /// live in it — carrying both cost 40 bytes in every slot of every group.
+    ScalarValue text_value;
 };
 
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked
@@ -589,6 +596,18 @@ inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
     }
 }
 
+/// Copy whichever value member `kind` makes active. int_value/double_value
+/// share storage, and text_value is the String case.
+inline void copy_active_value(AggSlot& dst, const AggSlot& src, ExprType kind) {
+    if (kind == ExprType::Int) {
+        dst.int_value = src.int_value;
+    } else if (kind == ExprType::Double) {
+        dst.double_value = src.double_value;
+    } else {
+        dst.text_value = src.text_value;
+    }
+}
+
 /// Merge `src` into `dst`, where `src` covers the row range immediately AFTER
 /// it. `func`/`kind` come from the caller's plan: AggSlot's own `func`/`kind`
 /// fields are left at their defaults by the flat-slot allocators, so reading
@@ -616,7 +635,7 @@ inline void agg_combine(AggSlot& dst, const AggSlot& src, ir::AggFunc func, Expr
             dst.has_value = dst.has_value || src.has_value;
             return;
         case ir::AggFunc::Mean:
-            dst.sum += src.sum;
+            dst.double_value += src.double_value;
             dst.count += src.count;
             dst.has_value = dst.has_value || src.has_value;
             return;
@@ -625,18 +644,25 @@ inline void agg_combine(AggSlot& dst, const AggSlot& src, ir::AggFunc func, Expr
             if (!src.has_value) {
                 return;
             }
+            // int_value and double_value SHARE storage, so only the member
+            // `kind` names may be touched — copying both would reinterpret one
+            // as the other.
             if (!dst.has_value) {
-                dst.int_value = src.int_value;
-                dst.double_value = src.double_value;
+                if (kind == ExprType::Int) {
+                    dst.int_value = src.int_value;
+                } else {
+                    dst.double_value = src.double_value;
+                }
                 dst.has_value = true;
                 return;
             }
-            if (func == ir::AggFunc::Min) {
-                dst.int_value = std::min(dst.int_value, src.int_value);
-                dst.double_value = std::min(dst.double_value, src.double_value);
+            if (kind == ExprType::Int) {
+                dst.int_value = func == ir::AggFunc::Min ? std::min(dst.int_value, src.int_value)
+                                                         : std::max(dst.int_value, src.int_value);
             } else {
-                dst.int_value = std::max(dst.int_value, src.int_value);
-                dst.double_value = std::max(dst.double_value, src.double_value);
+                dst.double_value = func == ir::AggFunc::Min
+                                       ? std::min(dst.double_value, src.double_value)
+                                       : std::max(dst.double_value, src.double_value);
             }
             return;
         case ir::AggFunc::Stddev: {
@@ -665,18 +691,14 @@ inline void agg_combine(AggSlot& dst, const AggSlot& src, ir::AggFunc func, Expr
         case ir::AggFunc::First:
             // Leftmost wins: `dst` is the earlier range.
             if (!dst.has_value && src.has_value) {
-                dst.int_value = src.int_value;
-                dst.double_value = src.double_value;
-                dst.first_value = src.first_value;
+                copy_active_value(dst, src, kind);
                 dst.has_value = true;
             }
             return;
         case ir::AggFunc::Last:
             // Rightmost wins: `src` is the later range.
             if (src.has_value) {
-                dst.int_value = src.int_value;
-                dst.double_value = src.double_value;
-                dst.last_value = src.last_value;
+                copy_active_value(dst, src, kind);
                 dst.has_value = true;
             }
             return;

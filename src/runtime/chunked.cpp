@@ -4602,7 +4602,7 @@ class ChunkedAggregateOperator final : public Operator {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            slot.sum += data[row];
+                            slot.double_value += data[row];
                             slot.count++;
                             slot.has_value = true;
                         }
@@ -4682,7 +4682,7 @@ class ChunkedAggregateOperator final : public Operator {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            slot.sum += static_cast<double>(data[row]);
+                            slot.double_value += static_cast<double>(data[row]);
                             slot.count++;
                             slot.has_value = true;
                         }
@@ -4765,7 +4765,7 @@ class ChunkedAggregateOperator final : public Operator {
                             continue;
                         auto& slot = slot_for(gids[row]);
                         if (!slot.has_value) {
-                            slot.first_value = value_at(row);
+                            slot.text_value = value_at(row);
                             slot.has_value = true;
                         }
                     }
@@ -4774,7 +4774,7 @@ class ChunkedAggregateOperator final : public Operator {
                         if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
-                        slot.last_value = value_at(row);
+                        slot.text_value = value_at(row);
                         slot.has_value = true;
                     }
                 }
@@ -4940,7 +4940,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Mean:
                         each([&](std::size_t r) {
-                            slot.sum += data[r];
+                            slot.double_value += data[r];
                             slot.count++;
                             slot.has_value = true;
                         });
@@ -5000,7 +5000,7 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Mean:
                         each([&](std::size_t r) {
-                            slot.sum += static_cast<double>(data[r]);
+                            slot.double_value += static_cast<double>(data[r]);
                             slot.count++;
                             slot.has_value = true;
                         });
@@ -5062,13 +5062,13 @@ class ChunkedAggregateOperator final : public Operator {
                 if (func == ir::AggFunc::First) {
                     each([&](std::size_t r) {
                         if (!slot.has_value) {
-                            slot.first_value = value_at(r);
+                            slot.text_value = value_at(r);
                             slot.has_value = true;
                         }
                     });
                 } else {
                     each([&](std::size_t r) {
-                        slot.last_value = value_at(r);
+                        slot.text_value = value_at(r);
                         slot.has_value = true;
                     });
                 }
@@ -5309,9 +5309,10 @@ class ChunkedAggregateOperator final : public Operator {
                         append_scalar(column, slot.count);
                         break;
                     case ir::AggFunc::Mean:
-                        append_scalar(column, slot.count == 0
-                                                  ? 0.0
-                                                  : slot.sum / static_cast<double>(slot.count));
+                        append_scalar(column,
+                                      slot.count == 0
+                                          ? 0.0
+                                          : slot.double_value / static_cast<double>(slot.count));
                         break;
                     case ir::AggFunc::Sum:
                     case ir::AggFunc::Min:
@@ -5337,7 +5338,7 @@ class ChunkedAggregateOperator final : public Operator {
                         } else if (plan_[i].kind == ExprType::Int) {
                             append_scalar(column, slot.int_value);
                         } else {
-                            append_scalar(column, slot.first_value);
+                            append_scalar(column, slot.text_value);
                         }
                         break;
                     case ir::AggFunc::Last:
@@ -5346,7 +5347,7 @@ class ChunkedAggregateOperator final : public Operator {
                         } else if (plan_[i].kind == ExprType::Int) {
                             append_scalar(column, slot.int_value);
                         } else {
-                            append_scalar(column, slot.last_value);
+                            append_scalar(column, slot.text_value);
                         }
                         break;
                     default:
@@ -5959,7 +5960,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    slot.sum += static_cast<double>(data[row]);
+                    slot.double_value += static_cast<double>(data[row]);
                     slot.count++;
                     slot.has_value = true;
                 }
@@ -6059,9 +6060,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     break;
                 case ir::AggFunc::Mean:
                     append_scalar(
-                        column,
-                        ScalarValue{slot.count == 0 ? 0.0
-                                                    : slot.sum / static_cast<double>(slot.count)});
+                        column, ScalarValue{slot.count == 0 ? 0.0
+                                                            : slot.double_value /
+                                                                  static_cast<double>(slot.count)});
                     break;
                 case ir::AggFunc::Stddev:
                     append_scalar(column, ScalarValue{agg_finalize_stddev(slot)});

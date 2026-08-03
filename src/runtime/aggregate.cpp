@@ -270,7 +270,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (const auto* dv = std::get_if<double>(&value)) {
                         slot.double_value = *dv;
                     } else {
-                        slot.first_value = std::move(value);
+                        slot.text_value = std::move(value);
                     }
                 }
                 slot.has_value = true;
@@ -283,7 +283,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 } else if (const auto* dv = std::get_if<double>(&value)) {
                     slot.double_value = *dv;
                 } else {
-                    slot.last_value = std::move(value);
+                    slot.text_value = std::move(value);
                 }
                 slot.has_value = true;
                 continue;
@@ -341,7 +341,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.int_value += value;
                         break;
                     case ir::AggFunc::Mean:
-                        slot.sum += static_cast<double>(value);
+                        slot.double_value += static_cast<double>(value);
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
@@ -379,7 +379,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.double_value += value;
                         break;
                     case ir::AggFunc::Mean:
-                        slot.sum += value;
+                        slot.double_value += value;
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
@@ -451,7 +451,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.int_value += value;
                         break;
                     case ir::AggFunc::Mean:
-                        slot.sum += static_cast<double>(value);
+                        slot.double_value += static_cast<double>(value);
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
@@ -488,7 +488,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         slot.double_value += value;
                         break;
                     case ir::AggFunc::Mean:
-                        slot.sum += value;
+                        slot.double_value += value;
                         slot.count += 1;
                         break;
                     case ir::AggFunc::Min:
@@ -596,7 +596,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     if (slot.count == 0) {
                         append_scalar(*column, 0.0);
                     } else {
-                        append_scalar(*column, slot.sum / static_cast<double>(slot.count));
+                        append_scalar(*column, slot.double_value / static_cast<double>(slot.count));
                     }
                     break;
                 case ir::AggFunc::Sum:
@@ -614,7 +614,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
                     } else {
-                        append_scalar(*column, slot.first_value);
+                        append_scalar(*column, slot.text_value);
                     }
                     break;
                 case ir::AggFunc::Last:
@@ -623,7 +623,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     } else if (slot.kind == ExprType::Double) {
                         append_scalar(*column, slot.double_value);
                     } else {
-                        append_scalar(*column, slot.last_value);
+                        append_scalar(*column, slot.text_value);
                     }
                     break;
                 // Median/Quantile/Skew/Kurtosis are reduced in the contiguous
@@ -744,7 +744,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
                         auto& slot = slot_for(g);
-                        slot.first_value = std::move(acc[g]);
+                        slot.text_value = std::move(acc[g]);
                         slot.has_value = true;
                     }
                 } else if (item.cat_col != nullptr) {
@@ -758,7 +758,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
                         auto& slot = slot_for(g);
-                        slot.first_value = std::move(acc[g]);
+                        slot.text_value = std::move(acc[g]);
                         slot.has_value = true;
                     }
                 }
@@ -793,7 +793,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[gids[row]] = (*item.str_col)[row];
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
-                        slot_for(g).last_value = std::move(acc[g]);
+                        slot_for(g).text_value = std::move(acc[g]);
                         slot_for(g).has_value = true;
                     }
                 } else if (item.cat_col != nullptr) {
@@ -802,7 +802,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         acc[gids[row]] = std::string((*item.cat_col)[row]);
                     }
                     for (std::uint32_t g = 0; g < n_groups; ++g) {
-                        slot_for(g).last_value = std::move(acc[g]);
+                        slot_for(g).text_value = std::move(acc[g]);
                         slot_for(g).has_value = true;
                     }
                 }
@@ -832,7 +832,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             counts[g]++;
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            slot_for(g).sum = acc[g];
+                            slot_for(g).double_value = acc[g];
                             slot_for(g).count = counts[g];
                         }
                         break;
@@ -887,7 +887,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             counts[g]++;
                         }
                         for (std::uint32_t g = 0; g < n_groups; ++g) {
-                            slot_for(g).sum = acc[g];
+                            slot_for(g).double_value = acc[g];
                             slot_for(g).count = counts[g];
                         }
                         break;

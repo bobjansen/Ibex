@@ -971,17 +971,48 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             row_gid.resize(rows);
         }
 
+        auto new_group = [&](std::size_t row) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], row);
+            }
+            group_order.push_back(std::move(key));
+            states.push_back(make_state());
+            return static_cast<std::uint32_t>(states.size() - 1);
+        };
+
+        // `by <categorical>` still resolved each row's group the expensive way:
+        // code -> dictionary string -> hash the bytes -> memcmp on every probe,
+        // once per ROW. That measured ~22% of `median(price) by symbol`. The
+        // dictionary is fixed for this table, so code -> gid is a function —
+        // memo it. Nulls keep the slow path: a null has no meaningful code, and
+        // the index already folds every null into one group.
+        constexpr std::uint32_t kNoCatGid = std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::uint32_t> cat_gid_memo;
+        if (key_cols.size() == 1 && key_cols.front().kind == KeyCol::Kind::Cat) {
+            cat_gid_memo.assign(key_cols.front().cat->dictionary().size(), kNoCatGid);
+        }
+
         for (std::size_t row = 0; row < rows; ++row) {
-            const std::uint32_t gid = index.find_or_insert(group_order, key_cols, row, [&] {
-                Key key;
-                key.values.reserve(group_columns.size());
-                for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-                    push_key_value(key, *group_columns[ci], group_validity[ci], row);
+            std::uint32_t gid = 0;
+            if (!cat_gid_memo.empty() && !key_cols.front().is_null(row)) {
+                const auto code = static_cast<std::size_t>(key_cols.front().cat->code_at(row));
+                if (code < cat_gid_memo.size()) {
+                    std::uint32_t& slot = cat_gid_memo[code];
+                    if (slot == kNoCatGid) {
+                        slot = index.find_or_insert(group_order, key_cols, row,
+                                                    [&] { return new_group(row); });
+                    }
+                    gid = slot;
+                } else {
+                    gid = index.find_or_insert(group_order, key_cols, row,
+                                               [&] { return new_group(row); });
                 }
-                group_order.push_back(std::move(key));
-                states.push_back(make_state());
-                return static_cast<std::uint32_t>(states.size() - 1);
-            });
+            } else {
+                gid = index.find_or_insert(group_order, key_cols, row,
+                                           [&] { return new_group(row); });
+            }
             if (!collect_aggs.empty()) {
                 row_gid[row] = gid;
             }

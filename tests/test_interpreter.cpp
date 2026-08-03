@@ -5613,6 +5613,47 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// Collect-aggregates (median/quantile) group through the same per-chunk
+// code -> gid memo. Same coverage trap as the top-k case below: with a
+// string key this path is never reached, so folding every code onto one
+// group passed the entire suite.
+TEST_CASE("median by a categorical key groups by code", "[agg][topk]") {
+    std::vector<std::string> dict{"AAA", "BBB"};
+    Column<Categorical> sym(dict);
+    Column<double> price;
+    // AAA -> 1,2,3 (median 2); BBB -> 100,200,300 (median 200). Interleaved so
+    // a collapsed grouping gives 3 (the median of all six), not either answer.
+    const std::vector<std::pair<int, double>> rows{
+        {0, 1.0}, {1, 100.0}, {0, 2.0}, {1, 200.0}, {0, 3.0}, {1, 300.0},
+    };
+    for (const auto& [code, value] : rows) {
+        sym.push_code(static_cast<Column<Categorical>::code_type>(code));
+        price.push_back(value);
+    }
+
+    runtime::Table table;
+    table.add_column("sym", std::move(sym));
+    table.add_column("price", std::move(price));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[select { m = median(price) }, by sym];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+
+    const auto& out_sym = std::get<Column<Categorical>>(*result->find("sym"));
+    const auto& med = std::get<Column<double>>(*result->find("m"));
+    robin_hood::unordered_map<std::string, double> by_symbol;
+    for (std::size_t i = 0; i < result->rows(); ++i) {
+        by_symbol[std::string(out_sym.dictionary()[static_cast<std::size_t>(out_sym.code_at(i))])] =
+            med[i];
+    }
+    REQUIRE(by_symbol.size() == 2);
+    CHECK(by_symbol["AAA"] == 2.0);
+    CHECK(by_symbol["BBB"] == 200.0);
+}
+
 // `order ... head N, by <categorical>` resolves the group heap through a
 // per-chunk code -> gid memo instead of hashing the dictionary string once per
 // row. Every other grouped test builds its key as Column<std::string>, which

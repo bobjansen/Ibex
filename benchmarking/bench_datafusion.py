@@ -350,6 +350,17 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         ).collect(),
     )
     run(
+        # `OVER ()` deliberately: the Ibex query lags by TABLE ORDER, and an
+        # explicit ORDER BY would add a 50M-row sort this engine's rivals do
+        # not pay (duckdb uses its virtual rowid). Verified to match duckdb's
+        # LAG exactly, NULL first row included.
+        "where_update_window",
+        lambda: ctx.sql(
+            "SELECT symbol, price, CASE WHEN price > 900.0 THEN "
+            "lag(price) OVER () ELSE NULL END AS prev FROM prices"
+        ).collect(),
+    )
+    run(
         "rbind_two",
         lambda: ctx.sql(
             "SELECT * FROM prices UNION ALL SELECT * FROM prices"

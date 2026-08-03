@@ -520,8 +520,12 @@ struct AggSlotCore {
     };
     double m2 = 0.0;  ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
                       ///< doubles as the running mean for the moment aggs.
-    double m3 = 0.0;  ///< Σ(x-mean)³ (online), for skewness.
-    double m4 = 0.0;  ///< Σ(x-mean)⁴ (online), for kurtosis.
+                      ///< The HIGHER moments (Σ(x-mean)³ and ⁴, for skew and
+                      ///< kurtosis) are deliberately NOT here: only two of
+                      ///< ten aggregates need them, so they live in the
+                      ///< caller's per-group scratch region rather than
+                      ///< taxing every slot of every group. See SlotPlan's
+                      ///< `scratch_doubles`.
 };
 
 /// AggSlotCore plus the boxed value First/Last needs for a non-numeric column
@@ -553,7 +557,7 @@ inline void agg_update_stddev(AggSlotCore& slot, double x) {
 
 // Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).
 // Updates m4 and m3 before m2 because they read the pre-update accumulators.
-inline void agg_update_moments(AggSlotCore& slot, double x) {
+inline void agg_update_moments(AggSlotCore& slot, double& m3, double& m4, double x) {
     const auto n1 = static_cast<double>(slot.count);
     slot.count += 1;
     const auto n = static_cast<double>(slot.count);
@@ -562,9 +566,9 @@ inline void agg_update_moments(AggSlotCore& slot, double x) {
     const double delta_n2 = delta_n * delta_n;
     const double term1 = delta * delta_n * n1;
     slot.double_value += delta_n;
-    slot.m4 += (term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0)) + (6.0 * delta_n2 * slot.m2) -
-               (4.0 * delta_n * slot.m3);
-    slot.m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * slot.m2);
+    m4 += (term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0)) + (6.0 * delta_n2 * slot.m2) -
+          (4.0 * delta_n * m3);
+    m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * slot.m2);
     slot.m2 += term1;
 }
 
@@ -572,23 +576,23 @@ inline auto agg_finalize_stddev(const AggSlotCore& slot) -> double {
     return slot.count < 2 ? 0.0 : std::sqrt(slot.m2 / static_cast<double>(slot.count - 1));
 }
 
-inline auto agg_finalize_skew(const AggSlotCore& slot) -> double {
+inline auto agg_finalize_skew(const AggSlotCore& slot, double m3) -> double {
     if (slot.count < 3 || slot.m2 == 0.0) {
         return 0.0;
     }
     const auto n = static_cast<double>(slot.count);
     // Fisher–Pearson sample skewness (matches pandas/scipy default).
-    return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (slot.m3 / std::pow(slot.m2, 1.5));
+    return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (m3 / std::pow(slot.m2, 1.5));
 }
 
-inline auto agg_finalize_kurtosis(const AggSlotCore& slot) -> double {
+inline auto agg_finalize_kurtosis(const AggSlotCore& slot, double m4) -> double {
     if (slot.count < 4 || slot.m2 == 0.0) {
         return 0.0;
     }
     const auto n = static_cast<double>(slot.count);
     // Unbiased Fisher excess kurtosis (matches pandas/scipy default).
     return (n - 1.0) / ((n - 2.0) * (n - 3.0)) *
-           (((n + 1.0) * n * slot.m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
+           (((n + 1.0) * n * m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
 }
 
 /// Can this aggregate be computed as independent partials and merged?

@@ -352,9 +352,6 @@ if (!skip_data_table) {
         function() dt[, .(symbol, price,
             prev = fifelse(price > 900.0, shift(price, 1L), NA_real_))])
 
-    bench("data.table", "rbind_two",
-        function() rbindlist(list(dt[, .(symbol, price)], dt[, .(symbol, price)])))
-
     bench("data.table", "cumsum_price",
         function() dt[, cs := cumsum(price)][])
 
@@ -521,9 +518,6 @@ if (!skip_dplyr) {
     bench("dplyr", "where_update_window",
         function() tb |> mutate(
             prev = if_else(price > 900.0, lag(price, 1L), NA_real_)))
-
-    bench("dplyr", "rbind_two",
-        function() bind_rows(tb, tb))
 
     bench("dplyr", "cumsum_price",
         function() tb |> mutate(cs = cumsum(price)))

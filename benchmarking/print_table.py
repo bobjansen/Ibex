@@ -91,7 +91,6 @@ QUERY_ORDER = [
     "where_update_expr",
     "where_update_multi",
     "where_update_window",
-    "rbind_two",
     # statistics
     "corr_price_vol",
     # joins
@@ -183,7 +182,6 @@ QUERY_LABEL = {
     "where_update_multi": "guarded update (multi-field)",
     "where_update_window": "guarded update (window)",
     "where_update_nullable": "guarded update (nullable)",
-    "rbind_two": "rbind (vertical concat)",
     "corr_price_vol": "correlation matrix",
     "sort_price": "sort (full)",
     "sort_price_desc": "sort desc (full)",

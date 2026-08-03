@@ -360,12 +360,6 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             "lag(price) OVER () ELSE NULL END AS prev FROM prices"
         ).collect(),
     )
-    run(
-        "rbind_two",
-        lambda: ctx.sql(
-            "SELECT * FROM prices UNION ALL SELECT * FROM prices"
-        ).collect(),
-    )
 
     run(
         "rand_uniform",

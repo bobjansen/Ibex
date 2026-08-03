@@ -512,7 +512,6 @@ struct AggSlot {
     double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
     ScalarValue first_value;
     ScalarValue last_value;
-    std::vector<double> values;  ///< Collected values for median.
 };
 
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked

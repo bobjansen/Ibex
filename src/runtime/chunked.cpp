@@ -103,7 +103,7 @@ struct ChunkIdentity {
 
 // Whether a streamed aggregate slot has enough observations to be non-null.
 // Mirrors the materializing aggregate's `agg_result_is_valid`.
-auto chunked_agg_valid(ir::AggFunc func, const AggSlot& slot) -> bool {
+auto chunked_agg_valid(ir::AggFunc func, const AggSlotCore& slot) -> bool {
     switch (func) {
         case ir::AggFunc::Mean:
             return slot.count > 0;
@@ -4277,6 +4277,15 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
+    /// Slot-indexed boxed value, grown on first use. `slot_index` is the same
+    /// `gid * n_aggs_ + agg_i` that indexes `flat_slots_`.
+    auto text_at(std::size_t slot_index) -> ScalarValue& {
+        if (text_store_.size() < flat_slots_.size()) {
+            text_store_.resize(flat_slots_.size());
+        }
+        return text_store_[slot_index];
+    }
+
     auto alloc_group() -> std::uint32_t {
         auto gid = static_cast<std::uint32_t>(n_groups_);
         ++n_groups_;
@@ -4563,13 +4572,13 @@ class ChunkedAggregateOperator final : public Operator {
     template <typename GidT>
     void accumulate_columns_into(const GidT* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
-                                 std::size_t begin, std::size_t end, AggSlot* base) {
-        AggSlot* fs = base;
+                                 std::size_t begin, std::size_t end, AggSlotCore* base) {
+        AggSlotCore* fs = base;
         const std::size_t rows = end;
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
             // Takes GidT so a signed Categorical code indexes without an
             // implicit narrowing conversion at each of the ~19 call sites.
-            const auto slot_for = [&](GidT g) -> AggSlot& {
+            const auto slot_for = [&](GidT g) -> AggSlotCore& {
                 return fs[(static_cast<std::size_t>(g) * n_aggs_) + agg_i];
             };
 
@@ -4765,7 +4774,8 @@ class ChunkedAggregateOperator final : public Operator {
                             continue;
                         auto& slot = slot_for(gids[row]);
                         if (!slot.has_value) {
-                            slot.text_value = value_at(row);
+                            text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i) =
+                                value_at(row);
                             slot.has_value = true;
                         }
                     }
@@ -4774,7 +4784,8 @@ class ChunkedAggregateOperator final : public Operator {
                         if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
-                        slot.text_value = value_at(row);
+                        text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i) =
+                            value_at(row);
                         slot.has_value = true;
                     }
                 }
@@ -4810,6 +4821,10 @@ class ChunkedAggregateOperator final : public Operator {
             if (!agg_is_combinable(plan_[a].func)) {
                 return false;
             }
+            // As above: a boxed First/Last value lives outside the slot.
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return false;
+            }
         }
         const std::size_t dict_size = cat.dictionary().size();
         if (dict_size == 0) {
@@ -4824,7 +4839,7 @@ class ChunkedAggregateOperator final : public Operator {
         constexpr std::size_t kMinRowsPerMorsel = 65536;
         constexpr std::size_t kMaxMorsels = 64;
         constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
-        const std::size_t per_morsel_bytes = dict_size * n_aggs_ * sizeof(AggSlot);
+        const std::size_t per_morsel_bytes = dict_size * n_aggs_ * sizeof(AggSlotCore);
         if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
             return false;  // one worker's state alone blows the budget
         }
@@ -4836,7 +4851,7 @@ class ChunkedAggregateOperator final : public Operator {
 
         const auto* codes = cat.codes_data();
         const std::size_t grain = (rows + morsels - 1) / morsels;
-        std::vector<AggSlot> partials(morsels * dict_size * n_aggs_);
+        std::vector<AggSlotCore> partials(morsels * dict_size * n_aggs_);
         // Per morsel, the codes it saw in first-occurrence order.
         std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
 
@@ -4875,7 +4890,7 @@ class ChunkedAggregateOperator final : public Operator {
             cat_dense_gid_.resize(dict_size, kNoGid);
         }
         for (std::size_t m = 0; m < morsels; ++m) {
-            const AggSlot* src = &partials[m * dict_size * n_aggs_];
+            const AggSlotCore* src = &partials[m * dict_size * n_aggs_];
             for (const auto code : seen[m]) {
                 const auto idx = static_cast<std::size_t>(code);
                 std::uint32_t gid = cat_dense_gid_[idx];
@@ -4884,7 +4899,7 @@ class ChunkedAggregateOperator final : public Operator {
                     cat_dense_gid_[idx] = gid;
                     cat_order_.push_back(code);
                 }
-                AggSlot* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
+                AggSlotCore* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
                 for (std::size_t a = 0; a < n_aggs_; ++a) {
                     agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind);
                 }
@@ -4897,9 +4912,9 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
     void accumulate_ungrouped_range(const std::vector<const ColumnEntry*>& agg_entries,
-                                    std::size_t begin, std::size_t end, AggSlot* slots) const {
+                                    std::size_t begin, std::size_t end, AggSlotCore* slots) {
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
-            AggSlot& slot = slots[agg_i];
+            AggSlotCore& slot = slots[agg_i];
             const auto func = plan_[agg_i].func;
             if (func == ir::AggFunc::Count) {
                 slot.count += static_cast<std::int64_t>(end - begin);
@@ -5062,13 +5077,13 @@ class ChunkedAggregateOperator final : public Operator {
                 if (func == ir::AggFunc::First) {
                     each([&](std::size_t r) {
                         if (!slot.has_value) {
-                            slot.text_value = value_at(r);
+                            text_at(agg_i) = value_at(r);
                             slot.has_value = true;
                         }
                     });
                 } else {
                     each([&](std::size_t r) {
-                        slot.text_value = value_at(r);
+                        text_at(agg_i) = value_at(r);
                         slot.has_value = true;
                     });
                 }
@@ -5093,7 +5108,7 @@ class ChunkedAggregateOperator final : public Operator {
             group_order_.emplace_back();
             alloc_group();
         }
-        AggSlot* dst = flat_slots_.data();
+        AggSlotCore* dst = flat_slots_.data();
 
         const std::size_t morsels = ungrouped_morsels(rows);
         if (morsels < 2) {
@@ -5106,7 +5121,7 @@ class ChunkedAggregateOperator final : public Operator {
         // order — is what keeps First/Last correct and the float reduction
         // reproducible run to run.
         const std::size_t grain = (rows + morsels - 1) / morsels;
-        std::vector<AggSlot> partials(morsels * n_aggs_);
+        std::vector<AggSlotCore> partials(morsels * n_aggs_);
 
         auto& pool = process_worker_pool();
         const std::size_t threads =
@@ -5149,6 +5164,11 @@ class ChunkedAggregateOperator final : public Operator {
         for (std::size_t a = 0; a < n_aggs_; ++a) {
             if (!agg_is_combinable(plan_[a].func)) {
                 return 1;  // Skew/Kurtosis: no partial merge, stay serial.
+            }
+            // A non-numeric First/Last keeps its value in `text_store_`, which
+            // agg_combine cannot reach and workers must not write concurrently.
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return 1;
             }
         }
         // The partition is a function of the ROW COUNT ALONE — deliberately
@@ -5266,7 +5286,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
         };
 
-        const AggSlot* fs = flat_slots_.data();
+        const AggSlotCore* fs = flat_slots_.data();
         for (std::size_t g = 0; g < n_groups_; ++g) {
             if (cat_fast_path_) {
                 const bool single_key = group_by_->size() == 1;
@@ -5300,7 +5320,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
             for (std::size_t i = 0; i < aggregations_->size(); ++i) {
                 auto& column = out.mutable_column(group_by_->size() + i);
-                const AggSlot& slot = fs[(g * n_aggs_) + i];
+                const AggSlotCore& slot = fs[(g * n_aggs_) + i];
                 if (track_validity[i] != 0U) {
                     agg_validity[i].push_back(chunked_agg_valid(plan_[i].func, slot));
                 }
@@ -5338,7 +5358,7 @@ class ChunkedAggregateOperator final : public Operator {
                         } else if (plan_[i].kind == ExprType::Int) {
                             append_scalar(column, slot.int_value);
                         } else {
-                            append_scalar(column, slot.text_value);
+                            append_scalar(column, text_store_[(g * n_aggs_) + i]);
                         }
                         break;
                     case ir::AggFunc::Last:
@@ -5347,7 +5367,7 @@ class ChunkedAggregateOperator final : public Operator {
                         } else if (plan_[i].kind == ExprType::Int) {
                             append_scalar(column, slot.int_value);
                         } else {
-                            append_scalar(column, slot.text_value);
+                            append_scalar(column, text_store_[(g * n_aggs_) + i]);
                         }
                         break;
                     default:
@@ -5443,8 +5463,14 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<SlotPlan> plan_;
     std::vector<ColumnValue> group_templates_;
 
-    // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlots.
-    std::vector<AggSlot> flat_slots_;
+    /// Boxed First/Last values for non-numeric columns, parallel to
+    /// `flat_slots_` and indexed identically. Stays EMPTY — no allocation, no
+    /// ScalarValue construction — for an all-numeric query, which is why the
+    /// slot itself can be a POD.
+    std::vector<ScalarValue> text_store_;
+
+    // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlotCores.
+    std::vector<AggSlotCore> flat_slots_;
 
     // Reusable per-chunk gids buffer to avoid repeated heap allocations.
     std::vector<std::uint32_t> gids_buf_;
@@ -5736,7 +5762,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 first.ordering()->begin(),
                 first.ordering()->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
         }
-        cur_slots_.assign(n_aggs_, AggSlot{});
+        cur_slots_.assign(n_aggs_, AggSlotCore{});
         reset_output();
         return std::nullopt;
     }
@@ -5874,7 +5900,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         for (const auto* col : key_cols) {
             open_key_.push_back(scalar_from_column(*col, row));
         }
-        std::ranges::fill(cur_slots_, AggSlot{});
+        std::ranges::fill(cur_slots_, AggSlotCore{});
         open_ = true;
     }
 
@@ -5919,7 +5945,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     void accumulate_range(const std::vector<const ColumnEntry*>& agg_entries, std::size_t start,
                           std::size_t end) {
         for (std::size_t i = 0; i < n_aggs_; ++i) {
-            AggSlot& slot = cur_slots_[i];
+            AggSlotCore& slot = cur_slots_[i];
             if (plan_[i].func == ir::AggFunc::Count) {
                 slot.count += static_cast<std::int64_t>(end - start);
                 continue;
@@ -5937,7 +5963,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     }
 
     template <typename T>
-    static void accumulate_typed(AggSlot& slot, ir::AggFunc func, const T* data,
+    static void accumulate_typed(AggSlotCore& slot, ir::AggFunc func, const T* data,
                                  const ColumnEntry& entry, bool has_nulls, std::size_t start,
                                  std::size_t end) {
         const auto valid = [&](std::size_t row) { return !has_nulls || (*entry.validity)[row]; };
@@ -6050,7 +6076,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         for (std::size_t i = 0; i < n_aggs_; ++i) {
             ColumnValue& column = *out_columns_[group_by_->size() + i].column;
-            const AggSlot& slot = cur_slots_[i];
+            const AggSlotCore& slot = cur_slots_[i];
             if (track_validity_[i] != 0U) {
                 out_validity_[i].push_back(chunked_agg_valid(plan_[i].func, slot));
             }
@@ -6130,7 +6156,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     std::vector<ir::OrderKey> out_ordering_;
 
     // Open-group state.
-    std::vector<AggSlot> cur_slots_;
+    std::vector<AggSlotCore> cur_slots_;
     std::vector<ScalarValue> open_key_;
 
     // Output buffers for closed groups awaiting emission.

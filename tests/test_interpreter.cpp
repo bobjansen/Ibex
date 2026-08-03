@@ -5613,6 +5613,34 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// EWMA's alpha is a property of the AGGREGATION, not the group, so it is read
+// from the plan rather than copied into every slot. Two ewma aggregates with
+// DIFFERENT alphas in one select is what catches a wrong plan index: with a
+// single alpha, reading the wrong entry still gives the right answer.
+TEST_CASE("two ewma aggregates keep their own alpha", "[agg]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 2, 2, 2});
+    t.add_column("v", Column<double>{10.0, 20.0, 30.0, 100.0, 200.0, 300.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir("t[select { a = ewma(v, 0.5), b = ewma(v, 0.25) }, by g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& a = std::get<Column<double>>(*result->find("a"));
+    const auto& b = std::get<Column<double>>(*result->find("b"));
+
+    // alpha=0.5 over 10,20,30: 10 -> 0.5*20+0.5*10=15 -> 0.5*30+0.5*15=22.5
+    CHECK(a[0] == Catch::Approx(22.5));
+    // alpha=0.25 over the same: 10 -> 0.25*20+0.75*10=12.5 -> 0.25*30+0.75*12.5=16.875
+    CHECK(b[0] == Catch::Approx(16.875));
+    CHECK(a[1] == Catch::Approx(225.0));
+    CHECK(b[1] == Catch::Approx(168.75));
+    // The two must differ — equal values would mean both read one alpha.
+    CHECK(a[0] != Catch::Approx(b[0]));
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

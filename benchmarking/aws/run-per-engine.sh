@@ -144,11 +144,16 @@ if [[ "$ON_DEMAND" -eq 0 ]]; then
 fi
 
 # ── Launch one instance per engine ────────────────────────────────────────────
-declare -A INSTANCE_OF RESULT_KEY_OF DONE_OF
+declare -A INSTANCE_OF RESULT_KEY_OF PARTIAL_KEY_OF DONE_OF STATUS_OF
 for engine in "${ENGINE_LIST[@]}"; do
     result_key="${RUN_PREFIX}/${engine}/scales.csv"
     RESULT_KEY_OF[$engine]="$result_key"
+    # bootstrap.sh syncs the in-progress CSV here every 60s. It is a SEPARATE
+    # key on purpose: a partial written to the final key would make the poll
+    # loop below declare the engine finished.
+    PARTIAL_KEY_OF[$engine]="${result_key%scales.csv}scales.partial.csv"
     DONE_OF[$engine]=0
+    STATUS_OF[$engine]="none"
 
     user_data=$(bench_user_data "$REPO_URL" "$COMMIT" \
         "IBEX_S3_BUCKET=${S3_BUCKET}" \
@@ -200,11 +205,36 @@ TIMEOUT=21600  # 6h — a full 1M-50M sweep for the slowest engine can run long
 START=$(date +%s)
 REMAINING=${#ENGINE_LIST[@]}
 
+# Recover whatever an engine completed when its final upload never happened —
+# a spot reclaim, a failed bootstrap, an OOM at a large size, or our own
+# timeout. Without this an engine that finished 6 of 7 sizes reports nothing at
+# all, which is how a run loses hours of work to one bad cell.
+fetch_partial() {
+    local engine="$1"
+    local dest="$RESULT_DIR/per_engine_${engine}.csv"
+    aws s3 ls "s3://${S3_BUCKET}/${PARTIAL_KEY_OF[$engine]}" --region "$REGION" &>/dev/null || return 1
+    aws s3 cp "s3://${S3_BUCKET}/${PARTIAL_KEY_OF[$engine]}" "$dest" \
+        --region "$REGION" --only-show-errors || return 1
+    # A header-only partial is not a result.
+    [[ $(wc -l < "$dest") -gt 1 ]] || { rm -f "$dest"; return 1; }
+    STATUS_OF[$engine]="partial"
+    return 0
+}
+
 while (( REMAINING > 0 )); do
     NOW=$(date +%s)
     if (( NOW - START > TIMEOUT )); then
         echo ""
         echo "Timed out after $((TIMEOUT/3600))h with $REMAINING engine(s) unfinished."
+        echo "Recovering partial results for the unfinished engines..."
+        for engine in "${ENGINE_LIST[@]}"; do
+            [[ "${DONE_OF[$engine]}" -eq 1 ]] && continue
+            if fetch_partial "$engine"; then
+                echo "  ${engine}: recovered $(( $(wc -l < "$RESULT_DIR/per_engine_${engine}.csv") - 1 )) row(s)"
+            else
+                echo "  ${engine}: no partial available"
+            fi
+        done
         break
     fi
 
@@ -214,6 +244,7 @@ while (( REMAINING > 0 )); do
             aws s3 cp "s3://${S3_BUCKET}/${RESULT_KEY_OF[$engine]}" \
                 "$RESULT_DIR/per_engine_${engine}.csv" --region "$REGION" --only-show-errors
             DONE_OF[$engine]=1
+            STATUS_OF[$engine]="complete"
             REMAINING=$(( REMAINING - 1 ))
             echo ""
             echo "✓ ${engine} done ($((  (NOW - START) / 60 ))m) — $REMAINING remaining"
@@ -230,7 +261,13 @@ while (( REMAINING > 0 )); do
             DONE_OF[$engine]=1
             REMAINING=$(( REMAINING - 1 ))
             echo ""
-            echo "⚠ ${engine} instance ${INSTANCE_OF[$engine]} is '$STATE' with no result — $REMAINING remaining"
+            if fetch_partial "$engine"; then
+                echo "⚠ ${engine} instance ${INSTANCE_OF[$engine]} is '$STATE' before finishing —" \
+                     "recovered $(( $(wc -l < "$RESULT_DIR/per_engine_${engine}.csv") - 1 )) partial row(s)," \
+                     "$REMAINING remaining"
+            else
+                echo "⚠ ${engine} instance ${INSTANCE_OF[$engine]} is '$STATE' with no result — $REMAINING remaining"
+            fi
             echo "  console: aws ec2 get-console-output --instance-id ${INSTANCE_OF[$engine]} --region $REGION --latest --output text"
         fi
     done
@@ -243,13 +280,21 @@ COMBINED="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
 HEADER="dataset_rows,framework,query,avg_ms,min_ms,max_ms,stddev_ms,p95_ms,p99_ms,rows,peak_rss_mb"
 echo "$HEADER" > "$COMBINED"
 got=0
+partial=0
 for engine in "${ENGINE_LIST[@]}"; do
     f="$RESULT_DIR/per_engine_${engine}.csv"
     if [[ -f "$f" ]]; then
         tail -n +2 "$f" >> "$COMBINED"
         got=$(( got + 1 ))
+        rows=$(( $(wc -l < "$f") - 1 ))
+        if [[ "${STATUS_OF[$engine]}" == "partial" ]]; then
+            partial=$(( partial + 1 ))
+            echo "  ${engine}: PARTIAL (${rows} rows)"
+        else
+            echo "  ${engine}: complete (${rows} rows)"
+        fi
     else
-        echo "  (no results for ${engine})"
+        echo "  ${engine}: no results"
     fi
 done
 
@@ -257,3 +302,11 @@ echo ""
 ELAPSED=$(( ($(date +%s) - START) / 60 ))
 echo "Done in ${ELAPSED}m. Combined ${got}/${#ENGINE_LIST[@]} engine(s):"
 echo "  $COMBINED"
+if (( partial > 0 )); then
+    # Say it loudly: a partial engine is missing its LARGEST sizes, which is
+    # exactly where cross-engine comparisons are usually drawn.
+    echo ""
+    echo "WARNING: ${partial} engine(s) contributed PARTIAL results — they are missing"
+    echo "         their largest sizes. Do not read a scaling curve across engines"
+    echo "         without checking which sizes each one actually reached."
+fi

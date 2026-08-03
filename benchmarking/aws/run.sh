@@ -148,6 +148,29 @@ echo "Live partial progress (completed sizes, refreshed ~60s):"
 echo "  aws s3 cp s3://${S3_BUCKET}/${PARTIAL_KEY} - --region ${REGION} | column -t -s,"
 echo ""
 
+OUTPUT="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
+
+# The box syncs its in-progress CSV to PARTIAL_KEY every 60s. When the final
+# upload never happens — spot reclaim, OOM at a large size, or our own timeout
+# — the completed sizes are still sitting in S3. Returning them beats exiting
+# with nothing after hours of runtime.
+recover_partial() {
+    local why="$1"
+    aws s3 ls "s3://${S3_BUCKET}/${PARTIAL_KEY}" --region "$REGION" &>/dev/null || return 1
+    aws s3 cp "s3://${S3_BUCKET}/${PARTIAL_KEY}" "$OUTPUT" --region "$REGION" --only-show-errors || return 1
+    local rows=$(( $(wc -l < "$OUTPUT") - 1 ))
+    if (( rows < 1 )); then
+        rm -f "$OUTPUT"
+        return 1
+    fi
+    echo ""
+    echo "Recovered PARTIAL results (${why}): ${rows} row(s)"
+    echo "  benchmarking/results/scales_aws_${TIMESTAMP}.csv"
+    echo "WARNING: the largest sizes are missing — check which sizes completed"
+    echo "         before comparing engines."
+    return 0
+}
+
 # ── Poll S3 ───────────────────────────────────────────────────────────────────
 TIMEOUT=21600  # 6 hours — a full 1M–50M sweep with all engines can run this long
 START=$(date +%s)
@@ -157,7 +180,9 @@ while true; do
     NOW=$(date +%s)
     if (( NOW - START > TIMEOUT )); then
         echo ""
-        echo "Timed out after 6h. Check instance logs:"
+        echo "Timed out after 6h."
+        recover_partial "timed out" && exit 0
+        echo "Check instance logs:"
         echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --output text"
         exit 1
     fi
@@ -181,8 +206,10 @@ while true; do
                 break
             fi
             echo ""
-            echo "Instance $INSTANCE_ID is '$STATE' without producing a result —"
-            echo "likely a spot interruption or a failed bootstrap. Check the console:"
+            echo "Instance $INSTANCE_ID is '$STATE' without producing a final result —"
+            echo "likely a spot interruption or a failed bootstrap."
+            recover_partial "$STATE" && exit 0
+            echo "Check the console:"
             echo "  aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
             exit 1
         fi
@@ -196,7 +223,6 @@ while true; do
 done
 
 # ── Download results ──────────────────────────────────────────────────────────
-OUTPUT="$IBEX_ROOT/benchmarking/results/scales_aws_${TIMESTAMP}.csv"
 aws s3 cp "s3://${S3_BUCKET}/${RESULT_KEY}" "$OUTPUT" --region "$REGION"
 
 ELAPSED=$(( ($(date +%s) - START) / 60 ))

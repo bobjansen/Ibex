@@ -276,9 +276,26 @@ Use this result to separate two questions:
 # Live partial progress (single-box run.sh):
 aws s3 cp s3://<bucket>/benchmarks/<ts>_<commit>/scales.partial.csv - | column -t -s,
 
+# Per-engine (run-per-engine.sh) — one partial key per engine:
+aws s3 cp s3://<bucket>/benchmarks/<ts>_<commit>/per-engine/<engine>/scales.partial.csv - | column -t -s,
+
 # Per-instance console (printed by the runners on launch):
 aws ec2 get-console-output --instance-id <id> --region <region> --latest --output text
 ```
+
+### Partial results are returned, not just written
+
+The box syncs its in-progress CSV to a `*.partial.csv` key every 60s (a
+separate key on purpose — a partial written to the final key would make the
+poll loop declare the run finished). Both runners now FALL BACK to that key
+when the final upload never happens: a spot reclaim, a failed bootstrap, an
+OOM at a large size, or the runner's own 6h timeout. `run-per-engine.sh` does
+this per engine, so one engine dying at 50M no longer discards the sizes it
+did finish, and labels each engine `complete` or `PARTIAL` in its summary.
+
+**A partial engine is missing its LARGEST sizes** — which is exactly where
+cross-engine comparisons get drawn. Check which sizes each engine reached
+before reading a scaling curve across them.
 
 ## Notes
 

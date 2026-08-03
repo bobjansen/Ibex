@@ -5613,6 +5613,53 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// `order ... head N, by <categorical>` resolves the group heap through a
+// per-chunk code -> gid memo instead of hashing the dictionary string once per
+// row. Every other grouped test builds its key as Column<std::string>, which
+// takes a different branch — so without a CATEGORICAL key here, folding every
+// code onto one group passes the whole suite.
+TEST_CASE("topk by a categorical key groups by code", "[guarded_update][topk]") {
+    std::vector<std::string> dict{"AAA", "BBB", "CCC"};
+    Column<Categorical> sym(dict);
+    Column<double> price;
+    // Interleave the symbols so a row's group cannot be inferred from position,
+    // and give each symbol a distinct value range so a mis-grouped result is
+    // unambiguous rather than coincidentally right.
+    const std::vector<std::pair<int, double>> rows{
+        {0, 10.0}, {1, 200.0}, {2, 3000.0}, {0, 11.0}, {1, 201.0}, {2, 3001.0},
+        {0, 12.0}, {1, 202.0}, {2, 3002.0}, {0, 13.0}, {1, 203.0}, {2, 3003.0},
+    };
+    for (const auto& [code, value] : rows) {
+        sym.push_code(static_cast<Column<Categorical>::code_type>(code));
+        price.push_back(value);
+    }
+
+    runtime::Table table;
+    table.add_column("sym", std::move(sym));
+    table.add_column("price", std::move(price));
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[order price desc, head 2, by sym];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    // Two rows per symbol, three symbols — not six rows of one symbol.
+    REQUIRE(result->rows() == 6);
+    const auto& out_sym = std::get<Column<Categorical>>(*result->find("sym"));
+    const auto& out_price = std::get<Column<double>>(*result->find("price"));
+
+    robin_hood::unordered_map<std::string, std::vector<double>> by_symbol;
+    for (std::size_t i = 0; i < result->rows(); ++i) {
+        by_symbol[std::string(out_sym.dictionary()[static_cast<std::size_t>(out_sym.code_at(i))])]
+            .push_back(out_price[i]);
+    }
+    REQUIRE(by_symbol.size() == 3);
+    CHECK(by_symbol["AAA"] == std::vector<double>{13.0, 12.0});
+    CHECK(by_symbol["BBB"] == std::vector<double>{203.0, 202.0});
+    CHECK(by_symbol["CCC"] == std::vector<double>{3003.0, 3002.0});
+}
+
 // Assigning a literal to a NULLABLE column takes a dedicated single-pass path.
 // The validity edges are what make it worth pinning: a non-null literal makes
 // every matched row valid, so filling all of a column's nulls must DROP the

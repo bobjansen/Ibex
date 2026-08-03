@@ -2266,8 +2266,13 @@ int main(int argc, char** argv) {
         // Transform benchmarks: core single-pass language features that had no
         // coverage. The guarded-update rows cover the literal fast path,
         // row-local subset evaluation, multi-field projection/scatter, and the
-        // full-table window fallback. rbind_two vertically concatenates two
-        // tables (RbindNode).
+        // full-table window fallback.
+        //
+        // rbind_two was REMOVED: it measured different work per engine. Ibex
+        // materialises the concatenated table, while polars' `pl.concat` and
+        // pandas' `pd.concat` stitch chunk references, so polars "did" 64M rows
+        // in 0.4ms at 32M. A replacement should CONSUME the concatenated table
+        // (e.g. aggregate over it) so every engine has to materialise it.
         if (status == 0 && run_suite("transform")) {
             fmt::print("\n-- Transform benchmarks ({} prices rows) --\n",
                        tables.at("prices").rows());
@@ -2280,7 +2285,6 @@ int main(int argc, char** argv) {
                  "900.0 }]"},
                 {"where_update_window",
                  "prices[where price > 900.0 update { prev = lag(price, 1) }]"},
-                {"rbind_two", "rbind(prices, prices)"},
             };
             for (const auto& query : transform_queries) {
                 ScanPaths sp;

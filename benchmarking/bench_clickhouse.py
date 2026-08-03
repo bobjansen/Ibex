@@ -317,8 +317,6 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "SELECT symbol, price, if(price > 900.0, lagInFrame(price, 1) OVER (), NULL) AS prev "
         "FROM prices",
     )
-    run("rbind_two", "SELECT * FROM prices UNION ALL SELECT * FROM prices")
-
     run(
         "rand_uniform",
         "SELECT *, rand() / 4294967295.0 AS r FROM prices",

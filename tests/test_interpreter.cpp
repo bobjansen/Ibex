@@ -5613,6 +5613,73 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
     }
 }
 
+// Assigning a literal to a NULLABLE column takes a dedicated single-pass path.
+// The validity edges are what make it worth pinning: a non-null literal makes
+// every matched row valid, so filling all of a column's nulls must DROP the
+// bitmap, while leaving one behind must keep it.
+TEST_CASE("guarded update: literal into a nullable column fixes up validity", "[guarded_update]") {
+    auto make = [] {
+        runtime::Table t;
+        t.add_column("v", Column<double>{1.0, 0.0, 3.0, 0.0},
+                     runtime::ValidityBitmap{true, false, true, false});
+        t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+        runtime::TableRegistry r;
+        r.emplace("t", t);
+        return r;
+    };
+
+    // Every null matches the guard -> result is fully valid, bitmap dropped.
+    {
+        auto registry = make();
+        auto ir = require_ir("t[where is_null(v) update { v = -1.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("v");
+        REQUIRE(entry != nullptr);
+        CHECK_FALSE(entry->validity.has_value());
+        const auto& v = std::get<Column<double>>(*entry->column);
+        CHECK(v[0] == 1.0);
+        CHECK(v[1] == -1.0);
+        CHECK(v[2] == 3.0);
+        CHECK(v[3] == -1.0);
+    }
+
+    // Only one of the two nulls matches -> the other must stay null.
+    {
+        auto registry = make();
+        auto ir = require_ir("t[where is_null(v) && g == 1 update { v = -1.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("v");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0]);
+        CHECK((*entry->validity)[1]);  // filled by the guard
+        CHECK((*entry->validity)[2]);
+        CHECK_FALSE((*entry->validity)[3]);  // unmatched null survives
+        const auto& v = std::get<Column<double>>(*entry->column);
+        CHECK(v[1] == -1.0);
+    }
+
+    // A guard that matches a non-null row overwrites the value and leaves the
+    // unrelated nulls alone.
+    {
+        auto registry = make();
+        auto ir = require_ir("t[where g == 2 update { v = 9.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("v");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        CHECK_FALSE((*entry->validity)[1]);  // untouched null
+        CHECK((*entry->validity)[2]);
+        CHECK((*entry->validity)[3]);  // was null, now assigned
+        const auto& v = std::get<Column<double>>(*entry->column);
+        CHECK(v[2] == 9.0);
+        CHECK(v[3] == 9.0);
+    }
+}
+
 TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
     runtime::TableRegistry registry;
 

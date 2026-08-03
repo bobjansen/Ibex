@@ -2733,7 +2733,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         const auto& field = update.fields().front();
         const auto* literal = std::get_if<ir::Literal>(&field.expr.node);
         const ColumnEntry* old_entry = input.find_entry(field.alias);
-        if (literal != nullptr && old_entry != nullptr && !old_entry->validity.has_value()) {
+        if (literal != nullptr && old_entry != nullptr) {
             ColumnValue replacement =
                 broadcast_scalar_column(scalar_from_literal(*literal), std::size_t{1});
             if (old_entry->column->index() != replacement.index()) {
@@ -2742,8 +2742,11 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                     "'");
             }
 
+            using LiteralResult = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
+            const ValidityBitmap* old_validity =
+                old_entry->validity.has_value() ? &*old_entry->validity : nullptr;
             auto result = std::visit(
-                [&](const auto& old_col) -> std::optional<ColumnValue> {
+                [&](const auto& old_col) -> std::optional<LiteralResult> {
                     using Col = std::decay_t<decltype(old_col)>;
                     if constexpr (std::is_same_v<Col, Column<std::string>> ||
                                   std::is_same_v<Col, Column<Categorical>>) {
@@ -2772,6 +2775,34 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                 out[idx] = value;
                             }
                         };
+                        auto matched = [&](std::size_t i) {
+                            return mask->value[i] != 0 &&
+                                   (!mask->valid.has_value() || (*mask->valid)[i]);
+                        };
+
+                        // A nullable target still fits this shape: a non-null
+                        // literal makes every matched row valid, and the rest
+                        // keep the old value and the old validity bit. That is
+                        // the same single pass, so it does not need the
+                        // general gather/scatter path — `where is_null(x)
+                        // update { x = <lit> }` is a common idiom.
+                        if (old_validity != nullptr) {
+                            ValidityBitmap out_valid = *old_validity;
+                            bool any_invalid = false;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                if (matched(i)) {
+                                    set_at(i);
+                                    out_valid.set(i, true);
+                                } else if (!out_valid[i]) {
+                                    any_invalid = true;
+                                }
+                            }
+                            return LiteralResult{
+                                ColumnValue{std::move(out)},
+                                any_invalid ? std::optional<ValidityBitmap>{std::move(out_valid)}
+                                            : std::nullopt};
+                        }
+
                         if (mask->valid.has_value()) {
                             const auto& valid = *mask->valid;
                             for (std::size_t i = 0; i < n; ++i) {
@@ -2786,14 +2817,14 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                 }
                             }
                         }
-                        return ColumnValue{std::move(out)};
+                        return LiteralResult{ColumnValue{std::move(out)}, std::nullopt};
                     }
                 },
                 *old_entry->column);
             if (result.has_value()) {
                 const auto pos = input.index.at(field.alias);
                 Table output = std::move(input);
-                output.replace_column(pos, std::move(*result));
+                output.replace_column(pos, std::move(result->first), std::move(result->second));
                 return output;
             }
         }
@@ -2908,6 +2939,43 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                             }
                         }
                         return {ColumnValue{std::move(out)}, std::nullopt};
+                    }
+
+                    // A guarded assignment that CREATES a column. Every
+                    // non-matching row is null by definition, so there is no
+                    // old value to interleave and the row loop below is doing
+                    // nothing but re-deriving `matched_idx`. Touch the matched
+                    // rows only — for a selective guard that is a small
+                    // fraction of the table.
+                    if (oldc == nullptr) {
+                        Col out;
+                        // Value-initialized on purpose: the payload under a
+                        // null is never read by Ibex, but it is still handed
+                        // to Arrow on export, so it must not be garbage.
+                        out.resize(n);
+                        ValidityBitmap valid(n, false);
+                        bool any_invalid = matched_idx.size() < n;
+                        typename Col::value_type* out_values = nullptr;
+                        if constexpr (is_dense_column_v<Col>) {
+                            out_values = out.data();
+                        }
+                        for (std::size_t k = 0; k < matched_idx.size(); ++k) {
+                            const std::size_t i = matched_idx[k];
+                            const std::size_t si = subset ? k : i;
+                            if (new_valid.has_value() && !(*new_valid)[si]) {
+                                any_invalid = true;
+                                continue;
+                            }
+                            if constexpr (is_dense_column_v<Col>) {
+                                out_values[i] = src[si];
+                            } else {
+                                out[i] = src[si];
+                            }
+                            valid.set(i, true);
+                        }
+                        return {ColumnValue{std::move(out)},
+                                any_invalid ? std::optional<ValidityBitmap>{std::move(valid)}
+                                            : std::nullopt};
                     }
                 }
 

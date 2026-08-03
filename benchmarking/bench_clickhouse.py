@@ -306,6 +306,17 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         "SELECT symbol, if(price > 900.0, price * 0.9, price) AS price, "
         "if(price > 900.0, price - 900.0, NULL) AS excess FROM prices",
     )
+    run(
+        # `OVER ()` deliberately: the Ibex query lags by TABLE ORDER, and an
+        # explicit ORDER BY would add a 50M-row sort the other engines do not
+        # pay (duckdb uses its virtual rowid). The Memory engine preserves
+        # insertion order, so the empty window is the faithful equivalent.
+        # NOTE: ClickHouse's lagInFrame defaults the FIRST row to 0 where
+        # duckdb/DataFusion give NULL — a one-row difference, not worth a sort.
+        "where_update_window",
+        "SELECT symbol, price, if(price > 900.0, lagInFrame(price, 1) OVER (), NULL) AS prev "
+        "FROM prices",
+    )
     run("rbind_two", "SELECT * FROM prices UNION ALL SELECT * FROM prices")
 
     run(

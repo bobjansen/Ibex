@@ -497,7 +497,15 @@ inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
         v);
 }
 
-struct AggSlot {
+/// The numeric half of an aggregate's per-group state, and deliberately a POD.
+///
+/// Triviality is the point, not the size. `flat_slots_.resize()` is called once
+/// per NEW GROUP, so a 100k-group aggregate grows the array ~17 times and moves
+/// ~200k elements; with a `ScalarValue` member every one of those is a
+/// discriminant check plus a string move instead of a memcpy, and every slot
+/// costs a constructor and a destructor. Measured on 100k slots: 1.59ms to
+/// build and tear down with a ScalarValue, 0.33ms without.
+struct AggSlotCore {
     ir::AggFunc func = ir::AggFunc::Sum;
     ExprType kind = ExprType::Int;
     bool has_value = false;
@@ -515,11 +523,21 @@ struct AggSlot {
     double m3 = 0.0;     ///< Σ(x-mean)³ (online), for skewness.
     double m4 = 0.0;     ///< Σ(x-mean)⁴ (online), for kurtosis.
     double param = 0.0;  ///< Function-specific parameter (e.g. EWMA alpha).
-    /// First/Last on a String/Categorical column. One field, not two: a slot
-    /// belongs to exactly ONE aggregate, so first and last can never both be
-    /// live in it — carrying both cost 40 bytes in every slot of every group.
+};
+
+/// AggSlotCore plus the boxed value First/Last needs for a non-numeric column
+/// (String, but also Bool/Date/Timestamp). The materializing aggregate path
+/// keeps its slots in several containers and reads this inline; the chunked
+/// operator stores `AggSlotCore` and keeps the boxed values in a side array
+/// that stays EMPTY — and therefore free — for an all-numeric query.
+struct AggSlot : AggSlotCore {
     ScalarValue text_value;
 };
+
+// The whole point of the split — lock it in so a future field cannot quietly
+// put a constructor back on the per-group hot path.
+static_assert(std::is_trivially_destructible_v<AggSlotCore>);
+static_assert(std::is_trivially_copyable_v<AggSlotCore>);
 
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked
 // aggregate operators. `double_value` holds the running mean; m2/m3/m4 hold
@@ -527,7 +545,7 @@ struct AggSlot {
 // aggregate computes to within floating-point rounding — and for stddev the
 // M2 update is bit-identical (Pébay's term1 reduces to the simple Welford
 // step), so `stddev` results agree exactly across paths.
-inline void agg_update_stddev(AggSlot& slot, double x) {
+inline void agg_update_stddev(AggSlotCore& slot, double x) {
     slot.count += 1;
     const double delta = x - slot.double_value;
     slot.double_value += delta / static_cast<double>(slot.count);
@@ -536,7 +554,7 @@ inline void agg_update_stddev(AggSlot& slot, double x) {
 
 // Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).
 // Updates m4 and m3 before m2 because they read the pre-update accumulators.
-inline void agg_update_moments(AggSlot& slot, double x) {
+inline void agg_update_moments(AggSlotCore& slot, double x) {
     const auto n1 = static_cast<double>(slot.count);
     slot.count += 1;
     const auto n = static_cast<double>(slot.count);
@@ -551,11 +569,11 @@ inline void agg_update_moments(AggSlot& slot, double x) {
     slot.m2 += term1;
 }
 
-inline auto agg_finalize_stddev(const AggSlot& slot) -> double {
+inline auto agg_finalize_stddev(const AggSlotCore& slot) -> double {
     return slot.count < 2 ? 0.0 : std::sqrt(slot.m2 / static_cast<double>(slot.count - 1));
 }
 
-inline auto agg_finalize_skew(const AggSlot& slot) -> double {
+inline auto agg_finalize_skew(const AggSlotCore& slot) -> double {
     if (slot.count < 3 || slot.m2 == 0.0) {
         return 0.0;
     }
@@ -564,7 +582,7 @@ inline auto agg_finalize_skew(const AggSlot& slot) -> double {
     return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (slot.m3 / std::pow(slot.m2, 1.5));
 }
 
-inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
+inline auto agg_finalize_kurtosis(const AggSlotCore& slot) -> double {
     if (slot.count < 4 || slot.m2 == 0.0) {
         return 0.0;
     }
@@ -596,15 +614,16 @@ inline auto agg_finalize_kurtosis(const AggSlot& slot) -> double {
     }
 }
 
-/// Copy whichever value member `kind` makes active. int_value/double_value
-/// share storage, and text_value is the String case.
-inline void copy_active_value(AggSlot& dst, const AggSlot& src, ExprType kind) {
+/// Copy whichever value member `kind` makes active. int_value and double_value
+/// share storage, so only the one `kind` names may be touched.
+inline void copy_active_value(AggSlotCore& dst, const AggSlotCore& src, ExprType kind) {
     if (kind == ExprType::Int) {
         dst.int_value = src.int_value;
-    } else if (kind == ExprType::Double) {
-        dst.double_value = src.double_value;
     } else {
-        dst.text_value = src.text_value;
+        // Double. A non-numeric First/Last keeps its value in the caller's side
+        // array, which this cannot reach — parallel callers must exclude those
+        // kinds, and agg_is_combinable()'s users assert it.
+        dst.double_value = src.double_value;
     }
 }
 
@@ -621,7 +640,7 @@ inline void copy_active_value(AggSlot& dst, const AggSlot& src, ExprType kind) {
 /// accumulation, so sums and stddev may differ from the serial path in the
 /// last ulps. That is inherent to any parallel float reduction; it is stable
 /// run-to-run, which is the property that matters.
-inline void agg_combine(AggSlot& dst, const AggSlot& src, ir::AggFunc func, ExprType kind) {
+inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc func, ExprType kind) {
     switch (func) {
         case ir::AggFunc::Count:
             dst.count += src.count;

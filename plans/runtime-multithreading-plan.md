@@ -1397,9 +1397,22 @@ serial fixes found while sizing item 2, each larger than the parallel win:
 - `param` (per-aggregation) was stored per-group; it reads from the plan now
   (98d477d).
 
-Remaining slot fat: `m3`/`m4` (16 bytes, only skew/kurtosis — could follow
-`text_value` into a side array, taking the core 48 -> 32). Lower value now that
-triviality is banked: ~16% of the scatter, no ctor/dtor gain left.
+**Aggregate per-group scratch (0166a57).** The slot-shrinking work generalised
+into an extension point: an aggregate DECLARES its per-group state in the plan
+(`SlotPlan::scratch_doubles`) and the operator lays it out beside the slots
+(`scratch_[gid * stride + offset[agg]]`), group-major, empty when unused, and
+`double` so it stays trivially copyable. Skew/Kurtosis are the first consumer
+(2 doubles each) and AggSlotCore is down to 32 bytes. **A third-party
+aggregate can now add per-group state without touching the slot** — previously
+it would have had to add a field and tax every group of every query.
+
+NOT covered: variable-length per-group state (what median needs). That has its
+own mechanism — histogram + prefix-sum offsets into one flat buffer — and a
+fixed-stride region cannot express it. Worth keeping in mind if extensible
+aggregates land.
+
+Slot fat is now essentially gone; the remaining per-group cost is the scatter
+itself, which the measurements say is smooth and sublinear in size.
 
 ## Phase 4 — Parallel Barriers
 

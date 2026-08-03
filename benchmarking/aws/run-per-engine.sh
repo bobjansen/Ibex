@@ -58,12 +58,12 @@ ENGINES="ibex,python,r,duckdb,datafusion,clickhouse"
 # variants are included because there's no shared box to keep them off for.
 declare -A ENGINE_ARGS=(
     [ibex]="--skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st"
-    [python]="--skip-ibex --skip-ibex-compiled --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st"
-    [r]="--skip-ibex --skip-ibex-compiled --skip-python --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st"
-    [duckdb]="--skip-ibex --skip-ibex-compiled --skip-python --skip-r --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st --duckdb-all-sizes"
-    [datafusion]="--skip-ibex --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-clickhouse --skip-clickhouse-st"
-    [clickhouse]="--skip-ibex --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st"
-    [sqlite]="--skip-ibex --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st --with-sqlite"
+    [python]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st"
+    [r]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-python --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st"
+    [duckdb]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-python --skip-r --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st --duckdb-all-sizes"
+    [datafusion]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-clickhouse --skip-clickhouse-st"
+    [clickhouse]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st"
+    [sqlite]="--skip-ibex --skip-ibex-st --skip-ibex-compiled --skip-python --skip-r --skip-duckdb --skip-duckdb-st --skip-datafusion --skip-datafusion-st --skip-clickhouse --skip-clickhouse-st --with-sqlite"
 )
 
 # Only the native Ibex worker needs the CMake tree. Building Ibex on the R,

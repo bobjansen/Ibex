@@ -39,7 +39,7 @@ class NoInitAllocator {
     NoInitAllocator() noexcept = default;
 
     template <typename U>
-    constexpr NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+    constexpr NoInitAllocator(const NoInitAllocator<U>& /*_*/) noexcept {}
 
     [[nodiscard]] auto allocate(std::size_t n) -> T* { return std::allocator<T>{}.allocate(n); }
 
@@ -69,12 +69,12 @@ class NoInitAllocator {
 };
 
 template <typename T, typename U>
-auto operator==(const NoInitAllocator<T>&, const NoInitAllocator<U>&) noexcept -> bool {
+auto operator==(const NoInitAllocator<T>& /*_*/, const NoInitAllocator<U>& /*_*/) noexcept -> bool {
     return true;
 }
 
 template <typename T, typename U>
-auto operator!=(const NoInitAllocator<T>&, const NoInitAllocator<U>&) noexcept -> bool {
+auto operator!=(const NoInitAllocator<T>& /*_*/, const NoInitAllocator<U>& /*_*/) noexcept -> bool {
     return false;
 }
 

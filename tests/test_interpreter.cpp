@@ -4022,6 +4022,113 @@ TEST_CASE("null: left join fan-out (duplicate right keys)", "[null][join]") {
     CHECK(val_col[3] == 30.0);
 }
 
+// A Categorical probe key resolves its DICTIONARY against the build index once
+// and then indexes by code, instead of rebuilding a string_view and hashing it
+// per row. The two sides have independent dictionaries, so the mapping is the
+// whole correctness question: a memo built in the wrong order, or reused across
+// a dictionary change, joins rows against the wrong keys and still returns a
+// plausible-looking table. These cases pin it against the equivalent
+// non-categorical join.
+TEST_CASE("join: categorical probe key resolves through its dictionary", "[join][categorical]") {
+    // Build side dictionary order deliberately disagrees with the probe's, and
+    // the probe has a code ("D") the build side never contains.
+    const std::vector<std::string> probe_dict{"D", "B", "A", "C"};
+    const std::vector<std::string> build_dict{"A", "B", "C"};
+
+    // Probe rows cycle every code, so "D" (unmatched) is interleaved with hits
+    // rather than sitting at an edge.
+    Column<Categorical> pk(probe_dict);
+    Column<std::int64_t> pv;
+    constexpr std::size_t kRows = 64;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        pk.push_code(static_cast<Column<Categorical>::code_type>(r % 4));
+        pv.push_back(static_cast<std::int64_t>(r));
+    }
+    runtime::Table left;
+    left.add_column("k", std::move(pk));
+    left.add_column("v", std::move(pv));
+
+    // Build side: "B" appears twice, so its chain has two links (fan-out), and
+    // the codes are in yet another order.
+    Column<Categorical> bk(build_dict);
+    for (const auto code : {2, 1, 0, 1}) {  // C, B, A, B
+        bk.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::Table right;
+    right.add_column("k", std::move(bk));
+    right.add_column("w", Column<std::int64_t>{100, 200, 300, 400});
+
+    auto got = runtime::join_tables(left, right, ir::JoinKind::Inner, {"k"});
+    REQUIRE(got.has_value());
+
+    // Reference: the same join with both keys as plain strings, which cannot
+    // take the dictionary path at all.
+    runtime::Table left_s;
+    Column<std::string> lks;
+    Column<std::int64_t> lvs;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        lks.push_back(probe_dict[r % 4]);
+        lvs.push_back(static_cast<std::int64_t>(r));
+    }
+    left_s.add_column("k", std::move(lks));
+    left_s.add_column("v", std::move(lvs));
+    runtime::Table right_s;
+    Column<std::string> rks;
+    for (const auto code : {2, 1, 0, 1}) {
+        rks.push_back(build_dict[static_cast<std::size_t>(code)]);
+    }
+    right_s.add_column("k", std::move(rks));
+    right_s.add_column("w", Column<std::int64_t>{100, 200, 300, 400});
+
+    auto want = runtime::join_tables(left_s, right_s, ir::JoinKind::Inner, {"k"});
+    REQUIRE(want.has_value());
+
+    REQUIRE(got->rows() == want->rows());
+    // 3 of every 4 probe rows match; "B" fans out to two build rows.
+    CHECK(got->rows() == (kRows / 4) * 4);
+    const auto& got_v = std::get<Column<std::int64_t>>(*got->find("v"));
+    const auto& want_v = std::get<Column<std::int64_t>>(*want->find("v"));
+    const auto& got_w = std::get<Column<std::int64_t>>(*got->find("w"));
+    const auto& want_w = std::get<Column<std::int64_t>>(*want->find("w"));
+    for (std::size_t r = 0; r < got->rows(); ++r) {
+        CAPTURE(r);
+        CHECK(got_v[r] == want_v[r]);
+        CHECK(got_w[r] == want_w[r]);
+    }
+}
+
+TEST_CASE("join: null categorical probe keys match nothing", "[join][categorical][null]") {
+    // A null key matches nothing, not even another null. The code under a null
+    // cell is still a real dictionary index, so a memo that skipped the
+    // validity check would happily resolve it to a build row.
+    const std::vector<std::string> dict{"A", "B"};
+    Column<Categorical> k(dict);
+    for (const auto code : {0, 1, 0, 1}) {
+        k.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::Table left;
+    left.add_column("k", std::move(k), runtime::ValidityBitmap{true, false, false, true});
+    left.add_column("v", Column<std::int64_t>{1, 2, 3, 4});
+
+    Column<Categorical> bk(dict);
+    for (const auto code : {0, 1}) {
+        bk.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::Table right;
+    right.add_column("k", std::move(bk));
+    right.add_column("w", Column<std::int64_t>{10, 20});
+
+    auto got = runtime::join_tables(left, right, ir::JoinKind::Inner, {"k"});
+    REQUIRE(got.has_value());
+    REQUIRE(got->rows() == 2);  // only rows 0 ("A") and 3 ("B")
+    const auto& v = std::get<Column<std::int64_t>>(*got->find("v"));
+    const auto& w = std::get<Column<std::int64_t>>(*got->find("w"));
+    CHECK(v[0] == 1);
+    CHECK(w[0] == 10);
+    CHECK(v[1] == 4);
+    CHECK(w[1] == 20);
+}
+
 // --- Phase 2: Nullable Expressions + 3VL Filter tests ------------------------
 
 TEST_CASE("null 3vl: arithmetic propagates null", "[null][3vl]") {

@@ -1047,16 +1047,18 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             for (auto& c : codes)
                 c = ~c;
         }
-        auto sort_result = radix_sort_u64_asc(std::move(codes), rows);
-        idx.resize(rows);
-        std::visit(
-            [&](const auto& sorted) {
-                for (std::size_t i = 0; i < rows; ++i)
-                    idx[i] = sorted[i];
-            },
-            sort_result);
-
-        if (!group_entries.empty()) {
+        if (group_entries.empty()) {
+            // Ungrouped: one run, so there is nothing to bucket and the whole
+            // table is the slice.
+            auto sort_result = radix_sort_u64_asc(std::move(codes), rows);
+            idx.resize(rows);
+            std::visit(
+                [&](const auto& sorted) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        idx[i] = sorted[i];
+                },
+                sort_result);
+        } else {
             // Assign group IDs using the already-flattened group_flat arrays (string_view,
             // no per-row allocation) instead of calling scalar_from_column (which
             // heap-allocates std::string for string columns on every row).
@@ -1127,9 +1129,24 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                     group_id[r] = it->second;
                 }
             }
-            // Stable counting sort of idx by group id.
-            // Save the prefix-sum as group_starts BEFORE the scatter so we have O(1)
-            // group boundary lookup for the rank sweep (avoids O(n) same_group calls).
+            // Bucket rows by group, then sort each group's run where it sits.
+            //
+            // The obvious structure — sort all `rows` globally, then stable
+            // counting-sort the result by group — walks a 64MB permutation
+            // twice and cannot be split. Bucketing first makes each run
+            // cache-resident and independent, so the runs sort concurrently
+            // and the counting pass over the sorted order disappears. Measured
+            // on a standalone harness at 8M rows, prices-shaped keys:
+            //
+            //   groups     global+count   bucket+per-group   ...threaded
+            //        1          322ms            251ms            247ms
+            //      252          346ms            150ms             50ms
+            //   100000          344ms            190ms            100ms
+            //
+            // The key travels with the row so each run holds its own keys
+            // contiguously; rows enter a run in ascending row order and the
+            // slice sort is stable, so ties break by row exactly as the global
+            // stable sort broke them.
             std::vector<std::size_t> cnt(static_cast<std::size_t>(ngroups) + 1, 0);
             for (std::size_t r = 0; r < rows; ++r)
                 ++cnt[static_cast<std::size_t>(group_id[r]) + 1];
@@ -1137,12 +1154,42 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 cnt[g + 1] += cnt[g];
             radix_group_starts =
                 cnt;  // group g spans [radix_group_starts[g], radix_group_starts[g+1])
-            std::vector<std::size_t> grouped(rows);
-            for (std::size_t i = 0; i < rows; ++i) {
-                std::uint32_t g = group_id[idx[i]];
-                grouped[cnt[g]++] = idx[i];
+
+            idx.resize(rows);
+            std::vector<std::uint64_t> run_keys(rows);
+            {
+                std::vector<std::size_t> cursor(cnt.begin(), cnt.end() - 1);
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const std::size_t at = cursor[group_id[r]]++;
+                    idx[at] = r;
+                    run_keys[at] = codes[r];
+                }
             }
-            idx = std::move(grouped);
+
+            const std::size_t sort_workers = ngroups >= 2 ? rank_sweep_worker_count(exec, rows) : 0;
+            if (sort_workers >= 2) {
+                std::atomic<std::size_t> next{0};
+                auto batch = process_worker_pool().submit(sort_workers, [&](std::size_t) noexcept {
+                    RadixSliceScratch scratch;
+                    while (true) {
+                        const std::size_t g = next.fetch_add(1, std::memory_order_relaxed);
+                        if (g >= ngroups) {
+                            return;
+                        }
+                        const std::size_t lo = radix_group_starts[g];
+                        sort_key_index_slice(run_keys.data() + lo, idx.data() + lo,
+                                             radix_group_starts[g + 1] - lo, scratch);
+                    }
+                });
+                batch.wait();
+            } else {
+                RadixSliceScratch scratch;
+                for (std::size_t g = 0; g < ngroups; ++g) {
+                    const std::size_t lo = radix_group_starts[g];
+                    sort_key_index_slice(run_keys.data() + lo, idx.data() + lo,
+                                         radix_group_starts[g + 1] - lo, scratch);
+                }
+            }
         }
     } else {
         ensure_group_flat();

@@ -505,7 +505,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     Table result = std::move(child.value());
                     for (const auto& field : update.fields()) {
                         const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
-                        auto res = evaluate_rank_column(result, *rank, update.group_by());
+                        auto res = evaluate_rank_column(result, *rank, update.group_by(), exec);
                         if (!res) {
                             return std::unexpected(res.error());
                         }

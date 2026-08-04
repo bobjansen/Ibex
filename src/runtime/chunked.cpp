@@ -825,8 +825,23 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
         lhs, rhs);
 }
 
+/// Workers for rank's per-group sweep, or 0 for serial. Sized on ROW COUNT, so
+/// the split — and therefore nothing about the answer — depends on the pool.
+/// Groups are the unit of work, so more workers than groups is pointless; the
+/// caller checks that separately.
+[[nodiscard]] auto rank_sweep_worker_count(const ExecutionContext& exec, std::size_t rows)
+    -> std::size_t {
+    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers = std::min(budget, pool_size);
+    return workers < 2 ? 0 : workers;
+}
+
 auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
-                          const std::vector<ir::ColumnRef>& group_by)
+                          const std::vector<ir::ColumnRef>& group_by, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
     const std::size_t rows = input.rows();
     auto order_keys = ordering_keys_for_table(input, rank.order_keys);
@@ -1208,18 +1223,10 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // scan (needed for nulls / string order keys / multi-key cases).
     std::size_t gs_cursor = 0;  // index into radix_group_starts for the fast path
 
-    std::size_t pos = 0;
-    while (pos < rows) {
-        std::size_t group_end = 0;
-        if (!radix_group_starts.empty()) {
-            ++gs_cursor;  // advance past the current group's start
-            group_end = radix_group_starts[gs_cursor];
-        } else {
-            group_end = pos + 1;
-            while (group_end < rows && same_group(idx[pos], idx[group_end]))
-                ++group_end;
-        }
-
+    // One group's ranks. Groups share no rows, and every write below is to
+    // `rank_values[idx[k]]` — a row this group owns — so groups are
+    // independent and the loop over them can be split.
+    auto rank_group = [&](std::size_t pos, std::size_t group_end) {
         std::size_t dense_rank = 1;
         std::size_t ordinal = 1;
         std::size_t i = pos;
@@ -1278,8 +1285,45 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             }
             i = tie_end;
         }
+    };
 
-        pos = group_end;
+    // Split the groups when the radix path ran. Two conditions make that safe
+    // and are exactly what the path already guarantees: the group boundaries
+    // are known up front (no serial scan to find them), and there is no
+    // nullable order key — so nothing writes the shared validity bitmap, whose
+    // neighbouring bits share a word and could not be written concurrently.
+    // The result does not depend on the split: each group's ranks are computed
+    // from its own rows and scattered to their own row positions.
+    const std::size_t group_count = radix_group_starts.empty() ? 0 : radix_group_starts.size() - 1;
+    const std::size_t sweep_workers =
+        (solo_key != nullptr && group_count >= 2) ? rank_sweep_worker_count(exec, rows) : 0;
+    if (sweep_workers >= 2) {
+        std::atomic<std::size_t> cursor{0};
+        auto batch = process_worker_pool().submit(sweep_workers, [&](std::size_t) noexcept {
+            while (true) {
+                const std::size_t g = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (g >= group_count) {
+                    return;
+                }
+                rank_group(radix_group_starts[g], radix_group_starts[g + 1]);
+            }
+        });
+        batch.wait();
+    } else {
+        std::size_t pos = 0;
+        while (pos < rows) {
+            std::size_t group_end = 0;
+            if (!radix_group_starts.empty()) {
+                ++gs_cursor;  // advance past the current group's start
+                group_end = radix_group_starts[gs_cursor];
+            } else {
+                group_end = pos + 1;
+                while (group_end < rows && same_group(idx[pos], idx[group_end]))
+                    ++group_end;
+            }
+            rank_group(pos, group_end);
+            pos = group_end;
+        }
     }
 
     const bool integral = !rank.pct && rank.method != ir::RankMethod::Average;
@@ -8232,7 +8276,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     Table result = std::move(input);
                     for (const auto& field : update.fields()) {
                         const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
-                        auto res = evaluate_rank_column(result, *rank, update.group_by());
+                        auto res = evaluate_rank_column(result, *rank, update.group_by(), exec);
                         if (!res) {
                             return std::unexpected(res.error());
                         }

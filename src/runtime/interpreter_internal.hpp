@@ -1605,7 +1605,8 @@ enum class FloatCleanMode : std::uint8_t {
     -> std::expected<OperatorPtr, std::string>;
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
 [[nodiscard]] auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
-                                        const std::vector<ir::ColumnRef>& group_by)
+                                        const std::vector<ir::ColumnRef>& group_by,
+                                        const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) -> int;
 [[nodiscard]] auto invoke_extern_call(const ir::ExternCallNode& ec, const ScalarRegistry* scalars,

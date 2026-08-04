@@ -6013,6 +6013,32 @@ TEST_CASE("rank: fast and general paths agree", "[rank][interpreter]") {
             }
         }
     }
+
+    // The grouped fast path splits its groups across workers. Each group's
+    // ranks come from its own rows and land in its own row positions, so the
+    // answer must not move with the thread count — and must still match the
+    // serial general path above.
+    SECTION("grouped sweep is deterministic across thread counts") {
+        auto ir = require_ir(
+            "t[update { rk = rank(fast, method = dense, ascending = false) }"
+            ", by sym];");
+        const auto at = [&](bool parallel, std::size_t threads) {
+            runtime::ExecutionContext exec;
+            exec.parallel = parallel;
+            exec.parallel_threads = threads;
+            exec.parallel_min_rows = 0;
+            exec.parallel_min_cells = 0;
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            const auto& col = std::get<Column<std::int64_t>>(*out->find("rk"));
+            return std::vector<std::int64_t>(col.begin(), col.end());
+        };
+        const auto serial = at(false, 0);
+        for (const std::size_t threads : {2U, 3U, 5U, 8U}) {
+            CAPTURE(threads);
+            CHECK(at(true, threads) == serial);
+        }
+    }
 }
 
 // A global aggregate (`select { … }` with no `by`) splits its row range across

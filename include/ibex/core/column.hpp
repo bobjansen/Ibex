@@ -580,6 +580,29 @@ class Column {
     ColumnMeta meta_;
 };
 
+/// Fraction of a column's rows that may be distinct before an importer stops
+/// promoting it to `Column<Categorical>`.
+inline constexpr double kCategoricalPromotionRatio = 0.10;
+
+/// Distinct-value budget for promoting a null-free string column to
+/// Categorical, given its row count. Every importer (read_csv, the JSON
+/// table builder its plugins share) must decide this the same way: the two
+/// representations take different join and group-by paths, so the same data
+/// arriving over two formats would otherwise perform differently for no
+/// reason the user can see. The rule is deliberately relative — an absolute
+/// cap is meaningless without knowing how many rows it is capping, and one
+/// (4096, in the JSON reader) sat far below where the representation stops
+/// paying: a 100k-value dictionary over 8M rows still beat plain strings by
+/// 7x on a join, because the probe resolves each code once rather than
+/// hashing a string per row.
+///
+/// The dictionary is indexed by `Column<Categorical>::code_type` (int32), so
+/// this bound is a performance judgement, not an overflow guard.
+[[nodiscard]] inline auto categorical_promotion_limit(std::size_t rows) noexcept -> std::size_t {
+    return std::max<std::size_t>(
+        1, static_cast<std::size_t>(static_cast<double>(rows) * kCategoricalPromotionRatio));
+}
+
 /// Specialization for categorical columns (dictionary-encoded strings).
 template <>
 class Column<Categorical> {

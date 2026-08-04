@@ -2719,6 +2719,19 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     if (!mask) {
         return std::unexpected(mask.error());
     }
+    // Fold the 3VL validity into the mask bytes. Every consumer below asks the
+    // same question — "true and not null?" — so answering it once turns each of
+    // them into a single dense byte read instead of a byte read plus a
+    // conditional bit probe, and lets the literal path below vectorize.
+    if (mask->valid.has_value()) {
+        const std::uint8_t* mask_valid = mask->valid->data();
+        std::uint8_t* bytes = mask->value.data();
+        for (std::size_t i = 0; i < n; ++i) {
+            bytes[i] = static_cast<std::uint8_t>(bytes[i] != 0 && mask_valid[i] != 0);
+        }
+        mask->valid.reset();
+    }
+    const std::uint8_t* matched_bytes = mask->value.data();
 
     // Common CASE-WHEN shape: replacing values in an existing, non-null,
     // fixed-width column with a literal. The general guarded-update path below
@@ -2755,69 +2768,96 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // categorical column. Keep their established path.
                         return std::nullopt;
                     } else {
-                        Col out = old_col;
                         const auto& scalar_col = std::get<Col>(replacement);
                         const auto value = scalar_col[0];
-                        // Resolve the storage once. `out[i]` re-tests whether
-                        // the column holds adopted (Arrow) storage on every
-                        // element, which costs far more than the store it
-                        // guards — this loop is the whole of `where … update
-                        // { col = literal }`. `Column<bool>` reaches here too
-                        // and is bit-packed, so it keeps the indexed path.
-                        typename Col::value_type* out_values = nullptr;
+
+                        Col out;
                         if constexpr (is_dense_column_v<Col>) {
-                            out_values = out.data();
-                        }
-                        auto set_at = [&](std::size_t idx) {
-                            if constexpr (is_dense_column_v<Col>) {
-                                out_values[idx] = value;
+                            // Select each output element from the guard in one
+                            // pass. Copying the old column and then scattering
+                            // the literal into it writes every element once and
+                            // then rewrites the matched ones; this writes each
+                            // exactly once, and because the guard is a dense
+                            // byte array with no branch left in the body it
+                            // vectorizes into a blend. Resolving the storage up
+                            // front also drops the per-element re-test of
+                            // whether the column holds adopted (Arrow) buffers,
+                            // which cost more than the store it guarded.
+                            using Value = typename Col::value_type;
+                            if constexpr (std::is_trivially_default_constructible_v<Value>) {
+                                out.resize_for_overwrite(n);
                             } else {
-                                out[idx] = value;
+                                // `Timestamp`/`Date` default their member, so
+                                // they cannot skip the fill; the select below
+                                // still writes every slot exactly once.
+                                out.resize(n);
                             }
-                        };
-                        auto matched = [&](std::size_t i) {
-                            return mask->value[i] != 0 &&
-                                   (!mask->valid.has_value() || (*mask->valid)[i]);
-                        };
+                            typename Col::value_type* dst = out.data();
+                            const typename Col::value_type* src = old_col.data();
+                            for (std::size_t i = 0; i < n; ++i) {
+                                dst[i] = matched_bytes[i] != 0 ? value : src[i];
+                            }
+                        } else {
+                            // `Column<bool>` reaches here and is bit-packed, so
+                            // it keeps copy-then-scatter through the indexed
+                            // accessor.
+                            out = old_col;
+                            for (std::size_t i = 0; i < n; ++i) {
+                                if (matched_bytes[i] != 0) {
+                                    out[i] = value;
+                                }
+                            }
+                        }
+
+                        if (old_validity == nullptr) {
+                            return LiteralResult{ColumnValue{std::move(out)}, std::nullopt};
+                        }
 
                         // A nullable target still fits this shape: a non-null
                         // literal makes every matched row valid, and the rest
-                        // keep the old value and the old validity bit. That is
-                        // the same single pass, so it does not need the
-                        // general gather/scatter path — `where is_null(x)
-                        // update { x = <lit> }` is a common idiom.
-                        if (old_validity != nullptr) {
-                            ValidityBitmap out_valid = *old_validity;
-                            bool any_invalid = false;
+                        // keep the old value and the old validity bit —
+                        // `where is_null(x) update { x = <lit> }` is a common
+                        // idiom. Merge the two a word at a time rather than
+                        // copying the old bitmap and setting a bit per matched
+                        // row.
+                        ValidityBitmap out_valid;
+                        out_valid.resize(n);
+                        bool any_invalid = false;
+                        if (!old_validity->is_external()) {
+                            constexpr std::size_t kBits = 64;
+                            const std::uint64_t* src = old_validity->words_data();
+                            std::uint64_t* dst = out_valid.words_data();
+                            const std::size_t words = (n + kBits - 1) / kBits;
+                            for (std::size_t w = 0; w < words; ++w) {
+                                const std::size_t base = w * kBits;
+                                const std::size_t len = std::min(kBits, n - base);
+                                std::uint64_t bits = 0;
+                                for (std::size_t b = 0; b < len; ++b) {
+                                    bits |= static_cast<std::uint64_t>(matched_bytes[base + b] != 0)
+                                            << b;
+                                }
+                                const std::uint64_t all = len == kBits
+                                                              ? ~std::uint64_t{0}
+                                                              : ((std::uint64_t{1} << len) - 1);
+                                const std::uint64_t merged = (src[w] | bits) & all;
+                                dst[w] = merged;
+                                any_invalid = any_invalid || merged != all;
+                            }
+                        } else {
+                            // An adopted Arrow bitmap may sit at a bit offset
+                            // and need not be word-aligned; read it bit by bit.
                             for (std::size_t i = 0; i < n; ++i) {
-                                if (matched(i)) {
-                                    set_at(i);
+                                if (matched_bytes[i] != 0 || (*old_validity)[i]) {
                                     out_valid.set(i, true);
-                                } else if (!out_valid[i]) {
+                                } else {
                                     any_invalid = true;
                                 }
                             }
-                            return LiteralResult{
-                                ColumnValue{std::move(out)},
-                                any_invalid ? std::optional<ValidityBitmap>{std::move(out_valid)}
-                                            : std::nullopt};
                         }
-
-                        if (mask->valid.has_value()) {
-                            const auto& valid = *mask->valid;
-                            for (std::size_t i = 0; i < n; ++i) {
-                                if (mask->value[i] != 0 && valid[i]) {
-                                    set_at(i);
-                                }
-                            }
-                        } else {
-                            for (std::size_t i = 0; i < n; ++i) {
-                                if (mask->value[i] != 0) {
-                                    set_at(i);
-                                }
-                            }
-                        }
-                        return LiteralResult{ColumnValue{std::move(out)}, std::nullopt};
+                        return LiteralResult{
+                            ColumnValue{std::move(out)},
+                            any_invalid ? std::optional<ValidityBitmap>{std::move(out_valid)}
+                                        : std::nullopt};
                     }
                 },
                 *old_entry->column);
@@ -2833,8 +2873,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     std::vector<std::size_t> matched_idx;
     matched_idx.reserve(n / 8);
     for (std::size_t i = 0; i < n; ++i) {
-        const bool m = mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
-        if (m) {
+        if (matched_bytes[i] != 0) {
             matched_idx.push_back(i);
         }
     }
@@ -2985,9 +3024,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                 bool any_invalid = false;
                 std::size_t k = 0;  // running index into `src` for the subset case
                 for (std::size_t i = 0; i < n; ++i) {
-                    const bool matches =
-                        mask->value[i] != 0 && (!mask->valid.has_value() || (*mask->valid)[i] != 0);
-                    if (matches) {
+                    if (matched_bytes[i] != 0) {
                         const std::size_t si = subset ? k++ : i;
                         appender.push(src[si]);
                         const bool v = !new_valid.has_value() || (*new_valid)[si];

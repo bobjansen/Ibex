@@ -2157,20 +2157,43 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // IS NULL / IS NOT NULL: test the operand column's validity.
                 // Always produces a valid Bool (never null itself).
                 const bool want_null = !node.negated;
-                Mask m;
-                m.value.resize(n, want_null ? uint8_t{0} : uint8_t{1});
                 if (const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node)) {
+                    const ValidityBitmap* bm = nullptr;
                     auto it = table.index.find(col_node->name);
                     if (it != table.index.end()) {
                         const auto& entry = table.columns[it->second];
                         if (entry.validity.has_value()) {
-                            const auto& bm = *entry.validity;
-                            for (std::size_t i = 0; i < n; ++i) {
-                                const bool v = bm[rows.begin + i];
-                                m.value[i] = static_cast<uint8_t>(want_null ? !v : v);
+                            bm = &*entry.validity;
+                        }
+                    }
+                    Mask m;
+                    m.value.resize(n);
+                    // No validity bitmap → every row is valid, one constant fill.
+                    if (bm == nullptr) {
+                        std::memset(m.value.data(), want_null ? 0 : 1, n);
+                        return m;
+                    }
+                    // Expand the bitmap a word at a time. Probing bit by bit
+                    // through `operator[]` re-tests whether the bitmap is an
+                    // adopted Arrow slice on every row, and this mask is the
+                    // whole of `where is_null(x) ...`.
+                    uint8_t* out = m.value.data();
+                    constexpr std::size_t kBits = 64;
+                    if (!bm->is_external() && rows.begin % kBits == 0) {
+                        const std::uint64_t* words = bm->words_data() + rows.begin / kBits;
+                        const std::uint64_t flip = want_null ? ~std::uint64_t{0} : 0;
+                        for (std::size_t base = 0; base < n; base += kBits) {
+                            const std::uint64_t w = words[base / kBits] ^ flip;
+                            const std::size_t len = std::min(kBits, n - base);
+                            for (std::size_t b = 0; b < len; ++b) {
+                                out[base + b] = static_cast<uint8_t>((w >> b) & 1U);
                             }
                         }
-                        // no validity bitmap → all rows valid → fill stays correct
+                    } else {
+                        for (std::size_t i = 0; i < n; ++i) {
+                            const bool v = (*bm)[rows.begin + i];
+                            out[i] = static_cast<uint8_t>(want_null ? !v : v);
+                        }
                     }
                     return m;
                 }

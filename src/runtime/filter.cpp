@@ -2583,7 +2583,18 @@ auto is_range_native_expr(const ir::Expr& expr) -> bool {
                 // in its order:
                 const auto* fn = find_builtin(node.callee);
                 if (fn == nullptr) {
-                    return false;  // extern or unknown: not evaluated here at all
+                    // `round(x, mode)` is dispatched apart from the value-based
+                    // registry because its mode is a bare identifier rather than
+                    // a value (see extract_ir_round_mode), so `find_builtin`
+                    // cannot see it. It is row-local either way: the fused
+                    // numeric tree compiles it to a range-aware UnaryToInt node
+                    // whose kernel the mode fixes at compile time, and the
+                    // per-row fallback walks the range too. Anything else
+                    // unknown here is an extern, which this evaluator does not
+                    // run at all.
+                    return node.callee == "round" &&
+                           std::ranges::all_of(
+                               node.args, [](const auto& a) { return is_range_native_expr(*a); });
                 }
                 if (use_column_kernel(*fn, node)) {
                     return false;  // whole-column builtin — a range changes its answer

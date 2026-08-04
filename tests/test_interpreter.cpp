@@ -5684,6 +5684,50 @@ TEST_CASE("two ewma aggregates keep their own alpha", "[agg]") {
     CHECK(a[0] != Catch::Approx(b[0]));
 }
 
+// `round(x, mode)` is dispatched apart from the value-based builtin registry
+// (its mode is a bare identifier), so `is_range_native_expr` has to admit it by
+// name. Getting that wrong is silent in both directions: rejecting it only
+// costs threading, but admitting a genuinely whole-table call would evaluate
+// every morsel over the whole table and still return the right answer, just
+// O(morsels x rows). Pin that a split update produces the serial answer, for
+// every mode.
+TEST_CASE("round in an update is range-native under a split", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<double> v;
+    v.reserve(kRows);
+    for (std::size_t r = 0; r < kRows; ++r) {
+        // Spread across sign and the .5 ties that separate the modes.
+        v.push_back((static_cast<double>(r) - (kRows / 2.0)) * 0.5);
+    }
+    runtime::Table t;
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    for (const char* mode : {"nearest", "bankers", "floor", "ceil", "trunc"}) {
+        CAPTURE(mode);
+        const std::string source = "t[update { r = round(v, " + std::string(mode) + ") }];";
+        auto ir = require_ir(source.c_str());
+
+        const auto run = [&](bool parallel) {
+            runtime::ExecutionContext exec;
+            exec.parallel = parallel;
+            exec.parallel_threads = 4;
+            exec.parallel_grain = 256;
+            exec.parallel_min_rows = 0;
+            exec.parallel_min_cells = 0;
+            auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(out.has_value());
+            const auto* col = std::get_if<Column<std::int64_t>>(out->find("r"));
+            REQUIRE(col != nullptr);
+            REQUIRE(col->size() == kRows);
+            return std::vector<std::int64_t>(col->begin(), col->end());
+        };
+
+        CHECK(run(true) == run(false));
+    }
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

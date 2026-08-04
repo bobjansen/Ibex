@@ -16,9 +16,20 @@ Distinct groups:
   prices:       252        (by symbol)
   prices_multi: 1008       (by symbol × day, 252 symbols × 4 days)
   trades:       252        (by symbol; qty uniform [1, 500])
-  events:       100 000    (by user_id — exceeds 4096 categorical threshold,
-                            stays as Column<std::string> to stress string gather
-                            and high-cardinality group-by)
+  events:       100 000    (by user_id — high-cardinality group-by and the
+                            large side of the inner-join benchmark)
+
+Categorical promotion is a RATIO, not a fixed count: read_csv promotes a
+null-free string column when its distinct values are at most 10% of its rows
+(kMaxCategoricalRatio, libs/csv/csv.hpp). So user_id's storage depends on the
+scale being generated — at N = 1M its 100 000 distinct values are exactly at
+the limit and it promotes; below N = 1M it would not. This note used to claim a
+fixed 4096-value threshold and that user_id "stays as Column<std::string>";
+both were wrong, and the mistake outlived the threshold it described. It
+matters because the two representations take different join and group-by paths
+(a Categorical key resolves through its dictionary once per chunk rather than
+hashing a string per row), so a benchmark at an unusual scale may not measure
+the path it appears to.
   users:        100 000    (one row per distinct events user_id; the dimension
                             for the high-cardinality inner-join benchmark. Fixed
                             size — independent of N.)

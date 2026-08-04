@@ -6016,6 +6016,68 @@ TEST_CASE("guarded update: literal into a nullable column fixes up validity", "[
     }
 }
 
+// Both the `is_null` mask and the validity merge under a guarded literal
+// update run a word at a time, so they need a table that spans several words
+// and ends mid-word — a 4-row table only ever exercises the tail.
+TEST_CASE("guarded update: nullable literal across whole and partial words", "[guarded_update]") {
+    constexpr std::size_t kRows = 200;  // 3 whole words + 8 bits
+    auto make = [] {
+        Column<double> v;
+        runtime::ValidityBitmap valid;
+        Column<std::int64_t> g;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            v.push_back(static_cast<double>(i));
+            valid.push_back(i % 3 != 0);  // every third row is null
+            g.push_back(static_cast<std::int64_t>(i % 2));
+        }
+        runtime::Table t;
+        t.add_column("v", std::move(v), std::move(valid));
+        t.add_column("g", std::move(g));
+        runtime::TableRegistry r;
+        r.emplace("t", t);
+        return r;
+    };
+
+    // Guard matches only half the nulls, so the result keeps a bitmap and the
+    // unmatched nulls must survive in every word, including the partial one.
+    {
+        auto registry = make();
+        auto ir = require_ir("t[where is_null(v) && g == 0 update { v = -1.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("v");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        const auto& v = std::get<Column<double>>(*entry->column);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const bool was_null = i % 3 == 0;
+            const bool matched = was_null && i % 2 == 0;
+            CHECK((*entry->validity)[i] == (!was_null || matched));
+            CHECK(v[i] == (matched ? -1.0 : static_cast<double>(i)));
+        }
+    }
+
+    // `is not null` takes the same mask path with the sense flipped, and here
+    // every remaining null is unmatched.
+    {
+        auto registry = make();
+        auto ir = require_ir("t[where v is not null update { v = 7.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("v");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        const auto& v = std::get<Column<double>>(*entry->column);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const bool was_null = i % 3 == 0;
+            CHECK((*entry->validity)[i] == !was_null);
+            if (!was_null) {
+                CHECK(v[i] == 7.0);
+            }
+        }
+    }
+}
+
 TEST_CASE("Table(n) builds an n-row scaffold", "[table_rows]") {
     runtime::TableRegistry registry;
 

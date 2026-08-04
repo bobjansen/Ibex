@@ -43,6 +43,24 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 
 namespace {
 
+/// The harness's execution context, built once from the environment.
+///
+/// Without this the harness ran on a default-constructed `ExecutionContext`,
+/// which silently ignored `IBEX_PARALLEL` and `IBEX_MORSEL_ROWS` — so the
+/// suite's `-st` single-thread pass was not single-threaded at all, it was a
+/// second identical run of the parallel binary. Every `ibex` vs `ibex-st`
+/// comparison it produced read as exactly 1.00x, which looks like "threading
+/// buys nothing" and is really "the knob was never connected". Only
+/// `IBEX_THREADS` worked, because that sizes the process pool directly.
+[[nodiscard]] auto bench_exec() -> const ibex::runtime::ExecutionContext& {
+    static const ibex::runtime::ExecutionContext exec = [] {
+        ibex::runtime::ExecutionContext ctx;
+        ibex::runtime::configure_parallel_from_env(ctx);
+        return ctx;
+    }();
+    return exec;
+}
+
 auto trim(std::string_view input) -> std::string_view {
     auto start = input.find_first_not_of(" \t\n\r");
     if (start == std::string_view::npos) {
@@ -1153,7 +1171,8 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         sliced.emplace("users", slice_table(*users, max_rows));
     }
 
-    auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars);
+    auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars, nullptr, nullptr,
+                                           bench_exec());
     if (!result) {
         return "interpret failed: " + result.error();
     }
@@ -1717,7 +1736,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                 fmt::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
                 return 1;
             }
-            auto result = ibex::runtime::interpret(*lowered.value(), fresh, &scalars);
+            auto result = ibex::runtime::interpret(*lowered.value(), fresh, &scalars, nullptr,
+                                                   nullptr, bench_exec());
             if (!result) {
                 fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
                 return 1;
@@ -1765,7 +1785,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         for (std::size_t i = 0; i < warmup_iters; ++i) {
-            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars, nullptr,
+                                                   nullptr, bench_exec());
             if (!result) {
                 fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
                 return 1;
@@ -1777,7 +1798,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
-            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars, nullptr,
+                                                   nullptr, bench_exec());
             auto t1 = std::chrono::steady_clock::now();
             if (!result) {
                 fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
@@ -1806,7 +1828,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             fmt::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
             return 1;
         }
-        auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+        auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars, nullptr, nullptr,
+                                               bench_exec());
         if (!result) {
             fmt::print("error: interpret failed for {}: {}\n", query.name, result.error());
             return 1;
@@ -3223,7 +3246,8 @@ int main(int argc, char** argv) {
             auto melt_parsed = ibex::parser::parse(melt_src);
             auto melt_lowered = ibex::parser::lower(*melt_parsed);
             auto long_result =
-                ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars);
+                ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars,
+                                         nullptr, nullptr, bench_exec());
             if (!long_result) {
                 fmt::print("error: failed to build long table for dcast: {}\n",
                            long_result.error());

@@ -2743,7 +2743,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     std::size_t rows = output.rows();
     for (const auto& field : fields) {
         if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
-            auto res = evaluate_rank_column(output, *rank, {});
+            auto res = evaluate_rank_column(output, *rank, {}, exec);
             if (!res) {
                 return std::unexpected(res.error());
             }

@@ -2549,9 +2549,30 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         exec.parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Allocate the destination up front and let each worker copy its own morsel
+    // into it. Merging the pieces serially after the barrier was a second full
+    // pass over the result — at 8M rows, 64MB read plus 64MB write — and a
+    // memory-bound kernel like `abs(price)` only moves ~128MB in total, so the
+    // merge cost what the threads saved and then some (measured: 8.8ms
+    // parallel vs 5.8ms serial). Copying inside the task does it while the
+    // piece is still hot in that worker's cache, and does it in parallel.
+    ColumnValue out = inferred.value() == ExprType::Int ? ColumnValue{Column<std::int64_t>{}}
+                                                        : ColumnValue{Column<double>{}};
+    std::int64_t* dst_int = nullptr;
+    double* dst_double = nullptr;
+    if (auto* ints = std::get_if<Column<std::int64_t>>(&out)) {
+        ints->resize_for_overwrite(rows);
+        dst_int = ints->data();
+    } else {
+        auto& doubles = std::get<Column<double>>(out);
+        doubles.resize_for_overwrite(rows);
+        dst_double = doubles.data();
+    }
+
     // One slot per morsel, each written by exactly one worker — no lock, and
     // the result order is positional rather than dependent on completion order.
-    std::vector<std::expected<ComputedColumn, std::string>> pieces(morsels);
+    // Only the validity survives the task; the values are already in `out`.
+    std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
     std::atomic<std::size_t> cursor{0};
     auto batch = pool.submit(threads, [&](std::size_t) {
         while (true) {
@@ -2561,8 +2582,32 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
             }
             const std::size_t begin = index * grain;
             const std::size_t count = std::min(grain, rows - begin);
-            pieces[index] =
-                evaluate_field(expr, table, RowRange{.begin = begin, .count = count}, ctx);
+            auto piece = evaluate_field(expr, table, RowRange{.begin = begin, .count = count}, ctx);
+            if (!piece.has_value()) {
+                pieces[index] = std::unexpected(std::move(piece.error()));
+                continue;
+            }
+            // `infer_expr_type` chose the destination, so a morsel of another
+            // type means the two disagree. Report it rather than throwing out
+            // of a worker.
+            const void* src = nullptr;
+            if (dst_int != nullptr) {
+                if (const auto* ints = std::get_if<Column<std::int64_t>>(&piece->column)) {
+                    src = ints->data();
+                }
+            } else if (const auto* doubles = std::get_if<Column<double>>(&piece->column)) {
+                src = doubles->data();
+            }
+            if (src == nullptr) {
+                pieces[index] = std::unexpected(
+                    std::string("evaluate_field_maybe_parallel: morsel column type does not "
+                                "match the inferred result type"));
+                continue;
+            }
+            void* at = dst_int != nullptr ? static_cast<void*>(dst_int + begin)
+                                          : static_cast<void*>(dst_double + begin);
+            std::memcpy(at, src, count * sizeof(std::int64_t));
+            pieces[index] = std::move(piece->validity);
         }
     });
     batch.wait();
@@ -2576,42 +2621,19 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     }
 
     const bool any_validity =
-        std::ranges::any_of(pieces, [](const auto& p) { return p->validity.has_value(); });
-    ColumnValue out = inferred.value() == ExprType::Int ? ColumnValue{Column<std::int64_t>{}}
-                                                        : ColumnValue{Column<double>{}};
-    std::visit(
-        [&](auto& dst) {
-            using ColT = std::decay_t<decltype(dst)>;
-            // Only the two numeric alternatives are constructed above; the rest
-            // exist so the visit compiles over the whole variant.
-            if constexpr (std::is_same_v<ColT, Column<std::int64_t>> ||
-                          std::is_same_v<ColT, Column<double>>) {
-                dst.resize_for_overwrite(rows);
-                std::size_t at = 0;
-                for (auto& piece : pieces) {
-                    const auto& src = std::get<ColT>(piece->column);
-                    std::memcpy(dst.data() + at, src.data(),
-                                src.size() * sizeof(typename ColT::value_type));
-                    at += src.size();
-                }
-            } else {
-                invariant_violation("evaluate_field_maybe_parallel: non-numeric result column");
-            }
-        },
-        out);
-
+        std::ranges::any_of(pieces, [](const auto& p) { return p->has_value(); });
     std::optional<ValidityBitmap> validity;
     if (any_validity) {
         ValidityBitmap merged(rows, true);
-        std::size_t at = 0;
-        for (auto& piece : pieces) {
-            const std::size_t n = std::visit([](const auto& c) { return c.size(); }, piece->column);
-            if (piece->validity.has_value()) {
-                for (std::size_t i = 0; i < n; ++i) {
-                    merged.set(at + i, (*piece->validity)[i]);
-                }
+        for (std::size_t index = 0; index < morsels; ++index) {
+            if (!pieces[index]->has_value()) {
+                continue;
             }
-            at += n;
+            const std::size_t begin = index * grain;
+            const ValidityBitmap& src = **pieces[index];
+            for (std::size_t i = 0; i < src.size(); ++i) {
+                merged.set(begin + i, src[i]);
+            }
         }
         validity = std::move(merged);
     }

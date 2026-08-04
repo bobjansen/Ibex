@@ -5946,6 +5946,75 @@ TEST_CASE("grouped update: categorical group key edge cases", "[update][groupby]
     }
 }
 
+// `rank` has two implementations: a radix fast path for a single non-null
+// numeric order key, and a general comparison sort for everything else. The
+// fast path now also gets its own tie scan, so the two can drift apart in the
+// one place that is hardest to notice — which rows count as tied.
+//
+// An all-true validity bitmap is the lever: it changes nothing about the
+// VALUES but makes the key nullable, which sends the identical data down the
+// general path. Any disagreement is a bug in one of them.
+TEST_CASE("rank: fast and general paths agree", "[rank][interpreter]") {
+    constexpr std::size_t kRows = 5000;
+    const std::vector<std::string> dict{"D", "C", "A", "B"};
+
+    Column<Categorical> sym(dict);
+    Column<double> plain;
+    Column<double> nullable;
+    runtime::ValidityBitmap all_true;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        sym.push_code(static_cast<Column<Categorical>::code_type>(r % 4));
+        // Heavy ties (many repeats) and a few negatives, so tie runs are long
+        // and the descending/ascending code paths both see sign changes.
+        const double v = static_cast<double>((r * 37) % 23) - 8.0;
+        plain.push_back(v);
+        nullable.push_back(v);
+        all_true.push_back(true);
+    }
+    runtime::Table t;
+    t.add_column("sym", std::move(sym));
+    t.add_column("fast", std::move(plain));
+    t.add_column("gen", std::move(nullable), std::move(all_true));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ranks = [&](const char* source) {
+        auto ir = require_ir(source);
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto* col = out->find("rk");
+        REQUIRE(col != nullptr);
+        std::vector<double> got;
+        got.reserve(kRows);
+        if (const auto* i = std::get_if<Column<std::int64_t>>(col)) {
+            for (std::size_t r = 0; r < kRows; ++r) {
+                got.push_back(static_cast<double>((*i)[r]));
+            }
+        } else {
+            const auto& d = std::get<Column<double>>(*col);
+            for (std::size_t r = 0; r < kRows; ++r) {
+                got.push_back(d[r]);
+            }
+        }
+        return got;
+    };
+
+    for (const char* method : {"dense", "min", "max", "average", "first"}) {
+        for (const char* dir : {"true", "false"}) {
+            for (const char* by : {"", ", by sym"}) {
+                CAPTURE(method, dir, by);
+                const std::string fast =
+                    "t[update { rk = rank(fast, method = " + std::string(method) +
+                    ", ascending = " + dir + ") }" + by + "];";
+                const std::string gen =
+                    "t[update { rk = rank(gen, method = " + std::string(method) +
+                    ", ascending = " + dir + ") }" + by + "];";
+                CHECK(ranks(fast.c_str()) == ranks(gen.c_str()));
+            }
+        }
+    }
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

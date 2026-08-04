@@ -542,6 +542,9 @@ struct AggSlot : AggSlotCore {
 static_assert(std::is_trivially_destructible_v<AggSlotCore>);
 static_assert(std::is_trivially_copyable_v<AggSlotCore>);
 
+// NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
+// We need AggSlotCore to be a POD
+
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked
 // aggregate operators. `double_value` holds the running mean; m2/m3/m4 hold
 // Σ(x-mean)^k. These match the two-pass central moments the materializing
@@ -729,6 +732,8 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             invariant_violation("agg_combine: aggregate is not combinable");
     }
 }
+
+// NOLINTEND(cppcoreguidelines-pro-type-union-access)
 
 struct AggState {
     std::vector<AggSlot> slots;

@@ -1058,7 +1058,6 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
     }
 
     ibex::runtime::Table table;
-    constexpr double kMaxCategoricalRatio = 0.10;
 
     for (std::size_t c = 0; c < columns.size(); ++c) {
         const auto& vals = columns[c];
@@ -1290,8 +1289,7 @@ inline auto read_csv_with_options(std::string_view path, const CsvReadOptions& o
 
         // Pure-string column: try categorical promotion.
         if (n > 0) {
-            const std::size_t max_uniques = std::max<std::size_t>(
-                1, static_cast<std::size_t>(static_cast<double>(n) * kMaxCategoricalRatio));
+            const std::size_t max_uniques = ibex::categorical_promotion_limit(n);
             std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
             codes.reserve(n);
             std::vector<std::string> dict;

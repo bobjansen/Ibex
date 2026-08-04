@@ -174,9 +174,6 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
     // Second pass: build columns.
     ibex::runtime::Table table;
 
-    constexpr std::size_t kMaxCategoricalUniques = 4096;
-    constexpr double kMaxCategoricalRatio = 0.05;
-
     for (std::size_t c = 0; c < n_cols; ++c) {
         const auto& name = col_names[c];
         const auto type = col_types[c];
@@ -261,10 +258,9 @@ inline auto read_json(std::string_view path) -> ibex::runtime::Table {
                 continue;
             }
 
-            // Try categorical compression.
-            const std::size_t ratio_limit = std::max<std::size_t>(
-                1, static_cast<std::size_t>(static_cast<double>(n_rows) * kMaxCategoricalRatio));
-            const std::size_t max_uniques = std::min(kMaxCategoricalUniques, ratio_limit);
+            // Try categorical compression, on the same terms as every other
+            // importer (see categorical_promotion_limit).
+            const std::size_t max_uniques = ibex::categorical_promotion_limit(n_rows);
             std::vector<ibex::Column<ibex::Categorical>::code_type> codes;
             codes.reserve(n_rows);
             std::vector<std::string> dict;

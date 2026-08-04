@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <csv.hpp>
 #include <filesystem>
 #include <fstream>
 #include <json.hpp>
@@ -305,4 +306,68 @@ TEST_CASE("Write JSON - CSV to JSON cross-format round-trip") {
     REQUIRE(scores != nullptr);
     REQUIRE((*scores)[0] == 95);
     REQUIRE((*scores)[1] == 87);
+}
+
+// Both importers must promote a string column to Categorical on the same
+// terms. They drifted once: read_csv used a 10% ratio while the JSON reader
+// used a 5% ratio capped at 4096 distinct values, so identical data arriving
+// over the two formats landed in different representations — and the two take
+// different join and group-by paths, so it showed up as an unexplained
+// performance difference rather than as a visible disagreement.
+TEST_CASE("Categorical promotion agrees between the CSV and JSON readers") {
+    constexpr int kRows = 200;
+
+    // 20 distinct over 200 rows is exactly the 10% budget: promoted. Under the
+    // JSON reader's old 5% rule this stayed a plain string column.
+    auto build = [](int distinct) {
+        std::string csv = "k,v\n";
+        std::string json = "[";
+        for (int r = 0; r < kRows; ++r) {
+            const std::string key = "key" + std::to_string(r % distinct);
+            csv += key + "," + std::to_string(r) + "\n";
+            if (r != 0) {
+                json += ",";
+            }
+            json += R"({"k":")" + key + R"(","v":)" + std::to_string(r) + "}";
+        }
+        json += "]";
+        return std::pair{csv, json};
+    };
+
+    auto is_categorical = [](const ibex::runtime::Table& t) {
+        return std::holds_alternative<ibex::Column<ibex::Categorical>>(*t.find("k"));
+    };
+
+    for (const int distinct : {20, 40}) {
+        CAPTURE(distinct);
+        const auto [csv, json] = build(distinct);
+        const auto csv_path = tmp("ibex_test_promo.csv");
+        const auto json_path = tmp("ibex_test_promo.json");
+        write_file(csv_path, csv.c_str());
+        write_file(json_path, json.c_str());
+
+        const auto from_csv = read_csv(csv_path.string());
+        const auto from_json = read_json(json_path.string());
+        REQUIRE(from_csv.rows() == kRows);
+        REQUIRE(from_json.rows() == kRows);
+
+        // 20 distinct is at the budget, 40 is over it — either way the two
+        // readers must agree, which is the property that actually broke.
+        CHECK(is_categorical(from_csv) == is_categorical(from_json));
+        CHECK(is_categorical(from_csv) == (distinct == 20));
+    }
+}
+
+TEST_CASE("Categorical promotion budget is relative, with no absolute cap") {
+    // The budget scales with the data. A fixed cap (the JSON reader carried
+    // 4096) stops promoting exactly where the representation is most
+    // valuable: a 100k-value dictionary over 8M rows beat plain strings ~7x on
+    // a join, because the probe resolves each code once instead of hashing a
+    // string per row.
+    CHECK(ibex::categorical_promotion_limit(200) == 20);
+    CHECK(ibex::categorical_promotion_limit(8'000'000) == 800'000);
+    CHECK(ibex::categorical_promotion_limit(50'000'000) == 5'000'000);
+    // Never zero, so a tiny frame can still promote a single repeated value.
+    CHECK(ibex::categorical_promotion_limit(0) == 1);
+    CHECK(ibex::categorical_promotion_limit(1) == 1);
 }

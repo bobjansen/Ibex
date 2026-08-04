@@ -3574,6 +3574,70 @@ class ChunkedInnerJoinOperator final : public Operator {
         return false;
     }
 
+    // Probe with the build-side chain head already resolved per row. Same two
+    // shapes as `probe_scalar`, but the caller supplies the head instead of a
+    // key to hash — see `resolve_categorical_heads`.
+    template <typename GetHead>
+    auto probe_resolved(std::size_t n, GetHead head_of, std::vector<std::size_t>& li,
+                        std::vector<std::size_t>& ri) -> bool {
+        if (build_unique_) {
+            li.resize(n);
+            ri.resize(n);
+            std::size_t* lp = li.data();
+            std::size_t* rp = ri.data();
+            std::size_t out = 0;
+            for (std::size_t l = 0; l < n; ++l) {
+                if (probe_is_null(l)) {
+                    continue;
+                }
+                const std::size_t head = head_of(l);
+                if (head == kNil) {
+                    continue;
+                }
+                lp[out] = l;
+                rp[out] = head;
+                ++out;
+            }
+            li.resize(out);
+            ri.resize(out);
+            return out == n;
+        }
+        for (std::size_t l = 0; l < n; ++l) {
+            if (probe_is_null(l)) {
+                continue;
+            }
+            std::size_t cur = head_of(l);
+            while (cur != kNil) {
+                li.push_back(l);
+                ri.push_back(cur);
+                cur = chain_next_[cur];
+            }
+        }
+        return false;
+    }
+
+    // A Categorical probe column is a dictionary plus one code per row, so
+    // every row sharing a code resolves to the same build chain. Resolve the
+    // DICTIONARY against the build index once — 252 entries for the symbol
+    // join — instead of rebuilding a string_view and hashing plus memcmp'ing
+    // it per row across 8M rows. That lookup was the single largest cost in
+    // the join profile (robin_hood string probe + __memcmp_avx2 + _Hash_bytes
+    // together ~57%).
+    //
+    // Rebuilt per chunk rather than cached on the operator: chunks of one scan
+    // usually share a dictionary, but nothing in the type guarantees it, and a
+    // stale memo would silently join against the wrong rows. |dict| lookups
+    // per chunk is noise next to |chunk rows|.
+    void resolve_categorical_heads(const std::vector<std::string>& dict) {
+        code_heads_.assign(dict.size(), kNil);
+        for (std::size_t c = 0; c < dict.size(); ++c) {
+            if (auto it = string_heads_.find(std::string_view{dict[c]});
+                it != string_heads_.end()) {
+                code_heads_[c] = it->second;
+            }
+        }
+    }
+
     auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
         const ColumnValue* key = left_chunk.find(keys_->front());
         if (key == nullptr) {
@@ -3633,12 +3697,28 @@ class ChunkedInnerJoinOperator final : public Operator {
         } else if (key_kind_ == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
-                li_identity = probe_scalar(
-                    string_heads_, n,
-                    [&](std::size_t i) {
-                        return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(i))]};
-                    },
-                    li, ri);
+                // Resolving the dictionary costs |dict| hash lookups and saves
+                // one per row, so it pays exactly when the dictionary is
+                // smaller than the chunk. A dictionary larger than the chunk
+                // (a narrow slice of a high-cardinality column) would hash more
+                // keys than there are rows to answer.
+                if (dict.size() < n) {
+                    resolve_categorical_heads(dict);
+                    li_identity = probe_resolved(
+                        n,
+                        [&](std::size_t i) {
+                            return code_heads_[static_cast<std::size_t>(c_cat->code_at(i))];
+                        },
+                        li, ri);
+                } else {
+                    li_identity = probe_scalar(
+                        string_heads_, n,
+                        [&](std::size_t i) {
+                            return std::string_view{
+                                dict[static_cast<std::size_t>(c_cat->code_at(i))]};
+                        },
+                        li, ri);
+                }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
                 li_identity = probe_scalar(
                     string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
@@ -3704,6 +3784,24 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         };
 
+        // Same shape with the chain head already resolved — see
+        // `resolve_categorical_heads`.
+        auto do_phase1_resolved = [&](auto&& head_at) {
+            for (std::size_t r = 0; r < n_right; ++r) {
+                if (probe_is_null(r)) {
+                    continue;
+                }
+                const std::size_t head = head_at(r);
+                if (head == kNil) {
+                    continue;
+                }
+                hits.push_back(Hit{r, head});
+                for (std::size_t cur = head; cur != kNil; cur = chain_next_[cur]) {
+                    ++total;
+                }
+            }
+        };
+
         if (key_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
             if (col == nullptr)
@@ -3736,11 +3834,19 @@ class ChunkedInnerJoinOperator final : public Operator {
         } else if (key_kind_ == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
                 const auto& dict = c_cat->dictionary();
-                do_phase1(
-                    [&](std::size_t r) {
-                        return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(r))]};
-                    },
-                    string_heads_);
+                if (dict.size() < n_right) {
+                    resolve_categorical_heads(dict);
+                    do_phase1_resolved([&](std::size_t r) {
+                        return code_heads_[static_cast<std::size_t>(c_cat->code_at(r))];
+                    });
+                } else {
+                    do_phase1(
+                        [&](std::size_t r) {
+                            return std::string_view{
+                                dict[static_cast<std::size_t>(c_cat->code_at(r))]};
+                        },
+                        string_heads_);
+                }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(rkey)) {
                 do_phase1([&](std::size_t r) { return (*c_str)[r]; }, string_heads_);
             } else {
@@ -3873,6 +3979,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Hash index on the build side (right in Stream, left in Swapped).
     bool build_unique_ = true;
     std::vector<std::size_t> chain_next_;
+    // Probe-chunk dictionary code -> build chain head (kNil = no match).
+    // Rebuilt per chunk by resolve_categorical_heads.
+    std::vector<std::size_t> code_heads_;
     robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads_;
     robin_hood::unordered_flat_map<double, std::size_t> f64_heads_;
     robin_hood::unordered_flat_map<bool, std::size_t> bool_heads_;

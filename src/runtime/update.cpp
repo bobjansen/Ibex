@@ -1659,8 +1659,15 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     return workers < 2 ? 0 : workers;
 }
 
-/// Row indices bucketed by group, in CSR form: `flat` holds every row index
-/// once, and group `g` owns `flat[offsets[g] .. offsets[g + 1])`, ascending.
+/// Row indices bucketed by group, in CSR form.
+///
+/// CSR — "compressed sparse row", the sparse-matrix layout the name is
+/// borrowed from — means two arrays instead of a container per group: one flat
+/// buffer holding every element once, and an offsets array marking where each
+/// group's run begins. Group `g` owns `flat[offsets[g] .. offsets[g + 1])`,
+/// ascending, so `offsets` has one more entry than there are groups and the
+/// last one is the total. Reading a group is a pointer and a length; there is
+/// no per-group allocation and nothing to chase.
 ///
 /// One flat buffer rather than a vector per group. The per-group vectors it
 /// replaces cost an allocation each, and — because a parallel scatter must
@@ -1679,6 +1686,170 @@ struct GroupedRows {
         return {flat.get() + offsets[g], offsets[g + 1] - offsets[g]};
     }
 };
+
+/// Assign every row a dense group id, writing them into `row_gid`, and return
+/// the group count. Ids are in order of first appearance, at any thread count.
+///
+/// The key is hashed and compared IN PLACE against the candidate group's
+/// stored key, so a `Key` is built once per GROUP rather than once per row.
+/// Boxing one per row — a heap vector of ScalarValue, built only to probe the
+/// index and then thrown away — measured ~60% of a grouped-window query's
+/// runtime, dwarfing the window it exists to organize.
+///
+/// Shared by both grouped update paths. It lived inside the windowed one until
+/// a profile showed the plain `by` update still boxing a key per row: 8M rows
+/// of `rank/lag/cumsum by symbol` spent ~17% of the whole window suite in
+/// KeyHash plus the string hashing under it, for a Categorical key whose codes
+/// are already dense.
+///
+/// `row_gid` is left uninitialised by callers: every path below assigns all
+/// `rows` entries before anything reads one, so value-initialising first would
+/// be an 8MB memset at 2M rows whose every byte is overwritten. A path that
+/// ever wrote only some rows would read garbage rather than a zero, so keep
+/// them total.
+[[nodiscard]] auto assign_group_ids(const std::vector<const ColumnValue*>& group_columns,
+                                    const std::vector<const ValidityBitmap*>& group_validity,
+                                    std::size_t rows, const ExecutionContext& exec,
+                                    std::span<std::uint32_t> row_gid) -> std::size_t {
+    // Bucket rows by group key — the row indices land in original
+    // (time-sorted) order within each group, which is the precondition the
+    // single-buffer rolling implementation relies on.
+    //
+    // The key is hashed and compared IN PLACE against the candidate group's
+    // stored key, so a `Key` is built once per GROUP rather than once per row.
+    // Boxing one per row — a heap vector of ScalarValue, built only to probe
+    // the index and then thrown away — measured ~60% of a grouped-window
+    // query's runtime, dwarfing the window it exists to organize. This is the
+    // same treatment group-by and distinct already had.
+    std::vector<KeyCol> key_cols;
+    key_cols.reserve(group_columns.size());
+    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+        auto col = make_key_col(*group_columns[ci], group_validity[ci]);
+        if (!col.has_value()) {
+            key_cols.clear();  // a type the in-place path cannot resolve
+            break;
+        }
+        key_cols.push_back(*col);
+    }
+
+    // Every grouping path below produces the same two things: a group id per
+    // row, and a group count. The CSR bucketing that turns them into per-group
+    // row lists is then shared.
+    //
+    // Left uninitialised: every path below assigns all `rows` entries before
+    // anything reads one, so value-initialising first would be an 8MB memset at
+    // 2M rows whose every byte is overwritten. A path that ever wrote only some
+    // rows would read garbage here rather than a zero, so keep them total.
+    std::size_t group_count = 0;
+    if (key_cols.size() == group_columns.size()) {
+        std::vector<Key> group_keys;
+
+        auto make_key_at = [&](std::size_t r) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], r);
+            }
+            return key;
+        };
+
+        const std::size_t bucket_workers = bucketing_worker_count(exec, rows);
+        if (bucket_workers < 2) {
+            KeyRowIndex index;
+            for (std::size_t r = 0; r < rows; ++r) {
+                row_gid[r] = index.find_or_insert(group_keys, key_cols, r, [&] {
+                    group_keys.push_back(make_key_at(r));
+                    return static_cast<std::uint32_t>(group_keys.size() - 1);
+                });
+            }
+        } else {
+            // Group each row range independently, then reconcile. Every worker
+            // numbers groups from zero in its own range, so the reconcile step
+            // maps local ids onto global ones — it is O(workers x groups),
+            // never O(rows), which is what makes the split pay.
+            //
+            // Global ids are handed out by walking workers in row order and
+            // each worker's groups in first-appearance order, so a group's id
+            // is still "order of first appearance in the table" exactly as the
+            // serial loop produces. Nothing downstream depends on that today,
+            // but a numbering that changed with the thread count would be a
+            // trap for whatever does next.
+            const std::size_t span = (rows + bucket_workers - 1) / bucket_workers;
+            struct Local {
+                std::vector<Key> keys;
+                std::vector<std::uint32_t> remap;  // local id -> global id
+            };
+            std::vector<Local> locals(bucket_workers);
+            {
+                auto batch =
+                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
+                        const std::size_t lo = w * span;
+                        const std::size_t hi = std::min(lo + span, rows);
+                        if (lo >= hi) {
+                            return;
+                        }
+                        KeyRowIndex index;
+                        auto& local = locals[w];
+                        for (std::size_t r = lo; r < hi; ++r) {
+                            row_gid[r] = index.find_or_insert(local.keys, key_cols, r, [&] {
+                                local.keys.push_back(make_key_at(r));
+                                return static_cast<std::uint32_t>(local.keys.size() - 1);
+                            });
+                        }
+                    });
+                batch.wait();
+            }
+
+            robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> global_index;
+            for (auto& local : locals) {
+                local.remap.resize(local.keys.size());
+                for (std::size_t l = 0; l < local.keys.size(); ++l) {
+                    auto [it, inserted] = global_index.emplace(
+                        local.keys[l], static_cast<std::uint32_t>(group_keys.size()));
+                    if (inserted) {
+                        group_keys.push_back(std::move(local.keys[l]));
+                    }
+                    local.remap[l] = it->second;
+                }
+            }
+
+            {
+                auto batch =
+                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
+                        const std::size_t lo = w * span;
+                        const std::size_t hi = std::min(lo + span, rows);
+                        const auto& remap = locals[w].remap;
+                        for (std::size_t r = lo; r < hi; ++r) {
+                            row_gid[r] = remap[row_gid[r]];
+                        }
+                    });
+                batch.wait();
+            }
+        }
+
+        group_count = group_keys.size();
+    } else {
+        // Fallback for a key column `make_key_col` cannot resolve. No built-in
+        // type reaches it today; it exists so an added column kind degrades to
+        // the slower grouping rather than to a wrong answer.
+        robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
+        for (std::size_t r = 0; r < rows; ++r) {
+            Key key;
+            key.values.reserve(group_columns.size());
+            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
+                push_key_value(key, *group_columns[ci], group_validity[ci], r);
+            }
+            auto [it, inserted] =
+                group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_count));
+            if (inserted) {
+                ++group_count;
+            }
+            row_gid[r] = it->second;
+        }
+    }
+
+    return group_count;
+}
 
 /// Bucket `row_gid` into CSR form.
 ///
@@ -1934,142 +2105,10 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.
-    //
-    // The key is hashed and compared IN PLACE against the candidate group's
-    // stored key, so a `Key` is built once per GROUP rather than once per row.
-    // Boxing one per row — a heap vector of ScalarValue, built only to probe
-    // the index and then thrown away — measured ~60% of a grouped-window
-    // query's runtime, dwarfing the window it exists to organize. This is the
-    // same treatment group-by and distinct already had.
-    std::vector<KeyCol> key_cols;
-    key_cols.reserve(group_columns.size());
-    for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-        auto col = make_key_col(*group_columns[ci], group_validity[ci]);
-        if (!col.has_value()) {
-            key_cols.clear();  // a type the in-place path cannot resolve
-            break;
-        }
-        key_cols.push_back(*col);
-    }
-
-    // Every grouping path below produces the same two things: a group id per
-    // row, and a group count. The CSR bucketing that turns them into per-group
-    // row lists is then shared.
-    //
-    // Left uninitialised: every path below assigns all `rows` entries before
-    // anything reads one, so value-initialising first would be an 8MB memset at
-    // 2M rows whose every byte is overwritten. A path that ever wrote only some
-    // rows would read garbage here rather than a zero, so keep them total.
     auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
     const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
-    std::size_t group_count = 0;
-    if (key_cols.size() == group_columns.size()) {
-        std::vector<Key> group_keys;
-
-        auto make_key_at = [&](std::size_t r) {
-            Key key;
-            key.values.reserve(group_columns.size());
-            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-                push_key_value(key, *group_columns[ci], group_validity[ci], r);
-            }
-            return key;
-        };
-
-        const std::size_t bucket_workers = bucketing_worker_count(exec, rows);
-        if (bucket_workers < 2) {
-            KeyRowIndex index;
-            for (std::size_t r = 0; r < rows; ++r) {
-                row_gid[r] = index.find_or_insert(group_keys, key_cols, r, [&] {
-                    group_keys.push_back(make_key_at(r));
-                    return static_cast<std::uint32_t>(group_keys.size() - 1);
-                });
-            }
-        } else {
-            // Group each row range independently, then reconcile. Every worker
-            // numbers groups from zero in its own range, so the reconcile step
-            // maps local ids onto global ones — it is O(workers x groups),
-            // never O(rows), which is what makes the split pay.
-            //
-            // Global ids are handed out by walking workers in row order and
-            // each worker's groups in first-appearance order, so a group's id
-            // is still "order of first appearance in the table" exactly as the
-            // serial loop produces. Nothing downstream depends on that today,
-            // but a numbering that changed with the thread count would be a
-            // trap for whatever does next.
-            const std::size_t span = (rows + bucket_workers - 1) / bucket_workers;
-            struct Local {
-                std::vector<Key> keys;
-                std::vector<std::uint32_t> remap;  // local id -> global id
-            };
-            std::vector<Local> locals(bucket_workers);
-            {
-                auto batch =
-                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
-                        const std::size_t lo = w * span;
-                        const std::size_t hi = std::min(lo + span, rows);
-                        if (lo >= hi) {
-                            return;
-                        }
-                        KeyRowIndex index;
-                        auto& local = locals[w];
-                        for (std::size_t r = lo; r < hi; ++r) {
-                            row_gid[r] = index.find_or_insert(local.keys, key_cols, r, [&] {
-                                local.keys.push_back(make_key_at(r));
-                                return static_cast<std::uint32_t>(local.keys.size() - 1);
-                            });
-                        }
-                    });
-                batch.wait();
-            }
-
-            robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> global_index;
-            for (auto& local : locals) {
-                local.remap.resize(local.keys.size());
-                for (std::size_t l = 0; l < local.keys.size(); ++l) {
-                    auto [it, inserted] = global_index.emplace(
-                        local.keys[l], static_cast<std::uint32_t>(group_keys.size()));
-                    if (inserted) {
-                        group_keys.push_back(std::move(local.keys[l]));
-                    }
-                    local.remap[l] = it->second;
-                }
-            }
-
-            {
-                auto batch =
-                    process_worker_pool().submit(bucket_workers, [&](std::size_t w) noexcept {
-                        const std::size_t lo = w * span;
-                        const std::size_t hi = std::min(lo + span, rows);
-                        const auto& remap = locals[w].remap;
-                        for (std::size_t r = lo; r < hi; ++r) {
-                            row_gid[r] = remap[row_gid[r]];
-                        }
-                    });
-                batch.wait();
-            }
-        }
-
-        group_count = group_keys.size();
-    } else {
-        // Fallback for a key column `make_key_col` cannot resolve. No built-in
-        // type reaches it today; it exists so an added column kind degrades to
-        // the slower grouping rather than to a wrong answer.
-        robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
-        for (std::size_t r = 0; r < rows; ++r) {
-            Key key;
-            key.values.reserve(group_columns.size());
-            for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-                push_key_value(key, *group_columns[ci], group_validity[ci], r);
-            }
-            auto [it, inserted] =
-                group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_count));
-            if (inserted) {
-                ++group_count;
-            }
-            row_gid[r] = it->second;
-        }
-    }
-
+    const std::size_t group_count =
+        assign_group_ids(group_columns, group_validity, rows, exec, row_gid);
     const GroupedRows group_rows = build_grouped_rows(row_gid, group_count, exec);
 
     // The unit of work is a span of row indices, not necessarily a whole group:
@@ -3123,24 +3162,19 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         return update_table(std::move(input), fields, scalars, externs, exec);
     }
 
-    robin_hood::unordered_flat_map<Key, std::uint32_t, KeyHash, KeyEq> group_index;
-    std::vector<std::vector<std::size_t>> group_rows;
-    for (std::size_t r = 0; r < rows; ++r) {
-        Key key;
-        key.values.reserve(group_columns.size());
-        for (std::size_t ci = 0; ci < group_columns.size(); ++ci) {
-            push_key_value(key, *group_columns[ci], group_validity[ci], r);
-        }
-        auto [it, inserted] =
-            group_index.emplace(std::move(key), static_cast<std::uint32_t>(group_rows.size()));
-        if (inserted) {
-            group_rows.emplace_back();
-        }
-        group_rows[it->second].push_back(r);
-    }
+    // Same grouping the windowed path uses: a key built once per group rather
+    // than boxed per row, and one flat CSR buffer rather than a vector per
+    // group. Both halves showed up in the profile of `rank/lag/cumsum by
+    // symbol` — the boxed key hashing a Categorical's dictionary string per
+    // row, and 252 vectors growing by push_back across 8M rows.
+    auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
+    const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
+    const std::size_t group_count =
+        assign_group_ids(group_columns, group_validity, rows, exec, row_gid);
+    const GroupedRows group_rows = build_grouped_rows(row_gid, group_count, exec);
 
     auto run_group =
-        [&](const std::vector<std::size_t>& row_idx) -> std::expected<Table, std::string> {
+        [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {
         Table sub;
         for (const auto& entry : input.columns) {
             ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
@@ -3249,7 +3283,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     }
 
     auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
-                           const std::vector<std::size_t>& indices) -> std::optional<std::string> {
+                           std::span<const std::size_t> indices) -> std::optional<std::string> {
         return std::visit(
             [&](auto& dcol) -> std::optional<std::string> {
                 using DT = std::decay_t<decltype(dcol)>;
@@ -3282,7 +3316,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     std::vector<std::optional<ValidityBitmap>> output_validity(written_field_names.size());
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
-                                const std::vector<std::size_t>& indices) {
+                                std::span<const std::size_t> indices) {
         const auto* sub_entry = sub_table.find_entry(written_field_names[f_idx]);
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
@@ -3312,7 +3346,7 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         scatter_validity(f, *first, group_rows[0]);
     }
 
-    for (std::size_t g = 1; g < group_rows.size(); ++g) {
+    for (std::size_t g = 1; g < group_count; ++g) {
         auto sub = run_group(group_rows[g]);
         if (!sub.has_value()) {
             return std::unexpected(sub.error());

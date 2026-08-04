@@ -1340,7 +1340,8 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
 ///
 /// This is the second half of `order_table` without the first: the sort exists
 /// to PRODUCE a permutation, and a caller that already holds one (a grouped
-/// operator's CSR bucketing, say) should not pay a radix pass to rediscover it.
+/// operator's CSR bucketing, say -- a flat row buffer plus per-group offsets)
+/// should not pay a radix pass to rediscover it.
 /// The movement itself is the expensive part and is threaded by column x row
 /// range; a hand-rolled serial gather in its place measured 0.85x, i.e. slower
 /// than not permuting at all.

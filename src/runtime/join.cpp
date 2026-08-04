@@ -36,7 +36,13 @@ constexpr std::size_t kNull = SIZE_MAX;
 constexpr std::uint32_t kNoGroup = UINT32_MAX;
 
 /// CSR view over the build side: matches(gid) is the ascending list of build
-/// rows whose key belongs to group gid. Replaces one heap-allocated
+/// rows whose key belongs to group gid.
+///
+/// CSR ("compressed sparse row", after the sparse-matrix layout) means one
+/// flat buffer holding every row index once, plus an offsets array marking
+/// where each group's run starts — so group `g` is `rows[offsets[g] ..
+/// offsets[g + 1])` and `offsets` carries one entry more than there are
+/// groups. Replaces one heap-allocated
 /// vector<size_t> per distinct key — on a PK build side (every TPC-H join)
 /// that was one single-element heap vector per build row — with two flat
 /// arrays.

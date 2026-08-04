@@ -1177,8 +1177,29 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         });
     }
 
+    // The tie scan below is the hot loop of the whole function: one call per
+    // row. `equal_rank_keys` answers it in full generality — an any_of for
+    // nulls, then an all_of of three-way compares each dispatching on the
+    // key's kind — none of which a single non-null numeric key needs. That is
+    // exactly the shape the radix path above requires, so when it ran the
+    // comparison is one array read per side.
+    const FlatCol* solo_key = radix_order ? &order_flat[0] : nullptr;
+    auto same_rank_keys = [&](std::size_t lhs, std::size_t rhs) -> bool {
+        if (solo_key != nullptr) {
+            return solo_key->kind == FlatKind::F64 ? solo_key->f64[lhs] == solo_key->f64[rhs]
+                                                   : solo_key->u64[lhs] == solo_key->u64[rhs];
+        }
+        return equal_rank_keys(lhs, rhs);
+    };
+
     std::vector<double> rank_values(rows, 0.0);
-    ValidityBitmap validity(rows, true);
+    // Only `na_option = keep` ever writes this, and only a null key makes it
+    // write. Allocating it regardless cost a bitmap per call for every rank
+    // that has no nulls to keep.
+    ValidityBitmap validity;
+    if (rank.na_option == ir::RankNaOption::Keep) {
+        validity.resize(rows, true);
+    }
 
     // When the radix fast path ran, group boundaries are already known from the
     // counting sort. Iterate the groups directly: walk radix_group_starts as a
@@ -1204,11 +1225,13 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         std::size_t i = pos;
         while (i < group_end) {
             std::size_t tie_end = i + 1;
-            while (tie_end < group_end && equal_rank_keys(idx[i], idx[tie_end])) {
+            while (tie_end < group_end && same_rank_keys(idx[i], idx[tie_end])) {
                 ++tie_end;
             }
 
-            const bool null_tie = is_null_row_for_keys(idx[i]);
+            // The radix path admits no nullable order key, so there is nothing
+            // to test when it ran.
+            const bool null_tie = solo_key == nullptr && is_null_row_for_keys(idx[i]);
             double assigned = 0.0;
             if (null_tie && rank.na_option == ir::RankNaOption::Keep) {
                 for (std::size_t k = i; k < tie_end; ++k) {
@@ -1262,9 +1285,10 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     const bool integral = !rank.pct && rank.method != ir::RankMethod::Average;
     if (integral) {
         Column<std::int64_t> out;
-        out.reserve(rows);
-        for (double value : rank_values) {
-            out.push_back(static_cast<std::int64_t>(value));
+        out.resize_for_overwrite(rows);
+        std::int64_t* dst = out.data();
+        for (std::size_t r = 0; r < rows; ++r) {
+            dst[r] = static_cast<std::int64_t>(rank_values[r]);
         }
         ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
         if (rank.na_option == ir::RankNaOption::Keep) {
@@ -1274,10 +1298,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     }
 
     Column<double> out;
-    out.reserve(rows);
-    for (const double value : rank_values) {
-        out.push_back(value);
-    }
+    out.resize_for_overwrite(rows);
+    std::memcpy(out.data(), rank_values.data(), rows * sizeof(double));
     ComputedColumn result{.column = std::move(out), .validity = std::nullopt};
     if (rank.na_option == ir::RankNaOption::Keep) {
         result.validity = std::move(validity);

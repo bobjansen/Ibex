@@ -1327,6 +1327,22 @@ void gather_selection_into(Table& output, const Table& input,
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
 [[nodiscard]] auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> SortIdx;
 
+/// Reusable buffers for `sort_key_index_slice`. One per worker: the slice sort
+/// is called once per group, and reallocating its ping-pong buffers per group
+/// would cost more than the sort of a small group.
+struct RadixSliceScratch {
+    std::vector<std::uint64_t> keys;
+    std::vector<std::size_t> idx;
+    std::vector<std::pair<std::uint64_t, std::size_t>> pairs;
+};
+
+/// Stably sort one contiguous run of `n` (key, row) pairs by key, ascending,
+/// in place. Equal keys keep their incoming order, so a caller that fills the
+/// run in ascending row order gets ties broken by row — the same total order a
+/// global stable sort produces.
+void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
+                          RadixSliceScratch& scratch);
+
 // Map an IEEE-754 double to a uint64 whose unsigned order matches ascending
 // double order, so radix_sort_u64_asc can sort doubles directly. For positive
 // values flip the sign bit; for negatives flip all bits. NaNs (sign bit clear)

@@ -5835,6 +5835,60 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
     }
 }
 
+// `grouped_update_table` now shares the windowed path's grouping, which means
+// it reaches the PARALLEL bucketing it never used before: worker-local group
+// numbering plus a reconcile pass. Two things have to hold and neither is
+// visible from one run — the answer must match the serial one, and it must be
+// the same answer at every thread count, because group ids are handed out by
+// first appearance and a numbering that shifted with the pool size would
+// silently permute which rows landed in which group.
+TEST_CASE("grouped update is deterministic across thread counts", "[update][parallel][groupby]") {
+    constexpr std::size_t kRows = 300'000;
+    // First-occurrence order (D,C,A,B) deliberately disagrees with dictionary
+    // order, so a grouping that numbered by dictionary or by worker order
+    // would produce a different assignment.
+    const std::vector<std::string> dict{"A", "B", "C", "D"};
+    const std::array<int, 4> first_order{3, 2, 0, 1};
+    Column<Categorical> sym(dict);
+    Column<double> v;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        const int code = r < 4 ? first_order[r] : first_order[(r * 7) % 4];
+        sym.push_code(static_cast<Column<Categorical>::code_type>(code));
+        v.push_back(1.0 + static_cast<double>(r % 1013));
+    }
+    runtime::Table t;
+    t.add_column("sym", std::move(sym));
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // cumsum is order-sensitive within a group, and mean is a whole-group
+    // aggregate broadcast back — between them they catch a group whose rows
+    // arrived out of order as well as one holding the wrong rows.
+    auto ir = require_ir("t[update { cs = cumsum(v), m = mean(v) }, by sym];");
+
+    const auto run = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == kRows);
+        const auto& cs = std::get<Column<double>>(*out->find("cs"));
+        const auto& m = std::get<Column<double>>(*out->find("m"));
+        return std::pair{std::vector<double>(cs.begin(), cs.end()),
+                         std::vector<double>(m.begin(), m.end())};
+    };
+
+    const auto serial = run(false, 0);
+    for (const std::size_t threads : {2U, 3U, 5U, 8U}) {
+        CAPTURE(threads);
+        CHECK(run(true, threads) == serial);
+    }
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

@@ -5889,6 +5889,63 @@ TEST_CASE("grouped update is deterministic across thread counts", "[update][para
     }
 }
 
+// A single Categorical group key skips hashing entirely: its codes are dense,
+// so each CODE resolves to a group id once. Two things that path must not get
+// wrong, neither of which the happy case exercises.
+TEST_CASE("grouped update: categorical group key edge cases", "[update][groupby][categorical]") {
+    SECTION("two codes for the same string are one group") {
+        // Nothing forbids a dictionary carrying a value twice — a remap can
+        // produce it — so resolving by code alone would split this in two.
+        const std::vector<std::string> dict{"A", "B", "A"};
+        Column<Categorical> k(dict);
+        for (const auto code : {0, 1, 2, 0, 2, 1}) {  // A B A A A B
+            k.push_code(static_cast<Column<Categorical>::code_type>(code));
+        }
+        runtime::Table t;
+        t.add_column("k", std::move(k));
+        t.add_column("v", Column<double>{1.0, 10.0, 2.0, 4.0, 8.0, 20.0});
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+
+        auto ir = require_ir("t[update { s = sum(v) }, by k];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& s = std::get<Column<double>>(*out->find("s"));
+        // All four "A" rows sum to 15, both "B" rows to 30.
+        CHECK(s[0] == 15.0);
+        CHECK(s[2] == 15.0);
+        CHECK(s[3] == 15.0);
+        CHECK(s[4] == 15.0);
+        CHECK(s[1] == 30.0);
+        CHECK(s[5] == 30.0);
+    }
+
+    SECTION("null keys form one group of their own") {
+        // The code under a null cell is still a real dictionary index, so it
+        // must not be resolved through the dictionary at all.
+        const std::vector<std::string> dict{"A", "B"};
+        Column<Categorical> k(dict);
+        for (const auto code : {0, 1, 0, 1, 0}) {
+            k.push_code(static_cast<Column<Categorical>::code_type>(code));
+        }
+        runtime::Table t;
+        t.add_column("k", std::move(k), runtime::ValidityBitmap{true, false, true, false, true});
+        t.add_column("v", Column<double>{1.0, 100.0, 2.0, 200.0, 4.0});
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+
+        auto ir = require_ir("t[update { s = sum(v) }, by k];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& s = std::get<Column<double>>(*out->find("s"));
+        CHECK(s[0] == 7.0);  // "A" rows 0,2,4
+        CHECK(s[2] == 7.0);
+        CHECK(s[4] == 7.0);
+        CHECK(s[1] == 300.0);  // both nulls together, NOT with "B"
+        CHECK(s[3] == 300.0);
+    }
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

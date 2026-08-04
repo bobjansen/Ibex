@@ -921,10 +921,21 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
         return fc;
     };
 
+    // Built on demand. The radix fast path below resolves a Categorical or
+    // numeric group key without ever comparing group values, and flattening a
+    // string group key eagerly costs a 128MB array of string_views at 8M rows
+    // — built only to be thrown away. Only the comparison-sort fallback and
+    // the single-string-key group id loop actually read it.
     std::vector<FlatCol> group_flat;
-    group_flat.reserve(group_entries.size());
-    for (const auto* entry : group_entries)
-        group_flat.push_back(flatten(entry, /*ascending=*/true));
+    auto ensure_group_flat = [&] {
+        if (!group_flat.empty() || group_entries.empty()) {
+            return;
+        }
+        group_flat.reserve(group_entries.size());
+        for (const auto* entry : group_entries) {
+            group_flat.push_back(flatten(entry, /*ascending=*/true));
+        }
+    };
 
     std::vector<FlatCol> order_flat;
     order_flat.reserve(resolved_keys.size());
@@ -1000,10 +1011,11 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // the comparison sort below for string order keys, multiple order keys, or
     // any nullable key (where na_option / null-group semantics need the general
     // path). This is the hot path for `rank(x) by g` over large frames.
-    const bool radix_order =
-        order_flat.size() == 1 && order_flat[0].kind != FlatKind::Str &&
-        order_flat[0].validity == nullptr &&
-        std::ranges::all_of(group_flat, [](const FlatCol& fc) { return fc.validity == nullptr; });
+    const bool radix_order = order_flat.size() == 1 && order_flat[0].kind != FlatKind::Str &&
+                             order_flat[0].validity == nullptr &&
+                             std::ranges::all_of(group_entries, [](const ColumnEntry* e) {
+                                 return !e->validity.has_value();
+                             });
     if (radix_order) {
         const FlatCol& ok = order_flat[0];
         std::vector<std::uint64_t> codes;
@@ -1035,7 +1047,45 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             // heap-allocates std::string for string columns on every row).
             std::vector<std::uint32_t> group_id(rows);
             std::uint32_t ngroups = 0;
-            if (group_flat.size() == 1 && group_flat[0].kind == FlatKind::Str) {
+            const Column<Categorical>* cat_group =
+                group_entries.size() == 1
+                    ? std::get_if<Column<Categorical>>(group_entries[0]->column.get())
+                    : nullptr;
+            if (cat_group != nullptr) {
+                // A Categorical group key carries a dense code per row, so
+                // resolve each CODE to a group id once instead of hashing the
+                // dictionary string it stands for on every row. `flatten` gives
+                // group keys string_views because order keys need lexicographic
+                // comparison; grouping only needs equality, which the codes
+                // already answer.
+                //
+                // Still resolved through the dictionary text rather than using
+                // the code directly: nothing forbids a dictionary from carrying
+                // the same string under two codes (a remap can produce one), and
+                // treating those as different groups would split a group in two.
+                constexpr std::uint32_t kUnset = std::numeric_limits<std::uint32_t>::max();
+                const auto& dict = cat_group->dictionary();
+                std::vector<std::uint32_t> code_gid(dict.size(), kUnset);
+                robin_hood::unordered_flat_map<std::string_view, std::uint32_t> by_text;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const auto code = static_cast<std::size_t>(cat_group->code_at(r));
+                    std::uint32_t gid = code_gid[code];
+                    if (gid == kUnset) {
+                        // Lazily, in row order, so group ids stay in order of
+                        // first appearance exactly as the hashing loop assigns
+                        // them.
+                        auto [it, inserted] =
+                            by_text.emplace(std::string_view{dict[code]}, ngroups);
+                        if (inserted) {
+                            ++ngroups;
+                        }
+                        gid = it->second;
+                        code_gid[code] = gid;
+                    }
+                    group_id[r] = gid;
+                }
+            } else if (ensure_group_flat();
+                       group_flat.size() == 1 && group_flat[0].kind == FlatKind::Str) {
                 // Single string group key: hash string_views directly.
                 robin_hood::unordered_flat_map<std::string_view, std::uint32_t> group_index;
                 const auto& sv = group_flat[0].str;
@@ -1080,6 +1130,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
             idx = std::move(grouped);
         }
     } else {
+        ensure_group_flat();
         idx.resize(rows);
         std::iota(idx.begin(), idx.end(), std::size_t{0});
         // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the

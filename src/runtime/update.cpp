@@ -1711,6 +1711,51 @@ struct GroupedRows {
                                     const std::vector<const ValidityBitmap*>& group_validity,
                                     std::size_t rows, const ExecutionContext& exec,
                                     std::span<std::uint32_t> row_gid) -> std::size_t {
+    // A single Categorical key needs no hashing at all. Its codes are already
+    // dense dictionary indices, so resolve each CODE to a group id once — 252
+    // of them for `by symbol` — and the per-row work becomes one array read.
+    // The in-place key path below still hashes the dictionary string a row at
+    // a time (`KeyCol::text` -> `hash_key_row` -> `_Hash_bytes`), which
+    // measured ~24% of the window suite once the boxing above it was gone.
+    //
+    // Resolved through the dictionary text rather than by using the code as
+    // the group id: nothing forbids two codes carrying the same string (a
+    // remap can produce that), and those must land in one group.
+    if (group_columns.size() == 1) {
+        if (const auto* cat = std::get_if<Column<Categorical>>(group_columns[0])) {
+            constexpr std::uint32_t kUnset = std::numeric_limits<std::uint32_t>::max();
+            const ValidityBitmap* validity = group_validity[0];
+            const auto& dict = cat->dictionary();
+            std::vector<std::uint32_t> code_gid(dict.size(), kUnset);
+            robin_hood::unordered_flat_map<std::string_view, std::uint32_t> by_text;
+            std::uint32_t next_gid = 0;
+            std::uint32_t null_gid = kUnset;  // nulls form one group of their own
+            for (std::size_t r = 0; r < rows; ++r) {
+                if (validity != nullptr && !(*validity)[r]) {
+                    if (null_gid == kUnset) {
+                        null_gid = next_gid++;
+                    }
+                    row_gid[r] = null_gid;
+                    continue;
+                }
+                const auto code = static_cast<std::size_t>(cat->code_at(r));
+                std::uint32_t gid = code_gid[code];
+                if (gid == kUnset) {
+                    // Filled lazily in row order, so ids stay in order of first
+                    // appearance — the same numbering the paths below produce.
+                    auto [it, inserted] = by_text.emplace(std::string_view{dict[code]}, next_gid);
+                    if (inserted) {
+                        ++next_gid;
+                    }
+                    gid = it->second;
+                    code_gid[code] = gid;
+                }
+                row_gid[r] = gid;
+            }
+            return next_gid;
+        }
+    }
+
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.

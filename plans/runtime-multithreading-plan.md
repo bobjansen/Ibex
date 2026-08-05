@@ -1414,6 +1414,92 @@ aggregates land.
 Slot fat is now essentially gone; the remaining per-group cost is the scatter
 itself, which the measurements say is smooth and sublinear in size.
 
+## Phase 4 status update (2026-08-04/05) — item 3 retired, item 4 part-done
+
+**The recoverable-time breakdown below is stale and must be re-derived before
+it is used to rank anything again.** It sized the remaining work as group-by/
+rank 3692ms (63%) and join 1880ms (32%), measured at 32M. Both thirds have
+since been largely removed, and — this is the point — **mostly by deleting work
+rather than distributing it**. Five of the six wins in this block were
+per-core. Note the asymmetry when re-deriving: the original breakdown was taken
+at 32M, the replacements were verified at 8M, and the threading share of a gap
+grows with row count (see the scale caveat below), so the two are not directly
+comparable.
+
+**The recurring finding: a Categorical key was being turned back into text and
+hashed once per row, in five separate places.** Its codes are already dense
+dictionary indices. Fixed in the join probe (`7e6576e`), the shared grouped-
+update grouping (`bdb5f30`), rank's group ids and its eager group-key flatten
+(`bdb5f30`), and rank's tie scan (`ff42bd9`). Each resolves through the
+dictionary TEXT, not the code itself: nothing forbids two codes carrying the
+same string (a remap produces exactly that), and treating those as different
+groups splits a group silently. **If a profile shows string hashing under a
+grouped or joined operator, check whether the key is Categorical before
+reaching for threads.**
+
+- **Item 3 (hash join) is retired, not deferred.** The probe hashed a
+  dictionary string per row; robin_hood's string probe plus `__memcmp_avx2`
+  plus `_Hash_bytes` were ~57% of the whole join profile. Resolving each code
+  once took inner_join_user 351.8 -> 50.2ms, join_update_group 365.6 -> 68.8,
+  inner_join_symbol 161.2 -> 56.7, join_filter_rank 564.6 -> 274.5. Three of
+  four went from losses to 1.4-6.2x WINS over threaded polars; the fourth is
+  parity. Threading the probe would have parallelised the hashing instead of
+  deleting it. The 1880ms line item is void.
+- **Item 4 (sort/top-k): the rank consumer is done, the rest is untouched.**
+  Two halves. `ff42bd9` gave the radix fast path its own tie scan (the general
+  `equal_rank_keys` runs an any_of for nulls then an all_of of kind-dispatching
+  compares, per row, for a shape that needs one array read per side).
+  `463fe8a` split the per-group sweep across workers — groups share no rows, so
+  there is no merge at all. `35f1d4f` then replaced "sort globally, then
+  counting-sort by group" with "bucket by group, then sort each run where it
+  sits". rank_by_symbol 584.7 -> 135.3 (0.23x), from 0.51x of polars to 1.73x.
+  `order_*_topk` and `sort_*` are not threaded and have not been looked at —
+  Ibex already wins top-k ~12x.
+- **Item 2 remains open for the string/int/generic hash paths and `distinct`.**
+  This is the plan's stated next item and is genuinely unaddressed.
+- **Item 5 is still gated on partition-boundary halo state.** It has a serial
+  half worth doing on its own: the cells behind polars PER CORE (st/st < 1, so
+  threading cannot explain them) are where_update_window 0.26, corr_price_vol
+  0.27, tf_lag1 0.29, where_update_expr 0.46, where_update_multi 0.56,
+  fill_null 0.57 — expression evaluation and the rolling/lag/fill kernels.
+  A per-core deficit is roughly scale-invariant, so those are worth fixing
+  whatever the data size. **That is NOT an argument that threading matters
+  less**; see the scale caveat below.
+
+**SCALE CAVEAT — everything above was measured at 1M and 8M rows, and the
+threading share of a gap GROWS with data.** In this suite's own numbers, at a
+fixed 8 cores, polars' multi-thread gain went 1.72x at 1M to 2.21x at 8M. The
+trend does not stop there, and Ibex is meant to run on far larger data than
+this box holds. So:
+
+- Read "the remaining gaps are per-core" as *true at 8M*, not as a claim about
+  the shape of the problem. At 50M or 500M the same table would likely put more
+  weight back on threading, because polars keeps converting cores into speed as
+  rows grow and an unthreaded operator does not.
+- A per-core win and a threading win are not substitutes. The Categorical work
+  removed per-row cost, which helps at every scale; it did not make the
+  operators parallel. Where both apply, both are still worth having.
+- **Before the next ranking, measure at a larger scale factor** — 32M/50M
+  locally, or the AWS harness on a big instance, which is also the only way to
+  see whether the O(workers x groups) merges start to dominate. Ranking Phase 4
+  by an 8M table is how the stale breakdown below got stale.
+
+**Two method notes from this block.**
+
+*Measure the restructure before writing it.* `35f1d4f`'s "bucket then sort per
+group" was prototyped in a standalone harness against the structure it
+replaces, same radix routine both sides. That harness found the shape where the
+new structure LOSES — 1M groups of 8 rows, where a radix pass builds a
+2048-counter histogram to order 8 elements, 849ms against the old 445ms — so
+the small-run fallback shipped with the change instead of arriving later as a
+bug report.
+
+*Doing strictly less work is not the same as being faster.* Removing rank's two
+remaining full-width passes (borrowing a Double column instead of copying it,
+folding the descending inversion into the code conversion) measured SLOWER,
+432 -> 524ms, while dropping peak RSS 686 -> 626MB. Reverted; see `ff42bd9`.
+Suspected aliasing, unverified.
+
 ## Phase 4 — Parallel Barriers
 
 Add one operator family at a time using worker-local state and deterministic

@@ -433,6 +433,10 @@ auto col_ref(std::string name) -> ir::Expr {
     return ir::Expr{ir::ColumnRef{.name = std::move(name)}};
 }
 
+auto lexical_ref(std::string name) -> ir::Expr {
+    return ir::Expr{ir::ColumnRef{.name = std::move(name), .lexical = true}};
+}
+
 auto int_lit(std::int64_t v) -> ir::Expr {
     return ir::Expr{ir::Literal{v}};
 }

@@ -32,6 +32,10 @@ using NodePtr = std::unique_ptr<Node>;
 struct ColumnRef {
     std::string name;
     NodeId source = {0};
+    /// Lowered from the scope-escape prefix `^name` (SPEC.md Section 6.2). A
+    /// lexical reference names a scalar binding and is never resolved against
+    /// the input's columns, even when a column of the same name exists.
+    bool lexical = false;
 };
 
 /// Expression node for computed fields.
@@ -179,6 +183,15 @@ struct Expr {
                  IsNullExpr>
         node;
 };
+
+/// The column `expr` names, or nullptr when it does not name one. A scope
+/// escape (`^name`, SPEC.md Section 6.2) never names a column, so it is
+/// reported as "not a column reference" to every caller that needs an actual
+/// input column (aggregate sources, window inputs, …).
+[[nodiscard]] inline auto as_column_ref(const Expr& expr) -> const ColumnRef* {
+    const auto* ref = std::get_if<ColumnRef>(&expr.node);
+    return (ref != nullptr && ref->lexical) ? nullptr : ref;
+}
 
 inline ExprPtr::ExprPtr() = default;
 

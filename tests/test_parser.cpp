@@ -506,6 +506,36 @@ TEST_CASE("Parse block expression with filter and select") {
     REQUIRE(select.fields[1].expr != nullptr);
 }
 
+TEST_CASE("Parse scope escape in a filter predicate") {
+    const char* source = "trades[filter price > ^price];";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+
+    const auto& expr_stmt = std::get<ExprStmt>(result->statements.front());
+    const auto& block = require_block(require_expr(expr_stmt.expr));
+    const auto& filter = std::get<FilterClause>(block.clauses[0]);
+    const auto& gt = require_binary(require_expr(filter.predicate), BinaryOp::Gt);
+
+    const auto& column = require_identifier(require_expr(gt.left));
+    REQUIRE(column.name == "price");
+    REQUIRE_FALSE(column.lexical);
+
+    const auto& lexical = require_identifier(require_expr(gt.right));
+    REQUIRE(lexical.name == "price");
+    REQUIRE(lexical.lexical);
+}
+
+TEST_CASE("Parse scope escape is restricted to bare identifiers") {
+    // SPEC.md Section 6.2: `^` is a prefix on an identifier, not a unary
+    // operator, so none of these are expressions.
+    REQUIRE_FALSE(parse("t[filter a > ^42];").has_value());
+    REQUIRE_FALSE(parse("t[filter a > ^(1 + 2)];").has_value());
+    REQUIRE_FALSE(parse("t[filter a > ^abs(x)];").has_value());
+    REQUIRE_FALSE(parse("t[filter a > ^\"x\"];").has_value());
+}
+
 TEST_CASE("Parse filter with lag call") {
     const char* source = "logs[filter num == lag(num, 1) && num == lag(num, 2)];";
 

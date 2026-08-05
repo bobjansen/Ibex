@@ -938,6 +938,50 @@ TEST_CASE("E2E: filter with scalar variable", "[e2e]") {
     CHECK(col_i64(out, "price") == std::vector<std::int64_t>{30, 40, 50});
 }
 
+// --- Scope escape (SPEC.md Section 6.2) --------------------------------------
+
+TEST_CASE("E2E: scope escape reads the shadowed lexical binding", "[e2e]") {
+    auto tables = make_trades();
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("price", static_cast<std::int64_t>(30));
+
+    // `price` is the column; `^price` is the scalar it shadows.
+    auto out = run("trades[filter price >= ^price];", tables, &scalars);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{30, 40, 50});
+
+    // A predicate over the lexical binding alone is constant: 30 >= 30.
+    auto all = run("trades[filter ^price >= 30];", tables, &scalars);
+    CHECK(all.rows() == 5);
+    auto none = run("trades[filter ^price > 30];", tables, &scalars);
+    CHECK(none.rows() == 0);
+}
+
+TEST_CASE("E2E: scope escape in computed fields and aggregates", "[e2e]") {
+    auto tables = make_trades();
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("price", static_cast<std::int64_t>(2));
+
+    auto out =
+        run("trades[select { price, scaled = price * ^price, lex = ^price }];", tables, &scalars);
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
+    CHECK(col_i64(out, "scaled") == std::vector<std::int64_t>{20, 40, 60, 80, 100});
+    CHECK(col_i64(out, "lex") == std::vector<std::int64_t>{2, 2, 2, 2, 2});
+
+    // Inside an aggregate the escaped name is a per-row constant, so summing it
+    // counts the group's rows.
+    auto agg = run("trades[by symbol, select { symbol, s = sum(^price) }];", tables, &scalars);
+    CHECK(col_i64(agg, "s") == std::vector<std::int64_t>{6, 4});
+}
+
+TEST_CASE("E2E: scope escape without a lexical binding is an error", "[e2e]") {
+    auto tables = make_trades();
+    // `price` is a column of the input, but `^price` never consults column
+    // scope, so with no scalar bound it fails to resolve.
+    const auto error = run_error("trades[filter ^price > 10];", tables);
+    CHECK(error.find("^price") != std::string::npos);
+}
+
 // --- Arithmetic in filter predicates -----------------------------------------
 
 TEST_CASE("E2E: filter with arithmetic expression", "[e2e]") {

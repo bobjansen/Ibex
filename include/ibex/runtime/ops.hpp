@@ -182,6 +182,9 @@ void stream_append_row(runtime::Table& dst, const runtime::Table& src, std::size
 //  Convenience factories for constructing IR expression trees in emitted code.
 
 [[nodiscard]] auto col_ref(std::string name) -> ir::Expr;
+/// `^name` — a scope escape (SPEC.md Section 6.2): the reference resolves in
+/// the scalar registry and never against a column of the same name.
+[[nodiscard]] auto lexical_ref(std::string name) -> ir::Expr;
 [[nodiscard]] auto int_lit(std::int64_t v) -> ir::Expr;
 [[nodiscard]] auto dbl_lit(double v) -> ir::Expr;
 [[nodiscard]] auto str_lit(std::string v) -> ir::Expr;

@@ -85,6 +85,10 @@ struct DurationLiteral {
 
 struct IdentifierExpr {
     std::string name;
+    /// Set by the scope-escape prefix `^name` (SPEC.md Section 6.2): the name
+    /// resolves in lexical scope only, never against the enclosing block's
+    /// column scope, even when a column of the same name shadows it.
+    bool lexical = false;
 };
 
 struct LiteralExpr {

@@ -397,7 +397,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
     if (call.args.empty()) {
         return std::unexpected(call.callee + ": expected column argument");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected(call.callee + ": argument must be a column name");
     }

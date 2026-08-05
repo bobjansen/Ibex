@@ -1,0 +1,3 @@
+let x = 15;
+let t = Table { x = [10, 20, 30], g = [1, 1, 2] };
+t[filter { x > ^x }][select { x, lex = ^x, sum = x + ^x }][order { x asc }];

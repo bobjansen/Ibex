@@ -52,6 +52,33 @@ TEST_CASE("Lower filter and select to IR") {
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("Lower carries the scope escape into the IR") {
+    // SPEC.md Section 6.2: `price` is the column, `^price` the lexical binding
+    // it shadows. Both lower to a ColumnRef, told apart by `lexical`.
+    auto program = require_parse("df[filter price > ^price];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* filter = as_node<ir::FilterNode>(result->get());
+    REQUIRE(filter != nullptr);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&filter->predicate().node);
+    REQUIRE(cmp != nullptr);
+
+    const auto* column = std::get_if<ibex::ir::ColumnRef>(&cmp->left->node);
+    REQUIRE(column != nullptr);
+    REQUIRE(column->name == "price");
+    REQUIRE_FALSE(column->lexical);
+
+    const auto* lexical = std::get_if<ibex::ir::ColumnRef>(&cmp->right->node);
+    REQUIRE(lexical != nullptr);
+    REQUIRE(lexical->name == "price");
+    REQUIRE(lexical->lexical);
+
+    // A lexical reference reads no column, so projection pushdown must not
+    // demand "price" on its account.
+    REQUIRE(ir::as_column_ref(*cmp->right) == nullptr);
+}
+
 TEST_CASE("Parallel-island eligibility follows lowered canonical IR", "[runtime][pipeline]") {
     auto program = require_parse("df[filter price > 10, select { price }];");
     auto result = parser::lower(program);

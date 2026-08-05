@@ -3190,7 +3190,7 @@ class Lowerer {
                     return it->second;
                 }
             }
-            return ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
+            return ir::Expr{.node = ir::ColumnRef{.name = ident->name, .lexical = ident->lexical}};
         }
         if (const auto* literal = std::get_if<LiteralExpr>(&expr.node)) {
             if (const auto* int_value = std::get_if<std::int64_t>(&literal->value)) {
@@ -3585,7 +3585,10 @@ class Lowerer {
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {
             if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
-                return ident;
+                // `^name` never names a column, so it takes the general path
+                // below: the scalar is broadcast into a temporary the
+                // aggregate then reads.
+                return ident->lexical ? nullptr : ident;
             }
             if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
                 return extract_column_ident(*group->expr);
@@ -3621,6 +3624,11 @@ class Lowerer {
         std::function<std::expected<ir::Expr, LowerError>(const Expr&)> lower_agg_expr;
         lower_agg_expr = [&](const Expr& expr) -> std::expected<ir::Expr, LowerError> {
             if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
+                // `^name` is a lexical scalar, not a column, so it is constant
+                // within a group and needs no aggregate.
+                if (ident->lexical) {
+                    return ir::Expr{.node = ir::ColumnRef{.name = ident->name, .lexical = true}};
+                }
                 if (group_keys.contains(ident->name)) {
                     return ir::Expr{.node = ir::ColumnRef{.name = ident->name}};
                 }
@@ -4149,7 +4157,10 @@ class Lowerer {
         std::function<const IdentifierExpr*(const Expr&)> extract_column_ident;
         extract_column_ident = [&](const Expr& expr) -> const IdentifierExpr* {
             if (const auto* ident = std::get_if<IdentifierExpr>(&expr.node)) {
-                return ident;
+                // `^name` never names a column, so it takes the general path
+                // below: the scalar is broadcast into a temporary the
+                // aggregate then reads.
+                return ident->lexical ? nullptr : ident;
             }
             if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
                 return extract_column_ident(*group->expr);

@@ -2000,7 +2000,7 @@ auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)
         return std::unexpected("aggregate functions take one argument");
     }
 
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (col_ref == nullptr) {
         return std::unexpected(call.callee +
                                "(): grouped update aggregate argument must be a column name");
@@ -2138,7 +2138,7 @@ auto eval_aggregate_call_scalar(const ir::CallExpr& node, const Table& input,
     // directly; otherwise materialise the computed arg as a temp
     // column appended to a shallow copy of the input (columns are
     // shared_ptr-backed, so the copy is cheap).
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&node.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*node.args[0]);
     Table working;
     const Table* effective_input = &input;
     std::string agg_col_name;
@@ -2214,6 +2214,10 @@ auto eval_aggregate_scalar(const ir::Expr& expr, const Table& input, const Scala
                         return expr_from_scalar(it->second);
                     }
                 }
+                if (node.lexical) {
+                    return std::unexpected("update + by: '^" + node.name +
+                                           "' does not resolve to a lexical binding");
+                }
                 return std::unexpected("update + by: non-aggregate column '" + node.name +
                                        "' in aggregate-broadcast field expression");
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
@@ -2258,7 +2262,7 @@ auto expr_has_bare_column(const ir::Expr& expr) -> bool {
         [](const auto& node) -> bool {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
-                return true;
+                return !node.lexical;  // `^name` is a scalar, not a column read
             } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
                 if (parse_aggregate_func(node.callee).has_value()) {
                     return false;  // columns inside an aggregate are not bare

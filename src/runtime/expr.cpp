@@ -218,7 +218,7 @@ auto resolve_zone_call(std::string_view fn, const ir::CallExpr& call, const Tabl
         return std::unexpected(prefix + ": unknown time zone '" + *zone_text + "'");
     }
 
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (col_ref == nullptr) {
         return std::unexpected(prefix + ": first argument must be a column name");
     }
@@ -362,7 +362,8 @@ auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegi
     if (ref == nullptr) {
         return std::unexpected("like: arguments must be columns, string literals, or scalars");
     }
-    if (const auto* entry = input.find_entry(ref->name); entry != nullptr) {
+    if (const auto* entry = ref->lexical ? nullptr : input.find_entry(ref->name);
+        entry != nullptr) {
         LikeArg arg;
         arg.validity = entry->validity.has_value() ? &*entry->validity : nullptr;
         if (const auto* dense = std::get_if<Column<std::string>>(entry->column.get())) {
@@ -383,6 +384,9 @@ auto resolve_like_arg(const ir::Expr& expr, const Table& input, const ScalarRegi
             }
             return LikeArg{.scalar = *text};
         }
+    }
+    if (ref->lexical) {
+        return std::unexpected("like: '^" + ref->name + "' does not resolve to a lexical binding");
     }
     return std::unexpected("like: unknown column '" + ref->name + "'");
 }
@@ -488,7 +492,7 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
     const ir::Expr& arg = *call.args[0];
     const ColumnEntry* entry = nullptr;
     if (const auto* ref = std::get_if<ir::ColumnRef>(&arg.node)) {
-        entry = input.find_entry(ref->name);
+        entry = ref->lexical ? nullptr : input.find_entry(ref->name);
         if (entry == nullptr) {
             // A lexical scalar: convert once through the per-row eval (the
             // semantic reference), then broadcast.
@@ -1554,7 +1558,9 @@ auto apply_round(double v, std::string_view mode) -> std::int64_t {
 auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars,
                      const ExternRegistry* externs) -> std::expected<ExprType, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
-        const auto* source = input.find(col->name);
+        // `^name` resolves in lexical scope only, so the input's columns are
+        // skipped even when one shares the name.
+        const auto* source = col->lexical ? nullptr : input.find(col->name);
         if (source == nullptr) {
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col->name); it != scalars->end()) {
@@ -1575,6 +1581,10 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     }
                     return ExprType::String;
                 }
+            }
+            if (col->lexical) {
+                return std::unexpected("'^" + col->name +
+                                       "' does not resolve to a lexical binding");
             }
             return std::unexpected("unknown column in expression: " + col->name +
                                    " (available: " + format_columns(input) + ")");
@@ -1704,12 +1714,16 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
                const ScalarRegistry* scalars, const ExternRegistry* externs)
     -> std::expected<ExprValue, std::string> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
-        const auto* entry = input.find_entry(col->name);
+        const auto* entry = col->lexical ? nullptr : input.find_entry(col->name);
         if (entry == nullptr) {
             if (scalars != nullptr) {
                 if (auto it = scalars->find(col->name); it != scalars->end()) {
                     return expr_from_scalar(it->second);
                 }
+            }
+            if (col->lexical) {
+                return std::unexpected("'^" + col->name +
+                                       "' does not resolve to a lexical binding");
             }
             return std::unexpected("unknown column in expression: " + col->name +
                                    " (available: " + format_columns(input) + ")");
@@ -2171,7 +2185,7 @@ auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_
     if (call.args.size() != 2) {
         return std::unexpected(fname + ": expected 2 arguments");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected(fname + ": first argument must be a column name");
     }
@@ -2284,7 +2298,7 @@ auto eval_cumsum_cumprod_column(const ir::CallExpr& call, const Table& input, bo
     if (call.args.size() != 1) {
         return std::unexpected(fname + ": expected 1 argument");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected(fname + ": argument must be a column name");
     }
@@ -2344,7 +2358,7 @@ auto eval_fill_null(const ir::CallExpr& call, const Table& input)
     if (call.args.size() != 2) {
         return std::unexpected("fill_null: expected 2 arguments (col, value)");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected("fill_null: first argument must be a column name");
     }
@@ -2420,7 +2434,7 @@ auto eval_fill_forward(const ir::CallExpr& call, const Table& input)
     if (call.args.size() != 1) {
         return std::unexpected("fill_forward: expected 1 argument (col)");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected("fill_forward: argument must be a column name");
     }
@@ -2477,7 +2491,7 @@ auto eval_fill_backward(const ir::CallExpr& call, const Table& input)
     if (call.args.size() != 1) {
         return std::unexpected("fill_backward: expected 1 argument (col)");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected("fill_backward: argument must be a column name");
     }
@@ -2541,7 +2555,7 @@ auto eval_float_clean(const ir::CallExpr& call, const Table& input, FloatCleanMo
     if (call.args.size() != 1) {
         return std::unexpected(std::string(fname) + ": expected 1 argument (col)");
     }
-    const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node);
+    const auto* col_ref = ir::as_column_ref(*call.args[0]);
     if (!col_ref) {
         return std::unexpected(std::string(fname) + ": argument must be a column name");
     }
@@ -3024,7 +3038,7 @@ auto apply_rep_func(const ir::CallExpr& call, const Table& input, std::size_t ro
     }
 
     // ── column reference x ───────────────────────────────────────────────────
-    if (const auto* col_ref = std::get_if<ir::ColumnRef>(&call.args[0]->node)) {
+    if (const auto* col_ref = ir::as_column_ref(*call.args[0])) {
         const auto* src_col = input.find(col_ref->name);
         if (src_col == nullptr) {
             return std::unexpected("rep: unknown column '" + col_ref->name + "'");

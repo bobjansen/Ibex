@@ -275,6 +275,9 @@ auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange ro
             [&](const auto& node) {
                 using T = std::decay_t<decltype(node)>;
                 if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                    if (node.lexical) {
+                        return;  // `^name`: a scalar binding, never null
+                    }
                     auto it = table.index.find(node.name);
                     if (it != table.index.end()) {
                         const auto& entry = table.columns[it->second];
@@ -1105,7 +1108,8 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table, std:
     const ir::ColumnRef* col_node = nullptr;
     const ir::Literal* lit_node = nullptr;
     ir::CompareOp op = cmp->op;
-    if (const auto* lcol = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
+    if (const auto* lcol = std::get_if<ir::ColumnRef>(&cmp->left->node);
+        lcol != nullptr && !lcol->lexical) {
         if (const auto* rlit = std::get_if<ir::Literal>(&cmp->right->node)) {
             col_node = lcol;
             lit_node = rlit;
@@ -1113,7 +1117,8 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table, std:
     }
     if (col_node == nullptr) {
         if (const auto* llit = std::get_if<ir::Literal>(&cmp->left->node)) {
-            if (const auto* rcol = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
+            if (const auto* rcol = std::get_if<ir::ColumnRef>(&cmp->right->node);
+                rcol != nullptr && !rcol->lexical) {
                 col_node = rcol;
                 lit_node = llit;
                 op = flip_cmp(op);
@@ -1198,7 +1203,7 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table, 
     }
 
     const auto* col_node = std::get_if<ir::ColumnRef>(&expr.node);
-    if (col_node == nullptr) {
+    if (col_node == nullptr || col_node->lexical) {
         return std::nullopt;
     }
     auto it = table.index.find(col_node->name);
@@ -1652,7 +1657,9 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
         [&](const auto& node) -> std::expected<ColResult, std::string> {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
-                if (const auto* col = table.find(node.name)) {
+                // `^name` skips column scope: it resolves in the scalar
+                // registry below even when a column shares its name.
+                if (const auto* col = node.lexical ? nullptr : table.find(node.name)) {
                     // The only borrowed leaf: the whole table column is handed
                     // back with the range's start as its offset, so no slice is
                     // materialized. Everything computed from it is dense.
@@ -1680,6 +1687,10 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                             it->second);
                         return ColResult{std::move(cv)};
                     }
+                }
+                if (node.lexical) {
+                    return std::unexpected("filter: '^" + node.name +
+                                           "' does not resolve to a lexical binding");
                 }
                 return std::unexpected("filter: unknown column '" + node.name + "'");
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
@@ -1927,13 +1938,15 @@ auto split_col_cmp_lit(const ir::Expr& expr)
     if (cmp == nullptr) {
         return std::nullopt;
     }
-    if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node)) {
+    if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->left->node);
+        col != nullptr && !col->lexical) {
         if (const auto* lit = std::get_if<ir::Literal>(&cmp->right->node)) {
             return std::tuple{col, cmp->op, lit};
         }
     }
     if (const auto* lit = std::get_if<ir::Literal>(&cmp->left->node)) {
-        if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->right->node)) {
+        if (const auto* col = std::get_if<ir::ColumnRef>(&cmp->right->node);
+            col != nullptr && !col->lexical) {
             return std::tuple{col, flip_cmp(cmp->op), lit};
         }
     }
@@ -2159,7 +2172,8 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 const bool want_null = !node.negated;
                 if (const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node)) {
                     const ValidityBitmap* bm = nullptr;
-                    auto it = table.index.find(col_node->name);
+                    auto it =
+                        col_node->lexical ? table.index.end() : table.index.find(col_node->name);
                     if (it != table.index.end()) {
                         const auto& entry = table.columns[it->second];
                         if (entry.validity.has_value()) {

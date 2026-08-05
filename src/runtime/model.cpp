@@ -757,7 +757,7 @@ auto fit_model(const Table& input, const ir::ModelFormula& formula, const std::s
         std::string weights_col;
         for (const auto& param : params) {
             if (param.name == "weights") {
-                if (const auto* ref = std::get_if<ir::ColumnRef>(&param.value.node)) {
+                if (const auto* ref = ir::as_column_ref(param.value)) {
                     weights_col = ref->name;
                 }
             }

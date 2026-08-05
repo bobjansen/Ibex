@@ -1140,6 +1140,9 @@ auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
         [](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                if (node.lexical) {
+                    return "ibex::ops::lexical_ref(\"" + escape_string(node.name) + "\")";
+                }
                 return "ibex::ops::filter_col(\"" + escape_string(node.name) + "\")";
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 return std::visit(
@@ -1208,6 +1211,9 @@ auto Emitter::emit_expr(const ir::Expr& expr) -> std::string {
         [&](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                if (node.lexical) {
+                    return "ibex::ops::lexical_ref(\"" + escape_string(node.name) + "\")";
+                }
                 return "ibex::ops::col_ref(\"" + escape_string(node.name) + "\")";
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 return std::visit(

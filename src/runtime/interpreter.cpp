@@ -1472,7 +1472,22 @@ auto interpret(const ir::Node& node, const TableRegistry& registry, const Scalar
 auto interpret(const ir::Node& node, const TableRegistry& registry, const ScalarRegistry* scalars,
                const ExternRegistry* externs, ModelResult* model_out)
     -> std::expected<Table, std::string> {
-    const ExecutionContext exec{};
+    // The environment is applied here, not left to each caller. Before this,
+    // `ExecutionContext{}` was the only spelling available to a caller with no
+    // opinion, and it meant "library defaults, ignore IBEX_*" — so every tool
+    // that used this overload silently opted out of the knobs. `ibex_bench`
+    // did, which made the suite's `-st` pass a second identical run of the
+    // parallel binary and every ibex-vs-ibex-st ratio read exactly 1.00.
+    // Nothing about that was visible in the output: `parallel` defaults to
+    // true, so the work WAS parallel, and only the off switch and the stats
+    // counter were dead.
+    //
+    // A caller that wants the environment ignored has a spelling for it —
+    // build an ExecutionContext and pass it to the overload above. There was
+    // no spelling for the opposite, which is the wrong way round for variables
+    // named IBEX_*.
+    ExecutionContext exec;
+    configure_parallel_from_env(exec);
     return interpret(node, registry, scalars, externs, model_out, exec);
 }
 

@@ -825,21 +825,6 @@ auto compare_scalar_for_order(const ScalarValue& lhs, const ScalarValue& rhs) ->
         lhs, rhs);
 }
 
-/// Workers for rank's per-group sweep, or 0 for serial. Sized on ROW COUNT, so
-/// the split — and therefore nothing about the answer — depends on the pool.
-/// Groups are the unit of work, so more workers than groups is pointless; the
-/// caller checks that separately.
-[[nodiscard]] auto rank_sweep_worker_count(const ExecutionContext& exec, std::size_t rows)
-    -> std::size_t {
-    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
-        return 0;
-    }
-    const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
-    const std::size_t workers = std::min(budget, pool_size);
-    return workers < 2 ? 0 : workers;
-}
-
 auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                           const std::vector<ir::ColumnRef>& group_by, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
@@ -1166,7 +1151,8 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                 }
             }
 
-            const std::size_t sort_workers = ngroups >= 2 ? rank_sweep_worker_count(exec, rows) : 0;
+            const std::size_t sort_workers =
+                ngroups >= 2 ? group_barrier_worker_count(exec, rows) : 0;
             if (sort_workers >= 2) {
                 std::atomic<std::size_t> next{0};
                 auto batch = process_worker_pool().submit(sort_workers, [&](std::size_t) noexcept {
@@ -1343,7 +1329,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // from its own rows and scattered to their own row positions.
     const std::size_t group_count = radix_group_starts.empty() ? 0 : radix_group_starts.size() - 1;
     const std::size_t sweep_workers =
-        (solo_key != nullptr && group_count >= 2) ? rank_sweep_worker_count(exec, rows) : 0;
+        (solo_key != nullptr && group_count >= 2) ? group_barrier_worker_count(exec, rows) : 0;
     if (sweep_workers >= 2) {
         std::atomic<std::size_t> cursor{0};
         auto batch = process_worker_pool().submit(sweep_workers, [&](std::size_t) noexcept {

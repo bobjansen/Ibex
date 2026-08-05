@@ -6,8 +6,10 @@
 #include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -83,7 +85,7 @@ auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
 
 // NOLINTNEXTLINE(readability-function-size)
 auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
-                     const std::vector<ir::AggSpec>& aggregations)
+                     const std::vector<ir::AggSpec>& aggregations, const ExecutionContext* exec)
     -> std::expected<Table, std::string> {
     std::vector<const ColumnValue*> group_columns;
     group_columns.reserve(group_by.size());
@@ -1068,7 +1070,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
                 const ir::AggFunc f = plan[ai].func;
                 const double p = plan[ai].param;
-                for (std::size_t g = 0; g < n_groups; ++g) {
+                // Reduce group g. Groups own disjoint slices of `buf` and
+                // distinct `states[g].slots[ai]`, so this is independent work
+                // with nothing to merge — `nth_element` alone was 22% of
+                // `median(price) by symbol` and ran on one core.
+                auto reduce_group = [&](std::size_t g) {
                     double* lo = buf.data() + offsets[g];
                     double* hi = buf.data() + offsets[g + 1];
                     const auto n = static_cast<std::size_t>(hi - lo);
@@ -1141,6 +1147,28 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                     }
                     slot.double_value = result;
+                };
+
+                const std::size_t reduce_workers = (exec != nullptr && n_groups >= 2)
+                                                       ? group_barrier_worker_count(*exec, rows)
+                                                       : 0;
+                if (reduce_workers >= 2) {
+                    std::atomic<std::size_t> next{0};
+                    auto batch =
+                        process_worker_pool().submit(reduce_workers, [&](std::size_t) noexcept {
+                            while (true) {
+                                const std::size_t g = next.fetch_add(1, std::memory_order_relaxed);
+                                if (g >= n_groups) {
+                                    return;
+                                }
+                                reduce_group(g);
+                            }
+                        });
+                    batch.wait();
+                } else {
+                    for (std::size_t g = 0; g < n_groups; ++g) {
+                        reduce_group(g);
+                    }
                 }
             }
         }

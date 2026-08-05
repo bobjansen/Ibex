@@ -1327,6 +1327,9 @@ void gather_selection_into(Table& output, const Table& input,
 using SortIdx = std::variant<std::vector<std::uint32_t>, std::vector<std::uint64_t>>;
 [[nodiscard]] auto radix_sort_u64_asc(std::vector<std::uint64_t> keys, std::size_t rows) -> SortIdx;
 
+[[nodiscard]] auto group_barrier_worker_count(const ExecutionContext& exec, std::size_t rows)
+    -> std::size_t;
+
 /// Reusable buffers for `sort_key_index_slice`. One per worker: the slice sort
 /// is called once per group, and reallocating its ping-pong buffers per group
 /// would cost more than the sort of a small group.
@@ -1381,8 +1384,13 @@ inline auto double_to_sortable_u64(double value) -> std::uint64_t {
     -> std::expected<Table, std::string>;
 
 // aggregate.cpp — grouped/global aggregation.
+/// `exec` is optional and only the GROUPED path can use it: the collect
+/// aggregates (median/quantile/skew/kurtosis) reduce disjoint per-group slices,
+/// which splits across workers. Callers that aggregate the whole table into one
+/// group have nothing to split and pass nothing.
 [[nodiscard]] auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group_by,
-                                   const std::vector<ir::AggSpec>& aggregations)
+                                   const std::vector<ir::AggSpec>& aggregations,
+                                   const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto parse_aggregate_func(std::string_view name) -> std::optional<ir::AggFunc>;
 [[nodiscard]] auto aggregate_call_to_spec(const ir::CallExpr& call, std::string alias)

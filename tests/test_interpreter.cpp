@@ -6041,6 +6041,61 @@ TEST_CASE("rank: fast and general paths agree", "[rank][interpreter]") {
     }
 }
 
+// The collect aggregates (median/quantile/skew/kurtosis) reduce one disjoint
+// slice of a flat buffer per group, and that loop now splits across workers.
+// The slices and the slots they write are disjoint, so the answer must not
+// move with the pool size — and `nth_element` REORDERS its slice, so a bug
+// that let two workers share one would corrupt values rather than just race a
+// counter.
+TEST_CASE("grouped collect aggregates are deterministic across thread counts",
+          "[agg][parallel][groupby]") {
+    constexpr std::size_t kRows = 120'000;
+    const std::vector<std::string> dict{"D", "C", "A", "B"};
+    Column<Categorical> sym(dict);
+    Column<double> v;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        sym.push_code(static_cast<Column<Categorical>::code_type>((r * 7) % 4));
+        // Wide spread with repeats, so medians land on real ties and the
+        // even/odd midpoint branches both get exercised across groups.
+        v.push_back(static_cast<double>((r * 8191) % 10007) * 0.5);
+    }
+    runtime::Table t;
+    t.add_column("sym", std::move(sym));
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    auto ir = require_ir(
+        "t[select { med = median(v), p90 = quantile(v, 0.9), "
+        "sk = skew(v), ku = kurtosis(v) }, by sym];");
+
+    const auto at = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        REQUIRE(out->rows() == 4);
+        std::vector<double> got;
+        for (const char* name : {"med", "p90", "sk", "ku"}) {
+            const auto& col = std::get<Column<double>>(*out->find(name));
+            for (std::size_t r = 0; r < col.size(); ++r) {
+                got.push_back(col[r]);
+            }
+        }
+        return got;
+    };
+
+    const auto serial = at(false, 0);
+    CHECK(serial.size() == 16);
+    for (const std::size_t threads : {2U, 3U, 5U, 8U}) {
+        CAPTURE(threads);
+        CHECK(at(true, threads) == serial);
+    }
+}
+
 // A global aggregate (`select { … }` with no `by`) splits its row range across
 // workers and merges the partials. Two properties have to hold, and neither is
 // visible from a single run:

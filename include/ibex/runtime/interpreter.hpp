@@ -638,6 +638,10 @@ using ModelRegistry = robin_hood::unordered_map<std::string, ModelResult>;
 /// nested query execution.
 class ExternRegistry;
 
+/// Interpret `node` under an ExecutionContext built from the environment
+/// (`IBEX_PARALLEL`, `IBEX_MORSEL_ROWS`, `IBEX_PARALLEL_STATS`) on top of the
+/// defaults. Use the overload below to supply a context directly — that is
+/// also how a caller opts OUT of the environment.
 [[nodiscard]] auto interpret(const ir::Node& node, const TableRegistry& registry,
                              const ScalarRegistry* scalars = nullptr,
                              const ExternRegistry* externs = nullptr,

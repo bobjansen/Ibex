@@ -1466,11 +1466,20 @@ reaching for threads.**
   whatever the data size. **That is NOT an argument that threading matters
   less**; see the scale caveat below.
 
-**SCALE CAVEAT — everything above was measured at 1M and 8M rows, and the
-threading share of a gap GROWS with data.** In this suite's own numbers, at a
-fixed 8 cores, polars' multi-thread gain went 1.72x at 1M to 2.21x at 8M. The
-trend does not stop there, and Ibex is meant to run on far larger data than
-this box holds. So:
+**SCALE CAVEAT — the threading share of a gap GROWS with data, and Ibex's
+threading gain does not.** Measured on a fixed 8 cores, 3 interleaved rounds
+per scale (2026-08-05):
+
+| rows | ibex vs polars | ibex-st vs polars-st | ibex MT | polars MT |
+|-----:|---------------:|---------------------:|--------:|----------:|
+|   1M |          2.50x |                2.99x |   1.41x |     1.69x |
+|   8M |          1.92x |                2.93x |   1.43x |     2.18x |
+|  16M |          1.85x |                2.91x |   1.45x |     2.27x |
+
+The per-core column is flat to three digits across a 16x range: Ibex's engine
+is ~2.9x polars per core wherever you look. The headline column is not, and the
+only moving part is polars converting cores into speed as rows grow while Ibex
+does not. So:
 
 - Read "the remaining gaps are per-core" as *true at 8M*, not as a claim about
   the shape of the problem. At 50M or 500M the same table would likely put more

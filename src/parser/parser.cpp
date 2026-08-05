@@ -849,6 +849,22 @@ class Parser {
         return keys;
     }
     auto parse_primary() -> ExprPtr {
+        // `^name` — the scope-escape primary (SPEC.md Section 6.2). It is a
+        // prefix on a bare identifier, not a unary operator: `^42`, `^(expr)`
+        // and `^f(x)` are parse errors.
+        if (match(TokenKind::Caret)) {
+            if (!check(TokenKind::Identifier)) {
+                return fail_expr(peek(), "'^' must be followed by an identifier");
+            }
+            advance();
+            std::string name(previous().lexeme);
+            if (check(TokenKind::LParen)) {
+                return fail_expr(peek(), "'^' cannot be applied to a call");
+            }
+            auto expr = std::make_unique<Expr>();
+            expr->node = IdentifierExpr{.name = std::move(name), .lexical = true};
+            return expr;
+        }
         // `outer(column)` — a correlated-subquery capture. `outer` is a reserved
         // word (the `outer join` operator), so it never reaches the Identifier
         // branch below; only the call form is an expression, and because the

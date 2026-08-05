@@ -270,7 +270,9 @@ void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::s
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
-                out.insert(n.name);
+                if (!n.lexical) {  // `^name` is a scalar binding, not a column
+                    out.insert(n.name);
+                }
             } else if constexpr (std::is_same_v<T, Literal>) {
                 // nothing
             } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {

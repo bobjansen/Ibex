@@ -24,7 +24,10 @@ void collect_refs(const Expr& expr, ColumnDemand& demand) {
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
-                demand.add(n.name);
+                // `^name` reads a scalar binding, not a column of the input.
+                if (!n.lexical) {
+                    demand.add(n.name);
+                }
             } else if constexpr (std::is_same_v<T, Literal>) {
                 // Reads nothing.
             } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||

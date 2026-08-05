@@ -337,7 +337,7 @@ auto match_probe_chain(const Node& node, std::string key)
                 for (const auto& field : update.fields()) {
                     if (field.alias == key) {
                         const auto* ref = std::get_if<ColumnRef>(&field.expr.node);
-                        if (ref == nullptr) {
+                        if (ref == nullptr || ref->lexical) {
                             // The key is computed; no scan column to bound.
                             return std::nullopt;
                         }

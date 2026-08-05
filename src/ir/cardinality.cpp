@@ -190,7 +190,8 @@ auto renamed_from(const std::vector<FieldSpec>& fields, const std::string& alias
         if (field.alias != alias) {
             continue;
         }
-        if (const auto* ref = std::get_if<ColumnRef>(&field.expr.node)) {
+        if (const auto* ref = std::get_if<ColumnRef>(&field.expr.node);
+            ref != nullptr && !ref->lexical) {
             return ref->name;
         }
         return std::nullopt;  // computed: not a rename of anything

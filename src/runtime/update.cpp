@@ -57,7 +57,9 @@ struct FastOperand {
 auto resolve_fast_operand(const ir::Expr& expr, const Table& input, const ScalarRegistry* scalars)
     -> std::optional<FastOperand> {
     if (const auto* col = std::get_if<ir::ColumnRef>(&expr.node)) {
-        if (const auto* source = input.find(col->name); source != nullptr) {
+        // `^name` skips column scope and resolves in the scalar registry below.
+        if (const auto* source = col->lexical ? nullptr : input.find(col->name);
+            source != nullptr) {
             return FastOperand{
                 .is_column = true,
                 .column = source,
@@ -1510,7 +1512,7 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
             return std::unexpected("rank(): not supported inside windowed update");
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
-            const auto* entry = output.find_entry(col_ref->name);
+            const auto* entry = col_ref->lexical ? nullptr : output.find_entry(col_ref->name);
             if (entry != nullptr) {
                 // `alias = other_column` renames rather than computes, so the
                 // two names can share one buffer under the copy-on-write
@@ -2751,7 +2753,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             continue;
         }
         if (const auto* col_ref = std::get_if<ir::ColumnRef>(&field.expr.node)) {
-            const auto* entry = output.find_entry(col_ref->name);
+            const auto* entry = col_ref->lexical ? nullptr : output.find_entry(col_ref->name);
             if (entry != nullptr) {
                 // `alias = other_column` renames rather than computes, so the
                 // two names can share one buffer under the copy-on-write

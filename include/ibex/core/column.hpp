@@ -171,6 +171,11 @@ class Column {
         return *this;
     }
 
+    /// Declared because the four copy/move members are: the rule of five is a
+    /// readability rule here, not a correctness one — every member cleans up
+    /// after itself, so the compiler-generated body is already right.
+    ~Column() = default;
+
     void swap(Column& other) noexcept {
         data_.swap(other.data_);
         external_owner_.swap(other.external_owner_);
@@ -697,6 +702,11 @@ class Column<Categorical> {
         return *this;
     }
 
+    /// Declared because the four copy/move members are: the rule of five is a
+    /// readability rule here, not a correctness one — every member cleans up
+    /// after itself, so the compiler-generated body is already right.
+    ~Column() = default;
+
     void swap(Column& other) noexcept {
         dict_.swap(other.dict_);
         index_.swap(other.index_);
@@ -1070,6 +1080,11 @@ class Column<std::string> {
         }
         return *this;
     }
+
+    /// Declared because the four copy/move members are: the rule of five is a
+    /// readability rule here, not a correctness one — every member cleans up
+    /// after itself, so the compiler-generated body is already right.
+    ~Column() = default;
 
     void swap(Column& other) noexcept {
         offsets_.swap(other.offsets_);
@@ -1450,6 +1465,11 @@ class Column<bool> {
         }
         return *this;
     }
+
+    /// Declared because the four copy/move members are: the rule of five is a
+    /// readability rule here, not a correctness one — every member cleans up
+    /// after itself, so the compiler-generated body is already right.
+    ~Column() = default;
 
     void swap(Column& other) noexcept {
         words_.swap(other.words_);

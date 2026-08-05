@@ -587,13 +587,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (it == registry.end()) {
                     return std::unexpected("unknown table: " + scan.source_name());
                 }
-                return aggregate_table(it->second, agg.group_by(), agg.aggregations());
+                return aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec);
             }
             auto child = interpret_node(child_node, registry, scalars, externs, exec);
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return aggregate_table(child.value(), agg.group_by(), agg.aggregations());
+            return aggregate_table(child.value(), agg.group_by(), agg.aggregations(), &exec);
         }
         case ir::NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);

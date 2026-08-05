@@ -11,11 +11,17 @@ Description: Pure-R bindings for the Ibex dataframe DSL. Queries are parsed and
     array or converted directly to a data.frame for immediate use with ggplot2.
 Depends: R (>= 4.4)
 Imports:
-    nanoarrow
+    dplyr (>= 1.1.0),
+    nanoarrow,
+    rlang (>= 1.1.0),
+    tibble (>= 3.2.0),
+    tidyselect (>= 1.2.0),
+    vctrs (>= 0.6.0)
 Suggests:
     knitr,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
+Config/ribex/dplyr-version: >= 1.1.0, < 1.2.0
 SystemRequirements: C++23, an existing Ibex build tree
 License: file LICENSE
 Encoding: UTF-8

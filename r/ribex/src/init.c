@@ -13,6 +13,7 @@ SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_s
                                SEXP scalars_sexp);
 SEXP ribex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sexp,
                                SEXP scalars_sexp);
+SEXP ribex_c_session_table_info(SEXP session_sexp, SEXP name_sexp);
 
 static const R_CallMethodDef call_methods[] = {
     {"ribex_c_arrow_buffer_addresses", (DL_FUNC)&ribex_c_arrow_buffer_addresses, 1},
@@ -22,6 +23,7 @@ static const R_CallMethodDef call_methods[] = {
     {"ribex_c_reset_session", (DL_FUNC)&ribex_c_reset_session, 1},
     {"ribex_c_session_eval_file", (DL_FUNC)&ribex_c_session_eval_file, 4},
     {"ribex_c_session_eval_ibex", (DL_FUNC)&ribex_c_session_eval_ibex, 4},
+    {"ribex_c_session_table_info", (DL_FUNC)&ribex_c_session_table_info, 2},
     {NULL, NULL, 0},
 };
 

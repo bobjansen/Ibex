@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -54,7 +55,10 @@ struct SessionState {
     ibex::runtime::ExternRegistry externs;
     std::unordered_set<std::string> loaded_plugins;
     std::vector<std::string> plugin_paths;
+    std::uint64_t generation = 0;
 };
+
+std::atomic<std::uint64_t> next_session_generation{1};
 
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      std::unordered_set<std::string>& loaded_plugins,
@@ -381,8 +385,48 @@ auto build_column_from_r_vector(const std::string& name, SEXP column_sexp) -> st
         }
 
         if (Rf_inherits(column_sexp, "factor")) {
-            return std::unexpected("column '" + name +
-                                   "': factor is not supported; convert to character");
+            if (TYPEOF(column_sexp) != INTSXP) {
+                return std::unexpected("column '" + name + "' factor data must be integer");
+            }
+            SEXP levels = Rf_getAttrib(column_sexp, R_LevelsSymbol);
+            if (TYPEOF(levels) != STRSXP) {
+                return std::unexpected("column '" + name + "' factor must have character levels");
+            }
+
+            std::vector<std::string> dictionary;
+            dictionary.reserve(static_cast<std::size_t>(XLENGTH(levels)));
+            for (R_xlen_t i = 0; i < XLENGTH(levels); ++i) {
+                SEXP level = STRING_ELT(levels, i);
+                if (level == NA_STRING) {
+                    return std::unexpected("column '" + name + "' factor must not have NA levels");
+                }
+                dictionary.emplace_back(CHAR(level));
+            }
+
+            ibex::Column<ibex::Categorical> column(std::move(dictionary));
+            column.reserve(static_cast<std::size_t>(size));
+            bool has_nulls = false;
+            ibex::runtime::ValidityBitmap validity;
+            for (R_xlen_t i = 0; i < size; ++i) {
+                const int value = INTEGER(column_sexp)[i];
+                const bool valid = value != NA_INTEGER;
+                if (valid && (value < 1 || value > XLENGTH(levels))) {
+                    return std::unexpected("column '" + name + "' factor has an out-of-range code");
+                }
+                if (!valid && !has_nulls) {
+                    has_nulls = true;
+                    validity.assign(static_cast<std::size_t>(size), true);
+                }
+                if (has_nulls) {
+                    validity.set(static_cast<std::size_t>(i), valid);
+                }
+                column.push_code(
+                    valid ? static_cast<ibex::Column<ibex::Categorical>::code_type>(value - 1) : 0);
+            }
+            return std::pair{ibex::runtime::ColumnValue{std::move(column)},
+                             has_nulls
+                                 ? std::optional<ibex::runtime::ValidityBitmap>(std::move(validity))
+                                 : std::nullopt};
         }
 
         switch (TYPEOF(column_sexp)) {
@@ -857,6 +901,108 @@ auto session_from_sexp(SEXP session_sexp) -> std::expected<SessionState*, std::s
     return session;
 }
 
+auto column_type_name(const ibex::runtime::ColumnValue& value) -> const char* {
+    return std::visit(
+        [](const auto& column) -> const char* {
+            using Column = std::decay_t<decltype(column)>;
+            if constexpr (std::is_same_v<Column, ibex::Column<std::int64_t>>) {
+                return "Int64";
+            } else if constexpr (std::is_same_v<Column, ibex::Column<double>>) {
+                return "Float64";
+            } else if constexpr (std::is_same_v<Column, ibex::Column<bool>>) {
+                return "Bool";
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Date>>) {
+                return "Date";
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Timestamp>>) {
+                return "Timestamp";
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Categorical>>) {
+                return "Categorical";
+            } else {
+                return "String";
+            }
+        },
+        value);
+}
+
+auto export_table_info(const SessionState& session, const std::string& name)
+    -> std::expected<SEXP, std::string> {
+    const auto it = session.tables.find(name);
+    if (it == session.tables.end()) {
+        return std::unexpected("session has no table binding named '" + name + "'");
+    }
+    const auto& table = it->second;
+    const auto column_count = static_cast<R_xlen_t>(table.columns.size());
+
+    SEXP out = PROTECT(Rf_allocVector(VECSXP, 11));
+    SEXP out_names = PROTECT(Rf_allocVector(STRSXP, 11));
+    constexpr const char* field_names[] = {"names",      "types",      "nullable",  "categorical",
+                                           "timezone",   "rows",       "ordering",  "descending",
+                                           "time_index", "generation", "grouped_by"};
+    for (R_xlen_t i = 0; i < 11; ++i) {
+        SET_STRING_ELT(out_names, i, Rf_mkChar(field_names[i]));
+    }
+    Rf_setAttrib(out, R_NamesSymbol, out_names);
+
+    SEXP names = PROTECT(Rf_allocVector(STRSXP, column_count));
+    SEXP types = PROTECT(Rf_allocVector(STRSXP, column_count));
+    SEXP nullable = PROTECT(Rf_allocVector(LGLSXP, column_count));
+    SEXP categorical = PROTECT(Rf_allocVector(LGLSXP, column_count));
+    SEXP timezone = PROTECT(Rf_allocVector(STRSXP, column_count));
+    for (R_xlen_t i = 0; i < column_count; ++i) {
+        const auto& entry = table.columns[static_cast<std::size_t>(i)];
+        SET_STRING_ELT(names, i, Rf_mkCharCE(entry.name.c_str(), CE_UTF8));
+        SET_STRING_ELT(types, i, Rf_mkChar(column_type_name(*entry.column)));
+        LOGICAL(nullable)[i] = entry.validity.has_value() ? TRUE : FALSE;
+        const auto* categorical_column =
+            std::get_if<ibex::Column<ibex::Categorical>>(entry.column.get());
+        LOGICAL(categorical)[i] = categorical_column != nullptr ? TRUE : FALSE;
+        const auto* timestamp = std::get_if<ibex::Column<ibex::Timestamp>>(entry.column.get());
+        if (timestamp != nullptr && timestamp->meta().zone.has_value()) {
+            const auto& zone = ibex::zone_name(*timestamp->meta().zone);
+            SET_STRING_ELT(timezone, i, Rf_mkCharCE(zone.c_str(), CE_UTF8));
+        } else {
+            SET_STRING_ELT(timezone, i, NA_STRING);
+        }
+    }
+    SET_VECTOR_ELT(out, 0, names);
+    SET_VECTOR_ELT(out, 1, types);
+    SET_VECTOR_ELT(out, 2, nullable);
+    SET_VECTOR_ELT(out, 3, categorical);
+    SET_VECTOR_ELT(out, 4, timezone);
+
+    SET_VECTOR_ELT(out, 5, Rf_ScalarReal(static_cast<double>(table.rows())));
+    const auto& ordering = table.ordering();
+    const auto order_count = ordering.has_value() ? static_cast<R_xlen_t>(ordering->size()) : 0;
+    SEXP order_names = PROTECT(Rf_allocVector(STRSXP, order_count));
+    SEXP descending = PROTECT(Rf_allocVector(LGLSXP, order_count));
+    if (ordering.has_value()) {
+        for (R_xlen_t i = 0; i < order_count; ++i) {
+            const auto& key = (*ordering)[static_cast<std::size_t>(i)];
+            SET_STRING_ELT(order_names, i, Rf_mkCharCE(key.name.c_str(), CE_UTF8));
+            LOGICAL(descending)[i] = key.ascending ? FALSE : TRUE;
+        }
+    }
+    SET_VECTOR_ELT(out, 6, order_names);
+    SET_VECTOR_ELT(out, 7, descending);
+    if (table.time_index().has_value()) {
+        SET_VECTOR_ELT(out, 8, Rf_mkString(table.time_index()->c_str()));
+    } else {
+        SET_VECTOR_ELT(out, 8, R_NilValue);
+    }
+    SET_VECTOR_ELT(out, 9, Rf_ScalarReal(static_cast<double>(session.generation)));
+
+    const auto group_count = static_cast<R_xlen_t>(table.grouped_by().size());
+    SEXP grouped_by = PROTECT(Rf_allocVector(STRSXP, group_count));
+    for (R_xlen_t i = 0; i < group_count; ++i) {
+        const auto& group = table.grouped_by()[static_cast<std::size_t>(i)];
+        SET_STRING_ELT(grouped_by, i, Rf_mkCharCE(group.c_str(), CE_UTF8));
+    }
+    SET_VECTOR_ELT(out, 10, grouped_by);
+
+    UNPROTECT(10);
+    return out;
+}
+
 void collect_buffer_addresses(const ArrowArray& array, const std::string& path,
                               std::vector<std::pair<std::string, std::string>>& out) {
     for (std::int64_t i = 0; i < array.n_buffers; ++i) {
@@ -982,6 +1128,7 @@ extern "C" SEXP ribex_c_create_session(SEXP plugin_paths_sexp) {
 
     auto* session = new SessionState();
     session->plugin_paths = std::move(*plugin_paths);
+    session->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
 
     SEXP ext = PROTECT(R_MakeExternalPtr(session, Rf_install("ribex_session"), R_NilValue));
     R_RegisterCFinalizerEx(ext, session_finalizer, TRUE);
@@ -1001,8 +1148,25 @@ extern "C" SEXP ribex_c_reset_session(SEXP session_sexp) {
     delete *session;
     auto* fresh = new SessionState();
     fresh->plugin_paths = std::move(plugin_paths);
+    fresh->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
     R_SetExternalPtrAddr(session_sexp, fresh);
     return session_sexp;
+}
+
+extern "C" SEXP ribex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+    auto name = scalar_string(name_sexp, "'name'");
+    if (!name.has_value()) {
+        Rf_error("%s", name.error().c_str());
+    }
+    auto info = export_table_info(**session, *name);
+    if (!info.has_value()) {
+        Rf_error("%s", make_error("session error", info.error()).c_str());
+    }
+    return *info;
 }
 
 extern "C" SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,

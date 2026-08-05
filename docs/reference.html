@@ -262,13 +262,20 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
       <div class="tour-item">
         <div class="tour-text">
           <span class="tour-tag">R Package</span>
-          <h3>Use Ibex from pure R and hand results straight to ggplot2</h3>
+          <h3>Use Ibex through native source or a lazy dplyr plan</h3>
           <p>
             The in-repo <code>ribex</code> package evaluates inline Ibex queries
             or <code>.ibex</code> files from R. Results come back as a
             <code>data.frame</code> by default, so the common
             <code>ggplot2</code> path is immediate. For lower-level interop,
             <code>format = "nanoarrow"</code> returns the Arrow-backed result.
+          </p>
+          <p>
+            <code>ibex_tbl()</code> also records a supported subset of dplyr as
+            an immutable native plan. <code>show_query()</code> reveals the
+            generated Ibex, while <code>collect()</code> returns a tibble.
+            Unsupported R calls cross one explicit fallback boundary and then
+            remain in local dplyr; R closures never execute on Ibex workers.
           </p>
           <p>
             Like the Python notebook path, <code>ribex</code> supports a
@@ -320,7 +327,15 @@ summary &lt;- session_eval(
 )
 
 ggplot(summary, aes(Species, mean_sl)) +
-  geom_col()</code></pre>
+  geom_col()
+
+query &lt;- ibex_tbl(trades, fallback = <span class="str">"error"</span>) |&gt;
+  filter(price &gt; <span class="num">10</span>) |&gt;
+  group_by(symbol) |&gt;
+  summarise(total = sum(price), .groups = <span class="str">"drop"</span>)
+
+show_query(query)
+result &lt;- collect(query)</code></pre>
         </div>
       </div>
 

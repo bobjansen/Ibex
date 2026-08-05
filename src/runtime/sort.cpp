@@ -131,6 +131,21 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
 
 }  // namespace
 
+/// Workers for a barrier operator whose unit of work is a GROUP — rank's sweep
+/// and per-group sorts, the collect-aggregate reduce. Sized on ROW COUNT, so
+/// the split, and therefore nothing about the answer, depends on the pool.
+/// More workers than groups is pointless; each caller checks its own group
+/// count, which this cannot see.
+auto group_barrier_worker_count(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
+    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers = std::min(budget, pool_size);
+    return workers < 2 ? 0 : workers;
+}
+
 // Per-group sorting for the grouped rank path. The whole-table entry points
 // above sort every row at once; this sorts one group's run where it already
 // sits, so a caller holding rows bucketed by group can sort the buckets

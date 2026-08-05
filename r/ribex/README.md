@@ -2,6 +2,31 @@
 
 Experimental pure-R bindings for Ibex.
 
+The package also provides a lazy native dplyr backend:
+
+```r
+library(dplyr)
+library(ribex)
+
+query <- ibex_tbl(trades) |>
+  filter(price > 10) |>
+  mutate(notional = price * size) |>
+  group_by(symbol) |>
+  summarise(total = sum(notional), .groups = "drop") |>
+  arrange(desc(total))
+
+show_query(query)
+result <- collect(query)
+```
+
+`ibex_tbl()` binds an in-memory source once and records supported verbs without
+executing them. `show_query()` prints generated Ibex with captured scalar values
+redacted, `compute()` materializes to another session binding, and `collect()`
+returns a tibble. Unsupported calls follow the constructor's explicit
+`fallback = "warn" | "error" | "collect"` policy; after fallback, the result is
+an ordinary local tibble and never silently re-enters Ibex. See
+`inst/dplyr-compatibility.md` for the exact native surface and semantic notes.
+
 Current shape:
 - `eval_ibex()` evaluates an inline Ibex query.
 - `eval_file()` evaluates a `.ibex` file.
@@ -17,6 +42,7 @@ Current shape:
   binds R scalars into Ibex by copy.
 - results return as a `data.frame` by default for immediate `ggplot2` use
 - `format = "nanoarrow"` returns the lower-level Arrow-backed nanoarrow array
+- `session_table_schema()` inspects a resident table without evaluating a query
 
 Nanoarrow inputs use `nanoarrow_pointer_export()` to create an independent,
 thread-safe ownership lease. Ibex adopts that lease, not the caller's external

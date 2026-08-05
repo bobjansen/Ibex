@@ -134,6 +134,34 @@ Supported magic options:
 This is the fastest way to get Ibex into a notebook today without inventing a
 separate plotting system or a full standalone kernel.
 
+## R and dplyr
+
+The in-repo `ribex` package includes a lazy dplyr backend for in-memory R and
+nanoarrow tables. Supported verbs remain an immutable Ibex plan until a
+terminal operation executes it:
+
+```r
+library(dplyr)
+library(ribex)
+
+query <- ibex_tbl(trades, fallback = "error") |>
+  filter(price > 10) |>
+  mutate(notional = price * size) |>
+  group_by(symbol) |>
+  summarise(total = sum(notional), .groups = "drop") |>
+  arrange(desc(total))
+
+show_query(query)
+result <- collect(query)
+```
+
+Captured R scalars cross as typed bindings, not interpolated source.
+Unsupported expressions use an explicit `"warn"`, `"error"`, or `"collect"`
+fallback policy; after a permitted fallback, execution stays in local dplyr.
+Arbitrary R closures never run as Ibex worker kernels. The package compatibility
+matrix documents the exact native verb, type, null, grouping, and ordering
+contract.
+
 ## Language at a glance
 
 ### Inline table construction

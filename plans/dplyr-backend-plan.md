@@ -2,11 +2,14 @@
 
 ## Status
 
-**Proposed; no implementation yet.** The existing `ribex` package, persistent
-session support, and Arrow C Data bridge are the foundation. The first useful
-release does not depend on arbitrary R callbacks: it translates a documented
-subset of dplyr into Ibex and has a deliberate fallback policy for unsupported
-expressions.
+**Initial supported release implemented.** The `ribex` package now provides the
+lazy source, terminal operations, schema inspection, core single-table verbs,
+`distinct`, `count`/`tally`, deterministic expression translation, and the
+three explicit fallback policies described below. `inner_join()` and
+`left_join()` currently use the documented one-way local fallback rather than a
+native join node. Native joins and windows remain Phase 3 follow-up work; the
+explicit R UDF barrier and constrained closure inlining remain the post-MVP
+Phases 5 and 6.
 
 ## Summary
 

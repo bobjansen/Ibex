@@ -4116,3 +4116,54 @@ quotes[
 This tooling is intentionally layered on top of the language rather than baked
 into the syntax. Ibex remains the table DSL; Python, pandas, pyarrow, and
 matplotlib provide notebook ergonomics, plotting, and ecosystem integration.
+
+---
+
+## Appendix E: R and dplyr Integration (Non-Normative)
+
+The `ribex` package exposes both direct source evaluation and a native lazy
+dplyr backend. `ibex_tbl(x)` binds an in-memory R data frame, tibble, or
+nanoarrow-compatible table into a persistent Ibex session. Supported dplyr
+verbs append immutable R-side plan nodes; they do not execute or copy a preview.
+
+```r
+query <- ibex_tbl(trades) |>
+  filter(price > 10) |>
+  mutate(notional = price * size) |>
+  group_by(symbol) |>
+  summarise(total = sum(notional), .groups = "drop") |>
+  arrange(desc(total))
+
+show_query(query)
+result <- collect(query)
+```
+
+`show_query()` renders the equivalent Ibex source with captured scalar values
+shown as typed placeholders. Captures cross the existing scalar binding bridge
+and are referenced with `^name`; values are never concatenated into generated
+source. `compute()` materializes a query into a fresh binding in the same
+session, while `collect()` executes once and returns a tibble through Arrow C
+Data. A read-only native schema endpoint exposes ordered column names, types,
+nullability, categoricals, time zones, ordering, time index, and row count
+without evaluating a user-visible query.
+
+The native MVP covers schema-driven select/rename/relocate, registered scalar
+filter and mutate expressions, grouping metadata, the core aggregates, arrange,
+head/slice-head, distinct, count, and tally. Function translation is based on
+registered R function identity, not spelling: a masked function named `mean`,
+for example, is not passed through as an Ibex call. Arbitrary R closures are not
+runtime kernels.
+
+Unsupported expressions are decided at the verb boundary. `fallback = "error"`
+rejects them before executing the native prefix. `"warn"` collects that prefix
+once, emits one warning naming the boundary, and replays the complete current
+verb in local dplyr; `"collect"` does the same without a warning. The returned
+local tibble never silently re-enters Ibex. Native joins and an explicit
+main-R-thread vector UDF barrier remain follow-up work.
+
+R `NA` maps to Ibex null, but IEEE `NaN` remains a present value. Ibex
+aggregates skip nulls, so nullable aggregate inputs require explicit
+`na.rm = TRUE` for native translation. Empty/all-null aggregate sentinels,
+factor empty groups (`.drop = FALSE`), R vector recycling, computed group keys,
+and other behavior without a documented Ibex equivalent fall back or error.
+The package ships a versioned compatibility matrix with the full contract.

@@ -134,7 +134,11 @@ void collect_filter_column_refs(const Expr& expr, robin_hood::unordered_set<std:
         [&](const auto& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
-                out.insert(n.name);
+                // `^name` names a scalar binding, so it is not a dependency on
+                // any column of the input.
+                if (!n.lexical) {
+                    out.insert(n.name);
+                }
             } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 collect_filter_column_refs(*n.left, out);
                 collect_filter_column_refs(*n.right, out);
@@ -161,6 +165,9 @@ void remap_filter_expr_through_rename(
         [&](auto& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
+                if (n.lexical) {
+                    return;  // scalar binding: renames do not apply
+                }
                 auto it = n2o.find(n.name);
                 if (it != n2o.end()) {
                     n.name = it->second;
@@ -236,9 +243,9 @@ void collect_equality_pinned_cols(const Expr& expr, robin_hood::unordered_set<st
                     const auto* llit = std::get_if<Literal>(&n.left->node);
                     const auto* rcol = std::get_if<ColumnRef>(&n.right->node);
                     const auto* rlit = std::get_if<Literal>(&n.right->node);
-                    if ((lcol != nullptr) && (rlit != nullptr)) {
+                    if ((lcol != nullptr) && !lcol->lexical && (rlit != nullptr)) {
                         out.insert(lcol->name);
-                    } else if ((rcol != nullptr) && (llit != nullptr)) {
+                    } else if ((rcol != nullptr) && !rcol->lexical && (llit != nullptr)) {
                         out.insert(rcol->name);
                     }
                 }

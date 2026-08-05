@@ -113,6 +113,11 @@ auto cast_target(std::string_view callee) -> std::optional<ColumnType> {
 /// common, unambiguous cases for the static pass.
 auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<ColumnType> {
     if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
+        // A lexical `^name` is a scalar binding whose type this pass does not
+        // know; it is deliberately not looked up in the input schema.
+        if (col->lexical) {
+            return std::nullopt;
+        }
         if (const auto* field = input.find(col->name)) {
             return field->type;
         }
@@ -908,12 +913,12 @@ auto missing_column(std::string_view clause, const std::string& name) -> std::st
 // Collect the column names referenced by an expression (value or predicate).
 // Function callees and bound scalars are filtered out by the caller against the
 // schema / lexical bindings; here we just gather every ColumnRef name.
-void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
+void collect_expr_columns(const Expr& expr, std::vector<ColumnRef>& out) {
     std::visit(
         [&](const auto& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, ColumnRef>) {
-                out.push_back(node.name);
+                out.push_back(node);
             } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
                 collect_expr_columns(*node.left, out);
                 collect_expr_columns(*node.right, out);
@@ -940,7 +945,7 @@ void collect_expr_columns(const Expr& expr, std::vector<std::string>& out) {
                 }
             } else if constexpr (std::is_same_v<T, RankExpr>) {
                 for (const auto& key : node.order_keys) {
-                    out.push_back(key.name);
+                    out.push_back(ColumnRef{.name = key.name});
                 }
             }
         },
@@ -986,24 +991,38 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
         return input.find(name) != nullptr || lexical_names.contains(name);
     };
 
-    if (check_expressions && node.kind() == NodeKind::Filter) {
-        std::vector<std::string> refs;
-        collect_expr_columns(static_cast<const FilterNode&>(node).predicate(), refs);
-        for (const auto& name : refs) {
-            if (!resolvable(name)) {
-                return missing_column("filter", name);
+    // `^name` skips column scope entirely, so it must name a lexical binding.
+    auto check_refs = [&](std::string_view clause,
+                          const std::vector<ColumnRef>& refs) -> std::optional<std::string> {
+        for (const auto& ref : refs) {
+            if (ref.lexical) {
+                if (!lexical_names.contains(ref.name)) {
+                    return std::string(clause) + ": '^" + ref.name +
+                           "' does not resolve to a lexical binding";
+                }
+                continue;
             }
+            if (!resolvable(ref.name)) {
+                return missing_column(clause, ref.name);
+            }
+        }
+        return std::nullopt;
+    };
+
+    if (check_expressions && node.kind() == NodeKind::Filter) {
+        std::vector<ColumnRef> refs;
+        collect_expr_columns(static_cast<const FilterNode&>(node).predicate(), refs);
+        if (auto err = check_refs("filter", refs)) {
+            return err;
         }
     }
     if (check_expressions && node.kind() == NodeKind::Update) {
-        std::vector<std::string> refs;
+        std::vector<ColumnRef> refs;
         for (const auto& field : static_cast<const UpdateNode&>(node).fields()) {
             collect_expr_columns(field.expr, refs);
         }
-        for (const auto& name : refs) {
-            if (!resolvable(name)) {
-                return missing_column("update", name);
-            }
+        if (auto err = check_refs("update", refs)) {
+            return err;
         }
     }
 

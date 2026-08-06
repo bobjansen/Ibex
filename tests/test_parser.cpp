@@ -1338,6 +1338,64 @@ TEST_CASE("Parse cross join") {
     REQUIRE(join.keys.empty());
 }
 
+TEST_CASE("Parse the join suffix clause") {
+    const auto suffix_of = [](const char* source) -> std::optional<JoinSuffix> {
+        auto result = parse(source);
+        REQUIRE(result.has_value());
+        const auto& expr_stmt = std::get<ExprStmt>(result->statements.front());
+        return require_join(require_expr(expr_stmt.expr)).suffix;
+    };
+
+    SECTION("after a bare key") {
+        const auto suffix = suffix_of(R"(a join b on k suffix { "_l", "_r" };)");
+        REQUIRE(suffix.has_value());
+        CHECK(suffix->left == "_l");
+        CHECK(suffix->right == "_r");
+    }
+
+    SECTION("after a braced key list") {
+        const auto suffix = suffix_of(R"(a join b on { k1, k2 } suffix { "_l", "_r" };)");
+        REQUIRE(suffix.has_value());
+        CHECK(suffix->left == "_l");
+    }
+
+    SECTION("after a predicate") {
+        const auto suffix = suffix_of(R"(a join b on x < y suffix { "_l", "_r" };)");
+        REQUIRE(suffix.has_value());
+        CHECK(suffix->right == "_r");
+    }
+
+    SECTION("on a cross join, which has no on-clause to trail") {
+        const auto suffix = suffix_of(R"(a cross join b suffix { "_l", "_r" };)");
+        REQUIRE(suffix.has_value());
+        CHECK(suffix->left == "_l");
+    }
+
+    SECTION("an empty side is preserved, not dropped") {
+        const auto suffix = suffix_of(R"(a join b on k suffix { "", "_r" };)");
+        REQUIRE(suffix.has_value());
+        CHECK(suffix->left.empty());
+        CHECK(suffix->right == "_r");
+    }
+
+    SECTION("absent when the clause is omitted") {
+        CHECK_FALSE(suffix_of("a join b on k;").has_value());
+    }
+
+    SECTION("two empty suffixes are rejected: they separate nothing") {
+        CHECK_FALSE(parse(R"(a join b on k suffix { "", "" };)").has_value());
+    }
+
+    SECTION("both suffixes are required") {
+        CHECK_FALSE(parse(R"(a join b on k suffix { "_l" };)").has_value());
+        CHECK_FALSE(parse("a join b on k suffix { };").has_value());
+    }
+
+    SECTION("suffixes must be strings, not identifiers") {
+        CHECK_FALSE(parse("a join b on k suffix { _l, _r };").has_value());
+    }
+}
+
 // --- All comparison operators parse correctly --------------------------------
 
 TEST_CASE("Parse all comparison operators") {

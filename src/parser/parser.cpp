@@ -565,6 +565,17 @@ class Parser {
                     }
                 }
             }
+            // `suffix { "_l", "_r" }` trails the key/predicate clause, and is
+            // available on a cross join too, which has no `on` to trail.
+            std::optional<JoinSuffix> suffix;
+            if (match(TokenKind::KeywordSuffix)) {
+                auto parsed_suffix = parse_join_suffix();
+                if (!parsed_suffix.has_value()) {
+                    return nullptr;
+                }
+                suffix = std::move(*parsed_suffix);
+            }
+
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
                 .kind = kind,
@@ -572,6 +583,7 @@ class Parser {
                 .right = std::move(right),
                 .keys = std::move(keys),
                 .predicate = std::move(predicate),
+                .suffix = std::move(suffix),
             };
             expr = std::move(join);
         }
@@ -836,6 +848,36 @@ class Parser {
             break;
         }
         return expr;
+    }
+
+    /// `suffix { "_left", "_right" }` — both sides are always named, so which
+    /// suffix belongs to which input never depends on position alone. An empty
+    /// string leaves that side's colliding column under its original name.
+    auto parse_join_suffix() -> std::optional<JoinSuffix> {
+        if (!consume(TokenKind::LBrace, "expected '{' after 'suffix'")) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::StringLiteral, "expected left suffix string")) {
+            return std::nullopt;
+        }
+        std::string left = unescape_string(previous().lexeme);
+        if (!consume(TokenKind::Comma, "expected ',' between the two suffixes")) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::StringLiteral, "expected right suffix string")) {
+            return std::nullopt;
+        }
+        std::string right = unescape_string(previous().lexeme);
+        if (!consume(TokenKind::RBrace, "expected '}' after the suffix pair")) {
+            return std::nullopt;
+        }
+        if (left.empty() && right.empty()) {
+            error_ = make_error(previous(),
+                                "suffix { \"\", \"\" } cannot separate a collision; give at least "
+                                "one side a suffix");
+            return std::nullopt;
+        }
+        return JoinSuffix{.left = std::move(left), .right = std::move(right)};
     }
 
     auto parse_join_keys() -> std::optional<std::vector<JoinKey>> {

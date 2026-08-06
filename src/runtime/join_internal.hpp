@@ -4,11 +4,23 @@
 
 #include <expected>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
+
+/// Column names of `table`, in order — the input form expected by
+/// `ir::plan_join_output()`.
+[[nodiscard]] inline auto table_column_names(const Table& table) -> std::vector<std::string_view> {
+    std::vector<std::string_view> names;
+    names.reserve(table.columns.size());
+    for (const auto& entry : table.columns) {
+        names.emplace_back(entry.name);
+    }
+    return names;
+}
 
 using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Expr& predicate,
                                                                     const Table& table,

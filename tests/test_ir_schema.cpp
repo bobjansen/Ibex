@@ -186,6 +186,49 @@ TEST_CASE("schema: a join with a non-unique left loses the right's proof", "[ir]
     REQUIRE(s.unique_keys().empty());
 }
 
+TEST_CASE("schema: a mapped join carries the right's proof under its own name", "[ir][schema]") {
+    // The old rule refused every mapped join outright. The right key column is
+    // retained natively, so the proof it carries is still about an output
+    // column -- `right_id`.
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                            std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}});
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+
+    SchemaInfo left = SchemaInfo::known({{.name = "left_id", .type = ColumnType::Int64},
+                                         {.name = "val", .type = ColumnType::Float64}});
+    left.add_unique_key({"left_id"});
+    SchemaInfo right = SchemaInfo::known({{.name = "right_id", .type = ColumnType::Int64},
+                                          {.name = "val", .type = ColumnType::Float64}});
+    right.add_unique_key({"right_id"});
+
+    auto s = ibex::ir::infer_schema(join, SourceSchemas{{"left", left}, {"right", right}});
+    REQUIRE(s.is_known());
+    CHECK(s.is_unique_within({"left_id"}));
+    CHECK(s.is_unique_within({"right_id"}));
+}
+
+TEST_CASE("schema: a proof on a renamed right column follows the rename", "[ir][schema]") {
+    // `code` collides, so the planner emits the right one as `code_right`; the
+    // right's proof is about that output column, not the left `code`.
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                            std::vector<ibex::ir::JoinKey>{{"id", "id"}});
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+
+    SchemaInfo left = SchemaInfo::known(
+        {{.name = "id", .type = ColumnType::Int64}, {.name = "code", .type = ColumnType::String}});
+    left.add_unique_key({"id"});
+    SchemaInfo right = SchemaInfo::known(
+        {{.name = "id", .type = ColumnType::Int64}, {.name = "code", .type = ColumnType::String}});
+    right.add_unique_key({"code"});
+
+    auto s = ibex::ir::infer_schema(join, SourceSchemas{{"left", left}, {"right", right}});
+    REQUIRE(s.is_known());
+    CHECK(s.is_unique_within({"code_right"}));
+    CHECK_FALSE(s.is_unique_within({"code"}));
+}
+
 TEST_CASE("schema: a join between two non-unique sides proves nothing", "[ir][schema]") {
     auto s = schema_of("t join t on a;", base_sources());
     REQUIRE(s.is_known());

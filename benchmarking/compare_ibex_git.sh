@@ -53,6 +53,7 @@ Options:
   --csv-trades <path>       trades.csv path
   --csv-events <path>       events.csv path
   --csv-lookup <path>       lookup.csv path
+  --csv-users <path>        users.csv path
   --keep-temp               Keep temporary worktrees/results directory
   -h, --help                Show this help
 
@@ -84,6 +85,7 @@ CSV_MULTI="$REPO_ROOT/benchmarking/data/prices_multi.csv"
 CSV_TRADES="$REPO_ROOT/benchmarking/data/trades.csv"
 CSV_EVENTS="$REPO_ROOT/benchmarking/data/events.csv"
 CSV_LOOKUP="$REPO_ROOT/benchmarking/data/lookup.csv"
+CSV_USERS="$REPO_ROOT/benchmarking/data/users.csv"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -105,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --csv-trades) CSV_TRADES="$2"; shift 2 ;;
         --csv-events) CSV_EVENTS="$2"; shift 2 ;;
         --csv-lookup) CSV_LOOKUP="$2"; shift 2 ;;
+        --csv-users) CSV_USERS="$2"; shift 2 ;;
         --keep-temp) KEEP_TEMP=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown option: $1" >&2; usage; exit 1 ;;
@@ -314,10 +317,16 @@ run_bench_once() {
     [[ -n "$MERGE_VALIDITY_ROWS" ]] && args+=(--merge-validity-rows "$MERGE_VALIDITY_ROWS")
     [[ -n "$RNG_MICRO_ROWS" ]] && args+=(--rng-micro-rows "$RNG_MICRO_ROWS")
     [[ -n "$FILTER_MICRO_ROWS" ]] && args+=(--filter-micro-rows "$FILTER_MICRO_ROWS")
+    # Every optional CSV must be forwarded explicitly. bench_ibex.sh defaults
+    # each one to its own $SCRIPT_DIR/data/<name>.csv, which inside a temp
+    # worktree is an empty gitignored directory -- so a table we fail to pass
+    # here does not error, it silently drops every query that needs it from
+    # both sides, and the missing rows never reach the report.
     [[ -f "$CSV_MULTI" ]] && args+=(--csv-multi "$CSV_MULTI")
     [[ -f "$CSV_TRADES" ]] && args+=(--csv-trades "$CSV_TRADES")
     [[ -f "$CSV_EVENTS" ]] && args+=(--csv-events "$CSV_EVENTS")
     [[ -f "$CSV_LOOKUP" ]] && args+=(--csv-lookup "$CSV_LOOKUP")
+    [[ -f "$CSV_USERS" ]] && args+=(--csv-users "$CSV_USERS")
 
     local -a cmd=(bash "$src_dir/benchmarking/bench_ibex.sh" "${args[@]}")
     if [[ "${#PIN_PREFIX[@]}" -gt 0 ]]; then
@@ -425,6 +434,19 @@ CTRL_BUILD_DIR="$TMP_ROOT/build-ctrl"
 BASE_LOG="$TMP_ROOT/log-base.txt"
 TARGET_LOG="$TMP_ROOT/log-target.txt"
 CTRL_LOG="$TMP_ROOT/log-ctrl.txt"
+
+# Warn loudly about absent optional inputs. A silently missing table shrinks
+# the comparison to whatever happened to load, and an all-noise verdict over
+# five queries looks the same as one over eight.
+for csv_desc in "prices_multi:$CSV_MULTI" "trades:$CSV_TRADES" \
+    "events:$CSV_EVENTS" "lookup:$CSV_LOOKUP" "users:$CSV_USERS"; do
+    csv_name="${csv_desc%%:*}"
+    csv_path="${csv_desc#*:}"
+    if [[ ! -f "$csv_path" ]]; then
+        echo "warning: $csv_name CSV not found: $csv_path" >&2
+        echo "         queries needing it are skipped on BOTH sides" >&2
+    fi
+done
 
 echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2

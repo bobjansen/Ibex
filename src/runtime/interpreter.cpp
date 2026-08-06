@@ -1509,7 +1509,7 @@ auto invoke_table_consumer(const ExternRegistry& externs, const std::string& cal
 }
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
-                 const std::vector<std::string>& keys, const ir::Expr* predicate,
+                 const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                  const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
     return join_table_impl(left, right, kind, keys, predicate, scalars, compute_mask);
 }

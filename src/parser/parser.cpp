@@ -537,7 +537,7 @@ class Parser {
                 return nullptr;
             }
 
-            std::vector<std::string> keys;
+            std::vector<JoinKey> keys;
             std::optional<ExprPtr> predicate;
             if (kind != JoinKind::Cross) {
                 if (!consume(TokenKind::KeywordOn, "expected 'on' after join expression")) {
@@ -559,7 +559,7 @@ class Parser {
                         return nullptr;
                     }
                     if (const auto* ident = std::get_if<IdentifierExpr>(&on_expr->node)) {
-                        keys.push_back(ident->name);
+                        keys.push_back(JoinKey{.left = ident->name, .right = ident->name});
                     } else {
                         predicate = std::move(on_expr);
                     }
@@ -820,8 +820,8 @@ class Parser {
         return expr;
     }
 
-    auto parse_join_keys() -> std::optional<std::vector<std::string>> {
-        std::vector<std::string> keys;
+    auto parse_join_keys() -> std::optional<std::vector<JoinKey>> {
+        std::vector<JoinKey> keys;
         if (match(TokenKind::LBrace)) {
             if (!check(TokenKind::RBrace)) {
                 do {
@@ -829,7 +829,17 @@ class Parser {
                     if (!name.has_value()) {
                         return std::nullopt;
                     }
-                    keys.push_back(std::move(*name));
+                    std::string left = std::move(*name);
+                    std::string right = left;
+                    if (match(TokenKind::Eq)) {
+                        auto mapped =
+                            consume_column_identifier("expected right join key after '='");
+                        if (!mapped.has_value()) {
+                            return std::nullopt;
+                        }
+                        right = std::move(*mapped);
+                    }
+                    keys.push_back(JoinKey{.left = std::move(left), .right = std::move(right)});
                 } while (match(TokenKind::Comma));
             }
             if (!consume(TokenKind::RBrace, "expected '}' after join key list")) {
@@ -840,7 +850,7 @@ class Parser {
             if (!name.has_value()) {
                 return std::nullopt;
             }
-            keys.push_back(std::move(*name));
+            keys.push_back(JoinKey{.left = *name, .right = std::move(*name)});
         }
         if (keys.empty()) {
             error_ = make_error(peek(), "expected at least one join key");

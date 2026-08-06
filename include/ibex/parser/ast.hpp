@@ -335,11 +335,20 @@ struct TableExpr {
     ExprPtr row_count;  ///< non-null iff the `Table(n)` paren form was used
 };
 
+/// One equijoin key pair. Same-name syntax stores the same name on both sides;
+/// mapped syntax (`left_name = right_name`) keeps the two input names distinct.
+struct JoinKey {
+    std::string left;
+    std::string right;
+
+    auto operator==(const JoinKey&) const -> bool = default;
+};
+
 struct JoinExpr {
     JoinKind kind = JoinKind::Inner;
     ExprPtr left;
     ExprPtr right;
-    std::vector<std::string> keys;
+    std::vector<JoinKey> keys;
     std::optional<ExprPtr> predicate;  ///< non-equijoin predicate (mutually exclusive with keys)
 };
 

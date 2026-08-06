@@ -155,10 +155,12 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                         return infer_schema(*node.children()[index], schemas);
                     };
                     std::optional<std::size_t> bound;
-                    if (right.rows.has_value() && side_schema(0).is_unique_within(join.keys())) {
+                    if (right.rows.has_value() &&
+                        side_schema(0).is_unique_within(left_join_key_names(join.keys()))) {
                         bound = *right.rows;
                     }
-                    if (left.rows.has_value() && side_schema(1).is_unique_within(join.keys())) {
+                    if (left.rows.has_value() &&
+                        side_schema(1).is_unique_within(right_join_key_names(join.keys()))) {
                         bound = bound.has_value() ? std::min(*bound, *left.rows) : *left.rows;
                     }
                     if (!bound.has_value()) {

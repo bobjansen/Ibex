@@ -46,15 +46,17 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        join.children().size() != 2 || join.children()[0] == nullptr ||
-        join.children()[1] == nullptr || join.children()[1]->kind() == NodeKind::Join) {
+        !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
+        join.children()[0] == nullptr || join.children()[1] == nullptr ||
+        join.children()[1]->kind() == NodeKind::Join) {
         return false;
     }
     if (!collect_left_deep(*join.children()[0], stats, relations, edges) ||
         !collect_left_deep(*join.children()[1], stats, relations, edges)) {
         return false;
     }
-    edges.push_back(JoinEdge{.right_relation = relations.size() - 1, .keys = join.keys()});
+    edges.push_back(
+        JoinEdge{.right_relation = relations.size() - 1, .keys = left_join_key_names(join.keys())});
     return true;
 }
 

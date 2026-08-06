@@ -259,19 +259,23 @@ auto format_expr_type(ExprType kind) -> std::string {
     return "?";
 }
 
-auto format_keys(const std::vector<std::string>& keys) -> std::string {
+auto format_key(const ir::JoinKey& key) -> std::string {
+    return key.left == key.right ? key.left : key.left + " = " + key.right;
+}
+
+auto format_keys(const std::vector<ir::JoinKey>& keys) -> std::string {
     if (keys.empty()) {
         return "<none>";
     }
     if (keys.size() == 1) {
-        return keys.front();
+        return format_key(keys.front());
     }
     std::string out = "{";
     for (std::size_t i = 0; i < keys.size(); ++i) {
         if (i > 0) {
             out.append(", ");
         }
-        out.append(keys[i]);
+        out.append(format_key(keys[i]));
     }
     out.push_back('}');
     return out;
@@ -320,7 +324,7 @@ auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::str
 }  // namespace
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                     const std::vector<std::string>& keys, const ir::Expr* predicate,
+                     const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator)
     -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
@@ -336,18 +340,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (!left.time_index().has_value() || !right.time_index().has_value()) {
             return std::unexpected(asof_not_timeframe_error(left, right));
         }
-        if (*left.time_index() != *right.time_index()) {
-            return std::unexpected(
-                "asof join requires both TimeFrames to share the same time index column"
-                "\n  left  time index: '" +
-                *left.time_index() + "'\n  right time index: '" + *right.time_index() +
-                "'\n  hint: re-promote one side with the matching name, e.g. "
-                "as_timeframe(<table>, \"" +
-                *left.time_index() + "\")");
-        }
-        const std::string& time_key = *left.time_index();
+        const std::string& left_time_key = *left.time_index();
+        const std::string& right_time_key = *right.time_index();
         for (std::size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i] == time_key) {
+            if (keys[i].left == left_time_key && keys[i].right == right_time_key) {
                 asof_time_key_pos = i;
                 break;
             }
@@ -355,19 +351,23 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (!asof_time_key_pos.has_value()) {
             std::string suggested;
             if (keys.empty()) {
-                suggested = time_key;
+                suggested = left_time_key == right_time_key
+                                ? left_time_key
+                                : left_time_key + " = " + right_time_key;
             } else {
-                suggested = "{" + time_key;
+                suggested = "{" + (left_time_key == right_time_key
+                                       ? left_time_key
+                                       : left_time_key + " = " + right_time_key);
                 for (const auto& k : keys) {
                     suggested.append(", ");
-                    suggested.append(k);
+                    suggested.append(format_key(k));
                 }
                 suggested.push_back('}');
             }
-            return std::unexpected("asof join: the 'on' keys must include the time index '" +
-                                   time_key + "'\n  got:  on " + format_keys(keys) +
-                                   "\n  hint: did you mean `... asof join ... on " + suggested +
-                                   "`?");
+            return std::unexpected(
+                "asof join: the 'on' keys must include the time index '" + left_time_key +
+                "' (left) and '" + right_time_key + "' (right)\n  got:  on " + format_keys(keys) +
+                "\n  hint: did you mean `... asof join ... on " + suggested + "`?");
         }
     }
 
@@ -376,18 +376,18 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     left_keys.reserve(keys.size());
     right_keys.reserve(keys.size());
     for (const auto& key : keys) {
-        const auto* left_col = left.find(key);
+        const auto* left_col = left.find(key.left);
         if (left_col == nullptr) {
-            return std::unexpected("join key not found in left: " + key +
+            return std::unexpected("join key not found in left: " + key.left +
                                    " (available: " + format_columns(left) + ")");
         }
-        const auto* right_col = right.find(key);
+        const auto* right_col = right.find(key.right);
         if (right_col == nullptr) {
-            return std::unexpected("join key not found in right: " + key +
+            return std::unexpected("join key not found in right: " + key.right +
                                    " (available: " + format_columns(right) + ")");
         }
         if (column_kind(*left_col) != column_kind(*right_col)) {
-            return std::unexpected("join key type mismatch for " + key);
+            return std::unexpected("join key type mismatch for " + format_key(key));
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);
@@ -405,8 +405,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     std::vector<const ValidityBitmap*> right_key_validity;
     bool has_null_keys = false;
     for (const auto& key : keys) {
-        const auto* left_entry = left.find_entry(key);
-        const auto* right_entry = right.find_entry(key);
+        const auto* left_entry = left.find_entry(key.left);
+        const auto* right_entry = right.find_entry(key.right);
         const auto* lv = left_entry != nullptr && left_entry->validity.has_value()
                              ? &*left_entry->validity
                              : nullptr;
@@ -426,7 +426,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         return false;
     };
-    robin_hood::unordered_set<std::string> key_set(keys.begin(), keys.end());
+    robin_hood::unordered_set<std::string> left_key_set;
+    robin_hood::unordered_set<std::string> shared_right_key_set;
+    for (const auto& key : keys) {
+        left_key_set.insert(key.left);
+        if (key.left == key.right) {
+            shared_right_key_set.insert(key.right);
+        }
+    }
 
     const std::size_t n_left = left.rows();
     const std::size_t n_right = right.rows();
@@ -455,7 +462,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     std::vector<RightOut> right_out;
     right_out.reserve(right.columns.size());
     for (const auto& entry : right.columns) {
-        if (semi_join || anti_join || key_set.contains(entry.name)) {
+        if (semi_join || anti_join || shared_right_key_set.contains(entry.name)) {
             continue;
         }
         std::string name = entry.name;
@@ -536,10 +543,20 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
 
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                const bool is_key = key_set.contains(left.columns[c].name);
+                const bool is_key = left_key_set.contains(left.columns[c].name);
                 if (is_key && !key_right_idx.empty()) {
                     // Key columns for unmatched right rows: fill from the right table.
-                    const auto* right_key_col = right.find(left.columns[c].name);
+                    const auto mapped = std::ranges::find_if(keys, [&](const ir::JoinKey& key) {
+                        return key.left == left.columns[c].name && key.left == key.right;
+                    });
+                    const auto* right_key_col =
+                        mapped != keys.end() ? right.find(mapped->right) : nullptr;
+                    if (right_key_col == nullptr) {
+                        auto [col_out, validity] = gather_column_with_nulls(
+                            *left.columns[c].column, left_idx.data(), total, kNull);
+                        output.replace_column(c, std::move(col_out), std::move(validity));
+                        continue;
+                    }
                     // Build per-row: pick from left or right depending on null.
                     // Key columns in outer joins are rare & small, so per-row is fine.
                     ColumnValue out_col = make_empty_like(*left.columns[c].column);
@@ -1037,9 +1054,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return std::nullopt;
         };
 
-        const std::string& time_key = keys[time_pos];
-
         auto wrong_type_error = [&](const char* label, const ColumnValue& col) {
+            const std::string& time_key =
+                std::string_view{label} == "left" ? keys[time_pos].left : keys[time_pos].right;
             return "asof join: time index column '" + time_key + "' on " + label + " has type " +
                    format_expr_type(column_kind(col)) +
                    ", but asof requires Timestamp, Date, or Int";
@@ -1087,12 +1104,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             const char* which = (!left_sorted && !right_sorted)
                                     ? "both sides are"
                                     : (!left_sorted ? "left is" : "right is");
+            const std::string sort_key = !left_sorted ? keys[time_pos].left : keys[time_pos].right;
             return std::unexpected(
                 std::string("asof join: ") + which + " not sorted ascending by time index '" +
-                time_key +
+                sort_key +
                 "' — silent look-ahead bias would be the result if this were allowed"
                 "\n  hint: order the offending side first, e.g. `<table>[order " +
-                time_key + "]` before promoting with as_timeframe()");
+                sort_key + "]` before promoting with as_timeframe()");
         }
 
         std::vector<const ColumnValue*> left_eq_keys;
@@ -1275,7 +1293,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         auto lc = make_key_col(*left_keys[i], nullptr);
         auto rc = make_key_col(*right_keys[i], nullptr);
         if (!lc.has_value() || !rc.has_value()) {
-            return std::unexpected("join: unsupported key column type for " + keys[i]);
+            return std::unexpected("join: unsupported key column type for " + format_key(keys[i]));
         }
         left_cols.push_back(*lc);
         right_cols.push_back(*rc);

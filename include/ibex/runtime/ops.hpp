@@ -137,31 +137,31 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto model_r_squared(const runtime::ModelResult& m) -> double;
 
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<std::string>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<std::string>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto right_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<std::string>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto outer_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<std::string>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto semi_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<std::string>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto anti_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<std::string>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto cross_join(const runtime::Table& left, const runtime::Table& right)
     -> runtime::Table;
 
 [[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<std::string>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
 
 [[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
-                                       ir::JoinKind kind, const std::vector<std::string>& keys,
+                                       ir::JoinKind kind, const std::vector<ir::JoinKey>& keys,
                                        const ir::Expr& predicate) -> runtime::Table;
 
 void print(const runtime::Table& t, std::ostream& out = std::cout);

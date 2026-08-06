@@ -1836,14 +1836,18 @@ class Lowerer {
         // Resolve the `on` clause: equikeys from the braced list path are
         // already in join.keys; an expression stored in join.predicate is
         // either a bare identifier (equikey) or a general predicate.
-        std::vector<std::string> keys = join.keys;
+        std::vector<ir::JoinKey> keys;
+        keys.reserve(join.keys.size() + (join.predicate.has_value() ? 1U : 0U));
+        for (const auto& key : join.keys) {
+            keys.emplace_back(key.left, key.right);
+        }
         std::optional<ir::Expr> predicate;
 
         if (join.predicate.has_value()) {
             const Expr& on_expr = **join.predicate;
             if (const auto* ident = std::get_if<IdentifierExpr>(&on_expr.node)) {
                 // Bare identifier → equikey (backward compat: `A join B on key`)
-                keys.push_back(ident->name);
+                keys.emplace_back(ident->name);
             } else {
                 // General expression → non-equijoin predicate
                 auto pred = lower_expr_to_ir(on_expr);
@@ -2956,8 +2960,13 @@ class Lowerer {
         // the cross join drops every outer row, exactly as comparing against
         // SQL's null scalar would.
         const bool correlated = !subplan->keys.empty();
-        auto join =
-            builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross, subplan->keys);
+        std::vector<ir::JoinKey> join_keys;
+        join_keys.reserve(subplan->keys.size());
+        for (const auto& key : subplan->keys) {
+            join_keys.emplace_back(key);
+        }
+        auto join = builder_.join(correlated ? ir::JoinKind::Left : ir::JoinKind::Cross,
+                                  std::move(join_keys));
         join->add_child(std::move(input));
         join->add_child(std::move(subplan->plan));
         input = std::move(join);

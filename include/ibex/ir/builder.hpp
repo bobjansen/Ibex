@@ -149,7 +149,7 @@ class Builder {
                                            std::move(value_column), std::move(row_keys));
     }
 
-    [[nodiscard]] auto join(JoinKind kind, std::vector<std::string> keys,
+    [[nodiscard]] auto join(JoinKind kind, std::vector<JoinKey> keys,
                             std::optional<Expr> predicate = std::nullopt) -> NodePtr {
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys), std::move(predicate));
     }

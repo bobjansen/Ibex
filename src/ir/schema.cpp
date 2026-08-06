@@ -343,10 +343,15 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
     // left's is kept -- so a right constraint naming it carries over only where
     // the join equates the two, which is exactly on a join key.
     const auto right_key_survives = [&](const UniqueKey& key) {
+        if (!join_keys_are_same_named(join.keys())) {
+            return false;
+        }
         return std::ranges::all_of(key, [&](const std::string& name) {
             return out.find(name) != nullptr &&
                    (left.find(name) == nullptr ||
-                    std::ranges::find(join.keys(), name) != join.keys().end());
+                    std::ranges::any_of(join.keys(), [&](const JoinKey& join_key) {
+                        return join_key.left == name && join_key.right == name;
+                    }));
         });
     };
     const auto keep = [&](const SchemaInfo& side, const auto& survives) {
@@ -364,10 +369,10 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
             keep(left, left_key_survives);
             return;
         case JoinKind::Inner:
-            if (right.is_unique_within(join.keys())) {
+            if (right.is_unique_within(right_join_key_names(join.keys()))) {
                 keep(left, left_key_survives);
             }
-            if (left.is_unique_within(join.keys())) {
+            if (left.is_unique_within(left_join_key_names(join.keys()))) {
                 keep(right, right_key_survives);
             }
             return;
@@ -696,8 +701,6 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Join: {
-            // A ∪ B: left columns, then right columns whose names are not
-            // already present (shared join keys appear once).
             const auto& join = static_cast<const JoinNode&>(node);
             const SchemaInfo left = child_schema(node, sources, 0);
             const SchemaInfo right = child_schema(node, sources, 1);
@@ -705,13 +708,28 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 return SchemaInfo::unknown();
             }
             std::vector<SchemaField> out = left.fields();
+            if (join.kind() == JoinKind::Semi || join.kind() == JoinKind::Anti) {
+                SchemaInfo result = SchemaInfo::known(std::move(out), left.is_open());
+                add_join_unique_keys(join, left, right, result);
+                return result;
+            }
+            robin_hood::unordered_set<std::string> out_names;
+            for (const auto& field : out) {
+                out_names.insert(field.name);
+            }
             for (const auto& field : right.fields()) {
-                const bool present = std::any_of(out.begin(), out.end(), [&](const SchemaField& f) {
-                    return f.name == field.name;
+                const bool shared_key = std::ranges::any_of(join.keys(), [&](const JoinKey& key) {
+                    return key.left == field.name && key.right == field.name;
                 });
-                if (!present) {
-                    out.push_back(field);
+                if (shared_key) {
+                    continue;
                 }
+                SchemaField emitted = field;
+                while (out_names.contains(emitted.name)) {
+                    emitted.name += "_right";
+                }
+                out_names.insert(emitted.name);
+                out.push_back(std::move(emitted));
             }
             SchemaInfo result =
                 SchemaInfo::known(std::move(out), left.is_open() || right.is_open());

@@ -16,7 +16,7 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
                                                                     RowRange rows);
 
 [[nodiscard]] auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                                   const std::vector<std::string>& keys, const ir::Expr* predicate,
+                                   const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                                    const ScalarRegistry* scalars,
                                    PredicateMaskEvaluator mask_evaluator)
     -> std::expected<Table, std::string>;

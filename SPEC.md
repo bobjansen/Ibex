@@ -859,6 +859,7 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
                 | "^" IDENT                      (* scope escape *)
                 | outer_capture
+                | join_side_ref
                 | literal
                 | array_lit
                 | schema_lit
@@ -872,6 +873,13 @@ primary         = IDENT [ "(" [ arg_list ] ")" ]
 scalar_subquery = "scalar" "(" expr ")" ;
 
 outer_capture   = "outer" "(" IDENT ")" ;
+
+(* Side-qualified column reference — Section 5.6. Valid only inside a join
+   predicate. `left` and `right` are hard keywords (the `left join` / `right
+   join` operators), so this call form is the only way a call named `left` or
+   `right` can exist. *)
+
+join_side_ref   = ( "left" | "right" ) "(" IDENT ")" ;
 
 table_col_def   = IDENT "=" expr ;
 
@@ -1969,6 +1977,7 @@ A join B on a < b
 A left join B on lo <= val && val < hi
 A semi join B on a != b
 A anti join B on score > threshold
+A join B on left(ts) >= right(start) && left(ts) < right(end)
 ```
 
 Semantics:
@@ -2014,12 +2023,29 @@ in the output when the predicate evaluates to true for that pair. All join
 semantics (left outer, semi, anti, etc.) apply — unmatched left rows are
 null-padded in the same way as equijoins.
 
-**Column name resolution in predicates.** Inside a non-equijoin predicate,
-column names are resolved against the combined output schema — the same schema
-that a `cross join` of the two inputs would produce. Right-side column names
-that collide with left-side column names receive a `_right` suffix (e.g. if
-both sides have column `id`, the predicate would reference `id` for the
-left-side value and `id_right` for the right-side value).
+**Column name resolution in predicates.** Inside a non-equijoin predicate, a
+bare column name is resolved against both inputs:
+
+- present in exactly one input — it names that input's column;
+- present in both — it is an error, because the predicate would otherwise
+  depend on an invisible tie-break. Say which side you mean;
+- present in neither — it resolves as an ordinary name outside column scope,
+  i.e. a scalar binding (Section 6.2), and is an error if no such binding
+  exists.
+
+`left(name)` and `right(name)` name a side explicitly:
+
+```ibex
+ticks join windows on right(start) <= left(ts) && left(ts) < right(end)
+```
+
+Both forms take a plain column name, and both are errors if that input has no
+such column. They are only meaningful in a join predicate; anywhere else,
+`left(...)` and `right(...)` are a compile-time error.
+
+A predicate never sees the join's *output* names: the two inputs keep their own
+namespaces, so a collision between them affects the result schema (see **Output
+columns** above) but not how the predicate reads.
 
 Non-equijoin joins use a nested-loop algorithm (O(N×M)) and are therefore
 suited for smaller tables or selective predicates. Equijoin hash-join paths

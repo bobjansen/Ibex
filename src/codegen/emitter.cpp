@@ -1145,6 +1145,11 @@ auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {
                 if (node.lexical) {
                     return "ibex::ops::lexical_ref(\"" + escape_string(node.name) + "\")";
                 }
+                if (node.side != ir::JoinSide::Any) {
+                    return "ibex::ops::filter_col_side(\"" + escape_string(node.name) +
+                           "\", ibex::ir::JoinSide::" +
+                           (node.side == ir::JoinSide::Left ? "Left" : "Right") + ")";
+                }
                 return "ibex::ops::filter_col(\"" + escape_string(node.name) + "\")";
             } else if constexpr (std::is_same_v<T, ir::Literal>) {
                 return std::visit(

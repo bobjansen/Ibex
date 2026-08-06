@@ -1554,4 +1554,73 @@ TEST_CASE("Parse outer(...) capture requires a bare column name") {
     REQUIRE_FALSE(parse("t[filter k == outer()];").has_value());
 }
 
+TEST_CASE("Parse left(...) / right(...) side-qualified references in a join predicate") {
+    auto result = parse("a join b on left(ts) >= right(start) && left(ts) < right(end);");
+    REQUIRE(result.has_value());
+    const auto& expr_stmt = std::get<ExprStmt>(result->statements.front());
+    const auto* join = std::get_if<JoinExpr>(&require_expr(expr_stmt.expr).node);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->keys.empty());  // a predicate, not an equikey
+    REQUIRE(join->predicate.has_value());
 
+    // left(ts) >= right(start)
+    const auto& conjunction = require_binary(require_expr(*join->predicate), BinaryOp::And);
+    const auto& first = require_binary(require_expr(conjunction.left), BinaryOp::Ge);
+    const auto* lhs = std::get_if<CallExpr>(&first.left->node);
+    REQUIRE(lhs != nullptr);
+    REQUIRE(lhs->callee == "left");
+    REQUIRE(lhs->args.size() == 1);
+    const auto* lhs_col = std::get_if<IdentifierExpr>(&lhs->args[0]->node);
+    REQUIRE(lhs_col != nullptr);
+    REQUIRE(lhs_col->name == "ts");
+
+    const auto* rhs = std::get_if<CallExpr>(&first.right->node);
+    REQUIRE(rhs != nullptr);
+    REQUIRE(rhs->callee == "right");
+    const auto* rhs_col = std::get_if<IdentifierExpr>(&rhs->args[0]->node);
+    REQUIRE(rhs_col != nullptr);
+    REQUIRE(rhs_col->name == "start");
+}
+
+TEST_CASE("Parse left(...) / right(...) do not shadow the join operators") {
+    // `left` and `right` stay join keywords; only the call form is an operand.
+    for (const char* source : {"a left join b on k;", "a right join b on k;"}) {
+        INFO(source);
+        auto joined = parse(source);
+        REQUIRE(joined.has_value());
+        const auto& expr_stmt = std::get<ExprStmt>(joined->statements.front());
+        const auto* join = std::get_if<JoinExpr>(&require_expr(expr_stmt.expr).node);
+        REQUIRE(join != nullptr);
+    }
+    // A predicate followed by another join operator still parses as two joins.
+    auto chained = parse("a join b on left(x) < right(y) left join c on k;");
+    REQUIRE(chained.has_value());
+}
+
+TEST_CASE("Parse reports a failed left operand instead of building a null node") {
+    // A primary that consumes tokens before failing used to leave its error
+    // behind: the binary levels checked only their right operand, so the
+    // operator that followed happily built a node with a null left child and
+    // the real diagnostic was lost (surfacing much later as a lowering error,
+    // or a crash on a walk that dereferenced it).
+    for (const char* source : {"t[filter ^ < 5];", "t[filter ^ + 1 > 2];", "t[filter ^ * 2 == 4];",
+                               "t[filter ^ && b];", "t[filter ^ || b];", "t[filter ^ != 1];"}) {
+        INFO(source);
+        auto result = parse(source);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().message.find("'^' must be followed by an identifier") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("Parse left(...) / right(...) require a bare column name") {
+    REQUIRE_FALSE(parse("a join b on left(1 + 2) < right(y);").has_value());
+    REQUIRE_FALSE(parse("a join b on left() < right(y);").has_value());
+    // `^name` is a scalar binding, never a column of either input.
+    REQUIRE_FALSE(parse("a join b on left(^x) < right(y);").has_value());
+    // An unclosed qualifier reports its own error rather than being swallowed
+    // by the comparison that follows it.
+    auto unclosed = parse("a join b on left(x < right(y);");
+    REQUIRE_FALSE(unclosed.has_value());
+    CHECK(unclosed.error().message.find("expected ')' after left(column)") != std::string::npos);
+}

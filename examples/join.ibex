@@ -40,3 +40,13 @@ iris anti join species_meta on Species;
 // Cross join returns the cartesian product
 print("cross join — cartesian product of both sides:");
 iris cross join species_meta;
+
+// A non-equijoin predicate compares columns across the two inputs. Both sides
+// here come from the same file, so every name exists twice — `left(...)` and
+// `right(...)` say which input is meant. A bare name would be ambiguous and is
+// rejected rather than resolved by a rule you would have to remember.
+print("non-equijoin — flowers wider than the row they are paired with:");
+iris[filter Species == "setosa"]
+    join species_meta[filter Species == "virginica"]
+    on left(`Sepal.Width`) > right(`Sepal.Width`)
+       && left(`Petal.Length`) < right(`Petal.Length`);

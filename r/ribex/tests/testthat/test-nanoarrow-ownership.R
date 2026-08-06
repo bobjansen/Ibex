@@ -133,6 +133,7 @@ test_that("mutation detaches only the written external column", {
 })
 
 test_that("failed adoption leaves the caller's nanoarrow array valid", {
+    skip_if_not_installed("arrow")
     # Needs a type Ibex genuinely cannot import. An integer column used to serve
     # here; it is supported now, so this uses uint64, which cannot be widened
     # into Ibex's Int64 without losing values.

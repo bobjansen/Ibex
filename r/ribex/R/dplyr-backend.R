@@ -233,6 +233,11 @@ ibex_render_plan <- function(x, redact = FALSE) {
                 "]"
             ),
             distinct = paste0(code, "[distinct { ", paste(vapply(step$names, ibex_quote_identifier, character(1)), collapse = ", "), " }]"),
+            join = paste0(
+                "(", code, if (identical(step$join_kind, "left")) " left join " else " join ",
+                sub(";$", "", ibex_render_plan(step$right)), " on { ",
+                paste(vapply(step$keys, ibex_quote_identifier, character(1)), collapse = ", "), " })"
+            ),
             rlang::abort(paste0("Unknown ibex lazy-plan step: ", step$kind))
         )
     }
@@ -361,8 +366,10 @@ ibex_capture_scalar <- function(state, value, expr) {
     list(code = paste0("^", name), type = if (inherits(value, "Date")) "Date" else if (inherits(value, "POSIXct")) "Timestamp" else if (is.logical(value)) "Bool" else if (is.integer(value)) "Int64" else if (is.double(value)) "Float64" else "String", nullable = FALSE, aggregate = FALSE, refs = character())
 }
 
-ibex_expr_result <- function(code, type = "Unknown", nullable = TRUE, aggregate = FALSE, refs = character()) {
-    list(code = code, type = type, nullable = nullable, aggregate = aggregate, refs = unique(refs))
+ibex_expr_result <- function(code, type = "Unknown", nullable = TRUE, aggregate = FALSE,
+                             refs = character(), rank = FALSE) {
+    list(code = code, type = type, nullable = nullable, aggregate = aggregate,
+         refs = unique(refs), rank = rank)
 }
 
 ibex_column_expr <- function(name, x) {
@@ -385,7 +392,9 @@ ibex_call_identity <- function(head, env) {
         pmin = base::pmin, pmax = base::pmax, sum = base::sum, mean = base::mean,
         min = base::min, max = base::max, is.na = base::is.na, is.nan = base::is.nan,
         coalesce = dplyr::coalesce, between = dplyr::between, first = dplyr::first,
-        last = dplyr::last, n = dplyr::n
+        last = dplyr::last, n = dplyr::n, min_rank = dplyr::min_rank,
+        dense_rank = dplyr::dense_rank, row_number = dplyr::row_number,
+        cume_dist = dplyr::cume_dist
     )
     if (!name %in% names(known)) return(NULL)
     resolved <- tryCatch(rlang::eval_bare(head, env), error = function(e) NULL)
@@ -413,6 +422,27 @@ ibex_translate_expr <- function(expr, quo_env, x, context, state, inside_aggrega
     head <- expr[[1]]
     operator <- if (is.symbol(head)) as.character(head) else NULL
     if (identical(operator, "(")) return(ibex_translate_expr(expr[[2]], quo_env, x, context, state, inside_aggregate))
+
+    if (identical(operator, "%in%")) {
+        if (length(expr) != 3L) ibex_unsupported("`%in%` requires a value and a vector of candidates.", expr)
+        value <- ibex_translate_expr(expr[[2]], quo_env, x, context, state, inside_aggregate)
+        candidates <- tryCatch(rlang::eval_bare(expr[[3]], quo_env), error = function(e) e)
+        if (inherits(candidates, "error") || !is.atomic(candidates) || is.object(candidates)) {
+            ibex_unsupported("Native `%in%` requires an atomic candidate vector.", expr)
+        }
+        if (!length(candidates)) return(ibex_expr_result("false", "Bool", FALSE, FALSE, value$refs))
+        non_missing <- candidates[!is.na(candidates)]
+        comparisons <- vapply(seq_along(non_missing), function(i) {
+            candidate <- ibex_capture_scalar(state, non_missing[[i]], expr[[3]])
+            paste0("(", value$code, " == ", candidate$code, ")")
+        }, character(1))
+        if (anyNA(candidates)) comparisons <- c(comparisons, paste0("is_null(", value$code, ")"))
+        if (!length(comparisons)) return(ibex_expr_result("false", "Bool", FALSE, FALSE, value$refs))
+        return(ibex_expr_result(
+            paste0("(", paste(comparisons, collapse = " || "), ")"),
+            "Bool", value$nullable, value$aggregate, value$refs
+        ))
+    }
 
     if (!is.null(operator) && operator %in% c("+", "-", "*", "/", "%%", "==", "!=", "<", "<=", ">", ">=", "&", "|")) {
         if (length(expr) == 2L && operator %in% c("+", "-")) {
@@ -454,6 +484,25 @@ ibex_translate_expr <- function(expr, quo_env, x, context, state, inside_aggrega
     if (identity %in% c("dplyr::n")) {
         if (length(args)) ibex_unsupported("`n()` takes no arguments.", expr)
         return(ibex_expr_result("count()", "Int64", FALSE, TRUE))
+    }
+    if (identity %in% c("dplyr::min_rank", "dplyr::dense_rank", "dplyr::row_number", "dplyr::cume_dist")) {
+        if (length(args) != 1L || any(nzchar(arg_names))) {
+            ibex_unsupported("Native rank helpers require exactly one column.", expr)
+        }
+        value <- ibex_translate_expr(args[[1]], quo_env, x, context, state, inside_aggregate)
+        if (value$aggregate) ibex_unsupported("Rank helpers cannot rank an aggregate.", expr)
+        rank_spec <- switch(
+            identity,
+            "dplyr::min_rank" = "method = min",
+            "dplyr::dense_rank" = "method = dense",
+            "dplyr::row_number" = "method = first",
+            "dplyr::cume_dist" = "method = max, pct = true"
+        )
+        return(ibex_expr_result(
+            paste0("rank(", value$code, ", ", rank_spec, ")"),
+            if (identity == "dplyr::cume_dist") "Float64" else "Int64",
+            value$nullable, FALSE, value$refs, rank = TRUE
+        ))
     }
     if (identity %in% c("base::sum", "base::mean", "base::min", "base::max", "dplyr::first", "dplyr::last")) {
         fn <- sub(".*::", "", identity)
@@ -618,7 +667,7 @@ ibex_mutate_impl <- function(.data, dots, keep = "all", before = NULL, after = N
             if (length(out$groups) && translated$aggregate && !all(translated$refs %in% out$groups)) {
                 ibex_unsupported("Grouped mutate expressions may only reference grouping keys outside aggregate calls.", rlang::quo_get_expr(dots[[i]]))
             }
-            step_groups <- if (length(out$groups) && translated$aggregate) out$groups else character()
+            step_groups <- if (length(out$groups) && (translated$aggregate || translated$rank)) out$groups else character()
             schema <- out$schema
             pos <- match(name, schema$names)
             if (is.na(pos)) {
@@ -849,7 +898,9 @@ tally.ibex_tbl <- function(x, wt = NULL, sort = FALSE, name = NULL) {
         rlang::new_quosure(rlang::expr(base::sum(!!rlang::quo_get_expr(wt), na.rm = TRUE)), rlang::quo_get_env(wt))
     }
     dots <- stats::setNames(list(aggregate), output)
-    result <- rlang::inject(summarise(x, !!!dots, .groups = "keep"))
+    # tally() follows summarise()'s default grouping contract: each tally
+    # consumes the last grouping key while retaining any preceding keys.
+    result <- rlang::inject(summarise(x, !!!dots, .groups = "drop_last"))
     if (inherits(result, "ibex_tbl") && isTRUE(sort)) {
         order_quo <- rlang::new_quosure(rlang::expr(dplyr::desc(!!as.name(output))), rlang::caller_env())
         result <- rlang::inject(arrange(result, !!order_quo))
@@ -885,18 +936,96 @@ ibex_join_fallback <- function(x, y, verb, by, copy, suffix, ..., keep = NULL,
     })
 }
 
+ibex_join_right_names <- function(x, y, keys) {
+    right <- setdiff(y$schema$names, keys)
+    output <- x$schema$names
+    vapply(right, function(name) {
+        candidate <- name
+        while (candidate %in% output) candidate <- paste0(candidate, "_right")
+        output <<- c(output, candidate)
+        candidate
+    }, character(1))
+}
+
+ibex_join_schema <- function(x, y, keys, kind) {
+    right <- setdiff(y$schema$names, keys)
+    right_schema <- lapply(y$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[match(right, y$schema$names)])
+    right_schema$names <- ibex_join_right_names(x, y, keys)
+    if (identical(kind, "left")) right_schema$nullable[] <- TRUE
+    schema <- lapply(x$schema[c("names", "types", "nullable", "categorical", "timezone")], identity)
+    for (field in names(right_schema)) schema[[field]] <- c(schema[[field]], right_schema[[field]])
+    schema$rows <- NA_real_
+    schema
+}
+
+ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
+                             na_matches, multiple, unmatched, relationship) {
+    dots <- rlang::list2(...)
+    if (length(dots) || isTRUE(copy) || !(is.null(keep) || identical(keep, FALSE)) ||
+        !identical(na_matches, "never") || !identical(multiple, "all") ||
+        !identical(unmatched, "drop") || !is.null(relationship)) {
+        ibex_unsupported("Native joins currently require simple equality keys, `na_matches = \"never\"`, and default join options.")
+    }
+    if (!inherits(y, "ibex_tbl")) y <- ibex_tbl(y, session = x$session, fallback = x$fallback_policy)
+    if (!identical(x$session, y$session)) ibex_unsupported("Native joins require both inputs to use the same Ibex session.")
+    if (length(x$captured_scalars) || length(y$captured_scalars)) ibex_unsupported("Native joins with captured scalar prefixes are not supported yet.")
+    if (is.null(by)) by <- intersect(x$schema$names, y$schema$names)
+    if (!is.character(by) || !length(by)) {
+        ibex_unsupported("Native joins currently require same-named character `by` keys.")
+    }
+    keys <- if (is.null(names(by))) by else {
+        if (!identical(unname(by), names(by))) ibex_unsupported("Native joins require same-named keys.")
+        unname(by)
+    }
+    if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
+        ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
+    }
+    schema <- ibex_join_schema(x, y, keys, kind)
+    result <- ibex_append_step(
+        x, list(kind = "join", join_kind = kind, right = y, keys = keys),
+        schema = schema, groups = character(), ordering = NULL
+    )
+    overlap <- intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
+    if (!length(overlap)) return(result)
+    if (length(suffix) != 2L || any(!nzchar(suffix))) ibex_unsupported("Native joins require two non-empty suffixes.")
+    native_right_names <- ibex_join_right_names(x, y, keys)
+    mappings <- c(
+        stats::setNames(paste0(overlap, suffix[[1]]), overlap),
+        stats::setNames(paste0(overlap, suffix[[2]]), native_right_names[match(overlap, setdiff(y$schema$names, keys))])
+    )
+    rename_dots <- rlang::syms(names(mappings))
+    names(rename_dots) <- unname(mappings)
+    rlang::inject(rename.ibex_tbl(result, !!!rename_dots))
+}
+
 inner_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,
                                 keep = NULL, na_matches = c("na", "never"), multiple = "all",
                                 unmatched = "drop", relationship = NULL) {
-    ibex_join_fallback(x, y, "inner_join", by, copy, suffix, ..., keep = keep,
-                       na_matches = na_matches, multiple = multiple,
-                       unmatched = unmatched, relationship = relationship)
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "inner_join", function() {
+        ibex_native_join(x, y, "inner", by, copy, suffix, ..., keep = keep,
+                         na_matches = na_matches, multiple = multiple,
+                         unmatched = unmatched, relationship = relationship)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::inner_join(local, right, by = by, copy = copy, suffix = suffix, ...,
+                          keep = keep, na_matches = na_matches, multiple = multiple,
+                          unmatched = unmatched, relationship = relationship)
+    })
 }
 
 left_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,
                                keep = NULL, na_matches = c("na", "never"), multiple = "all",
                                unmatched = "drop", relationship = NULL) {
-    ibex_join_fallback(x, y, "left_join", by, copy, suffix, ..., keep = keep,
-                       na_matches = na_matches, multiple = multiple,
-                       unmatched = unmatched, relationship = relationship)
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "left_join", function() {
+        ibex_native_join(x, y, "left", by, copy, suffix, ..., keep = keep,
+                         na_matches = na_matches, multiple = multiple,
+                         unmatched = unmatched, relationship = relationship)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::left_join(local, right, by = by, copy = copy, suffix = suffix, ...,
+                         keep = keep, na_matches = na_matches, multiple = multiple,
+                         unmatched = unmatched, relationship = relationship)
+    })
 }

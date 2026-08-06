@@ -9,5 +9,9 @@ let rhs = Table {
     ts = [15, 25],
     v = [7, 8]
 };
-let j = lhs join rhs on left(ts) < right(ts) && left(v) < right(v);
+// A theta join folds no keys, so both shared names collide in the output and
+// the clause names them; the predicate's qualifiers are a separate mechanism
+// reading the inputs.
+let j = lhs join rhs on left(ts) < right(ts) && left(v) < right(v)
+    suffix { "", "_right" };
 j[select { ts, v, ts_right, v_right }][order { ts asc, ts_right asc }];

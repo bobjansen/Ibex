@@ -298,6 +298,20 @@ struct JoinKey {
     auto operator==(const JoinKey&) const -> bool = default;
 };
 
+/// A join's `suffix { "_left", "_right" }` clause (SPEC.md Section 5.6).
+///
+/// Absent, a non-key collision between the two inputs is an error. Present, it
+/// renames both sides of each collision; an empty string on a side leaves that
+/// side's name alone. Suffixes apply to collisions only, never to every
+/// column.
+struct JoinSuffixPolicy {
+    bool present = false;
+    std::string left;
+    std::string right;
+
+    auto operator==(const JoinSuffixPolicy&) const -> bool = default;
+};
+
 [[nodiscard]] inline auto left_join_key_names(const std::vector<JoinKey>& keys)
     -> std::vector<std::string> {
     std::vector<std::string> names;
@@ -703,22 +717,25 @@ class ExternCallNode final : public Node {
 class JoinNode final : public Node {
    public:
     JoinNode(NodeId id, JoinKind kind, std::vector<JoinKey> keys,
-             std::optional<Expr> predicate = std::nullopt)
+             std::optional<Expr> predicate = std::nullopt, JoinSuffixPolicy suffix = {})
         : Node(NodeKind::Join, id),
           kind_(kind),
           keys_(std::move(keys)),
-          predicate_(std::move(predicate)) {}
+          predicate_(std::move(predicate)),
+          suffix_(std::move(suffix)) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
     [[nodiscard]] auto predicate() const noexcept -> const std::optional<Expr>& {
         return predicate_;
     }
+    [[nodiscard]] auto suffix() const noexcept -> const JoinSuffixPolicy& { return suffix_; }
 
    private:
     JoinKind kind_;
     std::vector<JoinKey> keys_;
     std::optional<Expr> predicate_;
+    JoinSuffixPolicy suffix_;
 };
 
 /// ResampleNode: time-bucket aggregation on a TimeFrame.

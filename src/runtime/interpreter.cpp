@@ -784,7 +784,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys(), pred,
-                                   scalars, compute_mask);
+                                   scalars, compute_mask, join.suffix());
         }
         case ir::NodeKind::Melt: {
             const auto& mn = static_cast<const ir::MeltNode&>(node);
@@ -1510,8 +1510,9 @@ auto invoke_table_consumer(const ExternRegistry& externs, const std::string& cal
 
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                  const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
-                 const ScalarRegistry* scalars) -> std::expected<Table, std::string> {
-    return join_table_impl(left, right, kind, keys, predicate, scalars, compute_mask);
+                 const ScalarRegistry* scalars, const ir::JoinSuffixPolicy& suffix)
+    -> std::expected<Table, std::string> {
+    return join_table_impl(left, right, kind, keys, predicate, scalars, compute_mask, suffix);
 }
 
 auto extract_scalar(const Table& table, const std::string& column)

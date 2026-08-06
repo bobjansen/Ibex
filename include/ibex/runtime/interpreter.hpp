@@ -682,7 +682,8 @@ class ExternRegistry;
 [[nodiscard]] auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                                const std::vector<ir::JoinKey>& keys,
                                const ir::Expr* predicate = nullptr,
-                               const ScalarRegistry* scalars = nullptr)
+                               const ScalarRegistry* scalars = nullptr,
+                               const ir::JoinSuffixPolicy& suffix = {})
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)

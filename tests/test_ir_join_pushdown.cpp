@@ -37,9 +37,15 @@ auto make_scan(ir::NodeId id, std::string name) -> ir::NodePtr {
     return std::make_unique<ir::ScanNode>(id, std::move(name));
 }
 
+// `a` and `b` both carry `shared`, which is a collision the planner will not
+// resolve on its own. These tests are about where a filter lands, not about
+// output names, so every join here carries the clause that reproduces the old
+// automatic naming -- without it inference returns Unknown and nothing pushes.
 auto make_join(ir::NodeId id, ir::JoinKind kind, std::vector<ir::JoinKey> keys, ir::NodePtr left,
                ir::NodePtr right) -> ir::NodePtr {
-    auto join = std::make_unique<ir::JoinNode>(id, kind, std::move(keys));
+    auto join = std::make_unique<ir::JoinNode>(
+        id, kind, std::move(keys), std::nullopt,
+        ir::JoinSuffixPolicy{.present = true, .left = "", .right = "_right"});
     join->add_child(std::move(left));
     join->add_child(std::move(right));
     return join;

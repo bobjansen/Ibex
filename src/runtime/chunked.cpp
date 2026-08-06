@@ -3085,8 +3085,12 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 /// `join_table_impl`.
 class ChunkedInnerJoinOperator final : public Operator {
    public:
-    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys)
-        : left_(std::move(left)), right_(std::move(right)), keys_(keys) {}
+    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
+                             ir::JoinSuffixPolicy suffix = {})
+        : left_(std::move(left)),
+          right_(std::move(right)),
+          keys_(keys),
+          suffix_(std::move(suffix)) {}
 
     /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
     /// its Project/Rename wrappers), interpreted only after this join has
@@ -3097,7 +3101,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const TableRegistry* registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const ExecutionContext& exec,
                              const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
-                             std::string probe_name)
+                             std::string probe_name, ir::JoinSuffixPolicy suffix = {})
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
@@ -3106,7 +3110,8 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_registry_(registry),
           deferred_scalars_(scalars),
           deferred_externs_(externs),
-          deferred_exec_(&exec) {}
+          deferred_exec_(&exec),
+          suffix_(std::move(suffix)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -3669,9 +3674,23 @@ class ChunkedInnerJoinOperator final : public Operator {
     // on the same output schema as the materialized route and IR inference.
     // The left column names are identical for every chunk, so the plan is
     // computed once from the first assembled chunk.
-    void setup_right_emit_schema(const Table& left_side) {
-        const std::vector<ir::JoinOutputColumn> plan = ir::plan_join_output(
-            ir::JoinKind::Inner, *keys_, table_column_names(left_side), table_column_names(right_));
+    auto setup_right_emit_schema(const Table& left_side) -> std::expected<void, std::string> {
+        auto planned =
+            ir::plan_join_output(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
+                                 table_column_names(right_), suffix_);
+        if (!planned.has_value()) {
+            return std::unexpected(std::move(planned.error()));
+        }
+        const std::vector<ir::JoinOutputColumn>& plan = *planned;
+        // A suffix clause renames the *left* side of a collision too, so the
+        // left names come from the plan as well; taking them from the chunk
+        // would keep the pre-rename spelling.
+        left_emit_names_.reserve(left_side.columns.size());
+        for (const auto& column : plan) {
+            if (column.side == ir::JoinOutputSide::Left) {
+                left_emit_names_.push_back(column.name);
+            }
+        }
         right_emit_idx_.reserve(plan.size() - left_side.columns.size());
         right_emit_names_.reserve(plan.size() - left_side.columns.size());
         for (const auto& column : plan) {
@@ -3682,6 +3701,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             right_emit_names_.push_back(column.name);
         }
         right_emit_ready_ = true;
+        return {};
     }
 
     // Stream mode: walk the probe side (a left chunk), for each row look
@@ -4047,7 +4067,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             return output;
         }
         if (!right_emit_ready_) {
-            setup_right_emit_schema(left_side);
+            if (auto ready = setup_right_emit_schema(left_side); !ready.has_value()) {
+                return std::unexpected(std::move(ready.error()));
+            }
         }
         output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
 
@@ -4071,18 +4093,25 @@ class ChunkedInnerJoinOperator final : public Operator {
         // can be passed through directly (shared_ptr share) instead of
         // gathered. Do NOT move the underlying ColumnValue — the shared_ptr
         // may be aliased by upstream state (e.g., re-runnable source).
+        const auto left_name = [&](std::size_t i, const ColumnEntry& lc) -> const std::string& {
+            return i < left_emit_names_.size() ? left_emit_names_[i] : lc.name;
+        };
         if (li_identity && total == left_side.rows()) {
-            for (auto& lc : left_side.columns) {
-                output.index[lc.name] = output.columns.size();
+            for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
+                auto& lc = left_side.columns[i];
+                std::string name = left_name(i, lc);
+                lc.name = name;
+                output.index[std::move(name)] = output.columns.size();
                 output.columns.push_back(std::move(lc));
             }
         } else {
-            for (const auto& lc : left_side.columns) {
+            for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
+                const auto& lc = left_side.columns[i];
                 auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
                 if (val.has_value()) {
-                    output.add_column(lc.name, std::move(gathered), std::move(*val));
+                    output.add_column(left_name(i, lc), std::move(gathered), std::move(*val));
                 } else {
-                    output.add_column(lc.name, std::move(gathered));
+                    output.add_column(left_name(i, lc), std::move(gathered));
                 }
             }
         }
@@ -4142,7 +4171,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         string_heads_;
     std::vector<std::size_t> right_emit_idx_;
     std::vector<std::string> right_emit_names_;
+    std::vector<std::string> left_emit_names_;
     bool right_emit_ready_ = false;
+    ir::JoinSuffixPolicy suffix_;
 
     // Stream mode: when right > threshold and left >= right, left was
     // materialized to measure but not swapped; replay as a single chunk.
@@ -8255,7 +8286,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 probe.scan != nullptr) {
                 return std::make_unique<ChunkedInnerJoinOperator>(
                     std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, exec, &join.keys(), probe.scan, *probe.name);
+                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix());
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
@@ -8267,14 +8298,14 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(std::move(right.error()));
             }
             return std::make_unique<ChunkedInnerJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), &join.keys());
+                std::move(left_op.value()), std::move(right.value()), &join.keys(), join.suffix());
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(
             *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
-                                       compute_mask);
+                                       compute_mask, join.suffix());
             });
     }
 

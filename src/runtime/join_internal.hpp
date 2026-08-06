@@ -30,7 +30,8 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
 [[nodiscard]] auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                    const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                                    const ScalarRegistry* scalars,
-                                   PredicateMaskEvaluator mask_evaluator)
+                                   PredicateMaskEvaluator mask_evaluator,
+                                   const ir::JoinSuffixPolicy& suffix = {})
     -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

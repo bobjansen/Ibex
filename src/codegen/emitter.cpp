@@ -683,7 +683,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     *out_ << "{\"" << escape_string(key.left) << "\", \""
                           << escape_string(key.right) << "\"}";
                 }
-                *out_ << "}, " << emit_filter_expr(*join.predicate()) << ");\n";
+                *out_ << "}, " << emit_filter_expr(*join.predicate())
+                      << emit_join_suffix(join.suffix()) << ");\n";
                 return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
@@ -699,7 +700,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 }
                 *out_ << "}";
             }
-            *out_ << ");\n";
+            *out_ << emit_join_suffix(join.suffix()) << ");\n";
             return var;
         }
 
@@ -1135,6 +1136,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
     }
     // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     throw std::runtime_error("ibex_compile: unknown IR node kind");
+}
+
+auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix) -> std::string {
+    if (!suffix.present) {
+        return "";
+    }
+    return ", ibex::ir::JoinSuffixPolicy{.present = true, .left = \"" +
+           escape_string(suffix.left) + "\", .right = \"" + escape_string(suffix.right) + "\"}";
 }
 
 auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {

@@ -57,6 +57,7 @@ enum class TokenKind : std::uint8_t {
     KeywordCross,
     KeywordAsof,
     KeywordOn,
+    KeywordSuffix,
     KeywordIs,
     KeywordNull,
     KeywordNot,

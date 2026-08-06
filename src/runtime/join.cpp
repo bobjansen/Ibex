@@ -417,8 +417,8 @@ auto resolve_predicate_sides(const ir::Expr& predicate, const Table& left, const
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
-                     const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator)
-    -> std::expected<Table, std::string> {
+                     const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
+                     const ir::JoinSuffixPolicy& suffix) -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
@@ -534,8 +534,26 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
     // The output column list and its collision names come from the shared
     // planner (see ir/join_output.hpp), the same one IR schema inference uses.
-    const std::vector<ir::JoinOutputColumn> plan =
-        ir::plan_join_output(kind, keys, table_column_names(left), table_column_names(right));
+    // Resolve the predicate before planning the output. Both an ambiguous
+    // predicate name and an output collision can be true of the same join, and
+    // the predicate is the more actionable of the two: a suffix clause renames
+    // output columns but leaves `on v < v` just as ambiguous, so reporting the
+    // collision first would send the reader to the wrong fix.
+    std::optional<ir::Expr> resolved_predicate;
+    if (predicate != nullptr) {
+        auto resolved = resolve_predicate_sides(*predicate, left, right);
+        if (!resolved.has_value()) {
+            return std::unexpected(std::move(resolved.error()));
+        }
+        resolved_predicate = std::move(*resolved);
+    }
+
+    auto planned = ir::plan_join_output(kind, keys, table_column_names(left),
+                                        table_column_names(right), suffix);
+    if (!planned.has_value()) {
+        return std::unexpected(std::move(planned.error()));
+    }
+    const std::vector<ir::JoinOutputColumn>& plan = *planned;
 
     Table output;
     output.columns.reserve(plan.size());
@@ -723,11 +741,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 {.column = entry.column.get(), .batch_name = nlj_right_batch_name(entry.name)});
         }
 
-        auto resolved = resolve_predicate_sides(*predicate, left, right);
-        if (!resolved.has_value()) {
-            return std::unexpected(std::move(resolved.error()));
-        }
-        const ir::Expr& batch_predicate = *resolved;
+        // Resolved once, above, so its diagnostics precede the output plan's.
+        const ir::Expr& batch_predicate = *resolved_predicate;
 
         std::vector<std::size_t> left_idx;
         std::vector<std::size_t> right_idx;
@@ -746,7 +761,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 for (std::size_t j = 0; j < n_right; ++j) {
                     append_value(col, *left.columns[ci].column, l);
                 }
-                batch.add_column(output.columns[ci].name, std::move(col));
+                // The predicate reads the *inputs* (SPEC.md Section 5.6), so
+                // the batch carries the left column's own name. Using the
+                // output name here was invisible until a suffix clause made
+                // the two differ, and then `left(v)` could not find `v`.
+                batch.add_column(left.columns[ci].name, std::move(col));
             }
             for (const auto& item : nlj_right) {
                 batch.add_column(item.batch_name, *item.column);

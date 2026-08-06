@@ -190,8 +190,14 @@ TEST_CASE("schema: a mapped join carries the right's proof under its own name", 
     // The old rule refused every mapped join outright. The right key column is
     // retained natively, so the proof it carries is still about an output
     // column -- `right_id`.
-    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
-                            std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}});
+    //
+    // Both sides also carry `val`, which is a collision now that the planner
+    // no longer renames one silently; the suffix clause is incidental to the
+    // proof being tested, but without it there is no output schema at all.
+    ibex::ir::JoinNode join(
+        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+        std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}}, std::nullopt,
+        ibex::ir::JoinSuffixPolicy{.present = true, .left = "_l", .right = "_r"});
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
 
@@ -209,10 +215,14 @@ TEST_CASE("schema: a mapped join carries the right's proof under its own name", 
 }
 
 TEST_CASE("schema: a proof on a renamed right column follows the rename", "[ir][schema]") {
-    // `code` collides, so the planner emits the right one as `code_right`; the
-    // right's proof is about that output column, not the left `code`.
-    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
-                            std::vector<ibex::ir::JoinKey>{{"id", "id"}});
+    // `code` collides, and the suffix clause emits the right one as
+    // `code_right`; the right's proof is about that output column, not the
+    // left `code`. An empty left suffix keeps the left name untouched, which
+    // is what makes the two spellings distinguishable here.
+    ibex::ir::JoinNode join(
+        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+        std::vector<ibex::ir::JoinKey>{{"id", "id"}}, std::nullopt,
+        ibex::ir::JoinSuffixPolicy{.present = true, .left = "", .right = "_right"});
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
 
@@ -230,7 +240,8 @@ TEST_CASE("schema: a proof on a renamed right column follows the rename", "[ir][
 }
 
 TEST_CASE("schema: a join between two non-unique sides proves nothing", "[ir][schema]") {
-    auto s = schema_of("t join t on a;", base_sources());
+    // A self-join collides on every non-key column, so it needs the clause.
+    auto s = schema_of("t join t on a suffix { \"\", \"_right\" };", base_sources());
     REQUIRE(s.is_known());
     REQUIRE(s.unique_keys().empty());
 }
@@ -325,8 +336,10 @@ TEST_CASE("schema: join unions both sides, deduplicating shared keys", "[ir][sch
 }
 
 TEST_CASE("schema: mapped join retains both differently named keys", "[ir][schema]") {
-    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
-                            std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}});
+    ibex::ir::JoinNode join(
+        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+        std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}}, std::nullopt,
+        ibex::ir::JoinSuffixPolicy{.present = true, .left = "", .right = "_right"});
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
 

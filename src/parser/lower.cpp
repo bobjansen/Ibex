@@ -305,7 +305,8 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
                               .left = clone_expr(*node.left),
                               .right = clone_expr(*node.right),
                               .keys = node.keys,
-                              .predicate = {}};
+                              .predicate = {},
+                              .suffix = node.suffix};
                 if (node.predicate.has_value()) {
                     join.predicate = clone_expr(**node.predicate);
                 }
@@ -1860,7 +1861,13 @@ class Lowerer {
             }
         }
 
-        auto node = builder_.join(kind, std::move(keys), std::move(predicate));
+        ir::JoinSuffixPolicy suffix;
+        if (join.suffix.has_value()) {
+            suffix = ir::JoinSuffixPolicy{
+                .present = true, .left = join.suffix->left, .right = join.suffix->right};
+        }
+
+        auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix));
         node->add_child(std::move(left.value()));
         node->add_child(std::move(right.value()));
         return node;
@@ -4657,7 +4664,8 @@ class Lowerer {
             case ir::NodeKind::Join: {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
-                clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone));
+                clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
+                                      join.suffix());
                 break;
             }
             case ir::NodeKind::Melt: {

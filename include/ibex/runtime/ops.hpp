@@ -139,33 +139,45 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto model_importance(const runtime::ModelResult& m) -> runtime::Table;
 [[nodiscard]] auto model_r_squared(const runtime::ModelResult& m) -> double;
 
+// Each join carries its `suffix { "_l", "_r" }` policy, defaulted to absent.
+// A transpiled join that dropped it would reject a program the interpreter
+// accepts, so the emitter passes it through whenever the clause is present.
+
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys,
+                              const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys,
+                             const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto right_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys,
+                              const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto outer_join(const runtime::Table& left, const runtime::Table& right,
-                              const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                              const std::vector<ir::JoinKey>& keys,
+                              const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto semi_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys,
+                             const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto anti_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys,
+                             const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
-[[nodiscard]] auto cross_join(const runtime::Table& left, const runtime::Table& right)
-    -> runtime::Table;
+[[nodiscard]] auto cross_join(const runtime::Table& left, const runtime::Table& right,
+                              const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
-                             const std::vector<ir::JoinKey>& keys) -> runtime::Table;
+                             const std::vector<ir::JoinKey>& keys,
+                             const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 [[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
                                        ir::JoinKind kind, const std::vector<ir::JoinKey>& keys,
-                                       const ir::Expr& predicate) -> runtime::Table;
+                                       const ir::Expr& predicate,
+                                       const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
 
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 

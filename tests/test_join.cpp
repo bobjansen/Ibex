@@ -228,18 +228,42 @@ TEST_CASE("join: multi-key join and duplicate column names", "[join]") {
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    auto out = interpret_expr("lhs join rhs on {k1, k2};", tables);
+    // Both same-name keys fold, so neither needs the clause; only the non-key
+    // `val` collides and is renamed on both sides.
+    auto out = interpret_expr(R"(lhs join rhs on {k1, k2} suffix { "_l", "_r" };)", tables);
 
     CHECK(out.rows() == 2);
     CHECK(out.find("k1") != nullptr);
     CHECK(out.find("k2") != nullptr);
-    CHECK(out.find("val") != nullptr);
-    CHECK(out.find("val_right") != nullptr);
-    CHECK(out.find("k1_right") == nullptr);
-    CHECK(out.find("k2_right") == nullptr);
-    CHECK(col_i64(out, "val") == std::vector<std::int64_t>{10, 20});
-    CHECK(col_i64(out, "val_right") == std::vector<std::int64_t>{100, 200});
+    CHECK(out.find("val_l") != nullptr);
+    CHECK(out.find("val_r") != nullptr);
+    CHECK(out.find("val") == nullptr);
+    CHECK(out.find("k1_l") == nullptr);
+    CHECK(out.find("k1_r") == nullptr);
+    CHECK(out.find("k2_l") == nullptr);
+    CHECK(out.find("k2_r") == nullptr);
+    CHECK(col_i64(out, "val_l") == std::vector<std::int64_t>{10, 20});
+    CHECK(col_i64(out, "val_r") == std::vector<std::int64_t>{100, 200});
     CHECK(col_str(out, "k2") == std::vector<std::string>{"A", "B"});
+}
+
+TEST_CASE("join: a non-key collision without a suffix clause is rejected", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+    lhs.add_column("val", Column<std::int64_t>{10, 20});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2});
+    rhs.add_column("val", Column<std::int64_t>{100, 200});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const auto err = interpret_error("lhs join rhs on id;", tables);
+    CHECK(err.find("\"val\"") != std::string::npos);
+    CHECK(err.find("both inputs") != std::string::npos);
+    CHECK(err.find("suffix") != std::string::npos);
 }
 
 TEST_CASE("join: asof join matches latest right row at-or-before left time", "[join]") {
@@ -1238,8 +1262,9 @@ auto inferred_names(std::string_view src, const ir::SourceSchemas& sources)
 
 TEST_CASE("join: inferred output names match the materialized ones for every kind",
           "[join][schema]") {
-    // "val" collides, and so does the "val_right" that renaming it would
-    // produce, so the right side has to suffix twice.
+    // "val" collides. The clause renames both sides of it; "val_right" is a
+    // left-only column and so is left alone, which is the distinction between
+    // "suffix the collisions" and "suffix the right side".
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
     lhs.add_column("val", Column<std::int64_t>{10, 20, 30});
@@ -1261,7 +1286,9 @@ TEST_CASE("join: inferred output names match the materialized ones for every kin
                                        {.name = "val", .type = ir::ColumnType::Int64}})},
     };
 
-    const std::vector<std::string> both{"id", "val", "val_right", "val_right_right"};
+    const std::vector<std::string> both{"id", "val_l", "val_right", "val_r"};
+    // Semi and anti emit no right columns, so nothing collides and the clause
+    // has nothing to apply -- the left side keeps its own spelling.
     const std::vector<std::string> left_only{"id", "val", "val_right"};
 
     struct Case {
@@ -1269,9 +1296,12 @@ TEST_CASE("join: inferred output names match the materialized ones for every kin
         const std::vector<std::string>* want;
     };
     const std::vector<Case> cases{
-        {"lhs join rhs on id;", &both},           {"lhs left join rhs on id;", &both},
-        {"lhs right join rhs on id;", &both},     {"lhs outer join rhs on id;", &both},
-        {"lhs semi join rhs on id;", &left_only}, {"lhs anti join rhs on id;", &left_only},
+        {R"(lhs join rhs on id suffix { "_l", "_r" };)", &both},
+        {R"(lhs left join rhs on id suffix { "_l", "_r" };)", &both},
+        {R"(lhs right join rhs on id suffix { "_l", "_r" };)", &both},
+        {R"(lhs outer join rhs on id suffix { "_l", "_r" };)", &both},
+        {R"(lhs semi join rhs on id suffix { "_l", "_r" };)", &left_only},
+        {R"(lhs anti join rhs on id suffix { "_l", "_r" };)", &left_only},
     };
 
     for (const auto& test : cases) {
@@ -1304,8 +1334,34 @@ TEST_CASE("join: inferred output names match the materialized ones for mapped ke
                                        {.name = "val", .type = ir::ColumnType::Int64}})},
     };
 
-    const std::string_view src = "lhs join rhs on { left_id = right_id };";
+    const std::string_view src =
+        R"(lhs join rhs on { left_id = right_id } suffix { "", "_right" };)";
     const std::vector<std::string> want{"left_id", "val", "right_id", "val_right"};
+    CHECK(column_names(interpret_expr(src, tables)) == want);
+    CHECK(inferred_names(src, sources) == want);
+}
+
+TEST_CASE("join: a mapped key does not fold, so an equal name on both sides collides",
+          "[join][schema]") {
+    // `on { a = b }` keeps both key columns, unlike a same-name key. Nothing
+    // here is a collision, so no clause is needed -- the inverse of the case
+    // above, where the non-key `val` did collide.
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 2});
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{2, 3});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const ir::SourceSchemas sources{
+        {"lhs", ir::SchemaInfo::known({{.name = "a", .type = ir::ColumnType::Int64}})},
+        {"rhs", ir::SchemaInfo::known({{.name = "b", .type = ir::ColumnType::Int64}})},
+    };
+
+    const std::string_view src = "lhs join rhs on { a = b };";
+    const std::vector<std::string> want{"a", "b"};
     CHECK(column_names(interpret_expr(src, tables)) == want);
     CHECK(inferred_names(src, sources) == want);
 }
@@ -1329,7 +1385,8 @@ TEST_CASE("join: inferred output names match the materialized ones for a cross j
         {"rhs", ir::SchemaInfo::known({{.name = "val", .type = ir::ColumnType::Int64}})},
     };
 
-    const std::string_view src = "lhs cross join rhs;";
+    // A cross join has no keys, so nothing folds and `val` simply collides.
+    const std::string_view src = R"(lhs cross join rhs suffix { "", "_right" };)";
     const std::vector<std::string> want{"id", "val", "val_right"};
     CHECK(column_names(interpret_expr(src, tables)) == want);
     CHECK(inferred_names(src, sources) == want);
@@ -1374,12 +1431,17 @@ TEST_CASE("join: swapped-mode inner join names colliding right columns like the 
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    auto out = interpret_expr("lhs join rhs on id;", tables);
+    // Both suffixes are non-empty, so this also pins the *left* rename on this
+    // route. The swapped path emits left columns from the materialized left
+    // side rather than the plan, and took only right names from the planner
+    // until a suffix clause made left renaming possible at all.
+    auto out = interpret_expr(R"(lhs join rhs on id suffix { "_l", "_r" };)", tables);
 
     CHECK(out.rows() == kLeftRows);
-    CHECK(column_names(out) ==
-          std::vector<std::string>{"id", "val", "val_right", "val_right_right"});
-    CHECK(col_i64(out, "val_right_right") == std::vector<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7});
+    CHECK(column_names(out) == std::vector<std::string>{"id", "val_l", "val_right", "val_r"});
+    CHECK(col_i64(out, "val_l") ==
+          std::vector<std::int64_t>{10, 11, 12, 13, 14, 15, 16, 17});
+    CHECK(col_i64(out, "val_r") == std::vector<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7});
 }
 
 // --- Side-qualified predicate references -------------------------------------
@@ -1400,15 +1462,20 @@ TEST_CASE("non-equijoin: left(col) and right(col) name the same column on both s
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
+    // A theta join has no keys, so nothing folds: both `id` and `v` collide
+    // and the clause is what makes the output nameable. Predicate resolution
+    // is independent of it — the qualifiers read the inputs, not the output.
     // left.v < right.v -> (10,15) (10,35) (20,35) (30,35)
-    auto out = interpret_expr("lhs join rhs on left(v) < right(v);", tables);
+    auto out = interpret_expr(
+        R"(lhs join rhs on left(v) < right(v) suffix { "", "_right" };)", tables);
     CHECK(out.rows() == 4);
     CHECK(col_i64(out, "v") == std::vector<std::int64_t>{10, 10, 20, 30});
     CHECK(col_i64(out, "v_right") == std::vector<std::int64_t>{15, 35, 35, 35});
 
     // The mirror image, to prove the sides are not simply swapped somewhere.
     // 10 > {5}; 20 > {15, 5}; 30 > {15, 5} — right rows in their own order.
-    auto flipped = interpret_expr("lhs join rhs on left(v) > right(v);", tables);
+    auto flipped = interpret_expr(
+        R"(lhs join rhs on left(v) > right(v) suffix { "", "_right" };)", tables);
     CHECK(flipped.rows() == 5);
     CHECK(col_i64(flipped, "v") == std::vector<std::int64_t>{10, 20, 20, 30, 30});
     CHECK(col_i64(flipped, "v_right") == std::vector<std::int64_t>{5, 15, 5, 15, 5});

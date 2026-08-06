@@ -344,12 +344,22 @@ struct JoinKey {
     auto operator==(const JoinKey&) const -> bool = default;
 };
 
+/// `suffix { "_left", "_right" }`: how the join renames columns held by both
+/// inputs. Absent, such a collision is an error rather than a silent rename.
+struct JoinSuffix {
+    std::string left;
+    std::string right;
+
+    auto operator==(const JoinSuffix&) const -> bool = default;
+};
+
 struct JoinExpr {
     JoinKind kind = JoinKind::Inner;
     ExprPtr left;
     ExprPtr right;
     std::vector<JoinKey> keys;
     std::optional<ExprPtr> predicate;  ///< non-equijoin predicate (mutually exclusive with keys)
+    std::optional<JoinSuffix> suffix;  ///< absent: a collision is an error
 };
 
 /// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`

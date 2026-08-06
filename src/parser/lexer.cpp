@@ -57,6 +57,7 @@ auto tokenize(std::string_view source) -> std::vector<Token> {
         {"cross", TokenKind::KeywordCross},
         {"asof", TokenKind::KeywordAsof},
         {"on", TokenKind::KeywordOn},
+        {"suffix", TokenKind::KeywordSuffix},
         {"is", TokenKind::KeywordIs},
         {"null", TokenKind::KeywordNull},
         {"not", TokenKind::KeywordNot},

@@ -3,6 +3,7 @@
 #include <ibex/ir/node.hpp>
 
 #include <cstddef>
+#include <expected>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,13 +36,21 @@ struct JoinOutputColumn {
 ///
 ///   - semi/anti joins return the left columns only;
 ///   - every left column is emitted, in input order, under its own name;
-///   - a same-name equijoin key contributes one output column (the left one);
+///   - a same-name equijoin key contributes one output column (the left one),
+///     so it is never a collision;
 ///   - differently named equijoin keys keep both native columns;
-///   - any other right column whose name is already taken gains a `_right`
-///     suffix, repeated until the name is free.
+///   - any other name held by both inputs is a collision. Without a suffix
+///     policy that is an error naming the column and both sides; with one,
+///     each side takes its suffix, and a suffixed name that still collides is
+///     an error in turn.
+///
+/// Returning an error rather than inventing a name is the point: repeated
+/// suffixing until a name was free (`val_right_right`) hid accidental
+/// collisions behind the same mechanism that served deliberate ones.
 [[nodiscard]] auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
                                     std::span<const std::string_view> left_names,
-                                    std::span<const std::string_view> right_names)
-    -> std::vector<JoinOutputColumn>;
+                                    std::span<const std::string_view> right_names,
+                                    const JoinSuffixPolicy& suffix = {})
+    -> std::expected<std::vector<JoinOutputColumn>, std::string>;
 
 }  // namespace ibex::ir

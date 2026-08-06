@@ -747,8 +747,15 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             };
             const std::vector<std::string_view> left_names = field_names(left);
             const std::vector<std::string_view> right_names = field_names(right);
-            const std::vector<JoinOutputColumn> plan =
-                plan_join_output(join.kind(), join.keys(), left_names, right_names);
+            const auto planned =
+                plan_join_output(join.kind(), join.keys(), left_names, right_names, join.suffix());
+            if (!planned.has_value()) {
+                // An unresolved collision has no output schema to describe.
+                // Inference stays total; `check_join_outputs()` raises the
+                // diagnostic where both schemas are known.
+                return SchemaInfo::unknown();
+            }
+            const std::vector<JoinOutputColumn>& plan = *planned;
 
             std::vector<SchemaField> out;
             out.reserve(plan.size());

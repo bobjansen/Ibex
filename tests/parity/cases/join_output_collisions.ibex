@@ -1,3 +1,7 @@
+// A collision is resolved by naming both sides, never by guessing. `val`
+// exists on both inputs; `val_right` exists only on the left and so is not a
+// collision, which is what distinguishes "suffix the collisions" from "suffix
+// the right side". The transpiled path must land on the same four names.
 let l = Table {
     id = [1, 2, 3],
     val = [10, 20, 30],
@@ -7,7 +11,5 @@ let r = Table {
     id = [2, 3, 4],
     val = [200, 300, 400]
 };
-// "val" collides, and so does the "val_right" that renaming it would produce,
-// so the right column ends up as "val_right_right".
-let j = l left join r on id;
-j[select { id, val, val_right, val_right_right }][order { id asc }];
+let j = l left join r on id suffix { "_l", "_r" };
+j[select { id, val_l, val_right, val_r }][order { id asc }];

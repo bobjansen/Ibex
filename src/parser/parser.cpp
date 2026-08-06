@@ -580,6 +580,9 @@ class Parser {
 
     auto parse_or() -> ExprPtr {
         auto expr = parse_and();
+        if (!expr) {
+            return nullptr;
+        }
         while (match(TokenKind::PipePipe)) {
             auto right = parse_and();
             if (!right) {
@@ -592,6 +595,9 @@ class Parser {
 
     auto parse_and() -> ExprPtr {
         auto expr = parse_equality();
+        if (!expr) {
+            return nullptr;
+        }
         while (match(TokenKind::AmpAmp)) {
             auto right = parse_equality();
             if (!right) {
@@ -604,6 +610,9 @@ class Parser {
 
     auto parse_equality() -> ExprPtr {
         auto expr = parse_comparison();
+        if (!expr) {
+            return nullptr;
+        }
         while (true) {
             if (match(TokenKind::EqEq)) {
                 auto right = parse_comparison();
@@ -628,6 +637,9 @@ class Parser {
 
     auto parse_comparison() -> ExprPtr {
         auto expr = parse_term();
+        if (!expr) {
+            return nullptr;
+        }
         while (true) {
             if (match(TokenKind::Lt)) {
                 auto right = parse_term();
@@ -679,6 +691,9 @@ class Parser {
 
     auto parse_term() -> ExprPtr {
         auto expr = parse_factor();
+        if (!expr) {
+            return nullptr;
+        }
         while (true) {
             if (match(TokenKind::Plus)) {
                 auto right = parse_factor();
@@ -703,6 +718,9 @@ class Parser {
 
     auto parse_factor() -> ExprPtr {
         auto expr = parse_unary();
+        if (!expr) {
+            return nullptr;
+        }
         while (true) {
             if (match(TokenKind::Star)) {
                 auto right = parse_unary();
@@ -873,6 +891,36 @@ class Parser {
             }
             auto expr = std::make_unique<Expr>();
             expr->node = IdentifierExpr{.name = std::move(name), .lexical = true};
+            return expr;
+        }
+        // `left(column)` / `right(column)` — a side-qualified column reference
+        // in a join predicate, where the same name can exist on both inputs.
+        // Same shape as `outer(column)` below, and for the same reason: both
+        // words are reserved (the `left join` / `right join` operators), so
+        // the call form is unambiguous and no user function can claim it.
+        // Whether the reference is in a join predicate at all is checked during
+        // lowering. See SPEC.md Section 5.6.
+        if ((check(TokenKind::KeywordLeft) || check(TokenKind::KeywordRight)) &&
+            peek_next().kind == TokenKind::LParen) {
+            const bool is_left = check(TokenKind::KeywordLeft);
+            const std::string_view word = is_left ? "left" : "right";
+            advance();  // 'left' / 'right'
+            advance();  // '('
+            auto column =
+                consume_column_identifier(fmt::format("expected a column name in {}(...)", word));
+            if (!column.has_value()) {
+                return nullptr;
+            }
+            if (!consume(TokenKind::RParen, fmt::format("expected ')' after {}(column)", word))) {
+                return nullptr;
+            }
+            auto arg = std::make_unique<Expr>();
+            arg->node = IdentifierExpr{.name = std::move(*column)};
+            auto expr = std::make_unique<Expr>();
+            std::vector<ExprPtr> args;
+            args.push_back(std::move(arg));
+            expr->node =
+                CallExpr{.callee = std::string(word), .args = std::move(args), .named_args = {}};
             return expr;
         }
         // `outer(column)` — a correlated-subquery capture. `outer` is a reserved

@@ -1553,3 +1553,5 @@ TEST_CASE("Parse outer(...) capture requires a bare column name") {
     REQUIRE_FALSE(parse("t[filter k == outer(1 + 2)];").has_value());
     REQUIRE_FALSE(parse("t[filter k == outer()];").has_value());
 }
+
+

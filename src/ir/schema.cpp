@@ -1,4 +1,5 @@
 #include <ibex/core/time.hpp>
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
@@ -333,31 +334,54 @@ auto update_schema(const std::vector<FieldSpec>& fields,
 /// a subset of that side's rows and every constraint that held there still
 /// holds.
 void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right,
-                          SchemaInfo& out) {
+                          const std::vector<JoinOutputColumn>& plan, SchemaInfo& out) {
     // Left columns always reach the output under their own names.
     const auto left_key_survives = [&](const UniqueKey& key) {
         return std::ranges::all_of(
             key, [&](const std::string& name) { return out.find(name) != nullptr; });
     };
-    // A right column whose name collides with a left one is dropped -- the
-    // left's is kept -- so a right constraint naming it carries over only where
-    // the join equates the two, which is exactly on a join key.
-    const auto right_key_survives = [&](const UniqueKey& key) {
-        if (!join_keys_are_same_named(join.keys())) {
-            return false;
+
+    // Where each right column ends up in the output. The planner renames a
+    // colliding right column rather than dropping it, so a right constraint
+    // naming one carries over — under the planner's name. The exception is a
+    // same-name key, which the planner folds into the left column of that
+    // name: the join equates the two, so the constraint carries over there.
+    robin_hood::unordered_map<std::string, std::string> right_out_name;
+    for (const auto& column : plan) {
+        if (column.side == JoinOutputSide::Right) {
+            right_out_name.emplace(right.fields()[column.source_index].name, column.name);
         }
-        return std::ranges::all_of(key, [&](const std::string& name) {
-            return out.find(name) != nullptr &&
-                   (left.find(name) == nullptr ||
-                    std::ranges::any_of(join.keys(), [&](const JoinKey& join_key) {
-                        return join_key.left == name && join_key.right == name;
-                    }));
-        });
+    }
+    for (const auto& key : join.keys()) {
+        if (key.left == key.right) {
+            right_out_name.emplace(key.right, key.right);
+        }
+    }
+    // Restates a right-side constraint in output names, or fails if any of its
+    // columns did not reach the output (semi/anti drop the right side whole).
+    const auto right_key_in_output = [&](const UniqueKey& key) -> std::optional<UniqueKey> {
+        UniqueKey renamed;
+        renamed.reserve(key.size());
+        for (const std::string& name : key) {
+            const auto found = right_out_name.find(name);
+            if (found == right_out_name.end()) {
+                return std::nullopt;
+            }
+            renamed.push_back(found->second);
+        }
+        return renamed;
     };
-    const auto keep = [&](const SchemaInfo& side, const auto& survives) {
-        for (const auto& key : side.unique_keys()) {
-            if (survives(key)) {
+    const auto keep_left = [&]() {
+        for (const auto& key : left.unique_keys()) {
+            if (left_key_survives(key)) {
                 out.add_unique_key(key);
+            }
+        }
+    };
+    const auto keep_right = [&]() {
+        for (const auto& key : right.unique_keys()) {
+            if (auto renamed = right_key_in_output(key)) {
+                out.add_unique_key(std::move(*renamed));
             }
         }
     };
@@ -366,14 +390,14 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
         case JoinKind::Semi:
         case JoinKind::Anti:
             // Selects left rows; the right contributes neither rows nor columns.
-            keep(left, left_key_survives);
+            keep_left();
             return;
         case JoinKind::Inner:
             if (right.is_unique_within(right_join_key_names(join.keys()))) {
-                keep(left, left_key_survives);
+                keep_left();
             }
             if (left.is_unique_within(left_join_key_names(join.keys()))) {
-                keep(right, right_key_survives);
+                keep_right();
             }
             return;
         case JoinKind::Cross:
@@ -383,12 +407,16 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
             // ungrouped aggregate: its key is empty, so the pair is just the
             // left's key.
             for (const auto& left_key : left.unique_keys()) {
+                if (!left_key_survives(left_key)) {
+                    continue;
+                }
                 for (const auto& right_key : right.unique_keys()) {
-                    if (!left_key_survives(left_key) || !right_key_survives(right_key)) {
+                    auto renamed = right_key_in_output(right_key);
+                    if (!renamed.has_value()) {
                         continue;
                     }
                     UniqueKey combined = left_key;
-                    combined.insert(combined.end(), right_key.begin(), right_key.end());
+                    combined.insert(combined.end(), renamed->begin(), renamed->end());
                     out.add_unique_key(std::move(combined));
                 }
             }
@@ -707,33 +735,34 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             if (!left.is_known() || !right.is_known()) {
                 return SchemaInfo::unknown();
             }
-            std::vector<SchemaField> out = left.fields();
-            if (join.kind() == JoinKind::Semi || join.kind() == JoinKind::Anti) {
-                SchemaInfo result = SchemaInfo::known(std::move(out), left.is_open());
-                add_join_unique_keys(join, left, right, result);
-                return result;
-            }
-            robin_hood::unordered_set<std::string> out_names;
-            for (const auto& field : out) {
-                out_names.insert(field.name);
-            }
-            for (const auto& field : right.fields()) {
-                const bool shared_key = std::ranges::any_of(join.keys(), [&](const JoinKey& key) {
-                    return key.left == field.name && key.right == field.name;
-                });
-                if (shared_key) {
-                    continue;
+            // Output columns and their names come from the shared planner, so
+            // inference cannot drift from what the executors materialize.
+            const auto field_names = [](const SchemaInfo& info) {
+                std::vector<std::string_view> names;
+                names.reserve(info.fields().size());
+                for (const auto& field : info.fields()) {
+                    names.emplace_back(field.name);
                 }
-                SchemaField emitted = field;
-                while (out_names.contains(emitted.name)) {
-                    emitted.name += "_right";
-                }
-                out_names.insert(emitted.name);
+                return names;
+            };
+            const std::vector<std::string_view> left_names = field_names(left);
+            const std::vector<std::string_view> right_names = field_names(right);
+            const std::vector<JoinOutputColumn> plan =
+                plan_join_output(join.kind(), join.keys(), left_names, right_names);
+
+            std::vector<SchemaField> out;
+            out.reserve(plan.size());
+            for (const auto& column : plan) {
+                const SchemaInfo& source = column.side == JoinOutputSide::Left ? left : right;
+                SchemaField emitted = source.fields()[column.source_index];
+                emitted.name = column.name;
                 out.push_back(std::move(emitted));
             }
-            SchemaInfo result =
-                SchemaInfo::known(std::move(out), left.is_open() || right.is_open());
-            add_join_unique_keys(join, left, right, result);
+
+            const bool left_only = join.kind() == JoinKind::Semi || join.kind() == JoinKind::Anti;
+            SchemaInfo result = SchemaInfo::known(
+                std::move(out), left_only ? left.is_open() : (left.is_open() || right.is_open()));
+            add_join_unique_keys(join, left, right, plan, result);
             return result;
         }
 

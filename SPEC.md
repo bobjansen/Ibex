@@ -1987,6 +1987,20 @@ emitted once in the result. A differently named pair retains both key columns,
 with the left column in left-schema position and the right column in
 right-schema position. Ordinary right-side collision suffixing still applies.
 
+**Output columns.** Every join kind produces its result columns by the same
+rules:
+
+- `semi join` and `anti join` return the left columns only; the right input
+  contributes no columns.
+- Every other kind emits all left columns first, in left-input order and under
+  their own names, followed by the right columns in right-input order.
+- A same-name equality key contributes one output column; a mapped pair keeps
+  both (see above).
+- A remaining right column whose name is already taken receives a `_right`
+  suffix, applied repeatedly until the name is free. So a right `val` joined
+  against a left that already has both `val` and `val_right` is emitted as
+  `val_right_right`.
+
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a
 join predicate rather than an equality key. A pair of rows `(a, b)` is included

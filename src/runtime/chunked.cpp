@@ -5,6 +5,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -3212,7 +3213,6 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (auto err = build_index(right_, right_key_name)) {
                 return err;
             }
-            setup_right_emit_schema();
             return std::nullopt;
         }
 
@@ -3236,7 +3236,6 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (auto err = build_index(*left_table_, left_key_name)) {
                 return err;
             }
-            setup_right_emit_schema();
             mode_ = Mode::Swapped;
             return std::nullopt;
         }
@@ -3246,7 +3245,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (auto err = build_index(right_, right_key_name)) {
             return err;
         }
-        setup_right_emit_schema();
         return std::nullopt;
     }
 
@@ -3439,7 +3437,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
             return err;
         }
-        setup_right_emit_schema();
 
         Table left_copy;
         left_copy.columns.reserve(build.columns.size());
@@ -3667,15 +3664,24 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
     }
 
-    void setup_right_emit_schema() {
-        right_emit_idx_.reserve(right_.columns.size());
-        for (std::size_t i = 0; i < right_.columns.size(); ++i) {
-            if (keys_->front().left == keys_->front().right &&
-                right_.columns[i].name == keys_->front().right) {
+    // Which right columns this join emits, and under which names. Both come
+    // from the shared planner (ir/join_output.hpp), so the chunked route lands
+    // on the same output schema as the materialized route and IR inference.
+    // The left column names are identical for every chunk, so the plan is
+    // computed once from the first assembled chunk.
+    void setup_right_emit_schema(const Table& left_side) {
+        const std::vector<ir::JoinOutputColumn> plan = ir::plan_join_output(
+            ir::JoinKind::Inner, *keys_, table_column_names(left_side), table_column_names(right_));
+        right_emit_idx_.reserve(plan.size() - left_side.columns.size());
+        right_emit_names_.reserve(plan.size() - left_side.columns.size());
+        for (const auto& column : plan) {
+            if (column.side != ir::JoinOutputSide::Right) {
                 continue;
             }
-            right_emit_idx_.push_back(i);
+            right_emit_idx_.push_back(column.source_index);
+            right_emit_names_.push_back(column.name);
         }
+        right_emit_ready_ = true;
     }
 
     // Stream mode: walk the probe side (a left chunk), for each row look
@@ -4041,10 +4047,10 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (total == 0) {
             return output;
         }
+        if (!right_emit_ready_) {
+            setup_right_emit_schema(left_side);
+        }
         output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
-
-        robin_hood::unordered_set<std::string> out_names;
-        out_names.reserve(left_side.columns.size() + right_emit_idx_.size());
 
         auto gather_with_validity =
             [&](const ColumnValue& src_col, const std::optional<ValidityBitmap>& src_val,
@@ -4068,14 +4074,12 @@ class ChunkedInnerJoinOperator final : public Operator {
         // may be aliased by upstream state (e.g., re-runnable source).
         if (li_identity && total == left_side.rows()) {
             for (auto& lc : left_side.columns) {
-                out_names.insert(lc.name);
                 output.index[lc.name] = output.columns.size();
                 output.columns.push_back(std::move(lc));
             }
         } else {
             for (const auto& lc : left_side.columns) {
                 auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
-                out_names.insert(lc.name);
                 if (val.has_value()) {
                     output.add_column(lc.name, std::move(gathered), std::move(*val));
                 } else {
@@ -4089,13 +4093,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         // so probe columns are shared rather than gathered — the same
         // reasoning as li_identity above.
         const bool share_right = ri_identity && total == right_.rows();
-        for (const std::size_t idx : right_emit_idx_) {
-            const auto& rc = right_.columns[idx];
-            std::string name = rc.name;
-            while (out_names.contains(name)) {
-                name += "_right";
-            }
-            out_names.insert(name);
+        for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
+            const auto& rc = right_.columns[right_emit_idx_[e]];
+            std::string name = right_emit_names_[e];
             if (share_right) {
                 output.add_column_from(std::move(name), rc);
                 continue;
@@ -4142,6 +4142,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
         string_heads_;
     std::vector<std::size_t> right_emit_idx_;
+    std::vector<std::string> right_emit_names_;
+    bool right_emit_ready_ = false;
 
     // Stream mode: when right > threshold and left >= right, left was
     // materialized to measure but not swapped; replay as a single chunk.

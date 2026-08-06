@@ -1,3 +1,4 @@
+#include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -1193,3 +1194,186 @@ TEST_CASE("join: swapped-mode inner join emits in right-scan order", "[join]") {
     CHECK(col_i64(out, "rval") == want_rval);
 }
 
+// --- Output schema agreement -------------------------------------------------
+//
+// IR schema inference and the executors derive their output column list from
+// the same planner (`ir::plan_join_output`). These tests pin that agreement on
+// real data: whatever the interpreter materializes must be exactly what a
+// caller planning against the inferred schema was told to expect.
+
+namespace {
+
+// Column names of `t`, in output order.
+auto column_names(const runtime::Table& t) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    out.reserve(t.columns.size());
+    for (const auto& entry : t.columns) {
+        out.push_back(entry.name);
+    }
+    return out;
+}
+
+// Names of the inferred output schema of `src`, in declaration order.
+auto inferred_names(std::string_view src, const ir::SourceSchemas& sources)
+    -> std::vector<std::string> {
+    auto parsed = parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    const ir::SchemaInfo schema = ir::infer_schema(*lowered.value(), sources);
+    REQUIRE(schema.is_known());
+    std::vector<std::string> out;
+    out.reserve(schema.fields().size());
+    for (const auto& field : schema.fields()) {
+        out.push_back(field.name);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("join: inferred output names match the materialized ones for every kind",
+          "[join][schema]") {
+    // "val" collides, and so does the "val_right" that renaming it would
+    // produce, so the right side has to suffix twice.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("val", Column<std::int64_t>{10, 20, 30});
+    lhs.add_column("val_right", Column<std::int64_t>{11, 21, 31});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 3, 4});
+    rhs.add_column("val", Column<std::int64_t>{200, 300, 400});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const ir::SourceSchemas sources{
+        {"lhs", ir::SchemaInfo::known({{.name = "id", .type = ir::ColumnType::Int64},
+                                       {.name = "val", .type = ir::ColumnType::Int64},
+                                       {.name = "val_right", .type = ir::ColumnType::Int64}})},
+        {"rhs", ir::SchemaInfo::known({{.name = "id", .type = ir::ColumnType::Int64},
+                                       {.name = "val", .type = ir::ColumnType::Int64}})},
+    };
+
+    const std::vector<std::string> both{"id", "val", "val_right", "val_right_right"};
+    const std::vector<std::string> left_only{"id", "val", "val_right"};
+
+    struct Case {
+        std::string_view src;
+        const std::vector<std::string>* want;
+    };
+    const std::vector<Case> cases{
+        {"lhs join rhs on id;", &both},           {"lhs left join rhs on id;", &both},
+        {"lhs right join rhs on id;", &both},     {"lhs outer join rhs on id;", &both},
+        {"lhs semi join rhs on id;", &left_only}, {"lhs anti join rhs on id;", &left_only},
+    };
+
+    for (const auto& test : cases) {
+        INFO(test.src);
+        CHECK(column_names(interpret_expr(test.src, tables)) == *test.want);
+        CHECK(inferred_names(test.src, sources) == *test.want);
+    }
+}
+
+TEST_CASE("join: inferred output names match the materialized ones for mapped keys",
+          "[join][schema]") {
+    // Differently named keys are both retained; the colliding non-key is
+    // suffixed.
+    runtime::Table lhs;
+    lhs.add_column("left_id", Column<std::int64_t>{1, 2});
+    lhs.add_column("val", Column<std::int64_t>{10, 20});
+
+    runtime::Table rhs;
+    rhs.add_column("right_id", Column<std::int64_t>{2, 3});
+    rhs.add_column("val", Column<std::int64_t>{200, 300});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const ir::SourceSchemas sources{
+        {"lhs", ir::SchemaInfo::known({{.name = "left_id", .type = ir::ColumnType::Int64},
+                                       {.name = "val", .type = ir::ColumnType::Int64}})},
+        {"rhs", ir::SchemaInfo::known({{.name = "right_id", .type = ir::ColumnType::Int64},
+                                       {.name = "val", .type = ir::ColumnType::Int64}})},
+    };
+
+    const std::string_view src = "lhs join rhs on { left_id = right_id };";
+    const std::vector<std::string> want{"left_id", "val", "right_id", "val_right"};
+    CHECK(column_names(interpret_expr(src, tables)) == want);
+    CHECK(inferred_names(src, sources) == want);
+}
+
+TEST_CASE("join: inferred output names match the materialized ones for a cross join",
+          "[join][schema]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2});
+    lhs.add_column("val", Column<std::int64_t>{10, 20});
+
+    runtime::Table rhs;
+    rhs.add_column("val", Column<std::int64_t>{200, 300});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const ir::SourceSchemas sources{
+        {"lhs", ir::SchemaInfo::known({{.name = "id", .type = ir::ColumnType::Int64},
+                                       {.name = "val", .type = ir::ColumnType::Int64}})},
+        {"rhs", ir::SchemaInfo::known({{.name = "val", .type = ir::ColumnType::Int64}})},
+    };
+
+    const std::string_view src = "lhs cross join rhs;";
+    const std::vector<std::string> want{"id", "val", "val_right"};
+    CHECK(column_names(interpret_expr(src, tables)) == want);
+    CHECK(inferred_names(src, sources) == want);
+}
+
+// The chunked join's swapped mode (right side above the 65,536-row stream
+// threshold) assembles its output from the materialized left side rather than
+// a probe chunk, so it names right columns through its own call into the
+// planner. This pins that route on the same repeated-collision case as the
+// stream-mode test above.
+TEST_CASE("join: swapped-mode inner join names colliding right columns like the planner",
+          "[join][schema]") {
+    constexpr std::size_t kLeftRows = 8;
+    constexpr std::size_t kRightRows = 70000;  // > kStreamRightThreshold
+
+    std::vector<std::int64_t> left_keys;
+    std::vector<std::int64_t> left_val;
+    std::vector<std::int64_t> left_val_right;
+    for (std::size_t i = 0; i < kLeftRows; ++i) {
+        left_keys.push_back(static_cast<std::int64_t>(i));
+        left_val.push_back(static_cast<std::int64_t>(10 + i));
+        left_val_right.push_back(static_cast<std::int64_t>(100 + i));
+    }
+
+    std::vector<std::int64_t> right_keys;
+    std::vector<std::int64_t> right_val;
+    for (std::size_t i = 0; i < kRightRows; ++i) {
+        right_keys.push_back(static_cast<std::int64_t>(i));
+        right_val.push_back(static_cast<std::int64_t>(i));
+    }
+
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{std::move(left_keys)});
+    lhs.add_column("val", Column<std::int64_t>{std::move(left_val)});
+    lhs.add_column("val_right", Column<std::int64_t>{std::move(left_val_right)});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{std::move(right_keys)});
+    rhs.add_column("val", Column<std::int64_t>{std::move(right_val)});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on id;", tables);
+
+    CHECK(out.rows() == kLeftRows);
+    CHECK(column_names(out) ==
+          std::vector<std::string>{"id", "val", "val_right", "val_right_right"});
+    CHECK(col_i64(out, "val_right_right") == std::vector<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7});
+}

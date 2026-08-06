@@ -1,5 +1,6 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
@@ -427,12 +428,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return false;
     };
     robin_hood::unordered_set<std::string> left_key_set;
-    robin_hood::unordered_set<std::string> shared_right_key_set;
     for (const auto& key : keys) {
         left_key_set.insert(key.left);
-        if (key.left == key.right) {
-            shared_right_key_set.insert(key.right);
-        }
     }
 
     const std::size_t n_left = left.rows();
@@ -444,35 +441,27 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     const bool semi_join = (kind == ir::JoinKind::Semi);
     const bool anti_join = (kind == ir::JoinKind::Anti);
 
+    // The output column list and its collision names come from the shared
+    // planner (see ir/join_output.hpp), the same one IR schema inference uses.
+    const std::vector<ir::JoinOutputColumn> plan =
+        ir::plan_join_output(kind, keys, table_column_names(left), table_column_names(right));
+
     Table output;
-    output.columns.reserve(left.columns.size() + right.columns.size());
-
-    robin_hood::unordered_set<std::string> out_names;
-    out_names.reserve(left.columns.size() + right.columns.size());
-
-    for (const auto& entry : left.columns) {
-        out_names.insert(entry.name);
-        output.add_column(entry.name, make_empty_like(*entry.column));
-    }
+    output.columns.reserve(plan.size());
 
     struct RightOut {
         const ColumnValue* column = nullptr;
         std::size_t out_index = 0;
     };
     std::vector<RightOut> right_out;
-    right_out.reserve(right.columns.size());
-    for (const auto& entry : right.columns) {
-        if (semi_join || anti_join || shared_right_key_set.contains(entry.name)) {
-            continue;
+    right_out.reserve(plan.size() - left.columns.size());
+    for (const auto& column : plan) {
+        const Table& source = column.side == ir::JoinOutputSide::Left ? left : right;
+        const ColumnValue* src = source.columns[column.source_index].column.get();
+        output.add_column(column.name, make_empty_like(*src));
+        if (column.side == ir::JoinOutputSide::Right) {
+            right_out.push_back(RightOut{.column = src, .out_index = output.columns.size() - 1});
         }
-        std::string name = entry.name;
-        while (out_names.contains(name)) {
-            name += "_right";
-        }
-        out_names.insert(name);
-        output.add_column(name, make_empty_like(*entry.column));
-        right_out.push_back(
-            RightOut{.column = entry.column.get(), .out_index = output.columns.size() - 1});
     }
 
     const bool preserve_left_only =

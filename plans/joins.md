@@ -58,24 +58,28 @@ is:
 x left join y on { left_id = right_id }
 ```
 
-### Static schema inference disagrees with runtime output
+### Static schema inference disagrees with runtime output (fixed in Ibex core)
 
-Runtime join materialization suffixes colliding right-side columns with
-`_right`, repeatedly if necessary. IR schema inference instead drops every
-right-side column whose name is already present. It also unions right columns
+Runtime join materialization suffixed colliding right-side columns with
+`_right`, repeatedly if necessary. IR schema inference instead dropped every
+right-side column whose name was already present, and unioned right columns
 into semi/anti join schemas even though those joins return only the left
 columns at runtime.
 
-There must be one canonical join-output schema/name planner shared in semantics
-by IR inference, interpreter execution, chunked execution, and ribex schema
-construction. It must define:
+`ir::plan_join_output()` (`include/ibex/ir/join_output.hpp`) is now the single
+canonical join-output schema/name planner. IR inference, the materialized
+interpreter and the chunked executor all derive their column list from it;
+codegen inherits it through the runtime ops, and ribex's own reconstruction
+follows the same rules. It defines:
 
 - semi/anti output as the left schema only;
 - one output column for a same-name equijoin key;
 - both native columns for differently named equijoin keys;
 - deterministic `_right`, `_right_right`, ... naming for other collisions;
-- outer-side nullability where the schema representation can carry it;
 - which uniqueness proofs survive the join and any key-name mapping.
+
+Outer-side nullability is still not carried in the IR schema representation,
+and stays out of the planner until it is.
 
 Native Ibex should retain both differently named key columns. The R adapter can
 drop, coalesce, cast, or rename them to reproduce dplyr's `keep` contract.
@@ -191,17 +195,23 @@ native execution.
 
 ### Stage 1: Repair native join schema inference
 
-Status: partially implemented alongside Stage 3. Semi/anti schemas, mapped-key
-retention, and repeated `_right` collision naming now agree with runtime. A
-shared output-schema planner and broader per-kind parity coverage remain.
+Status: implemented. `ir::plan_join_output()` (`include/ibex/ir/join_output.hpp`)
+is the canonical planner; IR schema inference, the materialized join and the
+chunked inner join all derive their output columns from it, and codegen
+inherits it through the runtime ops. Uniqueness proofs stay in
+`add_join_unique_keys` — the planner decides names, not proofs — but they now
+follow the planner's names instead of assuming a colliding right column is
+dropped.
 
-- Introduce the canonical join-output name/schema planner.
-- Make semi/anti inference return only the left schema.
-- Make inferred collision names match runtime `_right` naming exactly.
-- Correct uniqueness propagation for retained/dropped columns.
-- Use the same planner in both materialized and chunked execution.
-- Add IR schema tests, interpreter tests, chunked parity tests, and transpiled
-  code tests for every join kind and repeated collision.
+- ~~Introduce the canonical join-output name/schema planner.~~
+- ~~Make semi/anti inference return only the left schema.~~
+- ~~Make inferred collision names match runtime `_right` naming exactly.~~
+- ~~Correct uniqueness propagation for retained/dropped columns.~~ A right-side
+  proof now survives under the planner's output name (`code` → `code_right`),
+  and mapped joins no longer forfeit their right-side proofs.
+- ~~Use the same planner in both materialized and chunked execution.~~
+- ~~Add IR schema tests, interpreter tests, chunked parity tests, and
+  transpiled code tests for every join kind and repeated collision.~~
 
 This stage can use same-name keys and should land before widening the key IR.
 

@@ -829,6 +829,24 @@ employee[
             join&rsquo;s output names.
           </p>
           <p>
+            A name held by <strong>both</strong> inputs cannot appear twice in
+            the output, and Ibex will not invent a spelling for it. Such a
+            collision is an error unless the join says what to call each side
+            with <code>suffix { "_left", "_right" }</code>. The clause always
+            names both; an empty string leaves that side under its original
+            name. Suffixes apply to the collisions only &mdash; a column that
+            just one input carries keeps its name. A same-name key folds into a
+            single output column and so never collides, and semi and anti joins
+            emit no right columns at all.
+          </p>
+          <p>
+            This is deliberately not a rename rule. Renaming an overlap between
+            two snapshots of the same table and catching an accidental overlap
+            between unrelated tables want opposite handling, so the first asks
+            for the clause and the second gets an error naming the column and
+            both sides.
+          </p>
+          <p>
             A join makes <strong>no promise about row order</strong>: the engine
             picks which side to build its hash index from, and that choice shows
             up in the output. Add <code>order</code> when the order matters. The
@@ -862,9 +880,21 @@ employee[
 <span class="cm">// Non-equijoin — pair rows where a column satisfies an inequality</span>
 <span class="kw">let</span> events = ticks <span class="kw">join</span> windows <span class="kw">on</span> ts &gt;= start &amp;&amp; ts &lt; end;
 
-<span class="cm">// left(...) / right(...) when both inputs share a column name</span>
+<span class="cm">// left(...) / right(...) when both inputs share a column name.</span>
+<span class="cm">// Those shared names collide in the output too, so the join</span>
+<span class="cm">// also needs a suffix clause — the two mechanisms are separate:</span>
+<span class="cm">// the qualifiers read the inputs, the suffixes name the output.</span>
 <span class="kw">let</span> widened = bars_a <span class="kw">join</span> bars_b
-    <span class="kw">on</span> <span class="kw">left</span>(ts) &gt;= <span class="kw">right</span>(ts) &amp;&amp; <span class="kw">left</span>(close) &gt; <span class="kw">right</span>(close);
+    <span class="kw">on</span> <span class="kw">left</span>(ts) &gt;= <span class="kw">right</span>(ts) &amp;&amp; <span class="kw">left</span>(close) &gt; <span class="kw">right</span>(close)
+    <span class="kw">suffix</span> { <span class="str">"_a"</span>, <span class="str">"_b"</span> };
+
+<span class="cm">// suffix — rename what collides, on both sides</span>
+<span class="kw">let</span> compared = prices_2023 <span class="kw">join</span> prices_2024 <span class="kw">on</span> symbol
+    <span class="kw">suffix</span> { <span class="str">"_old"</span>, <span class="str">"_new"</span> };
+
+<span class="cm">// An empty side keeps its own names; only the right is renamed</span>
+<span class="kw">let</span> annotated = prices <span class="kw">join</span> prices_adj <span class="kw">on</span> symbol
+    <span class="kw">suffix</span> { <span class="str">""</span>, <span class="str">"_adj"</span> };
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);

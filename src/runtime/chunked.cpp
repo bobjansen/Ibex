@@ -3075,8 +3075,8 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 /// - Swapped: right is large and n_left < n_right. Materialize left,
 ///   build the hash index on left, iterate right rows once and emit output
 ///   in that same right-scan (probe) order (baseline's
-///   `build_indices_from_right_scan` equivalent) — SPEC.md does not
-///   guarantee join row order, and preserving the probe side's scan order
+///   `build_indices_from_right_scan` equivalent) — row order is outside the
+///   join contract (SPEC.md §5.6), and preserving the probe side's scan order
 ///   instead of reassembling by left row keeps cache locality for any
 ///   downstream join that probes this join's output. Much better cache
 ///   behavior overall when the smaller side fits.
@@ -4013,9 +4013,8 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         // Phase 2: replay the recorded hits in the same order Phase 1 visited
-        // them — right-scan (probe) order. SPEC.md does not guarantee join
-        // row order ("any join drop[s] ordering unless the implementation
-        // can prove a specific order"), so there's no correctness reason to
+        // them — right-scan (probe) order. Row order is outside the join
+        // contract (SPEC.md §5.6), so there's no correctness reason to
         // reassemble by left row instead; doing so was actively harmful,
         // permuting the output away from the probe side's natural scan
         // order and hurting cache locality on any downstream join that

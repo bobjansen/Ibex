@@ -1508,7 +1508,13 @@ Preservation rules (normative minimums):
   unchanged (no computed replacement) and remain in the output schema.
 - `update` preserves ordering only if it does not update any ordering key.
 - `distinct`, `by` (aggregation or grouped update), and any `join` drop ordering
-  unless the implementation can prove a specific order.
+  unless the implementation can prove a specific order. For `join` this is not a
+  gap to be closed later: row order is deliberately outside the join contract
+  (Section 5.6), so that an implementation stays free to pick its execution
+  strategy. An implementation that *can* prove its chosen strategy preserves an
+  input's ordering constraint may propagate it, and may satisfy a following
+  `order` from within the join instead of sorting; neither is required, and
+  neither is observable except as a missing sort.
 - `order` always sets the ordering constraint to its key list (or schema order
   if no keys are provided).
 
@@ -2019,9 +2025,27 @@ Non-equijoin joins use a nested-loop algorithm (O(N×M)) and are therefore
 suited for smaller tables or selective predicates. Equijoin hash-join paths
 are not used when the `on` clause is a predicate expression.
 
-**Row ordering.** The output preserves the left-table row order for all left-side
-rows (both matched and unmatched). For `outer join` and `right join`, unmatched
-right-side rows are appended after all left-side rows, in right-table order.
+**Row ordering.** A join makes no promise about the row order of its output.
+Implementations choose an execution strategy freely — which side is built into
+the hash index, whether the input is streamed in chunks — and those choices are
+observable in the row order. The same join may therefore emit a different order
+for different input sizes, or between the interpreter and generated code.
+
+Ask for an order when you need one:
+
+```ibex
+(trades join symbols on symbol)[order { ts asc }]
+```
+
+An implementation is free to satisfy such an `order` from within the join when
+its chosen strategy already produces that order, rather than sorting afterwards
+(Section 5.3, ordering constraints).
+
+The one exception is `asof join`. It returns a `TimeFrame`, and a `TimeFrame` is
+sorted by definition (Section 9.1), so its output is in ascending time-index
+order. Turning any other join's result into a `TimeFrame` goes through
+`as_timeframe`, which sorts if the rows are not already ordered — the invariant
+is established by that conversion, not by the join.
 
 The `on` list must contain one or more unqualified key entries. An unmapped
 entry must be present under that name in both inputs; a mapped entry's left name
@@ -3171,6 +3195,10 @@ in **both** input schemas. Join-expression syntax additionally supports mapped
 pairs (`on { left_key = right_key }`). The output schema is the union of both
 input schemas: same-name key columns appear once, while differently named key
 columns both remain present.
+
+The `DataFrame`-returning joins make no promise about output row order
+(Section 5.6). `asof_join` returns a `TimeFrame` and therefore emits in
+ascending time-index order.
 
 `asof_join` is valid only on `TimeFrame` operands. The final argument is a
 duration literal specifying the maximum time difference for a match. Both

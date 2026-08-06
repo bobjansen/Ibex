@@ -1,0 +1,13 @@
+// Both inputs carry `ts` and `v`, so every reference in the predicate has to
+// name its side. The transpiled path must resolve them the same way the
+// interpreter does — a lost side tag shows up here as an ambiguity error.
+let lhs = Table {
+    ts = [10, 20, 30],
+    v = [1, 2, 3]
+};
+let rhs = Table {
+    ts = [15, 25],
+    v = [7, 8]
+};
+let j = lhs join rhs on left(ts) < right(ts) && left(v) < right(v);
+j[select { ts, v, ts_right, v_right }][order { ts asc, ts_right asc }];

@@ -322,6 +322,97 @@ auto asof_not_timeframe_error(const Table& left, const Table& right) -> std::str
     return msg;
 }
 
+/// Batch-table name for a right column in a nested-loop join predicate.
+/// `#` cannot appear in an Ibex identifier, so this name is unreachable from
+/// source and cannot shadow a left column.
+auto nlj_right_batch_name(std::string_view name) -> std::string {
+    return "#right#" + std::string(name);
+}
+
+/// Rewrites a join predicate's column references to the names the batch table
+/// uses, resolving which side each one means.
+///
+/// `left(x)` and `right(x)` say it outright. A bare name resolves to whichever
+/// input has the column; a name both inputs have is ambiguous and is rejected
+/// rather than silently picking one. A bare name neither input has is left
+/// alone — it may still resolve as a scalar binding (SPEC.md Section 6.2).
+auto resolve_predicate_sides(const ir::Expr& predicate, const Table& left, const Table& right)
+    -> std::expected<ir::Expr, std::string> {
+    // `ExprPtr` deep-copies, so this is an independent tree to rewrite in place.
+    ir::Expr rewritten = predicate;
+    std::optional<std::string> failure;
+
+    const auto resolve_ref = [&](ir::ColumnRef& ref) {
+        if (ref.lexical) {
+            return;  // `^name` never names a column
+        }
+        const bool in_left = left.find(ref.name) != nullptr;
+        const bool in_right = right.find(ref.name) != nullptr;
+        switch (ref.side) {
+            case ir::JoinSide::Left:
+                if (!in_left) {
+                    failure = "join predicate: left(" + ref.name +
+                              ") but the left input has no column \"" + ref.name + "\"";
+                }
+                break;
+            case ir::JoinSide::Right:
+                if (!in_right) {
+                    failure = "join predicate: right(" + ref.name +
+                              ") but the right input has no column \"" + ref.name + "\"";
+                    break;
+                }
+                ref.name = nlj_right_batch_name(ref.name);
+                break;
+            case ir::JoinSide::Any:
+                if (in_left && in_right) {
+                    failure = "join predicate: \"" + ref.name +
+                              "\" exists in both inputs; write left(" + ref.name + ") or right(" +
+                              ref.name + ")";
+                    break;
+                }
+                if (in_right) {
+                    ref.name = nlj_right_batch_name(ref.name);
+                }
+                break;
+        }
+        ref.side = ir::JoinSide::Any;  // resolved: the batch is one namespace
+    };
+
+    const auto walk = [&](ir::Expr& expr, const auto& self) -> void {
+        std::visit(
+            [&](auto& node) {
+                using T = std::decay_t<decltype(node)>;
+                if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                    resolve_ref(node);
+                } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                     std::is_same_v<T, ir::CompareExpr> ||
+                                     std::is_same_v<T, ir::LogicalExpr>) {
+                    self(*node.left, self);
+                    if (node.right != nullptr) {  // unary `not` has no right
+                        self(*node.right, self);
+                    }
+                } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                    self(*node.operand, self);
+                } else if constexpr (std::is_same_v<T, ir::CallExpr>) {
+                    for (auto& arg : node.args) {
+                        self(*arg, self);
+                    }
+                } else {
+                    // Literal and RankExpr hold no column references.
+                    static_assert(std::is_same_v<T, ir::Literal> || std::is_same_v<T, ir::RankExpr>,
+                                  "join predicate walk is missing an Expr alternative");
+                }
+            },
+            expr.node);
+    };
+
+    walk(rewritten, walk);
+    if (failure.has_value()) {
+        return std::unexpected(std::move(*failure));
+    }
+    return rewritten;
+}
+
 }  // namespace
 
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
@@ -616,26 +707,27 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return std::unexpected("join predicate evaluation callback is not available");
         }
 
+        // The predicate is evaluated over a batch table holding one left row
+        // broadcast against every right row. Right columns go in under an
+        // internal name no identifier can spell, so a right column can never
+        // capture a reference meant for the left one; the predicate's column
+        // references are rewritten to match, once, before the row loop.
         struct NLJRightCol {
             const ColumnValue* column = nullptr;
             std::string batch_name;
         };
         std::vector<NLJRightCol> nlj_right;
         nlj_right.reserve(right.columns.size());
-        {
-            robin_hood::unordered_set<std::string> batch_left_names;
-            for (const auto& entry : left.columns) {
-                batch_left_names.insert(entry.name);
-            }
-            for (const auto& entry : right.columns) {
-                std::string name = entry.name;
-                while (batch_left_names.contains(name)) {
-                    name += "_right";
-                }
-                batch_left_names.insert(name);
-                nlj_right.push_back({.column = entry.column.get(), .batch_name = std::move(name)});
-            }
+        for (const auto& entry : right.columns) {
+            nlj_right.push_back(
+                {.column = entry.column.get(), .batch_name = nlj_right_batch_name(entry.name)});
         }
+
+        auto resolved = resolve_predicate_sides(*predicate, left, right);
+        if (!resolved.has_value()) {
+            return std::unexpected(std::move(resolved.error()));
+        }
+        const ir::Expr& batch_predicate = *resolved;
 
         std::vector<std::size_t> left_idx;
         std::vector<std::size_t> right_idx;
@@ -660,7 +752,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 batch.add_column(item.batch_name, *item.column);
             }
 
-            auto mask_res = mask_evaluator(*predicate, batch, scalars, RowRange::whole(n_right));
+            auto mask_res =
+                mask_evaluator(batch_predicate, batch, scalars, RowRange::whole(n_right));
             if (!mask_res) {
                 return std::unexpected(mask_res.error());
             }

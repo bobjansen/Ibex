@@ -40,19 +40,17 @@ A join makes no promise about row order. If you want an order, ask for one:
 (trades join symbols on symbol)[order { ts asc }]
 ```
 
-`SPEC.md` currently says this in one place and contradicts it in another: the
-ordering-constraint section says any `join` drops ordering, while the join
-section promises the output "preserves the left-table row order for all
-left-side rows" and appends unmatched right rows in right-table order. The join
-section's promise is the one to delete.
+Settled in `SPEC.md` (commit *Put join row order outside the contract,
+explicitly*). It used to say this in one place and contradict it in another:
+the ordering-constraint section said any `join` drops ordering, while the join
+section promised the output "preserves the left-table row order for all
+left-side rows". The join section's promise was deleted.
 
 Not promising an order is what lets the executor choose a build side by size,
 which is where the current right-scan emission comes from. The tests that pin
 that emission (`join: left join emits matches in right-scan order when left
 side is smaller`, and its outer/right/multi-key/swapped siblings) document a
-path's incidental behaviour, not a contract — they can stay, but their comments
-should stop implying the order is unspecified *by omission*. It is unspecified
-on purpose.
+path's incidental behaviour, not a contract.
 
 The value that a guarantee would have bought is better obtained in the
 optimizer, where it costs nothing to skip when it does not apply:
@@ -71,9 +69,11 @@ optimizer, where it costs nothing to skip when it does not apply:
   tolerates. A right-scan path proves nothing and a downstream `order` stands.
 
 One exception is not optional: a `TimeFrame` always carries the ordering
-constraint on its time index (SPEC.md, ordering constraints). A join producing a
-`TimeFrame` — as-of joins, and any join whose result is ascribed as one — must
-establish that ordering rather than drop it.
+constraint on its time index (SPEC.md, ordering constraints). `asof join`
+returns one and emits in time order, which the implementation already does by
+keeping every left row in input order. Turning any other join's result into a
+`TimeFrame` goes through `as_timeframe`, which sorts — the invariant is
+established there, not by the join.
 
 ### Colliding columns are an error, with an explicit escape hatch
 
@@ -110,25 +110,30 @@ names, or report a collision", with the suffix policy as an input. That the
 change lands in one function for all three consumers is the point of having
 built it.
 
-### Theta predicates need side-qualified column references
+### Theta predicates read the inputs, not the output (fixed in Ibex core)
 
-Two namespaces are built from the same two inputs, by different code, with
-different rules:
+Two namespaces used to be built from the same two inputs, by different code,
+with different rules: the output namespace from `ir::plan_join_output()` (keys
+folded, collisions renamed), and a predicate namespace built inline in
+`join_table_impl` (every right column, `_right` on collision, no key folding).
+`id_right` was referenceable in a predicate while no output column of that name
+could exist.
 
-- The **output** namespace comes from `ir::plan_join_output()`: same-name keys
-  folded, collisions renamed.
-- The **predicate** namespace is built inline in `join_table_impl` for the
-  nested-loop path: every right column, suffixed with `_right` purely on
-  collision, no key folding.
+A predicate now reads the two inputs' own namespaces. `ir::ColumnRef` carries a
+`JoinSide`, lowered from `left(col)` / `right(col)`:
 
-So `id_right` is referenceable in a theta predicate today while no output
-column of that name can ever exist. Removing automatic `_right` suffixing makes
-this unavoidable rather than merely untidy: the predicate namespace loses the
-names it currently depends on.
+```ibex
+ticks join windows on right(start) <= left(ts) && left(ts) < right(end)
+```
 
-The fix is to give predicate column references an explicit side, so `on a < b`
-names left `a` and right `b` without routing through combined output names.
-This is a prerequisite of the collision work, not a follow-up to it.
+A bare name resolves against whichever input has it; a name both inputs have is
+an error naming the two qualifiers rather than a silent pick; a name neither has
+falls through to scalar-binding resolution as before. The nested-loop batch
+still holds both sides, but under internal names no identifier can spell, so it
+is no longer a namespace anyone can reference.
+
+This was the prerequisite for the collision work: automatic `_right` suffixing
+can now be removed without taking the predicate namespace with it.
 
 ### Null keys do not match, unless asked
 
@@ -244,28 +249,34 @@ deliberately rather than inherited by accident.
 
 ### Ordering contract
 
-Documentation only, landed on its own so the contract can be argued with before
-any code moves.
+Status: implemented, documentation only. Commit *Put join row order outside the
+contract, explicitly*.
 
-- Delete the join section's left-order promise in `SPEC.md`; leave the
-  ordering-constraint section as the single truth.
-- State that row order is unspecified by design, and that build-side selection
-  and the materialized/chunked route may both affect it.
-- State the `TimeFrame` exception: a join producing a `TimeFrame` establishes
-  the time-index ordering.
-- Mirror in `docs/index.html`; adjust the right-scan test comments so they
-  describe a path, not a gap in the spec.
+- ~~Delete the join section's left-order promise in `SPEC.md`; leave the
+  ordering-constraint section as the single truth.~~
+- ~~State that row order is unspecified by design, and that build-side
+  selection and the materialized/chunked route may both affect it.~~
+- ~~State the `TimeFrame` exception.~~ Scoped to `asof join`; `as_timeframe`
+  establishes the invariant for anything else.
+- ~~Mirror in the reference page; adjust the right-scan test and runtime
+  comments so they describe a path, not a gap in the spec.~~
 
 ### Side-qualified predicate references
 
-Prerequisite for collision resolution.
+Status: implemented. `left(col)` / `right(col)` parse as a keyword-triggered
+call form (the same shape as `outer(col)`), lower to `ir::ColumnRef::side`, and
+resolve in `join_table_impl` before the row loop. `filter_col_side()` carries
+the tag into generated C++. Required-column analysis now demands a qualified
+reference from its own side only, which tightens pruning above a theta join.
 
-- Give theta-predicate column references an explicit side in the AST and IR.
-- Resolve them against each input's own schema instead of a combined namespace.
-- Keep the nested-loop batch construction an implementation detail with no
-  observable naming.
-- Parser, lowering, interpreter, chunked and codegen tests; `SPEC.md` and
-  `docs/index.html`; an `.ibex` example.
+- ~~Give theta-predicate column references an explicit side in the AST and
+  IR.~~
+- ~~Resolve them against each input's own schema instead of a combined
+  namespace.~~
+- ~~Keep the nested-loop batch construction an implementation detail with no
+  observable naming.~~
+- ~~Parser, lowering, interpreter and codegen tests; `SPEC.md`, the reference
+  page, an `.ibex` example, and a parity case.~~
 
 ### Collision resolution and the `suffix` clause
 
@@ -337,9 +348,9 @@ regression.
 
 ## Sequencing
 
-1. **Ordering contract** — documentation only, unblocks nothing but settles
-   the argument first.
-2. **Side-qualified predicate references** — prerequisite for the next item.
+1. ~~**Ordering contract**~~ — done.
+2. ~~**Side-qualified predicate references**~~ — done; the prerequisite for the
+   next item is in place.
 3. **Collision resolution and `suffix`** — the largest language-visible change;
    do it while the whole corpus of Ibex programs is still this repo.
 4. **Early key validation** — cheap, static, improves every frontend's errors.

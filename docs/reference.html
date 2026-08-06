@@ -821,6 +821,14 @@ employee[
             Both tables must be <code>TimeFrame</code>s for an asof join.
           </p>
           <p>
+            Inside a predicate a bare column name must exist on exactly one
+            side. When both inputs carry the name, write
+            <code>left(<em>col</em>)</code> or <code>right(<em>col</em>)</code>
+            &mdash; an ambiguous name is an error rather than a silent choice.
+            The predicate reads the two inputs&rsquo; own names, never the
+            join&rsquo;s output names.
+          </p>
+          <p>
             A join makes <strong>no promise about row order</strong>: the engine
             picks which side to build its hash index from, and that choice shows
             up in the output. Add <code>order</code> when the order matters. The
@@ -853,6 +861,10 @@ employee[
 
 <span class="cm">// Non-equijoin — pair rows where a column satisfies an inequality</span>
 <span class="kw">let</span> events = ticks <span class="kw">join</span> windows <span class="kw">on</span> ts &gt;= start &amp;&amp; ts &lt; end;
+
+<span class="cm">// left(...) / right(...) when both inputs share a column name</span>
+<span class="kw">let</span> widened = bars_a <span class="kw">join</span> bars_b
+    <span class="kw">on</span> <span class="kw">left</span>(ts) &gt;= <span class="kw">right</span>(ts) &amp;&amp; <span class="kw">left</span>(close) &gt; <span class="kw">right</span>(close);
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);

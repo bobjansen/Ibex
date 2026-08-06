@@ -6,6 +6,7 @@ build-gcc/
 build-release/
 cmake-build-*/
 out/
+ribex.Rcheck/**
 
 # IDE & tool caches
 .idea/

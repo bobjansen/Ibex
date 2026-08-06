@@ -29,6 +29,15 @@ labels, not positions in a sequence. Remaining work is named, not numbered.
   output columns and their names; IR inference, the materialized join and the
   chunked join all derive from it, and codegen inherits it through the runtime
   ops. Commit *Share one canonical join-output schema planner*.
+- **Ordering contract.** Row order is unspecified by design, stated as such in
+  `SPEC.md` and the reference page, with `asof join` on a `TimeFrame` as the
+  one exception. Documentation only — the runtime already behaved this way.
+  Commit *Put join row order outside the contract, explicitly*.
+- **Side-qualified predicate references.** `left(col)` / `right(col)` parse as
+  a keyword-triggered call form, lower to `ir::ColumnRef::side`, and resolve
+  against each input's own schema in `join_table_impl` before the row loop.
+  The nested-loop batch holds both sides under `#`-prefixed names no identifier
+  can spell. Commit *Give join predicates side-qualified column references*.
 
 ## The contract
 
@@ -462,3 +471,45 @@ nullable hashing, validation and match selection all touch hot paths. For each:
 Never infer performance neutrality from identical output or from debug builds,
 and land changes to the same hot path one at a time so a regression has one
 candidate cause.
+
+Run the comparison with `--replica-control`, which builds the base source a
+second time and runs it as a third side. Its base-versus-replica delta is the
+noise floor measured under the same conditions; `replica_binary=identical`
+confirms the two builds agree bit for bit, so anything it reports is
+measurement spread rather than code. Pass `IBEX_PERFCMP_TMPDIR` to a real disk:
+`/tmp` is a RAM-backed tmpfs here, and three Release trees in it will exhaust
+memory. Cap `CMAKE_BUILD_PARALLEL_LEVEL` well under the core count for the same
+reason.
+
+Check the query list in the report before reading the numbers. `bench_ibex.sh`
+defaults each optional table to a path inside the worktree, where benchmarking
+data does not exist, so a table the comparison fails to forward silently
+removes every query needing it — from both sides at once, which keeps the
+report self-consistent and gives nothing to notice.
+
+### A reproducible delta is not a caused delta
+
+Small effects need pairing, and pairing needs adjacency. Difference the two
+sides *within* each repeat rather than comparing per-side medians: run-to-run
+drift is common-mode and cancels, which is what pulls a sub-millisecond effect
+out of a millisecond of spread. Two sides interleaved adjacently pair far
+better than the same two sides several slots apart in a longer rotation.
+
+Before believing a localized regression, confirm the changed code actually runs
+in the affected query. A commit that inserts a function ahead of a hot one in
+the same translation unit moves that hot code relative to cache lines and
+branch-predictor state, and the resulting shift is stable across rebuilds
+because layout is deterministic. It will reproduce under every protocol, at any
+sample size, with an arbitrarily small p-value, and it means nothing. The
+replica control cannot catch this: identical source yields identical layout, so
+it correctly reports zero while the artifact sits between two *different*
+commits.
+
+So reproducibility is not evidence of causation here — it is exactly what the
+artifact predicts. Read the diff and ask which changed lines the benchmarked
+query executes. When every changed path is guarded off for that query, and
+struct sizes are unchanged, layout is the remaining explanation and the delta
+should not be recorded as a regression. A bisection over a range of commits
+gets a free null control wherever two adjacent commits compile to identical
+binaries, which is worth checking for with `cmp` before spending measurement
+time on that rung.

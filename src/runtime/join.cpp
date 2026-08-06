@@ -717,9 +717,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // order — the probe side's natural row order (parquet/CSV scan order,
     // or an upstream join's own probe order). An earlier shape reassembled
     // hits grouped by LEFT row instead, which reads as "preserve left
-    // order" but SPEC.md is explicit that "any join drop[s] ordering unless
-    // the implementation can prove a specific order" — there is no
-    // language-level guarantee here to preserve. Grouping by left row
+    // order" but SPEC.md §5.6 puts row order outside the join contract on
+    // purpose — there is no language-level guarantee here to preserve. Grouping by left row
     // silently permutes the output away from the probe side's scan order,
     // which then hurts cache locality on any DOWNSTREAM join that probes
     // this join's output (measured ~10-15% on a chained TPC-H-style join

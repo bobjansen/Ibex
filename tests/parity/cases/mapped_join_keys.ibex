@@ -1,0 +1,13 @@
+let lhs = Table {
+    account_id = [1, 1, 2],
+    region = [10, 20, 10],
+    amount = [100, 200, 300]
+};
+let rhs = Table {
+    client_id = [1, 2, 2],
+    area = [20, 10, 30],
+    label = [7, 8, 9]
+};
+let joined = lhs join rhs on { account_id = client_id, region = area };
+joined[select { account_id, client_id, region, area, amount, label }]
+    [order { account_id asc, region asc }];

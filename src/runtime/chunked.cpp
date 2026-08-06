@@ -2727,7 +2727,7 @@ class ChunkedDistinctOperator final : public Operator {
 class ChunkedSemiAntiJoinOperator final : public Operator {
    public:
     ChunkedSemiAntiJoinOperator(OperatorPtr left, Table right, ir::JoinKind kind,
-                                const std::vector<std::string>* keys)
+                                const std::vector<ir::JoinKey>* keys)
         : left_(std::move(left)), right_(std::move(right)), kind_(kind), keys_(keys) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -2794,7 +2794,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         left_swapped_ = std::move(*left_res);
         swapped_ = true;
 
-        const ColumnValue* lkey = left_swapped_->find(keys_->front());
+        const ColumnValue* lkey = left_swapped_->find(keys_->front().left);
         const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
         if (lcol != nullptr && lcol->size() < rcol.size()) {
             // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
@@ -2831,9 +2831,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         if (right_.columns.empty()) {
             return std::nullopt;
         }
-        const ColumnValue* key = right_.find(keys_->front());
+        const ColumnValue* key = right_.find(keys_->front().right);
         if (key == nullptr) {
-            return "join key not found in right table: " + keys_->front();
+            return "join key not found in right table: " + keys_->front().right;
         }
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
@@ -2913,7 +2913,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     }
 
     auto filter_chunk(Table t) -> std::optional<Table> {
-        const ColumnValue* key = t.find(keys_->front());
+        const ColumnValue* key = t.find(keys_->front().left);
         if (key == nullptr) {
             return std::nullopt;
         }
@@ -3008,7 +3008,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     OperatorPtr left_;
     Table right_;
     ir::JoinKind kind_;
-    const std::vector<std::string>* keys_;
+    const std::vector<ir::JoinKey>* keys_;
     bool initialized_ = false;
     bool swapped_ = false;
     bool swapped_emitted_ = false;
@@ -3084,7 +3084,7 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 /// `join_table_impl`.
 class ChunkedInnerJoinOperator final : public Operator {
    public:
-    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<std::string>* keys)
+    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys)
         : left_(std::move(left)), right_(std::move(right)), keys_(keys) {}
 
     /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
@@ -3095,7 +3095,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
                              const TableRegistry* registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const ExecutionContext& exec,
-                             const std::vector<std::string>* keys, const DeferredScan* probe,
+                             const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
                              std::string probe_name)
         : left_(std::move(left)),
           keys_(keys),
@@ -3196,10 +3196,11 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::nullopt;
             }
         }
-        const std::string& key_name = keys_->front();
-        const ColumnValue* rkey = right_.find(key_name);
+        const std::string& left_key_name = keys_->front().left;
+        const std::string& right_key_name = keys_->front().right;
+        const ColumnValue* rkey = right_.find(right_key_name);
         if (rkey == nullptr) {
-            return "join key not found in right table: " + key_name;
+            return "join key not found in right table: " + right_key_name;
         }
         if (auto err = detect_key_kind(*rkey, key_kind_)) {
             return err;
@@ -3208,10 +3209,10 @@ class ChunkedInnerJoinOperator final : public Operator {
         const std::size_t n_right = right_.rows();
 
         if (n_right <= kStreamRightThreshold) {
-            if (auto err = build_index(right_, key_name)) {
+            if (auto err = build_index(right_, right_key_name)) {
                 return err;
             }
-            setup_right_emit_schema(key_name);
+            setup_right_emit_schema();
             return std::nullopt;
         }
 
@@ -3232,20 +3233,20 @@ class ChunkedInnerJoinOperator final : public Operator {
 
         if (n_left < n_right) {
             left_table_ = std::move(left_table);
-            if (auto err = build_index(*left_table_, key_name)) {
+            if (auto err = build_index(*left_table_, left_key_name)) {
                 return err;
             }
-            setup_right_emit_schema(key_name);
+            setup_right_emit_schema();
             mode_ = Mode::Swapped;
             return std::nullopt;
         }
 
         left_materialized_ = std::move(left_table);
         use_materialized_left_ = true;
-        if (auto err = build_index(right_, key_name)) {
+        if (auto err = build_index(right_, right_key_name)) {
             return err;
         }
-        setup_right_emit_schema(key_name);
+        setup_right_emit_schema();
         return std::nullopt;
     }
 
@@ -3335,7 +3336,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::nullopt;
         }
         const Table& build = *left_materialized_;
-        const auto* build_entry = build.find_entry(keys_->front());
+        const auto* build_entry = build.find_entry(keys_->front().left);
         if (build_entry == nullptr ||
             !std::holds_alternative<Column<std::int64_t>>(*build_entry->column)) {
             return std::nullopt;
@@ -3364,7 +3365,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         key_kind_ = ExprType::Int;
-        if (auto err = build_index(build, keys_->front())) {
+        if (auto err = build_index(build, keys_->front().left)) {
             return err;
         }
 
@@ -3438,7 +3439,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
             return err;
         }
-        setup_right_emit_schema(keys_->front());
+        setup_right_emit_schema();
 
         Table left_copy;
         left_copy.columns.reserve(build.columns.size());
@@ -3468,7 +3469,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     // pruning, the fused key scan uses the raw bounds for row-group
     // skipping.
     void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
-        const auto* entry = build.find_entry(keys_->front());
+        const auto* entry = build.find_entry(keys_->front().left);
         if (entry == nullptr) {
             return;
         }
@@ -3666,10 +3667,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
     }
 
-    void setup_right_emit_schema(const std::string& key_name) {
+    void setup_right_emit_schema() {
         right_emit_idx_.reserve(right_.columns.size());
         for (std::size_t i = 0; i < right_.columns.size(); ++i) {
-            if (right_.columns[i].name == key_name) {
+            if (keys_->front().left == keys_->front().right &&
+                right_.columns[i].name == keys_->front().right) {
                 continue;
             }
             right_emit_idx_.push_back(i);
@@ -3789,11 +3791,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
-        const ColumnValue* key = left_chunk.find(keys_->front());
+        const ColumnValue* key = left_chunk.find(keys_->front().left);
         if (key == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + keys_->front());
+            return std::unexpected("join key not found in left chunk: " + keys_->front().left);
         }
-        const auto* probe_entry = left_chunk.find_entry(keys_->front());
+        const auto* probe_entry = left_chunk.find_entry(keys_->front().left);
         probe_validity_ = probe_entry != nullptr && probe_entry->validity.has_value()
                               ? &*probe_entry->validity
                               : nullptr;
@@ -3892,9 +3894,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     // cache-missing lookups. `hits` costs one entry per *matching* right row,
     // so it is bounded by the output row count.
     auto emit_swapped() -> std::expected<Table, std::string> {
-        const ColumnValue* rkey = right_.find(keys_->front());
+        const ColumnValue* rkey = right_.find(keys_->front().right);
         if (rkey == nullptr) {
-            return std::unexpected("join key not found in right table: " + keys_->front());
+            return std::unexpected("join key not found in right table: " + keys_->front().right);
         }
         if (!left_table_.has_value()) {
             return std::unexpected(
@@ -3907,7 +3909,7 @@ class ChunkedInnerJoinOperator final : public Operator {
 
         // In swapped mode the index is on the left, so the right table is the
         // probe side. Its null-keyed rows match nothing (see build_index).
-        const auto* right_entry = right_.find_entry(keys_->front());
+        const auto* right_entry = right_.find_entry(keys_->front().right);
         probe_validity_ = right_entry != nullptr && right_entry->validity.has_value()
                               ? &*right_entry->validity
                               : nullptr;
@@ -4110,7 +4112,7 @@ class ChunkedInnerJoinOperator final : public Operator {
 
     OperatorPtr left_;
     Table right_;
-    const std::vector<std::string>* keys_;
+    const std::vector<ir::JoinKey>* keys_;
 
     // Deferred-probe context (see the second constructor). `deferred_probe_`
     // doubles as the mode flag: non-null until the probe scan is resolved.

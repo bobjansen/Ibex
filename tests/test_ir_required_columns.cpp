@@ -147,7 +147,7 @@ TEST_CASE("required_columns: rename maps a demanded name back to its source name
 
 TEST_CASE("required_columns: join demands its keys from both sides", "[ir][required_columns]") {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{2}, ir::JoinKind::Inner,
-                                               std::vector<std::string>{"id"});
+                                               std::vector<ir::JoinKey>{"id"});
     join->add_child(make_scan("left"));
     join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
     auto plan =
@@ -158,6 +158,19 @@ TEST_CASE("required_columns: join demands its keys from both sides", "[ir][requi
     // schema is simply not read there.
     CHECK(demand.at("left").names == std::set<std::string>{"a", "id"});
     CHECK(demand.at("right").names == std::set<std::string>{"a", "id"});
+}
+
+TEST_CASE("required_columns: mapped join demands each side's own key", "[ir][required_columns]") {
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{2}, ir::JoinKind::Inner,
+                                               std::vector<ir::JoinKey>{{"left_id", "right_id"}});
+    join->add_child(make_scan("left"));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"a"})), std::move(join));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK(demand.at("left").names == std::set<std::string>{"a", "left_id"});
+    CHECK(demand.at("right").names == std::set<std::string>{"a", "right_id"});
 }
 
 TEST_CASE("required_columns: distinct cannot be narrowed", "[ir][required_columns]") {
@@ -228,7 +241,7 @@ TEST_CASE("scan_predicates: rejects a filter containing a non-local conjunct",
 TEST_CASE("scan_predicates: repeated source scans are not selected globally",
           "[ir][scan_predicates]") {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
-                                               std::vector<std::string>{"id"});
+                                               std::vector<ir::JoinKey>{"id"});
     join->add_child(
         with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
     join->add_child(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, gt_zero("b")),
@@ -267,7 +280,7 @@ TEST_CASE("scan_predicates: removes a fully applied fused filter while retaining
 TEST_CASE("split_scan_instances: repeated scans get per-instance identity",
           "[ir][scan_predicates]") {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
-                                               std::vector<std::string>{"id"});
+                                               std::vector<ir::JoinKey>{"id"});
     join->add_child(
         with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
     join->add_child(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, gt_zero("b")),
@@ -300,7 +313,7 @@ TEST_CASE("split_scan_instances: a source scanned once keeps its name", "[ir][sc
 
 TEST_CASE("split_scan_instances: only named sources are split", "[ir][scan_predicates]") {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
-                                               std::vector<std::string>{"id"});
+                                               std::vector<ir::JoinKey>{"id"});
     join->add_child(make_scan("t"));
     join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t"));
 
@@ -331,7 +344,7 @@ namespace {
 
 auto inner_join(ir::NodePtr left, ir::NodePtr right, std::string key) -> ir::NodePtr {
     auto join = std::make_unique<ir::JoinNode>(ir::NodeId{20}, ir::JoinKind::Inner,
-                                               std::vector<std::string>{std::move(key)});
+                                               std::vector<ir::JoinKey>{std::move(key)});
     join->add_child(std::move(left));
     join->add_child(std::move(right));
     return join;
@@ -393,19 +406,19 @@ TEST_CASE("deferrable_probe_scans: a scan consumed twice is never deferred",
 TEST_CASE("deferrable_probe_scans: non-inner, multi-key, and predicate joins are ineligible",
           "[ir][scan_predicates][deferred_scan]") {
     auto left_join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Left,
-                                                    std::vector<std::string>{"id"});
+                                                    std::vector<ir::JoinKey>{"id"});
     left_join->add_child(make_scan("build"));
     left_join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
     CHECK(ir::deferrable_probe_scans(*left_join, {"t"}).empty());
 
     auto two_key = std::make_unique<ir::JoinNode>(ir::NodeId{6}, ir::JoinKind::Inner,
-                                                  std::vector<std::string>{"id", "id2"});
+                                                  std::vector<ir::JoinKey>{"id", "id2"});
     two_key->add_child(make_scan("build"));
     two_key->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
     CHECK(ir::deferrable_probe_scans(*two_key, {"t"}).empty());
 
     auto with_pred = std::make_unique<ir::JoinNode>(ir::NodeId{7}, ir::JoinKind::Inner,
-                                                    std::vector<std::string>{"id"}, gt_zero("a"));
+                                                    std::vector<ir::JoinKey>{"id"}, gt_zero("a"));
     with_pred->add_child(make_scan("build"));
     with_pred->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
     CHECK(ir::deferrable_probe_scans(*with_pred, {"t"}).empty());

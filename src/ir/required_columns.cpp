@@ -294,16 +294,23 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
                 visit_children_widened(node, out);
                 return;
             }
-            ColumnDemand below = need;
+            ColumnDemand left_below = need;
+            ColumnDemand right_below = need;
             for (const auto& key : join.keys()) {
-                below.add(key);
+                left_below.add(key.left);
+                right_below.add(key.right);
             }
             if (join.predicate().has_value()) {
-                collect_refs(*join.predicate(), below);
+                collect_refs(*join.predicate(), left_below);
+                collect_refs(*join.predicate(), right_below);
             }
-            // `below` is the union across both sides; a name absent from one
-            // side's schema is simply not read there.
-            visit_children(node, below, out);
+            if (join.children().size() != 2 || join.children()[0] == nullptr ||
+                join.children()[1] == nullptr) {
+                visit_children_widened(node, out);
+                return;
+            }
+            visit(*join.children()[0], left_below, out);
+            visit(*join.children()[1], right_below, out);
             return;
         }
 

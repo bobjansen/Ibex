@@ -473,7 +473,7 @@ TEST_CASE("Parse asof join expression with multiple keys") {
     const auto& expr_stmt = std::get<ExprStmt>(stmt);
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Asof);
-    REQUIRE(join.keys == std::vector<std::string>{"ts", "symbol"});
+    REQUIRE(join.keys == std::vector<JoinKey>{{"ts", "ts"}, {"symbol", "symbol"}});
     REQUIRE(require_identifier(require_expr(join.left)).name == "lhs");
     REQUIRE(require_identifier(require_expr(join.right)).name == "rhs");
 }
@@ -1258,7 +1258,16 @@ TEST_CASE("Parse inner join") {
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Inner);
     REQUIRE(join.keys.size() == 1);
-    REQUIRE(join.keys[0] == "id");
+    REQUIRE(join.keys[0] == JoinKey{"id", "id"});
+}
+
+TEST_CASE("Parse join with mapped key pairs") {
+    auto result = parse("a join b on {left_id = right_id, tenant};");
+    REQUIRE(result.has_value());
+    const auto& stmt = std::get<ExprStmt>(result->statements.front());
+    const auto& join = require_join(require_expr(stmt.expr));
+    REQUIRE(join.kind == JoinKind::Inner);
+    REQUIRE(join.keys == std::vector<JoinKey>{{"left_id", "right_id"}, {"tenant", "tenant"}});
 }
 
 TEST_CASE("Parse left join") {
@@ -1270,7 +1279,7 @@ TEST_CASE("Parse left join") {
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Left);
     REQUIRE(join.keys.size() == 1);
-    REQUIRE(join.keys[0] == "key");
+    REQUIRE(join.keys[0] == JoinKey{"key", "key"});
 }
 
 TEST_CASE("Parse right join") {
@@ -1282,7 +1291,7 @@ TEST_CASE("Parse right join") {
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Right);
     REQUIRE(join.keys.size() == 1);
-    REQUIRE(join.keys[0] == "key");
+    REQUIRE(join.keys[0] == JoinKey{"key", "key"});
 }
 
 TEST_CASE("Parse outer join") {
@@ -1294,7 +1303,7 @@ TEST_CASE("Parse outer join") {
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Outer);
     REQUIRE(join.keys.size() == 1);
-    REQUIRE(join.keys[0] == "key");
+    REQUIRE(join.keys[0] == JoinKey{"key", "key"});
 }
 TEST_CASE("Parse semi join") {
     const char* source = "a semi join b on key;";
@@ -1304,7 +1313,7 @@ TEST_CASE("Parse semi join") {
     const auto& expr_stmt = std::get<ExprStmt>(stmt);
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Semi);
-    REQUIRE(join.keys == std::vector<std::string>{"key"});
+    REQUIRE(join.keys == std::vector<JoinKey>{{"key", "key"}});
 }
 
 TEST_CASE("Parse anti join") {
@@ -1315,7 +1324,7 @@ TEST_CASE("Parse anti join") {
     const auto& expr_stmt = std::get<ExprStmt>(stmt);
     const auto& join = require_join(require_expr(expr_stmt.expr));
     REQUIRE(join.kind == JoinKind::Anti);
-    REQUIRE(join.keys == std::vector<std::string>{"key"});
+    REQUIRE(join.keys == std::vector<JoinKey>{{"key", "key"}});
 }
 
 TEST_CASE("Parse cross join") {

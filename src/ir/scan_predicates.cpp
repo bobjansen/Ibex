@@ -363,9 +363,10 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
     if (node.kind() == NodeKind::Join) {
         const auto& join = static_cast<const JoinNode&>(node);
         if (join.kind() == JoinKind::Inner && join.keys().size() == 1 &&
+            join.keys().front().left == join.keys().front().right &&
             !join.predicate().has_value() && join.children().size() == 2 &&
             join.children()[1] != nullptr) {
-            if (auto match = match_probe_chain(*join.children()[1], join.keys().front());
+            if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {
                 if (const auto count = counts.find(match->first);
                     count != counts.end() && count->second == 1) {

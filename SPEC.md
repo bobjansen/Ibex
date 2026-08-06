@@ -982,9 +982,14 @@ update_clause   = [ guard ] "update" field_or_list
                                                         the rest unchanged *)
 
 join_keys       = IDENT
-                | "{" IDENT { "," IDENT } [ "," ] "}" ;
+                | "{" join_key { "," join_key } [ "," ] "}" ;
 
-(* When `on` is followed by a brace-list, the identifiers are equijoin keys.
+join_key        = IDENT [ "=" IDENT ] ;
+
+(* A mapped brace-list entry `left_key = right_key` pairs differently named
+   columns from the left and right inputs. Unmapped identifiers use the same
+   name on both sides. When `on` is followed by a brace-list, its entries are
+   equijoin keys.
    When `on` is followed by a bare identifier, that identifier is an equijoin key.
    When `on` is followed by any other expression (comparison, logical, arithmetic),
    the expression is a non-equijoin predicate (theta join). *)
@@ -1950,6 +1955,8 @@ A outer join B on { key1, key2 }
 A semi join B on { key1, key2 }
 A anti join B on { key1, key2 }
 A asof join B on { time }
+A join B on { left_id = right_id }
+A join B on { tenant, left_id = right_id }
 
 (* Non-equijoin / theta join — any comparison or boolean expression *)
 A join B on a < b
@@ -1973,6 +1980,13 @@ Semantics:
 - `A cross join B` returns the Cartesian product of rows from `A` and `B`.
 - `A asof join B on time` is an as-of join on the TimeFrame index column.
 
+**Mapped equality keys.** Inside a braced `on` list, `left_key = right_key`
+matches `A.left_key` to `B.right_key`. Unmapped entries remain shorthand for a
+same-name pair: `tenant` is equivalent to `tenant = tenant`. A same-name key is
+emitted once in the result. A differently named pair retains both key columns,
+with the left column in left-schema position and the right column in
+right-schema position. Ordinary right-side collision suffixing still applies.
+
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a
 join predicate rather than an equality key. A pair of rows `(a, b)` is included
@@ -1995,12 +2009,14 @@ are not used when the `on` clause is a predicate expression.
 rows (both matched and unmatched). For `outer join` and `right join`, unmatched
 right-side rows are appended after all left-side rows, in right-table order.
 
-The `on` list must be one or more unqualified column names present in both
-input schemas. `asof join` requires both operands to be `TimeFrame`s and the
-`on` list must include their shared time index column. Additional columns are
-treated as equality keys.
+The `on` list must contain one or more unqualified key entries. An unmapped
+entry must be present under that name in both inputs; a mapped entry's left name
+must be present in the left input and its right name in the right input.
+`asof join` requires both operands to be `TimeFrame`s and the `on` list must
+pair their respective time-index columns. Additional pairs are equality keys.
 
-Join expressions are **syntactic sugar** for the built-in join functions:
+Same-name join expressions are **syntactic sugar** for the built-in join
+functions:
 
 - `A join B on key` → `inner_join(A, B, key)`
 - `A left join B on key` → `left_join(A, B, key)`
@@ -2018,6 +2034,9 @@ Join expressions are **syntactic sugar** for the built-in join functions:
 - `A anti join B on { k1, k2 }` → `anti_join(A, B, k1, k2)`
 - `A asof join B on { time }` → `asof_join(A, B, time, tolerance = 0s)`
 - `A asof join B on { time, k1, k2 }` → `asof_join(A, B, time, k1, k2, tolerance = 0s)`
+
+Mapped-key forms lower to the same join operator with explicit left/right key
+pairs; the function shorthand accepts only common-name identifiers.
 
 For non-zero as-of tolerances, use the function forms directly (Section 11.3).
 
@@ -3133,15 +3152,18 @@ outer_join(left: DataFrame<A>, right: DataFrame<B>, key1, ..., keyN) -> DataFram
 asof_join(left: TimeFrame<A>, right: TimeFrame<B>, key1, ..., keyN, tolerance: Duration) -> TimeFrame<A ∪ B>
 ```
 
-Key arguments are unqualified identifiers naming columns present in **both**
-input schemas. The output schema is the union of both input schemas (duplicate
-key columns appear once).
+Function-form key arguments are unqualified identifiers naming columns present
+in **both** input schemas. Join-expression syntax additionally supports mapped
+pairs (`on { left_key = right_key }`). The output schema is the union of both
+input schemas: same-name key columns appear once, while differently named key
+columns both remain present.
 
 `asof_join` is valid only on `TimeFrame` operands. The final argument is a
 duration literal specifying the maximum time difference for a match. Both
-TimeFrames must share the same time index column. Additional key arguments
-apply equality matching in addition to the time-based match. Join expressions
-(Section 5.5) always pass a tolerance of `0s`.
+Function-form operands must share the same time-index column name. A mapped
+as-of join expression may instead pair differently named time-index columns.
+Additional key arguments apply equality matching in addition to the time-based
+match. Join expressions (Section 5.5) always pass a tolerance of `0s`.
 
 ### 12.4 Ordering
 
@@ -4020,6 +4042,7 @@ stream_field:
 
 join_form:
     expr "join" expr "on" IDENT
+    expr "join" expr "on" "{" IDENT "=" IDENT ("," IDENT ["=" IDENT])* "}"
     expr "left" "join" expr "on" IDENT
     expr "asof" "join" expr "on" IDENT
 ```

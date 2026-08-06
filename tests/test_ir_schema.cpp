@@ -264,7 +264,8 @@ TEST_CASE("schema: scan resolves from the source environment", "[ir][schema]") {
 }
 
 TEST_CASE("schema: join unions both sides, deduplicating shared keys", "[ir][schema]") {
-    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner, {"a"});
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                            std::vector<ibex::ir::JoinKey>{{"a", "a"}});
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
     join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "u"));
 
@@ -278,6 +279,23 @@ TEST_CASE("schema: join unions both sides, deduplicating shared keys", "[ir][sch
     REQUIRE(s.is_known());
     REQUIRE(names(s) == std::vector<std::string>{"a", "b", "c"});  // shared "a" appears once
     REQUIRE(type_of(s, "c") == ColumnType::String);
+}
+
+TEST_CASE("schema: mapped join retains both differently named keys", "[ir][schema]") {
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                            std::vector<ibex::ir::JoinKey>{{"left_id", "right_id"}});
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+
+    SourceSchemas sources{
+        {"left", SchemaInfo::known({{.name = "left_id", .type = ColumnType::Int64},
+                                    {.name = "value", .type = ColumnType::Float64}})},
+        {"right", SchemaInfo::known({{.name = "right_id", .type = ColumnType::Int64},
+                                     {.name = "value", .type = ColumnType::String}})},
+    };
+    auto s = ibex::ir::infer_schema(join, sources);
+    REQUIRE(s.is_known());
+    REQUIRE(names(s) == std::vector<std::string>{"left_id", "value", "right_id", "value_right"});
 }
 
 TEST_CASE("schema: ascription recovers a known schema over an unknown child", "[ir][schema]") {

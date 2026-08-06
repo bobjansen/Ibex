@@ -2,6 +2,7 @@
 
 #include <ibex/core/time.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -268,6 +269,45 @@ enum class JoinKind : std::uint8_t {
     Cross,
     Asof,
 };
+
+/// A pair of input column names used by an equijoin. A single-name surface key
+/// is represented by equal `left` and `right` names.
+struct JoinKey {
+    std::string left;
+    std::string right;
+
+    JoinKey() = default;
+    JoinKey(const char* name) : left(name), right(name) {}
+    JoinKey(std::string name) : left(name), right(std::move(name)) {}
+    JoinKey(std::string left_name, std::string right_name)
+        : left(std::move(left_name)), right(std::move(right_name)) {}
+
+    auto operator==(const JoinKey&) const -> bool = default;
+};
+
+[[nodiscard]] inline auto left_join_key_names(const std::vector<JoinKey>& keys)
+    -> std::vector<std::string> {
+    std::vector<std::string> names;
+    names.reserve(keys.size());
+    for (const auto& key : keys) {
+        names.push_back(key.left);
+    }
+    return names;
+}
+
+[[nodiscard]] inline auto right_join_key_names(const std::vector<JoinKey>& keys)
+    -> std::vector<std::string> {
+    std::vector<std::string> names;
+    names.reserve(keys.size());
+    for (const auto& key : keys) {
+        names.push_back(key.right);
+    }
+    return names;
+}
+
+[[nodiscard]] inline auto join_keys_are_same_named(const std::vector<JoinKey>& keys) -> bool {
+    return std::ranges::all_of(keys, [](const JoinKey& key) { return key.left == key.right; });
+}
 
 /// Aggregation specification: apply function to column, store as alias.
 struct AggSpec {
@@ -649,7 +689,7 @@ class ExternCallNode final : public Node {
 /// general non-equijoin predicate (theta join).
 class JoinNode final : public Node {
    public:
-    JoinNode(NodeId id, JoinKind kind, std::vector<std::string> keys,
+    JoinNode(NodeId id, JoinKind kind, std::vector<JoinKey> keys,
              std::optional<Expr> predicate = std::nullopt)
         : Node(NodeKind::Join, id),
           kind_(kind),
@@ -657,14 +697,14 @@ class JoinNode final : public Node {
           predicate_(std::move(predicate)) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
-    [[nodiscard]] auto keys() const noexcept -> const std::vector<std::string>& { return keys_; }
+    [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
     [[nodiscard]] auto predicate() const noexcept -> const std::optional<Expr>& {
         return predicate_;
     }
 
    private:
     JoinKind kind_;
-    std::vector<std::string> keys_;
+    std::vector<JoinKey> keys_;
     std::optional<Expr> predicate_;
 };
 

@@ -680,7 +680,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     if (!first)
                         *out_ << ", ";
                     first = false;
-                    *out_ << '"' << escape_string(key) << '"';
+                    *out_ << "{\"" << escape_string(key.left) << "\", \""
+                          << escape_string(key.right) << "\"}";
                 }
                 *out_ << "}, " << emit_filter_expr(*join.predicate()) << ");\n";
                 return var;
@@ -693,7 +694,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                     if (!first)
                         *out_ << ", ";
                     first = false;
-                    *out_ << '"' << escape_string(key) << '"';
+                    *out_ << "{\"" << escape_string(key.left) << "\", \""
+                          << escape_string(key.right) << "\"}";
                 }
                 *out_ << "}";
             }

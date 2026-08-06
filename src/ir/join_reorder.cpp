@@ -57,15 +57,16 @@ auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vec
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        join.children().size() != 2 || join.children()[0] == nullptr ||
-        join.children()[1] == nullptr || join.children()[1]->kind() == NodeKind::Join) {
+        !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
+        join.children()[0] == nullptr || join.children()[1] == nullptr ||
+        join.children()[1]->kind() == NodeKind::Join) {
         return false;
     }
     if (!scan_left_deep(*join.children()[0], leaves, edges)) {
         return false;
     }
     leaves.push_back(join.children()[1].get());
-    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join.keys()});
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = left_join_key_names(join.keys())});
     return true;
 }
 
@@ -77,8 +78,8 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     auto* join = static_cast<JoinNode*>(node.get());
     if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
-        join->mutable_children().size() != 2 || join->mutable_children()[0] == nullptr ||
-        join->mutable_children()[1] == nullptr ||
+        !join_keys_are_same_named(join->keys()) || join->mutable_children().size() != 2 ||
+        join->mutable_children()[0] == nullptr || join->mutable_children()[1] == nullptr ||
         join->mutable_children()[1]->kind() == NodeKind::Join) {
         return false;
     }
@@ -89,7 +90,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
         return false;
     }
     leaves.push_back(std::move(right));
-    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join->keys()});
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = left_join_key_names(join->keys())});
     return true;
 }
 
@@ -235,7 +236,13 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
         if (keys == nullptr || leaves[candidate] == nullptr) {
             return nullptr;
         }
-        auto join = std::make_unique<JoinNode>(NodeId{next_id()++}, JoinKind::Inner, *keys);
+        std::vector<JoinKey> paired_keys;
+        paired_keys.reserve(keys->size());
+        for (const auto& key : *keys) {
+            paired_keys.emplace_back(key);
+        }
+        auto join = std::make_unique<JoinNode>(NodeId{next_id()++}, JoinKind::Inner,
+                                               std::move(paired_keys));
         join->add_child(std::move(result));
         join->add_child(std::move(leaves[candidate]));
         result = std::move(join);

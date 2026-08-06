@@ -11,6 +11,12 @@ let species_meta = read_csv("data/iris.csv");
 print("inner join on Species — only matching rows:");
 iris join species_meta on Species;
 
+// Mapped keys join differently named columns. Both key columns remain in the
+// native Ibex output; same-name keys above are emitted only once.
+let species_by_code = species_meta[rename SpeciesCode = Species];
+print("inner join on mapped keys — Species matches SpeciesCode:");
+iris join species_by_code on { Species = SpeciesCode };
+
 // Left join on a single key
 print("left join on Species — all left rows, nulls where unmatched:");
 iris left join species_meta on Species;

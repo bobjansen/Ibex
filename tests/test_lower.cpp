@@ -834,8 +834,20 @@ TEST_CASE("Lower join to IR") {
     REQUIRE(join != nullptr);
     REQUIRE(join->kind() == ir::JoinKind::Inner);
     REQUIRE(join->keys().size() == 1);
-    REQUIRE(join->keys()[0] == "key");
+    REQUIRE(join->keys()[0] == ir::JoinKey{"key", "key"});
     REQUIRE(join->children().size() == 2);
+}
+
+TEST_CASE("Lower mapped join keys to IR") {
+    auto program = require_parse("a left join b on {left_id = right_id, tenant};");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+
+    const auto* join = as_node<ir::JoinNode>(result->get());
+    REQUIRE(join != nullptr);
+    REQUIRE(join->kind() == ir::JoinKind::Left);
+    REQUIRE(join->keys() ==
+            std::vector<ir::JoinKey>{{"left_id", "right_id"}, {"tenant", "tenant"}});
 }
 
 TEST_CASE("Lower left join to IR") {
@@ -1105,7 +1117,7 @@ parts[filter p_partkey == scalar(
     const auto* join = find_join(*result.value());
     REQUIRE(join != nullptr);
     REQUIRE(join->kind() == ir::JoinKind::Left);
-    REQUIRE(join->keys() == std::vector<std::string>{"p_partkey"});
+    REQUIRE(join->keys() == std::vector<ir::JoinKey>{{"p_partkey", "p_partkey"}});
     REQUIRE(join->predicate() == std::nullopt);  // a theta join would be a nested loop
 
     // Right side: Rename(ps_partkey -> p_partkey) over the aggregate.

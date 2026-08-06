@@ -79,7 +79,7 @@ auto and_combine(std::vector<Expr> parts) -> Expr {
 enum class Destination : std::uint8_t { Above, Left, Right, BothSides };
 
 auto classify(const Expr& conjunct, const SchemaInfo& left, const SchemaInfo& right,
-              const std::vector<std::string>& keys) -> Destination {
+              const std::vector<JoinKey>& keys) -> Destination {
     // A conjunct whose value depends on rows other than its own (rolling, lag,
     // rank, aggregates, ...) means something different below the join.
     if (!is_subset_evaluable_expr(conjunct)) {
@@ -93,7 +93,8 @@ auto classify(const Expr& conjunct, const SchemaInfo& left, const SchemaInfo& ri
     }
 
     auto is_key = [&](const std::string& name) {
-        return std::ranges::find(keys, name) != keys.end();
+        return std::ranges::any_of(
+            keys, [&](const JoinKey& key) { return key.left == name && key.right == name; });
     };
 
     // Above the join a name shared by both sides resolves to the LEFT column,
@@ -133,6 +134,9 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     const JoinKind kind = join.kind();
     if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Right) {
         return node;  // Outer/Semi/Anti/Cross/Asof: see the header's safety table.
+    }
+    if (!join_keys_are_same_named(join.keys())) {
+        return node;  // Moving a predicate would require remapping its column refs per side.
     }
     if (join.children().size() != 2 || join.children()[0] == nullptr ||
         join.children()[1] == nullptr) {
@@ -248,7 +252,8 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     auto& outer = static_cast<JoinNode&>(*node);
     if ((outer.kind() != JoinKind::Semi && outer.kind() != JoinKind::Anti) ||
-        outer.predicate().has_value() || outer.keys().empty()) {
+        outer.predicate().has_value() || outer.keys().empty() ||
+        !join_keys_are_same_named(outer.keys())) {
         return node;
     }
     if (outer.children().size() != 2 || outer.children()[0] == nullptr ||
@@ -266,12 +271,14 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
 
     const SchemaInfo left = infer_schema(*inner.children()[0], sources);
     const SchemaInfo right = infer_schema(*inner.children()[1], sources);
-    const auto& keys = outer.keys();
+    const auto keys = left_join_key_names(outer.keys());
     const auto in_schema = [](const SchemaInfo& s, const std::string& name) {
         return s.is_known() && s.find(name) != nullptr;
     };
     const auto is_inner_key = [&](const std::string& name) {
-        return std::ranges::find(inner.keys(), name) != inner.keys().end();
+        return std::ranges::any_of(inner.keys(), [&](const JoinKey& key) {
+            return key.left == name && key.right == name;
+        });
     };
     // A left push is licensed when every key is in the (Known) left schema — a
     // shared name resolves to the left above the join. A right push additionally

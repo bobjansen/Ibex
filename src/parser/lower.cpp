@@ -1850,7 +1850,9 @@ class Lowerer {
                 keys.emplace_back(ident->name);
             } else {
                 // General expression → non-equijoin predicate
+                const bool outer_context = std::exchange(in_join_predicate_, true);
                 auto pred = lower_expr_to_ir(on_expr);
+                in_join_predicate_ = outer_context;
                 if (!pred) {
                     return std::unexpected(pred.error());
                 }
@@ -3230,6 +3232,29 @@ class Lowerer {
                 return std::unexpected(LowerError{
                     .message = "outer(): a capture is only valid inside a scalar(...) correlated "
                                "subquery"});
+            }
+            // `left(col)` / `right(col)`: which input of the enclosing join the
+            // column comes from. Only a join predicate has two inputs to choose
+            // between, so anywhere else this is a mistake worth naming.
+            if (call->callee == "left" || call->callee == "right") {
+                if (!in_join_predicate_) {
+                    return std::unexpected(LowerError{
+                        .message = call->callee + "(): a side-qualified column reference is only "
+                                                  "valid in a join predicate"});
+                }
+                if (call->args.size() != 1 || !call->named_args.empty()) {
+                    return std::unexpected(
+                        LowerError{.message = call->callee + "() expects exactly one column name"});
+                }
+                const auto* ident = std::get_if<IdentifierExpr>(&call->args.front()->node);
+                if (ident == nullptr || ident->lexical) {
+                    return std::unexpected(LowerError{
+                        .message = call->callee + "() expects a column name, not an expression"});
+                }
+                return ir::Expr{.node = ir::ColumnRef{.name = ident->name,
+                                                      .side = call->callee == "left"
+                                                                  ? ir::JoinSide::Left
+                                                                  : ir::JoinSide::Right}};
             }
             if (as_scalar_subquery(expr) != nullptr) {
                 return std::unexpected(LowerError{
@@ -4867,6 +4892,9 @@ class Lowerer {
     // parameter substitutions (top = innermost inlined body) and a guard set to
     // reject recursive inlining.
     std::vector<robin_hood::unordered_map<std::string, ir::Expr>> inline_scopes_;
+    /// True while lowering a join's `on` predicate, where `left(col)` and
+    /// `right(col)` are meaningful. Everywhere else they are an error.
+    bool in_join_predicate_ = false;
     robin_hood::unordered_set<std::string> inlining_active_;
     // Serial number for the generated column a `scalar(...)` subquery lands in.
     std::size_t scalar_subquery_count_ = 0;

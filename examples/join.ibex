@@ -8,26 +8,29 @@ let species_meta = read_csv("data/iris.csv");
 // Each result is truncated to 10 rows on display.
 
 // Inner join on a single key
+// Both inputs are the same file, so every non-key column exists on both
+// sides. Ibex will not guess a name for a clash: the `suffix` clause says
+// what to call each side, and without it the join is an error.
 print("inner join on Species — only matching rows:");
-iris join species_meta on Species;
+iris join species_meta on Species suffix { "", "_meta" };
 
 // Mapped keys join differently named columns. Both key columns remain in the
 // native Ibex output; same-name keys above are emitted only once.
 let species_by_code = species_meta[rename SpeciesCode = Species];
 print("inner join on mapped keys — Species matches SpeciesCode:");
-iris join species_by_code on { Species = SpeciesCode };
+iris join species_by_code on { Species = SpeciesCode } suffix { "", "_meta" };
 
 // Left join on a single key
 print("left join on Species — all left rows, nulls where unmatched:");
-iris left join species_meta on Species;
+iris left join species_meta on Species suffix { "", "_meta" };
 
 // Right join on a single key
 print("right join on Species — all right rows:");
-iris right join species_meta on Species;
+iris right join species_meta on Species suffix { "", "_meta" };
 
 // Full outer join on a single key
 print("outer join on Species — union of both sides:");
-iris outer join species_meta on Species;
+iris outer join species_meta on Species suffix { "", "_meta" };
 
 // Semi join keeps only matching left rows
 print("semi join on Species — left rows that have a match (no right columns):");
@@ -39,7 +42,7 @@ iris anti join species_meta on Species;
 
 // Cross join returns the cartesian product
 print("cross join — cartesian product of both sides:");
-iris cross join species_meta;
+iris cross join species_meta suffix { "", "_meta" };
 
 // A non-equijoin predicate compares columns across the two inputs. Both sides
 // here come from the same file, so every name exists twice — `left(...)` and
@@ -49,4 +52,13 @@ print("non-equijoin — flowers wider than the row they are paired with:");
 iris[filter Species == "setosa"]
     join species_meta[filter Species == "virginica"]
     on left(`Sepal.Width`) > right(`Sepal.Width`)
-       && left(`Petal.Length`) < right(`Petal.Length`);
+       && left(`Petal.Length`) < right(`Petal.Length`)
+    suffix { "", "_other" };
+
+// An empty suffix leaves that side alone, as above. Naming both sides is the
+// other common shape — useful when neither input is the "original".
+print("both sides renamed — neither input is privileged:");
+iris[head 3] join species_meta[head 3] on Species suffix { "_a", "_b" };
+
+// Semi and anti joins emit no right columns, so nothing can collide and no
+// clause is needed — see the two examples above.

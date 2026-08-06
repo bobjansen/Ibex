@@ -158,6 +158,7 @@ let    mut    extern  fn      from
 filter select update  distinct order head tail by window
 rename resample melt  dcast  cov  corr  transpose
 join   left   right   outer   asof   on
+cross  semi   anti    suffix
 import Stream
 asc    desc    as
 true   false
@@ -843,17 +844,22 @@ expr            = primary
                 | unary_op expr
                 | expr binary_op expr
                 | expr "[" clause_list "]"
-                | expr "join" expr "on" join_keys
-                | expr "left" "join" expr "on" join_keys
-                | expr "right" "join" expr "on" join_keys
-                | expr "outer" "join" expr "on" join_keys
-                | expr "asof" "join" expr "on" join_keys
-                | expr "join" expr "on" expr
-                | expr "left" "join" expr "on" expr
-                | expr "right" "join" expr "on" expr
-                | expr "outer" "join" expr "on" expr
-                | expr "semi" "join" expr "on" expr
-                | expr "anti" "join" expr "on" expr ;
+                | expr "join" expr "on" join_keys [ join_suffix ]
+                | expr "left" "join" expr "on" join_keys [ join_suffix ]
+                | expr "right" "join" expr "on" join_keys [ join_suffix ]
+                | expr "outer" "join" expr "on" join_keys [ join_suffix ]
+                | expr "asof" "join" expr "on" join_keys [ join_suffix ]
+                | expr "cross" "join" expr [ join_suffix ]
+                | expr "join" expr "on" expr [ join_suffix ]
+                | expr "left" "join" expr "on" expr [ join_suffix ]
+                | expr "right" "join" expr "on" expr [ join_suffix ]
+                | expr "outer" "join" expr "on" expr [ join_suffix ]
+                | expr "semi" "join" expr "on" expr [ join_suffix ]
+                | expr "anti" "join" expr "on" expr [ join_suffix ] ;
+
+(* Collision renaming — Section 5.6. Both suffixes are always named; an empty
+   string leaves that side alone, and two empty strings are rejected. *)
+join_suffix     = "suffix" "{" STRING "," STRING "}" ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
@@ -2000,7 +2006,9 @@ matches `A.left_key` to `B.right_key`. Unmapped entries remain shorthand for a
 same-name pair: `tenant` is equivalent to `tenant = tenant`. A same-name key is
 emitted once in the result. A differently named pair retains both key columns,
 with the left column in left-schema position and the right column in
-right-schema position. Ordinary right-side collision suffixing still applies.
+right-schema position. Because a mapped pair keeps both columns, it can itself
+collide with a column of the other input, and is subject to the collision rules
+below.
 
 **Output columns.** Every join kind produces its result columns by the same
 rules:
@@ -2011,10 +2019,36 @@ rules:
   their own names, followed by the right columns in right-input order.
 - A same-name equality key contributes one output column; a mapped pair keeps
   both (see above).
-- A remaining right column whose name is already taken receives a `_right`
-  suffix, applied repeatedly until the name is free. So a right `val` joined
-  against a left that already has both `val` and `val_right` is emitted as
-  `val_right_right`.
+- Any other name held by both inputs is a **collision**, and a collision is an
+  error unless the join carries a `suffix` clause. The message names the column
+  and both sides. This is a static error where both schemas are known and a
+  runtime one otherwise.
+
+**The `suffix` clause.** A join may name the suffixes that resolve its
+collisions:
+
+```ibex
+prices_2023 join prices_2024 on symbol suffix { "_old", "_new" }
+```
+
+- The clause always names both suffixes. The first applies to colliding left
+  columns, the second to colliding right ones.
+- An empty string leaves that side under its original name, so
+  `suffix { "", "_right" }` renames only the right side of each collision.
+- Suffixes apply to collisions only, never to every column. A column held by
+  one input alone keeps its name.
+- A same-name equality key folds into a single output column, so it is not a
+  collision and is never suffixed. `semi join` and `anti join` emit no right
+  columns and so cannot collide at all.
+- If a suffixed name still collides — because it lands on an existing column,
+  or because both suffixes are equal — that is an error in turn. Names are
+  never adjusted a second time to find a free one.
+- `suffix { "", "" }` is rejected at parse time: it cannot separate anything.
+
+Renaming is never silent. Earlier versions suffixed a colliding right column
+with `_right`, repeating until the name was free, which meant an accidental
+collision between two unrelated tables was resolved by the same mechanism as a
+deliberate wide-table comparison, and produced names like `val_right_right`.
 
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a

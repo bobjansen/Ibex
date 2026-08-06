@@ -596,6 +596,51 @@ TEST_CASE("emitter: join node - side-qualified predicate references", "[codegen]
     CHECK(contains(out, "ibex::ops::filter_col_side(\"v\", ibex::ir::JoinSide::Right)"));
 }
 
+TEST_CASE("emitter: join node - suffix policy", "[codegen]") {
+    // A dropped policy does not produce wrong names, it produces a *rejected
+    // program*: the transpiled join would report the collision the clause
+    // exists to resolve, on input the interpreter accepts.
+    ir::Builder b;
+
+    SECTION("a clause is carried into the generated call") {
+        auto join = b.join(ir::JoinKind::Inner, {{"id", "id"}}, std::nullopt,
+                           ir::JoinSuffixPolicy{.present = true, .left = "_l", .right = "_r"});
+        join->add_child(make_source(b, "left.csv"));
+        join->add_child(make_source(b, "right.csv"));
+        const auto out = emit_to_string(*join);
+        CHECK(contains(out, "ibex::ir::JoinSuffixPolicy{.present = true, .left = \"_l\", "
+                            ".right = \"_r\"}"));
+    }
+
+    SECTION("an absent clause emits no extra argument") {
+        auto join = b.join(ir::JoinKind::Inner, {{"id", "id"}});
+        join->add_child(make_source(b, "left.csv"));
+        join->add_child(make_source(b, "right.csv"));
+        CHECK_FALSE(contains(emit_to_string(*join), "JoinSuffixPolicy"));
+    }
+
+    SECTION("an empty suffix survives as an empty string, not as absence") {
+        auto join = b.join(ir::JoinKind::Inner, {{"id", "id"}}, std::nullopt,
+                           ir::JoinSuffixPolicy{.present = true, .left = "", .right = "_r"});
+        join->add_child(make_source(b, "left.csv"));
+        join->add_child(make_source(b, "right.csv"));
+        const auto out = emit_to_string(*join);
+        CHECK(contains(out, ".present = true, .left = \"\", .right = \"_r\""));
+    }
+
+    SECTION("a theta join carries both the predicate and the clause") {
+        auto join = b.join(ir::JoinKind::Inner, {},
+                           filter_cmp(ir::CompareOp::Lt, filter_col_side("v", ir::JoinSide::Left),
+                                      filter_col_side("v", ir::JoinSide::Right)),
+                           ir::JoinSuffixPolicy{.present = true, .left = "", .right = "_r"});
+        join->add_child(make_source(b, "left.csv"));
+        join->add_child(make_source(b, "right.csv"));
+        const auto out = emit_to_string(*join);
+        CHECK(contains(out, "ibex::ops::join_with_predicate("));
+        CHECK(contains(out, "ibex::ir::JoinSuffixPolicy{"));
+    }
+}
+
 // --- Config ------------------------------------------------------------------
 
 TEST_CASE("emitter: extern headers in config", "[codegen]") {

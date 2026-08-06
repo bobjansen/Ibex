@@ -17,6 +17,18 @@ ibex_quote_identifier <- function(name) {
     paste0("`", escaped, "`")
 }
 
+# A double-quoted Ibex string literal. Used for join suffixes, which are data
+# rather than identifiers and so cannot go through the backtick form.
+ibex_quote_string <- function(value) {
+    stopifnot(is.character(value), length(value) == 1L, !is.na(value))
+    characters <- strsplit(value, "", fixed = TRUE)[[1]]
+    escaped <- paste0(
+        ifelse(characters %in% c("\\", "\""), paste0("\\", characters), characters),
+        collapse = ""
+    )
+    paste0("\"", escaped, "\"")
+}
+
 ibex_new_binding_name <- function(session, kind = "source") {
     repeat {
         ibex_dplyr_state$binding_id <- ibex_dplyr_state$binding_id + 1L
@@ -236,7 +248,15 @@ ibex_render_plan <- function(x, redact = FALSE) {
             join = paste0(
                 "(", code, if (identical(step$join_kind, "left")) " left join " else " join ",
                 sub(";$", "", ibex_render_plan(step$right)), " on { ",
-                paste(vapply(step$keys, ibex_quote_identifier, character(1)), collapse = ", "), " })"
+                paste(vapply(step$keys, ibex_quote_identifier, character(1)), collapse = ", "), " }",
+                # Ibex refuses a non-key collision without this clause, and its
+                # two-suffix form is exactly dplyr's `suffix` argument, so the
+                # names come out right without a rename pass afterwards.
+                if (length(step$suffix) == 2L) {
+                    paste0(" suffix { ", ibex_quote_string(step$suffix[[1]]), ", ",
+                           ibex_quote_string(step$suffix[[2]]), " }")
+                } else "",
+                ")"
             ),
             rlang::abort(paste0("Unknown ibex lazy-plan step: ", step$kind))
         )
@@ -936,23 +956,30 @@ ibex_join_fallback <- function(x, y, verb, by, copy, suffix, ..., keep = NULL,
     })
 }
 
-ibex_join_right_names <- function(x, y, keys) {
+# Ibex suffixes both sides of a collision and leaves everything else alone,
+# which is dplyr's rule too. `suffix` is NULL when the caller has not reached
+# the point of supplying one; then no name changes.
+ibex_join_output_names <- function(x, y, keys, suffix) {
     right <- setdiff(y$schema$names, keys)
-    output <- x$schema$names
-    vapply(right, function(name) {
-        candidate <- name
-        while (candidate %in% output) candidate <- paste0(candidate, "_right")
-        output <<- c(output, candidate)
-        candidate
-    }, character(1))
+    left <- x$schema$names
+    overlap <- intersect(setdiff(left, keys), right)
+    if (!length(overlap) || length(suffix) != 2L) {
+        return(list(left = left, right = right))
+    }
+    list(
+        left = ifelse(left %in% overlap, paste0(left, suffix[[1]]), left),
+        right = ifelse(right %in% overlap, paste0(right, suffix[[2]]), right)
+    )
 }
 
-ibex_join_schema <- function(x, y, keys, kind) {
+ibex_join_schema <- function(x, y, keys, kind, suffix) {
     right <- setdiff(y$schema$names, keys)
+    names <- ibex_join_output_names(x, y, keys, suffix)
     right_schema <- lapply(y$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[match(right, y$schema$names)])
-    right_schema$names <- ibex_join_right_names(x, y, keys)
+    right_schema$names <- names$right
     if (identical(kind, "left")) right_schema$nullable[] <- TRUE
     schema <- lapply(x$schema[c("names", "types", "nullable", "categorical", "timezone")], identity)
+    schema$names <- names$left
     for (field in names(right_schema)) schema[[field]] <- c(schema[[field]], right_schema[[field]])
     schema$rows <- NA_real_
     schema
@@ -980,22 +1007,19 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
         ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
     }
-    schema <- ibex_join_schema(x, y, keys, kind)
-    result <- ibex_append_step(
-        x, list(kind = "join", join_kind = kind, right = y, keys = keys),
+    overlap <- intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
+    if (length(overlap) && (length(suffix) != 2L || any(!nzchar(suffix)))) {
+        ibex_unsupported("Native joins require two non-empty suffixes.")
+    }
+    # Only emit the clause when something actually collides: Ibex accepts it
+    # either way, but a clause with nothing to rename is noise in the plan.
+    step_suffix <- if (length(overlap)) suffix else NULL
+    schema <- ibex_join_schema(x, y, keys, kind, step_suffix)
+    ibex_append_step(
+        x,
+        list(kind = "join", join_kind = kind, right = y, keys = keys, suffix = step_suffix),
         schema = schema, groups = character(), ordering = NULL
     )
-    overlap <- intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
-    if (!length(overlap)) return(result)
-    if (length(suffix) != 2L || any(!nzchar(suffix))) ibex_unsupported("Native joins require two non-empty suffixes.")
-    native_right_names <- ibex_join_right_names(x, y, keys)
-    mappings <- c(
-        stats::setNames(paste0(overlap, suffix[[1]]), overlap),
-        stats::setNames(paste0(overlap, suffix[[2]]), native_right_names[match(overlap, setdiff(y$schema$names, keys))])
-    )
-    rename_dots <- rlang::syms(names(mappings))
-    names(rename_dots) <- unname(mappings)
-    rlang::inject(rename.ibex_tbl(result, !!!rename_dots))
 }
 
 inner_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,

@@ -89,6 +89,28 @@ TEST_CASE("join: inner join on single key", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 300});
 }
 
+TEST_CASE("join: mapped key pair retains both key columns", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("left_id", Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("lval", Column<std::int64_t>{10, 20, 30});
+
+    runtime::Table rhs;
+    rhs.add_column("right_id", Column<std::int64_t>{2, 3, 4});
+    rhs.add_column("rval", Column<std::int64_t>{200, 300, 400});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on {left_id = right_id};", tables);
+
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "left_id") == std::vector<std::int64_t>{2, 3});
+    CHECK(col_i64(out, "right_id") == std::vector<std::int64_t>{2, 3});
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 30});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{200, 300});
+}
+
 TEST_CASE("join: inner join on Int64 key preserves duplicate matches", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2});
@@ -439,7 +461,7 @@ TEST_CASE("join: asof error reports both sides when neither is a TimeFrame",
     CHECK(error.find("as_timeframe(right, \"ts\")") != std::string::npos);
 }
 
-TEST_CASE("join: asof error names mismatched time indexes", "[join][asof][diagnostic]") {
+TEST_CASE("join: asof error requests a mapped time-index pair", "[join][asof][diagnostic]") {
     runtime::Table lhs;
     lhs.add_column("ts", Column<Timestamp>{Timestamp{1}});
     lhs.add_column("symbol", Column<std::string>{"A"});
@@ -455,9 +477,31 @@ TEST_CASE("join: asof error names mismatched time indexes", "[join][asof][diagno
     tables.emplace("rhs", std::move(rhs));
 
     auto error = interpret_error("lhs asof join rhs on symbol;", tables);
-    CHECK(error.find("share the same time index") != std::string::npos);
-    CHECK(error.find("left  time index: 'ts'") != std::string::npos);
-    CHECK(error.find("right time index: 'event_time'") != std::string::npos);
+    CHECK(error.find("time index 'ts' (left)") != std::string::npos);
+    CHECK(error.find("'event_time' (right)") != std::string::npos);
+    CHECK(error.find("ts = event_time") != std::string::npos);
+}
+
+TEST_CASE("join: asof supports differently named time indexes", "[join][asof]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<Timestamp>{Timestamp{1}, Timestamp{3}});
+    lhs.add_column("lval", Column<std::int64_t>{10, 30});
+    lhs.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::Table rhs;
+    rhs.add_column("event_time", Column<Timestamp>{Timestamp{1}, Timestamp{2}});
+    rhs.add_column("rval", Column<std::int64_t>{100, 200});
+    rhs.set_properties(ibex::runtime::TableProperties::time_frame("event_time"));
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs asof join rhs on {ts = event_time};", tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{10, 30});
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{100, 200});
+    REQUIRE(out.find("event_time") != nullptr);
 }
 
 TEST_CASE("join: asof error names which side is unsorted", "[join][asof][diagnostic]") {
@@ -1148,3 +1192,4 @@ TEST_CASE("join: swapped-mode inner join emits in right-scan order", "[join]") {
     CHECK(col_i64(out, "lval") == want_lval);
     CHECK(col_i64(out, "rval") == want_rval);
 }
+

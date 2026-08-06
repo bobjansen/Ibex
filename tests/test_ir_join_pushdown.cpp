@@ -37,7 +37,7 @@ auto make_scan(ir::NodeId id, std::string name) -> ir::NodePtr {
     return std::make_unique<ir::ScanNode>(id, std::move(name));
 }
 
-auto make_join(ir::NodeId id, ir::JoinKind kind, std::vector<std::string> keys, ir::NodePtr left,
+auto make_join(ir::NodeId id, ir::JoinKind kind, std::vector<ir::JoinKey> keys, ir::NodePtr left,
                ir::NodePtr right) -> ir::NodePtr {
     auto join = std::make_unique<ir::JoinNode>(id, kind, std::move(keys));
     join->add_child(std::move(left));
@@ -75,7 +75,7 @@ auto semi_over_join_tree(ir::JoinKind semi_kind, std::string semi_key,
                          ir::JoinKind inner_kind = ir::JoinKind::Inner) -> ir::NodePtr {
     auto inner = make_join({2}, inner_kind, {"k"}, make_scan({3}, "a"), make_scan({4}, "b"));
     auto semi = std::make_unique<ir::JoinNode>(ir::NodeId{1}, semi_kind,
-                                               std::vector<std::string>{std::move(semi_key)});
+                                               std::vector<ir::JoinKey>{std::move(semi_key)});
     semi->add_child(std::move(inner));
     semi->add_child(make_scan({5}, "c"));
     return semi;

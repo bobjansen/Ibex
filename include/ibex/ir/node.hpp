@@ -30,6 +30,16 @@ class Node;
 using NodePtr = std::unique_ptr<Node>;
 
 /// Column reference in the IR.
+/// Which input of a join a column reference names. Only meaningful inside a
+/// join predicate, where the same column name can exist on both sides.
+/// `Any` — the ordinary case everywhere else — resolves against whichever
+/// input has the column, and is an error when both do.
+enum class JoinSide : std::uint8_t {
+    Any,
+    Left,
+    Right,
+};
+
 struct ColumnRef {
     std::string name;
     NodeId source = {0};
@@ -37,6 +47,9 @@ struct ColumnRef {
     /// lexical reference names a scalar binding and is never resolved against
     /// the input's columns, even when a column of the same name exists.
     bool lexical = false;
+    /// Lowered from `left(name)` / `right(name)` in a join predicate
+    /// (SPEC.md Section 5.6). Ignored outside one.
+    JoinSide side = JoinSide::Any;
 };
 
 /// Expression node for computed fields.

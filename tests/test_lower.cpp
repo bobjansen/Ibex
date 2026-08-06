@@ -1307,3 +1307,47 @@ parts[filter p_partkey == scalar(supply[select { m = min(ps_cost) }])];
     }
     REQUIRE(kept == std::vector<std::string>{"p_partkey", "p_name"});
 }
+
+TEST_CASE("Lower turns left(col) / right(col) into side-qualified column refs") {
+    auto lowered = lower_source("a join b on left(ts) < right(ts);");
+    REQUIRE(lowered.has_value());
+
+    // The lowered plan is the join itself.
+    const ir::Node* node = lowered.value().get();
+    REQUIRE(node->kind() == ir::NodeKind::Join);
+    const auto& join = static_cast<const ir::JoinNode&>(*node);
+    REQUIRE(join.keys().empty());
+    REQUIRE(join.predicate().has_value());
+
+    const auto* compare = std::get_if<ir::CompareExpr>(&join.predicate()->node);
+    REQUIRE(compare != nullptr);
+    const auto* lhs = std::get_if<ir::ColumnRef>(&compare->left->node);
+    REQUIRE(lhs != nullptr);
+    CHECK(lhs->name == "ts");
+    CHECK(lhs->side == ir::JoinSide::Left);
+    const auto* rhs = std::get_if<ir::ColumnRef>(&compare->right->node);
+    REQUIRE(rhs != nullptr);
+    CHECK(rhs->name == "ts");
+    CHECK(rhs->side == ir::JoinSide::Right);
+}
+
+TEST_CASE("Lower leaves an unqualified join-predicate reference unsided") {
+    auto lowered = lower_source("a join b on lo < hi;");
+    REQUIRE(lowered.has_value());
+    const auto& join = static_cast<const ir::JoinNode&>(*lowered.value());
+    const auto* compare = std::get_if<ir::CompareExpr>(&join.predicate()->node);
+    REQUIRE(compare != nullptr);
+    const auto* lhs = std::get_if<ir::ColumnRef>(&compare->left->node);
+    REQUIRE(lhs != nullptr);
+    CHECK(lhs->side == ir::JoinSide::Any);  // resolved against the inputs later
+}
+
+TEST_CASE("Lower rejects left(...) / right(...) outside a join predicate") {
+    for (const char* source : {"t[filter left(a) > 1];", "t[select { x = right(a) }];",
+                               "t[update { x = left(a) + 1 }];"}) {
+        INFO(source);
+        auto result = lower_source(source);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().message.find("only valid in a join predicate") != std::string::npos);
+    }
+}

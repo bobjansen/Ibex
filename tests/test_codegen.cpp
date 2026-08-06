@@ -578,6 +578,24 @@ TEST_CASE("emitter: join node - non-equijoin predicate", "[codegen]") {
     CHECK(contains(out, "ibex::ir::JoinKind::Inner"));
 }
 
+TEST_CASE("emitter: join node - side-qualified predicate references", "[codegen]") {
+    // A side tag has to survive into the generated code: without it the
+    // transpiled join would re-resolve `v` against both inputs and reject it
+    // as ambiguous, where the interpreter honours the qualifier.
+    ir::Builder b;
+    auto left = make_source(b, "left.csv");
+    auto right = make_source(b, "right.csv");
+    auto join = b.join(ir::JoinKind::Inner, {},
+                       filter_cmp(ir::CompareOp::Lt, filter_col_side("v", ir::JoinSide::Left),
+                                  filter_col_side("v", ir::JoinSide::Right)));
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+
+    auto out = emit_to_string(*join);
+    CHECK(contains(out, "ibex::ops::filter_col_side(\"v\", ibex::ir::JoinSide::Left)"));
+    CHECK(contains(out, "ibex::ops::filter_col_side(\"v\", ibex::ir::JoinSide::Right)"));
+}
+
 // --- Config ------------------------------------------------------------------
 
 TEST_CASE("emitter: extern headers in config", "[codegen]") {

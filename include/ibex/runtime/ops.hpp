@@ -35,6 +35,9 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 //  (`ir::Expr`) in emitted and test code.
 
 [[nodiscard]] auto filter_col(std::string name) -> ir::Expr;
+/// A join predicate's `left(name)` / `right(name)`: a column reference tied to
+/// one input of the enclosing join (SPEC.md Section 5.6).
+[[nodiscard]] auto filter_col_side(std::string name, ir::JoinSide side) -> ir::Expr;
 [[nodiscard]] auto filter_int(std::int64_t v) -> ir::Expr;
 [[nodiscard]] auto filter_dbl(double v) -> ir::Expr;
 [[nodiscard]] auto filter_bool(bool v) -> ir::Expr;

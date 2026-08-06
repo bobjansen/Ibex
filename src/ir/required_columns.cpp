@@ -18,6 +18,48 @@ void collect_refs(const ExprPtr& expr, ColumnDemand& demand) {
     }
 }
 
+/// Add the columns `expr` reads *from one side of a join* to `demand`.
+///
+/// A `left(x)` / `right(x)` reference names its side outright, so the other
+/// side is not asked for it. An unqualified reference could be either side (or
+/// a scalar binding), so it is demanded from both — the conservative reading
+/// that keeps pruning sound.
+void collect_side_refs(const Expr& expr, ColumnDemand& demand, JoinSide side);
+
+void collect_side_refs(const ExprPtr& expr, ColumnDemand& demand, JoinSide side) {
+    if (expr != nullptr) {
+        collect_side_refs(*expr, demand, side);
+    }
+}
+
+void collect_side_refs(const Expr& expr, ColumnDemand& demand, JoinSide side) {
+    std::visit(
+        [&](const auto& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, ColumnRef>) {
+                if (!n.lexical && (n.side == side || n.side == JoinSide::Any)) {
+                    demand.add(n.name);
+                }
+            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr> ||
+                                 std::is_same_v<T, LogicalExpr>) {
+                collect_side_refs(n.left, demand, side);
+                collect_side_refs(n.right, demand, side);
+            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
+                collect_side_refs(n.operand, demand, side);
+            } else if constexpr (std::is_same_v<T, CallExpr>) {
+                for (const auto& arg : n.args) {
+                    collect_side_refs(arg, demand, side);
+                }
+                for (const auto& named : n.named_args) {
+                    collect_side_refs(named.value, demand, side);
+                }
+            } else {
+                // Literal and RankExpr read no columns of the join's inputs.
+            }
+        },
+        expr.node);
+}
+
 /// Add every column `expr` reads to `demand`.
 void collect_refs(const Expr& expr, ColumnDemand& demand) {
     std::visit(
@@ -301,8 +343,8 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
                 right_below.add(key.right);
             }
             if (join.predicate().has_value()) {
-                collect_refs(*join.predicate(), left_below);
-                collect_refs(*join.predicate(), right_below);
+                collect_side_refs(*join.predicate(), left_below, JoinSide::Left);
+                collect_side_refs(*join.predicate(), right_below, JoinSide::Right);
             }
             if (join.children().size() != 2 || join.children()[0] == nullptr ||
                 join.children()[1] == nullptr) {

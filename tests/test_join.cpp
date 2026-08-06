@@ -1381,3 +1381,94 @@ TEST_CASE("join: swapped-mode inner join names colliding right columns like the 
           std::vector<std::string>{"id", "val", "val_right", "val_right_right"});
     CHECK(col_i64(out, "val_right_right") == std::vector<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7});
 }
+
+// --- Side-qualified predicate references -------------------------------------
+
+TEST_CASE("non-equijoin: left(col) and right(col) name the same column on both sides",
+          "[join][non-equijoin]") {
+    // Every column name exists on both sides, so an unqualified predicate has
+    // nothing to resolve against — the qualifiers are the only way to say it.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("v", Column<std::int64_t>{10, 20, 30});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    rhs.add_column("v", Column<std::int64_t>{15, 5, 35});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // left.v < right.v -> (10,15) (10,35) (20,35) (30,35)
+    auto out = interpret_expr("lhs join rhs on left(v) < right(v);", tables);
+    CHECK(out.rows() == 4);
+    CHECK(col_i64(out, "v") == std::vector<std::int64_t>{10, 10, 20, 30});
+    CHECK(col_i64(out, "v_right") == std::vector<std::int64_t>{15, 35, 35, 35});
+
+    // The mirror image, to prove the sides are not simply swapped somewhere.
+    // 10 > {5}; 20 > {15, 5}; 30 > {15, 5} — right rows in their own order.
+    auto flipped = interpret_expr("lhs join rhs on left(v) > right(v);", tables);
+    CHECK(flipped.rows() == 5);
+    CHECK(col_i64(flipped, "v") == std::vector<std::int64_t>{10, 20, 20, 30, 30});
+    CHECK(col_i64(flipped, "v_right") == std::vector<std::int64_t>{5, 15, 5, 15, 5});
+}
+
+TEST_CASE("non-equijoin: an unqualified name resolves against whichever side has it",
+          "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("ts", Column<std::int64_t>{5, 15, 25});
+
+    runtime::Table rhs;
+    rhs.add_column("lo", Column<std::int64_t>{0, 20});
+    rhs.add_column("hi", Column<std::int64_t>{10, 30});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on ts >= lo && ts < hi;", tables);
+    CHECK(out.rows() == 2);
+    CHECK(col_i64(out, "ts") == std::vector<std::int64_t>{5, 25});
+    CHECK(col_i64(out, "lo") == std::vector<std::int64_t>{0, 20});
+
+    // Mixing the two forms is fine.
+    auto mixed = interpret_expr("lhs join rhs on left(ts) >= lo && ts < right(hi);", tables);
+    CHECK(mixed.rows() == 2);
+    CHECK(col_i64(mixed, "ts") == std::vector<std::int64_t>{5, 25});
+}
+
+TEST_CASE("non-equijoin: an ambiguous unqualified name is rejected", "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("v", Column<std::int64_t>{1, 2});
+
+    runtime::Table rhs;
+    rhs.add_column("v", Column<std::int64_t>{1, 2});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    const std::string err = interpret_error("lhs join rhs on v < v;", tables);
+    CHECK(err.find("exists in both inputs") != std::string::npos);
+    CHECK(err.find("left(v)") != std::string::npos);
+    CHECK(err.find("right(v)") != std::string::npos);
+}
+
+TEST_CASE("non-equijoin: a qualifier naming a column the side lacks is rejected",
+          "[join][non-equijoin]") {
+    runtime::Table lhs;
+    lhs.add_column("a", Column<std::int64_t>{1, 2});
+
+    runtime::Table rhs;
+    rhs.add_column("b", Column<std::int64_t>{1, 2});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    CHECK(interpret_error("lhs join rhs on left(b) < right(b);", tables)
+              .find("the left input has no column") != std::string::npos);
+    CHECK(interpret_error("lhs join rhs on left(a) < right(a);", tables)
+              .find("the right input has no column") != std::string::npos);
+}

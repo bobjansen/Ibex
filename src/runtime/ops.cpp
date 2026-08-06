@@ -507,6 +507,10 @@ auto filter_col(std::string name) -> ir::Expr {
     return ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}};
 }
 
+auto filter_col_side(std::string name, ir::JoinSide side) -> ir::Expr {
+    return ir::Expr{.node = ir::ColumnRef{.name = std::move(name), .side = side}};
+}
+
 auto filter_int(std::int64_t v) -> ir::Expr {
     return lit_expr(v);
 }

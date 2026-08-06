@@ -820,6 +820,14 @@ employee[
             (theta join) evaluated for every pair of rows.
             Both tables must be <code>TimeFrame</code>s for an asof join.
           </p>
+          <p>
+            A join makes <strong>no promise about row order</strong>: the engine
+            picks which side to build its hash index from, and that choice shows
+            up in the output. Add <code>order</code> when the order matters. The
+            optimizer can often satisfy it from inside the join, so asking is
+            usually free. As-of joins are the exception &mdash; they return a
+            <code>TimeFrame</code>, which is always time-ascending.
+          </p>
         </div>
         <div class="tour-code">
 <pre><code><span class="cm">// Inner join — drop non-matching rows</span>

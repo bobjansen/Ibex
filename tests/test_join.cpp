@@ -175,13 +175,17 @@ TEST_CASE("join: left join preserves left rows", "[join]") {
     CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{0, 200, 300});
 }
 
-// SPEC.md's ordering-constraints section is explicit that "any join drop[s]
-// ordering unless the implementation can prove a specific order" — there is
-// no language-level guarantee of left-row order. This small-left/large-right
-// path emits matched rows in the probe (right) side's scan order instead
-// (cheaper: no reassembly pass, and preserves locality for any downstream
-// join that probes this join's output), with unmatched left rows appended
-// after.
+// Row order is outside the join contract on purpose (SPEC.md §5.6): the engine
+// picks a build side by size, and that choice is observable. This
+// small-left/large-right path emits matched rows in the probe (right) side's
+// scan order (cheaper: no reassembly pass, and it preserves locality for any
+// downstream join that probes this output), with unmatched left rows appended.
+//
+// So this test and its siblings below pin *this path's* behaviour, not a
+// promise to callers. A strategy change may legitimately rewrite them —
+// what it may not do is make the order depend on something a caller cannot
+// see while some other test still asserts the old one. Callers that need an
+// order write `order`.
 TEST_CASE("join: left join emits matches in right-scan order when left side is smaller", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{2, 1, 4});
@@ -685,9 +689,9 @@ TEST_CASE("join: outer join row count and key values", "[join]") {
 }
 
 // See the comment on "left join emits matches in right-scan order..." above:
-// SPEC.md does not guarantee join row order. Matched rows come out in the
-// probe (right) side's scan order; unmatched left rows are appended, then
-// unmatched right rows.
+// row order is outside the join contract. Matched rows come out in the probe
+// (right) side's scan order; unmatched left rows are appended, then unmatched
+// right rows.
 TEST_CASE("join: outer join emits matches in right-scan order when left side is smaller",
           "[join]") {
     runtime::Table lhs;
@@ -850,7 +854,7 @@ TEST_CASE("join: right join preserves right rows", "[join]") {
 }
 
 // See the comment on "left join emits matches in right-scan order..." above:
-// SPEC.md does not guarantee join row order. Matches come out in right-scan
+// row order is outside the join contract. Matches come out in right-scan
 // order, then unmatched right rows are appended.
 TEST_CASE(
     "join: right join emits matches in right-scan order, then unmatched right rows, when left "
@@ -884,7 +888,7 @@ TEST_CASE(
 }
 
 // See the comment on "left join emits matches in right-scan order..." above:
-// SPEC.md does not guarantee join row order. Matches come out in right-scan
+// row order is outside the join contract. Matches come out in right-scan
 // order, unmatched left rows next, then unmatched right rows.
 TEST_CASE("join: multi-key outer join emits matches in right-scan order when left side is smaller",
           "[join]") {
@@ -1113,9 +1117,9 @@ TEST_CASE("non-equijoin: not-equal predicate", "[join][non-equijoin]") {
 // A right side above the chunked join's stream threshold (65,536 rows) makes
 // the operator materialize the left side, build its hash index there, and
 // probe with the right — the "swapped" path, which every other join test in
-// this file is too small to reach. SPEC.md does not guarantee join row
-// order, and this path emits matches in right-scan (probe) order rather
-// than reassembling by left row (see the class comment on
+// this file is too small to reach. Row order is outside the join contract,
+// and this path emits matches in right-scan (probe) order rather than
+// reassembling by left row (see the class comment on
 // ChunkedInnerJoinOperator), so the assertions below pin the exact emission
 // order (right row ascending, then left row ascending within a key's chain)
 // against an independent reference, not just the row count.

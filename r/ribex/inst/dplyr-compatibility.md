@@ -9,15 +9,15 @@ collection and `fallback = "collect"` makes it silent.
 |---|---|---|
 | Sources | In-memory data frames, tibbles, and nanoarrow-compatible tables; ordered schema and row count are read without a query | Session-resident/plugin sources are not public constructors yet |
 | `select`, `rename`, `relocate` | tidyselect is resolved against the stored schema in R; non-syntactic names are quoted centrally | A column name containing the Ibex template marker `${` is rejected until the lexer can quote it unambiguously |
-| `filter` | Arithmetic, comparison, `&`, `|`, `!`, registered scalar functions, `between()`, `is.na()`, and `is.nan()` | `.by`, `.preserve = TRUE`, unknown/masked calls, R recycling, and unsupported captures |
-| `mutate`, `transmute` | Named sequential fields, row-local registered expressions, captured length-one scalars; grouped aggregates broadcast with Ibex `by` | `.by`, `.keep` other than `"all"`, placement options, unknown/masked calls, arbitrary R closures |
+| `filter` | Arithmetic, comparison, `%in%` with an atomic candidate vector, `&`, `|`, `!`, registered scalar functions, `between()`, `is.na()`, and `is.nan()` | `.by`, `.preserve = TRUE`, unknown/masked calls, R recycling, and unsupported captures |
+| `mutate`, `transmute` | Named sequential fields, row-local registered expressions, captured length-one scalars; grouped aggregates broadcast with Ibex `by`; `min_rank(x)`, `dense_rank(x)`, `row_number(x)`, and `cume_dist(x)` | `.by`, `.keep` other than `"all"`, placement options, unknown/masked calls, arbitrary R closures, and unsupported rank helpers |
 | `group_by`, `ungroup` | Existing columns, `.add`, `.drop = TRUE`; grouping remains lazy metadata | Computed grouping expressions and `.drop = FALSE` |
 | `summarise` | `sum`, `mean`, `min`, `max`, `first`, `last`, and `n`; `.groups = "drop"`, `"drop_last"`, or `"keep"` | `.by`, non-scalar summaries, unsupported aggregates |
 | `arrange` | Column names and registered `dplyr::desc(column)`; `.by_group` | Computed sort expressions and masked `desc()` |
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | — | `inner_join` and `left_join` currently use the explicit one-way fallback; native joins are a follow-up |
+| joins | `inner_join` and `left_join` with same-named character keys, otherwise-default join options, and `na_matches = "never"`; a local right data frame is bound into the left session | Different key names / `join_by()`, dplyr's default NA matching, `keep`, multiplicity and relationship options, and other join kinds |
 
 ## Types and missing values
 

@@ -162,6 +162,10 @@ Arbitrary R closures never run as Ibex worker kernels. The package compatibility
 matrix documents the exact native verb, type, null, grouping, and ordering
 contract.
 
+See [`examples/ribex_dplyr.R`](examples/ribex_dplyr.R) for a complete runnable
+example with scalar capture, lazy translation, grouped aggregation, and
+collection back into R.
+
 ## Language at a glance
 
 ### Inline table construction

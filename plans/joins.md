@@ -375,11 +375,38 @@ the same sort.
   `ChunkedOrderOperator`, where it also replaces an O(n) data scan that only
   ever covered a single ascending Timestamp/Date/Int key — the claim covers
   multi-key, descending and string orderings too.
-- **Include the pending sort in build-side selection.** Not done. This is the
-  part that needs plan-level information: deliberately building the *larger*
-  side to preserve an order the query is about to ask for. It is also the part
-  that can make a join slower to make a sort disappear, so it needs the cost
-  comparison, not just the capability.
+- ~~**Include the pending sort in build-side selection.**~~ Done.
+  `ir::annotate_pending_orders` writes an `order`'s keys into the join beneath
+  it (`JoinNode::pending_order`), looking through the operators that neither
+  move a row relative to its neighbours nor rename a column. Both executors
+  then decline to index the smaller side when doing so would give up an order
+  the left already carries and the query is about to ask for.
+
+  The cost comparison, since this can make a join slower to make a sort
+  disappear. Splitting each measurement into a query and a control differing
+  only in the trailing `order` separates the two effects:
+
+  | ratio (right/left) | extra join cost of declining to swap | sort saved | net |
+  |---|---|---|---|
+  | 1.33 | −105 ms | 674 ms | −779 ms |
+  | 4 | +51 ms | 160 ms | −109 ms |
+  | 8 | +65 ms | 67 ms | −2 ms |
+  | 16 | +80 ms | 33 ms | **+47 ms** |
+
+  Break-even is around 8. The guard is 4, deliberately below it: the sort saved
+  depends on the key type, and this measures a *string* key, the expensive
+  case. An integer key reaches the pre-sorted data check, so far less is saved
+  and break-even moves down with it. At 1.33 declining to swap is cheaper on
+  its own, before the sort is counted at all.
+
+  Neutrality re-checked on the same suite after this: 28 queries all `noise`,
+  geometric mean 0.998, total +0.33%.
+
+  Worth recording how nearly this shipped inert. The first run measured no
+  effect whatsoever, because `lower_expr` -- the statement planner, which any
+  script using `import` takes -- never calls `optimize_plan`, so the annotation
+  pass sitting in the pass manager never ran. Every unit test passed throughout,
+  since they go through `lower()`, which does optimize.
 - ~~**Benchmark.**~~ Two measurements, because the suite could only supply one
   of them.
 
@@ -450,8 +477,9 @@ regression.
    Ibex programs was still this repo.
 4. ~~**Early key validation**~~ — done; cheap, static, and it improves every
    frontend's errors.
-5. **Order-aware join planning** — the payoff for step 1. Next.
-6. **Null-match policy** — after step 5 has a benchmarked baseline.
+5. ~~**Order-aware join planning**~~ — done; the payoff for step 1.
+6. **Null-match policy** — after step 5 has a benchmarked baseline, which it
+   now has. Next.
 7. **Cardinality assertions and match selection**.
 8. **Schema nullability** — independent; pull forward if step 4 wants it.
 9. **Time-domain joins** — the largest new feature, and the one most worth

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -73,8 +74,15 @@ struct DcastKey {
     static constexpr std::size_t kMaxCols = 8;
     std::array<std::int64_t, kMaxCols> v{};
     std::uint8_t n{0};
+    /// Bit k set when key column k is null in this row. A null cannot be
+    /// encoded as a reserved value in `v`: every 64-bit pattern is a legal
+    /// key for some column type, so any sentinel is a value that collides.
+    std::uint8_t null_mask{0};
 
     auto operator==(const DcastKey& o) const noexcept -> bool {
+        if (null_mask != o.null_mask) {
+            return false;
+        }
         // Element-wise rather than std::memcmp: this runs once per input row
         // (incl. the prev-key shortcut), and a libc memcmp call for ~16 bytes
         // is dominated by call overhead. n is small (typically 1–3), so an
@@ -93,7 +101,7 @@ struct DcastKey {
 
 struct DcastKeyHash {
     auto operator()(const DcastKey& k) const noexcept -> std::size_t {
-        std::uint64_t h = 0;
+        std::uint64_t h = k.null_mask;
         for (const auto elem : std::span(k.v.data(), k.n)) {
             h ^= static_cast<std::uint64_t>(elem);
             h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -1223,7 +1231,6 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
 
     const std::size_t n_pivots = pivot_values.size();
 
-    constexpr std::int64_t kNullKey = std::numeric_limits<std::int64_t>::min();
     const std::size_t n_keys = key_indices.size();
     std::vector<std::vector<std::int32_t>> str_intern(n_keys);
 
@@ -1271,10 +1278,18 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
     first_input_row.reserve(est_out_rows);
     std::vector<std::size_t> cell_rows(est_out_rows * n_pivots, kMissingCell);
 
+    const auto key_is_null = [&](std::size_t k, std::size_t r) -> bool {
+        return is_null(input.columns[key_indices[k]], r);
+    };
+
+    // The row key's identity, as one 64-bit code per key column. Every encoding
+    // here must be INJECTIVE: two distinct key values that encode alike merge
+    // two output rows into one and silently drop a row's values. Null-ness
+    // travels separately, in the key's null mask.
     const auto encode_key = [&](std::size_t k, std::size_t r) -> std::int64_t {
         const std::size_t ki = key_indices[k];
-        if (is_null(input.columns[ki], r)) {
-            return kNullKey;
+        if (key_is_null(k, r)) {
+            return 0;  // the value is not read; the mask carries the null
         }
         if (!str_intern[k].empty()) {
             return str_intern[k][r];
@@ -1287,7 +1302,13 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 } else if constexpr (std::is_same_v<T, Column<std::int64_t>>) {
                     return c[r];
                 } else if constexpr (std::is_same_v<T, Column<double>>) {
-                    return static_cast<std::int64_t>(c[r]);
+                    // Truncating to an integer is not injective: 1.5 and 1.9
+                    // both became 1, merging two row keys and keeping only the
+                    // later row's cells. The bit pattern is exact. -0.0 is
+                    // folded onto 0.0 so the two group together, matching the
+                    // value equality every other key path uses.
+                    const double value = c[r] == 0.0 ? 0.0 : c[r];
+                    return std::bit_cast<std::int64_t>(value);
                 } else if constexpr (std::is_same_v<T, Column<bool>>) {
                     return static_cast<std::int64_t>(c[r] ? 1 : 0);
                 } else if constexpr (std::is_same_v<T, Column<Date>>) {
@@ -1295,8 +1316,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
                 } else if constexpr (std::is_same_v<T, Column<Timestamp>>) {
                     return c[r].nanos;
                 } else {
-                    // gcc doesn't like kNullKey here as it is not captured.
-                    return std::numeric_limits<std::int64_t>::min();
+                    return 0;
                 }
             },
             *input.columns[ki].column);
@@ -1361,6 +1381,9 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             key.n = static_cast<std::uint8_t>(n_keys);
             for (std::size_t k = 0; k < n_keys; ++k) {
                 key.v[k] = encode_key(k, r);
+                if (key_is_null(k, r)) {
+                    key.null_mask |= static_cast<std::uint8_t>(1U << k);
+                }
             }
 
             std::size_t out_row{};
@@ -1382,9 +1405,12 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             cell_rows[(out_row * n_pivots) + pvi] = r;
         }
     } else {
+        // More key columns than DcastKey holds, so the key is a byte buffer.
+        // It carries the same two halves: one code per column, then one byte
+        // per column saying whether that column was null.
         robin_hood::unordered_map<std::string, std::size_t> key_to_row_str;
         key_to_row_str.reserve(est_out_rows);
-        const std::size_t key_bytes = n_keys * sizeof(std::int64_t);
+        const std::size_t key_bytes = n_keys * (sizeof(std::int64_t) + 1);
         std::string prev_key_str(key_bytes, '\0');
         std::size_t prev_out_row = std::numeric_limits<std::size_t>::max();
 
@@ -1398,6 +1424,7 @@ auto dcast_table(const Table& input, const std::string& pivot_column,
             for (std::size_t k = 0; k < n_keys; ++k) {
                 std::int64_t v = encode_key(k, r);
                 std::memcpy(key.data() + (k * sizeof(std::int64_t)), &v, sizeof(v));
+                key[(n_keys * sizeof(std::int64_t)) + k] = key_is_null(k, r) ? '\1' : '\0';
             }
 
             std::size_t out_row{};

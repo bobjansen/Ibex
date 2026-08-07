@@ -2,6 +2,7 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -212,6 +213,32 @@ class TableProperties {
     [[nodiscard]] auto ordering() const noexcept
         -> const std::optional<std::vector<ir::OrderKey>>& {
         return ordering_;
+    }
+
+    /// True when the rows are already in `requested` order, so sorting by it
+    /// would move nothing.
+    ///
+    /// The test is prefix containment, which is the exact rule: rows ordered by
+    /// (a, b) are ordered by (a) — ties on `a` are merely broken further — while
+    /// rows ordered by (a) say nothing about (a, b). Directions must match key
+    /// for key; a descending claim does not satisfy an ascending request.
+    ///
+    /// This decides an O(1) elision of an O(n log n) sort, so it has to be
+    /// conservative in one direction only: a claim is made by the operator that
+    /// laid the rows out, and every constructor of this type requires naming
+    /// how. Answering "not satisfied" when it is costs a sort; answering
+    /// "satisfied" when it is not returns wrong data.
+    [[nodiscard]] auto satisfies(const std::vector<ir::OrderKey>& requested) const -> bool {
+        if (!ordering_.has_value() || requested.size() > ordering_->size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < requested.size(); ++i) {
+            if ((*ordering_)[i].name != requested[i].name ||
+                (*ordering_)[i].ascending != requested[i].ascending) {
+                return false;
+            }
+        }
+        return true;
     }
     [[nodiscard]] auto time_index() const noexcept -> const std::optional<std::string>& {
         return time_index_;

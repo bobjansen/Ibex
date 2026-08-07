@@ -2441,8 +2441,13 @@ int main(int argc, char** argv) {
                            cross_reg.at("prices_small").rows(),
                            cross_reg.at("lookup_small").rows());
 
-                BenchQuery cross_query{"null_cross_join_small",
-                                       "prices_small cross join lookup_small"};
+                // Both slices come from tables that share `symbol`, and a cross
+                // join has no keys to fold it into one output column, so the
+                // clash has to be named. Without the clause this query is an
+                // error rather than a benchmark.
+                BenchQuery cross_query{
+                    "null_cross_join_small",
+                    R"(prices_small cross join lookup_small suffix { "", "_lookup" })"};
                 if (verify) {
                     if (auto err = verify_benchmark(cross_query, cross_reg, verify_rows)) {
                         fmt::print("error: verify failed for {}: {}\n", cross_query.name, *err);

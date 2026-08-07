@@ -68,6 +68,17 @@ auto interpret_error(std::string_view src, const runtime::TableRegistry& tables)
     return result.error();
 }
 
+/// A program that must fail to parse or lower; returns the message.
+auto interpret_error_at_parse(std::string_view src) -> std::string {
+    auto parsed = parser::parse(src);
+    if (!parsed.has_value()) {
+        return parsed.error().format();
+    }
+    auto lowered = parser::lower(*parsed);
+    REQUIRE_FALSE(lowered.has_value());
+    return lowered.error().message;
+}
+
 }  // namespace
 
 TEST_CASE("join: inner join on single key", "[join]") {
@@ -1828,13 +1839,16 @@ TEST_CASE("join: a null in a right column stays null through the join", "[join]"
     CHECK_FALSE((*entry->validity)[2]);
 }
 
-// ── A null key matches nothing, in semi and anti too ──────────────────────
+// ── `nulls equal` ─────────────────────────────────────────────────────────
+//
+// Every case pits a null against a GENUINE 0 in the same key column. That is
+// the point: a null cell holds its type's zero, so a test whose keys avoid 0
+// passes even when the two are conflated.
 
-TEST_CASE("join: a null key matches nothing in a semi or anti join", "[join][nulls]") {
-    // Both sides pit a null against a GENUINE 0 in the key column. That is the
-    // whole point: a null cell holds its type's zero, so a test whose keys
-    // avoid 0 passes even when the two are conflated. `lv` 101 and 103 have
-    // null keys and must not find the 0 on the right.
+namespace {
+
+// Keys 0, null, 5, null on the left; 0, null, 7 on the right.
+auto null_key_registry() -> runtime::TableRegistry {
     runtime::Table lhs;
     runtime::ValidityBitmap lv(4, true);
     lv.set(1, false);
@@ -1846,15 +1860,135 @@ TEST_CASE("join: a null key matches nothing in a semi or anti join", "[join][nul
     runtime::ValidityBitmap rv(3, true);
     rv.set(1, false);
     rhs.add_column("k", Column<std::int64_t>{0, 0, 7}, rv);
+    rhs.add_column("rv", Column<std::int64_t>{200, 201, 202});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("join: by default a null key matches nothing", "[join][nulls]") {
+    auto tables = null_key_registry();
+    auto out = interpret_expr("lhs join rhs on k;", tables);
+    // Only the genuine zeros pair up.
+    CHECK(col_i64(out, "lv") == std::vector<std::int64_t>{100});
+    CHECK(col_i64(out, "rv") == std::vector<std::int64_t>{200});
+}
+
+TEST_CASE("join: `nulls equal` pairs nulls with nulls only", "[join][nulls]") {
+    auto tables = null_key_registry();
+    auto out = interpret_expr("(lhs join rhs on k nulls equal)[order { lv asc }];", tables);
+    // 100 is the genuine 0 and pairs only with 200, the other genuine 0.
+    // 101 and 103 are the null keys and pair only with 201, the null on the
+    // right. 102 (k = 5) and 202 (k = 7) match nothing either way.
+    CHECK(col_i64(out, "lv") == std::vector<std::int64_t>{100, 101, 103});
+    CHECK(col_i64(out, "rv") == std::vector<std::int64_t>{200, 201, 201});
+}
+
+TEST_CASE("join: `nulls equal` keeps the key column null in the output",
+          "[join][nulls]") {
+    auto tables = null_key_registry();
+    auto out = interpret_expr("(lhs join rhs on k nulls equal)[order { lv asc }];", tables);
+    const auto* entry = out.find_entry("k");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0]);        // the genuine 0
+    CHECK_FALSE((*entry->validity)[1]);  // matched because both were null
+    CHECK_FALSE((*entry->validity)[2]);
+}
+
+TEST_CASE("join: a left join under `nulls equal` matches instead of filling",
+          "[join][nulls]") {
+    // Without the policy a null-keyed left row survives with null right
+    // columns; with it, the row finds its partner and carries real values.
+    auto tables = null_key_registry();
+    auto plain = interpret_expr("(lhs left join rhs on k)[order { lv asc }];", tables);
+    CHECK(plain.rows() == 4);
+    const auto* plain_rv = plain.find_entry("rv");
+    REQUIRE(plain_rv != nullptr);
+    REQUIRE(plain_rv->validity.has_value());
+    CHECK_FALSE((*plain_rv->validity)[1]);  // null key, unmatched
+
+    auto equal = interpret_expr("(lhs left join rhs on k nulls equal)[order { lv asc }];", tables);
+    CHECK(equal.rows() == 4);
+    const auto* equal_rv = equal.find_entry("rv");
+    REQUIRE(equal_rv != nullptr);
+    CHECK(col_i64(equal, "rv")[1] == 201);
+    if (equal_rv->validity.has_value()) {
+        CHECK((*equal_rv->validity)[1]);
+    }
+}
+
+TEST_CASE("join: semi and anti follow the policy", "[join][nulls]") {
+    auto tables = null_key_registry();
+    // Semi: without the policy only the genuine 0 survives; with it the two
+    // null-keyed rows do too.
+    CHECK(col_i64(interpret_expr("lhs semi join rhs on k;", tables), "lv") ==
+          std::vector<std::int64_t>{100});
+    CHECK(col_i64(interpret_expr("(lhs semi join rhs on k nulls equal)[order { lv asc }];", tables),
+                  "lv") == std::vector<std::int64_t>{100, 101, 103});
+    // Anti is the complement of the same question.
+    CHECK(col_i64(interpret_expr("(lhs anti join rhs on k)[order { lv asc }];", tables), "lv") ==
+          std::vector<std::int64_t>{101, 102, 103});
+    CHECK(col_i64(interpret_expr("(lhs anti join rhs on k nulls equal)[order { lv asc }];", tables),
+                  "lv") == std::vector<std::int64_t>{102});
+}
+
+TEST_CASE("join: a composite key needs every component to match", "[join][nulls]") {
+    // (1, null) matches (1, null) but not (1, 0): the null component pairs only
+    // with a null in that same component.
+    runtime::Table lhs;
+    runtime::ValidityBitmap lv(3, true);
+    lv.set(0, false);
+    lhs.add_column("a", Column<std::int64_t>{1, 1, 2});
+    lhs.add_column("b", Column<std::int64_t>{0, 0, 0}, lv);
+    lhs.add_column("lv", Column<std::int64_t>{10, 11, 12});
+
+    runtime::Table rhs;
+    runtime::ValidityBitmap rv(2, true);
+    rv.set(0, false);
+    rhs.add_column("a", Column<std::int64_t>{1, 1});
+    rhs.add_column("b", Column<std::int64_t>{0, 0}, rv);
+    rhs.add_column("rv", Column<std::int64_t>{20, 21});
 
     runtime::TableRegistry tables;
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    // Only the genuine 0 has a match at all.
-    CHECK(col_i64(interpret_expr("lhs semi join rhs on k;", tables), "lv") ==
-          std::vector<std::int64_t>{100});
-    // Anti is the complement: everything the semi join dropped.
-    CHECK(col_i64(interpret_expr("(lhs anti join rhs on k)[order { lv asc }];", tables), "lv") ==
-          std::vector<std::int64_t>{101, 102, 103});
+    auto out = interpret_expr("(lhs join rhs on { a, b } nulls equal)[order { lv asc }];", tables);
+    // lv 10 is (1, null) -> rv 20, the (1, null) on the right.
+    // lv 11 is (1, 0)    -> rv 21, the (1, 0). The two must not cross.
+    CHECK(col_i64(out, "lv") == std::vector<std::int64_t>{10, 11});
+    CHECK(col_i64(out, "rv") == std::vector<std::int64_t>{20, 21});
+}
+
+TEST_CASE("join: `nulls` is rejected where there are no keys to apply it to",
+          "[join][nulls]") {
+    auto tables = null_key_registry();
+    auto cross = interpret_error_at_parse("lhs cross join rhs nulls equal;");
+    CHECK(cross.find("cross join") != std::string::npos);
+    // A pure predicate join has no equijoin keys either, and the clause does
+    // not redefine how the predicate compares nulls.
+    auto theta = interpret_error_at_parse("lhs join rhs on left(k) < right(k) nulls equal;");
+    CHECK(theta.find("equijoin keys") != std::string::npos);
+}
+
+TEST_CASE("join: `nulls` takes only equal or never", "[join][nulls]") {
+    auto err = interpret_error_at_parse("lhs join rhs on k nulls sometimes;");
+    CHECK(err.find("'equal' or 'never'") != std::string::npos);
+}
+
+TEST_CASE("join: `nulls` is not a reserved word", "[join][nulls]") {
+    // `read_csv(path, nulls: String = "", ...)` names a parameter `nulls`, so
+    // reserving it would have broken the shipped csv reader. It is matched in
+    // the join trailer position only.
+    runtime::Table t;
+    t.add_column("nulls", Column<std::int64_t>{1, 2});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    auto out = interpret_expr("t[filter nulls > 1];", tables);
+    CHECK(col_i64(out, "nulls") == std::vector<std::int64_t>{2});
 }

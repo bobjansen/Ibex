@@ -2995,9 +2995,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         const bool keep_matches = (kind_ == ir::JoinKind::Semi);
         // A null key matches nothing, not even another null. The set below is
         // keyed by VALUE and a null cell holds its type's zero, so without this
-        // a null-keyed row matches a genuine zero on the other side -- keeping
-        // rows a semi join should drop and dropping rows an anti join should
-        // keep.
+        // a null-keyed row would match a genuine zero on the other side --
+        // silently, and in the direction that keeps rows a semi join should
+        // drop and drops rows an anti join should keep.
         const auto* probe_entry = t.find_entry(keys_->front().left);
         const ValidityBitmap* probe_validity =
             probe_entry != nullptr && probe_entry->validity.has_value() ? &*probe_entry->validity
@@ -8426,7 +8426,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         }
         const bool streamable_semi_anti =
             (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
-            !join.predicate().has_value() && join.keys().size() == 1;
+            !join.predicate().has_value() && join.keys().size() == 1 &&
+            join.null_match() == ir::NullMatch::Never;
         if (streamable_semi_anti) {
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
@@ -8445,8 +8446,16 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             return std::make_unique<ChunkedSemiAntiJoinOperator>(
                 std::move(left_op.value()), std::move(right.value()), join.kind(), &join.keys());
         }
+        // `nulls equal` goes to the materialized join, which implements the
+        // policy. These streaming operators hash and probe on their own and
+        // would each need the same null tagging; sending the opt-in case to the
+        // one implementation that has it keeps a single definition of the
+        // semantics -- and leaves this hot path bit-for-bit unchanged for every
+        // join that does not ask for it.
         const bool streamable_inner = join.kind() == ir::JoinKind::Inner &&
-                                      !join.predicate().has_value() && join.keys().size() == 1;
+                                      !join.predicate().has_value() &&
+                                      join.keys().size() == 1 &&
+                                      join.null_match() == ir::NullMatch::Never;
         if (streamable_inner) {
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
@@ -8481,7 +8490,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
-                                       compute_mask, join.suffix(), join.pending_order());
+                                       compute_mask, join.suffix(), join.pending_order(),
+                                       join.null_match());
             });
     }
 

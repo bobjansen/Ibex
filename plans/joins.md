@@ -45,6 +45,15 @@ labels, not positions in a sequence. Remaining work is named, not numbered.
   carry the policy in and the failure out. Commits *Make a join collision an
   error with an explicit escape hatch* and *Document the join suffix clause in
   the reference*.
+- **Order-aware join planning.** A join states an ordering when its path
+  produced one, `order` skips its work when the input already claims what it
+  was asked for, and `ir::annotate_pending_orders` lets the build-side choice
+  weigh a pending sort. Commits *Let a join say when it produced an order, and
+  `order` believe it* and *Weigh a pending sort when picking the join's build
+  side*.
+- **Null-match policy.** `nulls equal` opts a join's equality keys into
+  matching null to null; `Never` stays the default and the language's
+  three-valued rule. Commit *Give a join keys that can match on null*.
 - **Early key validation.** `ir::check_joins()` proves a join's `on` keys
   against both inputs' inferred schemas — each key names a column of its own
   side, the two sides agree on type, the output names resolve — and names the
@@ -433,16 +442,45 @@ the same sort.
 
 ### Null-match policy
 
-Must not share a commit with order-aware planning or any other hot-path change:
-both rewrite hashing and probing, and a combined benchmark cannot attribute a
-regression.
+Status: implemented. The surface spelling is `nulls equal` / `nulls never`,
+trailing the `suffix` clause.
 
-- Carry `NullMatch` through IR, interpreter, chunked execution, public runtime
-  ops and codegen, with a surface spelling.
-- Tagged-null hashing and equality for scalar and composite keys.
-- Cover null/null, null/value, partially null composite keys, duplicate nulls,
-  categorical nulls, and every join kind.
-- `SPEC.md` and `docs/index.html`.
+- ~~Carry `NullMatch` through IR, interpreter, chunked execution, public runtime
+  ops and codegen, with a surface spelling.~~ Chunked execution carries it by
+  *declining* it: a join asking for `nulls equal` routes to the materialized
+  implementation instead of teaching each streaming operator its own null
+  tagging. One definition of the semantics, and the chunked hot path is
+  untouched for every join that does not ask.
+- ~~Tagged-null hashing and equality for scalar and composite keys.~~ Mostly
+  already there: `hash_key_row` tags a null by position for group-by. What was
+  missing was `key_rows_equal` comparing null-ness (it had never needed to) and
+  the generic path passing validity into its `KeyCol`s at all.
+- ~~Cover null/null, null/value, partially null composite keys, duplicate
+  nulls, categorical nulls, and every join kind.~~
+- ~~`SPEC.md` and `docs/index.html`.~~ Plus `docs/reference.html`, an `.ibex`
+  example and a parity case.
+
+`nulls`, `equal` and `never` are matched contextually in the join trailer, not
+reserved. Reserving `nulls` broke `read_csv(path, nulls: String = "", ...)`,
+whose own parameter is named that — the cost of a hard keyword, arriving
+immediately rather than hypothetically.
+
+Two pre-existing bugs surfaced, both the same shape as the one the null-key
+rules exist to prevent — a null cell holds its type's zero, so anything
+comparing values alone conflates the two:
+
+- the materialized join dropped source-column validity while gathering, so a
+  null came back as `0`. Commit *Stop the materialized join turning a source
+  null into a zero*;
+- the streaming semi/anti join built a set of key *values*, so a null key
+  matched every genuine zero — `semi` kept rows it should drop and `anti`
+  dropped rows it should keep. Commit *Stop a null key matching a genuine zero
+  in semi and anti joins*.
+
+Each landed on its own, before the feature: both touch the join hot path, which
+is exactly what this package must not share a commit with.
+
+Benchmark: 28 queries all `noise`, geometric mean 1.006, total +0.25%.
 
 ### Cardinality assertions and match selection
 
@@ -478,9 +516,8 @@ regression.
 4. ~~**Early key validation**~~ — done; cheap, static, and it improves every
    frontend's errors.
 5. ~~**Order-aware join planning**~~ — done; the payoff for step 1.
-6. **Null-match policy** — after step 5 has a benchmarked baseline, which it
-   now has. Next.
-7. **Cardinality assertions and match selection**.
+6. ~~**Null-match policy**~~ — done, on the benchmarked baseline step 5 left.
+7. **Cardinality assertions and match selection**. Next.
 8. **Schema nullability** — independent; pull forward if step 4 wants it.
 9. **Time-domain joins** — the largest new feature, and the one most worth
    designing slowly.

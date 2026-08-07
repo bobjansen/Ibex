@@ -344,6 +344,14 @@ struct JoinKey {
     auto operator==(const JoinKey&) const -> bool = default;
 };
 
+/// `nulls equal` / `nulls never`: whether a null equijoin key matches another
+/// null. Mirrors `ir::NullMatch`; the AST keeps its own so the parser does not
+/// depend on the IR headers.
+enum class JoinNullMatch : std::uint8_t {
+    Never,
+    Equal,
+};
+
 /// `suffix { "_left", "_right" }`: how the join renames columns held by both
 /// inputs. Absent, such a collision is an error rather than a silent rename.
 struct JoinSuffix {
@@ -360,6 +368,8 @@ struct JoinExpr {
     std::vector<JoinKey> keys;
     std::optional<ExprPtr> predicate;  ///< non-equijoin predicate (mutually exclusive with keys)
     std::optional<JoinSuffix> suffix;  ///< absent: a collision is an error
+    /// `nulls equal` / `nulls never`; absent means the default, `Never`.
+    std::optional<JoinNullMatch> null_match;
 };
 
 /// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`

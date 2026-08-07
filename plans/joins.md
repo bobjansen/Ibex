@@ -38,6 +38,19 @@ labels, not positions in a sequence. Remaining work is named, not numbered.
   against each input's own schema in `join_table_impl` before the row loop.
   The nested-loop batch holds both sides under `#`-prefixed names no identifier
   can spell. Commit *Give join predicates side-qualified column references*.
+- **Collision resolution and the `suffix` clause.** A name held by both inputs
+  is a collision and an error; `suffix { "_old", "_new" }` names both sides
+  explicitly. `ir::plan_join_output()` resolves names and returns
+  `expected<>`; IR inference, the materialized join and the chunked join all
+  carry the policy in and the failure out. Commits *Make a join collision an
+  error with an explicit escape hatch* and *Document the join suffix clause in
+  the reference*.
+- **Early key validation.** `ir::check_joins()` proves a join's `on` keys
+  against both inputs' inferred schemas — each key names a column of its own
+  side, the two sides agree on type, the output names resolve — and names the
+  side, the key and the type in the message. It runs at all three lowering
+  entry points and again in the driver once reader footers have supplied the
+  source schemas.
 
 ## The contract
 
@@ -289,24 +302,50 @@ reference from its own side only, which tightens pruning above a theta join.
 
 ### Collision resolution and the `suffix` clause
 
-- Add `suffix { "_left", "_right" }` to the join grammar, AST, IR node, builder
-  API, codegen and public runtime ops.
-- Extend `ir::plan_join_output()` to take the suffix policy and to report a
-  collision instead of inventing a name.
-- Report collisions statically where both schemas are known, at runtime
-  otherwise, naming both sides and the column.
-- Error when a suffixed name still collides.
-- Sweep the repo for programs relying on automatic `_right`.
-- `SPEC.md`, `docs/index.html`, an `.ibex` example, and parity coverage for the
-  suffixed and error paths.
+Status: implemented. Commits *Make a join collision an error with an explicit
+escape hatch* and *Document the join suffix clause in the reference*.
+
+- ~~Add `suffix { "_left", "_right" }` to the join grammar, AST, IR node,
+  builder API, codegen and public runtime ops.~~
+- ~~Extend `ir::plan_join_output()` to take the suffix policy and to report a
+  collision instead of inventing a name.~~
+- ~~Report collisions statically where both schemas are known, at runtime
+  otherwise, naming both sides and the column.~~ Inference stays total and
+  falls to `Unknown` rather than failing; an unresolved collision has no schema
+  to describe, and the error arrives from execution.
+- ~~Error when a suffixed name still collides.~~
+- ~~Sweep the repo for programs relying on automatic `_right`.~~
+- ~~`SPEC.md`, `docs/index.html`, an `.ibex` example, and parity coverage for
+  the suffixed and error paths.~~ `docs/reference.html` too; its
+  `left(...)`/`right(...)` example was premised on the old silent renaming.
 
 ### Early key validation
 
-- Validate key existence and type compatibility before execution when both
-  schemas are known.
-- Name side, key and type in the message; improve the runtime diagnostic for
-  the unknown-schema case the same way.
-- Tests for missing keys, mismatched types, mapped keys, and open schemas.
+Status: implemented as `ir::check_joins()` (`include/ibex/ir/schema.hpp`),
+modelled on `check_ascriptions`.
+
+- ~~Validate key existence and type compatibility before execution when both
+  schemas are known.~~ Types compare at the *runtime's* granularity, not the
+  IR's: the runtime carries one integer and one float width, so Int32 meets
+  Int64 as the same physical column and rejecting the pair statically would
+  reject a join the executor runs.
+- ~~Name side, key and type in the message; improve the runtime diagnostic for
+  the unknown-schema case the same way.~~ Both now read `join key type
+  mismatch: left 'a' is Int64 but right 'b' is String`.
+- ~~Tests for missing keys, mismatched types, mapped keys, and open schemas.~~
+
+The pass also raises the collision diagnostic, which `infer_schema` cannot:
+inference is total, so it falls to Unknown on an unresolved collision and
+leaves the join with no schema to complain about. That is the caveat in the
+collision package above, closed.
+
+Where it runs matters as much as what it checks. The three lowering entry
+points (`lower`, `lower_script`, `lower_expr`) cover the interpreter, the
+transpiler and the REPL, but a reader call site has no schema at lowering, so
+a join over `read_csv`/`read_parquet` was still checked by the runtime. The
+driver runs it a second time after the footers are read, where `schemas` holds
+every source's names and types — the same place `check_ascriptions` gets its
+second run, and for the same reason.
 
 ### Order-aware join planning
 
@@ -360,10 +399,11 @@ regression.
 1. ~~**Ordering contract**~~ — done.
 2. ~~**Side-qualified predicate references**~~ — done; the prerequisite for the
    next item is in place.
-3. **Collision resolution and `suffix`** — the largest language-visible change;
-   do it while the whole corpus of Ibex programs is still this repo.
-4. **Early key validation** — cheap, static, improves every frontend's errors.
-5. **Order-aware join planning** — the payoff for step 1.
+3. ~~**Collision resolution and `suffix`**~~ — done, while the whole corpus of
+   Ibex programs was still this repo.
+4. ~~**Early key validation**~~ — done; cheap, static, and it improves every
+   frontend's errors.
+5. **Order-aware join planning** — the payoff for step 1. Next.
 6. **Null-match policy** — after step 5 has a benchmarked baseline.
 7. **Cardinality assertions and match selection**.
 8. **Schema nullability** — independent; pull forward if step 4 wants it.
@@ -381,14 +421,14 @@ bridge and any adapter. Adapter-specific behaviour stays in the adapter.
 ### ribex (dplyr)
 
 Currently native: `inner_join()` and `left_join()`, same-name keys,
-`na_matches = "never"`, both inputs in one session. The backend renames
-Ibex's `_right` columns to dplyr's `.x`/`.y` after the join.
+`na_matches = "never"`, both inputs in one session.
 
 - **Mapped keys.** Lower character `by` mappings to `on { left = right }`
   instead of renaming whole inputs. Available now.
-- **Suffixes.** Once the `suffix` clause exists, ask for `.x`/`.y` directly
-  and delete the post-join rename step entirely. dplyr's suffixes become an
-  argument passed through, not a translation.
+- ~~**Suffixes.**~~ Done: the backend emits `suffix { ".x", ".y" }` and the
+  post-join rename step is gone. dplyr's suffixes are an argument passed
+  through, not a translation. A collision with an empty suffix on either side
+  falls back rather than translating, since Ibex would then reject the join.
 - **Row order.** dplyr guarantees left order; Ibex does not. The adapter adds
   an explicit `order` to the plan it builds. Any dplyr guarantee Ibex declines
   is the adapter's to reconstruct.

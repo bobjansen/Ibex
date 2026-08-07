@@ -124,6 +124,33 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 [[nodiscard]] auto check_ascriptions(Node& root, const SourceSchemas& sources)
     -> std::expected<void, std::string>;
 
+/// Validate every join in `node`'s subtree against the statically inferred
+/// schemas of its two inputs: each `on` key names a column of its own side, the
+/// two sides of a key agree on type, and the output names resolve.
+///
+/// This is the static half of checks the runtime otherwise makes on first
+/// contact with data, and it can say more: it names the side, the key and the
+/// type instead of failing opaquely part-way through a query, and it fires
+/// before a single page is decoded.
+///
+/// Every check is conditional on evidence, so an unknown schema costs nothing
+/// but the runtime check that was already there:
+///
+///   - a missing key is only provable against a closed Known schema, since an
+///     open one may carry the column anonymously;
+///   - types are compared at the *runtime's* granularity, not the IR's: the
+///     runtime carries one integer and one float width, so a declared Int32
+///     joins a declared Int64 and only a genuinely different kind is rejected.
+///     Erring toward acceptance keeps this pass from rejecting what the
+///     executor would have run;
+///   - an unresolved collision is reported here because `infer_schema` cannot:
+///     inference is total, so it falls to Unknown and leaves the join with no
+///     schema at all.
+///
+/// Returns the first provable failure, or `nullopt`.
+[[nodiscard]] auto check_joins(const Node& node, const SourceSchemas& sources = {})
+    -> std::optional<std::string>;
+
 /// Validate the column references in `node` (and its subtree) against the
 /// statically inferred input schemas, where the input schema is `Known`.
 ///

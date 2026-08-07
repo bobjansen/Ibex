@@ -284,7 +284,7 @@ TEST_CASE("lower_script shares an expensive binding referenced twice", "[parser]
 let agg = t[select { b, s = sum(a) }, by { b }];
 let lo = agg[filter b == 1];
 let hi = agg[filter b == 2];
-let result = lo join hi on b;
+let result = lo join hi on b suffix { "_lo", "_hi" };
 result;
 )");
 
@@ -343,7 +343,7 @@ let agg = t[select { b, s = sum(a) }, by { b }];
 let lo = agg[filter b == 1];
 let agg = t[select { b, s = max(a) }, by { b }];
 let hi = agg[filter b == 2];
-let result = lo join hi on b;
+let result = lo join hi on b suffix { "_lo", "_hi" };
 result;
 )");
 

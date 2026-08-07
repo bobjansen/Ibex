@@ -4,6 +4,7 @@
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
+#include <ibex/ir/pending_order.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
@@ -5023,6 +5024,11 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
         const ir::SourceSchemas schemas = lowerer.source_schemas();
         *lowered = ir::push_filters_into_joins(std::move(*lowered), schemas);
         *lowered = ir::push_semi_joins_down(std::move(*lowered), schemas);
+        // Directly, not through the optimizer: this path does not run one, so
+        // a join here would never learn what the `order` above it wants. There
+        // is no canonicalize to wait for either, which is the only reason the
+        // pass manager runs it late elsewhere.
+        ir::annotate_pending_orders(*lowered.value());
     }
     return lowered;
 }

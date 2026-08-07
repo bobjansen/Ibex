@@ -731,11 +731,29 @@ class JoinNode final : public Node {
     }
     [[nodiscard]] auto suffix() const noexcept -> const JoinSuffixPolicy& { return suffix_; }
 
+    /// Keys an `order` directly above this join asks for, in the join's own
+    /// output names. Empty when the plan has no such `order`.
+    ///
+    /// A hint about *cost*, never about results: it can only change which side
+    /// the executor indexes, and the row order a join produces is outside the
+    /// contract either way (SPEC.md Section 5.6). Dropping it changes timings
+    /// and nothing else, which is why the transpiler is free to ignore it.
+    ///
+    /// The executor needs the keys rather than a bare flag because preferring
+    /// the order-preserving side is only worth anything when the left's
+    /// ordering actually satisfies what the `order` will ask for -- and only
+    /// the executor knows what the left carries.
+    [[nodiscard]] auto pending_order() const noexcept -> const std::vector<OrderKey>& {
+        return pending_order_;
+    }
+    void set_pending_order(std::vector<OrderKey> keys) { pending_order_ = std::move(keys); }
+
    private:
     JoinKind kind_;
     std::vector<JoinKey> keys_;
     std::optional<Expr> predicate_;
     JoinSuffixPolicy suffix_;
+    std::vector<OrderKey> pending_order_;
 };
 
 /// ResampleNode: time-bucket aggregation on a TimeFrame.

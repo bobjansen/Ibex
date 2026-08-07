@@ -3124,11 +3124,13 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 class ChunkedInnerJoinOperator final : public Operator {
    public:
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-                             ir::JoinSuffixPolicy suffix = {})
+                             ir::JoinSuffixPolicy suffix = {},
+                             const std::vector<ir::OrderKey>* pending_order = nullptr)
         : left_(std::move(left)),
           right_(std::move(right)),
           keys_(keys),
-          suffix_(std::move(suffix)) {}
+          suffix_(std::move(suffix)),
+          pending_order_(pending_order) {}
 
     /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
     /// its Project/Rename wrappers), interpreted only after this join has
@@ -3139,7 +3141,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const TableRegistry* registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const ExecutionContext& exec,
                              const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
-                             std::string probe_name, ir::JoinSuffixPolicy suffix = {})
+                             std::string probe_name, ir::JoinSuffixPolicy suffix = {},
+                             const std::vector<ir::OrderKey>* pending_order = nullptr)
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
@@ -3149,7 +3152,8 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_scalars_(scalars),
           deferred_externs_(externs),
           deferred_exec_(&exec),
-          suffix_(std::move(suffix)) {}
+          suffix_(std::move(suffix)),
+          pending_order_(pending_order) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -3274,7 +3278,13 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         const std::size_t n_left = left_table.rows();
 
-        if (n_left < n_right) {
+        // Swapping indexes the smaller (left) side and scans the right, which
+        // gives up left-row order. When an `order` above this join wants
+        // exactly the order the left already carries, declining to swap
+        // delivers it and that whole sort disappears -- worth a larger index,
+        // but only while "larger" stays modest, since the index is probed once
+        // per row of the other side. The same trade is made in join.cpp.
+        if (n_left < n_right && !order_preserving_pays(left_table, n_left, n_right)) {
             left_table_ = std::move(left_table);
             if (auto err = build_index(*left_table_, left_key_name)) {
                 return err;
@@ -3712,6 +3722,44 @@ class ChunkedInnerJoinOperator final : public Operator {
     // on the same output schema as the materialized route and IR inference.
     // The left column names are identical for every chunk, so the plan is
     // computed once from the first assembled chunk.
+    /// Would indexing the right instead of the left buy the pending `order`,
+    /// and is the index small enough that it is worth buying?
+    ///
+    /// The pending keys are in the join's output names and the left's claim is
+    /// in the left's own, so the claim is restated through the output plan
+    /// before they are compared -- a suffixed key is renamed and a key the
+    /// output drops takes the claim with it.
+    auto order_preserving_pays(const Table& left_table, std::size_t n_left, std::size_t n_right)
+        -> bool {
+        constexpr std::size_t kMaxOrderPreservingBuildRatio = 4;
+        if (pending_order_ == nullptr || pending_order_->empty() ||
+            !left_table.properties().ordering().has_value() ||
+            n_right > kMaxOrderPreservingBuildRatio * n_left) {
+            return false;
+        }
+        if (!right_emit_ready_) {
+            if (auto ready = setup_right_emit_schema(left_table); !ready.has_value()) {
+                return false;  // the join is about to fail on this anyway
+            }
+        }
+        std::vector<ir::OrderKey> carried;
+        for (const auto& key : *left_table.properties().ordering()) {
+            std::size_t idx = left_table.columns.size();
+            for (std::size_t i = 0; i < left_table.columns.size(); ++i) {
+                if (left_table.columns[i].name == key.name) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx == left_table.columns.size() || idx >= left_emit_names_.size()) {
+                return false;
+            }
+            carried.push_back(
+                ir::OrderKey{.name = left_emit_names_[idx], .ascending = key.ascending});
+        }
+        return TableProperties::sorted_by(std::move(carried)).satisfies(*pending_order_);
+    }
+
     auto setup_right_emit_schema(const Table& left_side) -> std::expected<void, std::string> {
         auto planned =
             ir::plan_join_output(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
@@ -4249,6 +4297,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     std::vector<std::string> left_emit_names_;
     bool right_emit_ready_ = false;
     ir::JoinSuffixPolicy suffix_;
+    // What an `order` above this join will ask for, or null. Only ever shifts
+    // which side is indexed; see `initialize`.
+    const std::vector<ir::OrderKey>* pending_order_ = nullptr;
 
     // Stream mode: when right > threshold and left >= right, left was
     // materialized to measure but not swapped; replay as a single chunk.
@@ -8361,7 +8412,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 probe.scan != nullptr) {
                 return std::make_unique<ChunkedInnerJoinOperator>(
                     std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix());
+                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
+                    &join.pending_order());
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
@@ -8373,14 +8425,15 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(std::move(right.error()));
             }
             return std::make_unique<ChunkedInnerJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), &join.keys(), join.suffix());
+                std::move(left_op.value()), std::move(right.value()), &join.keys(), join.suffix(),
+                &join.pending_order());
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(
             *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
-                                       compute_mask, join.suffix());
+                                       compute_mask, join.suffix(), join.pending_order());
             });
     }
 

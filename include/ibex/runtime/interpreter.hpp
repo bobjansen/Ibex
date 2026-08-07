@@ -685,7 +685,8 @@ class ExternRegistry;
                                const ScalarRegistry* scalars = nullptr,
                                const ir::JoinSuffixPolicy& suffix = {},
                                ir::NullMatch null_match = ir::NullMatch::Never,
-                               const ir::JoinExpect& expect = {})
+                               const ir::JoinExpect& expect = {},
+                               ir::MatchSelection take = ir::MatchSelection::All)
     -> std::expected<Table, std::string>;
 
 [[nodiscard]] auto extract_scalar(const Table& table, const std::string& column)

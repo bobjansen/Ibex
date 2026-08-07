@@ -1,0 +1,18 @@
+// The order-sensitive claims a table carries, as `:peek` reports them.
+//
+// They decide real behaviour: `order` skips its work when the ordering already
+// satisfies it, `take first` reads the ordering and refuses a value carrying
+// none, and the grouping arms the row-order guard on lag/rolling. A session
+// that cannot see them has to infer them from how a binding was built, which is
+// what the claims exist to stop people doing.
+let quotes = Table { sym = ["a", "b"], ts = [2, 1] };
+
+// No claim yet.
+let ordered = quotes[order { ts asc }];
+
+// A filter removes rows but does not move them, so the claim survives it —
+// which is why ordering a binding once is enough for `take first`.
+let live = ordered[filter ts > 0];
+
+let events = Table { ts = [1, 2, 3], sym = ["a", "a", "b"], v = [1, 2, 3] };
+let windowed = as_timeframe(events, "ts")[window 10s, update { c = cumsum(v) }, by { sym }];

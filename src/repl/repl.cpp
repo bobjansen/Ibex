@@ -1787,7 +1787,10 @@ void print_help() {
     fmt::print("  :imports              List imported libraries and extern origins\n");
     fmt::print("  :schema <table>       Show column names and types\n");
     fmt::print("  :head <table> [n]     Show first n rows\n");
-    fmt::print("  :peek <expr>          Evaluate and compactly display an expression\n");
+    fmt::print(
+        "  :peek <expr>          Evaluate and compactly display an expression, with any\n"
+        "                        order-sensitive claims it carries (time index, ordering,\n"
+        "                        grouping)\n");
     fmt::print("  :describe <table>     Schema + first rows\n");
     fmt::print("  :doc <name>           Show docs/signature for a binding or built-in\n");
     fmt::print("  ?name                 Shorthand for :doc name\n");
@@ -2034,8 +2037,35 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
             total += column_bytes(entry);
         }
         fmt::print("  cols: {}  ~{}", table.columns.size(), format_bytes(total));
+        // The order-sensitive claims a table carries. They decide real
+        // behaviour -- `order` skips its work when the ordering already
+        // satisfies it, `take first` reads the ordering and refuses a value
+        // without one, and the grouping arms the row-order guard on lag/
+        // rolling -- so a session needs a way to see them rather than
+        // inferring them from how a binding was built.
         if (table.time_index().has_value()) {
             fmt::print("  time_index: {}", *table.time_index());
+        }
+        if (table.ordering().has_value() && !table.ordering()->empty()) {
+            std::string keys;
+            for (const auto& key : *table.ordering()) {
+                if (!keys.empty()) {
+                    keys += ", ";
+                }
+                keys += key.name;
+                keys += key.ascending ? " asc" : " desc";
+            }
+            fmt::print("  ordered by: {}", keys);
+        }
+        if (!table.grouped_by().empty()) {
+            std::string keys;
+            for (const auto& key : table.grouped_by()) {
+                if (!keys.empty()) {
+                    keys += ", ";
+                }
+                keys += key;
+            }
+            fmt::print("  grouped by: {}", keys);
         }
     }
     fmt::print("\n");

@@ -97,6 +97,24 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    echo "▸ REPL smoke (:peek reports a table's order-sensitive claims)"
+    repl_out="$(mktemp)"
+    printf ":load tests/data/table_claims_check.ibex\n:peek quotes\n:peek live\n:peek windowed\n:quit\n" \
+        | IBEX_LIBRARY_PATH="$BUILD_DIR/tools" "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+    # `quotes` carries nothing; `live` still carries the ordering its binding
+    # was given three statements earlier; `windowed` carries all three. The
+    # first assertion is the one that would pass vacuously if :peek printed
+    # nothing at all, so the other two have to find their text.
+    if rg -n "error:" "$repl_out" >/dev/null \
+        || ! rg -n "ordered by: ts asc" "$repl_out" >/dev/null \
+        || ! rg -n "time_index: ts.*grouped by: sym" "$repl_out" >/dev/null \
+        || [ "$(rg -c "ordered by" "$repl_out")" != "2" ]; then
+        cat "$repl_out" >&2
+        rm -f "$repl_out"
+        exit 1
+    fi
+    rm -f "$repl_out"
+
     echo "▸ REPL smoke (null keys: group-by / distinct / order / join)"
     repl_out="$(mktemp)"
     printf ":load tests/data/null_keys_check.ibex\n:quit\n" \

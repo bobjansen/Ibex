@@ -784,7 +784,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys(), pred,
-                                   scalars, compute_mask, join.suffix());
+                                   scalars, compute_mask, join.suffix(), join.pending_order());
         }
         case ir::NodeKind::Melt: {
             const auto& mn = static_cast<const ir::MeltNode&>(node);

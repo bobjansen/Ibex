@@ -10,6 +10,7 @@ add_library(ibex_ir STATIC
     join_reorder.cpp
     node.cpp
     optimizer.cpp
+    pending_order.cpp
     required_columns.cpp
     scan_predicates.cpp
     schema.cpp

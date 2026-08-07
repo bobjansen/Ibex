@@ -1690,3 +1690,79 @@ TEST_CASE("join: a following order over a carried claim returns the same rows", 
     CHECK(col_i64(elided, "rval") == col_i64(sorted, "rval"));
 }
 
+
+// ── Build-side selection with a pending `order` ───────────────────────────
+//
+// A join indexes the smaller side. When an `order` above it wants the order
+// the left already carries, indexing the right instead delivers that order and
+// the sort disappears. These pin the choice through its one observable
+// consequence: whether the result claims the ordering.
+
+TEST_CASE("join: a pending order flips the build side when the ratio allows",
+          "[join][order]") {
+    // Left is the smaller side, so the default is to index it and scan the
+    // right -- which loses left-row order. The pending `order` asks for exactly
+    // what the ordered left carries, and 3 rows against 9 is inside the ratio,
+    // so the join indexes the right instead and the order survives.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{3, 1, 2});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9});
+    rhs.add_column("rval", Column<std::int64_t>{10, 20, 30, 40, 50, 60, 70, 80, 90});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out =
+        interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];", tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
+}
+
+TEST_CASE("join: a pending order for something else does not flip the build side",
+          "[join][order]") {
+    // The left is ordered by `id` but the query wants `rval`, which the left
+    // does not have at all. Nothing to preserve, so the default choice stands
+    // and the `order` sorts for real -- which it must still get right.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{3, 1, 2});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9});
+    rhs.add_column("rval", Column<std::int64_t>{90, 80, 70, 60, 50, 40, 30, 20, 10});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out =
+        interpret_expr("(lhs[order { id asc }] join rhs on id)[order { rval asc }];", tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "rval") == std::vector<std::int64_t>{70, 80, 90});
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{3, 2, 1});
+}
+
+TEST_CASE("join: the answer is the same whichever side is indexed", "[join][order]") {
+    // The whole point is that this is a cost decision. Run the same query with
+    // and without the pending order in the plan and compare the rows, since
+    // the two take different paths through the executor.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{3, 1, 2});
+    lhs.add_column("lval", Column<std::int64_t>{30, 10, 20});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9});
+    rhs.add_column("rval", Column<std::int64_t>{10, 20, 30, 40, 50, 60, 70, 80, 90});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto hinted =
+        interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];", tables);
+    auto plain = interpret_expr("(lhs join rhs on id)[order { id asc }];", tables);
+
+    CHECK(col_i64(hinted, "id") == col_i64(plain, "id"));
+    CHECK(col_i64(hinted, "lval") == col_i64(plain, "lval"));
+    CHECK(col_i64(hinted, "rval") == col_i64(plain, "rval"));
+}

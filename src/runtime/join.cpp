@@ -418,7 +418,9 @@ auto resolve_predicate_sides(const ir::Expr& predicate, const Table& left, const
 auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
-                     const ir::JoinSuffixPolicy& suffix) -> std::expected<Table, std::string> {
+                     const ir::JoinSuffixPolicy& suffix,
+                     const std::vector<ir::OrderKey>& pending_order)
+    -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
@@ -619,6 +621,31 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             output.set_properties(output.properties().with_ordering(carried_ordering));
         }
     };
+
+    // ── Build side ────────────────────────────────────────────────────────
+    // The default is to index the smaller side, which is right whenever there
+    // is nothing else to weigh: the probe side is scanned once either way, and
+    // a smaller index is the one that stays in cache.
+    //
+    // The exception is a pending `order` the left already satisfies. Indexing
+    // the right instead scans the left, which emits in left-row order, which
+    // that `order` then finds it has nothing to do. Trading a bigger index for
+    // a whole sort is worth it -- but only while "bigger" stays modest, since
+    // the index is probed once per row of the other side and a large one misses
+    // cache on nearly every probe. Beyond the ratio the sort is the cheaper of
+    // the two costs and the default wins.
+    //
+    // Semi and anti joins are excluded because they emit in left-row order
+    // whichever side is indexed (see `build_indices_from_right_scan`), so there
+    // is no trade to make -- forcing the side would pay the cost for nothing.
+    constexpr std::size_t kMaxOrderPreservingBuildRatio = 4;
+    const bool order_preserving_pays =
+        !pending_order.empty() && !carried_ordering.empty() && !semi_join && !anti_join &&
+        TableProperties::sorted_by(carried_ordering).satisfies(pending_order) &&
+        n_right <= kMaxOrderPreservingBuildRatio * n_left;
+    // True means "index the left, scan the right", which does NOT preserve the
+    // left's order. Hence the negation: preserving it means indexing the right.
+    const bool build_left = n_left < n_right && !order_preserving_pays;
 
     // Prove the claim from the emitted index array rather than from which path
     // produced it. The paths are many and change for performance reasons; the
@@ -1050,8 +1077,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (kind != ir::JoinKind::Asof && !has_null_keys && keys.size() == 1 &&
         (std::holds_alternative<Column<std::string>>(*left_keys[0]) ||
          std::holds_alternative<Column<Categorical>>(*left_keys[0]))) {
-        // Index the smaller side: key → dense gid, rows per gid in a CSR.
-        const bool build_left = n_left < n_right;
+        // Which side is indexed was decided once, above.
         const ColumnValue& build_col = build_left ? *left_keys[0] : *right_keys[0];
         const std::size_t n_build = build_left ? n_left : n_right;
 
@@ -1148,8 +1174,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         const auto& left_ints = std::get<Column<std::int64_t>>(*left_keys[0]);
         const auto& right_ints = std::get<Column<std::int64_t>>(*right_keys[0]);
 
-        // Index the smaller side: key → dense gid, rows per gid in a CSR.
-        const bool build_left = n_left < n_right;
+        // Which side is indexed was decided once, above.
         const auto* build_data = build_left ? left_ints.data() : right_ints.data();
         const std::size_t n_build = build_left ? n_left : n_right;
 
@@ -1464,7 +1489,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         right_cols.push_back(*rc);
     }
 
-    const bool build_left = n_left < n_right;
     const auto& build_cols = build_left ? left_cols : right_cols;
     const auto& probe_cols = build_left ? right_cols : left_cols;
     const auto& build_key_validity = build_left ? left_key_validity : right_key_validity;

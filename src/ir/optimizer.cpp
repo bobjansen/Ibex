@@ -1,6 +1,7 @@
 #include <ibex/ir/canonicalize.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
+#include <ibex/ir/pending_order.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -103,6 +104,20 @@ class DeadPurePreamblePass final : public OptimizationPass {
     }
 };
 
+/// Runs last: canonicalize relocates `order` (above a filter, above a
+/// key-preserving projection), so the join-under-order shape this looks for is
+/// only final once those rewrites have settled.
+class PendingOrderPass final : public OptimizationPass {
+   public:
+    auto run(NodePtr root, const OptimizationContext& /*context*/,
+             OptimizationStats& /*stats*/) const -> NodePtr override {
+        if (root != nullptr) {
+            annotate_pending_orders(*root);
+        }
+        return root;
+    }
+};
+
 }  // namespace
 
 auto is_elidable(const EffectSummary& effects) -> bool {
@@ -158,6 +173,7 @@ auto make_default_pass_manager() -> PassManager {
     PassManager manager;
     manager.add_pass(std::make_unique<DeadPurePreamblePass>());
     manager.add_pass(std::make_unique<CanonicalizePass>());
+    manager.add_pass(std::make_unique<PendingOrderPass>());
     return manager;
 }
 

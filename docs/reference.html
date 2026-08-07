@@ -517,20 +517,25 @@ prices[
 <span class="cm">// Series-literal columns</span>
 <span class="kw">let</span> t = Table {
     symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
-    price  = price,
+    price  = price
 };
 
-<span class="cm">// Columns from existing table expressions</span>
-<span class="kw">let</span> summary = Table {
-    symbol = prices[<span class="kw">select</span> { symbol }],
-    high   = prices[<span class="kw">select</span> { high = <span class="fn-name">max</span>(price) }, <span class="kw">by</span> symbol],
-    low    = prices[<span class="kw">select</span> { low  = <span class="fn-name">min</span>(price) }, <span class="kw">by</span> symbol],
+<span class="cm">// Assemble aligned columns from an existing table expression</span>
+<span class="kw">let</span> quotes = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>],
+    price  = [<span class="num">150.0</span>, <span class="num">155.0</span>, <span class="num">140.0</span>],
+    qty    = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">15</span>]
+};
+<span class="kw">let</span> enriched = Table {
+    symbol   = quotes,
+    price    = quotes,
+    notional = quotes[<span class="kw">select</span> { notional = price <span class="op">*</span> qty }]
 };
 
 <span class="cm">// Mix literals and expressions</span>
-<span class="kw">let</span> ref = Table {
-    label  = [<span class="str">"open"</span>, <span class="str">"close"</span>],
-    value  = ohlc[<span class="kw">select</span> { value = <span class="fn-name">mean</span>(price) }],
+<span class="kw">let</span> benchmark = Table {
+    label = [<span class="str">"average price"</span>],
+    value = quotes[<span class="kw">select</span> { value = <span class="fn-name">mean</span>(price) }]
 };
 
 <span class="cm">// Promote to TimeFrame</span>

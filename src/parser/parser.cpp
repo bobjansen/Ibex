@@ -601,6 +601,25 @@ class Parser {
                 }
                 null_match = *parsed;
             }
+            // `expect n:1` trails the lot. Contextual like `nulls`, for the
+            // same reason: a trailing position after a key list is the only
+            // place the word can appear with this meaning, and reserving it
+            // would take an ordinary name away from every program.
+            std::optional<JoinExpect> expect;
+            if (check(TokenKind::Identifier) && peek().lexeme == "expect") {
+                advance();
+                auto parsed = parse_join_expect();
+                if (!parsed.has_value()) {
+                    return nullptr;
+                }
+                if (keys.empty()) {
+                    error_ = make_error(previous(),
+                                        "`expect` describes how the join's keys line up, and this "
+                                        "join has none");
+                    return nullptr;
+                }
+                expect = *parsed;
+            }
 
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
@@ -611,6 +630,7 @@ class Parser {
                 .predicate = std::move(predicate),
                 .suffix = std::move(suffix),
                 .null_match = null_match,
+                .expect = expect,
             };
             expr = std::move(join);
         }
@@ -924,6 +944,44 @@ class Parser {
         error_ = make_error(previous(), "expected 'equal' or 'never' after 'nulls', got '" +
                                             std::string(setting) + "'");
         return std::nullopt;
+    }
+
+    /// `expect n:1` — one multiplicity per side, `1` or `n`, separated by a
+    /// colon. `1` arrives as an integer literal and `n` as an identifier, so
+    /// each side is read on its own rather than lexed as one token.
+    auto parse_join_expect() -> std::optional<JoinExpect> {
+        const auto side = [this]() -> std::optional<JoinMultiplicity> {
+            if (match(TokenKind::IntLiteral)) {
+                if (previous().lexeme == "1") {
+                    return JoinMultiplicity::One;
+                }
+                error_ = make_error(previous(), "expect: a side is `1` or `n`, got '" +
+                                                    std::string(previous().lexeme) + "'");
+                return std::nullopt;
+            }
+            if (match(TokenKind::Identifier)) {
+                if (previous().lexeme == "n") {
+                    return JoinMultiplicity::Many;
+                }
+                error_ = make_error(previous(), "expect: a side is `1` or `n`, got '" +
+                                                    std::string(previous().lexeme) + "'");
+                return std::nullopt;
+            }
+            error_ = make_error(peek(), "expect: a side is `1` or `n`");
+            return std::nullopt;
+        };
+        auto left = side();
+        if (!left.has_value()) {
+            return std::nullopt;
+        }
+        if (!consume(TokenKind::Colon, "expected ':' between the two sides of `expect`")) {
+            return std::nullopt;
+        }
+        auto right = side();
+        if (!right.has_value()) {
+            return std::nullopt;
+        }
+        return JoinExpect{.left = *left, .right = *right};
     }
 
     auto parse_join_keys() -> std::optional<std::vector<JoinKey>> {

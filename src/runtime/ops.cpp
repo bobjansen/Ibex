@@ -330,11 +330,12 @@ auto model_r_squared(const runtime::ModelResult& m) -> double {
 auto inner_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<ir::JoinKey>& keys,
                 const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Inner, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -344,11 +345,12 @@ auto inner_join(const runtime::Table& left, const runtime::Table& right,
 auto left_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<ir::JoinKey>& keys,
                const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Left, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -358,11 +360,12 @@ auto left_join(const runtime::Table& left, const runtime::Table& right,
 auto right_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<ir::JoinKey>& keys,
                 const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Right, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -372,11 +375,12 @@ auto right_join(const runtime::Table& left, const runtime::Table& right,
 auto outer_join(const runtime::Table& left, const runtime::Table& right,
                 const std::vector<ir::JoinKey>& keys,
                 const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Outer, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -386,10 +390,11 @@ auto outer_join(const runtime::Table& left, const runtime::Table& right,
 auto semi_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<ir::JoinKey>& keys,
                const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Semi, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -399,10 +404,11 @@ auto semi_join(const runtime::Table& left, const runtime::Table& right,
 auto anti_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<ir::JoinKey>& keys,
                const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Anti, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -422,11 +428,12 @@ auto cross_join(const runtime::Table& left, const runtime::Table& right,
 auto asof_join(const runtime::Table& left, const runtime::Table& right,
                const std::vector<ir::JoinKey>& keys,
                const ir::JoinSuffixPolicy& suffix,
-                ir::NullMatch null_match) -> runtime::Table {
+                ir::NullMatch null_match, const ir::JoinExpect& expect)
+    -> runtime::Table {
     // Joins already have a dedicated runtime path; call it directly.
     auto result =
         runtime::join_tables(left, right, ir::JoinKind::Asof, keys, nullptr,
-                             scalars_ptr(), suffix, null_match);
+                             scalars_ptr(), suffix, null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }
@@ -435,10 +442,10 @@ auto asof_join(const runtime::Table& left, const runtime::Table& right,
 
 auto join_with_predicate(const runtime::Table& left, const runtime::Table& right, ir::JoinKind kind,
                          const std::vector<ir::JoinKey>& keys, const ir::Expr& predicate,
-                         const ir::JoinSuffixPolicy& suffix, ir::NullMatch null_match)
-    -> runtime::Table {
+                         const ir::JoinSuffixPolicy& suffix, ir::NullMatch null_match,
+                         const ir::JoinExpect& expect) -> runtime::Table {
     auto result = runtime::join_tables(left, right, kind, keys, &predicate, scalars_ptr(), suffix,
-                                       null_match);
+                                       null_match, expect);
     if (!result) {
         throw std::runtime_error(result.error());
     }

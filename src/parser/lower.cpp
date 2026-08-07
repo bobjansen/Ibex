@@ -303,12 +303,24 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
                 }
                 out->node = std::move(block);
             } else if constexpr (std::is_same_v<T, JoinExpr>) {
+                // Every field, named. A field left out here is not a compile
+                // error, just a default -- so a clone would quietly turn
+                // `nulls equal` into `nulls never` and drop `expect`, and the
+                // same source text would mean different things depending only
+                // on whether it was cloned. I could not reach this with a
+                // JoinExpr: UDF inlining takes another route for joins, and
+                // the two callers substitute into scalar bodies. It is written
+                // out anyway because the next field added is the one that gets
+                // forgotten, and -Wmissing-designated-field-initializers only
+                // warns once someone reads the build log.
                 JoinExpr join{.kind = node.kind,
                               .left = clone_expr(*node.left),
                               .right = clone_expr(*node.right),
                               .keys = node.keys,
                               .predicate = {},
-                              .suffix = node.suffix};
+                              .suffix = node.suffix,
+                              .null_match = node.null_match,
+                              .expect = node.expect};
                 if (node.predicate.has_value()) {
                     join.predicate = clone_expr(**node.predicate);
                 }
@@ -1875,7 +1887,7 @@ class Lowerer {
             }
         }
 
-        ir::JoinSuffixPolicy suffix;
+        ir::JoinSuffixPolicy suffix{};
         if (join.suffix.has_value()) {
             suffix = ir::JoinSuffixPolicy{
                 .present = true, .left = join.suffix->left, .right = join.suffix->right};
@@ -1885,8 +1897,20 @@ class Lowerer {
                                                  *join.null_match == JoinNullMatch::Equal
                                              ? ir::NullMatch::Equal
                                              : ir::NullMatch::Never;
+        // Value-initialized, not default-initialized: `JoinExpect` has no
+        // member defaults, so `ir::JoinExpect expect;` would leave it
+        // indeterminate. `{}` is the neutral n:n.
+        ir::JoinExpect expect{};
+        if (join.expect.has_value()) {
+            const auto multiplicity = [](JoinMultiplicity m) {
+                return m == JoinMultiplicity::One ? ir::JoinMultiplicity::One
+                                                  : ir::JoinMultiplicity::Many;
+            };
+            expect = ir::JoinExpect{.left = multiplicity(join.expect->left),
+                                    .right = multiplicity(join.expect->right)};
+        }
         auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix),
-                                  null_match);
+                                  null_match, expect);
         node->add_child(std::move(left.value()));
         node->add_child(std::move(right.value()));
         return node;
@@ -4684,7 +4708,7 @@ class Lowerer {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
                 clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
-                                      join.suffix(), join.null_match());
+                                      join.suffix(), join.null_match(), join.expect());
                 break;
             }
             case ir::NodeKind::Melt: {

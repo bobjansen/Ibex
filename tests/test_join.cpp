@@ -1992,3 +1992,104 @@ TEST_CASE("join: `nulls` is not a reserved word", "[join][nulls]") {
     auto out = interpret_expr("t[filter nulls > 1];", tables);
     CHECK(col_i64(out, "nulls") == std::vector<std::int64_t>{2});
 }
+
+// ── `expect L:R` ──────────────────────────────────────────────────────────
+//
+// L is how many LEFT rows may match one right row, R how many RIGHT rows may
+// match one left row. It is checked against the pairs actually emitted, so one
+// rule covers every join kind and every path through the executor.
+
+namespace {
+
+// Two orders share customer 10; customer 20 has one. So n:1 holds and 1:1 does
+// not, and the violation is on the right side of the join.
+auto orders_registry() -> runtime::TableRegistry {
+    runtime::Table orders;
+    orders.add_column("id", Column<std::int64_t>{1, 2, 3});
+    orders.add_column("cust", Column<std::int64_t>{10, 10, 20});
+
+    runtime::Table customers;
+    customers.add_column("cust", Column<std::int64_t>{10, 20});
+    customers.add_column("tier", Column<std::int64_t>{7, 8});
+
+    runtime::TableRegistry tables;
+    tables.emplace("orders", std::move(orders));
+    tables.emplace("customers", std::move(customers));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("join: expect n:1 holds when each left row matches once", "[join][expect]") {
+    auto tables = orders_registry();
+    auto out = interpret_expr("(orders join customers on cust expect n:1)[order { id asc }];",
+                              tables);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(col_i64(out, "tier") == std::vector<std::int64_t>{7, 7, 8});
+}
+
+TEST_CASE("join: expect 1:1 fails when a right row matches twice", "[join][expect]") {
+    auto tables = orders_registry();
+    auto err = interpret_error("orders join customers on cust expect 1:1;", tables);
+    CHECK(err.find("expect 1:1") != std::string::npos);
+    CHECK(err.find("right row 0") != std::string::npos);
+}
+
+TEST_CASE("join: expect 1:n fails on the same data, naming the other side",
+          "[join][expect]") {
+    // 1:n says each right row matches at most one left row — the half of 1:1
+    // that this data breaks.
+    auto tables = orders_registry();
+    auto err = interpret_error("orders join customers on cust expect 1:n;", tables);
+    CHECK(err.find("right row 0") != std::string::npos);
+    CHECK(err.find("more than one row on the left") != std::string::npos);
+}
+
+TEST_CASE("join: expect n:1 fails when a left row matches twice", "[join][expect]") {
+    // Reverse the shape: now the LEFT row is the one with two partners.
+    runtime::Table lhs;
+    lhs.add_column("k", Column<std::int64_t>{1});
+    runtime::Table rhs;
+    rhs.add_column("k", Column<std::int64_t>{1, 1});
+    rhs.add_column("v", Column<std::int64_t>{5, 6});
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto err = interpret_error("lhs join rhs on k expect n:1;", tables);
+    CHECK(err.find("left row 0") != std::string::npos);
+    CHECK(err.find("more than one row on the right") != std::string::npos);
+}
+
+TEST_CASE("join: expect n:n asserts nothing", "[join][expect]") {
+    auto tables = orders_registry();
+    auto out = interpret_expr("orders join customers on cust expect n:n;", tables);
+    CHECK(out.rows() == 3);
+}
+
+TEST_CASE("join: an unmatched row is not a repeat", "[join][expect]") {
+    // A left join pads unmatched left rows. Those match nothing, so they cannot
+    // break a declaration about matching more than once.
+    runtime::Table lhs;
+    lhs.add_column("k", Column<std::int64_t>{1, 2, 3});
+    runtime::Table rhs;
+    rhs.add_column("k", Column<std::int64_t>{2});
+    rhs.add_column("v", Column<std::int64_t>{20});
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("(lhs left join rhs on k expect n:1)[order { k asc }];", tables);
+    CHECK(out.rows() == 3);
+}
+
+TEST_CASE("join: expect is rejected where there are no keys", "[join][expect]") {
+    auto err = interpret_error_at_parse("lhs cross join rhs expect n:1;");
+    CHECK(err.find("has none") != std::string::npos);
+}
+
+TEST_CASE("join: expect takes only 1 or n", "[join][expect]") {
+    auto err = interpret_error_at_parse("lhs join rhs on k expect 2:1;");
+    CHECK(err.find("`1` or `n`") != std::string::npos);
+}
+

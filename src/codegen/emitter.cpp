@@ -684,7 +684,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                           << escape_string(key.right) << "\"}";
                 }
                 *out_ << "}, " << emit_filter_expr(*join.predicate())
-                      << emit_join_suffix(join.suffix(), join.null_match(), join.expect()) << ");\n";
+                      << emit_join_suffix(join.suffix(), join.null_match(), join.expect(), join.take()) << ");\n";
                 return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
@@ -700,7 +700,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 }
                 *out_ << "}";
             }
-            *out_ << emit_join_suffix(join.suffix(), join.null_match(), join.expect()) << ");\n";
+            *out_ << emit_join_suffix(join.suffix(), join.null_match(), join.expect(), join.take()) << ");\n";
             return var;
         }
 
@@ -1139,7 +1139,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
 }
 
 auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix, ir::NullMatch null_match,
-                               const ir::JoinExpect& expect) -> std::string {
+                               const ir::JoinExpect& expect, ir::MatchSelection take)
+    -> std::string {
     // These sit after `suffix` in the ops signatures, so a non-default one has
     // to spell every earlier argument out even where it is absent.
     const auto multiplicity = [](ir::JoinMultiplicity m) {
@@ -1147,9 +1148,15 @@ auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix, ir::NullMatch
                                               : "ibex::ir::JoinMultiplicity::Many";
     };
     std::string tail_arg;
-    if (expect.asserts_anything()) {
+    if (expect.asserts_anything() || take != ir::MatchSelection::All) {
         tail_arg = std::string(", ibex::ir::JoinExpect{.left = ") + multiplicity(expect.left) +
                    ", .right = " + multiplicity(expect.right) + "}";
+    }
+    if (take != ir::MatchSelection::All) {
+        const auto* name = take == ir::MatchSelection::First   ? "First"
+                           : take == ir::MatchSelection::Last  ? "Last"
+                                                               : "Any";
+        tail_arg += std::string(", ibex::ir::MatchSelection::") + name;
     }
     const std::string null_arg =
         null_match == ir::NullMatch::Equal ? ", ibex::ir::NullMatch::Equal"

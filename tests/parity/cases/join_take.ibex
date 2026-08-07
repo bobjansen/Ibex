@@ -1,0 +1,11 @@
+// `take first` reads the right value's stated order, so both paths must agree
+// on which match survives — not merely on how many. The quotes are written out
+// of ts order on purpose: a path that used input order instead would keep px 10
+// where this keeps px 11.
+let trades = Table { sym = ["a", "b"], qty = [1, 2] };
+let quotes = Table {
+    sym = ["a", "a", "b"],
+    px  = [10, 11, 20],
+    ts  = [3, 1, 5]
+};
+(trades join quotes[order { ts asc }] on sym take first)[order { sym asc }];

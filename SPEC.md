@@ -844,11 +844,11 @@ expr            = primary
                 | unary_op expr
                 | expr binary_op expr
                 | expr "[" clause_list "]"
-                | expr "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
-                | expr "left" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
-                | expr "right" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
-                | expr "outer" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
-                | expr "asof" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
+                | expr "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ] [ join_take ]
+                | expr "left" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ] [ join_take ]
+                | expr "right" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ] [ join_take ]
+                | expr "outer" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ] [ join_take ]
+                | expr "asof" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ] [ join_take ]
                 | expr "cross" "join" expr [ join_suffix ]
                 | expr "join" expr "on" expr [ join_suffix ]
                 | expr "left" "join" expr "on" expr [ join_suffix ]
@@ -874,6 +874,12 @@ join_nulls      = "nulls" ( "equal" | "never" ) ;
    reserved words. *)
 join_expect     = "expect" multiplicity ":" multiplicity ;
 multiplicity    = "1" | "n" ;
+
+(* Match selection — Section 5.6. Keeps one of a left row's matches. `first`
+   and `last` read the right value's own ordering claim and are an error when
+   it carries none; `any` needs no order. Matched in this position only and not
+   reserved. *)
+join_take       = "take" ( "first" | "last" | "any" ) ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
@@ -2115,6 +2121,34 @@ most one. The four forms are `n:n` (the default, asserting nothing), `n:1`,
   rows the proof describes wrongly.
 - It describes how the keys line up, so it is an error on a join that has no
   keys.
+
+**Match selection.** When a row has several matches and only one is wanted,
+`take` says which to keep:
+
+```ibex
+trades join quotes[order { ts asc }] on symbol take first
+```
+
+- `first` and `last` are meaningful only against a stated order, so they read
+  the **right value's own ordering claim** — the one `order` establishes. The
+  claim travels with the value, so ordering a binding once is enough; `filter`,
+  `select`, `rename`, `head` and `tail` carry it forward, while an operator that
+  rebuilds rows (another join, an aggregate) clears it.
+- A right input carrying no ordering claim is an **error** under `first` and
+  `last`. Without one, "first" could only mean whichever match the executor
+  happened to reach, which changes with the build side and is not something a
+  query should depend on.
+- `any` keeps one match and states that the caller does not care which. Which
+  one is **unspecified and must not be relied on**. The current implementation
+  chooses the lowest-indexed match, so the same input rows give the same output
+  row — that is a property of this implementation, not a promise.
+- A row with no match has nothing to choose between, so an outer join's padded
+  rows are unaffected.
+- `expect` describes how the inputs match, so it is checked **before** `take`
+  drops anything. Otherwise `take first` would satisfy every `expect n:1` by
+  construction.
+- `take` is an error where there is nothing to choose: a join with no keys, or
+  a `semi`/`anti` join, which emits each left row at most once already.
 
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a

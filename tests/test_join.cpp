@@ -2093,3 +2093,125 @@ TEST_CASE("join: expect takes only 1 or n", "[join][expect]") {
     CHECK(err.find("`1` or `n`") != std::string::npos);
 }
 
+
+// ── `take first` / `last` / `any` ─────────────────────────────────────────
+
+namespace {
+
+// Two quotes for "a", one for "b". The quotes are deliberately NOT in ts order
+// as written, so a rule that silently used input order would be visible.
+auto quotes_registry() -> runtime::TableRegistry {
+    runtime::Table trades;
+    trades.add_column("sym", Column<std::string>{"a", "b"});
+
+    runtime::Table quotes;
+    quotes.add_column("sym", Column<std::string>{"a", "a", "b"});
+    quotes.add_column("px", Column<std::int64_t>{10, 11, 20});
+    quotes.add_column("ts", Column<std::int64_t>{3, 1, 5});
+
+    runtime::TableRegistry tables;
+    tables.emplace("trades", std::move(trades));
+    tables.emplace("quotes", std::move(quotes));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("join: take first reads the right value's stated order", "[join][take]") {
+    auto tables = quotes_registry();
+    // Ordered by ts, the earliest quote for "a" is px 11 (ts 1) — not the one
+    // that comes first in the quotes table as written.
+    auto out = interpret_expr(
+        "(trades join quotes[order { ts asc }] on sym take first)[order { sym asc }];", tables);
+    CHECK(col_i64(out, "px") == std::vector<std::int64_t>{11, 20});
+}
+
+TEST_CASE("join: take last reads the same order from the far end", "[join][take]") {
+    auto tables = quotes_registry();
+    auto out = interpret_expr(
+        "(trades join quotes[order { ts asc }] on sym take last)[order { sym asc }];", tables);
+    CHECK(col_i64(out, "px") == std::vector<std::int64_t>{10, 20});
+}
+
+TEST_CASE("join: reversing the order swaps first and last", "[join][take]") {
+    // `last` is a convenience, not a separate concept: the order decides.
+    auto tables = quotes_registry();
+    auto desc = interpret_expr(
+        "(trades join quotes[order { ts desc }] on sym take first)[order { sym asc }];", tables);
+    CHECK(col_i64(desc, "px") == std::vector<std::int64_t>{10, 20});
+}
+
+TEST_CASE("join: the order can be stated once on a binding", "[join][take]") {
+    // The claim travels with the value, so a filter in between keeps it and
+    // nothing has to be repeated at the join.
+    auto tables = quotes_registry();
+    auto out = interpret_expr(R"(
+let ordered = quotes[order { ts asc }];
+let live = ordered[filter px > 0];
+(trades join live on sym take first)[order { sym asc }];
+)",
+                              tables);
+    CHECK(col_i64(out, "px") == std::vector<std::int64_t>{11, 20});
+}
+
+TEST_CASE("join: take first refuses a right input with no stated order",
+          "[join][take]") {
+    auto tables = quotes_registry();
+    auto err = interpret_error("trades join quotes on sym take first;", tables);
+    CHECK(err.find("state an order") != std::string::npos);
+    CHECK(err.find("take any") != std::string::npos);
+}
+
+TEST_CASE("join: take any needs no order and keeps one match", "[join][take]") {
+    // Which one is unspecified, so this asserts only the row count and that the
+    // surviving row is one of the two candidates.
+    auto tables = quotes_registry();
+    auto out = interpret_expr("(trades join quotes on sym take any)[order { sym asc }];", tables);
+    REQUIRE(out.rows() == 2);
+    const auto px = col_i64(out, "px");
+    CHECK((px[0] == 10 || px[0] == 11));
+    CHECK(px[1] == 20);
+}
+
+TEST_CASE("join: take any gives the same answer twice", "[join][take]") {
+    // Unspecified but stable: the contract does not say which row, but the same
+    // input rows must give the same output row, or no test over such a query
+    // could exist.
+    auto tables = quotes_registry();
+    auto first = interpret_expr("(trades join quotes on sym take any)[order { sym asc }];", tables);
+    auto again = interpret_expr("(trades join quotes on sym take any)[order { sym asc }];", tables);
+    CHECK(col_i64(first, "px") == col_i64(again, "px"));
+}
+
+TEST_CASE("join: take leaves an unmatched row alone", "[join][take]") {
+    // A left join's padding has no match to choose between, so it survives.
+    auto tables = quotes_registry();
+    auto out = interpret_expr(R"(
+let extra = Table { sym = ["a", "b", "c"] };
+(extra left join quotes[order { ts asc }] on sym take first)[order { sym asc }];
+)",
+                              tables);
+    CHECK(out.rows() == 3);
+}
+
+TEST_CASE("join: expect still describes the matching, not what take kept",
+          "[join][take]") {
+    // `take first` would satisfy every `expect n:1` by construction if the
+    // declaration were checked after the drop, so it is checked before.
+    auto tables = quotes_registry();
+    auto err = interpret_error(
+        "trades join quotes[order { ts asc }] on sym expect n:1 take first;", tables);
+    CHECK(err.find("expect n:1") != std::string::npos);
+}
+
+TEST_CASE("join: take is rejected where there is nothing to choose", "[join][take]") {
+    CHECK(interpret_error_at_parse("lhs cross join rhs take first;").find("no keys") !=
+          std::string::npos);
+    CHECK(interpret_error_at_parse("lhs semi join rhs on k take first;").find("at most once") !=
+          std::string::npos);
+}
+
+TEST_CASE("join: take takes only first, last or any", "[join][take]") {
+    auto err = interpret_error_at_parse("lhs join rhs on k take some;");
+    CHECK(err.find("'first', 'last' or 'any'") != std::string::npos);
+}

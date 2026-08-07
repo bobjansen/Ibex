@@ -232,3 +232,30 @@ TEST_CASE("null keys: a fully valid TimeFrame index is still accepted", "[nulls]
     CHECK(ints(run("as_timeframe(t, \"ts\");", tables), "v") ==
           std::vector<std::int64_t>{10, 20, 30});
 }
+
+TEST_CASE("null keys: an empty string key does not take the run-length sentinel",
+          "[nulls][keys]") {
+    // The group-by run-length cache compared `key == prev_key` with `prev_key`
+    // default-built — and a default string_view IS the empty string. So a first
+    // row holding a GENUINE "" matched the empty cache and took the cache's
+    // sentinel code, which then indexed the Cartesian cell array out of bounds:
+    // a wild write, and a segfault in `resample ... by` on real data.
+    //
+    // Two keys, because the out-of-range code only reaches the cell array on
+    // the multi-key path.
+    runtime::Table t;
+    runtime::ValidityBitmap sv(4, true);
+    sv.set(1, false);
+    sv.set(3, false);
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 1});
+    t.add_column("s", Column<std::string>{"", "", "", ""}, sv);
+    t.add_column("v", Column<std::int64_t>{1, 10, 2, 20});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    // The genuine empty strings are one group and the nulls another.
+    auto out = run("t[select { n = count(), total = sum(v) }, by { g, s }];", tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(ints(out, "n") == std::vector<std::int64_t>{2, 2});
+    CHECK(ints(out, "total") == std::vector<std::int64_t>{3, 30});
+}

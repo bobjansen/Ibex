@@ -292,6 +292,14 @@ auto format_expr_type(ExprType kind) -> std::string {
     return "?";
 }
 
+/// `expect n:1` as written, for the diagnostic.
+auto format_expect(const ir::JoinExpect& expect) -> std::string {
+    const auto side = [](ir::JoinMultiplicity m) {
+        return m == ir::JoinMultiplicity::One ? "1" : "n";
+    };
+    return std::string(side(expect.left)) + ":" + side(expect.right);
+}
+
 auto format_key(const ir::JoinKey& key) -> std::string {
     return key.left == key.right ? key.left : key.left + " = " + key.right;
 }
@@ -451,8 +459,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
                      const ir::JoinSuffixPolicy& suffix,
-                     const std::vector<ir::OrderKey>& pending_order, ir::NullMatch null_match)
-    -> std::expected<Table, std::string> {
+                     const std::vector<ir::OrderKey>& pending_order, ir::NullMatch null_match,
+                     const ir::JoinExpect& expect) -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
@@ -686,6 +694,52 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // left's order. Hence the negation: preserving it means indexing the right.
     const bool build_left = n_left < n_right && !order_preserving_pays;
 
+    // ── `expect L:R` ──────────────────────────────────────────────────────
+    // Checked against the pairs actually emitted, which is what makes one
+    // check serve every join kind and every path through this function: a
+    // violation is a row index appearing twice in the emitted array, whatever
+    // produced it.
+    //
+    // Nothing is checked when the clause is absent, so a join that does not
+    // declare a shape pays nothing.
+    std::string expect_error;
+    auto check_expect = [&](const std::vector<std::size_t>* left_idx,
+                            const std::vector<std::size_t>* right_idx, std::size_t total) {
+        const auto first_repeat = [&](const std::vector<std::size_t>* idx,
+                                      std::size_t side_rows) -> std::optional<std::size_t> {
+            if (idx == nullptr) {
+                return std::nullopt;  // identity: each row of that side appears once
+            }
+            std::vector<std::uint8_t> seen(side_rows, 0U);
+            for (std::size_t i = 0; i < total && i < idx->size(); ++i) {
+                const std::size_t row = (*idx)[i];
+                if (row == kNull) {
+                    continue;  // an unmatched row matched nothing, so it repeats nothing
+                }
+                if (seen[row] != 0U) {
+                    return row;
+                }
+                seen[row] = 1U;
+            }
+            return std::nullopt;
+        };
+        if (expect.right_at_most_one()) {
+            if (auto row = first_repeat(left_idx, n_left)) {
+                expect_error = "join declared `expect " + format_expect(expect) +
+                               "`, but left row " + std::to_string(*row) +
+                               " matches more than one row on the right";
+                return;
+            }
+        }
+        if (expect.left_at_most_one()) {
+            if (auto row = first_repeat(right_idx, n_right)) {
+                expect_error = "join declared `expect " + format_expect(expect) +
+                               "`, but right row " + std::to_string(*row) +
+                               " matches more than one row on the left";
+            }
+        }
+    };
+
     // Prove the claim from the emitted index array rather than from which path
     // produced it. The paths are many and change for performance reasons; the
     // indices are what actually determine the row order.
@@ -718,6 +772,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // Every left row, once, in its own order: the strongest form of the
         // claim, and it needs no index array to prove it.
         claim_carried_ordering();
+        check_expect(nullptr, &right_idx, right_idx.size());
     };
 
     // ── Materialize output columns from index arrays ─────────────────────
@@ -807,6 +862,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         normalize_time_index(output);
         claim_if_left_ordered(left_idx);
+        check_expect(&left_idx, &right_idx, total);
     };
 
     // ── Cross join ───────────────────────────────────────────────────────
@@ -824,7 +880,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         static const std::vector<std::size_t> empty_key_idx;
         materialize(li, ri, empty_key_idx);
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     // ── Predicate (nested-loop) join ─────────────────────────────────────
@@ -928,7 +985,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         materialize(left_idx, right_idx, key_right_idx);
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     // ── Helper: build index arrays from a right-row → left-matches lookup ─
@@ -1128,7 +1186,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             };
             auto [li, ri, kri] = build_indices_from_right_scan(lookup);
             materialize(li, ri, kri);
-            return output;
+            return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
         }
 
         if (const auto* lc = std::get_if<Column<Categorical>>(left_keys[0])) {
@@ -1152,7 +1211,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     }
                 }
                 materialize_left_identity(ri);
-                return output;
+                return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
             }
             auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
                 const std::uint32_t gid = code_gid[static_cast<std::size_t>(codes[l])];
@@ -1171,7 +1231,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     }
                 }
                 materialize_left_identity(ri);
-                return output;
+                return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
             }
             auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
                 auto it = key_gid.find(ls[l]);
@@ -1181,7 +1242,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             auto [li, ri, kri] = build_indices_from_left_scan(lookup);
             materialize(li, ri, kri);
         }
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     // ── Single int64 key fast path ───────────────────────────────────────
@@ -1214,7 +1276,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             };
             auto [li, ri, kri] = build_indices_from_right_scan(lookup);
             materialize(li, ri, kri);
-            return output;
+            return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
         }
 
         const auto* probe_data = left_ints.data();
@@ -1227,7 +1290,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
             materialize_left_identity(ri);
-            return output;
+            return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
         }
 
         auto lookup = [&](std::size_t l) -> std::span<const std::size_t> {
@@ -1237,7 +1301,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         };
         auto [li, ri, kri] = build_indices_from_left_scan(lookup);
         materialize(li, ri, kri);
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     // ── Asof join ────────────────────────────────────────────────────────
@@ -1503,7 +1568,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                                           : KeyFate::dropped();
                                            },
                                            RowTransform::Preserve));
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     // ── Generic multi-key fallback ───────────────────────────────────────
@@ -1559,7 +1625,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     if (build_left) {
         auto [li, ri, kri] = build_indices_from_right_scan(lookup);
         materialize(li, ri, kri);
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     if (preserve_left_only && grouped.unique()) {
@@ -1571,12 +1638,14 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
         }
         materialize_left_identity(ri);
-        return output;
+        return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
     }
 
     auto [li, ri, kri] = build_indices_from_left_scan(lookup);
     materialize(li, ri, kri);
-    return output;
+    return expect_error.empty() ? std::expected<Table, std::string>{std::move(output)}
+                                : std::unexpected(expect_error);
 }
 
 }  // namespace ibex::runtime

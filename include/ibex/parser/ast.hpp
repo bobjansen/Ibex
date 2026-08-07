@@ -347,6 +347,22 @@ struct JoinKey {
 /// `nulls equal` / `nulls never`: whether a null equijoin key matches another
 /// null. Mirrors `ir::NullMatch`; the AST keeps its own so the parser does not
 /// depend on the IR headers.
+/// `expect n:1` — see `ir::JoinExpect`. The AST keeps its own so the parser
+/// does not depend on the IR headers.
+enum class JoinMultiplicity : std::uint8_t {
+    Many,
+    One,
+};
+
+/// No defaults, so the compiler names any site that forgets a field — see
+/// `ir::JoinExpect`.
+struct JoinExpect {
+    JoinMultiplicity left;
+    JoinMultiplicity right;
+
+    auto operator==(const JoinExpect&) const -> bool = default;
+};
+
 enum class JoinNullMatch : std::uint8_t {
     Never,
     Equal,
@@ -370,6 +386,8 @@ struct JoinExpr {
     std::optional<JoinSuffix> suffix;  ///< absent: a collision is an error
     /// `nulls equal` / `nulls never`; absent means the default, `Never`.
     std::optional<JoinNullMatch> null_match;
+    /// `expect n:1`; absent means `n:n`, which asserts nothing.
+    std::optional<JoinExpect> expect;
 };
 
 /// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`

@@ -29,6 +29,7 @@ set(IBEX_TEST_SOURCES
     test_parser.cpp
     test_repl.cpp
     test_lower.cpp
+    test_null_keys.cpp
     test_interpreter.cpp
     test_interrupt.cpp
     test_codegen.cpp

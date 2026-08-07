@@ -904,16 +904,23 @@ auto head_table(const Table& input, std::size_t count, const std::vector<ir::Col
     idx.reserve(
         std::min(rows, count * std::max<std::size_t>(1, rows / std::max<std::size_t>(1, count))));
 
+    if (group_by.size() > kMaxKeyColumns) {
+        return std::unexpected("head: at most " + std::to_string(kMaxKeyColumns) +
+                               " group-by columns");
+    }
     for (std::size_t row = 0; row < rows; ++row) {
         Key key;
         key.values.reserve(group_by.size());
         for (const auto& ref : group_by) {
-            const auto* column = input.find(ref.name);
-            if (column == nullptr) {
+            const auto* entry = input.find_entry(ref.name);
+            if (entry == nullptr) {
                 return std::unexpected("head group-by column not found: " + ref.name +
                                        " (available: " + format_columns(input) + ")");
             }
-            key.values.push_back(scalar_from_column(*column, row));
+            // Through the shared builder, so the null bit travels with the
+            // value: a null cell holds its type's zero, and pushing the raw
+            // scalar merges a null key into the zero group.
+            push_key_value(key, *entry, row);
         }
         auto& seen = seen_counts[key];
         if (seen >= count) {
@@ -957,16 +964,20 @@ auto tail_table(const Table& input, std::size_t count, const std::vector<ir::Col
     std::vector<Key> order;
     order.reserve(rows);
 
+    if (group_by.size() > kMaxKeyColumns) {
+        return std::unexpected("tail: at most " + std::to_string(kMaxKeyColumns) +
+                               " group-by columns");
+    }
     for (std::size_t row = 0; row < rows; ++row) {
         Key key;
         key.values.reserve(group_by.size());
         for (const auto& ref : group_by) {
-            const auto* column = input.find(ref.name);
-            if (column == nullptr) {
+            const auto* entry = input.find_entry(ref.name);
+            if (entry == nullptr) {
                 return std::unexpected("tail group-by column not found: " + ref.name +
                                        " (available: " + format_columns(input) + ")");
             }
-            key.values.push_back(scalar_from_column(*column, row));
+            push_key_value(key, *entry, row);
         }
         auto [it, inserted] = groups.try_emplace(key);
         if (inserted) {

@@ -103,3 +103,20 @@ iris[head 6] join species_by_code[distinct { SpeciesCode }] on { Species = Speci
 // Uncomment to see it fail —
 //   iris[head 6] join species_by_code[distinct { SpeciesCode }]
 //       on { Species = SpeciesCode } expect 1:1;
+
+// ── Choosing among several matches ────────────────────────────────────────
+// When a row matches several and only one is wanted, `take` says which. The
+// `first` and `last` forms read the right value's own stated order — ordering
+// the binding once is enough, and a right input with no order is an error
+// rather than a silent pick.
+let by_length = species_meta[order { `Sepal.Length` asc }];
+print("take first — the shortest-sepalled row of each species:");
+iris[distinct { Species }] join by_length on Species suffix { "", "_m" } take first;
+
+print("take last — the longest, from the same order:");
+iris[distinct { Species }] join by_length on Species suffix { "", "_m" } take last;
+
+// `take any` keeps one match and says the choice does not matter. Which row
+// survives is unspecified — do not rely on it.
+print("take any — one row per species, no order needed:");
+iris[distinct { Species }] join species_meta on Species suffix { "", "_m" } take any;

@@ -620,6 +620,28 @@ class Parser {
                 }
                 expect = *parsed;
             }
+            // `take first` / `last` / `any`, last of the trailing clauses.
+            std::optional<MatchSelection> take;
+            if (check(TokenKind::Identifier) && peek().lexeme == "take") {
+                advance();
+                auto parsed = parse_join_take();
+                if (!parsed.has_value()) {
+                    return nullptr;
+                }
+                if (keys.empty()) {
+                    error_ = make_error(previous(),
+                                        "`take` chooses among a row's matches, and this join has "
+                                        "no keys to match on");
+                    return nullptr;
+                }
+                if (kind == JoinKind::Semi || kind == JoinKind::Anti) {
+                    error_ = make_error(previous(),
+                                        "`take` chooses among a row's matches, but a semi or anti "
+                                        "join emits each left row at most once already");
+                    return nullptr;
+                }
+                take = *parsed;
+            }
 
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
@@ -631,6 +653,7 @@ class Parser {
                 .suffix = std::move(suffix),
                 .null_match = null_match,
                 .expect = expect,
+                .take = take,
             };
             expr = std::move(join);
         }
@@ -982,6 +1005,27 @@ class Parser {
             return std::nullopt;
         }
         return JoinExpect{.left = *left, .right = *right};
+    }
+
+    /// `take first` / `take last` / `take any`. Matched contextually, as the
+    /// other trailing clauses are.
+    auto parse_join_take() -> std::optional<MatchSelection> {
+        if (!consume(TokenKind::Identifier, "expected 'first', 'last' or 'any' after 'take'")) {
+            return std::nullopt;
+        }
+        const std::string_view which = previous().lexeme;
+        if (which == "first") {
+            return MatchSelection::First;
+        }
+        if (which == "last") {
+            return MatchSelection::Last;
+        }
+        if (which == "any") {
+            return MatchSelection::Any;
+        }
+        error_ = make_error(previous(), "expected 'first', 'last' or 'any' after 'take', got '" +
+                                            std::string(which) + "'");
+        return std::nullopt;
     }
 
     auto parse_join_keys() -> std::optional<std::vector<JoinKey>> {

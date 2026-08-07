@@ -349,6 +349,24 @@ struct JoinExpect {
     auto operator==(const JoinExpect&) const -> bool = default;
 };
 
+/// Which of a left row's matches to keep, from `take first` / `last` / `any`.
+///
+/// `First` and `Last` are meaningful only against a stated order, so they read
+/// the right value's own ordering claim and are an error when it carries none.
+/// The claim travels with the value, so ordering a binding once is enough.
+///
+/// `Any` states that the caller does not care which match survives, only that
+/// one does. Which one is **unspecified** and must not be relied on. The
+/// implementation picks the lowest-indexed match, so the same input rows give
+/// the same output row and a golden test or parity case still works -- that is
+/// a property of this implementation, not a promise of the language.
+enum class MatchSelection : std::uint8_t {
+    All,
+    First,
+    Last,
+    Any,
+};
+
 /// A pair of input column names used by an equijoin. A single-name surface key
 /// is represented by equal `left` and `right` names.
 struct JoinKey {
@@ -785,14 +803,16 @@ class JoinNode final : public Node {
    public:
     JoinNode(NodeId id, JoinKind kind, std::vector<JoinKey> keys,
              std::optional<Expr> predicate = std::nullopt, JoinSuffixPolicy suffix = {},
-             NullMatch null_match = NullMatch::Never, JoinExpect expect = JoinExpect{})
+             NullMatch null_match = NullMatch::Never, JoinExpect expect = JoinExpect{},
+             MatchSelection take = MatchSelection::All)
         : Node(NodeKind::Join, id),
           kind_(kind),
           keys_(std::move(keys)),
           predicate_(std::move(predicate)),
           suffix_(std::move(suffix)),
           null_match_(null_match),
-          expect_(expect) {}
+          expect_(expect),
+          take_(take) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
@@ -802,6 +822,7 @@ class JoinNode final : public Node {
     [[nodiscard]] auto suffix() const noexcept -> const JoinSuffixPolicy& { return suffix_; }
     [[nodiscard]] auto null_match() const noexcept -> NullMatch { return null_match_; }
     [[nodiscard]] auto expect() const noexcept -> const JoinExpect& { return expect_; }
+    [[nodiscard]] auto take() const noexcept -> MatchSelection { return take_; }
 
     /// Keys an `order` directly above this join asks for, in the join's own
     /// output names. Empty when the plan has no such `order`.
@@ -827,6 +848,7 @@ class JoinNode final : public Node {
     JoinSuffixPolicy suffix_;
     NullMatch null_match_ = NullMatch::Never;
     JoinExpect expect_{};
+    MatchSelection take_ = MatchSelection::All;
     std::vector<OrderKey> pending_order_;
 };
 

@@ -320,7 +320,8 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
                               .predicate = {},
                               .suffix = node.suffix,
                               .null_match = node.null_match,
-                              .expect = node.expect};
+                              .expect = node.expect,
+                              .take = node.take};
                 if (node.predicate.has_value()) {
                     join.predicate = clone_expr(**node.predicate);
                 }
@@ -1909,8 +1910,17 @@ class Lowerer {
             expect = ir::JoinExpect{.left = multiplicity(join.expect->left),
                                     .right = multiplicity(join.expect->right)};
         }
+        ir::MatchSelection take = ir::MatchSelection::All;
+        if (join.take.has_value()) {
+            switch (*join.take) {
+                case MatchSelection::All: take = ir::MatchSelection::All; break;
+                case MatchSelection::First: take = ir::MatchSelection::First; break;
+                case MatchSelection::Last: take = ir::MatchSelection::Last; break;
+                case MatchSelection::Any: take = ir::MatchSelection::Any; break;
+            }
+        }
         auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix),
-                                  null_match, expect);
+                                  null_match, expect, take);
         node->add_child(std::move(left.value()));
         node->add_child(std::move(right.value()));
         return node;
@@ -4708,7 +4718,8 @@ class Lowerer {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
                 clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
-                                      join.suffix(), join.null_match(), join.expect());
+                                      join.suffix(), join.null_match(), join.expect(),
+                                      join.take());
                 break;
             }
             case ir::NodeKind::Melt: {

@@ -54,6 +54,12 @@ labels, not positions in a sequence. Remaining work is named, not numbered.
 - **Null-match policy.** `nulls equal` opts a join's equality keys into
   matching null to null; `Never` stays the default and the language's
   three-valued rule. Commit *Give a join keys that can match on null*.
+- **Cardinality and match selection.** `expect n:1` declares how rows line up
+  and is checked against the emitted pairs, and its proofs carry into the
+  output schema. `take first` / `last` / `any` keeps one of a row's matches,
+  the first two reading the right value's own ordering claim. Commits *Let a
+  join declare how its rows line up, and check it* and *Let a join keep one of
+  a row's matches*.
 - **Early key validation.** `ir::check_joins()` proves a join's `on` keys
   against both inputs' inferred schemas — each key names a column of its own
   side, the two sides agree on type, the output names resolve — and names the
@@ -484,11 +490,33 @@ Benchmark: 28 queries all `noise`, geometric mean 1.006, total +0.25%.
 
 ### Cardinality assertions and match selection
 
-- Declared cardinality (1:1, 1:many, many:1, many:many) checked by the existing
-  build/probe, returning a structured failure.
-- Carry the resulting proofs into the output schema.
-- `MatchSelection::First` / `Last` against an explicit order.
-- Fast paths unlocked by a declared 1:1 join.
+Status: implemented. `expect n:1` and `take first` / `last` / `any`.
+
+- ~~Declared cardinality checked by the existing build/probe, returning a
+  structured failure.~~ Spelled `expect n:1` (ER notation, `n` not `many`), and
+  checked against the pairs the join actually emits rather than by the
+  build/probe: a violation is a row index appearing twice in the emitted array,
+  which makes one rule serve every join kind and every path. An unmatched row
+  matched nothing, so it can never break a declaration.
+- ~~Carry the resulting proofs into the output schema.~~ `expect n:1` says each
+  left row appears at most once in the output, which is what keeps a left-side
+  uniqueness proof valid there. Because the declaration is checked, relying on
+  it is sound in the same way an ascription is.
+- ~~`MatchSelection::First` / `Last` against an explicit order.~~ They read the
+  right *value's* ordering claim, not an order restated at the join: the claim
+  travels with the value, so ordering a binding once is enough. A right input
+  with no claim is an error.
+- **Fast paths unlocked by a declared 1:1 join.** Not done. The proofs now
+  carry; nothing yet consumes them to pick a cheaper path.
+
+`Any` was admitted after all, against this plan's position. "I want one row and
+do not care which" is a real intent, and refusing it makes the author write
+`take first` plus an order that means nothing — a sort, and a recorded
+intention they did not have. The plan's objection was to the anti-contract, so
+the contract still says "which one is unspecified"; the implementation picks
+the lowest-indexed match, which keeps golden tests and parity cases working
+without promising anything. The distinction is written down in `SPEC.md` rather
+than left to whoever reads the code.
 
 ### Schema nullability
 
@@ -517,8 +545,9 @@ Benchmark: 28 queries all `noise`, geometric mean 1.006, total +0.25%.
    frontend's errors.
 5. ~~**Order-aware join planning**~~ — done; the payoff for step 1.
 6. ~~**Null-match policy**~~ — done, on the benchmarked baseline step 5 left.
-7. **Cardinality assertions and match selection**. Next.
-8. **Schema nullability** — independent; pull forward if step 4 wants it.
+7. ~~**Cardinality assertions and match selection**~~ — done, except the fast
+   paths a declared 1:1 could unlock.
+8. **Schema nullability** — independent; pull forward if step 4 wants it. Next.
 9. **Time-domain joins** — the largest new feature, and the one most worth
    designing slowly.
 

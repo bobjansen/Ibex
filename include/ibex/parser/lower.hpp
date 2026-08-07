@@ -4,6 +4,8 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 
+#include <span>
+
 #include <expected>
 #include <optional>
 #include <robin_hood.h>
@@ -102,8 +104,16 @@ struct LowerContext {
 /// and without reader schemas that pass is blind, pushing a conjunct only when
 /// its join side happens to be a `Project` that describes itself. Passing them
 /// is what lets a naturally-written join push its filters at all.
+/// `prelude` holds programs whose declarations are in scope for `program` but
+/// whose statements are not its own — the stub an `import` names. They are kept
+/// separate rather than spliced in because a `Stmt` owns move-only expressions
+/// and so cannot be copied into a combined program; the caller keeps them alive
+/// for the call. Only declarations are read from them, so a prelude carrying
+/// anything else contributes nothing.
 [[nodiscard]] auto lower_script(const Program& program,
-                                const ir::SourceSchemas& reader_schemas = {}) -> ScriptPlanResult;
+                                const ir::SourceSchemas& reader_schemas = {},
+                                std::span<const Program* const> prelude = {})
+    -> ScriptPlanResult;
 
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;

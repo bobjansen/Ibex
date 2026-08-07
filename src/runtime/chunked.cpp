@@ -1209,10 +1209,19 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                     if (rank.na_option == ir::RankNaOption::Top) {
                         return lhs_null;
                     }
-                    if (rank.na_option == ir::RankNaOption::Bottom) {
-                        return !lhs_null;
-                    }
-                    return lhs < rhs;
+                    // `Bottom` and `Keep` both put nulls after the values.
+                    // `Keep` overwrites their ranks with null further down, so
+                    // where they sit does not show — but it has to be SOMEWHERE
+                    // consistent. Ordering them by row index instead made the
+                    // comparator intransitive: with rows 7, null, 3 it said
+                    // 7 < null and null < 3 and 3 < 7, and a sort given a
+                    // comparator like that produces an arbitrary permutation,
+                    // which is how every rank came out in row order.
+                    //
+                    // Putting them last also keeps the ordinals right: nulls
+                    // consume rank positions as they are walked, so they must
+                    // be walked after every value.
+                    return !lhs_null;
                 }
                 return lhs < rhs;
             }
@@ -1532,6 +1541,21 @@ class ChunkedOrderOperator final : public Operator {
         if (rows == 0) {
             return true;
         }
+        // Every comparison below reads the key's VALUE, and a null cell holds
+        // its type's zero — so a null would be judged against a real zero and,
+        // worse, judged in the wrong place: nulls sort last, and a column whose
+        // values happen to ascend would be declared already sorted with its
+        // nulls still at the front. The real sort knows where nulls go, so a
+        // nullable key gives up the shortcut rather than answer wrongly. This
+        // is the same guard the materialized `order_table_resolved` applies to
+        // its own pre-sorted check.
+        for (const auto& key : resolved_keys_) {
+            for (const auto& column : chunk.columns) {
+                if (column.name == key.name && column.validity.has_value()) {
+                    return false;
+                }
+            }
+        }
         // Index of each key within this chunk's column list.
         std::vector<std::size_t> key_idx;
         key_idx.reserve(resolved_keys_.size());
@@ -1830,6 +1854,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
                 }
                 type_checked_ = true;
             }
+
 
             // Promote Int → Timestamp per chunk (cheap — same row count, same
             // layout — and keeps downstream operators seeing Timestamp).

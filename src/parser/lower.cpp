@@ -4928,6 +4928,12 @@ auto lower(const Program& program) -> LowerResult {
     if (auto err = ir::check_column_refs(*lowered.value(), source_schemas)) {
         return std::unexpected(LowerError{.message = *err});
     }
+    // Joins are checked here rather than in check_column_refs because the check
+    // needs both inputs' schemas, and because a key is more than a reference:
+    // the two sides have to agree on type, and the output names have to resolve.
+    if (auto err = ir::check_joins(*lowered.value(), source_schemas)) {
+        return std::unexpected(LowerError{.message = *err});
+    }
     // Schema-aware join pushdown runs before canonicalize: canonicalize is a
     // pure structural rewrite that cannot tell which side of a join produces a
     // column, and its rules expect the un-fused Filter(Join(...)) shape.
@@ -4970,12 +4976,18 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
         if (auto err = ir::check_column_refs(*shared.plan, source_schemas)) {
             return std::unexpected(LowerError{.message = *err});
         }
+        if (auto err = ir::check_joins(*shared.plan, source_schemas)) {
+            return std::unexpected(LowerError{.message = *err});
+        }
         shared.plan = ir::push_filters_into_joins(std::move(shared.plan), source_schemas);
         shared.plan = ir::push_semi_joins_down(std::move(shared.plan), source_schemas);
         source_schemas.insert_or_assign(shared.name,
                                         ir::infer_schema(*shared.plan, source_schemas));
     }
     if (auto err = ir::check_column_refs(*lowered->result, source_schemas)) {
+        return std::unexpected(LowerError{.message = *err});
+    }
+    if (auto err = ir::check_joins(*lowered->result, source_schemas)) {
         return std::unexpected(LowerError{.message = *err});
     }
     lowered->result = ir::push_filters_into_joins(std::move(lowered->result), source_schemas);
@@ -5000,6 +5012,9 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
         if (auto err = ir::check_column_refs(*lowered.value(), lowerer.source_schemas(),
                                              context.lexical_names,
                                              /*check_expressions=*/true)) {
+            return std::unexpected(LowerError{.message = *err});
+        }
+        if (auto err = ir::check_joins(*lowered.value(), lowerer.source_schemas())) {
             return std::unexpected(LowerError{.message = *err});
         }
         // Join pushdown must precede the caller's `required_columns` pass so

@@ -507,6 +507,138 @@ auto check_ascriptions(Node& root, const SourceSchemas& sources)
     return {};
 }
 
+namespace {
+
+/// The granularity at which the *runtime* compares two join keys. Its column
+/// variant holds one integer width and one float width, and reports a
+/// dictionary-encoded column as a string, so several IR types share a kind.
+/// Comparing at this granularity is what keeps the static check from rejecting
+/// a join the executor would have run.
+enum class KeyKind : std::uint8_t {
+    Int,
+    Float,
+    Bool,
+    String,
+    Date,
+    Timestamp,
+};
+
+auto key_kind(ColumnType type) -> KeyKind {
+    switch (type) {
+        case ColumnType::Int32:
+        case ColumnType::Int64:
+            return KeyKind::Int;
+        case ColumnType::Float32:
+        case ColumnType::Float64:
+            return KeyKind::Float;
+        case ColumnType::Bool:
+            return KeyKind::Bool;
+        case ColumnType::String:
+            return KeyKind::String;
+        case ColumnType::Date:
+            return KeyKind::Date;
+        case ColumnType::Timestamp:
+            return KeyKind::Timestamp;
+    }
+    return KeyKind::String;
+}
+
+auto format_field_names(const SchemaInfo& info) -> std::string {
+    std::string out;
+    for (const auto& field : info.fields()) {
+        if (!out.empty()) {
+            out.append(", ");
+        }
+        out.append(field.name);
+    }
+    if (info.is_open()) {
+        out.append(out.empty() ? "..." : ", ...");
+    }
+    return out;
+}
+
+auto check_one_join(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right)
+    -> std::optional<std::string> {
+    for (const auto& key : join.keys()) {
+        const auto* left_field = left.find(key.left);
+        const auto* right_field = right.find(key.right);
+        // Only a closed schema proves absence: an open one lists the columns it
+        // knows about and admits others.
+        if (left_field == nullptr && !left.is_open()) {
+            return "join key '" + key.left + "' not found on the left side (available: " +
+                   format_field_names(left) + ")";
+        }
+        if (right_field == nullptr && !right.is_open()) {
+            return "join key '" + key.right + "' not found on the right side (available: " +
+                   format_field_names(right) + ")";
+        }
+        if (left_field == nullptr || right_field == nullptr) {
+            continue;
+        }
+        if (!left_field->type.has_value() || !right_field->type.has_value()) {
+            continue;  // an untyped column is still known to exist
+        }
+        if (key_kind(*left_field->type) != key_kind(*right_field->type)) {
+            return "join key type mismatch: left '" + key.left + "' is " +
+                   std::string(type_name(*left_field->type)) + " but right '" + key.right +
+                   "' is " + std::string(type_name(*right_field->type));
+        }
+    }
+
+    std::vector<std::string_view> left_names;
+    std::vector<std::string_view> right_names;
+    left_names.reserve(left.fields().size());
+    right_names.reserve(right.fields().size());
+    for (const auto& field : left.fields()) {
+        left_names.emplace_back(field.name);
+    }
+    for (const auto& field : right.fields()) {
+        right_names.emplace_back(field.name);
+    }
+    // An open schema hides columns, so it can hide a collision -- but never
+    // invent one. Reporting what the listed names prove is still sound.
+    auto planned =
+        plan_join_output(join.kind(), join.keys(), left_names, right_names, join.suffix());
+    if (!planned.has_value()) {
+        return planned.error();
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+auto check_joins(const Node& node, const SourceSchemas& sources) -> std::optional<std::string> {
+    if (node.kind() == NodeKind::Program) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& program = static_cast<const ProgramNode&>(node);
+        for (const auto& pre : program.preamble()) {
+            if (auto err = check_joins(*pre, sources)) {
+                return err;
+            }
+        }
+        return check_joins(program.main_node(), sources);
+    }
+
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            if (auto err = check_joins(*child, sources)) {
+                return err;
+            }
+        }
+    }
+
+    if (node.kind() != NodeKind::Join) {
+        return std::nullopt;
+    }
+    const SchemaInfo left = child_schema(node, sources, 0);
+    const SchemaInfo right = child_schema(node, sources, 1);
+    if (!left.is_known() || !right.is_known()) {
+        return std::nullopt;  // nothing to prove it against; the runtime checks the data
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    return check_one_join(static_cast<const JoinNode&>(node), left, right);
+}
+
 auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& args)
     -> std::optional<std::string> {
     std::string key = callee;
@@ -751,8 +883,9 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 plan_join_output(join.kind(), join.keys(), left_names, right_names, join.suffix());
             if (!planned.has_value()) {
                 // An unresolved collision has no output schema to describe.
-                // Inference stays total; `check_join_outputs()` raises the
-                // diagnostic where both schemas are known.
+                // Inference stays total; `check_joins()` raises the diagnostic
+                // where both schemas are known, and the executor where they
+                // are not.
                 return SchemaInfo::unknown();
             }
             const std::vector<JoinOutputColumn>& plan = *planned;

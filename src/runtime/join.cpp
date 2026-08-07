@@ -479,7 +479,13 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                                    " (available: " + format_columns(right) + ")");
         }
         if (column_kind(*left_col) != column_kind(*right_col)) {
-            return std::unexpected("join key type mismatch for " + format_key(key));
+            // Same wording as the static `ir::check_joins` diagnostic: this is
+            // the same failure, reached only when a schema was not known ahead
+            // of execution.
+            return std::unexpected("join key type mismatch: left '" + key.left + "' is " +
+                                   format_expr_type(column_kind(*left_col)) + " but right '" +
+                                   key.right + "' is " +
+                                   format_expr_type(column_kind(*right_col)));
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);

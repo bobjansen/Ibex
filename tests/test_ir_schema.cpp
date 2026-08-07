@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -483,4 +484,120 @@ TEST_CASE("schema: like infers a Bool column", "[ir][schema]") {
     REQUIRE(s.is_known());
     REQUIRE(names(s) == std::vector<std::string>{"a", "b", "c", "m"});
     REQUIRE(type_of(s, "m") == ColumnType::Bool);
+}
+
+namespace {
+
+// A join of scans over "left" and "right", so the check can be driven by the
+// two source schemas alone.
+auto join_of(std::vector<ibex::ir::JoinKey> keys, ibex::ir::JoinKind kind = ibex::ir::JoinKind::Inner,
+             ibex::ir::JoinSuffixPolicy suffix = {}) -> ibex::ir::JoinNode {
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, kind, std::move(keys), std::nullopt,
+                            std::move(suffix));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+    return join;
+}
+
+auto two_sources(SchemaInfo left, SchemaInfo right) -> SourceSchemas {
+    return {{"left", std::move(left)}, {"right", std::move(right)}};
+}
+
+}  // namespace
+
+TEST_CASE("check_joins: a key absent from one side is named with its side", "[ir][schema]") {
+    auto join = join_of({{"id", "id"}});
+    auto sources = two_sources(
+        SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+        SchemaInfo::known({{.name = "other", .type = ColumnType::Int64},
+                           {.name = "v", .type = ColumnType::Float64}}));
+    auto err = ibex::ir::check_joins(join, sources);
+    REQUIRE(err.has_value());
+    REQUIRE(err->find("'id'") != std::string::npos);
+    REQUIRE(err->find("right side") != std::string::npos);
+    REQUIRE(err->find("other, v") != std::string::npos);
+}
+
+TEST_CASE("check_joins: a mapped key is checked against its own side", "[ir][schema]") {
+    // left_id exists on the left and right_id on the right, so the join is
+    // fine; swapping the mapping is what must fail.
+    auto sources =
+        two_sources(SchemaInfo::known({{.name = "left_id", .type = ColumnType::Int64}}),
+                    SchemaInfo::known({{.name = "right_id", .type = ColumnType::Int64}}));
+    auto ok = join_of({{"left_id", "right_id"}});
+    REQUIRE_FALSE(ibex::ir::check_joins(ok, sources).has_value());
+
+    auto swapped = join_of({{"right_id", "left_id"}});
+    auto err = ibex::ir::check_joins(swapped, sources);
+    REQUIRE(err.has_value());
+    REQUIRE(err->find("left side") != std::string::npos);
+}
+
+TEST_CASE("check_joins: the two sides of a key must agree on type", "[ir][schema]") {
+    auto join = join_of({{"id", "id"}});
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::String}}));
+    auto err = ibex::ir::check_joins(join, sources);
+    REQUIRE(err.has_value());
+    REQUIRE(err->find("Int64") != std::string::npos);
+    REQUIRE(err->find("String") != std::string::npos);
+}
+
+TEST_CASE("check_joins: widths that share a runtime kind are compatible", "[ir][schema]") {
+    // The runtime carries one integer width, so Int32 and Int64 keys meet as
+    // the same physical column. Rejecting this pair statically would reject a
+    // join the executor runs.
+    auto join = join_of({{"id", "id"}});
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int32}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}));
+    REQUIRE_FALSE(ibex::ir::check_joins(join, sources).has_value());
+}
+
+TEST_CASE("check_joins: an untyped or open side defers to the runtime", "[ir][schema]") {
+    auto join = join_of({{"id", "id"}});
+    // No type on the right: the column is known to exist, nothing more.
+    auto untyped = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "id", .type = std::nullopt}}));
+    REQUIRE_FALSE(ibex::ir::check_joins(join, untyped).has_value());
+
+    // An open schema may carry the key among the columns it does not list.
+    auto open = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                            SchemaInfo::known({{.name = "v", .type = std::nullopt}}, /*open=*/true));
+    REQUIRE_FALSE(ibex::ir::check_joins(join, open).has_value());
+
+    // An unknown source proves nothing either way.
+    SourceSchemas one{{"left", SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}})}};
+    REQUIRE_FALSE(ibex::ir::check_joins(join, one).has_value());
+}
+
+TEST_CASE("check_joins: an unresolved output collision is reported here", "[ir][schema]") {
+    // infer_schema falls to Unknown on a collision, so this is the only place
+    // the diagnostic can come from before execution.
+    auto join = join_of({{"id", "id"}});
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                                                  {.name = "v", .type = ColumnType::Float64}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                                                  {.name = "v", .type = ColumnType::Float64}}));
+    REQUIRE_FALSE(ibex::ir::infer_schema(join, sources).is_known());
+    auto err = ibex::ir::check_joins(join, sources);
+    REQUIRE(err.has_value());
+    REQUIRE(err->find("v") != std::string::npos);
+
+    // With suffixes it resolves, and the check passes.
+    auto suffixed = join_of({{"id", "id"}}, ibex::ir::JoinKind::Inner,
+                            ibex::ir::JoinSuffixPolicy{.present = true, .left = "_l", .right = "_r"});
+    REQUIRE_FALSE(ibex::ir::check_joins(suffixed, sources).has_value());
+}
+
+TEST_CASE("check_joins: a join nested below another operator is still checked", "[ir][schema]") {
+    auto join = std::make_unique<ibex::ir::JoinNode>(
+        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner, std::vector<ibex::ir::JoinKey>{{"id", "id"}});
+    join->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+    ibex::ir::HeadNode head(ibex::ir::NodeId{4}, std::size_t{5});
+    head.add_child(std::move(join));
+
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::String}}));
+    REQUIRE(ibex::ir::check_joins(head, sources).has_value());
 }

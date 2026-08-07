@@ -3339,6 +3339,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             !ok.has_value()) {
             return std::unexpected(ok.error());
         }
+        if (auto err = ir::check_joins(*lowered.value(), context.source_schemas)) {
+            return std::unexpected(*err);
+        }
         auto predicates = ir::scan_predicates(*lowered.value());
         std::set<std::string> applied_scan_filters;
         for (const auto& [name, conjuncts] : predicates) {
@@ -4454,6 +4457,12 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // what stops them demanding the data they only assert.
         if (auto ok = ir::check_ascriptions(*rewritten, schemas); !ok.has_value()) {
             return std::unexpected(ok.error());
+        }
+        // The same argument for the join keys, and this is the first point they
+        // can be checked at all: at lowering a reader call site had no schema,
+        // and `schemas` has just gained every source's names and types.
+        if (auto err = ir::check_joins(*rewritten, schemas)) {
+            return std::unexpected(*err);
         }
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);

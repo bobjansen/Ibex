@@ -2662,6 +2662,20 @@ column in the first argument's schema. The resulting `TimeFrame` maintains the
 sortedness invariant: rows are ordered by the index column in ascending order.
 If the input is not sorted, `as_timeframe` sorts it.
 
+**The index may not contain nulls.** A `TimeFrame`'s contract is an ordering on
+its time index, and a null has no position in time — it is neither before nor
+after anything, so every operator that reads the index (`asof join`, `window`,
+`resample`) would be asking a question with no answer. `as_timeframe` rejects a
+null in the index rather than sorting it to one end and letting each of those
+operators decide separately what it means. Drop or fill the nulls first:
+
+```ibex
+let tf = as_timeframe(trades[filter timestamp is not null], timestamp);
+```
+
+The restriction is on the index only. Every other column of a `TimeFrame` may
+be null as usual.
+
 ### 9.2 Duration Literals
 
 Duration literals specify time spans for windowing and tolerance parameters:

@@ -1009,6 +1009,14 @@ supply[
             fewer than 4. Only <code>count</code> never returns null.
           </p>
           <p>
+            A <code>TimeFrame</code>&rsquo;s time index may not contain nulls
+            at all &mdash; a null has no position in time, so
+            <code>as_timeframe</code> rejects one rather than let
+            <code>asof join</code>, <code>window</code> and
+            <code>resample</code> each decide what it means. Every other column
+            may be null as usual.
+          </p>
+          <p>
             A null is never equal to anything, itself included, so a null
             <strong>join key</strong> matches no row by default; a
             <code>by</code> key is the deliberate exception, grouping nulls

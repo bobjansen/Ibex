@@ -884,6 +884,17 @@ employee[
             in the output, which a join could not otherwise conclude.
           </p>
           <p>
+            When a row has several matches and only one is wanted,
+            <code><em>take</em> first</code> / <code>last</code> keeps one.
+            Both read the right value&rsquo;s own ordering claim &mdash; the one
+            <code>order</code> establishes, which travels with the value, so
+            ordering a binding once is enough. A right input carrying no order
+            is an error rather than a silent pick, since &ldquo;first&rdquo;
+            would otherwise mean whichever match the executor happened to reach.
+            <code>take any</code> keeps one match and says the choice does not
+            matter; which one is unspecified and must not be relied on.
+          </p>
+          <p>
             This is deliberately not a rename rule. Renaming an overlap between
             two snapshots of the same table and catching an accidental overlap
             between unrelated tables want opposite handling, so the first asks

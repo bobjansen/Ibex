@@ -354,6 +354,14 @@ enum class JoinMultiplicity : std::uint8_t {
     One,
 };
 
+/// `take first` / `last` / `any` — see `ir::MatchSelection`.
+enum class MatchSelection : std::uint8_t {
+    All,
+    First,
+    Last,
+    Any,
+};
+
 /// No defaults, so the compiler names any site that forgets a field — see
 /// `ir::JoinExpect`.
 struct JoinExpect {
@@ -388,6 +396,8 @@ struct JoinExpr {
     std::optional<JoinNullMatch> null_match;
     /// `expect n:1`; absent means `n:n`, which asserts nothing.
     std::optional<JoinExpect> expect;
+    /// `take first` / `last` / `any`; absent means every match is kept.
+    std::optional<MatchSelection> take;
 };
 
 /// `Stream { source = call_expr, transform = [clauses...], sink = call_expr }`

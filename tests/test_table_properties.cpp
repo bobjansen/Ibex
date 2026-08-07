@@ -279,3 +279,41 @@ TEST_CASE("An overwritten time index is no longer an index", "[runtime][properti
     // The grouping is independent and survives the overwrite of a different key.
     CHECK(out.grouped_by() == std::vector<std::string>{"symbol"});
 }
+
+// `satisfies` decides whether a sort can be skipped outright, so its two
+// directions are not symmetric in cost: a false negative pays for a sort that
+// was not needed, a false positive returns unsorted rows as sorted.
+TEST_CASE("An ordering satisfies each of its own prefixes", "[runtime][properties][ordering]") {
+    const auto props = TableProperties::sorted_by({{.name = "a", .ascending = true},
+                                                   {.name = "b", .ascending = false}});
+
+    CHECK(props.satisfies({}));
+    CHECK(props.satisfies({{.name = "a", .ascending = true}}));
+    CHECK(props.satisfies({{.name = "a", .ascending = true}, {.name = "b", .ascending = false}}));
+}
+
+TEST_CASE("An ordering does not satisfy an extension of itself",
+          "[runtime][properties][ordering]") {
+    // Rows ordered by (a) may be in any order within a run of equal `a`, so
+    // they say nothing about (a, b).
+    const auto props = TableProperties::sorted_by({{.name = "a", .ascending = true}});
+    CHECK_FALSE(
+        props.satisfies({{.name = "a", .ascending = true}, {.name = "b", .ascending = true}}));
+}
+
+TEST_CASE("A direction or a name must match key for key", "[runtime][properties][ordering]") {
+    const auto props = TableProperties::sorted_by({{.name = "a", .ascending = true},
+                                                   {.name = "b", .ascending = true}});
+    CHECK_FALSE(props.satisfies({{.name = "a", .ascending = false}}));
+    CHECK_FALSE(props.satisfies({{.name = "b", .ascending = true}}));
+    // Right names, wrong order of them.
+    CHECK_FALSE(
+        props.satisfies({{.name = "b", .ascending = true}, {.name = "a", .ascending = true}}));
+}
+
+TEST_CASE("No claim satisfies nothing", "[runtime][properties][ordering]") {
+    CHECK_FALSE(TableProperties::none().satisfies({{.name = "a", .ascending = true}}));
+    // Not even the empty request: with no claim, the rows may be in any order,
+    // and an `order` with no keys sorts by the whole schema rather than by none.
+    CHECK_FALSE(TableProperties::none().satisfies({}));
+}

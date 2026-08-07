@@ -407,6 +407,17 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
         return output;
     }
 
+    // The input may already carry a claim that it is in this order, in which
+    // case there is nothing to prove by looking at the data at all. This is
+    // what makes an upstream `order` — or a join that emitted its left rows in
+    // order — pay for the sort once instead of once per consumer, and unlike
+    // the data scan below it covers multi-key, descending and string orderings.
+    if (input.properties().satisfies(resolved_keys)) {
+        Table output = input;
+        output.set_properties(input.properties().with_ordering(resolved_keys));
+        return output;
+    }
+
     // Fast pre-sorted check for single ascending Timestamp/Date/Int key — avoids building
     // the 8 MB flat_keys[0].u64 vector when the input is already sorted (common TimeFrame case).
     if (resolved_keys.size() == 1 && resolved_keys[0].ascending &&

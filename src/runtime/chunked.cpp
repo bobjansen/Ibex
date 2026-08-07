@@ -1462,12 +1462,27 @@ class ChunkedOrderOperator final : public Operator {
                 resolved_keys_ = std::move(*resolved);
             }
             if (still_sorted_) {
-                auto ok = validate_chunk(chunk);
-                if (!ok.has_value()) {
-                    return std::unexpected(std::move(ok.error()));
-                }
-                if (!*ok) {
-                    still_sorted_ = false;
+                // A chunk that already claims this ordering needs no checking:
+                // the claim was made by the operator that laid the rows out.
+                // This is what carries an upstream `order`, or a join that
+                // emitted its left rows in order, past a second sort -- and it
+                // covers multi-key, descending and string orderings, which the
+                // data check below deliberately does not.
+                if (chunk.properties().satisfies(resolved_keys_)) {
+                    // The boundary snapshot still has to advance: a later chunk
+                    // that makes no claim is compared against the last row seen,
+                    // and a stale one would compare it against the wrong rows.
+                    if (auto ok = record_chunk_boundary(chunk); !ok.has_value()) {
+                        return std::unexpected(std::move(ok.error()));
+                    }
+                } else {
+                    auto ok = validate_chunk(chunk);
+                    if (!ok.has_value()) {
+                        return std::unexpected(std::move(ok.error()));
+                    }
+                    if (!*ok) {
+                        still_sorted_ = false;
+                    }
                 }
             }
             buffered_.push_back(std::move(chunk));
@@ -1606,13 +1621,36 @@ class ChunkedOrderOperator final : public Operator {
             }
         }
 
-        // Snapshot last row for next boundary check.
-        prev_last_.clear();
-        prev_last_.reserve(resolved_keys_.size());
-        for (std::size_t i = 0; i < resolved_keys_.size(); ++i) {
-            prev_last_.push_back(scalar_from_column(*chunk.columns[key_idx[i]].column, rows - 1));
+        if (auto ok = record_chunk_boundary(chunk); !ok.has_value()) {
+            return std::unexpected(std::move(ok.error()));
         }
         return true;
+    }
+
+    /// Snapshot this chunk's last row as the boundary the next chunk's first
+    /// row is compared against. Separate from `validate_chunk` because a chunk
+    /// whose ordering claim was believed still has to advance the boundary.
+    auto record_chunk_boundary(const Chunk& chunk) -> std::expected<void, std::string> {
+        const std::size_t rows = chunk.rows();
+        if (rows == 0) {
+            return {};
+        }
+        prev_last_.clear();
+        prev_last_.reserve(resolved_keys_.size());
+        for (const auto& key : resolved_keys_) {
+            std::size_t found = chunk.columns.size();
+            for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
+                if (chunk.columns[i].name == key.name) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == chunk.columns.size()) {
+                return std::unexpected("order column not found in chunk: " + key.name);
+            }
+            prev_last_.push_back(scalar_from_column(*chunk.columns[found].column, rows - 1));
+        }
+        return {};
     }
 
     // Lexicographic comparison of two rows within the same chunk, honoring
@@ -4096,6 +4134,40 @@ class ChunkedInnerJoinOperator final : public Operator {
         const auto left_name = [&](std::size_t i, const ColumnEntry& lc) -> const std::string& {
             return i < left_emit_names_.size() ? left_emit_names_[i] : lc.name;
         };
+
+        // The left's ordering, restated in the output's names, when this batch
+        // emitted the left rows in their own order. Same rule and reasoning as
+        // the materialized join in join.cpp -- a join promises no order, but a
+        // path that produces one should say so, and the claim is proved from
+        // the emitted index array rather than from which mode ran. Computed
+        // before the identity branch below, which renames left columns in place.
+        const auto carried_ordering = [&]() -> std::vector<ir::OrderKey> {
+            if (!left_side.properties().ordering().has_value()) {
+                return {};
+            }
+            if (!li_identity) {
+                for (std::size_t i = 1; i < total; ++i) {
+                    if (li[i] < li[i - 1]) {
+                        return {};
+                    }
+                }
+            }
+            std::vector<ir::OrderKey> out;
+            for (const auto& key : *left_side.properties().ordering()) {
+                std::optional<std::string> emitted;
+                for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
+                    if (left_side.columns[i].name == key.name) {
+                        emitted = left_name(i, left_side.columns[i]);
+                        break;
+                    }
+                }
+                if (!emitted.has_value()) {
+                    return {};  // a key the output cannot name
+                }
+                out.push_back(ir::OrderKey{.name = std::move(*emitted), .ascending = key.ascending});
+            }
+            return out;
+        }();
         if (li_identity && total == left_side.rows()) {
             for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
                 auto& lc = left_side.columns[i];
@@ -4134,6 +4206,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             } else {
                 output.add_column(std::move(name), std::move(gathered));
             }
+        }
+        if (!carried_ordering.empty()) {
+            output.set_properties(output.properties().with_ordering(carried_ordering));
         }
         return output;
     }

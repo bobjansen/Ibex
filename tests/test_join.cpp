@@ -1827,3 +1827,34 @@ TEST_CASE("join: a null in a right column stays null through the join", "[join]"
     CHECK((*entry->validity)[1]);
     CHECK_FALSE((*entry->validity)[2]);
 }
+
+// ── A null key matches nothing, in semi and anti too ──────────────────────
+
+TEST_CASE("join: a null key matches nothing in a semi or anti join", "[join][nulls]") {
+    // Both sides pit a null against a GENUINE 0 in the key column. That is the
+    // whole point: a null cell holds its type's zero, so a test whose keys
+    // avoid 0 passes even when the two are conflated. `lv` 101 and 103 have
+    // null keys and must not find the 0 on the right.
+    runtime::Table lhs;
+    runtime::ValidityBitmap lv(4, true);
+    lv.set(1, false);
+    lv.set(3, false);
+    lhs.add_column("k", Column<std::int64_t>{0, 0, 5, 0}, lv);
+    lhs.add_column("lv", Column<std::int64_t>{100, 101, 102, 103});
+
+    runtime::Table rhs;
+    runtime::ValidityBitmap rv(3, true);
+    rv.set(1, false);
+    rhs.add_column("k", Column<std::int64_t>{0, 0, 7}, rv);
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // Only the genuine 0 has a match at all.
+    CHECK(col_i64(interpret_expr("lhs semi join rhs on k;", tables), "lv") ==
+          std::vector<std::int64_t>{100});
+    // Anti is the complement: everything the semi join dropped.
+    CHECK(col_i64(interpret_expr("(lhs anti join rhs on k)[order { lv asc }];", tables), "lv") ==
+          std::vector<std::int64_t>{101, 102, 103});
+}

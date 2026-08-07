@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ibex;
@@ -1539,3 +1540,153 @@ TEST_CASE("non-equijoin: a qualifier naming a column the side lacks is rejected"
     CHECK(interpret_error("lhs join rhs on left(a) < right(a);", tables)
               .find("the right input has no column") != std::string::npos);
 }
+
+// ── Row order carried over from the left input ────────────────────────────
+//
+// A join still promises no row order. What these pin is that when a path
+// happens to emit the left rows in their own order, the result SAYS so, which
+// is what lets a following `order` skip the sort.
+
+namespace {
+
+// An ordering claim as (name, ascending) pairs, for comparison in tests.
+auto ordering_of(const runtime::Table& t) -> std::vector<std::pair<std::string, bool>> {
+    std::vector<std::pair<std::string, bool>> out;
+    if (t.ordering().has_value()) {
+        for (const auto& key : *t.ordering()) {
+            out.emplace_back(key.name, key.ascending);
+        }
+    }
+    return out;
+}
+
+// A left side deliberately larger than the right, so the executor indexes the
+// right and scans the left — the path that emits in left-row order.
+auto big_left_registry() -> runtime::TableRegistry {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{5, 4, 3, 2, 1});
+    lhs.add_column("lval", Column<std::int64_t>{50, 40, 30, 20, 10});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 3});
+    rhs.add_column("rval", Column<std::int64_t>{200, 300});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+    return tables;
+}
+
+}  // namespace
+
+TEST_CASE("join: a left-scan path carries the left's ordering into the output", "[join][order]") {
+    auto tables = big_left_registry();
+    auto out = interpret_expr("lhs[order { id asc }] join rhs on id;", tables);
+
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 3});
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
+}
+
+TEST_CASE("join: an unordered left carries nothing", "[join][order]") {
+    auto tables = big_left_registry();
+    auto out = interpret_expr("lhs join rhs on id;", tables);
+    CHECK(ordering_of(out).empty());
+}
+
+TEST_CASE("join: duplicate matches stay adjacent, so the claim still holds", "[join][order]") {
+    // Two right rows per left key: the left row is emitted twice, together.
+    // A non-strict ordering tolerates that -- (1, 1, 3) is still ascending.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{3, 1, 2, 4, 5});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 1, 3, 3});
+    rhs.add_column("rval", Column<std::int64_t>{10, 11, 30, 31});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs[order { id asc }] join rhs on id;", tables);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 1, 3, 3});
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
+}
+
+TEST_CASE("join: a right join's unmatched rows void the claim", "[join][order]") {
+    // Unmatched right rows are appended with null left columns, so the left's
+    // ordering says nothing about where they belong. `id = 9` is the one that
+    // matters: without it every right row matches and the order does survive.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{5, 4, 3, 2, 1});
+    lhs.add_column("lval", Column<std::int64_t>{50, 40, 30, 20, 10});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{2, 9});
+    rhs.add_column("rval", Column<std::int64_t>{200, 900});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs[order { id asc }] right join rhs on id;", tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(ordering_of(out).empty());
+}
+
+TEST_CASE("join: a right join whose right rows all match keeps the claim", "[join][order]") {
+    // The companion to the case above: nothing is appended, so every emitted
+    // row is a left row in left order and the claim stands. Which of the two
+    // happens is a property of the data, which is why the claim is proved from
+    // the emitted rows rather than from the join kind.
+    auto tables = big_left_registry();
+    auto out = interpret_expr("lhs[order { id asc }] right join rhs on id;", tables);
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
+}
+
+TEST_CASE("join: a semi join keeps the left ordering", "[join][order]") {
+    // Left columns only, emitted in left-row order: the claim survives whole.
+    auto tables = big_left_registry();
+    auto out = interpret_expr("lhs[order { id asc }] semi join rhs on id;", tables);
+    CHECK(col_i64(out, "id") == std::vector<std::int64_t>{2, 3});
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
+}
+
+TEST_CASE("join: a suffixed key column is claimed under its output name", "[join][order]") {
+    // `lval` collides and takes the left suffix, so the claim has to be
+    // restated in the output's names or it names a column that is not there.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{3, 1, 2, 4, 5});
+    lhs.add_column("lval", Column<std::int64_t>{30, 10, 20, 40, 50});
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2});
+    rhs.add_column("lval", Column<std::int64_t>{100, 200});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr(
+        R"(lhs[order { lval asc }] join rhs on id suffix { "_l", "_r" };)", tables);
+    CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"lval_l", true}});
+}
+
+TEST_CASE("join: an ordering key the output drops takes the claim with it", "[join][order]") {
+    // An anti join emits left columns only, but the left was ordered by a
+    // column projected away before the join, so nothing can be claimed.
+    auto tables = big_left_registry();
+    auto out = interpret_expr("lhs[order { lval asc }][select { id }] anti join rhs on id;", tables);
+    CHECK(ordering_of(out).empty());
+}
+
+TEST_CASE("join: a following order over a carried claim returns the same rows", "[join][order]") {
+    // The elision is invisible by construction -- what it must not do is change
+    // the answer. Compare it against the same query over an unordered left,
+    // which sorts for real.
+    auto tables = big_left_registry();
+    auto elided = interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];",
+                                 tables);
+    auto sorted = interpret_expr("(lhs join rhs on id)[order { id asc }];", tables);
+
+    CHECK(col_i64(elided, "id") == col_i64(sorted, "id"));
+    CHECK(col_i64(elided, "lval") == col_i64(sorted, "lval"));
+    CHECK(col_i64(elided, "rval") == col_i64(sorted, "rval"));
+}
+

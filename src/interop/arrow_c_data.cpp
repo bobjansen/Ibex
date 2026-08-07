@@ -253,6 +253,114 @@ auto decode_metadata(const char* metadata)
     return out;
 }
 
+/// Is row `a` of `entry` ordered at-or-before row `b`, treating a null as
+/// greater than every value (Ibex sorts nulls last)?
+auto row_at_or_before(const runtime::ColumnEntry& entry, std::size_t a, std::size_t b,
+                      bool ascending) -> bool {
+    const auto is_null = [&](std::size_t row) {
+        return entry.validity.has_value() && !(*entry.validity)[row];
+    };
+    if (is_null(a) || is_null(b)) {
+        // Nulls sort last whichever way the values run, so `desc` does not flip
+        // them — the same rule `order` follows.
+        return is_null(b);
+    }
+    return std::visit(
+        [&](const auto& col) -> bool {
+            using ColT = std::decay_t<decltype(col)>;
+            if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                const std::string_view lhs = col.dictionary()[static_cast<std::size_t>(col.code_at(a))];
+                const std::string_view rhs = col.dictionary()[static_cast<std::size_t>(col.code_at(b))];
+                return ascending ? lhs <= rhs : rhs <= lhs;
+            } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
+                return ascending ? col[a].nanos <= col[b].nanos : col[b].nanos <= col[a].nanos;
+            } else if constexpr (std::is_same_v<ColT, Column<Date>>) {
+                return ascending ? col[a].days <= col[b].days : col[b].days <= col[a].days;
+            } else {
+                return ascending ? !(col[b] < col[a]) : !(col[a] < col[b]);
+            }
+        },
+        *entry.column);
+}
+
+/// Check the `ibex.*` claims against the data they describe.
+///
+/// This is a trust boundary. Inside the process a claim is made by the operator
+/// that laid the rows out, and can be believed because nothing else can write
+/// one. Metadata arriving through the C Data Interface is just bytes from
+/// another producer, and both claims below are load-bearing for correctness:
+/// a stated ordering lets `order` skip its work entirely, and a time index is
+/// what `asof join`, `window` and `resample` navigate by. A wrong one does not
+/// degrade the answer, it changes it.
+auto validate_imported_claims(const runtime::Table& table,
+                              const std::optional<std::vector<ir::OrderKey>>& ordering,
+                              const std::optional<std::string>& time_index,
+                              const std::vector<std::string>& grouped_by)
+    -> std::expected<void, std::string> {
+    if (time_index.has_value()) {
+        const auto* entry = table.find_entry(*time_index);
+        if (entry == nullptr) {
+            return std::unexpected("ibex.time_index names a column not in the table: '" +
+                                   *time_index + "'");
+        }
+        if (!std::holds_alternative<Column<Timestamp>>(*entry->column) &&
+            !std::holds_alternative<Column<Date>>(*entry->column)) {
+            return std::unexpected("ibex.time_index column '" + *time_index +
+                                   "' must be Timestamp or Date");
+        }
+        // Same rule as `as_timeframe`: a null has no position in time, so it
+        // cannot be an index.
+        if (entry->validity.has_value()) {
+            for (std::size_t row = 0; row < table.rows(); ++row) {
+                if (!(*entry->validity)[row]) {
+                    return std::unexpected("ibex.time_index '" + *time_index +
+                                           "' is null at row " + std::to_string(row) +
+                                           "; a TimeFrame's index must have no nulls");
+                }
+            }
+        }
+    }
+    for (const auto& name : grouped_by) {
+        if (table.find_entry(name) == nullptr) {
+            return std::unexpected("ibex.grouped_by names a column not in the table: '" + name +
+                                   "'");
+        }
+    }
+    if (!ordering.has_value()) {
+        return {};
+    }
+    std::vector<const runtime::ColumnEntry*> entries;
+    entries.reserve(ordering->size());
+    for (const auto& key : *ordering) {
+        const auto* entry = table.find_entry(key.name);
+        if (entry == nullptr) {
+            return std::unexpected("ibex.ordering names a column not in the table: '" + key.name +
+                                   "'");
+        }
+        entries.push_back(entry);
+    }
+    // The rows have to actually be in the claimed order. Verifying costs one
+    // pass, against an import that already copied every value; believing a
+    // false claim costs the caller a wrong answer from an `order` that skipped
+    // its sort.
+    for (std::size_t row = 1; row < table.rows(); ++row) {
+        for (std::size_t k = 0; k < entries.size(); ++k) {
+            const auto& key = (*ordering)[k];
+            if (!row_at_or_before(*entries[k], row - 1, row, key.ascending)) {
+                return std::unexpected("ibex.ordering claims '" + key.name +
+                                       "' is sorted, but row " + std::to_string(row) +
+                                       " breaks it");
+            }
+            // Equal on this key: the next key decides. Otherwise this key
+            // already settled the pair and the rest do not apply.
+            if (!row_at_or_before(*entries[k], row, row - 1, key.ascending)) {
+                break;
+            }
+        }
+    }
+    return {};
+}
+
 auto find_metadata_value(const std::vector<std::pair<std::string, std::string>>& metadata,
                          std::string_view key) -> std::optional<std::string> {
     for (const auto& [k, v] : metadata) {
@@ -1243,9 +1351,13 @@ auto import_table_impl(const ArrowArray& array, const ArrowSchema& schema,
         grouped_text.has_value()) {
         grouped_by = parse_grouped_by(*grouped_text);
     }
+    auto time_index = find_metadata_value(*metadata, "ibex.time_index");
+    if (auto ok = validate_imported_claims(table, ordering, time_index, grouped_by);
+        !ok.has_value()) {
+        return std::unexpected(std::move(ok.error()));
+    }
     table.set_properties(runtime::TableProperties::recovered(
-        std::move(ordering), find_metadata_value(*metadata, "ibex.time_index"),
-        std::move(grouped_by)));
+        std::move(ordering), std::move(time_index), std::move(grouped_by)));
 
     return table;
 }

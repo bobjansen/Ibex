@@ -349,13 +349,60 @@ second run, and for the same reason.
 
 ### Order-aware join planning
 
-- Recognize an `order` above a join and let the join emit in that order when a
-  path can do so without extra work.
-- Include the pending sort in build-side selection.
-- Let a join prove an ordering constraint when its chosen path preserves one,
-  so a redundant downstream `order` folds away.
-- Benchmark: this is the payoff for not promising an order, so it needs a
-  measured sort-avoidance result, not just correctness.
+The proof turned out to belong in the runtime, not the optimizer. Which path a
+join takes is a build-side decision made from the two actual row counts
+(`build_left = n_left < n_right`), so the optimizer cannot know whether the
+chosen path emits in left order — it does not know the row counts. What it
+*can* do is arrange for the claim to be usable, which is what the ordering
+metadata on `TableProperties` already is.
+
+So the shape is: the join states an ordering when it produced one, and `order`
+skips its work when the input already claims what it was asked for. A redundant
+`order` does not fold away in the plan; it becomes O(1) at execution, which buys
+the same sort.
+
+- ~~Let a join prove an ordering constraint when its chosen path preserves
+  one.~~ Done, and proved from the emitted left-row index array rather than
+  from which path ran — the paths are many and change for performance reasons,
+  the indices are what actually determine row order. Covers inner/left/semi/
+  anti, and right/outer whenever no unmatched right row is appended. The claim
+  is restated in the output's names, so a suffixed key follows the rename and a
+  dropped key voids it. Implemented in both join routes: `join_table_impl`
+  (materialized) and `ChunkedInnerJoinOperator::assemble_output` (chunked).
+- ~~So a redundant downstream `order` folds away.~~ `TableProperties::satisfies`
+  decides it: the requested keys must be a prefix of the claim with matching
+  directions. Consulted by `order_table_resolved` and by
+  `ChunkedOrderOperator`, where it also replaces an O(n) data scan that only
+  ever covered a single ascending Timestamp/Date/Int key — the claim covers
+  multi-key, descending and string orderings too.
+- **Include the pending sort in build-side selection.** Not done. This is the
+  part that needs plan-level information: deliberately building the *larger*
+  side to preserve an order the query is about to ask for. It is also the part
+  that can make a join slower to make a sort disappear, so it needs the cost
+  comparison, not just the capability.
+- ~~**Benchmark.**~~ Two measurements, because the suite could only supply one
+  of them.
+
+  *Neutrality*, `compare_ibex_git.sh --replica-control` over
+  `join,null,events,sort,timeframe`, 15 repeats, `replica_binary=identical`:
+  all 28 queries `noise`, geometric mean 0.999, total +0.13%. That is the
+  regression check the added work needs — a scan over the emitted left-index
+  array in both join routes, and a claim check in `order`.
+
+  *Sort avoidance* had to be measured outside the suite, which has no
+  join-then-order query. A new bench query would have existed on one side only
+  and been silently dropped, so instead: one worktree at base, built, binary
+  saved, the diff applied, rebuilt. Two scripts differing only in a trailing
+  `order`, so the CSV read and the join cancel in the pair difference:
+
+  | | cost of the second `order` (median of 9 paired repeats) |
+  |---|---|
+  | base | **+40 ms** (every repeat positive, 29–78) |
+  | target | **+2 ms** (repeats straddle zero, −14 to +34) |
+
+  38 ms off a 306 ms query. The key is a string, deliberately: the pre-existing
+  pre-sorted data check covers a single ascending Timestamp/Date/Int key only,
+  so before this change the sort was paid in full.
 
 ### Null-match policy
 

@@ -582,6 +582,61 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     const bool preserve_left_only =
         preserve_left_rows && !preserve_right_rows && kind != ir::JoinKind::Asof;
 
+    // ── Row order carried over from the left input ────────────────────────
+    // A join promises no row order (SPEC.md), and this changes nothing about
+    // that. But a path that happens to emit the left rows in their own order
+    // still *produces* one, and saying so lets a following `order` skip a sort
+    // instead of re-establishing what the rows already satisfy. Which path runs
+    // is a build-side decision made from the two row counts, so this is knowable
+    // here and nowhere earlier.
+    //
+    // Duplicate matches for one left row are emitted adjacently, which a
+    // non-strict ordering tolerates: (1, 1, 3) is still ascending.
+    std::vector<ir::OrderKey> carried_ordering;
+    if (left.properties().ordering().has_value()) {
+        // The output planner renames a colliding left column and drops every
+        // left column from neither semi nor anti, so a claim has to be restated
+        // in the output's own names -- or dropped when a key cannot be named.
+        robin_hood::unordered_map<std::string, std::string> left_output_name;
+        for (const auto& column : plan) {
+            if (column.side == ir::JoinOutputSide::Left) {
+                left_output_name.emplace(left.columns[column.source_index].name, column.name);
+            }
+        }
+        for (const auto& key : *left.properties().ordering()) {
+            const auto it = left_output_name.find(key.name);
+            if (it == left_output_name.end()) {
+                carried_ordering.clear();
+                break;
+            }
+            carried_ordering.push_back(
+                ir::OrderKey{.name = it->second, .ascending = key.ascending});
+        }
+    }
+
+    auto claim_carried_ordering = [&] {
+        if (!carried_ordering.empty()) {
+            output.set_properties(output.properties().with_ordering(carried_ordering));
+        }
+    };
+
+    // Prove the claim from the emitted index array rather than from which path
+    // produced it. The paths are many and change for performance reasons; the
+    // indices are what actually determine the row order.
+    auto claim_if_left_ordered = [&](const std::vector<std::size_t>& left_idx) {
+        if (carried_ordering.empty()) {
+            return;
+        }
+        for (std::size_t i = 0; i < left_idx.size(); ++i) {
+            // kNull is an unmatched right row, whose left columns are null: the
+            // left's ordering says nothing about where such a row belongs.
+            if (left_idx[i] == kNull || (i > 0 && left_idx[i] < left_idx[i - 1])) {
+                return;
+            }
+        }
+        claim_carried_ordering();
+    };
+
     auto materialize_left_identity = [&](const std::vector<std::size_t>& right_idx) {
         for (std::size_t c = 0; c < left.columns.size(); ++c) {
             output.replace_column(c, *left.columns[c].column, left.columns[c].validity);
@@ -609,6 +664,9 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         normalize_time_index(output);
+        // Every left row, once, in its own order: the strongest form of the
+        // claim, and it needs no index array to prove it.
+        claim_carried_ordering();
     };
 
     // ── Materialize output columns from index arrays ─────────────────────
@@ -705,6 +763,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         normalize_time_index(output);
+        claim_if_left_ordered(left_idx);
     };
 
     // ── Cross join ───────────────────────────────────────────────────────

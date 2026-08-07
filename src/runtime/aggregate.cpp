@@ -1494,13 +1494,21 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 // insertion. At 100K distinct keys that's ~100K extra probes.
                 // robin_hood::emplace returns (iterator, inserted) so we can
                 // do the full find-or-insert in one call.
+                // `have_prev`, not an empty `prev_key`: a default-built
+                // string_view IS the empty string, so a first key of "" would
+                // match the empty cache and take the sentinel gid. I could not
+                // construct an input that reaches it here — the keys come from
+                // an already-densified dictionary — but it is the same shape as
+                // the crash fixed in the multi-key path below, and the cost of
+                // ruling it out is one bool.
                 std::string_view prev_key;
-                std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
+                std::uint32_t prev_gid = 0;
+                bool have_prev = false;
                 for (std::size_t row = 0; row < rows; ++row) {
                     const std::string_view key{src_chars + src_off[row],
                                                src_off[row + 1] - src_off[row]};
                     std::uint32_t gid{};
-                    if (key == prev_key) {
+                    if (have_prev && key == prev_key) {
                         gid = prev_gid;
                     } else {
                         auto result = key_to_gid.emplace(key, n_groups);
@@ -1515,6 +1523,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         prev_key = key;
                         prev_gid = gid;
+                        have_prev = true;
                     }
                     group_ids[row] = gid;
                 }
@@ -1641,8 +1650,15 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     cc.str_chars.reserve(512);
                     robin_hood::unordered_flat_map<std::string_view, std::uint32_t> map;
                     map.reserve(64);
+                    // `have_prev` rather than a sentinel `prev_code`: the cache
+                    // is compared with `key == prev_key`, and a default-built
+                    // string_view IS the empty string — so a first row holding a
+                    // genuine "" matched the empty cache and took the sentinel as
+                    // its code. That code then indexes the Cartesian cell array,
+                    // out of bounds, which is a wild write and a crash.
                     std::string_view prev_key;
-                    std::uint32_t prev_code = std::numeric_limits<std::uint32_t>::max();
+                    std::uint32_t prev_code = 0;
+                    bool have_prev = false;
                     for (std::size_t row = 0; row < rows; ++row) {
                         if (is_null_row(row)) {
                             if (cc.null_code == kNoNullCode) {
@@ -1661,7 +1677,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         const std::string_view key{col[row]};
                         std::uint32_t code{};
-                        if (key == prev_key) {
+                        if (have_prev && key == prev_key) {
                             code = prev_code;
                         } else {
                             auto it = map.find(key);
@@ -1677,6 +1693,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                             }
                             prev_key = key;
                             prev_code = code;
+                            have_prev = true;
                         }
                         cc.codes[row] = code;
                     }

@@ -200,3 +200,35 @@ TEST_CASE("null keys: dcast separates a null row key from every real value",
     CHECK(out.rows() == 3);
     CHECK(ints(out, "a") == std::vector<std::int64_t>{1, 2, 3});
 }
+
+TEST_CASE("null keys: a TimeFrame index may not contain nulls", "[nulls][keys]") {
+    // A null has no position in time, so it cannot be an index. The refusal is
+    // at as_timeframe, where the TimeFrame is established, rather than at each
+    // operator that would later ask where the row sits.
+    runtime::Table t;
+    runtime::ValidityBitmap tv(3, true);
+    tv.set(1, false);
+    t.add_column("ts", Column<std::int64_t>{1, 0, 3}, tv);
+    t.add_column("v", Column<std::int64_t>{10, 20, 30});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+
+    auto parsed = parser::parse("as_timeframe(t, \"ts\");");
+    REQUIRE(parsed.has_value());
+    auto lowered = parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("null at row 1") != std::string::npos);
+}
+
+TEST_CASE("null keys: a fully valid TimeFrame index is still accepted", "[nulls][keys]") {
+    runtime::Table t;
+    t.add_column("ts", Column<std::int64_t>{3, 1, 2});
+    t.add_column("v", Column<std::int64_t>{30, 10, 20});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(t));
+    // Sorted by the index, which is what as_timeframe establishes.
+    CHECK(ints(run("as_timeframe(t, \"ts\");", tables), "v") ==
+          std::vector<std::int64_t>{10, 20, 30});
+}

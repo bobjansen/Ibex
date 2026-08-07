@@ -688,6 +688,23 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected("as_timeframe: column '" + atf.column() +
                                        "' must be Timestamp, Date, or Int");
             }
+            // A TimeFrame's whole contract is an ordering on its time index, and
+            // a null has no position in time — it cannot be earlier or later
+            // than anything. Every operator that reads the index (asof, window,
+            // resample) would be asking where a row sits when the answer does
+            // not exist, so the index is required to be fully valid and the
+            // rejection happens here, where the TimeFrame is established.
+            if (const auto* entry = t.find_entry(atf.column());
+                entry != nullptr && entry->validity.has_value()) {
+                for (std::size_t r = 0; r < t.rows(); ++r) {
+                    if (!(*entry->validity)[r]) {
+                        return std::unexpected(
+                            "as_timeframe: time index '" + atf.column() + "' is null at row " +
+                            std::to_string(r) +
+                            "; a TimeFrame's index must have no nulls (drop or fill them first)");
+                    }
+                }
+            }
             auto sorted = order_table(t, {{.name = atf.column(), .ascending = true}}, exec);
             if (!sorted.has_value()) {
                 return sorted;

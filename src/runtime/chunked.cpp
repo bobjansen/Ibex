@@ -1855,6 +1855,23 @@ class ChunkedAsTimeframeOperator final : public Operator {
                 type_checked_ = true;
             }
 
+            // A null has no position in time, so it cannot be an index (see
+            // the same check in the materialized as_timeframe). Chunk-local row
+            // numbers would be misleading, so the message counts from the start
+            // of the input.
+            if (chunk.columns[col_idx].validity.has_value()) {
+                const auto& validity = *chunk.columns[col_idx].validity;
+                for (std::size_t r = 0; r < chunk.rows(); ++r) {
+                    if (!validity[r]) {
+                        return std::unexpected(
+                            "as_timeframe: time index '" + column_ + "' is null at row " +
+                            std::to_string(rows_seen_ + r) +
+                            "; a TimeFrame's index must have no nulls (drop or fill them first)");
+                    }
+                }
+            }
+            rows_seen_ += chunk.rows();
+
 
             // Promote Int → Timestamp per chunk (cheap — same row count, same
             // layout — and keeps downstream operators seeing Timestamp).
@@ -2007,6 +2024,7 @@ class ChunkedAsTimeframeOperator final : public Operator {
     std::size_t emit_idx_ = 0;
     std::optional<Table> sorted_result_;
     bool type_checked_ = false;
+    std::size_t rows_seen_ = 0;  ///< input rows drained, for null-index messages
     bool needs_promotion_ = false;
     bool still_sorted_ = true;
 };

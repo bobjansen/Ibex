@@ -20,6 +20,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
@@ -1262,6 +1263,34 @@ class Lowerer {
         return sources;
     }
 
+    /// Register a declaration statement, returning true when `stmt` was one.
+    ///
+    /// Shared by the script's own statements and by any prelude in front of it
+    /// (an `import`'s stub), so a declaration means the same thing whichever
+    /// file it came from.
+    auto collect_declaration(const Stmt& stmt) -> bool {
+        if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
+            // Track externs that return a table so lower_table_call can
+            // produce ExternCallNodes for them.
+            if (ext->return_type.kind == Type::Kind::DataFrame ||
+                ext->return_type.kind == Type::Kind::TimeFrame) {
+                table_externs_.insert(ext->name);
+                table_extern_decls_.insert_or_assign(ext->name, ext);
+            }
+            // Track externs whose first argument is a DataFrame — these are sink candidates
+            // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
+            if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
+                sink_externs_.insert(ext->name);
+            }
+            return true;
+        }
+        if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
+            functions_.insert_or_assign(fn->name, fn);
+            return true;
+        }
+        return false;
+    }
+
     auto lower_script(const Program& program) -> ScriptPlanResult {
         ir::NodePtr last_expr;
         std::vector<ir::NodePtr> preamble_calls;
@@ -1299,23 +1328,7 @@ class Lowerer {
             return infer_output_column_names(*lowered.value());
         };
         for (const auto& stmt : program.statements) {
-            if (const auto* ext = std::get_if<ExternDecl>(&stmt)) {
-                // Track externs that return a table so lower_table_call can
-                // produce ExternCallNodes for them.
-                if (ext->return_type.kind == Type::Kind::DataFrame ||
-                    ext->return_type.kind == Type::Kind::TimeFrame) {
-                    table_externs_.insert(ext->name);
-                    table_extern_decls_.insert_or_assign(ext->name, ext);
-                }
-                // Track externs whose first argument is a DataFrame — these are sink candidates
-                // (e.g. write_csv, udp_send).  lower_stream uses this to validate sink calls.
-                if (!ext->params.empty() && ext->params[0].type.kind == Type::Kind::DataFrame) {
-                    sink_externs_.insert(ext->name);
-                }
-                continue;
-            }
-            if (const auto* fn = std::get_if<FunctionDecl>(&stmt)) {
-                functions_.insert_or_assign(fn->name, fn);
+            if (collect_declaration(stmt)) {
                 continue;
             }
             if (std::holds_alternative<ImportDecl>(stmt)) {
@@ -4953,8 +4966,8 @@ auto lower(const Program& program) -> LowerResult {
     return optimized;
 }
 
-auto lower_script(const Program& program, const ir::SourceSchemas& reader_schemas)
-    -> ScriptPlanResult {
+auto lower_script(const Program& program, const ir::SourceSchemas& reader_schemas,
+                  std::span<const Program* const> prelude) -> ScriptPlanResult {
     auto effects = analyze_effects(program);
     if (!effects.has_value()) {
         return std::unexpected(LowerError{.message = effects.error().format()});
@@ -4965,6 +4978,16 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     // so a reader call site resolves for check_column_refs and -- the point --
     // for the join filter pushdown a few lines below.
     Lowerer lowerer(&bindings, {}, {}, {}, {}, reader_schemas);
+    // An imported stub's declarations come first, so the script's own can
+    // shadow them the way a later declaration shadows an earlier one.
+    for (const Program* unit : prelude) {
+        if (unit == nullptr) {
+            continue;
+        }
+        for (const auto& stmt : unit->statements) {
+            lowerer.collect_declaration(stmt);
+        }
+    }
     auto lowered = lowerer.lower_script(program);
     if (!lowered.has_value()) {
         return lowered;

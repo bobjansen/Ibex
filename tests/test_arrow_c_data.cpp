@@ -2,6 +2,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
+
 #include <cstring>
 #include <interpreter_internal.hpp>
 #include <limits>
@@ -1115,4 +1117,97 @@ TEST_CASE("A dictionary-encoded index is still a categorical", "[interop][arrow]
 
     schema.release(&schema);
     array.release(&array);
+}
+
+// ── The `ibex.*` metadata is a claim, and import is a trust boundary ──────
+//
+// Inside the process a claim is made by the operator that laid the rows out.
+// Arriving through the C Data Interface it is just bytes, and both claims are
+// load-bearing: a stated ordering lets `order` skip its work entirely, and a
+// time index is what asof/window/resample navigate by. A wrong one does not
+// degrade the answer, it changes it — so import checks rather than believes.
+//
+// `TableProperties::recovered` is what makes these testable: it is the one
+// constructor that asserts nothing, so a deliberately false claim can be built
+// and shipped through a real export.
+
+namespace {
+
+auto import_with_claim(ibex::runtime::Table table) -> std::expected<ibex::runtime::Table, std::string> {
+    ArrowArray array{};
+    ArrowSchema schema{};
+    auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
+    REQUIRE(exported.has_value());
+    return ibex::interop::import_table_from_arrow(array, schema);
+}
+
+}  // namespace
+
+TEST_CASE("Arrow import rejects a time index that is not there", "[interop][arrow][claims]") {
+    ibex::runtime::Table table;
+    table.add_column("id", ibex::Column<std::int64_t>{1, 2});
+    table.set_properties(ibex::runtime::TableProperties::recovered(std::nullopt, "nope", {}));
+
+    auto imported = import_with_claim(std::move(table));
+    REQUIRE_FALSE(imported.has_value());
+    CHECK(imported.error().find("time_index") != std::string::npos);
+}
+
+TEST_CASE("Arrow import rejects a null in the time index", "[interop][arrow][claims]") {
+    // The same rule as_timeframe enforces, at the other door into a TimeFrame.
+    ibex::runtime::Table table;
+    ibex::runtime::ValidityBitmap tv(2, true);
+    tv.set(1, false);
+    table.add_column("ts",
+                     ibex::Column<ibex::Timestamp>{ibex::Timestamp{100}, ibex::Timestamp{0}}, tv);
+    table.set_properties(ibex::runtime::TableProperties::recovered(std::nullopt, "ts", {}));
+
+    auto imported = import_with_claim(std::move(table));
+    REQUIRE_FALSE(imported.has_value());
+    CHECK(imported.error().find("null at row 1") != std::string::npos);
+}
+
+TEST_CASE("Arrow import rejects an ordering the rows do not have",
+          "[interop][arrow][claims]") {
+    ibex::runtime::Table table;
+    table.add_column("k", ibex::Column<std::int64_t>{3, 1, 2});
+    table.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ibex::ir::OrderKey>{{"k", true}}, std::nullopt, {}));
+
+    auto imported = import_with_claim(std::move(table));
+    REQUIRE_FALSE(imported.has_value());
+    CHECK(imported.error().find("ordering") != std::string::npos);
+}
+
+TEST_CASE("Arrow import accepts an ordering the rows do have", "[interop][arrow][claims]") {
+    // Including the multi-key case, where the second key only decides the pairs
+    // the first leaves tied.
+    ibex::runtime::Table table;
+    table.add_column("a", ibex::Column<std::int64_t>{1, 1, 2});
+    table.add_column("b", ibex::Column<std::int64_t>{9, 4, 7});
+    table.set_properties(ibex::runtime::TableProperties::recovered(
+        std::vector<ibex::ir::OrderKey>{{"a", true}, {"b", false}}, std::nullopt, {}));
+
+    auto imported = import_with_claim(std::move(table));
+    REQUIRE(imported.has_value());
+    REQUIRE(imported->ordering().has_value());
+    CHECK((*imported->ordering())[0].name == "a");
+}
+
+TEST_CASE("Arrow import puts nulls last when checking a claimed ordering",
+          "[interop][arrow][claims]") {
+    // A null sorts last whichever way the values run, so a trailing null keeps
+    // the claim and a leading one breaks it — even though the null's cell holds
+    // the zero that would look perfectly ascending.
+    auto build = [](bool null_first) {
+        ibex::runtime::Table table;
+        ibex::runtime::ValidityBitmap kv(2, true);
+        kv.set(null_first ? 0 : 1, false);
+        table.add_column("k", ibex::Column<std::int64_t>{0, 0}, kv);
+        table.set_properties(ibex::runtime::TableProperties::recovered(
+            std::vector<ibex::ir::OrderKey>{{"k", true}}, std::nullopt, {}));
+        return table;
+    };
+    CHECK(import_with_claim(build(false)).has_value());
+    CHECK_FALSE(import_with_claim(build(true)).has_value());
 }

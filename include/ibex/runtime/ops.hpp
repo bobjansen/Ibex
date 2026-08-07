@@ -148,38 +148,44 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto inner_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<ir::JoinKey>& keys,
                               const ir::JoinSuffixPolicy& suffix = {},
-                              ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                              ir::NullMatch null_match = ir::NullMatch::Never,
+
+                              const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto left_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<ir::JoinKey>& keys,
                              const ir::JoinSuffixPolicy& suffix = {},
-                             ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                             ir::NullMatch null_match = ir::NullMatch::Never,
+
+                             const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto right_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<ir::JoinKey>& keys,
                               const ir::JoinSuffixPolicy& suffix = {},
-                              ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                              ir::NullMatch null_match = ir::NullMatch::Never,
+
+                              const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto outer_join(const runtime::Table& left, const runtime::Table& right,
                               const std::vector<ir::JoinKey>& keys,
                               const ir::JoinSuffixPolicy& suffix = {},
-                              ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                              ir::NullMatch null_match = ir::NullMatch::Never,
+
+                              const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto semi_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<ir::JoinKey>& keys,
                              const ir::JoinSuffixPolicy& suffix = {},
-                             ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                             ir::NullMatch null_match = ir::NullMatch::Never,
+
+                             const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto anti_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<ir::JoinKey>& keys,
                              const ir::JoinSuffixPolicy& suffix = {},
-                             ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                             ir::NullMatch null_match = ir::NullMatch::Never,
+
+                             const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto cross_join(const runtime::Table& left, const runtime::Table& right,
                               const ir::JoinSuffixPolicy& suffix = {}) -> runtime::Table;
@@ -187,15 +193,17 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto asof_join(const runtime::Table& left, const runtime::Table& right,
                              const std::vector<ir::JoinKey>& keys,
                              const ir::JoinSuffixPolicy& suffix = {},
-                             ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                             ir::NullMatch null_match = ir::NullMatch::Never,
+
+                             const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 [[nodiscard]] auto join_with_predicate(const runtime::Table& left, const runtime::Table& right,
                                        ir::JoinKind kind, const std::vector<ir::JoinKey>& keys,
                                        const ir::Expr& predicate,
                                        const ir::JoinSuffixPolicy& suffix = {},
-                                       ir::NullMatch null_match = ir::NullMatch::Never)
-    -> runtime::Table;
+                                       ir::NullMatch null_match = ir::NullMatch::Never,
+
+                                       const ir::JoinExpect& expect = {}) -> runtime::Table;
 
 void print(const runtime::Table& t, std::ostream& out = std::cout);
 

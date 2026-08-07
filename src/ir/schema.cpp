@@ -393,10 +393,18 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
             keep_left();
             return;
         case JoinKind::Inner:
-            if (right.is_unique_within(right_join_key_names(join.keys()))) {
+            // A proof, or a declaration the executor is about to check. The
+            // two are interchangeable here: `expect n:1` says each left row
+            // matches at most one right row, which is exactly what makes a
+            // left-side unique key still unique in the output — and a run whose
+            // data disagrees fails instead of producing rows this describes
+            // wrongly. Same standing as an ascription.
+            if (join.expect().right_at_most_one() ||
+                right.is_unique_within(right_join_key_names(join.keys()))) {
                 keep_left();
             }
-            if (left.is_unique_within(left_join_key_names(join.keys()))) {
+            if (join.expect().left_at_most_one() ||
+                left.is_unique_within(left_join_key_names(join.keys()))) {
                 keep_right();
             }
             return;

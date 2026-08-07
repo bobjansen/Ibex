@@ -8470,7 +8470,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const bool streamable_semi_anti =
             (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
             !join.predicate().has_value() && join.keys().size() == 1 &&
-            join.null_match() == ir::NullMatch::Never;
+            join.null_match() == ir::NullMatch::Never && !join.expect().asserts_anything();
         if (streamable_semi_anti) {
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
@@ -8498,7 +8498,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         const bool streamable_inner = join.kind() == ir::JoinKind::Inner &&
                                       !join.predicate().has_value() &&
                                       join.keys().size() == 1 &&
-                                      join.null_match() == ir::NullMatch::Never;
+                                      join.null_match() == ir::NullMatch::Never &&
+                                      !join.expect().asserts_anything();
         if (streamable_inner) {
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
@@ -8534,7 +8535,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
                                        compute_mask, join.suffix(), join.pending_order(),
-                                       join.null_match());
+                                       join.null_match(), join.expect());
             });
     }
 

@@ -450,6 +450,7 @@ h3 {
 /* ── Code blocks ─────────────────────────────────────────────────────────── */
 
 pre {
+  position: relative;
   background: #1d2427;
   color: #f5f0e8;
   border-radius: 12px;
@@ -466,6 +467,30 @@ code {
 
 pre code {
   font-size: inherit;
+}
+
+.copy-code {
+  position: absolute;
+  top: 0.55rem;
+  right: 0.55rem;
+  border: 1px solid rgba(245, 240, 232, 0.35);
+  border-radius: 6px;
+  padding: 0.2rem 0.45rem;
+  background: rgba(29, 36, 39, 0.88);
+  color: #f5f0e8;
+  cursor: pointer;
+  font: 600 0.72rem/1 "Space Grotesk", sans-serif;
+}
+
+.copy-code:hover,
+.copy-code:focus-visible {
+  border-color: #86cec9;
+  color: #86cec9;
+}
+
+.copy-code.copied {
+  border-color: #86cec9;
+  color: #86cec9;
 }
 
 /* Ibex syntax colouring inside <pre> blocks */

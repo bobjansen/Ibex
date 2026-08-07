@@ -9,6 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
 </head>
 <body>
 <main class="page">
@@ -304,7 +305,7 @@ result &lt;- collect(query)</code></pre>
           <tr><td><code>rename { <em>map</em> }</code></td><td>Relabel columns without touching data</td></tr>
           <tr><td><code>distinct { <em>keys</em> }</code></td><td>Deduplicate on one or more columns</td></tr>
           <tr><td><code>head <em>n</em></code> / <code>tail <em>n</em></code></td><td>Keep the first / last n rows (per group with <code>by</code>)</td></tr>
-          <tr><td><code><em>a</em> join <em>b</em> on <em>key</em></code></td><td>Inner / left / right / outer / semi / anti / cross / as-of joins; pair different names with <code>on { left_id = right_id }</code>. Semi and anti joins return the left columns only; other kinds append the right columns. A name held by both inputs is an error unless the join carries <code><em>suffix</em> { "_left", "_right" }</code>, which renames both sides of each clash; an empty string leaves that side alone. Same-name keys fold into one column and never clash. A null key matches nothing by default, not even another null, matching the three-valued rule <code>filter</code> uses; <code><em>nulls equal</em></code> after the keys makes nulls match nulls and only nulls</td></tr>
+          <tr><td><code><em>a</em> join <em>b</em> on <em>key</em></code></td><td>Inner / left / right / outer / semi / anti / cross / as-of joins; pair different names with <code>on { left_id = right_id }</code>. Semi and anti joins return the left columns only; other kinds append the right columns. A name held by both inputs is an error unless the join carries <code><em>suffix</em> { "_left", "_right" }</code>, which renames both sides of each clash; an empty string leaves that side alone. Same-name keys fold into one column and never clash. A null key matches nothing by default, not even another null, matching the three-valued rule <code>filter</code> uses; <code><em>nulls equal</em></code> after the keys makes nulls match nulls and only nulls. <code><em>expect</em> n:1</code> declares how the rows line up (many left rows per right row, one right row per left row) and fails the run when the data disagrees</td></tr>
           <tr><td><code>window <em>duration</em></code></td><td>Lookback window for rolling aggregates on a <code>TimeFrame</code> (e.g. <code>window 5m</code>)</td></tr>
           <tr><td><code>resample <em>duration</em></code></td><td>Bucket a <code>TimeFrame</code> into fixed time intervals, then aggregate per bucket (e.g. 1m OHLC)</td></tr>
         </tbody>

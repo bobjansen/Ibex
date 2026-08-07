@@ -9,6 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
 </head>
 <body>
 <main class="page">
@@ -384,7 +385,12 @@ let raw = read_csv("examples/measurements.txt", "", ";", false)
           </p>
         </div>
         <div class="tour-code">
-<pre><code><span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
+<pre><code><span class="kw">let</span> trades = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>],
+    price  = [<span class="num">150.0</span>, <span class="num">155.0</span>, <span class="num">140.0</span>],
+    fee    = [<span class="num">1.0</span>, <span class="num">1.5</span>, <span class="num">2.0</span>]
+};
+<span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
 
 trades[<span class="kw">select</span> {
     symbol,
@@ -392,6 +398,11 @@ trades[<span class="kw">select</span> {
 }, <span class="kw">by</span> symbol];
 
 <span class="kw">let</span> price_cols = [<span class="str">"ask_price"</span>, <span class="str">"bid_price"</span>, <span class="str">"wap"</span>];
+<span class="kw">let</span> book = Table {
+    ask_price = [<span class="num">101.0</span>, <span class="num">103.0</span>],
+    bid_price = [<span class="num">99.0</span>, <span class="num">100.0</span>],
+    wap       = [<span class="num">100.0</span>, <span class="num">101.5</span>]
+};
 
 book[<span class="kw">update</span> {
     <span class="kw">map</span> (i, a) <span class="kw">in</span> price_cols, (j, b) <span class="kw">in</span> price_cols
@@ -858,6 +869,19 @@ employee[
             The clause governs equality keys, so it is an error on a join that
             has none &mdash; a <code>cross join</code>, or one whose
             <code>on</code> is a bare predicate.
+          </p>
+          <p>
+            A join can also state how its rows are expected to line up, and
+            have the executor check it:
+            <code>orders join customers on cust_id <em>expect</em> n:1</code>.
+            The left term is how many left rows may match one right row, the
+            right term how many right rows may match one left row &mdash; so
+            <code>n:1</code> reads &ldquo;many orders, one customer&rdquo;. It
+            is checked against the pairs actually emitted, so the same rule
+            covers every join kind, and an unmatched row can never break it.
+            Because it is checked rather than assumed, the optimizer may rely on
+            it: <code>expect n:1</code> keeps a left-side uniqueness proof valid
+            in the output, which a join could not otherwise conclude.
           </p>
           <p>
             This is deliberately not a rename rule. Renaming an overlap between

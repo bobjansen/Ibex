@@ -1770,14 +1770,13 @@ auto file_descriptor(std::FILE* stream) -> int {
 /// Runs `source` with planner reporting on; returns what the REPL wrote to stderr.
 /// The `planner:` line there is what bench_ibex.py reads to record which engine
 /// path each query measured, so its shape is a contract, not just a log line.
-auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry& registry)
-    -> std::string {
+auto capture_planner_line(std::string_view source, ibex::runtime::ExternRegistry& registry,
+                          ibex::repl::ReplConfig config = {}) -> std::string {
     // Per-pid: catch_discover_tests gives each TEST_CASE its own process, and
     // ctest -j runs them concurrently -- a fixed name would let two captures
     // clobber each other's file.
     const auto path = std::filesystem::temp_directory_path() /
                       ("ibex_planner_capture_" + std::to_string(current_process_id()) + ".txt");
-    ibex::repl::ReplConfig config;
     config.report_planner = true;
     config.persistent_history = false;
 
@@ -1853,6 +1852,49 @@ read_fake()[select { c = count() }];
         CHECK(capture_planner_line(source, registry) ==
               "planner: statements (`let n` has a non-DataFrame type annotation)");
     }
+}
+
+TEST_CASE("REPL plans a script that imports as one block", "[repl][lazy][planner]") {
+    // An `import` used to send the whole script to the statement-at-a-time
+    // path, which runs no optimizer at all -- so `import "csv"` silently cost
+    // canonicalize and every pass after it. The stub's declarations are now a
+    // prelude to the same plan.
+    std::vector<std::vector<std::string>> decode_calls;
+    ibex::runtime::ExternRegistry registry;
+    register_recording_lazy_source(registry, decode_calls);
+
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("ibex_import_planner_" + std::to_string(current_process_id()));
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream stub{dir / "fakelib.ibex"};
+        stub << "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n";
+    }
+
+    const std::string source = R"(
+import "fakelib";
+read_fake()[select { n = count() }];
+)";
+    ibex::repl::ReplConfig config;
+    config.import_search_paths = {dir.string()};
+    config.plugin_search_paths = {dir.string()};
+    CHECK(capture_planner_line(source, registry, config) == "planner: whole-script");
+
+    // A stub is read for declarations only, so anything else in one has to send
+    // the script back to the path that executes it.
+    {
+        std::ofstream stub{dir / "fnlib.ibex"};
+        stub << "extern fn read_fake() -> DataFrame from \"fake.hpp\";\n"
+             << "fn double_it(x: Int) -> Int {\n  x * 2;\n}\n";
+    }
+    const std::string with_fn = R"(
+import "fnlib";
+read_fake()[select { n = count() }];
+)";
+    CHECK(capture_planner_line(with_fn, registry, config) ==
+          "planner: statements (import stub declares a function)");
+
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("REPL shared bindings keep their schema for scalar() decorrelation",

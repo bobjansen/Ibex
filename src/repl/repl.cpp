@@ -4315,9 +4315,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     };
 
     for (const auto& stmt : program.statements) {
-        if (std::holds_alternative<parser::ImportDecl>(stmt)) {
-            return decline("script uses `import`");
-        }
         if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
             return decline("script declares a function");
         }
@@ -4333,8 +4330,69 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     }
 
     robin_hood::unordered_set<std::string> loaded_plugins;
-    std::set<std::string> lazy_callees;
+
+    // An `import` names a stub of declarations. Resolving it here rather than
+    // declining is what lets a script that reads a CSV be planned as one block:
+    // the statement-at-a-time path it used to fall back to runs no optimizer at
+    // all, so `import "csv"` quietly cost the whole script canonicalize and
+    // every pass after it.
+    //
+    // The stubs stay owned here and are handed to lowering as a prelude. A
+    // `Stmt` owns move-only expressions, so they cannot be copied into one
+    // combined program, and moving them would take them out of a `const`
+    // program that is not ours.
+    std::vector<parser::Program> imported_units;
+    std::vector<const parser::Program*> prelude;
     for (const auto& stmt : program.statements) {
+        const auto* imp = std::get_if<parser::ImportDecl>(&stmt);
+        if (imp == nullptr) {
+            continue;
+        }
+        const auto loaded =
+            try_load_plugin(imp->name, config.plugin_search_paths, loaded_plugins, externs);
+        if (loaded.status == PluginLoadStatus::LoadError) {
+            fmt::print("warning: {}\n", loaded.message);
+        }
+        const auto& primary_paths = config.import_search_paths.empty()
+                                        ? config.plugin_search_paths
+                                        : config.import_search_paths;
+        auto source = find_library_source(imp->name, primary_paths);
+        if (!source.has_value() && !config.import_search_paths.empty()) {
+            source = find_library_source(imp->name, config.plugin_search_paths);
+        }
+        if (!source.has_value()) {
+            // Let the statement path report it, so the diagnostic is written
+            // once and says the same thing whichever planner ran.
+            return decline("import could not be resolved");
+        }
+        auto parsed = parser::parse(*source);
+        if (!parsed) {
+            return decline("import stub failed to parse");
+        }
+        // Only declarations are read from a prelude, so a stub that does
+        // anything else would silently lose it.
+        for (const auto& imported : parsed->statements) {
+            if (!std::holds_alternative<parser::ExternDecl>(imported) &&
+                !std::holds_alternative<parser::FunctionDecl>(imported)) {
+                return decline("import stub has statements beyond declarations");
+            }
+            if (std::holds_alternative<parser::FunctionDecl>(imported)) {
+                return decline("import stub declares a function");
+            }
+        }
+        imported_units.push_back(std::move(*parsed));
+        prelude.push_back(&imported_units.back());
+    }
+    // `imported_units` must not reallocate after `prelude` points into it.
+    prelude.clear();
+    prelude.reserve(imported_units.size());
+    for (const auto& unit : imported_units) {
+        prelude.push_back(&unit);
+    }
+
+    std::set<std::string> lazy_callees;
+    const auto scan_externs = [&](const parser::Program& unit) -> bool {
+    for (const auto& stmt : unit.statements) {
         const auto* decl = std::get_if<parser::ExternDecl>(&stmt);
         if (decl == nullptr) {
             continue;
@@ -4352,6 +4410,16 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             function != nullptr && function->lazy_table_func) {
             lazy_callees.insert(decl->name);
         }
+    }
+        return true;
+    };
+    for (const auto* unit : prelude) {
+        if (!scan_externs(*unit)) {
+            return false;
+        }
+    }
+    if (!scan_externs(program)) {
+        return false;
     }
     if (lazy_callees.empty()) {
         return decline("script has no lazy table sources to plan against");
@@ -4372,7 +4440,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     // Lower once to discover which readers are called with which arguments, ask
     // each for its schema, then lower for real with the answers.
     ir::SourceSchemas reader_schemas;
-    if (auto probe = parser::lower_script(program); probe.has_value()) {
+    if (auto probe = parser::lower_script(program, {}, prelude); probe.has_value()) {
         std::vector<ir::NodePtr> probe_plans;
         probe_plans.push_back(std::move(probe->result));
         for (auto& shared : probe->shared_bindings) {
@@ -4408,7 +4476,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
     }
 
-    auto script = parser::lower_script(program, reader_schemas);
+    auto script = parser::lower_script(program, reader_schemas, prelude);
     if (!script.has_value()) {
         return decline(fmt::format("script did not lower: {}", script.error().message));
     }

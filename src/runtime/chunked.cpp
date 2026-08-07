@@ -2833,6 +2833,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         left_swapped_ = std::move(*left_res);
         swapped_ = true;
 
+        const auto* rentry = right_.find_entry(keys_->front().right);
+        const ValidityBitmap* rvalidity =
+            rentry != nullptr && rentry->validity.has_value() ? &*rentry->validity : nullptr;
+        const auto rnull = [rvalidity](std::size_t row) {
+            return rvalidity != nullptr && !(*rvalidity)[row];
+        };
         const ColumnValue* lkey = left_swapped_->find(keys_->front().left);
         const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
         if (lcol != nullptr && lcol->size() < rcol.size()) {
@@ -2842,8 +2848,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             for (const std::int64_t v : *lcol) {
                 seen.try_emplace(v, char{0});
             }
-            for (const std::int64_t v : rcol) {
-                if (auto it = seen.find(v); it != seen.end()) {
+            for (std::size_t i = 0; i < rcol.size(); ++i) {
+                if (rnull(i)) {
+                    continue;  // a null right key puts nothing in the set
+                }
+                if (auto it = seen.find(rcol[i]); it != seen.end()) {
                     it->second = char{1};
                 }
             }
@@ -2856,8 +2865,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             // Left is not the smaller side (or its key vanished); the plain
             // right set is as good, and the materialized left still emits once.
             right_i64_.reserve(rcol.size());
-            for (const std::int64_t v : rcol) {
-                right_i64_.insert(v);
+            for (std::size_t i = 0; i < rcol.size(); ++i) {
+                if (!rnull(i)) {
+                    right_i64_.insert(rcol[i]);
+                }
             }
         }
         return std::nullopt;
@@ -2874,42 +2885,62 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         if (key == nullptr) {
             return "join key not found in right table: " + keys_->front().right;
         }
+        // The other half of "a null matches nothing": a null-keyed right row is
+        // never put in the set, so nothing can find it. Skipping it on the probe
+        // side alone would still let a null here be found by a genuine zero.
+        const auto* right_entry = right_.find_entry(keys_->front().right);
+        const ValidityBitmap* build_validity =
+            right_entry != nullptr && right_entry->validity.has_value() ? &*right_entry->validity
+                                                                       : nullptr;
+        const auto build_is_null = [build_validity](std::size_t row) {
+            return build_validity != nullptr && !(*build_validity)[row];
+        };
 
         if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
             right_kind_ = ExprType::Int;
             if (col->size() > kSemiSwapThreshold) {
                 return init_int_swapped(*col);
             }
-            for (const std::int64_t row : *col) {
-                right_i64_.insert(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (!build_is_null(i)) {
+                    right_i64_.insert((*col)[i]);
+                }
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<double>>(key)) {
             right_kind_ = ExprType::Double;
-            for (const double row : *col) {
-                right_f64_.insert(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (!build_is_null(i)) {
+                    right_f64_.insert((*col)[i]);
+                }
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<bool>>(key)) {
             right_kind_ = ExprType::Bool;
-            for (const bool row : *col) {
-                right_bool_.insert(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (!build_is_null(i)) {
+                    right_bool_.insert((*col)[i]);
+                }
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<Date>>(key)) {
             right_kind_ = ExprType::Date;
-            for (auto row : *col) {
-                right_date_.insert(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (!build_is_null(i)) {
+                    right_date_.insert((*col)[i]);
+                }
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<Timestamp>>(key)) {
             right_kind_ = ExprType::Timestamp;
-            for (auto row : *col) {
-                right_timestamp_.insert(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (!build_is_null(i)) {
+                    right_timestamp_.insert((*col)[i]);
+                }
             }
             return std::nullopt;
         }
@@ -2917,14 +2948,19 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             right_kind_ = ExprType::String;
             right_cat_dictionary_id_ = static_cast<const void*>(col->dictionary_ptr().get());
             for (std::size_t row = 0; row < col->size(); ++row) {
-                right_cat_codes_.insert(col->code_at(row));
+                if (!build_is_null(row)) {
+                    right_cat_codes_.insert(col->code_at(row));
+                }
             }
             return std::nullopt;
         }
         if (const auto* col = std::get_if<Column<std::string>>(key)) {
             right_kind_ = ExprType::String;
-            for (auto row : *col) {
-                owned_strings_.emplace_back(row);
+            for (std::size_t i = 0; i < col->size(); ++i) {
+                if (build_is_null(i)) {
+                    continue;
+                }
+                owned_strings_.emplace_back((*col)[i]);
                 right_strings_.insert(std::string_view{owned_strings_.back()});
             }
             return std::nullopt;
@@ -2957,6 +2993,18 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return std::nullopt;
         }
         const bool keep_matches = (kind_ == ir::JoinKind::Semi);
+        // A null key matches nothing, not even another null. The set below is
+        // keyed by VALUE and a null cell holds its type's zero, so without this
+        // a null-keyed row matches a genuine zero on the other side -- keeping
+        // rows a semi join should drop and dropping rows an anti join should
+        // keep.
+        const auto* probe_entry = t.find_entry(keys_->front().left);
+        const ValidityBitmap* probe_validity =
+            probe_entry != nullptr && probe_entry->validity.has_value() ? &*probe_entry->validity
+                                                                       : nullptr;
+        const auto probe_is_null = [probe_validity](std::size_t row) {
+            return probe_validity != nullptr && !(*probe_validity)[row];
+        };
 
         if (right_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(key);
@@ -2964,7 +3012,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_i64_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_i64_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }
@@ -2974,7 +3022,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_f64_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_f64_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }
@@ -2984,7 +3032,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_bool_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_bool_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }
@@ -2994,7 +3042,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_date_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_date_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }
@@ -3004,7 +3052,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_timestamp_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_timestamp_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }
@@ -3013,7 +3061,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             col != nullptr &&
             static_cast<const void*>(col->dictionary_ptr().get()) == right_cat_dictionary_id_) {
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_cat_codes_.contains(col->code_at(row));
+                const bool match = !probe_is_null(row) && right_cat_codes_.contains(col->code_at(row));
                 return keep_matches ? match : !match;
             });
         }
@@ -3037,7 +3085,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
         if (const auto* col = std::get_if<Column<std::string>>(key)) {
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = right_strings_.contains((*col)[row]);
+                const bool match = !probe_is_null(row) && right_strings_.contains((*col)[row]);
                 return keep_matches ? match : !match;
             });
         }

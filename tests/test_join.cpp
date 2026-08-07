@@ -1766,3 +1766,64 @@ TEST_CASE("join: the answer is the same whichever side is indexed", "[join][orde
     CHECK(col_i64(hinted, "lval") == col_i64(plain, "lval"));
     CHECK(col_i64(hinted, "rval") == col_i64(plain, "rval"));
 }
+
+// ── Source nulls survive the join ─────────────────────────────────────────
+
+TEST_CASE("join: a null in a left column stays null through the join", "[join]") {
+    // The materialized join gathered its columns without their validity, so a
+    // null came out as the type's zero. A zero was chosen for `v` deliberately
+    // elsewhere in these tests; here the point is that `null` and `0` must not
+    // become the same value just because the rows were rearranged.
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("g", Column<std::int64_t>{1, 1, 1});
+    runtime::ValidityBitmap lv(3, true);
+    lv.set(1, false);
+    lhs.add_column("v", Column<std::int64_t>{7, 0, 9}, lv);
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    rhs.add_column("g", Column<std::int64_t>{1, 1, 1});
+    rhs.add_column("w", Column<std::int64_t>{10, 20, 30});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // Two keys, so this is not one of the streamable single-key shapes and
+    // takes the materialized join.
+    auto out = interpret_expr("lhs join rhs on { id, g };", tables);
+    REQUIRE(out.rows() == 3);
+    const auto* entry = out.find_entry("v");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0]);
+    CHECK_FALSE((*entry->validity)[1]);
+    CHECK((*entry->validity)[2]);
+}
+
+TEST_CASE("join: a null in a right column stays null through the join", "[join]") {
+    runtime::Table lhs;
+    lhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    lhs.add_column("g", Column<std::int64_t>{1, 1, 1});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{1, 2, 3});
+    rhs.add_column("g", Column<std::int64_t>{1, 1, 1});
+    runtime::ValidityBitmap rv(3, true);
+    rv.set(2, false);
+    rhs.add_column("w", Column<std::int64_t>{10, 20, 0}, rv);
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs join rhs on { id, g };", tables);
+    REQUIRE(out.rows() == 3);
+    const auto* entry = out.find_entry("w");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+    CHECK((*entry->validity)[0]);
+    CHECK((*entry->validity)[1]);
+    CHECK_FALSE((*entry->validity)[2]);
+}

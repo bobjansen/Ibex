@@ -151,9 +151,10 @@ class Builder {
 
     [[nodiscard]] auto join(JoinKind kind, std::vector<JoinKey> keys,
                             std::optional<Expr> predicate = std::nullopt,
-                            JoinSuffixPolicy suffix = {}) -> NodePtr {
+                            JoinSuffixPolicy suffix = {},
+                            NullMatch null_match = NullMatch::Never) -> NodePtr {
         return std::make_unique<JoinNode>(next_id(), kind, std::move(keys), std::move(predicate),
-                                          std::move(suffix));
+                                          std::move(suffix), null_match);
     }
 
     [[nodiscard]] auto construct(std::vector<ConstructColumn> columns) -> NodePtr {

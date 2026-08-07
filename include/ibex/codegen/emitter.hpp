@@ -76,7 +76,8 @@ class Emitter {
     /// Emit the trailing `, ibex::ir::JoinSuffixPolicy{...}` argument for a
     /// join, or nothing when the join carries no clause. Dropping it would let
     /// a transpiled program reject a collision the interpreter resolves.
-    static auto emit_join_suffix(const ir::JoinSuffixPolicy& suffix) -> std::string;
+    static auto emit_join_suffix(const ir::JoinSuffixPolicy& suffix,
+                                 ir::NullMatch null_match = ir::NullMatch::Never) -> std::string;
 
     /// Emit an Expr expression builder call (inline).
     auto emit_expr(const ir::Expr& expr) -> std::string;

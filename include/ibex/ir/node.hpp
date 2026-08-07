@@ -283,6 +283,25 @@ enum class JoinKind : std::uint8_t {
     Asof,
 };
 
+/// Whether a null equijoin key can match another null (`nulls equal`).
+///
+/// `Never` is the default because it is what the rest of the language does:
+/// `filter x == y` does not match a null to a null, and a join that quietly
+/// did would be inconsistent in a way nothing in the query says out loud.
+///
+/// The policy governs equijoin keys only. A theta comparison in a join
+/// predicate keeps ordinary three-valued semantics under either setting --
+/// `nulls equal` is a statement about key identity, not a redefinition of
+/// `==`.
+enum class NullMatch : std::uint8_t {
+    /// A null key matches nothing, not even another null.
+    Never,
+    /// A null key matches exactly the nulls on the other side. For a composite
+    /// key every component must match under this same rule, so one null
+    /// component pairs only with a null in that component.
+    Equal,
+};
+
 /// A pair of input column names used by an equijoin. A single-name surface key
 /// is represented by equal `left` and `right` names.
 struct JoinKey {
@@ -717,12 +736,14 @@ class ExternCallNode final : public Node {
 class JoinNode final : public Node {
    public:
     JoinNode(NodeId id, JoinKind kind, std::vector<JoinKey> keys,
-             std::optional<Expr> predicate = std::nullopt, JoinSuffixPolicy suffix = {})
+             std::optional<Expr> predicate = std::nullopt, JoinSuffixPolicy suffix = {},
+             NullMatch null_match = NullMatch::Never)
         : Node(NodeKind::Join, id),
           kind_(kind),
           keys_(std::move(keys)),
           predicate_(std::move(predicate)),
-          suffix_(std::move(suffix)) {}
+          suffix_(std::move(suffix)),
+          null_match_(null_match) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
@@ -730,6 +751,7 @@ class JoinNode final : public Node {
         return predicate_;
     }
     [[nodiscard]] auto suffix() const noexcept -> const JoinSuffixPolicy& { return suffix_; }
+    [[nodiscard]] auto null_match() const noexcept -> NullMatch { return null_match_; }
 
     /// Keys an `order` directly above this join asks for, in the join's own
     /// output names. Empty when the plan has no such `order`.
@@ -753,6 +775,7 @@ class JoinNode final : public Node {
     std::vector<JoinKey> keys_;
     std::optional<Expr> predicate_;
     JoinSuffixPolicy suffix_;
+    NullMatch null_match_ = NullMatch::Never;
     std::vector<OrderKey> pending_order_;
 };
 

@@ -840,6 +840,21 @@ employee[
             emit no right columns at all.
           </p>
           <p>
+            A <strong>null key matches nothing</strong> &mdash; not even another
+            null. That is the same three-valued rule
+            <code>filter x == y</code> follows, and deliberately unlike
+            <code>by</code>, where nulls do group together. Add
+            <code>nulls equal</code> after the keys to ask for the other
+            behaviour: a null then matches exactly the nulls on the other side,
+            and never a present value &mdash; not even the zero the null&rsquo;s
+            cell physically holds. For a composite key every component follows
+            the same rule, so <code>(1,&nbsp;null)</code> pairs with
+            <code>(1,&nbsp;null)</code> and not with <code>(1,&nbsp;0)</code>.
+            The clause governs equality keys, so it is an error on a join that
+            has none &mdash; a <code>cross join</code>, or one whose
+            <code>on</code> is a bare predicate.
+          </p>
+          <p>
             This is deliberately not a rename rule. Renaming an overlap between
             two snapshots of the same table and catching an accidental overlap
             between unrelated tables want opposite handling, so the first asks
@@ -895,6 +910,12 @@ employee[
 <span class="cm">// An empty side keeps its own names; only the right is renamed</span>
 <span class="kw">let</span> annotated = prices <span class="kw">join</span> prices_adj <span class="kw">on</span> symbol
     <span class="kw">suffix</span> { <span class="str">""</span>, <span class="str">"_adj"</span> };
+
+<span class="cm">// nulls equal — a null key matches the nulls, and only those.</span>
+<span class="cm">// `with_meta` above has a null `sector` wherever the lookup missed,</span>
+<span class="cm">// so by default those rows pair with nothing when joined back on it.</span>
+<span class="kw">let</span> peers  = with_meta[<span class="kw">select</span> { sector, peer = symbol }];
+<span class="kw">let</span> paired = with_meta <span class="kw">join</span> peers <span class="kw">on</span> sector <span class="kw">nulls</span> equal;
 
 <span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
 <span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);
@@ -986,6 +1007,13 @@ supply[
             plus <code>std</code> on fewer than 2 non-null values,
             <code>skew</code> on fewer than 3, <code>kurtosis</code> on
             fewer than 4. Only <code>count</code> never returns null.
+          </p>
+          <p>
+            A null is never equal to anything, itself included, so a null
+            <strong>join key</strong> matches no row by default; a
+            <code>by</code> key is the deliberate exception, grouping nulls
+            together. A join can opt into the grouping behaviour for its keys
+            with <code>nulls equal</code>.
           </p>
           <p>
             Floating-point <code>NaN</code> and <code>Inf</code> values are

@@ -575,6 +575,32 @@ class Parser {
                 }
                 suffix = std::move(*parsed_suffix);
             }
+            // `nulls equal` trails the suffix clause. It governs equijoin keys,
+            // so a join that has none is told rather than silently handed a
+            // clause that does nothing.
+            std::optional<JoinNullMatch> null_match;
+            // `nulls` is matched contextually, not reserved: the shipped
+            // `read_csv(path, nulls: String = "", ...)` names a parameter that,
+            // and a join trailer is the one place the word can appear with this
+            // meaning. Nothing else may follow a key list, so there is no
+            // ambiguity to resolve.
+            if (check(TokenKind::Identifier) && peek().lexeme == "nulls") {
+                advance();
+                auto parsed = parse_join_null_match();
+                if (!parsed.has_value()) {
+                    return nullptr;
+                }
+                if (keys.empty()) {
+                    error_ = make_error(
+                        previous(),
+                        kind == JoinKind::Cross
+                            ? "a cross join has no keys, so `nulls` has nothing to apply to"
+                            : "`nulls` applies to equijoin keys, and this join has none; it does "
+                              "not change how a join predicate compares nulls");
+                    return nullptr;
+                }
+                null_match = *parsed;
+            }
 
             auto join = std::make_unique<Expr>();
             join->node = JoinExpr{
@@ -584,6 +610,7 @@ class Parser {
                 .keys = std::move(keys),
                 .predicate = std::move(predicate),
                 .suffix = std::move(suffix),
+                .null_match = null_match,
             };
             expr = std::move(join);
         }
@@ -878,6 +905,25 @@ class Parser {
             return std::nullopt;
         }
         return JoinSuffix{.left = std::move(left), .right = std::move(right)};
+    }
+
+    /// `nulls equal` / `nulls never`. The setting word is matched as an
+    /// ordinary identifier in this one position rather than reserved, so
+    /// `equal` and `never` stay usable as column and function names.
+    auto parse_join_null_match() -> std::optional<JoinNullMatch> {
+        if (!consume(TokenKind::Identifier, "expected 'equal' or 'never' after 'nulls'")) {
+            return std::nullopt;
+        }
+        const std::string_view setting = previous().lexeme;
+        if (setting == "equal") {
+            return JoinNullMatch::Equal;
+        }
+        if (setting == "never") {
+            return JoinNullMatch::Never;
+        }
+        error_ = make_error(previous(), "expected 'equal' or 'never' after 'nulls', got '" +
+                                            std::string(setting) + "'");
+        return std::nullopt;
     }
 
     auto parse_join_keys() -> std::optional<std::vector<JoinKey>> {

@@ -88,14 +88,25 @@ auto group_rows_csr(const std::vector<std::uint32_t>& row_gid, std::uint32_t n_g
 /// Do two rows carry equal key values? `a` and `b` are the resolved key
 /// columns of the two sides; they may differ in representation (a String
 /// column joins against a Categorical one — both compare as text) but never
-/// in ExprType, which key validation already enforced. Null-keyed rows never
-/// reach this (they match nothing and are skipped before probing), so
-/// validity is not consulted.
+/// in ExprType, which key validation already enforced.
+///
+/// Null-ness is compared before value, and this is not optional even though
+/// under `NullMatch::Never` no null-keyed row reaches here: a null cell carries
+/// its type's zero, so comparing values alone would make a null equal a genuine
+/// zero. Under `Equal` that is exactly the pair that must NOT match, while two
+/// nulls must — which is the same rule stated once, for both.
 auto key_rows_equal(const std::vector<KeyCol>& a, std::size_t ra, const std::vector<KeyCol>& b,
                     std::size_t rb) -> bool {
     for (std::size_t i = 0; i < a.size(); ++i) {
         const KeyCol& ca = a[i];
         const KeyCol& cb = b[i];
+        const bool a_null = ca.is_null(ra);
+        if (a_null != cb.is_null(rb)) {
+            return false;
+        }
+        if (a_null) {
+            continue;  // both null in this component: equal, and no value to read
+        }
         switch (ca.kind) {
             case KeyCol::Kind::Int64:
                 if (ca.i64[ra] != cb.i64[rb]) {
@@ -440,7 +451,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
                      const ir::JoinSuffixPolicy& suffix,
-                     const std::vector<ir::OrderKey>& pending_order)
+                     const std::vector<ir::OrderKey>& pending_order, ir::NullMatch null_match)
     -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
@@ -547,6 +558,12 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
         return false;
     };
+    // Under `Never` a null-keyed row is kept out of the index and never looked
+    // up -- the pair of half-measures that makes it match nothing. Under
+    // `Equal` it takes part like any other key, and the null-aware hashing and
+    // equality below pair it with the nulls on the other side and nothing else.
+    const bool skip_null_keys = null_match == ir::NullMatch::Never;
+
     robin_hood::unordered_set<std::string> left_key_set;
     for (const auto& key : keys) {
         left_key_set.insert(key.left);
@@ -777,6 +794,11 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         if (right_out.empty()) {
             // semi/anti — no right columns to emit.
         } else {
+            bool has_right_nulls = false;
+            for (std::size_t i = 0; i < total && !has_right_nulls; ++i) {
+                has_right_nulls = (right_idx[i] == kNull);
+            }
+
             for (const auto& item : right_out) {
                 auto [col_out, validity] = gather_entry(*item.entry, right_idx.data(), total);
                 output.replace_column(item.out_index, std::move(col_out), std::move(validity));
@@ -1319,10 +1341,30 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // another null. A null-keyed right row is never a candidate, and a
         // null-keyed left row is left unmatched.
         const auto left_eq_is_null = [&](std::size_t l) {
-            return has_null_eq_keys && row_key_is_null(left_eq_validity, l);
+            return has_null_eq_keys && skip_null_keys && row_key_is_null(left_eq_validity, l);
         };
         const auto right_eq_is_null = [&](std::size_t r) {
-            return has_null_eq_keys && row_key_is_null(right_eq_validity, r);
+            return has_null_eq_keys && skip_null_keys && row_key_is_null(right_eq_validity, r);
+        };
+        // `Key` carries one null bit per column, so a null equality key groups
+        // with the nulls rather than with the zero its cell physically holds.
+        // Past 64 columns the bit is dropped and nulls would silently rejoin the
+        // zero group, so that case is refused instead of answered wrongly.
+        if (!skip_null_keys && has_null_eq_keys && left_eq_keys.size() > kMaxKeyColumns) {
+            return std::unexpected(
+                "asof join: `nulls equal` supports at most " + std::to_string(kMaxKeyColumns) +
+                " equality keys");
+        }
+        const auto mark_nulls = [&](Key& key, const std::vector<const ValidityBitmap*>& validity,
+                                    std::size_t row) {
+            if (skip_null_keys) {
+                return;
+            }
+            for (std::size_t i = 0; i < validity.size(); ++i) {
+                if (validity[i] != nullptr && !(*validity[i])[row]) {
+                    key.set_null(i);
+                }
+            }
         };
 
         // Asof keeps every left row exactly once in input order, so the left
@@ -1411,6 +1453,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 for (const auto* col : right_eq_keys) {
                     group.values.push_back(scalar_from_column(*col, r));
                 }
+                mark_nulls(group, right_eq_validity, r);
                 right_groups[group].push_back(r);
             }
 
@@ -1427,6 +1470,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 for (const auto* col : left_eq_keys) {
                     group.values.push_back(scalar_from_column(*col, l));
                 }
+                mark_nulls(group, left_eq_validity, l);
 
                 auto it = right_groups.find(group);
                 if (it == right_groups.end()) {
@@ -1472,10 +1516,12 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     left_cols.reserve(keys.size());
     right_cols.reserve(keys.size());
     for (std::size_t i = 0; i < keys.size(); ++i) {
-        // Null-keyed rows are skipped before hashing (they match nothing), so
-        // the KeyCols carry no validity.
-        auto lc = make_key_col(*left_keys[i], nullptr);
-        auto rc = make_key_col(*right_keys[i], nullptr);
+        // The KeyCols carry validity because under `Equal` a null key is hashed
+        // and compared like any other, and a null cell holds its type's zero --
+        // so without it a null would match a genuine zero. Under `Never` no
+        // null-keyed row reaches the comparison and the pointers go unread.
+        auto lc = make_key_col(*left_keys[i], left_key_validity[i]);
+        auto rc = make_key_col(*right_keys[i], right_key_validity[i]);
         if (!lc.has_value() || !rc.has_value()) {
             return std::unexpected("join: unsupported key column type for " + format_key(keys[i]));
         }
@@ -1492,8 +1538,10 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     RowKeyIndex index;
     index.reserve(n_build);
     std::vector<std::uint32_t> row_gid(n_build, kNoGroup);
+    // `key_rows_equal` and `hash_key_row` tag a null by position rather than
+    // substituting a sentinel, which could collide with real data.
     for (std::size_t i = 0; i < n_build; ++i) {
-        if (has_null_keys && row_key_is_null(build_key_validity, i)) {
+        if (has_null_keys && skip_null_keys && row_key_is_null(build_key_validity, i)) {
             continue;  // never matchable, so never indexed
         }
         row_gid[i] = index.find_or_insert(build_cols, i);
@@ -1501,7 +1549,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     const GroupedRows grouped = group_rows_csr(row_gid, index.size());
 
     auto lookup = [&](std::size_t row) -> std::span<const std::size_t> {
-        if (has_null_keys && row_key_is_null(probe_key_validity, row)) {
+        if (has_null_keys && skip_null_keys && row_key_is_null(probe_key_validity, row)) {
             return {};  // matches nothing, including another null
         }
         const std::uint32_t gid = index.find(probe_cols, row, build_cols);

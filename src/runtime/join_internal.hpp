@@ -36,7 +36,8 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
                                    const ScalarRegistry* scalars,
                                    PredicateMaskEvaluator mask_evaluator,
                                    const ir::JoinSuffixPolicy& suffix = {},
-                                   const std::vector<ir::OrderKey>& pending_order = {})
+                                   const std::vector<ir::OrderKey>& pending_order = {},
+                                   ir::NullMatch null_match = ir::NullMatch::Never)
     -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

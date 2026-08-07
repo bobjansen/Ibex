@@ -844,11 +844,11 @@ expr            = primary
                 | unary_op expr
                 | expr binary_op expr
                 | expr "[" clause_list "]"
-                | expr "join" expr "on" join_keys [ join_suffix ]
-                | expr "left" "join" expr "on" join_keys [ join_suffix ]
-                | expr "right" "join" expr "on" join_keys [ join_suffix ]
-                | expr "outer" "join" expr "on" join_keys [ join_suffix ]
-                | expr "asof" "join" expr "on" join_keys [ join_suffix ]
+                | expr "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
+                | expr "left" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
+                | expr "right" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
+                | expr "outer" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
+                | expr "asof" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
                 | expr "cross" "join" expr [ join_suffix ]
                 | expr "join" expr "on" expr [ join_suffix ]
                 | expr "left" "join" expr "on" expr [ join_suffix ]
@@ -860,6 +860,12 @@ expr            = primary
 (* Collision renaming — Section 5.6. Both suffixes are always named; an empty
    string leaves that side alone, and two empty strings are rejected. *)
 join_suffix     = "suffix" "{" STRING "," STRING "}" ;
+
+(* Null key matching — Section 5.6. Governs equijoin keys, so it is available
+   only on the `on join_keys` forms; on a cross join or a pure predicate join
+   it is an error rather than a clause that does nothing. `nulls`, `equal` and
+   `never` are matched in this position only and are not reserved words. *)
+join_nulls      = "nulls" ( "equal" | "never" ) ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
@@ -2049,6 +2055,33 @@ Renaming is never silent. Earlier versions suffixed a colliding right column
 with `_right`, repeating until the name was free, which meant an accidental
 collision between two unrelated tables was resolved by the same mechanism as a
 deliberate wide-table comparison, and produced names like `val_right_right`.
+
+**Null equality keys.** A null key matches nothing by default — not even
+another null. This is the same three-valued rule the rest of the language uses:
+`filter x == y` does not match a null to a null, and a join that quietly did
+would be inconsistent in a way nothing in the query says out loud. It is
+deliberately unlike `by`, where nulls do group together.
+
+Callers that want the other behaviour ask for it:
+
+```ibex
+old join new on id nulls equal
+```
+
+- `nulls equal` makes a null key match exactly the nulls on the other side. It
+  never matches a present value, including the zero the null's cell physically
+  holds.
+- `nulls never` spells the default out; it changes nothing.
+- For a composite key every component must match under the same rule, so
+  `(1, null)` pairs with `(1, null)` and not with `(1, 0)`.
+- The clause governs equality keys only. A theta comparison in a join predicate
+  keeps ordinary three-valued semantics under either setting — `nulls equal` is
+  a statement about key identity, not a redefinition of `==`.
+- Because it governs equality keys, it is an error on a join that has none: a
+  `cross join`, or a join whose `on` is a bare predicate. The message says so
+  rather than accepting a clause that would do nothing.
+- `nulls`, `equal` and `never` are matched in this position only and remain
+  usable as ordinary identifiers — `read_csv` has a `nulls` parameter.
 
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a

@@ -1868,7 +1868,12 @@ class Lowerer {
                 .present = true, .left = join.suffix->left, .right = join.suffix->right};
         }
 
-        auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix));
+        const ir::NullMatch null_match = join.null_match.has_value() &&
+                                                 *join.null_match == JoinNullMatch::Equal
+                                             ? ir::NullMatch::Equal
+                                             : ir::NullMatch::Never;
+        auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix),
+                                  null_match);
         node->add_child(std::move(left.value()));
         node->add_child(std::move(right.value()));
         return node;
@@ -4666,7 +4671,7 @@ class Lowerer {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
                 clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
-                                      join.suffix());
+                                      join.suffix(), join.null_match());
                 break;
             }
             case ir::NodeKind::Melt: {

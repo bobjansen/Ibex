@@ -62,3 +62,29 @@ iris[head 3] join species_meta[head 3] on Species suffix { "_a", "_b" };
 
 // Semi and anti joins emit no right columns, so nothing can collide and no
 // clause is needed — see the two examples above.
+
+// ── Null keys ─────────────────────────────────────────────────────────────
+// A null key matches nothing by default — not even another null. That is the
+// same rule `filter x == y` follows, and deliberately unlike `by`, where nulls
+// do group together.
+//
+// One row per species, left joined to a lookup that only knows about setosa,
+// so `region` is a real null on the other two rows.
+let species = iris[distinct { Species }][order { Species asc }];
+let regions = Table { Species = ["setosa"], region = ["north"] };
+let with_region = species left join regions on Species;
+print("region is null wherever the lookup missed:");
+with_region;
+
+// The same three rows again, to join back on that nullable column.
+let sites = with_region[select { region, site = Species }];
+
+// By default the two null-keyed rows on each side find nothing, so only the
+// setosa/north pair survives.
+print("default — a null key matches nothing:");
+with_region join sites on region;
+
+// `nulls equal` asks for the other behaviour by name: each null row now pairs
+// with each null row on the other side, and never with a present value.
+print("nulls equal — nulls pair with nulls, and only with nulls:");
+with_region join sites on region nulls equal;

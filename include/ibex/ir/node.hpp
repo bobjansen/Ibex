@@ -302,6 +302,53 @@ enum class NullMatch : std::uint8_t {
     Equal,
 };
 
+/// How many rows of one side may match a single row of the other, as written
+/// in `expect n:1`. `One` is an assertion the executor checks against the rows
+/// it actually emits; `Many` states nothing.
+enum class JoinMultiplicity : std::uint8_t {
+    Many,
+    One,
+};
+
+/// `expect L:R` — L is how many LEFT rows may match one right row, R how many
+/// RIGHT rows may match one left row. So `orders join customers expect n:1`
+/// says each order matches at most one customer, and any number of orders may
+/// share a customer.
+///
+/// It is checked, not assumed, so the optimizer may rely on it: a run whose
+/// data disagrees fails rather than producing a result the proof describes
+/// wrongly. `n:n` asserts nothing and is the default.
+/// No member has a default. A default member initializer silences
+/// `-Wmissing-designated-field-initializers`, so a field that has one can be
+/// left out of an aggregate initializer in complete silence — which is how a
+/// clone of a join came to drop its null-match policy. Without defaults the
+/// compiler names every site that forgets a field, which is the only reason
+/// the next field added will not repeat it. Value-initialize (`JoinExpect{}`)
+/// for the neutral `n:n`; never default-initialize.
+///
+/// There is deliberately no `present` flag: `n:n` asserts nothing, so writing
+/// it and omitting the clause are the same thing, and a separate flag would be
+/// a second way to say so that could disagree with the first.
+struct JoinExpect {
+    JoinMultiplicity left;
+    JoinMultiplicity right;
+
+    /// Each right row matches at most one left row.
+    [[nodiscard]] auto left_at_most_one() const noexcept -> bool {
+        return left == JoinMultiplicity::One;
+    }
+    /// Each left row matches at most one right row.
+    [[nodiscard]] auto right_at_most_one() const noexcept -> bool {
+        return right == JoinMultiplicity::One;
+    }
+    /// Whether anything is claimed at all.
+    [[nodiscard]] auto asserts_anything() const noexcept -> bool {
+        return left_at_most_one() || right_at_most_one();
+    }
+
+    auto operator==(const JoinExpect&) const -> bool = default;
+};
+
 /// A pair of input column names used by an equijoin. A single-name surface key
 /// is represented by equal `left` and `right` names.
 struct JoinKey {
@@ -323,8 +370,9 @@ struct JoinKey {
 /// renames both sides of each collision; an empty string on a side leaves that
 /// side's name alone. Suffixes apply to collisions only, never to every
 /// column.
+/// No member has a default, for the reason given on `JoinExpect`.
 struct JoinSuffixPolicy {
-    bool present = false;
+    bool present;
     std::string left;
     std::string right;
 
@@ -737,13 +785,14 @@ class JoinNode final : public Node {
    public:
     JoinNode(NodeId id, JoinKind kind, std::vector<JoinKey> keys,
              std::optional<Expr> predicate = std::nullopt, JoinSuffixPolicy suffix = {},
-             NullMatch null_match = NullMatch::Never)
+             NullMatch null_match = NullMatch::Never, JoinExpect expect = JoinExpect{})
         : Node(NodeKind::Join, id),
           kind_(kind),
           keys_(std::move(keys)),
           predicate_(std::move(predicate)),
           suffix_(std::move(suffix)),
-          null_match_(null_match) {}
+          null_match_(null_match),
+          expect_(expect) {}
 
     [[nodiscard]] auto kind() const noexcept -> JoinKind { return kind_; }
     [[nodiscard]] auto keys() const noexcept -> const std::vector<JoinKey>& { return keys_; }
@@ -752,6 +801,7 @@ class JoinNode final : public Node {
     }
     [[nodiscard]] auto suffix() const noexcept -> const JoinSuffixPolicy& { return suffix_; }
     [[nodiscard]] auto null_match() const noexcept -> NullMatch { return null_match_; }
+    [[nodiscard]] auto expect() const noexcept -> const JoinExpect& { return expect_; }
 
     /// Keys an `order` directly above this join asks for, in the join's own
     /// output names. Empty when the plan has no such `order`.
@@ -776,6 +826,7 @@ class JoinNode final : public Node {
     std::optional<Expr> predicate_;
     JoinSuffixPolicy suffix_;
     NullMatch null_match_ = NullMatch::Never;
+    JoinExpect expect_{};
     std::vector<OrderKey> pending_order_;
 };
 

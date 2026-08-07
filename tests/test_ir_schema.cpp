@@ -601,3 +601,33 @@ TEST_CASE("check_joins: a join nested below another operator is still checked", 
                                SchemaInfo::known({{.name = "id", .type = ColumnType::String}}));
     REQUIRE(ibex::ir::check_joins(head, sources).has_value());
 }
+
+TEST_CASE("schema: a declared expect carries the proofs a join cannot prove",
+          "[ir][schema]") {
+    // Neither side has a proven unique key here, so inference alone carries
+    // nothing. `expect n:1` says each left row matches at most one right row,
+    // which is exactly what keeps a left-side unique key unique in the output.
+    // The executor checks the declaration, so relying on it cannot describe a
+    // result that was actually produced -- a run whose data disagrees fails.
+    auto sources = two_sources(
+        SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                           {.name = "cust", .type = ColumnType::Int64}}),
+        SchemaInfo::known({{.name = "cust", .type = ColumnType::Int64},
+                           {.name = "tier", .type = ColumnType::Int64}}));
+    sources["left"].add_unique_key({"id"});
+
+    auto plain = join_of({{"cust", "cust"}});
+    CHECK(ibex::ir::infer_schema(plain, sources).unique_keys().empty());
+
+    ibex::ir::JoinNode declared(
+        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+        std::vector<ibex::ir::JoinKey>{{"cust", "cust"}}, std::nullopt, {},
+        ibex::ir::NullMatch::Never,
+        ibex::ir::JoinExpect{.left = ibex::ir::JoinMultiplicity::Many,
+                             .right = ibex::ir::JoinMultiplicity::One});
+    declared.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    declared.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+
+    const auto out = ibex::ir::infer_schema(declared, sources);
+    CHECK(out.is_unique_within({"id"}));
+}

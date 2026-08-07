@@ -1,0 +1,12 @@
+// `expect n:1` is checked against the pairs the join actually emits, so the
+// transpiled path must reach the same verdict as the interpreter — both that
+// this data satisfies it, and which rows come out.
+let orders = Table {
+    id   = [1, 2, 3, 4],
+    cust = [10, 20, 10, 30]
+};
+let customers = Table {
+    cust = [10, 20, 30],
+    tier = [7, 8, 9]
+};
+(orders join customers on cust expect n:1)[order { id asc }];

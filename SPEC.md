@@ -844,11 +844,11 @@ expr            = primary
                 | unary_op expr
                 | expr binary_op expr
                 | expr "[" clause_list "]"
-                | expr "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
-                | expr "left" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
-                | expr "right" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
-                | expr "outer" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
-                | expr "asof" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ]
+                | expr "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
+                | expr "left" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
+                | expr "right" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
+                | expr "outer" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
+                | expr "asof" "join" expr "on" join_keys [ join_suffix ] [ join_nulls ] [ join_expect ]
                 | expr "cross" "join" expr [ join_suffix ]
                 | expr "join" expr "on" expr [ join_suffix ]
                 | expr "left" "join" expr "on" expr [ join_suffix ]
@@ -866,6 +866,14 @@ join_suffix     = "suffix" "{" STRING "," STRING "}" ;
    it is an error rather than a clause that does nothing. `nulls`, `equal` and
    `never` are matched in this position only and are not reserved words. *)
 join_nulls      = "nulls" ( "equal" | "never" ) ;
+
+(* Declared cardinality — Section 5.6. The left term is how many LEFT rows may
+   match one right row, the right term how many RIGHT rows may match one left
+   row. Checked against the emitted pairs, so it applies to every join kind.
+   `expect`, `n` and the sides are matched in this position only and are not
+   reserved words. *)
+join_expect     = "expect" multiplicity ":" multiplicity ;
+multiplicity    = "1" | "n" ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
@@ -2083,6 +2091,31 @@ old join new on id nulls equal
 - `nulls`, `equal` and `never` are matched in this position only and remain
   usable as ordinary identifiers — `read_csv` has a `nulls` parameter.
 
+**Declared cardinality.** A join may state how its rows are expected to line
+up, and the executor checks it:
+
+```ibex
+orders join customers on cust_id expect n:1
+```
+
+The left term is how many **left** rows may match one right row; the right term
+how many **right** rows may match one left row. So `n:1` reads "many orders, one
+customer": any number of orders may share a customer, and each order matches at
+most one. The four forms are `n:n` (the default, asserting nothing), `n:1`,
+`1:n` and `1:1`.
+
+- It is checked against the pairs the join actually emits, so one rule covers
+  every join kind. A violation names the offending row and which side it is on.
+- An unmatched row matched nothing, so it can never violate a declaration —
+  only a row that matched more than once can.
+- Because it is checked, the optimizer may rely on it. `expect n:1` says each
+  left row appears at most once in the output, which is what keeps a left-side
+  uniqueness proof valid there — the same standing as a schema ascription, and
+  for the same reason: a run whose data disagrees fails rather than producing
+  rows the proof describes wrongly.
+- It describes how the keys line up, so it is an error on a join that has no
+  keys.
+
 **Non-equijoin / theta join.** When the expression after `on` is a comparison or
 boolean expression (not a bare column name or brace-list), it is treated as a
 join predicate rather than an equality key. A pair of rows `(a, b)` is included
@@ -2553,18 +2586,20 @@ extracted from the result table using the following rule:
    the definition name is used.
 3. If neither applies, an error is returned.
 
-This allows pulling columns directly from block operations on existing tables:
+This allows extracting columns by name from an existing table expression:
 
 ```
-extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
-
-let prices = read_csv("prices.csv");
-
-// Each column comes from a different pipeline expression
-let t = Table {
-    symbol = prices[select { symbol }],          // single-column result
-    high   = prices[select { high   = max(price) }, by symbol],
-    low    = prices[select { low    = min(price) }, by symbol],
+// Assemble aligned columns from an existing table expression.
+// A multi-column result is matched by the constructor column name.
+let quotes = Table {
+    symbol = ["AAPL", "AAPL", "GOOG"],
+    price  = [150.0, 155.0, 140.0],
+    qty    = [10, 20, 15]
+};
+let enriched = Table {
+    symbol   = quotes,
+    price    = quotes,
+    notional = quotes[select { notional = price * qty }]
 };
 ```
 
@@ -2575,16 +2610,16 @@ as the binding contains a column matching the definition name:
 // prices has columns: symbol, price, volume
 Table {
     symbol = prices,   // extracts 'symbol' from prices
-    price  = prices,   // extracts 'price' from prices
+    price  = prices    // extracts 'price' from prices
 }
 ```
 
 Literal and expression columns may be freely mixed within the same constructor:
 
 ```
-let ref = Table {
-    label = ["open", "close"],           // series literal
-    value = ohlc[select { open }],       // expression
+let benchmark = Table {
+    label = ["average price"],                          // series literal
+    value = quotes[select { value = mean(price) }] // expression
 };
 ```
 

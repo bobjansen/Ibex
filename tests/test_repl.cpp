@@ -2010,3 +2010,36 @@ rows[select { n = count() }];
         CHECK_FALSE(ibex::repl::execute_script(source, registry));
     }
 }
+
+TEST_CASE("REPL keeps a join's clauses when a function body is inlined",
+          "[repl][join]") {
+    // A join written inside a function body has to mean there what it means
+    // anywhere else. `expect 1:1` makes that observable rather than silent:
+    // customer 10 matches two orders, so the run must fail. A clause lost on
+    // the way through the function would succeed instead.
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+
+    const std::string violating = R"(
+fn pair(a: DataFrame, b: DataFrame) -> DataFrame {
+  a join b on cust expect 1:1;
+}
+let orders = Table { id = [1, 2, 3], cust = [10, 10, 20] };
+let customers = Table { cust = [10, 20], tier = [7, 8] };
+pair(orders, customers);
+)";
+    CHECK_FALSE(ibex::repl::execute_script(violating, registry, config));
+
+    // The same shape the data does satisfy, so the clause is carried and the
+    // check passes rather than the clause simply being absent.
+    const std::string satisfied = R"(
+fn pair(a: DataFrame, b: DataFrame) -> DataFrame {
+  a join b on cust expect n:1;
+}
+let orders = Table { id = [1, 2, 3], cust = [10, 10, 20] };
+let customers = Table { cust = [10, 20], tier = [7, 8] };
+pair(orders, customers);
+)";
+    CHECK(ibex::repl::execute_script(satisfied, registry, config));
+}

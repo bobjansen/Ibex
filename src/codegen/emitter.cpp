@@ -684,7 +684,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                           << escape_string(key.right) << "\"}";
                 }
                 *out_ << "}, " << emit_filter_expr(*join.predicate())
-                      << emit_join_suffix(join.suffix(), join.null_match()) << ");\n";
+                      << emit_join_suffix(join.suffix(), join.null_match(), join.expect()) << ");\n";
                 return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
@@ -700,7 +700,7 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 }
                 *out_ << "}";
             }
-            *out_ << emit_join_suffix(join.suffix(), join.null_match()) << ");\n";
+            *out_ << emit_join_suffix(join.suffix(), join.null_match(), join.expect()) << ");\n";
             return var;
         }
 
@@ -1138,21 +1138,31 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
     throw std::runtime_error("ibex_compile: unknown IR node kind");
 }
 
-auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix, ir::NullMatch null_match)
-    -> std::string {
-    // `null_match` sits after `suffix` in the ops signatures, so a non-default
-    // policy has to spell the suffix argument out even when it is absent.
+auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix, ir::NullMatch null_match,
+                               const ir::JoinExpect& expect) -> std::string {
+    // These sit after `suffix` in the ops signatures, so a non-default one has
+    // to spell every earlier argument out even where it is absent.
+    const auto multiplicity = [](ir::JoinMultiplicity m) {
+        return m == ir::JoinMultiplicity::One ? "ibex::ir::JoinMultiplicity::One"
+                                              : "ibex::ir::JoinMultiplicity::Many";
+    };
+    std::string tail_arg;
+    if (expect.asserts_anything()) {
+        tail_arg = std::string(", ibex::ir::JoinExpect{.left = ") + multiplicity(expect.left) +
+                   ", .right = " + multiplicity(expect.right) + "}";
+    }
     const std::string null_arg =
-        null_match == ir::NullMatch::Equal ? ", ibex::ir::NullMatch::Equal" : "";
+        null_match == ir::NullMatch::Equal ? ", ibex::ir::NullMatch::Equal"
+                                           : (tail_arg.empty() ? "" : ", ibex::ir::NullMatch::Never");
     if (!suffix.present) {
         if (!null_arg.empty()) {
-            return ", ibex::ir::JoinSuffixPolicy{}" + null_arg;
+            return ", ibex::ir::JoinSuffixPolicy{}" + null_arg + tail_arg;
         }
         return "";
     }
     return ", ibex::ir::JoinSuffixPolicy{.present = true, .left = \"" +
            escape_string(suffix.left) + "\", .right = \"" + escape_string(suffix.right) + "\"}" +
-           null_arg;
+           null_arg + tail_arg;
 }
 
 auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {

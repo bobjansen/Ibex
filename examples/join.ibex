@@ -88,3 +88,18 @@ with_region join sites on region;
 // with each null row on the other side, and never with a present value.
 print("nulls equal — nulls pair with nulls, and only with nulls:");
 with_region join sites on region nulls equal;
+
+// ── Declared cardinality ──────────────────────────────────────────────────
+// A join can state how its rows are expected to line up. The left term is how
+// many left rows may match one right row, the right term how many right rows
+// may match one left row — so `n:1` reads "many measurements, one species".
+//
+// It is checked against the pairs actually emitted, and a run whose data
+// disagrees fails rather than fanning out silently.
+print("n:1 — many iris rows per species, one species row per iris row:");
+iris[head 6] join species_by_code[distinct { SpeciesCode }] on { Species = SpeciesCode } expect n:1;
+
+// The same join declared 1:1 is a lie: three iris rows share each species.
+// Uncomment to see it fail —
+//   iris[head 6] join species_by_code[distinct { SpeciesCode }]
+//       on { Species = SpeciesCode } expect 1:1;

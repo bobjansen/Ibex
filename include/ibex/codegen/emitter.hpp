@@ -77,7 +77,8 @@ class Emitter {
     /// join, or nothing when the join carries no clause. Dropping it would let
     /// a transpiled program reject a collision the interpreter resolves.
     static auto emit_join_suffix(const ir::JoinSuffixPolicy& suffix,
-                                 ir::NullMatch null_match = ir::NullMatch::Never) -> std::string;
+                                 ir::NullMatch null_match = ir::NullMatch::Never,
+                                 const ir::JoinExpect& expect = {}) -> std::string;
 
     /// Emit an Expr expression builder call (inline).
     auto emit_expr(const ir::Expr& expr) -> std::string;

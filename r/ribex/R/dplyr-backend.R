@@ -287,7 +287,7 @@ ibex_render_plan <- function(x, redact = FALSE) {
             ),
             distinct = paste0(code, "[distinct { ", paste(vapply(step$names, ibex_quote_identifier, character(1)), collapse = ", "), " }]"),
             join = paste0(
-                "(", code, if (identical(step$join_kind, "left")) " left join " else " join ",
+                "(", code, ibex_join_operator(step$join_kind),
                 sub(";$", "", ibex_render_plan(step$right)), " on { ",
                 paste(vapply(step$keys, ibex_quote_identifier, character(1)), collapse = ", "), " }",
                 # Ibex refuses a non-key collision without this clause, and its
@@ -1010,7 +1010,19 @@ ibex_join_output_names <- function(x, y, keys, suffix) {
     )
 }
 
-ibex_join_schema <- function(x, y, keys, kind, suffix) {
+# dplyr's verb names and Ibex's operators agree on three of the four; dplyr's
+# `full` is Ibex's `outer`. A lookup rather than a chain of `if`s so an
+# unmapped kind stops here instead of quietly rendering an inner join.
+ibex_join_operator <- function(kind) {
+    c(inner = " join ", left = " left join ",
+      right = " right join ", full = " outer join ")[[kind]]
+}
+
+# Every kind emits the left input's columns first and folds a same-named key
+# into one column, so the output names do not depend on the kind. Which of
+# them can hold a null does, and that answer comes back from Ibex itself --
+# see `ibex_infer_nullable()`.
+ibex_join_schema <- function(x, y, keys, suffix) {
     right <- setdiff(y$schema$names, keys)
     names <- ibex_join_output_names(x, y, keys, suffix)
     right_schema <- lapply(y$schema[c("names", "types", "categorical", "timezone")], function(v) v[match(right, y$schema$names)])
@@ -1051,7 +1063,7 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     # Only emit the clause when something actually collides: Ibex accepts it
     # either way, but a clause with nothing to rename is noise in the plan.
     step_suffix <- if (length(overlap)) suffix else NULL
-    schema <- ibex_join_schema(x, y, keys, kind, step_suffix)
+    schema <- ibex_join_schema(x, y, keys, step_suffix)
     ibex_append_step(
         x,
         list(kind = "join", join_kind = kind, right = y, keys = keys, suffix = step_suffix),
@@ -1088,5 +1100,40 @@ left_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", "
         dplyr::left_join(local, right, by = by, copy = copy, suffix = suffix, ...,
                          keep = keep, na_matches = na_matches, multiple = multiple,
                          unmatched = unmatched, relationship = relationship)
+    })
+}
+
+right_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,
+                                keep = NULL, na_matches = c("na", "never"), multiple = "all",
+                                unmatched = "drop", relationship = NULL) {
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "right_join", function() {
+        ibex_native_join(x, y, "right", by, copy, suffix, ..., keep = keep,
+                         na_matches = na_matches, multiple = multiple,
+                         unmatched = unmatched, relationship = relationship)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::right_join(local, right, by = by, copy = copy, suffix = suffix, ...,
+                          keep = keep, na_matches = na_matches, multiple = multiple,
+                          unmatched = unmatched, relationship = relationship)
+    })
+}
+
+# `full_join()` takes no `unmatched`, which is dplyr's signature rather than an
+# omission: there is no side whose rows it could drop. `ibex_native_join()`
+# still gates on the argument, so pass the value that means "nothing dropped".
+full_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,
+                               keep = NULL, na_matches = c("na", "never"), multiple = "all",
+                               relationship = NULL) {
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "full_join", function() {
+        ibex_native_join(x, y, "full", by, copy, suffix, ..., keep = keep,
+                         na_matches = na_matches, multiple = multiple,
+                         unmatched = "drop", relationship = relationship)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::full_join(local, right, by = by, copy = copy, suffix = suffix, ...,
+                         keep = keep, na_matches = na_matches, multiple = multiple,
+                         relationship = relationship)
     })
 }

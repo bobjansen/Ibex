@@ -20,6 +20,9 @@
 #include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
+// The `IBEX_PARALLEL_STATS` reporter prints with `fmt::print`.
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>

@@ -12,6 +12,9 @@
 
 #include <algorithm>
 #include <bit>
+// `std::chrono::time_zone` is used under `IBEX_HAS_STD_CHRONO_TIME_ZONES`, which
+// an include-what-you-use pass run with that macro off cannot see.
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -553,13 +556,13 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
                         constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
                         T sum{};
-                        std::size_t const val_cnt = 0;  // non-null, non-NaN in window
-                        std::size_t nan_cnt = 0;        // valid-but-NaN (Float only)
+                        std::size_t val_cnt = 0;  // non-null, non-NaN in window
+                        std::size_t nan_cnt = 0;  // valid-but-NaN (Float only)
                         std::size_t lo = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
                             if (!kHasNulls || valid_at(i)) {
                                 const T v = col_values[i];
-                                bool const is_nan = false;
+                                bool is_nan = false;
                                 if constexpr (std::is_floating_point_v<T>) {
                                     is_nan = std::isnan(v);
                                 }
@@ -575,7 +578,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             while (lo < i && drop_pred(lo, i)) {
                                 if (!kHasNulls || valid_at(lo)) {
                                     const T w = col_values[lo];
-                                    bool const is_nan = false;
+                                    bool is_nan = false;
                                     if constexpr (std::is_floating_point_v<T>) {
                                         is_nan = std::isnan(w);
                                     }
@@ -1195,7 +1198,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 // for `Column<bool>`, which is bit-packed and has no dense
                 // `data()`. The numeric instantiations still get the hoisted
                 // pointer; bool keeps the per-element path it has to use.
-                T const* result_values = nullptr;
+                T* result_values = nullptr;
                 if constexpr (is_dense_column_v<ColT>) {
                     result_values = result.data();
                 }

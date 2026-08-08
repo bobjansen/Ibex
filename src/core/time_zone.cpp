@@ -4,6 +4,10 @@
 #include <ibex/core/time_zone.hpp>
 
 #include <algorithm>
+// `locate_zone` lives here, and it is used under `IBEX_HAS_STD_CHRONO_TIME_ZONES`.
+// A tool that prunes includes cannot see into a disabled branch, so this one has
+// to survive an include-what-you-use pass run with the macro off.
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>

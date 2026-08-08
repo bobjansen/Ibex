@@ -251,16 +251,22 @@ not derived from another language's spelling of them. A frontend's
 `join_by(closest())` or `between()` then becomes one way to *reach* the
 operator rather than the thing that defines it.
 
-### The IR schema cannot express nullability
+### The IR schema can express nullability (fixed in Ibex core)
 
-`SchemaField` carries a name and a type, nothing else. A `left join` therefore
-infers an output schema claiming the right columns are as non-null as their
-source, which is false for every unmatched row. The output planner has nowhere
-to record it, so it deliberately does not try.
+`SchemaField` used to carry a name and a type, nothing else. A `left join`
+therefore inferred an output schema claiming the right columns were as non-null
+as their source, which is false for every unmatched row, and the output planner
+had nowhere to record it.
 
-The cost is small today and grows: early key checking wants it, any pass
-wanting to prove a column null-free wants it, and adapters currently maintain
-their own parallel nullability tracking because the core has none.
+It now carries `Nullability`, propagated by `infer_schema` through every
+operator it models. The outer-join rule is the one that motivated it — a side
+that may be unmatched loses its proofs — but the interesting direction turned
+out to be the other one, where a join *adds* a proof: an equijoin key of an
+inner or semi join is null-free, because under the default `nulls never` a null
+key matches nothing.
+
+Adapters still maintain their own parallel tracking. Moving them onto the core
+is the remaining piece.
 
 ## Borrowing from dplyr
 
@@ -506,8 +512,22 @@ Status: implemented. `expect n:1` and `take first` / `last` / `any`.
   right *value's* ordering claim, not an order restated at the join: the claim
   travels with the value, so ordering a binding once is enough. A right input
   with no claim is an error.
-- **Fast paths unlocked by a declared 1:1 join.** Not done. The proofs now
-  carry; nothing yet consumes them to pick a cheaper path.
+- **Fast paths unlocked by a declared 1:1 join.** Mostly moot, and worth
+  writing down before someone spends a week on it. The identity fast path this
+  bullet was after already runs: `GroupedRows::unique()` reads uniqueness off
+  the built CSR index, and the string/categorical and int64 paths branch on
+  `preserve_left_only && grouped.unique()` into `materialize_left_identity`.
+  That observed proof is strictly better than a declared one — free, exact, and
+  it fires for joins that declared nothing.
+
+  What a declaration could still buy is the *build-side* choice, which
+  `build_left = n_left < n_right` makes from row counts alone: when the right
+  side is larger the join builds the left and scans the right, forfeiting both
+  the identity path and the left-order claim, even though `expect n:1` says the
+  right is a unique index. That is the same shape as the `pending_order` guard
+  — making a join slower to unlock something better — so it needs a threshold
+  and a paired benchmark, and it is speculative optimizer work rather than the
+  contract work this plan is about.
 
 `Any` was admitted after all, against this plan's position. "I want one row and
 do not care which" is a real intent, and refusing it makes the author write
@@ -520,11 +540,63 @@ than left to whoever reads the code.
 
 ### Schema nullability
 
-- Add a nullability flag to `ir::SchemaField`.
-- Propagate through scan, filter, project, update, aggregate and join,
-  including the outer-join rules.
-- Decide what `Ascribe` asserts about nullability.
-- Let adapters defer to the core once the core is authoritative.
+Status: the core is authoritative; the adapters have not yet been moved onto
+it.
+
+- ~~Add a nullability flag to `ir::SchemaField`.~~ `Nullability::{Maybe,
+  Never}`, with `Maybe` as ⊥. Like `unique_keys` it is a *proof*, not a
+  declaration: `Never` means some operator's definition rules nulls out, never
+  that a source promised it, so no rule may reach `Never` without an argument.
+  It is the one field of `SchemaField` with a default member initializer, which
+  `JoinExpect`'s comment argues against — the difference is that the default
+  here is ⊥, so a construction site that forgets it under-claims rather than
+  dropping something the user wrote.
+- ~~Propagate through scan, filter, project, update, aggregate and join,
+  including the outer-join rules.~~ Also rename, rbind, melt, construct,
+  resample, cov/corr, `columns`, and the fused `Filter*` nodes canonicalize
+  produces — leaving one of those out would have quietly voided the proof for
+  every real plan's leaf, which is the trap `infer_schema`'s own comment
+  records about the fused nodes.
+- ~~Decide what `Ascribe` asserts about nullability.~~ Nothing — there is no
+  surface syntax to assert it with. But it *erases* nothing either: an
+  ascription is an identity on the data, so a proof from below is still true of
+  the rows that come out. The two questions are separate and answering the
+  first with "no" is not a reason to answer the second with it.
+- **Let adapters defer to the core once the core is authoritative.** Not done.
+  `ribex` still maintains its own tracking.
+
+Where a proof comes from, since a flag nothing produces is a flag nothing can
+consume. Sources declare one (a reader footer, an adapter); a literal column
+has no null literal to hold; a grouped `count` counts rows; an equijoin key of
+an inner or semi join is proved by the join itself, because under the default
+`nulls never` a null key matches nothing, so every surviving row has a value in
+every key. That last one is a proof neither input carried, and is the reason
+nullability is worth carrying *through* a join rather than only weakening at
+one.
+
+And `filter`, which is the general case: Ibex is three-valued, so a row whose
+predicate went null is dropped along with the rows that went false, and every
+column the predicate had to read to reach `true` is present in every row that
+survived. The rule stops where the argument does — `||` proves nothing (either
+branch may have been the true one), `!` proves nothing, `is_null(x)` is true
+for exactly the rows the proof would exclude, and a column read only through
+`coalesce`/`fill_null` was never required to be there.
+
+Two places the conservative answer is deliberate rather than incidental. An
+*ungrouped* aggregate emits its single row over an empty input too, where
+`min(a)` has no value to return however null-free `a` is — so only the grouped
+form inherits, and only `count` is unconditional. And `rbind` takes child[0]'s
+column set but not its rows, so each proof survives a vote across the operands
+rather than riding along with the schema it was written on.
+
+No benchmark: this is plan-time inference only, and no runtime path reads the
+flag yet.
+
+The one bug found was in neither the design nor a rule: `LogicalExpr` carries a
+null `right` for `Not`, and the operand fold read both unconditionally. Every
+unit test passed — none had put a negation in a computed field — and the parity
+suite segfaulted the transpiler on the first `!like(...)` it met. Regression
+test added in both predicate and computed-field position.
 
 ### Time-domain joins
 
@@ -545,9 +617,13 @@ than left to whoever reads the code.
    frontend's errors.
 5. ~~**Order-aware join planning**~~ — done; the payoff for step 1.
 6. ~~**Null-match policy**~~ — done, on the benchmarked baseline step 5 left.
-7. ~~**Cardinality assertions and match selection**~~ — done, except the fast
-   paths a declared 1:1 could unlock.
-8. **Schema nullability** — independent; pull forward if step 4 wants it. Next.
+7. ~~**Cardinality assertions and match selection**~~ — done. The fast paths a
+   declared 1:1 was to unlock turned out to be reached dynamically already;
+   only build-side biasing remains, as an optimizer item rather than a contract
+   one.
+8. ~~**Schema nullability**~~ — done in the core. The adapters still track it
+   themselves; moving them onto it is the next piece, and it is what unblocks
+   `right_join()` / `full_join()` in ribex.
 9. **Time-domain joins** — the largest new feature, and the one most worth
    designing slowly.
 

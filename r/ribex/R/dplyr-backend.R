@@ -297,6 +297,11 @@ ibex_render_plan <- function(x, redact = FALSE) {
                     paste0(" suffix { ", ibex_quote_string(step$suffix[[1]]), ", ",
                            ibex_quote_string(step$suffix[[2]]), " }")
                 } else "",
+                # Trails the suffix clause, which is where Ibex's grammar wants
+                # it. `never` is the default, so only `equal` needs saying --
+                # and saying it is what tells the core to withdraw the key's
+                # non-null proof, since a null key now matches.
+                if (identical(step$null_match, "equal")) " nulls equal" else "",
                 ")"
             ),
             rlang::abort(paste0("Unknown ibex lazy-plan step: ", step$kind))
@@ -1018,6 +1023,33 @@ ibex_join_operator <- function(kind) {
       right = " right join ", full = " outer join ")[[kind]]
 }
 
+# dplyr's `na_matches` and Ibex's `nulls` clause ask the same question of
+# nulls, so the translation is a word swap -- with one exception, which is why
+# this is a function rather than a lookup.
+#
+# `na_matches = "na"` also makes NaN match NaN, and Ibex's `nulls equal` does
+# not: its subject is the validity bitmap, and a NaN is a value that is
+# present. R keeps the two apart as well (NaN does not match NA under either
+# option), so there is no rewrite that recovers dplyr's answer -- mapping NaN
+# to null would wrongly pair it with NA. A float key therefore falls back
+# rather than returning a differently-shaped result, which is a divergence a
+# caller would have no way to notice.
+#
+# `"never"` needs no such care: neither side matches a NaN under it.
+ibex_join_null_match <- function(x, y, keys, na_matches) {
+    if (identical(na_matches, "never")) {
+        return("never")
+    }
+    key_type <- function(tbl) tbl$schema$types[match(keys, tbl$schema$names)]
+    if (any(c(key_type(x), key_type(y)) == "Float64")) {
+        ibex_unsupported(paste(
+            "Native joins cannot match NaN keys the way `na_matches = \"na\"` does;",
+            "a floating-point key needs `na_matches = \"never\"` or local dplyr."
+        ))
+    }
+    "equal"
+}
+
 # Every kind emits the left input's columns first and folds a same-named key
 # into one column, so the output names do not depend on the kind. Which of
 # them can hold a null does, and that answer comes back from Ibex itself --
@@ -1038,9 +1070,9 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
                              na_matches, multiple, unmatched, relationship) {
     dots <- rlang::list2(...)
     if (length(dots) || isTRUE(copy) || !(is.null(keep) || identical(keep, FALSE)) ||
-        !identical(na_matches, "never") || !identical(multiple, "all") ||
-        !identical(unmatched, "drop") || !is.null(relationship)) {
-        ibex_unsupported("Native joins currently require simple equality keys, `na_matches = \"never\"`, and default join options.")
+        !identical(multiple, "all") || !identical(unmatched, "drop") ||
+        !is.null(relationship)) {
+        ibex_unsupported("Native joins currently require simple equality keys and default join options.")
     }
     if (!inherits(y, "ibex_tbl")) y <- ibex_tbl(y, session = x$session, fallback = x$fallback_policy)
     if (!identical(x$session, y$session)) ibex_unsupported("Native joins require both inputs to use the same Ibex session.")
@@ -1060,13 +1092,15 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     if (length(overlap) && (length(suffix) != 2L || any(!nzchar(suffix)))) {
         ibex_unsupported("Native joins require two non-empty suffixes.")
     }
+    null_match <- ibex_join_null_match(x, y, keys, na_matches)
     # Only emit the clause when something actually collides: Ibex accepts it
     # either way, but a clause with nothing to rename is noise in the plan.
     step_suffix <- if (length(overlap)) suffix else NULL
     schema <- ibex_join_schema(x, y, keys, step_suffix)
     ibex_append_step(
         x,
-        list(kind = "join", join_kind = kind, right = y, keys = keys, suffix = step_suffix),
+        list(kind = "join", join_kind = kind, right = y, keys = keys,
+             suffix = step_suffix, null_match = null_match),
         schema = schema, groups = character(), ordering = NULL
     )
 }

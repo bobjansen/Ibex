@@ -154,6 +154,14 @@ test_that("poorman-derived equality joins execute natively", {
     )
     expect_s3_class(actual_left, "ibex_tbl")
     expect_equal(dplyr::collect(actual_left), expected_left)
+
+    # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — default NA
+    # matching, which was on the unsupported list until `nulls equal` landed.
+    keyed <- tibble::tibble(g = c("a", NA, "b"), x = 1:3)
+    expected_na <- dplyr::inner_join(keyed, keyed, by = "g")
+    actual_na <- dplyr::inner_join(ibex_tbl(keyed, fallback = "error"), keyed, by = "g")
+    expect_s3_class(actual_na, "ibex_tbl")
+    expect_equal(dplyr::collect(actual_na), expected_na)
 })
 
 test_that("poorman cases outside native ribex support are classified separately", {
@@ -177,9 +185,10 @@ test_that("poorman cases outside native ribex support are classified separately"
         class = "ribex_translation_error"
     )
 
-    # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — default NA matching.
+    # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — `keep = TRUE` asks
+    # for both key columns, which Ibex's folded key has no spelling for.
     expect_error(
-        dplyr::inner_join(ibex_tbl(input, fallback = "error"), input, by = "g"),
+        dplyr::inner_join(ibex_tbl(input, fallback = "error"), input, by = "g", keep = TRUE),
         class = "ribex_translation_error"
     )
 })

@@ -53,6 +53,9 @@ jobs:
         env:
           IBEX_ROOT: ${{ github.workspace }}
           IBEX_BUILD_DIR: ${{ github.workspace }}/build-ribex
+          # Dependencies above are installed into the action's R library.
+          # Do not switch to the repository's unpopulated renv library here.
+          RENV_CONFIG_AUTOLOADER_ENABLED: "false"
         run: |
           R CMD INSTALL r/ribex
           Rscript --vanilla -e 'testthat::test_package("ribex")'

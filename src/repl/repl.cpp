@@ -35,8 +35,8 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <expected>

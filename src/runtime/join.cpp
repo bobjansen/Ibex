@@ -767,7 +767,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     /// match (an outer join's padding) are left alone: there is nothing to
     /// choose between.
     auto apply_take = [&](std::vector<std::size_t>& left_idx, std::vector<std::size_t>& right_idx,
-                          std::vector<std::size_t>& key_right_idx) {  // NOLINT(bugprone-easily-swappable-parameters)
+                          std::vector<std::size_t>&
+                              key_right_idx) {  // NOLINT(bugprone-easily-swappable-parameters)
         const std::size_t total = left_idx.size();
         std::vector<std::size_t> chosen(n_left, kNull);
         bool any_choice = false;

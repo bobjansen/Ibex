@@ -1,4 +1,5 @@
 #include <ibex/core/time.hpp>
+#include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
@@ -186,6 +187,105 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
     return std::nullopt;
 }
 
+/// Whether a computed field can hold a null, given the input schema.
+///
+/// The shape mirrors `expr_type`: `Maybe` is the answer for anything not
+/// argued, so an unmodelled expression costs precision and never soundness.
+/// The one structural rule is that Ibex's scalars propagate null -- a null
+/// operand yields a null result -- so an arithmetic or comparison expression is
+/// null-free exactly when all of its operands are. The exceptions are the
+/// functions whose *purpose* is null: `is_null`/`is_not_null` answer for a null
+/// rather than propagating it, and `coalesce`/`fill_null` consume one.
+auto expr_nullability(const Expr& expr, const SchemaInfo& input) -> Nullability {
+    // Fold over sub-expressions: null-free only if every operand is.
+    const auto all_of = [&](const auto&... operands) {
+        Nullability result = Nullability::Never;
+        ((result = weaker(result, expr_nullability(*operands, input))), ...);
+        return result;
+    };
+
+    if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
+        // A lexical `^name` is a scalar binding, not a column; this pass knows
+        // nothing about its value, exactly as `expr_type` knows nothing about
+        // its type.
+        if (col->lexical) {
+            return Nullability::Maybe;
+        }
+        const auto* field = input.find(col->name);
+        return field != nullptr ? field->nulls : Nullability::Maybe;
+    }
+    if (std::holds_alternative<Literal>(expr.node)) {
+        // There is no null literal in the surface language, so every literal
+        // that parsed is a value.
+        return Nullability::Never;
+    }
+    if (std::holds_alternative<IsNullExpr>(expr.node)) {
+        // `is_null(x)` / `is_not_null(x)` are total: they answer true or false
+        // for a null input rather than propagating it.
+        return Nullability::Never;
+    }
+    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
+        // Three-valued: a null operand makes the comparison null, not false.
+        return all_of(cmp->left, cmp->right);
+    }
+    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node)) {
+        // Deliberately not Kleene-precise. `false && null` is false whatever
+        // the right operand does, but proving that needs a value-level
+        // argument this pass does not make; the conservative fold under-claims.
+        //
+        // `Not` carries no right operand at all (see `LogicalExpr`), so the
+        // fold has to be written out rather than handed both unconditionally.
+        const Nullability left = expr_nullability(*logical->left, input);
+        return logical->right != nullptr ? weaker(left, expr_nullability(*logical->right, input))
+                                         : left;
+    }
+    if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
+        // Including Div: integer division by zero is an error and float
+        // division yields an infinity, so neither manufactures a null.
+        return all_of(bin->left, bin->right);
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        // `coalesce(a, ..., z)` is the first non-null argument, so one
+        // null-free argument anywhere makes the result null-free.
+        if (call->callee == "coalesce") {
+            return std::ranges::any_of(call->args,
+                                       [&](const auto& arg) {
+                                           return expr_nullability(*arg, input) ==
+                                                  Nullability::Never;
+                                       })
+                       ? Nullability::Never
+                       : Nullability::Maybe;
+        }
+        // `fill_null(x, v)` is `x` when present and `v` otherwise, so it is
+        // null-free when the replacement is -- whatever `x` does.
+        if (call->callee == "fill_null" && call->args.size() == 2) {
+            return expr_nullability(*call->args[1], input);
+        }
+        // `null_if_nan(x)` and `null_if_not_finite(x)` manufacture a null from
+        // a perfectly present value, which is the whole point of them. They are
+        // `Scalar` like the rest, so they have to be named here.
+        if (call->callee == "null_if_nan" || call->callee == "null_if_not_finite") {
+            return Nullability::Maybe;
+        }
+        // Every other row-local builtin propagates: `sqrt(null)` is null, so
+        // `sqrt(x)` is null-free exactly when `x` is. Only `Scalar` qualifies.
+        // A `Transform` is excluded even when its argument is null-free --
+        // `lag(x)` is null in the first row of each group whatever `x` does,
+        // and so is every function with a warm-up -- and an unknown callee is
+        // a plugin, about which this pass assumes nothing (see
+        // `BuiltinFunctionInfo`).
+        if (call->args.empty() || fn_kind(call->callee) != FnKind::Scalar) {
+            return Nullability::Maybe;
+        }
+        Nullability result = Nullability::Never;
+        for (const auto& arg : call->args) {
+            result = weaker(result, expr_nullability(*arg, input));
+        }
+        return result;
+    }
+    return Nullability::Maybe;
+}
+
 /// Output type of an aggregate, when known with certainty.
 auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::optional<ColumnType> {
     switch (agg.func) {
@@ -212,6 +312,54 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
             return std::nullopt;
     }
     return std::nullopt;
+}
+
+/// Whether an aggregate's result column can hold a null.
+///
+/// Two conditions have to hold together, and `grouped` is the one that is easy
+/// to lose: an aggregate emits one row per group that *occurred*, so a grouped
+/// aggregate's every row summarizes at least one input row. An ungrouped one
+/// emits its single row even over an empty input, where `min` has no value to
+/// return -- so it proves nothing regardless of the column it reads.
+auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) -> Nullability {
+    if (agg.func == AggFunc::Count) {
+        // A count is a row count. Nothing it reads can make it absent, and an
+        // empty group counts zero rather than null.
+        return Nullability::Never;
+    }
+    if (!grouped) {
+        return Nullability::Maybe;
+    }
+    const auto* field = input.find(agg.column.name);
+    if (field == nullptr || !field->non_null()) {
+        return Nullability::Maybe;
+    }
+    switch (agg.func) {
+        case AggFunc::Sum:
+        case AggFunc::Min:
+        case AggFunc::Max:
+        case AggFunc::First:
+        case AggFunc::Last:
+        case AggFunc::Mean:
+        case AggFunc::Median:
+            // Each is a value drawn from, or an arithmetic mean over, at least
+            // one non-null input value.
+            return Nullability::Never;
+        case AggFunc::Stddev:
+        case AggFunc::Ewma:
+        case AggFunc::Quantile:
+        case AggFunc::Skew:
+        case AggFunc::Kurtosis:
+            // Deliberately under-claimed: each is undefined for a group below
+            // some size -- a sample stddev needs two rows, skew and kurtosis
+            // more -- and this pass has no bound on group size. Proving these
+            // means reading each kernel's small-group behaviour, which is a
+            // separate piece of work from establishing the flag.
+            return Nullability::Maybe;
+        case AggFunc::Count:
+            break;  // handled above
+    }
+    return Nullability::Maybe;
 }
 
 auto child_schema(const Node& node, const SourceSchemas& sources, std::size_t index = 0)
@@ -253,11 +401,13 @@ auto project_schema(const std::vector<ColumnRef>& columns, const SchemaInfo& inp
     std::vector<SchemaField> out;
     out.reserve(columns.size());
     for (const auto& ref : columns) {
-        std::optional<ColumnType> type;
+        // A projection moves a column, so every proof about its values -- type
+        // and nullability alike -- moves with it.
         if (const auto* field = input.find(ref.name)) {
-            type = field->type;
+            out.push_back(*field);
+        } else {
+            out.push_back(SchemaField{.name = ref.name, .type = std::nullopt});
         }
-        out.push_back(SchemaField{.name = ref.name, .type = type});
     }
     // Keep the time index only if the projection retains that column.
     std::optional<std::string> time_index;
@@ -286,21 +436,28 @@ auto update_schema(const std::vector<FieldSpec>& fields,
         return SchemaInfo::unknown();
     }
     std::vector<SchemaField> out = input.fields();
-    auto upsert = [&out](const std::string& name, std::optional<ColumnType> type) {
+    auto upsert = [&out](const std::string& name, std::optional<ColumnType> type,
+                         Nullability nulls) {
         for (auto& field : out) {
             if (field.name == name) {
                 field.type = type;
+                // An assignment replaces the column's values outright, so any
+                // proof the old column carried is gone with them -- including
+                // when the new expression is the unproven one.
+                field.nulls = nulls;
                 return;
             }
         }
-        out.push_back(SchemaField{.name = name, .type = type});
+        out.push_back(SchemaField{.name = name, .type = type, .nulls = nulls});
     };
     for (const auto& field : fields) {
-        upsert(field.alias, expr_type(field.expr, input));
+        // Each field reads the *input* schema, not the running one: `update`
+        // evaluates its fields against the rows as they arrived.
+        upsert(field.alias, expr_type(field.expr, input), expr_nullability(field.expr, input));
     }
     for (const auto& tuple : tuple_fields) {
         for (const auto& alias : tuple.aliases) {
-            upsert(alias, std::nullopt);
+            upsert(alias, std::nullopt, Nullability::Maybe);
         }
     }
     // Update retains every existing column, so the time index survives.
@@ -323,6 +480,194 @@ auto update_schema(const std::vector<FieldSpec>& fields,
         }
     }
     return result;
+}
+
+/// Collect the columns whose nullness would make `expr` evaluate to null,
+/// into `out`. The mirror of `expr_nullability`: that answers "is this
+/// null-free", this answers "which columns would have to be".
+void collect_null_propagating_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
+    if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
+        if (!col->lexical) {
+            out.insert(col->name);
+        }
+        return;
+    }
+    if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
+        collect_null_propagating_refs(*bin->left, out);
+        collect_null_propagating_refs(*bin->right, out);
+        return;
+    }
+    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
+        collect_null_propagating_refs(*cmp->left, out);
+        collect_null_propagating_refs(*cmp->right, out);
+        return;
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        // The same three exclusions as `expr_nullability`, for the same
+        // reasons: a null-consuming function's argument need not be present,
+        // and a non-`Scalar` callee's relationship to its arguments is not
+        // row-local (or, for an unknown callee, not known at all).
+        if (call->callee == "coalesce" || call->callee == "fill_null" ||
+            fn_kind(call->callee) != FnKind::Scalar) {
+            return;
+        }
+        for (const auto& arg : call->args) {
+            collect_null_propagating_refs(*arg, out);
+        }
+        return;
+    }
+    // Literal: no column. IsNullExpr: total, so its operand's nullness does not
+    // reach the result. LogicalExpr and RankExpr: not descended into -- see
+    // `collect_filtered_non_null_refs`, which handles `&&` where it can say
+    // something stronger.
+}
+
+/// Collect the columns that `predicate` proves null-free in the rows it keeps.
+///
+/// `filter` keeps a row only when its predicate is *true*, and Ibex is
+/// three-valued everywhere: null is not true, so a row whose predicate went
+/// null is dropped along with the rows that went false. Every column the
+/// predicate had to read to reach true is therefore present in every surviving
+/// row.
+void collect_filtered_non_null_refs(const Expr& predicate,
+                                    robin_hood::unordered_set<std::string>& out) {
+    if (const auto* logical = std::get_if<LogicalExpr>(&predicate.node)) {
+        if (logical->op == LogicalOp::And) {
+            // Both conjuncts are true, so both prove.
+            collect_filtered_non_null_refs(*logical->left, out);
+            if (logical->right != nullptr) {
+                collect_filtered_non_null_refs(*logical->right, out);
+            }
+        }
+        // `||` proves only what both branches prove and `!` proves nothing at
+        // all -- `!(x > 0)` is true for no null `x`, but it is *false* for one,
+        // which is not a row this filter keeps either way. Both are left
+        // unclaimed rather than intersected: an under-claim costs precision, and
+        // the intersection is worth writing when something needs it.
+        return;
+    }
+    if (const auto* is_null = std::get_if<IsNullExpr>(&predicate.node)) {
+        // `is_not_null(x)` true says exactly this and nothing else; `is_null(x)`
+        // true says the opposite, and there is no way to record that here.
+        if (is_null->negated) {
+            collect_null_propagating_refs(*is_null->operand, out);
+        }
+        return;
+    }
+    // Anything else -- a comparison, a bare Bool column, an arithmetic
+    // expression read as a predicate -- had to be non-null to be true.
+    collect_null_propagating_refs(predicate, out);
+}
+
+/// Apply a filter's proofs to the schema flowing through it.
+auto filtered_schema(const Expr& predicate, SchemaInfo input) -> SchemaInfo {
+    if (!input.is_known()) {
+        return input;
+    }
+    robin_hood::unordered_set<std::string> proved;
+    collect_filtered_non_null_refs(predicate, proved);
+    if (proved.empty()) {
+        return input;
+    }
+    std::vector<SchemaField> fields = input.fields();
+    for (auto& field : fields) {
+        if (proved.contains(field.name)) {
+            field.nulls = Nullability::Never;
+        }
+    }
+    SchemaInfo result = SchemaInfo::known(std::move(fields), input.is_open(), input.time_index());
+    // Row-dropping, so every unique key survives -- the same reason
+    // `inherit_unique_keys` gives.
+    inherit_unique_keys(input, result);
+    return result;
+}
+
+/// Whether a join may emit a row in which one side contributed nothing, per
+/// side. This is the only reason a join weakens a nullability proof: an
+/// unmatched row's columns on the absent side are filled with nulls, whatever
+/// that input's own schema said.
+struct JoinUnmatched {
+    bool left;   ///< An output row may have no left row (right/outer).
+    bool right;  ///< An output row may have no right row (left/outer/asof).
+};
+
+auto join_unmatched_sides(JoinKind kind) -> JoinUnmatched {
+    switch (kind) {
+        case JoinKind::Left:
+        case JoinKind::Asof:
+            // `asof` keeps every left row whether or not a right row precedes
+            // it, so its right columns null out exactly as a left join's do.
+            return {.left = false, .right = true};
+        case JoinKind::Right:
+            return {.left = true, .right = false};
+        case JoinKind::Outer:
+            return {.left = true, .right = true};
+        case JoinKind::Inner:
+        case JoinKind::Semi:
+        case JoinKind::Anti:
+        case JoinKind::Cross:
+            // Semi and anti emit left columns only, and emit whole left rows;
+            // cross pairs every row with every row. None of them fills.
+            return {.left = false, .right = false};
+    }
+    return {.left = true, .right = true};
+}
+
+/// Nullability of each planned output column of a join.
+///
+/// Two rules, in this order. First, an equijoin key column of a join that emits
+/// only matched rows is null-free: under `NullMatch::Never` a null key matches
+/// nothing, so every row that survived has a value in every key. This is a
+/// proof the inputs did not have, and the reason nullability is worth carrying
+/// through a join at all rather than just weakening it.
+///
+/// Second, a column on a side that may be unmatched loses whatever it had. The
+/// exception is a *folded* same-name key: `plan_join_output` emits one column
+/// for it, and the executor fills that column from the right key for rows with
+/// no left row (`materialize`, join.cpp), so it is null-free when both sides'
+/// keys are.
+void apply_join_nullability(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right,
+                            const std::vector<JoinOutputColumn>& plan,
+                            std::vector<SchemaField>& out) {
+    const JoinUnmatched unmatched = join_unmatched_sides(join.kind());
+    const bool only_matched_rows = join.kind() == JoinKind::Inner || join.kind() == JoinKind::Semi;
+    // `nulls equal` admits null keys into a match, which is exactly what the
+    // key proof below rests on being impossible.
+    const bool keys_are_null_free =
+        only_matched_rows && join.null_match() == NullMatch::Never && !join.keys().empty();
+
+    for (std::size_t i = 0; i < plan.size(); ++i) {
+        const JoinOutputColumn& column = plan[i];
+        const bool from_left = column.side == JoinOutputSide::Left;
+        const SchemaInfo& source = from_left ? left : right;
+        const std::string& source_name = source.fields()[column.source_index].name;
+
+        const auto key = std::ranges::find_if(join.keys(), [&](const JoinKey& k) {
+            return (from_left ? k.left : k.right) == source_name;
+        });
+        if (key == join.keys().end()) {
+            out[i].nulls =
+                (from_left ? unmatched.left : unmatched.right) ? Nullability::Maybe : out[i].nulls;
+            continue;
+        }
+
+        if (keys_are_null_free) {
+            out[i].nulls = Nullability::Never;
+            continue;
+        }
+        // A key folded into one output column (same name on both sides) draws
+        // from whichever side is present, so it needs both proofs -- but only
+        // when a left row can actually be missing.
+        if (from_left && unmatched.left && key->left == key->right) {
+            const auto* right_field = right.find(key->right);
+            out[i].nulls = weaker(out[i].nulls,
+                                  right_field != nullptr ? right_field->nulls : Nullability::Maybe);
+            continue;
+        }
+        if (from_left ? unmatched.left : unmatched.right) {
+            out[i].nulls = Nullability::Maybe;
+        }
+    }
 }
 
 /// Unique constraints a join's output inherits from its inputs. Each follows
@@ -711,11 +1056,17 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
 
         // Pure row-shaping operators: schema, time index and unique constraints
         // all pass through. These only drop or reorder rows.
-        case NodeKind::Filter:
         case NodeKind::Order:
         case NodeKind::Head:
         case NodeKind::Tail:
             return child_schema(node, sources);
+
+        // Filter is row-shaping too, but the rows it drops are informative: a
+        // predicate that reached `true` read a value from every column it
+        // propagated null through.
+        case NodeKind::Filter:
+            return filtered_schema(static_cast<const FilterNode&>(node).predicate(),
+                                   child_schema(node, sources));
 
         case NodeKind::Distinct: {
             // Deduplicates whole rows, so all columns together are unique by
@@ -765,8 +1116,27 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             }
             return project_schema(keep, child);
         }
-        case NodeKind::Rbind:
-            return without_unique_keys(child_schema(node, sources));
+        case NodeKind::Rbind: {
+            // The operands share child[0]'s column set, so its names and types
+            // describe the result -- but its *rows* do not. A column null-free
+            // in the first operand is only null-free in the concatenation when
+            // it is null-free in every operand, so each proof has to survive a
+            // vote rather than ride along with the schema it was written on.
+            SchemaInfo result = without_unique_keys(child_schema(node, sources));
+            if (!result.is_known()) {
+                return result;
+            }
+            std::vector<SchemaField> fields = result.fields();
+            for (std::size_t i = 1; i < node.children().size(); ++i) {
+                const SchemaInfo operand = child_schema(node, sources, i);
+                for (auto& field : fields) {
+                    const auto* other = operand.is_known() ? operand.find(field.name) : nullptr;
+                    field.nulls =
+                        weaker(field.nulls, other != nullptr ? other->nulls : Nullability::Maybe);
+                }
+            }
+            return SchemaInfo::known(std::move(fields), result.is_open(), result.time_index());
+        }
 
         case NodeKind::AsTimeframe: {
             // Designates the time-index column. The index column is materialised
@@ -842,16 +1212,21 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             const SchemaInfo input = child_schema(node, sources);
             std::vector<SchemaField> out;
             out.reserve(agg.group_by().size() + agg.aggregations().size());
+            const bool grouped = !agg.group_by().empty();
             for (const auto& key : agg.group_by()) {
-                std::optional<ColumnType> type;
+                // A key column holds one of the values it grouped, so it is
+                // null-free exactly when the column it grouped was. (A null key
+                // forms its own group and reaches the output as a null.)
                 if (const auto* field = input.find(key.name)) {
-                    type = field->type;
+                    out.push_back(*field);
+                } else {
+                    out.push_back(SchemaField{.name = key.name, .type = std::nullopt});
                 }
-                out.push_back(SchemaField{.name = key.name, .type = type});
             }
             for (const auto& spec : agg.aggregations()) {
-                out.push_back(
-                    SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
+                out.push_back(SchemaField{.name = spec.alias,
+                                          .type = agg_result_type(spec, input),
+                                          .nulls = agg_nullability(spec, input, grouped)});
             }
             SchemaInfo result = SchemaInfo::known(std::move(out));
             // One row per distinct group, so the group keys are unique by
@@ -906,6 +1281,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 emitted.name = column.name;
                 out.push_back(std::move(emitted));
             }
+            apply_join_nullability(join, left, right, plan, out);
 
             const bool left_only = join.kind() == JoinKind::Semi || join.kind() == JoinKind::Anti;
             SchemaInfo result = SchemaInfo::known(
@@ -920,15 +1296,20 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             out.reserve(construct.columns().size());
             for (const auto& col : construct.columns()) {
                 std::optional<ColumnType> type;
+                Nullability nulls = Nullability::Maybe;
                 if (!col.elements.empty()) {
                     type = literal_type(col.elements.front());
+                    // A literal list is written out value by value, and the
+                    // surface language has no null literal to write.
+                    nulls = Nullability::Never;
                 } else if (col.expr_node != nullptr) {
                     const SchemaInfo sub = infer_schema(*col.expr_node, sources);
                     if (sub.is_known() && sub.fields().size() == 1) {
                         type = sub.fields().front().type;
+                        nulls = sub.fields().front().nulls;
                     }
                 }
-                out.push_back(SchemaField{.name = col.name, .type = type});
+                out.push_back(SchemaField{.name = col.name, .type = type, .nulls = nulls});
             }
             return SchemaInfo::known(std::move(out));
         }
@@ -937,13 +1318,29 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // The ascription fixes the statically visible result schema. Extra
             // physical columns pass through at run time, but are deliberately
             // hidden until a later ascription names them.
+            //
+            // It asserts nothing about nullability -- there is no surface
+            // syntax to assert it with -- but it erases nothing either: an
+            // ascription is an identity on the data, so a proof the input
+            // carried is still true of the rows that come out. Assertion and
+            // preservation are different questions, and answering the first
+            // with "no" is not a reason to answer the second with it.
             const auto& asc = static_cast<const AscribeNode&>(node);
-            return SchemaInfo::known(asc.schema(), /*open=*/false);
+            const SchemaInfo input = child_schema(node, sources);
+            std::vector<SchemaField> out = asc.schema();
+            for (auto& field : out) {
+                if (const auto* from_input = input.find(field.name)) {
+                    field.nulls = from_input->nulls;
+                }
+            }
+            return SchemaInfo::known(std::move(out), /*open=*/false);
         }
 
         case NodeKind::Columns:
             // Exposes child column names as a single String column named "name".
-            return SchemaInfo::known({SchemaField{.name = "name", .type = ColumnType::String}});
+            // Every row is a column name, and a column always has one.
+            return SchemaInfo::known({SchemaField{
+                .name = "name", .type = ColumnType::String, .nulls = Nullability::Never}});
 
         case NodeKind::Melt: {
             // Output: the id columns (types from input), then `variable: String`
@@ -953,14 +1350,19 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             const SchemaInfo input = child_schema(node, sources);
             std::vector<SchemaField> out;
             for (const auto& id : melt.id_columns()) {
-                std::optional<ColumnType> type;
+                // An id column is repeated once per measure, values unchanged.
                 if (const auto* field = input.find(id)) {
-                    type = field->type;
+                    out.push_back(*field);
+                } else {
+                    out.push_back(SchemaField{.name = id, .type = std::nullopt});
                 }
-                out.push_back(SchemaField{.name = id, .type = type});
             }
-            out.push_back(SchemaField{.name = "variable", .type = ColumnType::String});
+            // Each row's `variable` is the name of the column it was melted
+            // from, so it is present by construction.
+            out.push_back(SchemaField{
+                .name = "variable", .type = ColumnType::String, .nulls = Nullability::Never});
             std::optional<ColumnType> value_type;
+            Nullability value_nulls = Nullability::Maybe;
             if (input.is_known()) {
                 std::vector<std::string> measures(melt.measure_columns().begin(),
                                                   melt.measure_columns().end());
@@ -973,6 +1375,14 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                             measures.push_back(field.name);
                         }
                     }
+                }
+                // `value` holds one measure column's value per row, so it is
+                // null-free only if every melted column is.
+                value_nulls = measures.empty() ? Nullability::Maybe : Nullability::Never;
+                for (const auto& measure : measures) {
+                    const auto* field = input.find(measure);
+                    value_nulls =
+                        weaker(value_nulls, field != nullptr ? field->nulls : Nullability::Maybe);
                 }
                 bool consistent = !measures.empty();
                 for (std::size_t i = 0; i < measures.size(); ++i) {
@@ -993,7 +1403,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                     value_type = std::nullopt;
                 }
             }
-            out.push_back(SchemaField{.name = "value", .type = value_type});
+            out.push_back(SchemaField{.name = "value", .type = value_type, .nulls = value_nulls});
             return SchemaInfo::known(std::move(out));
         }
 
@@ -1007,12 +1417,16 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                 return SchemaInfo::unknown();
             }
             std::vector<SchemaField> out;
-            out.push_back(SchemaField{.name = "column", .type = ColumnType::String});
+            // One row per numeric input column, labelled with its name.
+            out.push_back(SchemaField{
+                .name = "column", .type = ColumnType::String, .nulls = Nullability::Never});
             for (const auto& field : input.fields()) {
                 if (!field.type.has_value()) {
                     return SchemaInfo::unknown();  // can't tell if this column is numeric
                 }
                 if (is_numeric(*field.type)) {
+                    // Left unclaimed however null-free the inputs are: a
+                    // correlation with a zero-variance column divides by zero.
                     out.push_back(SchemaField{.name = field.name, .type = ColumnType::Float64});
                 }
             }
@@ -1030,16 +1444,22 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             const std::optional<std::string>& bucket = input.time_index();
             std::vector<SchemaField> out;
             if (bucket.has_value()) {
-                out.push_back(SchemaField{.name = *bucket, .type = ColumnType::Timestamp});
+                // A generated bucket boundary, so never absent.
+                out.push_back(SchemaField{
+                    .name = *bucket, .type = ColumnType::Timestamp, .nulls = Nullability::Never});
             }
             for (const auto& key : rs.group_by()) {
-                std::optional<ColumnType> type;
                 if (const auto* field = input.find(key.name)) {
-                    type = field->type;
+                    out.push_back(*field);
+                } else {
+                    out.push_back(SchemaField{.name = key.name, .type = std::nullopt});
                 }
-                out.push_back(SchemaField{.name = key.name, .type = type});
             }
             for (const auto& spec : rs.aggregations()) {
+                // Not `agg_nullability`: unlike `Aggregate`, a resample emits a
+                // row for every bucket in the range, including buckets no input
+                // row fell into. Its aggregates summarize an empty set as
+                // readily as a non-empty one.
                 out.push_back(
                     SchemaField{.name = spec.alias, .type = agg_result_type(spec, input)});
             }
@@ -1069,7 +1489,8 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         case NodeKind::FilterProject: {
             // Project(Filter(x)): the projection fixes the output columns.
             const auto& fused = static_cast<const FilterProjectNode&>(node);
-            return project_schema(fused.columns(), child_schema(node, sources));
+            return project_schema(fused.columns(),
+                                  filtered_schema(fused.predicate(), child_schema(node, sources)));
         }
         case NodeKind::FilterUpdateProject: {
             // Project(Update(Filter(x))). The update's computed fields are only
@@ -1077,13 +1498,20 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // against the update's output -- so type the update first, then
             // project it.
             const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
-            SchemaInfo updated = update_schema(fused.fields(), {}, child_schema(node, sources));
+            SchemaInfo filtered = filtered_schema(fused.predicate(), child_schema(node, sources));
+            SchemaInfo updated = update_schema(fused.fields(), {}, std::move(filtered));
             return project_schema(fused.project_columns(), updated);
         }
-        // Head(Filter(x)) / Tail(Filter(x)) / Head(Order(x)): row-subsetting
-        // only, so schema, time index and unique constraints pass through.
+        // Head(Filter(x)) / Tail(Filter(x)): row-subsetting only, so schema,
+        // time index and unique constraints pass through -- and the filter's
+        // proofs come through with them, as they do for the unfused shapes.
         case NodeKind::FilterHead:
+            return filtered_schema(static_cast<const FilterHeadNode&>(node).predicate(),
+                                   child_schema(node, sources));
         case NodeKind::FilterTail:
+            return filtered_schema(static_cast<const FilterTailNode&>(node).predicate(),
+                                   child_schema(node, sources));
+        // Head(Order(x)): no predicate, so nothing to prove.
         case NodeKind::TopK:
             return child_schema(node, sources);
 

@@ -631,3 +631,296 @@ TEST_CASE("schema: a declared expect carries the proofs a join cannot prove",
     const auto out = ibex::ir::infer_schema(declared, sources);
     CHECK(out.is_unique_within({"id"}));
 }
+
+// ── Nullability ──────────────────────────────────────────────────────────
+//
+// `Nullability::Never` is a proof, so every test below is really two
+// assertions: that the rule fires where it is argued, and that it does *not*
+// fire where the argument runs out. The second is the one that keeps a
+// downstream pass honest, so it is written out rather than left implied.
+
+namespace {
+
+using ibex::ir::Nullability;
+
+auto nulls_of(const SchemaInfo& schema, std::string_view name) -> Nullability {
+    const auto* field = schema.find(name);
+    REQUIRE(field != nullptr);
+    return field->nulls;
+}
+
+// `t` again, but with `a` declared null-free at the source -- the shape a
+// reader footer or an adapter supplies. `b` and `c` stay unproven, so every
+// test has both a proof to carry and a non-proof to preserve.
+auto nullable_sources() -> SourceSchemas {
+    return {{"t", SchemaInfo::known({
+                      {.name = "a", .type = ColumnType::Int64, .nulls = Nullability::Never},
+                      {.name = "b", .type = ColumnType::Float64},
+                      {.name = "c", .type = ColumnType::String},
+                  })}};
+}
+
+}  // namespace
+
+TEST_CASE("schema: a source's nullability survives the row-shaping operators", "[ir][schema]") {
+    for (const auto* query : {"t[order { a asc }];", "t[head 5];", "t[select { a, b }];",
+                              "t[rename { z = a }][rename { a = z }];"}) {
+        CAPTURE(query);
+        auto s = schema_of(query, nullable_sources());
+        REQUIRE(s.is_known());
+        CHECK(nulls_of(s, "a") == Nullability::Never);
+        CHECK(nulls_of(s, "b") == Nullability::Maybe);
+    }
+}
+
+TEST_CASE("schema: a filter proves the columns its predicate had to read", "[ir][schema]") {
+    // A null `b` makes `b > 0` null, and null is not true, so no row with a
+    // null `b` survives. `c` is untouched by the predicate and stays unproven.
+    auto s = schema_of("t[filter b > 0];", nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "b") == Nullability::Never);
+    CHECK(nulls_of(s, "c") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a filter's proof reaches through arithmetic and conjunction", "[ir][schema]") {
+    auto s = schema_of("t[filter b * 2 > 0 && c == \"x\"];", nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "b") == Nullability::Never);
+    CHECK(nulls_of(s, "c") == Nullability::Never);
+}
+
+TEST_CASE("schema: a filter proves nothing under a disjunction", "[ir][schema]") {
+    // A row surviving `b > 0 || c == "x"` may have satisfied either branch, so
+    // neither column is proved. Under `&&` both branches are true at once and
+    // both are proved -- the contrast is the whole rule.
+    auto disjunction = schema_of("t[filter b > 0 || c == \"x\"];", nullable_sources());
+    REQUIRE(disjunction.is_known());
+    CHECK(nulls_of(disjunction, "b") == Nullability::Maybe);
+    CHECK(nulls_of(disjunction, "c") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: is_not_null proves its column and is_null does not", "[ir][schema]") {
+    auto positive = schema_of("t[filter is_not_null(b)];", nullable_sources());
+    CHECK(nulls_of(positive, "b") == Nullability::Never);
+
+    // `is_null(b)` is true exactly for the rows this proof would exclude.
+    auto negative = schema_of("t[filter is_null(b)];", nullable_sources());
+    CHECK(nulls_of(negative, "b") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a filter proves nothing about a column a null-consumer read", "[ir][schema]") {
+    // `coalesce(b, 0) > 0` is true for a null `b`, so surviving says nothing
+    // about `b`. Reading the argument list without minding the callee would
+    // claim it does.
+    auto s = schema_of("t[filter coalesce(b, 0.0) > 0];", nullable_sources());
+    CHECK(nulls_of(s, "b") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a computed field is null-free when its operands are", "[ir][schema]") {
+    auto s = schema_of("t[update { lit = 5, from_proved = a * 2, from_unproved = b * 2 }];",
+                       nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "lit") == Nullability::Never);
+    CHECK(nulls_of(s, "from_proved") == Nullability::Never);
+    CHECK(nulls_of(s, "from_unproved") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: fill_null makes a column null-free whatever it replaced", "[ir][schema]") {
+    auto s = schema_of("t[update { filled = fill_null(b, 0.0), coalesced = coalesce(b, 0.0) }];",
+                       nullable_sources());
+    CHECK(nulls_of(s, "filled") == Nullability::Never);
+    CHECK(nulls_of(s, "coalesced") == Nullability::Never);
+}
+
+TEST_CASE("schema: an order-dependent call is not proved by its argument", "[ir][schema]") {
+    // `a` is null-free, but `lag(a)` is null in the first row regardless: the
+    // rule has to turn on the function's shape, not just its arguments.
+    auto s = schema_of("t[update { prev = lag(a) }];", nullable_sources());
+    CHECK(nulls_of(s, "prev") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: assigning over a column replaces its proof", "[ir][schema]") {
+    // `a` arrives proved; the update overwrites it with an unproven expression,
+    // and the proof must not outlive the values it described.
+    auto s = schema_of("t[update { a = b * 2 }];", nullable_sources());
+    CHECK(nulls_of(s, "a") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a grouped count is null-free and a grouped sum inherits", "[ir][schema]") {
+    auto s = schema_of("t[select { c, n = count(), sa = sum(a), sb = sum(b) }, by c];",
+                       nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "n") == Nullability::Never);
+    CHECK(nulls_of(s, "sa") == Nullability::Never);
+    CHECK(nulls_of(s, "sb") == Nullability::Maybe);
+    // The key column holds one of the values it grouped, so it carries that
+    // column's own proof -- here, none.
+    CHECK(nulls_of(s, "c") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: an ungrouped aggregate proves only its count", "[ir][schema]") {
+    // The single row is emitted even over an empty input, where `min(a)` has
+    // no value to return however null-free `a` is. `count()` is 0 there, which
+    // is a value.
+    auto s = schema_of("t[select { n = count(), m = min(a) }];", nullable_sources());
+    CHECK(nulls_of(s, "n") == Nullability::Never);
+    CHECK(nulls_of(s, "m") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: an inner join proves its key columns null-free", "[ir][schema]") {
+    // Under the default `nulls never` a null key matches nothing, so every row
+    // that survived an inner join has a value in every key -- a proof neither
+    // input carried.
+    auto join = join_of({{"id", "id"}});
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                                                  {.name = "lv", .type = ColumnType::Float64}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                                                  {.name = "rv", .type = ColumnType::Float64}}));
+    auto s = ibex::ir::infer_schema(join, sources);
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "id") == Nullability::Never);
+    CHECK(nulls_of(s, "lv") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: `nulls equal` withdraws the inner join's key proof", "[ir][schema]") {
+    // The proof rests on a null key matching nothing. `nulls equal` is exactly
+    // the option that makes it match.
+    ibex::ir::JoinNode join(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                            std::vector<ibex::ir::JoinKey>{{"id", "id"}}, std::nullopt, {},
+                            ibex::ir::NullMatch::Equal);
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
+    join.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}));
+    CHECK(nulls_of(ibex::ir::infer_schema(join, sources), "id") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a left join withdraws every proof on its right side", "[ir][schema]") {
+    // This is the case the plan opened with: the right columns are null for
+    // every unmatched left row, whatever the right input's own schema said.
+    auto join = join_of({{"id", "id"}}, ibex::ir::JoinKind::Left);
+    auto sources = two_sources(
+        SchemaInfo::known(
+            {{.name = "id", .type = ColumnType::Int64, .nulls = Nullability::Never},
+             {.name = "lv", .type = ColumnType::Float64, .nulls = Nullability::Never}}),
+        SchemaInfo::known(
+            {{.name = "id", .type = ColumnType::Int64, .nulls = Nullability::Never},
+             {.name = "rv", .type = ColumnType::Float64, .nulls = Nullability::Never}}));
+    auto s = ibex::ir::infer_schema(join, sources);
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "lv") == Nullability::Never);
+    CHECK(nulls_of(s, "rv") == Nullability::Maybe);
+    // The same-name key folds into one column taken from the left, which is
+    // present in every row a left join emits.
+    CHECK(nulls_of(s, "id") == Nullability::Never);
+}
+
+TEST_CASE("schema: a right join's folded key needs both sides' proofs", "[ir][schema]") {
+    // A right join emits rows with no left row at all, and the executor fills
+    // the folded key column from the right key there. So the output column is
+    // null-free only if both sides' key columns are -- which is why it is not
+    // simply "a left column, and the left may be missing".
+    auto both = join_of({{"id", "id"}}, ibex::ir::JoinKind::Right);
+    auto proved =
+        two_sources(SchemaInfo::known(
+                        {{.name = "id", .type = ColumnType::Int64, .nulls = Nullability::Never},
+                         {.name = "lv", .type = ColumnType::Float64, .nulls = Nullability::Never}}),
+                    SchemaInfo::known(
+                        {{.name = "id", .type = ColumnType::Int64, .nulls = Nullability::Never}}));
+    auto s = ibex::ir::infer_schema(both, proved);
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "id") == Nullability::Never);
+    CHECK(nulls_of(s, "lv") == Nullability::Maybe);  // no left row for an unmatched right row
+
+    // Withdraw the right key's proof and the folded column loses its own.
+    auto one_sided = proved;
+    one_sided["right"] = SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}});
+    CHECK(nulls_of(ibex::ir::infer_schema(both, one_sided), "id") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a mapped key in a right join is an ordinary left column", "[ir][schema]") {
+    // Differently-named keys are both emitted natively, so nothing folds and
+    // nothing is filled from the other side: `left_id` is null for an unmatched
+    // right row like any other left column.
+    auto join = join_of({{"left_id", "right_id"}}, ibex::ir::JoinKind::Right);
+    auto sources = two_sources(
+        SchemaInfo::known(
+            {{.name = "left_id", .type = ColumnType::Int64, .nulls = Nullability::Never}}),
+        SchemaInfo::known(
+            {{.name = "right_id", .type = ColumnType::Int64, .nulls = Nullability::Never}}));
+    auto s = ibex::ir::infer_schema(join, sources);
+    CHECK(nulls_of(s, "left_id") == Nullability::Maybe);
+    CHECK(nulls_of(s, "right_id") == Nullability::Never);
+}
+
+TEST_CASE("schema: a semi join keeps the left's proofs and an anti join its key", "[ir][schema]") {
+    auto sources =
+        two_sources(SchemaInfo::known(
+                        {{.name = "id", .type = ColumnType::Int64},
+                         {.name = "lv", .type = ColumnType::Float64, .nulls = Nullability::Never}}),
+                    SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}));
+
+    // Semi emits whole left rows, and only matched ones -- so the key is proved
+    // for the same reason an inner join's is.
+    auto semi = join_of({{"id", "id"}}, ibex::ir::JoinKind::Semi);
+    auto s = ibex::ir::infer_schema(semi, sources);
+    CHECK(nulls_of(s, "id") == Nullability::Never);
+    CHECK(nulls_of(s, "lv") == Nullability::Never);
+
+    // Anti keeps the rows that matched *nothing*, which is what a null key
+    // does under `nulls never`. The key proof must not carry over.
+    auto anti = join_of({{"id", "id"}}, ibex::ir::JoinKind::Anti);
+    auto a = ibex::ir::infer_schema(anti, sources);
+    CHECK(nulls_of(a, "id") == Nullability::Maybe);
+    CHECK(nulls_of(a, "lv") == Nullability::Never);
+}
+
+TEST_CASE("schema: an ascription asserts nothing and erases nothing", "[ir][schema]") {
+    // There is no surface syntax to ascribe nullability with, so the ascription
+    // adds no proof -- but it is an identity on the data, so it must not take
+    // away the one its input arrived with either.
+    auto s = schema_of("t as DataFrame<{ a: Int64, b: Float64 }>;", nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "a") == Nullability::Never);
+    CHECK(nulls_of(s, "b") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a literal column is null-free", "[ir][schema]") {
+    auto s = schema_of("Table { x = [1, 2, 3] };");
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "x") == Nullability::Never);
+}
+
+TEST_CASE("schema: rbind keeps a proof only when every operand supports it", "[ir][schema]") {
+    // The result takes child[0]'s column set, but not its rows: `x` is null-free
+    // in the first operand and unproven in the second, and the concatenation
+    // holds both operands' rows. Riding the proof along with the schema, as the
+    // types do, would be wrong here.
+    auto s = schema_of(
+        "rbind(t, u);",
+        SourceSchemas{
+            {"t", SchemaInfo::known(
+                      {{.name = "x", .type = ColumnType::Int64, .nulls = Nullability::Never},
+                       {.name = "y", .type = ColumnType::Int64, .nulls = Nullability::Never}})},
+            {"u", SchemaInfo::known(
+                      {{.name = "x", .type = ColumnType::Int64},
+                       {.name = "y", .type = ColumnType::Int64, .nulls = Nullability::Never}})},
+        });
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "x") == Nullability::Maybe);
+    CHECK(nulls_of(s, "y") == Nullability::Never);
+}
+
+TEST_CASE("schema: a negation has one operand, and the fold must not read two", "[ir][schema]") {
+    // `LogicalExpr` carries a null `right` for `Not`. Handing both operands to
+    // the fold unconditionally segfaulted the transpiler on the first `!expr`
+    // it met -- caught by the parity suite, not by any unit test, because no
+    // unit test had put a negation in a computed field.
+    auto s =
+        schema_of("t[update { neg = !(b > 0), both = !(a > 0) && a > 1 }];", nullable_sources());
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "neg") == Nullability::Maybe);
+    CHECK(nulls_of(s, "both") == Nullability::Never);
+    // And in predicate position, where the proof rules read the same node.
+    CHECK(schema_of("t[filter !(b > 0)];", nullable_sources()).is_known());
+}

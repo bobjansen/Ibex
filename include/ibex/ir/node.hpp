@@ -448,12 +448,48 @@ enum class ColumnType : std::uint8_t {
     Timestamp,
 };
 
+/// Whether a column may hold nulls.
+///
+/// Like `SchemaInfo::unique_keys`, this is a *proof* carried by the schema, not
+/// a declaration to be trusted: `Never` means some operator's definition rules
+/// nulls out, never that a source promised it. So the lattice has only two
+/// points and only one of them says anything — `Maybe` is the ⊥ every rule
+/// falls back to, and no propagation rule may reach `Never` without an argument
+/// for it.
+enum class Nullability : std::uint8_t {
+    /// No proof; the column may hold nulls. Sound for any column whatever.
+    Maybe,
+    /// Proved null-free by construction.
+    Never,
+};
+
 /// One column in a schema. `type` is `nullopt` when the column is known to
 /// exist but its scalar type has not been inferred.
+///
+/// `nulls` has a default member initializer where `JoinExpect`'s fields
+/// deliberately have none, and for the reason that argument turns on: there,
+/// silently defaulting a field an aggregate initializer forgot dropped a policy
+/// the *user wrote*, so silence was the bug. Here the default is the bottom of
+/// the lattice — a site that forgets `nulls` claims nothing, which loses
+/// precision and can never lose soundness. Making every one of the ~20 existing
+/// `SchemaField{...}` sites restate "I have no proof" would be noise that
+/// obscures the few that do.
 struct SchemaField {
     std::string name;
     std::optional<ColumnType> type;
+    Nullability nulls = Nullability::Maybe;
+
+    /// True when this column is proved null-free.
+    [[nodiscard]] auto non_null() const noexcept -> bool { return nulls == Nullability::Never; }
 };
+
+/// The weaker of two proofs: `Never` only when both sides are `Never`. Used
+/// wherever a column's values can come from either of two places (a folded join
+/// key, a melted value column, an `rbind` operand).
+[[nodiscard]] constexpr auto weaker(Nullability a, Nullability b) noexcept -> Nullability {
+    return a == Nullability::Never && b == Nullability::Never ? Nullability::Never
+                                                              : Nullability::Maybe;
+}
 
 /// IR node types.
 /// See SPEC.md Section 1.3 (Mapping to Relational Algebra).

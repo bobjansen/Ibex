@@ -95,9 +95,36 @@ echo "Fixing includes, const-correctness, and designated initializers in: $*"
 # apply fixes computed from a broken/error-recovery AST (verified this
 # produces flatly wrong fixits, e.g. suggesting `const` on a variable
 # mutated two lines later, once the AST was built past a #include error).
+# Keep the checks that do not use ExprMutationAnalyzer together.  LLVM 23's
+# misc-const-correctness can segfault while recursively analyzing a function's
+# parameter mutations (currently triggered by interpreter.cpp).  Run it one
+# file at a time so one compiler bug neither prevents the other fixes nor
+# leaves us unable to identify the affected translation unit.
 "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
-    --checks='-*,misc-include-cleaner,misc-const-correctness,modernize-use-designated-initializers' \
+    --checks='-*,misc-include-cleaner,modernize-use-designated-initializers' \
     --fix "$@"
+
+skipped_const_files=()
+for f in "$@"; do
+    backup_file="$(mktemp)"
+    cp -- "$f" "$backup_file"
+    if "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
+        --checks='-*,misc-const-correctness' --fix "$f"; then
+        :
+    else
+        tidy_status=$?
+        # A crashing tidy process may have written only a subset of its fixes.
+        # Restore the pre-check version rather than leaving a half-applied edit.
+        cp -- "$backup_file" "$f"
+        if [[ "$tidy_status" -ge 128 ]]; then
+            skipped_const_files+=("$f")
+        else
+            rm -f -- "$backup_file"
+            exit "$tidy_status"
+        fi
+    fi
+    rm -f -- "$backup_file"
+done
 
 for f in "$@"; do
     # misc-include-cleaner's fixit inserts ibex/ headers quoted; the project
@@ -110,3 +137,7 @@ done
 
 echo "Done. Review the diff, then REBUILD AND RUN TESTS before committing —"
 echo "misc-const-correctness has real known false positives (see script header)."
+if [[ "${#skipped_const_files[@]}" -ne 0 ]]; then
+    echo "warning: misc-const-correctness crashed and was skipped for: ${skipped_const_files[*]}" >&2
+    echo "         Safe tidy fixes were still applied; retry those files with a newer clang-tidy." >&2
+fi

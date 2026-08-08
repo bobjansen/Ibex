@@ -16,6 +16,7 @@ Checks: >
   -readability-implicit-bool-conversion,
   -misc-no-recursion,
   -readability-function-cognitive-complexity,
+  -readability-avoid-nested-conditional-operator,
   -modernize-use-trailing-return-type,
   -readability-identifier-length,
   -cppcoreguidelines-avoid-magic-numbers,

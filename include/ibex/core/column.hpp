@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/compiler.hpp>
 #include <ibex/core/time_zone.hpp>
 
 #include <algorithm>
@@ -283,13 +284,13 @@ class Column {
     ///
     /// Prefer `reserve` + a hoisted `data()` pointer in a hot kernel regardless:
     /// that resolves the storage once instead of per row.
-    [[gnu::always_inline]] void push_back(const T& value) {
+    IBEX_ALWAYS_INLINE void push_back(const T& value) {
         if (is_external()) [[unlikely]] {
             detach_external_slow();
         }
         data_.push_back(value);
     }
-    [[gnu::always_inline]] void push_back(T&& value) {
+    IBEX_ALWAYS_INLINE void push_back(T&& value) {
         if (is_external()) [[unlikely]] {
             detach_external_slow();
         }
@@ -560,7 +561,7 @@ class Column {
     }
 
     // NOLINTNEXTLINE(readability-function-size)
-    [[gnu::noinline]] void detach_external_slow() {
+    IBEX_NOINLINE void detach_external_slow() {
         storage_type owned;
         owned.reserve(external_size_);
         if (external_size_ != 0) {

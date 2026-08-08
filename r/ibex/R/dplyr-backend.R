@@ -3,6 +3,7 @@
 
 ibex_dplyr_state <- new.env(parent = emptyenv())
 ibex_dplyr_state$binding_id <- 0L
+ibex_dplyr_state$default_session <- NULL
 
 ibex_quote_identifier <- function(name) {
     stopifnot(is.character(name), length(name) == 1L, !is.na(name))
@@ -123,15 +124,53 @@ new_ibex_tbl <- function(session, source, schema, generation, steps = list(), gr
     )
 }
 
+#' The shared session `ibex_tbl()` uses by default
+#'
+#' Tables can only be combined natively — joined, or referenced from the same
+#' query — when they live in the same Ibex session. `ibex_tbl()` therefore
+#' binds into one lazily created per-R-session default rather than calling
+#' [create_session()] afresh for every table, which would make even
+#' `inner_join(ibex_tbl(a), ibex_tbl(b))` fall back to local dplyr.
+#'
+#' Bindings in this session are held for the lifetime of the R session, so
+#' repeatedly wrapping large tables accumulates memory. Call
+#' [ibex_reset_default_session()] to drop them, or pass an explicit `session`
+#' to [ibex_tbl()] when you want an independent lifetime.
+#'
+#' @return An Ibex session handle.
+#' @export
+ibex_default_session <- function() {
+    session <- ibex_dplyr_state$default_session
+    if (is.null(session)) {
+        session <- create_session()
+        ibex_dplyr_state$default_session <- session
+    }
+    session
+}
+
+#' Discard the shared default Ibex session
+#'
+#' Invalidates every `ibex_tbl` created against the default session; the next
+#' call to [ibex_default_session()] creates a fresh one.
+#'
+#' @return Invisibly, `NULL`.
+#' @export
+ibex_reset_default_session <- function() {
+    ibex_dplyr_state$default_session <- NULL
+    invisible(NULL)
+}
+
 #' Create a lazy dplyr table backed by Ibex
 #'
 #' @param x An in-memory data frame, tibble, or nanoarrow-compatible table.
-#' @param session A persistent ibex session.
+#' @param session A persistent ibex session. Defaults to the shared session
+#'   returned by [ibex_default_session()], so that tables wrapped separately
+#'   can still be joined natively.
 #' @param name An optional display name. Native binding names are generated.
 #' @param fallback What to do when a verb cannot be translated: warn and collect,
 #'   error, or collect silently.
 #' @export
-ibex_tbl <- function(x, session = create_session(), name = NULL,
+ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
                      fallback = c("warn", "error", "collect")) {
     fallback_missing <- missing(fallback)
     if (inherits(x, "ibex_tbl")) {

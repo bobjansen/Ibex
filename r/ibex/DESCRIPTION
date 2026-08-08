@@ -26,3 +26,4 @@ SystemRequirements: C++23, an existing Ibex build tree
 License: AGPL-3 + file LICENSE
 Encoding: UTF-8
 LazyData: false
+RoxygenNote: 7.3.2

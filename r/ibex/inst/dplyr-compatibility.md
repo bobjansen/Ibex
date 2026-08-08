@@ -128,6 +128,13 @@ session without transferring values to R. `collect()` returns a tibble and
 reapplies current grouping metadata. Resetting the owning session changes its
 generation and invalidates every dependent lazy table with a dedicated error.
 
+`ibex_tbl()` binds into one shared per-R-session default, `ibex_default_session()`,
+because tables can only be combined natively when they live in the same
+session: a fresh session per table would make even
+`inner_join(ibex_tbl(a), ibex_tbl(b))` fall back to local dplyr. Bindings in
+it live as long as the R session, so `ibex_reset_default_session()` discards
+them, and an explicit `session =` argument opts out.
+
 Arbitrary R callbacks are deliberately absent from the MVP. An explicit,
 vectorized main-thread R UDF barrier remains a post-MVP design; no R object or
 closure is placed in `ExternRegistry` or invoked on an Ibex worker.

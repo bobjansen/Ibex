@@ -167,7 +167,8 @@ test_that("nullable aggregate semantics require explicit na.rm", {
 })
 
 test_that("reset_session invalidates dependent lazy tables", {
-    query <- ibex_tbl(tibble::tibble(x = 1:3))
+    # An explicit session, so resetting it cannot disturb the shared default.
+    query <- ibex_tbl(tibble::tibble(x = 1:3), session = create_session())
     reset_session(query$session)
     expect_error(dplyr::collect(query), class = "ibex_invalid_session")
 })
@@ -272,6 +273,31 @@ test_that("join nullability follows Ibex's rules, not the adapter's", {
     outer <- dplyr::left_join(lt, rt, by = "id", na_matches = "never")
     expect_identical(outer$schema$names, c("id", "lv", "rv"))
     expect_identical(outer$schema$nullable, c(TRUE, FALSE, TRUE))
+})
+
+test_that("separately wrapped tables share a session and join natively", {
+    # Every other join test threads one explicit session through both sides,
+    # which is not how a user writes it. Two bare `ibex_tbl()` calls used to
+    # land in two sessions and silently collect into local dplyr.
+    left <- tibble::tibble(id = c(1L, 2L, 3L), lv = c(1, 2, 3))
+    right <- tibble::tibble(id = c(2L, 3L), rv = c(10, 20))
+    lt <- ibex_tbl(left, fallback = "error")
+    rt <- ibex_tbl(right, fallback = "error")
+
+    expect_identical(lt$session, rt$session)
+    joined <- dplyr::inner_join(lt, rt, by = "id")
+    expect_s3_class(joined, "ibex_tbl")
+    expect_equal(
+        as.data.frame(dplyr::collect(joined)),
+        as.data.frame(dplyr::inner_join(left, right, by = "id"))
+    )
+})
+
+test_that("an explicit session still overrides the shared default", {
+    session <- create_session()
+    isolated <- ibex_tbl(tibble::tibble(x = 1:3), session = session)
+    expect_identical(isolated$session, session)
+    expect_false(identical(isolated$session, ibex_default_session()))
 })
 
 test_that("dplyr's default NA matching runs natively across every kind", {

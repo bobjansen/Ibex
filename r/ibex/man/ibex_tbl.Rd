@@ -4,14 +4,16 @@
 \usage{
 ibex_tbl(
   x,
-  session = create_session(),
+  session = ibex_default_session(),
   name = NULL,
   fallback = c("warn", "error", "collect")
 )
 }
 \arguments{
 \item{x}{An in-memory data frame, tibble, or nanoarrow-compatible table.}
-\item{session}{A persistent \code{ibex} session.}
+\item{session}{A persistent \code{ibex} session. Defaults to the shared
+session returned by \code{\link{ibex_default_session}}, so that separately
+wrapped tables can still be joined natively.}
 \item{name}{An optional display name. Native binding names are generated.}
 \item{fallback}{The policy for unsupported expressions. \code{"warn"} and
 \code{"collect"} collect the native prefix and replay the complete current

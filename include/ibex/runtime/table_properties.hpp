@@ -34,15 +34,11 @@ class KeyFate {
 
     /// Still a column under the same name, but an update rewrote its values. No
     /// longer a valid sort key; still a valid statement about the row layout.
-    [[nodiscard]] static auto overwritten() -> KeyFate {
-        return KeyFate{Kind::Overwritten, {}};
-    }
+    [[nodiscard]] static auto overwritten() -> KeyFate { return KeyFate{Kind::Overwritten, {}}; }
 
     /// Gone from the output — projected away, aggregated over, or otherwise not
     /// nameable in the result.
-    [[nodiscard]] static auto dropped() -> KeyFate {
-        return KeyFate{Kind::Dropped, {}};
-    }
+    [[nodiscard]] static auto dropped() -> KeyFate { return KeyFate{Kind::Dropped, {}}; }
 
     [[nodiscard]] auto is_kept() const noexcept -> bool { return kind_ == Kind::Kept; }
     [[nodiscard]] auto is_overwritten() const noexcept -> bool {

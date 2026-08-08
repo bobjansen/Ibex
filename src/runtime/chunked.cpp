@@ -4852,6 +4852,9 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
+    // We need AggSlotCore to be a POD
+
     /// Scatter-accumulate rows [begin, end) into `base`, indexed by
     /// `gids[row] * n_aggs_ + agg_i`. `base` is the caller's slot array —
     /// `flat_slots_` for the serial path, a worker-private array for the
@@ -5705,6 +5708,8 @@ class ChunkedAggregateOperator final : public Operator {
         return std::optional<Chunk>{std::move(out)};
     }
 
+    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
+
     struct SlotPlan {
         ir::AggFunc func = ir::AggFunc::Sum;
         ExprType kind = ExprType::Int;
@@ -6287,6 +6292,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
     }
 
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
+    // We need AggSlotCore to be a POD
+
     template <typename T>
     /// `scratch` is this aggregate's per-group scratch (2 doubles for the
     /// higher moments); it stays a parameter so this helper remains static and
@@ -6441,6 +6449,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         ++pending_rows_;
     }
+
+    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
 
     auto take_pending() -> Chunk {
         for (std::size_t i = 0; i < n_aggs_; ++i) {

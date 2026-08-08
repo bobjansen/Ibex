@@ -1682,7 +1682,7 @@ inline constexpr bool is_dense_column_v<Column<std::string>> = false;
 template <typename ColT>
 class ColumnAppender {
    public:
-    using value_type = typename ColT::value_type;
+    using value_type = ColT::value_type;
 
     ColumnAppender(ColT& column, std::size_t rows) : column_(&column) {
         if constexpr (is_dense_column_v<ColT>) {

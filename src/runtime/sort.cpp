@@ -169,8 +169,8 @@ void sort_key_index_slice(std::uint64_t* keys, std::size_t* idx, std::size_t n,
         for (std::size_t i = 0; i < n; ++i) {
             pairs[i] = {keys[i], idx[i]};
         }
-        std::stable_sort(pairs.begin(), pairs.end(),
-                         [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+        std::ranges::stable_sort(
+            pairs, [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
         for (std::size_t i = 0; i < n; ++i) {
             keys[i] = pairs[i].first;
             idx[i] = pairs[i].second;

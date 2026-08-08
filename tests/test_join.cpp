@@ -1870,6 +1870,54 @@ TEST_CASE("join: a null in a right column stays null through the join", "[join]"
     CHECK_FALSE((*entry->validity)[2]);
 }
 
+TEST_CASE("join: a null in a folded key stays null through the join", "[join]") {
+    // The same defect as the two above, in the one column they cannot reach:
+    // a folded key is built per-row from whichever side is present, and that
+    // loop copied the value without the validity that went with it. A key can
+    // be null in an emitted row -- an outer join keeps an unmatched row and
+    // its own null key -- so the null came back as a genuine 0.
+    runtime::Table lhs;
+    runtime::ValidityBitmap lv(2, true);
+    lv.set(1, false);
+    lhs.add_column("id", Column<std::int64_t>{1, 0}, lv);
+    lhs.add_column("lval", Column<std::int64_t>{10, 20});
+
+    runtime::Table rhs;
+    rhs.add_column("id", Column<std::int64_t>{9});
+    rhs.add_column("rval", Column<std::int64_t>{90});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    // Nothing matches, so all three rows are unmatched and each key comes from
+    // its own side -- including the left row whose key is null.
+    auto out = interpret_expr("lhs outer join rhs on { id };", tables);
+    REQUIRE(out.rows() == 3);
+    const auto* entry = out.find_entry("id");
+    REQUIRE(entry != nullptr);
+    REQUIRE(entry->validity.has_value());
+
+    // Find the row the null key belongs to by its payload: the join promises
+    // no order, and a null read as 0 would sort among the values.
+    const auto lvals = col_i64(out, "lval");
+    std::size_t null_row = out.rows();
+    for (std::size_t i = 0; i < lvals.size(); ++i) {
+        if (lvals[i] == 20) {
+            null_row = i;
+        }
+    }
+    REQUIRE(null_row < out.rows());
+    CHECK_FALSE((*entry->validity)[null_row]);
+
+    // And the two rows with real keys keep them.
+    for (std::size_t i = 0; i < out.rows(); ++i) {
+        if (i != null_row) {
+            CHECK((*entry->validity)[i]);
+        }
+    }
+}
+
 // ── `nulls equal` ─────────────────────────────────────────────────────────
 //
 // Every case pits a null against a GENUINE 0 in the same key column. That is

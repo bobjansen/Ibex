@@ -927,19 +927,34 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 // key list here would restate folding rules it owns.
                 const auto peer = plan[c].folded_peer_index;
                 if (peer.has_value() && !key_right_idx.empty()) {
-                    const ColumnValue* right_key_col = right.columns[*peer].column.get();
+                    const ColumnEntry& right_key = right.columns[*peer];
                     // Build per-row: pick from left or right depending on null.
                     // Key columns in outer joins are rare & small, so per-row is fine.
                     ColumnValue out_col = make_empty_like(*left.columns[c].column);
                     std::visit([total](auto& cc) { cc.reserve(total); }, out_col);
+                    // A key can be null in a row this join emitted: an
+                    // unmatched row keeps its own null key under `nulls never`,
+                    // and under `nulls equal` a null key even matches. Copying
+                    // the value alone would land the type's default here -- an
+                    // empty string, a zero -- so the source row's validity has
+                    // to come across with it.
+                    std::optional<ValidityBitmap> out_validity;
+                    const auto carry_null = [&](std::size_t row) {
+                        if (!out_validity.has_value()) {
+                            out_validity = ValidityBitmap(total, true);
+                        }
+                        out_validity->set(row, false);
+                    };
                     for (std::size_t i = 0; i < total; ++i) {
-                        if (left_idx[i] != kNull) {
-                            append_value(out_col, *left.columns[c].column, left_idx[i]);
-                        } else {
-                            append_value(out_col, *right_key_col, key_right_idx[i]);
+                        const bool from_left = left_idx[i] != kNull;
+                        const ColumnEntry& source = from_left ? left.columns[c] : right_key;
+                        const std::size_t row = from_left ? left_idx[i] : key_right_idx[i];
+                        append_value(out_col, *source.column, row);
+                        if (source.validity.has_value() && !(*source.validity)[row]) {
+                            carry_null(i);
                         }
                     }
-                    output.replace_column(c, std::move(out_col));
+                    output.replace_column(c, std::move(out_col), std::move(out_validity));
                 } else {
                     auto [col_out, validity] =
                         gather_entry(left.columns[c], left_idx.data(), total);

@@ -1015,13 +1015,20 @@ ibex_join_output_names <- function(x, y, keys, suffix) {
     )
 }
 
-# dplyr's verb names and Ibex's operators agree on three of the four; dplyr's
-# `full` is Ibex's `outer`. A lookup rather than a chain of `if`s so an
-# unmapped kind stops here instead of quietly rendering an inner join.
+# dplyr's verb names and Ibex's operators agree on all but one; dplyr's `full`
+# is Ibex's `outer`. A lookup rather than a chain of `if`s so an unmapped kind
+# stops here instead of quietly rendering an inner join.
 ibex_join_operator <- function(kind) {
     c(inner = " join ", left = " left join ",
-      right = " right join ", full = " outer join ")[[kind]]
+      right = " right join ", full = " outer join ",
+      semi = " semi join ", anti = " anti join ")[[kind]]
 }
+
+# `semi join` and `anti join` return the left columns only. That one fact is
+# what makes them the simplest kinds to translate -- no right columns means no
+# collision, so no suffix; the output schema is the input's; and the grouping
+# survives, because every column it names is still there under its own name.
+ibex_join_is_filtering <- function(kind) kind %in% c("semi", "anti")
 
 # dplyr's `na_matches` and Ibex's `nulls` clause ask the same question of
 # nulls, so the translation is a word swap -- with one exception, which is why
@@ -1088,7 +1095,10 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
         ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
     }
-    overlap <- intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
+    filtering <- ibex_join_is_filtering(kind)
+    overlap <- if (filtering) character() else {
+        intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
+    }
     if (length(overlap) && (length(suffix) != 2L || any(!nzchar(suffix)))) {
         ibex_unsupported("Native joins require two non-empty suffixes.")
     }
@@ -1096,12 +1106,25 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     # Only emit the clause when something actually collides: Ibex accepts it
     # either way, but a clause with nothing to rename is noise in the plan.
     step_suffix <- if (length(overlap)) suffix else NULL
-    schema <- ibex_join_schema(x, y, keys, step_suffix)
+    schema <- if (filtering) {
+        # The left columns, unchanged. Only the row count is unknown, and
+        # nullability is re-derived from the plan like every other verb's.
+        filtered <- x$schema
+        filtered$rows <- NA_real_
+        filtered
+    } else {
+        ibex_join_schema(x, y, keys, step_suffix)
+    }
     ibex_append_step(
         x,
         list(kind = "join", join_kind = kind, right = y, keys = keys,
              suffix = step_suffix, null_match = null_match),
-        schema = schema, groups = character(), ordering = NULL
+        # A filtering join drops rows and touches nothing else, so it keeps the
+        # grouping it was handed -- the columns naming it all survive. The
+        # other kinds cannot promise that, since a group column may be
+        # suffixed or gain nulls.
+        schema = schema, groups = if (filtering) x$groups else character(),
+        ordering = NULL
     )
 }
 
@@ -1169,5 +1192,36 @@ full_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", "
         dplyr::full_join(local, right, by = by, copy = copy, suffix = suffix, ...,
                          keep = keep, na_matches = na_matches, multiple = multiple,
                          relationship = relationship)
+    })
+}
+
+# The filtering joins take a smaller argument list than the mutating ones --
+# no `suffix`, `keep`, `multiple`, `unmatched` or `relationship`, because a
+# join that adds no columns and duplicates no rows has nothing for them to
+# say. `ibex_native_join()` still gates on all of them, so pass the values
+# that mean "default" rather than widening the signature past dplyr's.
+semi_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, ...,
+                               na_matches = c("na", "never")) {
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "semi_join", function() {
+        ibex_native_join(x, y, "semi", by, copy, suffix = NULL, ..., keep = NULL,
+                         na_matches = na_matches, multiple = "all",
+                         unmatched = "drop", relationship = NULL)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::semi_join(local, right, by = by, copy = copy, ..., na_matches = na_matches)
+    })
+}
+
+anti_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, ...,
+                               na_matches = c("na", "never")) {
+    na_matches <- match.arg(na_matches)
+    ibex_with_fallback(x, "anti_join", function() {
+        ibex_native_join(x, y, "anti", by, copy, suffix = NULL, ..., keep = NULL,
+                         na_matches = na_matches, multiple = "all",
+                         unmatched = "drop", relationship = NULL)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::anti_join(local, right, by = by, copy = copy, ..., na_matches = na_matches)
     })
 }

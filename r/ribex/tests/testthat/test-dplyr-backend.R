@@ -402,6 +402,84 @@ test_that("a full join's key is only as proved as the two sides together", {
     )
 })
 
+test_that("the filtering joins keep left rows, and keep each of them once", {
+    session <- create_session()
+    # The right side repeats a key that the left also repeats. A filtering join
+    # must not multiply rows the way an inner join on the same data would --
+    # that is the whole difference between the two.
+    left <- tibble::tibble(id = c("a", "b", NA, "c", "b"), lv = 1:5)
+    right <- tibble::tibble(id = c("b", "b", NA, "e"), rv = 1:4)
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    sorted <- function(data) {
+        data <- as.data.frame(dplyr::collect(data))
+        data[do.call(order, c(unname(as.list(data)), list(na.last = TRUE))), , drop = FALSE]
+    }
+
+    for (verb in c("semi_join", "anti_join")) {
+        join <- getExportedValue("dplyr", verb)
+        for (na_matches in c("na", "never")) {
+            actual <- join(lt, right, by = "id", na_matches = na_matches)
+            expect_s3_class(actual, "ibex_tbl")
+            # The left schema, unchanged: no right column, no suffix, no
+            # reordering. This is what makes these the simplest kinds.
+            expect_identical(actual$schema$names, c("id", "lv"))
+            expect_equal(
+                sorted(actual),
+                sorted(join(left, right, by = "id", na_matches = na_matches)),
+                ignore_attr = TRUE
+            )
+        }
+    }
+
+    # Named separately from the comparison above, because a semi join that
+    # duplicated `b` would agree with dplyr on every column and disagree only
+    # on how many rows carry them.
+    expect_identical(nrow(dplyr::collect(dplyr::semi_join(lt, right, by = "id"))), 3L)
+})
+
+test_that("a filtering join's key proof follows the rows it keeps", {
+    session <- create_session()
+    left <- tibble::tibble(id = c("a", NA), lv = 1:2)
+    right <- tibble::tibble(id = c("a", NA), rv = 1:2)
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    # A semi join keeps the rows that matched, and under `nulls never` a null
+    # key matches nothing -- so every surviving key is present.
+    expect_identical(
+        dplyr::semi_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(FALSE, FALSE)
+    )
+    # The anti join is the exact mirror and gets the opposite answer from the
+    # same rule: the rows it keeps are the ones that did not match, which is
+    # precisely where a null key ends up.
+    expect_identical(
+        dplyr::anti_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(TRUE, FALSE)
+    )
+    # `nulls equal` lets a null match, so the semi join's proof goes away.
+    expect_identical(
+        dplyr::semi_join(lt, right, by = "id", na_matches = "na")$schema$nullable,
+        c(TRUE, FALSE)
+    )
+})
+
+test_that("a filtering join keeps the grouping it was handed", {
+    session <- create_session()
+    left <- tibble::tibble(g = c("a", "a", "b"), x = 1:3)
+    right <- tibble::tibble(g = "a")
+    grouped <- dplyr::group_by(ibex_tbl(left, session = session, fallback = "error"), g)
+
+    # Unlike the mutating kinds, nothing here can rename a group column or add
+    # nulls to it, so the grouping survives -- as it does in dplyr.
+    expect_identical(dplyr::group_vars(dplyr::semi_join(grouped, right, by = "g")), "g")
+    expect_identical(dplyr::group_vars(dplyr::anti_join(grouped, right, by = "g")), "g")
+    expect_identical(
+        dplyr::group_vars(dplyr::semi_join(dplyr::group_by(left, g), right, by = "g")),
+        "g"
+    )
+})
+
 test_that("a captured scalar does not cost the plan its nullability proofs", {
     # The plan carries `^name` for a scalar bound at eval time rather than in
     # the session, so inference has to be told the name exists. Without that

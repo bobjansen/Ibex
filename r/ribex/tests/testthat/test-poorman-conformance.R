@@ -155,6 +155,18 @@ test_that("poorman-derived equality joins execute natively", {
     expect_s3_class(actual_left, "ibex_tbl")
     expect_equal(dplyr::collect(actual_left), expected_left)
 
+    # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — the filtering
+    # joins, which give that file its name.
+    expected_semi <- dplyr::semi_join(left, right, by = "id")
+    actual_semi <- dplyr::semi_join(ibex_tbl(left, fallback = "error"), right, by = "id")
+    expect_s3_class(actual_semi, "ibex_tbl")
+    expect_equal(dplyr::collect(actual_semi), expected_semi)
+
+    expected_anti <- dplyr::anti_join(left, right, by = "id")
+    actual_anti <- dplyr::anti_join(ibex_tbl(left, fallback = "error"), right, by = "id")
+    expect_s3_class(actual_anti, "ibex_tbl")
+    expect_equal(dplyr::collect(actual_anti), expected_anti)
+
     # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — default NA
     # matching, which was on the unsupported list until `nulls equal` landed.
     keyed <- tibble::tibble(g = c("a", NA, "b"), x = 1:3)

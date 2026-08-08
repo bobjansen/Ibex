@@ -575,11 +575,6 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     // equality below pair it with the nulls on the other side and nothing else.
     const bool skip_null_keys = null_match == ir::NullMatch::Never;
 
-    robin_hood::unordered_set<std::string> left_key_set;
-    for (const auto& key : keys) {
-        left_key_set.insert(key.left);
-    }
-
     const std::size_t n_left = left.rows();
     const std::size_t n_right = right.rows();
 
@@ -923,21 +918,16 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 }
             }
 
+            // The plan's left columns are its first `left.columns.size()`
+            // entries, in input order, so `plan[c]` describes `left.columns[c]`.
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                const bool is_key = left_key_set.contains(left.columns[c].name);
-                if (is_key && !key_right_idx.empty()) {
-                    // Key columns for unmatched right rows: fill from the right table.
-                    const auto mapped = std::ranges::find_if(keys, [&](const ir::JoinKey& key) {
-                        return key.left == left.columns[c].name && key.left == key.right;
-                    });
-                    const auto* right_key_col =
-                        mapped != keys.end() ? right.find(mapped->right) : nullptr;
-                    if (right_key_col == nullptr) {
-                        auto [col_out, validity] =
-                            gather_entry(left.columns[c], left_idx.data(), total);
-                        output.replace_column(c, std::move(col_out), std::move(validity));
-                        continue;
-                    }
+                // A folded key is the one output column two inputs feed, so it
+                // is the only one an unmatched right row can fill. The planner
+                // recorded which right column that is; recovering it from the
+                // key list here would restate folding rules it owns.
+                const auto peer = plan[c].folded_peer_index;
+                if (peer.has_value() && !key_right_idx.empty()) {
+                    const ColumnValue* right_key_col = right.columns[*peer].column.get();
                     // Build per-row: pick from left or right depending on null.
                     // Key columns in outer joins are rare & small, so per-row is fine.
                     ColumnValue out_col = make_empty_like(*left.columns[c].column);

@@ -643,9 +643,19 @@ least-maintained copy of the rule behind it:
   `JoinOutputColumn` now carries `is_key` and `folded_peer_index`, set by the
   planner while it still has both sides in hand.
 
-  The executor's `materialize` recovers the same fold by name and should read
-  the field too. Left alone here deliberately: it is a behaviour-preserving
-  change to the join path, which this plan's own rule says to land on its own.
+  The executor's `materialize` recovered the same fold by name and now reads
+  the field too — landed on its own, as a change to the join path should be.
+  The executor had been asking two questions to answer one: `left_key_set`
+  said "is this a key", then a search through `keys` for a `left == right`
+  entry said "did it fold", with a silent fall-back to a plain gather when the
+  second disagreed with the first. Only the conjunction ever mattered, and the
+  fold is exactly what `folded_peer_index` records, so both lookups and the
+  fall-back went with it. `left_key_set` had no other reader.
+
+  Worth noting what made the swap safe to check: the planner emits the left
+  input's columns first and in order, so `plan[c]` describes `left.columns[c]`
+  — the same correspondence `materialize`'s `replace_column(c, …)` already
+  relied on.
 
 Also from review: the rules moved out of `infer_schema` into `ir/nullability`
 (schema.cpp 1739 → 1409 lines), since they are a body of semantics rather than

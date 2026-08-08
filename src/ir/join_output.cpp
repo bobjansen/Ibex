@@ -4,7 +4,18 @@
 #include <ibex/ir/join_output.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <expected>
+#include <iterator>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

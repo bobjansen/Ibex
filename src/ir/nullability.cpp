@@ -7,9 +7,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <robin_hood.h>
 #include <string>
 #include <variant>
 #include <vector>
+
+#include "ibex/ir/join_output.hpp"
+#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

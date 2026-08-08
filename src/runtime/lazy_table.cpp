@@ -7,14 +7,20 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <robin_hood.h>
 #include <set>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "ibex/core/column.hpp"
+#include "ibex/ir/node.hpp"
+#include "ibex/runtime/interpreter.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -75,7 +81,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
 
 auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
     {
-        std::lock_guard lock(reader_pool_->mutex);
+        std::lock_guard const lock(reader_pool_->mutex);
         if (!reader_pool_->available.empty()) {
             auto reader = std::move(reader_pool_->available.back());
             reader_pool_->available.pop_back();
@@ -93,7 +99,7 @@ auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::stri
 }
 
 void LazyTable::release_reader(LazySourceReaderPtr reader) {
-    std::lock_guard lock(reader_pool_->mutex);
+    std::lock_guard const lock(reader_pool_->mutex);
     reader_pool_->available.push_back(std::move(reader));
 }
 
@@ -306,7 +312,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
-    Table& predicates = *predicates_res;
+    Table const& predicates = *predicates_res;
 
     const auto key =
         membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
@@ -550,7 +556,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
-    Table& predicates = *predicates_res;
+    Table const& predicates = *predicates_res;
 
     const auto key = int64_key_column(predicates, key_name);
     if (!key.has_value()) {

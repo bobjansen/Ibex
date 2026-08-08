@@ -114,8 +114,8 @@ TEST_CASE("join output plan: a suffixed name that still collides is an error",
     }
 
     SECTION("both suffixes are the same") {
-        const auto plan =
-            plan_of(JoinKind::Inner, {{"id", "id"}}, {"id", "val"}, {"id", "val"}, suffixes("", ""));
+        const auto plan = plan_of(JoinKind::Inner, {{"id", "id"}}, {"id", "val"}, {"id", "val"},
+                                  suffixes("", ""));
         REQUIRE_FALSE(plan.has_value());
         CHECK_THAT(plan.error(), ContainsSubstring("\"val\""));
     }

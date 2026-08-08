@@ -530,8 +530,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             // of execution.
             return std::unexpected("join key type mismatch: left '" + key.left + "' is " +
                                    format_expr_type(column_kind(*left_col)) + " but right '" +
-                                   key.right + "' is " +
-                                   format_expr_type(column_kind(*right_col)));
+                                   key.right + "' is " + format_expr_type(column_kind(*right_col)));
         }
         left_keys.push_back(left_col);
         right_keys.push_back(right_col);
@@ -628,7 +627,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         output.add_column(column.name, make_empty_like(*src));
         if (column.side == ir::JoinOutputSide::Right) {
             right_out.push_back(RightOut{.entry = &source.columns[column.source_index],
-                                        .out_index = output.columns.size() - 1});
+                                         .out_index = output.columns.size() - 1});
         }
     }
 
@@ -765,8 +764,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                 "`order` to it, or use `take any` if the choice does not matter";
         }
     }
-    const auto keep_lowest_index = take == ir::MatchSelection::First ||
-                                   take == ir::MatchSelection::Any;
+    const auto keep_lowest_index =
+        take == ir::MatchSelection::First || take == ir::MatchSelection::Any;
 
     /// Rewrite the emitted pairs so each left row keeps one match. Rows with no
     /// match (an outer join's padding) are left alone: there is nothing to
@@ -1520,9 +1519,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // Past 64 columns the bit is dropped and nulls would silently rejoin the
         // zero group, so that case is refused instead of answered wrongly.
         if (!skip_null_keys && has_null_eq_keys && left_eq_keys.size() > kMaxKeyColumns) {
-            return std::unexpected(
-                "asof join: `nulls equal` supports at most " + std::to_string(kMaxKeyColumns) +
-                " equality keys");
+            return std::unexpected("asof join: `nulls equal` supports at most " +
+                                   std::to_string(kMaxKeyColumns) + " equality keys");
         }
         const auto mark_nulls = [&](Key& key, const std::vector<const ValidityBitmap*>& validity,
                                     std::size_t row) {

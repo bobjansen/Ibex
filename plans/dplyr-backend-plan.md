@@ -2,7 +2,7 @@
 
 ## Status
 
-**Initial supported release implemented.** The `ribex` package now provides the
+**Initial supported release implemented.** The `ibex` package now provides the
 lazy source, terminal operations, schema inspection, core single-table verbs,
 `distinct`, `count`/`tally`, deterministic expression translation, and the
 three explicit fallback policies described below. `inner_join()` and
@@ -13,7 +13,7 @@ Phases 5 and 6.
 
 ## Summary
 
-Make Ibex a lazy dplyr backend hosted by `ribex`:
+Make Ibex a lazy dplyr backend hosted by `ibex`:
 
 ```r
 result <- ibex_tbl(trades) |>
@@ -46,13 +46,13 @@ optimizer barrier, is interpreter-only, and can never run on an Ibex worker.
 
 ### Decisions
 
-1. **Implement in `r/ribex`, not in core dplyr or dbplyr.** Add dplyr, rlang,
+1. **Implement in `r/ibex`, not in core dplyr or dbplyr.** Add dplyr, rlang,
    tidyselect, tibble, and vctrs as package dependencies only as each becomes
    necessary. Keep the C++ runtime usable without R.
 2. **Own an Ibex-specific lazy plan.** Do not render fake SQL or depend on
    dbplyr's SQL query nesting rules. Store enough schema and grouping metadata
    to implement dplyr methods and lower them directly to Ibex operations.
-3. **Render Ibex source for the MVP.** The current `ribex` execution API already
+3. **Render Ibex source for the MVP.** The current `ibex` execution API already
    accepts source strings. Keep a structured R-side plan until execution, then
    render once and submit it to the existing parser/lowerer. Do not concatenate
    user data into source text: captured R constants cross through scalar
@@ -93,7 +93,7 @@ optimizer barrier, is interpreter-only, and can never run on an Ibex worker.
 
 The current tree already supplies most of the expensive interop work:
 
-- `r/ribex/R/ribex.R` exposes one-shot and persistent-session evaluation.
+- `r/ibex/R/ibex.R` exposes one-shot and persistent-session evaluation.
 - R tables can be bound by copy, while supported nanoarrow objects are exported
   under an independent Arrow C Data ownership lease and adopted by Ibex.
 - Results can remain nanoarrow-backed or become ordinary R data frames.
@@ -105,7 +105,7 @@ The current tree already supplies most of the expensive interop work:
 Important gaps for a dplyr backend are:
 
 - no lazy R-side query object or dplyr S3 methods;
-- no stable `ribex` API to ask a session/table for its schema without executing
+- no stable `ibex` API to ask a session/table for its schema without executing
   a user-visible query;
 - no R-to-Ibex expression translation registry;
 - no dplyr-vs-Ibex semantic compatibility table;
@@ -136,7 +136,7 @@ printing.
 Minimum logical fields:
 
 ```text
-session          persistent ribex session external pointer
+session          persistent ibex session external pointer
 source           collision-proof Ibex binding name and source locality
 schema           ordered names, Ibex types, nullability, categorical/time metadata
 steps            immutable list of Ibex-specific lazy plan nodes
@@ -283,7 +283,7 @@ Before claiming support for a verb/function, record and test these dimensions:
 7. **Names.** Support non-syntactic and reserved names through quoted
    identifiers, plus dplyr name repair and join suffix behavior.
 8. **Time zones and categoricals.** Do not claim preservation beyond the
-   metadata actually retained by the native operators. Existing ribex timezone
+   metadata actually retained by the native operators. Existing ibex timezone
    propagation limitations remain visible until fixed independently.
 9. **Empty inputs.** Cover zero rows, zero selected columns, all-null columns,
    empty groups, and aggregates over empty data.
@@ -566,7 +566,7 @@ is part of the contract.
 - Exercise session schema inspection and stale-session diagnostics at the C API
   boundary.
 - Run existing parser/runtime/parity/e2e tests after any native API change.
-- Run `R CMD check` for `ribex` in CI against the supported R/dplyr versions.
+- Run `R CMD check` for `ibex` in CI against the supported R/dplyr versions.
 - Verify R callbacks under parallel-enabled native segments with a main-thread
   assertion or test hook.
 - Rebuild bundled plugins after any public runtime/header change.
@@ -595,7 +595,7 @@ multi-threaded Polars results.
 
 For the first backend release, update:
 
-- `r/ribex/README.md` with installation, lifecycle, fallback, and examples;
+- `r/ibex/README.md` with installation, lifecycle, fallback, and examples;
 - R help pages/vignettes with the supported verb/function matrix;
 - `README.md`, `docs/index.html`, and `docs/reference.html` with the dplyr entry
   point and the native-versus-R execution boundary; and

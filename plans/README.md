@@ -26,7 +26,7 @@ complete enough to move under `plans/done/`.
 | [execution-plan-seam-plan.md](execution-plan-seam-plan.md) | **Prerequisite groundwork landed.** Option B designates `build_operator()` as the parallel-island seam; one serial-only eligibility analysis replaced the test-only `PipelinePlan`. It is activated only when Phase 1 adds runtime executor options, so the current serial path has no extra analysis cost. |
 | [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md) | **Prereq for runtime-multithreading, before its Phase 0.** The master plan's parity gate needs schema/metadata/validity/categorical-backing comparison; the current `run_parity.sh` only `diff`s stdout and can see none of that. Build an in-process structured `Table`-vs-`Table` comparator + case matrix. |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |
-| [dplyr-backend-plan.md](dplyr-backend-plan.md) | Lazy `ribex` dplyr backend with typed expression translation, visible collect fallback, and a post-MVP main-thread vectorized R-UDF barrier |
+| [dplyr-backend-plan.md](dplyr-backend-plan.md) | Lazy `ibex` dplyr backend with typed expression translation, visible collect fallback, and a post-MVP main-thread vectorized R-UDF barrier |
 | [short-mode-plan.md](short-mode-plan.md) | Prefix-abbreviated golf mode (`t[s{s,p}]`) behind an explicit mode gate + formatter round-trip. Design sketch only |
 
 ## Complete — kept for reference

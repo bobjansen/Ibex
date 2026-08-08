@@ -3,7 +3,7 @@
 
 # Run supported dplyr pipelines with Ibex's native execution backend.
 library(dplyr)
-library(ribex)
+library(ibex)
 
 trades <- tibble(
     symbol = c("AAPL", "MSFT", "AAPL", "GOOG", "MSFT"),

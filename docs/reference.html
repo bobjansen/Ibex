@@ -170,7 +170,7 @@ tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">
           Drive Ibex from a notebook: the <code>ibex_ipython</code> extension
           binds pandas or Arrow tables into <code>%%ibex</code> cells and hands
           results back to pandas, <code>pyarrow</code>, or matplotlib; the
-          <code>ribex</code> package runs Ibex from pure R and returns a
+          <code>ibex</code> package runs Ibex from pure R and returns a
           <code>data.frame</code> ready for <code>ggplot2</code>. Both keep table
           bindings alive across cells.
         </p>
@@ -265,7 +265,7 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
           <span class="tour-tag">R Package</span>
           <h3>Use Ibex through native source or a lazy dplyr plan</h3>
           <p>
-            The in-repo <code>ribex</code> package evaluates inline Ibex queries
+            The in-repo <code>ibex</code> package evaluates inline Ibex queries
             or <code>.ibex</code> files from R. Results come back as a
             <code>data.frame</code> by default, so the common
             <code>ggplot2</code> path is immediate. For lower-level interop,
@@ -279,12 +279,12 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
             remain in local dplyr; R closures never execute on Ibex workers.
           </p>
           <p>
-            Like the Python notebook path, <code>ribex</code> supports a
+            Like the Python notebook path, <code>ibex</code> supports a
             persistent Ibex session, so large CSV or parquet loads can happen
             once and then be reused across later calls.
           </p>
           <p>
-            For literate reports, <code>ribex</code> can also register a real
+            For literate reports, <code>ibex</code> can also register a real
             <code>{ibex}</code> knitr engine inside R Markdown, so Ibex chunks
             and ordinary R / <code>ggplot2</code> chunks can share one named
             session.
@@ -299,10 +299,10 @@ train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>
         </div>
         <div class="tour-code">
 <pre><code><span class="cm"># R</span>
-library(ribex)
+library(ibex)
 library(ggplot2)
 
-ribex::register_knitr_engines()
+ibex::register_knitr_engines()
 
 sess &lt;- create_session(
   plugin_paths = c(<span class="str">"build-release/tools"</span>)

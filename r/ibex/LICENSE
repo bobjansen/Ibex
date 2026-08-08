@@ -4,6 +4,6 @@ at the repository root in ../../LICENSE; see ../../LICENSING.md for the Ibex
 copyright notice, commercial-licensing position, contributor terms, and the
 separate MIT notice for Poorman-derived test material.
 
-When distributing ribex independently of this repository, include the complete
+When distributing ibex independently of this repository, include the complete
 AGPLv3 license text and retain the Poorman MIT notice at
 inst/third-party/poorman/LICENSE.

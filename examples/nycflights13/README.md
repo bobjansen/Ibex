@@ -1,6 +1,6 @@
 # Ibex + R · nycflights13
 
-An integrated example of the [`ribex`](../../r/ribex) bindings, split the way a
+An integrated example of the [`ibex`](../../r/ibex) bindings, split the way a
 real project would split it:
 
 - [`flights.ibex`](flights.ibex) — every query, as named `let` bindings.
@@ -29,7 +29,7 @@ cmake -B build-release -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=
 cmake --build build-release
 
 # 2. install the bindings against it
-IBEX_ROOT=$PWD IBEX_BUILD_DIR=$PWD/build-release R CMD INSTALL r/ribex
+IBEX_ROOT=$PWD IBEX_BUILD_DIR=$PWD/build-release R CMD INSTALL r/ibex
 
 # 3. the R-side dependencies
 R -e 'install.packages(c("nycflights13", "ggplot2", "dplyr", "slider", "data.table"))'
@@ -44,7 +44,7 @@ Rscript examples/nycflights13/compare.R
 Plots land in `plots/`, `plots-dplyr/`, and `plots-datatable/` under the example
 directory; set `IBEX_EXAMPLE_OUT` to write them somewhere else.
 
-`ribex` finds the runtime through `IBEX_BUILD_DIR`, or by falling back to `build-release/tools` and `build/tools` under the working
+`ibex` finds the runtime through `IBEX_BUILD_DIR`, or by falling back to `build-release/tools` and `build/tools` under the working
 directory — which is why the script is meant to be run from the repository
 root.
 
@@ -166,11 +166,11 @@ to interpolate towards.
 
 ## Notes and gotchas this example works around
 
-- **Reinstall `ribex` after rebuilding Ibex.** The package statically links the
-  Ibex runtime, so a `ribex.so` older than `build-release/` runs old engine code
+- **Reinstall `ibex` after rebuilding Ibex.** The package statically links the
+  Ibex runtime, so a `ibex.so` older than `build-release/` runs old engine code
   and reports lowering errors for syntax the current REPL accepts. Rerun
-  `R CMD INSTALL r/ribex` whenever the C++ build changes.
-- **Run from the repository root, so renv picks the right `ribex`.** A second,
+  `R CMD INSTALL r/ibex` whenever the C++ build changes.
+- **Run from the repository root, so renv picks the right `ibex`.** A second,
   older copy may sit in the system library; loading that one is the same trap as
   above wearing a different hat.
 - **`update` and `select` cannot share one bracket.** Step 4 computes `age` in

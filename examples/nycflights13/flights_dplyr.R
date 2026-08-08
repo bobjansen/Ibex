@@ -20,6 +20,7 @@ suppressPackageStartupMessages({
     library(nycflights13)
     library(dplyr)
     library(slider)
+    library(ibex)
 })
 
 example_dir <- file.path("examples", "nycflights13")
@@ -27,6 +28,9 @@ out_dir <- Sys.getenv("IBEX_EXAMPLE_OUT", unset = file.path(example_dir, "plots-
 
 the_year <- 2013L
 min_flights <- 1000L
+
+flights <- ibex_tbl(flights)
+airlines <- ibex_tbl(airlines)
 
 # ── 1. Carrier delay ranking ─────────────────────────────────────────────────
 carriers <- flights |>

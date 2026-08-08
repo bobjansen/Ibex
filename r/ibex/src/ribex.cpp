@@ -36,7 +36,7 @@
 namespace {
 
 auto make_error(std::string_view stage, const std::string& message) -> std::string {
-    return "ribex " + std::string(stage) + ": " + message;
+    return "ibex " + std::string(stage) + ": " + message;
 }
 
 auto plugin_stem(const std::string& source_path) -> std::string {
@@ -132,7 +132,7 @@ auto load_source_plugins(const ibex::parser::Program& program,
 
         if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
             return std::unexpected(
-                "ribex does not yet support import declarations; use explicit extern fn "
+                "ibex does not yet support import declarations; use explicit extern fn "
                 "declarations with plugin_paths");
         }
     }
@@ -542,7 +542,7 @@ auto build_runtime_table_from_r(SEXP table_obj)
                 if (array == nullptr || schema == nullptr) {
                     return std::unexpected("invalid Arrow payload table binding");
                 }
-                if (Rf_inherits(table_obj, "ribex_arrow_export")) {
+                if (Rf_inherits(table_obj, "ibex_arrow_export")) {
                     return ibex::interop::adopt_table_from_arrow(array, *schema);
                 }
                 return ibex::interop::import_table_from_arrow(*array, *schema);
@@ -756,16 +756,16 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         if (std::holds_alternative<ibex::parser::ImportDecl>(stmt)) {
             return std::unexpected(
                 make_error("session error",
-                           "import declarations are not supported in ribex sessions; use "
+                           "import declarations are not supported in ibex sessions; use "
                            "explicit extern fn declarations"));
         }
         if (std::holds_alternative<ibex::parser::FunctionDecl>(stmt)) {
             return std::unexpected(make_error(
-                "session error", "function declarations are not supported in ribex sessions"));
+                "session error", "function declarations are not supported in ibex sessions"));
         }
         if (std::holds_alternative<ibex::parser::TupleLetStmt>(stmt)) {
             return std::unexpected(make_error(
-                "session error", "tuple let bindings are not supported in ribex sessions"));
+                "session error", "tuple let bindings are not supported in ibex sessions"));
         }
 
         ibex::parser::LowerContext context;
@@ -804,7 +804,7 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
             if (!lowered.has_value()) {
                 return std::unexpected(
                     make_error("lowering error",
-                               "ribex sessions currently support only table-valued let bindings: " +
+                               "ibex sessions currently support only table-valued let bindings: " +
                                    lowered.error().message));
             }
             auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
@@ -828,7 +828,7 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
         if (!lowered.has_value()) {
             return std::unexpected(
                 make_error("lowering error",
-                           "ribex sessions currently support only table-valued expressions: " +
+                           "ibex sessions currently support only table-valued expressions: " +
                                lowered.error().message));
         }
         auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
@@ -918,11 +918,11 @@ auto scalar_string(SEXP value, const char* what) -> std::expected<std::string, s
 
 auto session_from_sexp(SEXP session_sexp) -> std::expected<SessionState*, std::string> {
     if (TYPEOF(session_sexp) != EXTPTRSXP) {
-        return std::unexpected("'session' must be a ribex session");
+        return std::unexpected("'session' must be a ibex session");
     }
     auto* session = static_cast<SessionState*>(R_ExternalPtrAddr(session_sexp));
     if (session == nullptr) {
-        return std::unexpected("invalid ribex session");
+        return std::unexpected("invalid ibex session");
     }
     return session;
 }
@@ -1148,7 +1148,7 @@ void collect_buffer_addresses(const ArrowArray& array, const std::string& path,
 
 }  // namespace
 
-extern "C" SEXP ribex_c_arrow_buffer_addresses(SEXP array_sexp) {
+extern "C" SEXP ibex_c_arrow_buffer_addresses(SEXP array_sexp) {
     if (TYPEOF(array_sexp) != EXTPTRSXP || !Rf_inherits(array_sexp, "nanoarrow_array")) {
         Rf_error("'array' must be a nanoarrow_array");
     }
@@ -1171,7 +1171,7 @@ extern "C" SEXP ribex_c_arrow_buffer_addresses(SEXP array_sexp) {
     return result;
 }
 
-extern "C" SEXP ribex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
+extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
                                   SEXP scalars_sexp) {
     auto query = scalar_string(query_sexp, "'query'");
     if (!query.has_value()) {
@@ -1206,7 +1206,7 @@ extern "C" SEXP ribex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP 
     return *payload;
 }
 
-extern "C" SEXP ribex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
+extern "C" SEXP ibex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
                                   SEXP scalars_sexp) {
     auto path = scalar_string(path_sexp, "'path'");
     if (!path.has_value()) {
@@ -1246,7 +1246,7 @@ extern "C" SEXP ribex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP t
     return *payload;
 }
 
-extern "C" SEXP ribex_c_create_session(SEXP plugin_paths_sexp) {
+extern "C" SEXP ibex_c_create_session(SEXP plugin_paths_sexp) {
     auto plugin_paths = parse_plugin_paths(plugin_paths_sexp);
     if (!plugin_paths.has_value()) {
         Rf_error("%s", plugin_paths.error().c_str());
@@ -1256,15 +1256,15 @@ extern "C" SEXP ribex_c_create_session(SEXP plugin_paths_sexp) {
     session->plugin_paths = std::move(*plugin_paths);
     session->generation = next_session_generation.fetch_add(1, std::memory_order_relaxed);
 
-    SEXP ext = PROTECT(R_MakeExternalPtr(session, Rf_install("ribex_session"), R_NilValue));
+    SEXP ext = PROTECT(R_MakeExternalPtr(session, Rf_install("ibex_session"), R_NilValue));
     R_RegisterCFinalizerEx(ext, session_finalizer, TRUE);
-    SEXP cls = PROTECT(Rf_mkString("ribex_session"));
+    SEXP cls = PROTECT(Rf_mkString("ibex_session"));
     Rf_classgets(ext, cls);
     UNPROTECT(2);
     return ext;
 }
 
-extern "C" SEXP ribex_c_reset_session(SEXP session_sexp) {
+extern "C" SEXP ibex_c_reset_session(SEXP session_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
         Rf_error("%s", session.error().c_str());
@@ -1279,7 +1279,7 @@ extern "C" SEXP ribex_c_reset_session(SEXP session_sexp) {
     return session_sexp;
 }
 
-extern "C" SEXP ribex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
+extern "C" SEXP ibex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
         Rf_error("%s", session.error().c_str());
@@ -1295,7 +1295,7 @@ extern "C" SEXP ribex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
     return *info;
 }
 
-extern "C" SEXP ribex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
+extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
                                              SEXP lexical_names_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
@@ -1343,7 +1343,7 @@ extern "C" SEXP ribex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
     return out;
 }
 
-extern "C" SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,
+extern "C" SEXP ibex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,
                                           SEXP scalars_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
@@ -1380,7 +1380,7 @@ extern "C" SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SE
     return *payload;
 }
 
-extern "C" SEXP ribex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sexp,
+extern "C" SEXP ibex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sexp,
                                           SEXP scalars_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {

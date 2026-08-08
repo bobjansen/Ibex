@@ -9,7 +9,7 @@
 # Each case records its original tinytest file immediately above the adapted
 # assertion.  See tests/poorman-c9eb1f1.md for the pinned-source and license
 # record.  These tests intentionally use dplyr, rather than poorman, as their
-# oracle: ribex implements dplyr's contract, not poorman's independent one.
+# oracle: ibex implements dplyr's contract, not poorman's independent one.
 
 poorman_dplyr_oracle <- function(input, operation) {
     expected <- operation(tibble::as_tibble(input))
@@ -176,31 +176,31 @@ test_that("poorman-derived equality joins execute natively", {
     expect_equal(dplyr::collect(actual_na), expected_na)
 })
 
-test_that("poorman cases outside native ribex support are classified separately", {
+test_that("poorman cases outside native ibex support are classified separately", {
     input <- tibble::tibble(g = c("a", "a", "b"), x = 1:3, y = 4:6)
 
     # Source: inst/tinytest/test_group_by.R @ c9eb1f1 — computed grouping columns.
     expect_error(
         dplyr::group_by(ibex_tbl(input, fallback = "error"), bucket = x * 2L),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 
     # Source: inst/tinytest/test_distinct.R @ c9eb1f1 — .keep_all on a subset.
     expect_error(
         dplyr::distinct(ibex_tbl(input, fallback = "error"), g, .keep_all = TRUE),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 
     # Source: inst/tinytest/test_slice.R @ c9eb1f1 — tail slicing.
     expect_error(
         dplyr::slice_tail(ibex_tbl(input, fallback = "error"), n = 1L),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 
     # Source: inst/tinytest/test_joins_filter.R @ c9eb1f1 — `keep = TRUE` asks
     # for both key columns, which Ibex's folded key has no spelling for.
     expect_error(
         dplyr::inner_join(ibex_tbl(input, fallback = "error"), input, by = "g", keep = TRUE),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })

@@ -17,7 +17,8 @@ collection and `fallback = "collect"` makes it silent.
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and the remaining kinds (`semi_join`, `anti_join`, `cross_join`, `nest_join`) |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and the remaining kinds (`cross_join`, `nest_join`) |
+| filtering joins | `semi_join` and `anti_join` under the same key and `na_matches` rules; they return the left columns unchanged and keep the input's grouping, since no column can be renamed or gain nulls | `copy = TRUE` and the key restrictions above |
 
 ## Types and missing values
 
@@ -51,9 +52,12 @@ does), an inner join proves its key columns, and a left join withdraws every
 proof on its right side. The key column a join folds is the interesting one:
 it holds a value from whichever side turned up, so it keeps its proof exactly
 when every side whose unmatched rows survive has one — both for `full_join`,
-only the right for `right_join`, only the left for `left_join`. A plan the
-core cannot describe falls back to assuming every column nullable, which only
-ever costs native execution.
+only the right for `right_join`, only the left for `left_join`. The filtering
+joins answer the same question from opposite ends: under `na_matches =
+"never"` a null key matches nothing, so `semi_join` — which keeps the rows
+that matched — proves its key, while `anti_join` keeps exactly the rows that
+did not and cannot. A plan the core cannot describe falls back to assuming
+every column nullable, which only ever costs native execution.
 
 All-null and empty inputs can still differ: Ibex returns null
 for value-bearing aggregates, while some R aggregates return a sentinel such as

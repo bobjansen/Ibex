@@ -538,12 +538,30 @@ void collect_filtered_non_null_refs(const Expr& predicate,
             if (logical->right != nullptr) {
                 collect_filtered_non_null_refs(*logical->right, out);
             }
+            return;
         }
-        // `||` proves only what both branches prove and `!` proves nothing at
-        // all -- `!(x > 0)` is true for no null `x`, but it is *false* for one,
-        // which is not a row this filter keeps either way. Both are left
-        // unclaimed rather than intersected: an under-claim costs precision, and
-        // the intersection is worth writing when something needs it.
+        if (logical->op == LogicalOp::Not) {
+            // `!` proves nothing in general -- `!(x > 0)` is true for no null
+            // `x`, but it is *false* for one, and neither is a row this filter
+            // keeps. The exception is a null test, which is total: `!is_null(x)`
+            // is true exactly when `x` is present, so negating one is the same
+            // statement as the other spelled directly.
+            //
+            // Worth the special case rather than left to the general rule,
+            // because it is not an exotic spelling: `filter(!is.na(x))` is how
+            // dplyr says this, and `is.na()` lowers to `is_null()`, so a
+            // frontend cannot reach `is_not_null` from the idiom its users
+            // actually write.
+            if (const auto* inner = std::get_if<IsNullExpr>(&logical->left->node)) {
+                if (!inner->negated) {
+                    collect_null_propagating_refs(*inner->operand, out);
+                }
+            }
+            return;
+        }
+        // `||` proves only what both branches prove. Left unclaimed rather than
+        // intersected: an under-claim costs precision, and the intersection is
+        // worth writing when something needs it.
         return;
     }
     if (const auto* is_null = std::get_if<IsNullExpr>(&predicate.node)) {

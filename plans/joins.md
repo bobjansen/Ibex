@@ -540,8 +540,7 @@ than left to whoever reads the code.
 
 ### Schema nullability
 
-Status: the core is authoritative; the adapters have not yet been moved onto
-it.
+Status: implemented, and `ribex` is on it.
 
 - ~~Add a nullability flag to `ir::SchemaField`.~~ `Nullability::{Maybe,
   Never}`, with `Maybe` as ⊥. Like `unique_keys` it is a *proof*, not a
@@ -562,8 +561,38 @@ it.
   ascription is an identity on the data, so a proof from below is still true of
   the rows that come out. The two questions are separate and answering the
   first with "no" is not a reason to answer the second with it.
-- **Let adapters defer to the core once the core is authoritative.** Not done.
-  `ribex` still maintains its own tracking.
+- ~~**Let adapters defer to the core once the core is authoritative.**~~ Done
+  for `ribex`. `ribex_c_session_infer_schema` lowers a rendered lazy plan and
+  runs `infer_schema` over it without executing anything, and every verb takes
+  its `nullable` vector from there — one call in `ibex_append_step`, which every
+  verb already routes through, replacing a nullability rule restated per verb.
+
+  The session's own tables ground it: a materialized column with no validity
+  bitmap holds no nulls, which is the same fact `session_table_info` already
+  reported, so the two cannot disagree. Total by construction — an unlowerable
+  plan or an Unknown schema returns `NULL` and the adapter assumes every column
+  nullable, which is what it assumed before it asked.
+
+  The gain is not only that one implementation replaced two. The adapter's
+  rules were per-verb and could not see a plan: it knew a left join nulls its
+  right side (it restated exactly that), but it could not know that an inner
+  join *proves* its keys, or that a `filter` proves the columns its predicate
+  read. Those land as native execution, because the aggregate gate reads
+  nullability: `filter(!is.na(x)) |> summarise(mean(x))` needed an explicit
+  `na.rm = TRUE` before and now runs without one.
+
+  That idiom also forced a core rule. `is.na()` lowers to `is_null()`, so dplyr
+  writes `!is_null(x)` where Ibex would write `is_not_null(x)`, and `!` proves
+  nothing in general. A null test is total, though, so negating one is the same
+  statement spelled the other way — `collect_filtered_non_null_refs` now says
+  so. Worth doing in the core rather than by special-casing the translation: no
+  frontend can reach `is_not_null` from the idiom its users actually write.
+
+  What stays in R is expression-level nullability during translation
+  (`left$nullable || right$nullable` and the `coalesce` rule in
+  `ibex_expr_result`). The core has no entry point for an expression in
+  isolation, only for a plan; the leaves those rules start from are now the
+  core's.
 
 Where a proof comes from, since a flag nothing produces is a flag nothing can
 consume. Sources declare one (a reader footer, an adapter); a literal column
@@ -621,9 +650,9 @@ test added in both predicate and computed-field position.
    declared 1:1 was to unlock turned out to be reached dynamically already;
    only build-side biasing remains, as an optimizer item rather than a contract
    one.
-8. ~~**Schema nullability**~~ — done in the core. The adapters still track it
-   themselves; moving them onto it is the next piece, and it is what unblocks
-   `right_join()` / `full_join()` in ribex.
+8. ~~**Schema nullability**~~ — done, in the core and in `ribex`. The outer-join
+   rules it was blocking are in place, so `right_join()` / `full_join()` are
+   now reachable in the adapter.
 9. **Time-domain joins** — the largest new feature, and the one most worth
    designing slowly.
 
@@ -649,6 +678,8 @@ Currently native: `inner_join()` and `left_join()`, same-name keys,
 - **Row order.** dplyr guarantees left order; Ibex does not. The adapter adds
   an explicit `order` to the plan it builds. Any dplyr guarantee Ibex declines
   is the adapter's to reconstruct.
+- ~~**Nullability.**~~ Done: the backend asks the core for it rather than
+  restating its rules per verb. See the schema-nullability package.
 - **`na_matches = "na"`.** Maps to the explicit `Equal` policy once it exists.
 - **Grouping.** Preserve `x$groups` for joins retaining the left columns; remap
   a group name if its column takes a suffix.

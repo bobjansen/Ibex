@@ -202,7 +202,45 @@ ibex_append_step <- function(x, step, schema = x$schema, groups = x$groups,
     x$groups <- groups
     x$ordering <- ordering
     x$captured_scalars <- scalars
+    x$schema$nullable <- ibex_infer_nullable(x)
     x
+}
+
+# Ask Ibex which columns of the plan built so far can hold nulls.
+#
+# Every verb routes through `ibex_append_step`, so this is the single place the
+# answer is produced -- deliberately, because the alternative is what this
+# replaced: a nullability rule written out again in each verb, which is a second
+# implementation of the core's propagation that can only ever drift from it.
+# Ibex's rules are also strictly better than the ones that were here, since they
+# see the whole plan rather than one step: a `filter` proves the columns its
+# predicate had to read, and an inner join proves its key columns, neither of
+# which a per-verb rule can express.
+#
+# Nothing here can fail loudly. Ibex returns NULL for a plan it cannot lower or
+# whose schema is Unknown, and every column is then assumed nullable, which is
+# what the adapter assumed before asking.
+ibex_infer_nullable <- function(x) {
+    unproven <- rep(TRUE, length(x$schema$names))
+    inferred <- tryCatch(
+        .Call(
+            ribex_c_session_infer_schema,
+            x$session,
+            ibex_render_plan(x),
+            names(x$captured_scalars) %||% character()
+        ),
+        error = function(e) NULL
+    )
+    if (is.null(inferred)) {
+        return(unproven)
+    }
+    # Align by name rather than by position, and keep the conservative answer
+    # for anything Ibex did not describe. The two column lists agree today; a
+    # disagreement means the adapter and the core read the plan differently,
+    # and silently pairing them off by index would turn that into a wrong
+    # proof about the wrong column.
+    pos <- match(x$schema$names, inferred$names)
+    ifelse(is.na(pos), TRUE, inferred$nullable[pos])
 }
 
 ibex_render_fields <- function(fields) {
@@ -590,7 +628,7 @@ select.ibex_tbl <- function(.data, ...) {
         inputs <- c(missing_groups, inputs)
     }
     source_pos <- match(inputs, .data$schema$names)
-    schema <- lapply(.data$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[source_pos])
+    schema <- lapply(.data$schema[c("names", "types", "categorical", "timezone")], function(v) v[source_pos])
     schema$names <- selected
     schema$rows <- .data$schema$rows
     fields <- Map(function(out, input) list(name = out, code = ibex_quote_identifier(input)), selected, inputs)
@@ -648,7 +686,7 @@ relocate.ibex_tbl <- function(.data, ..., .before = NULL, .after = NULL) {
     }
     order <- append(remaining, moved, after = insert_at - 1L)
     fields <- lapply(.data$schema$names[order], function(name) list(name = name, code = ibex_quote_identifier(name)))
-    schema <- lapply(.data$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[order])
+    schema <- lapply(.data$schema[c("names", "types", "categorical", "timezone")], function(v) v[order])
     schema$rows <- .data$schema$rows
     ibex_append_step(.data, list(kind = "project", fields = fields), schema = schema)
 }
@@ -693,12 +731,10 @@ ibex_mutate_impl <- function(.data, dots, keep = "all", before = NULL, after = N
             if (is.na(pos)) {
                 schema$names <- c(schema$names, name)
                 schema$types <- c(schema$types, translated$type)
-                schema$nullable <- c(schema$nullable, translated$nullable)
                 schema$categorical <- c(schema$categorical, FALSE)
                 schema$timezone <- c(schema$timezone, NA_character_)
             } else {
                 schema$types[[pos]] <- translated$type
-                schema$nullable[[pos]] <- translated$nullable
                 schema$categorical[[pos]] <- FALSE
                 schema$timezone[[pos]] <- NA_character_
             }
@@ -788,7 +824,7 @@ summarise.ibex_tbl <- function(.data, ..., .by = NULL, .groups = NULL) {
             value <- ibex_translate_quosure(quo, .data, "aggregate", state)
             if (!value$aggregate) ibex_unsupported("Native summarise expressions must contain an aggregate.", rlang::quo_get_expr(quo))
             if (!all(value$refs %in% .data$groups)) ibex_unsupported("summarise() references non-group columns outside aggregate calls.", rlang::quo_get_expr(quo))
-            list(name = name, code = value$code, type = value$type, nullable = value$nullable)
+            list(name = name, code = value$code, type = value$type)
         }, dots, names(dots))
         group_pos <- match(.data$groups, .data$schema$names)
         group_fields <- lapply(.data$groups, function(name) list(name = name, code = ibex_quote_identifier(name)))
@@ -796,7 +832,6 @@ summarise.ibex_tbl <- function(.data, ..., .by = NULL, .groups = NULL) {
         schema <- list(
             names = c(.data$groups, names(dots)),
             types = c(.data$schema$types[group_pos], vapply(translated, `[[`, character(1), "type")),
-            nullable = c(.data$schema$nullable[group_pos], vapply(translated, `[[`, logical(1), "nullable")),
             categorical = c(.data$schema$categorical[group_pos], rep(FALSE, length(translated))),
             timezone = c(.data$schema$timezone[group_pos], rep(NA_character_, length(translated))),
             rows = NA_real_
@@ -899,7 +934,7 @@ distinct.ibex_tbl <- function(.data, ..., .keep_all = FALSE) {
         inputs <- if (isTRUE(.keep_all)) selected else .data$schema$names[unname(positions)]
         if (!identical(selected, inputs)) ibex_unsupported("Computed or renamed distinct columns are not supported natively.")
         pos <- match(selected, .data$schema$names)
-        schema <- lapply(.data$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[pos])
+        schema <- lapply(.data$schema[c("names", "types", "categorical", "timezone")], function(v) v[pos])
         schema$rows <- NA_real_
         groups <- intersect(.data$groups, selected)
         ibex_append_step(.data, list(kind = "distinct", names = selected), schema, groups, NULL)
@@ -975,10 +1010,9 @@ ibex_join_output_names <- function(x, y, keys, suffix) {
 ibex_join_schema <- function(x, y, keys, kind, suffix) {
     right <- setdiff(y$schema$names, keys)
     names <- ibex_join_output_names(x, y, keys, suffix)
-    right_schema <- lapply(y$schema[c("names", "types", "nullable", "categorical", "timezone")], function(v) v[match(right, y$schema$names)])
+    right_schema <- lapply(y$schema[c("names", "types", "categorical", "timezone")], function(v) v[match(right, y$schema$names)])
     right_schema$names <- names$right
-    if (identical(kind, "left")) right_schema$nullable[] <- TRUE
-    schema <- lapply(x$schema[c("names", "types", "nullable", "categorical", "timezone")], identity)
+    schema <- lapply(x$schema[c("names", "types", "categorical", "timezone")], identity)
     schema$names <- names$left
     for (field in names(right_schema)) schema[[field]] <- c(schema[[field]], right_schema[[field]])
     schema$rows <- NA_real_

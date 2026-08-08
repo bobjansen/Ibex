@@ -763,12 +763,19 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     const auto keep_lowest_index =
         take == ir::MatchSelection::First || take == ir::MatchSelection::Any;
 
+    struct MutableJoinIndices {
+        std::vector<std::size_t>* left;
+        std::vector<std::size_t>* right;
+        std::vector<std::size_t>* key_right;
+    };
+
     /// Rewrite the emitted pairs so each left row keeps one match. Rows with no
     /// match (an outer join's padding) are left alone: there is nothing to
     /// choose between.
-    auto apply_take = [&](std::vector<std::size_t>& left_idx, std::vector<std::size_t>& right_idx,
-                          std::vector<std::size_t>&
-                              key_right_idx) {  // NOLINT(bugprone-easily-swappable-parameters)
+    auto apply_take = [&](MutableJoinIndices indices) {
+        auto& left_idx = *indices.left;
+        auto& right_idx = *indices.right;
+        auto& key_right_idx = *indices.key_right;
         const std::size_t total = left_idx.size();
         std::vector<std::size_t> chosen(n_left, kNull);
         bool any_choice = false;
@@ -884,7 +891,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             taken_left = in_left_idx;
             taken_right = in_right_idx;
             taken_key = in_key_right_idx;
-            apply_take(taken_left, taken_right, taken_key);
+            apply_take(MutableJoinIndices{
+                .left = &taken_left, .right = &taken_right, .key_right = &taken_key});
             left_idx_p = &taken_left;
             right_idx_p = &taken_right;
             key_right_idx_p = &taken_key;

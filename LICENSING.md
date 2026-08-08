@@ -29,16 +29,16 @@ contribution process.
 This is a project licensing notice, not legal advice.  Obtain counsel before
 selling commercial licenses or enforcing rights in a particular jurisdiction.
 
-## ribex and Poorman-derived material
+## ibex and Poorman-derived material
 
-The `r/ribex` package is part of Ibex and is AGPL-3.0-only except for the
+The `r/ibex` package is part of Ibex and is AGPL-3.0-only except for the
 Poorman-derived test material described below.  Its package metadata points to
 the repository-level [`LICENSE`](LICENSE).
 
-The Poorman-derived conformance-test material under `r/ribex/tests/` is
-separately attributed in `r/ribex/tests/poorman-c9eb1f1.md`.  The original
+The Poorman-derived conformance-test material under `r/ibex/tests/` is
+separately attributed in `r/ibex/tests/poorman-c9eb1f1.md`.  The original
 Poorman license is MIT and is preserved at
-`r/ribex/inst/third-party/poorman/LICENSE`:
+`r/ibex/inst/third-party/poorman/LICENSE`:
 
 - Copyright (c) 2020 Nathan Eastwood.
 - The MIT notice remains applicable to the Poorman-derived material.

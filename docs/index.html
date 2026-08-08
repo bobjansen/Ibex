@@ -157,7 +157,7 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
     <p class="section-label">R integration</p>
     <h2>Keep dplyr syntax; execute supported work in Ibex</h2>
     <p class="section-sub">
-      The <code>ribex</code> package provides a lazy <code>ibex_tbl</code>.
+      The <code>ibex</code> package provides a lazy <code>ibex_tbl</code>.
       Supported verbs build an immutable Ibex plan, <code>show_query()</code>
       reveals the generated source, and <code>collect()</code> returns a tibble
       through Arrow C Data.
@@ -181,7 +181,7 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
         </div>
         <div class="tour-code">
 <pre><code><span class="kw">library</span>(dplyr)
-<span class="kw">library</span>(ribex)
+<span class="kw">library</span>(ibex)
 
 query &lt;- ibex_tbl(trades, fallback = <span class="str">"error"</span>) |&gt;
   filter(price &gt; <span class="num">10</span>) |&gt;

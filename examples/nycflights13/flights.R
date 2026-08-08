@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 #  Ibex + R · nycflights13
 #
-#  An end-to-end example of the `ribex` bindings. The division of labour is the
+#  An end-to-end example of the `ibex` bindings. The division of labour is the
 #  point: every query lives in flights.ibex, R binds the data, sources that file
 #  once, and then pulls each named result out of the same session as a plain
 #  data.frame that goes straight into ggplot2. No Ibex source is embedded in
@@ -15,11 +15,11 @@
 #
 #  Requires: an existing build (build-release/ or build/) and
 #      R -e 'install.packages(c("nycflights13", "ggplot2"))'
-#      IBEX_ROOT=$PWD IBEX_BUILD_DIR=$PWD/build-release R CMD INSTALL r/ribex
+#      IBEX_ROOT=$PWD IBEX_BUILD_DIR=$PWD/build-release R CMD INSTALL r/ibex
 # ─────────────────────────────────────────────────────────────────────────────
 
 suppressPackageStartupMessages({
-    library(ribex)
+    library(ibex)
     library(nycflights13)
 })
 

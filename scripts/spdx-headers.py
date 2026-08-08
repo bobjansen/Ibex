@@ -28,8 +28,8 @@ BASENAMES = {"CMakeLists.txt"}
 
 # Prefix-matched, relative to the repository root.
 EXCLUDE = (
-    "r/ribex/inst/third-party/",            # Poorman MIT material
-    "r/ribex/tests/testthat/test-poorman-conformance.R",  # Poorman-derived, MIT
+    "r/ibex/inst/third-party/",            # Poorman MIT material
+    "r/ibex/tests/testthat/test-poorman-conformance.R",  # Poorman-derived, MIT
     "renv/",                                # vendored Posit code
 )
 

@@ -1,4 +1,4 @@
-useDynLib(ribex, .registration = TRUE)
+useDynLib(ibex, .registration = TRUE)
 
 export(create_session)
 export(default_plugin_paths)

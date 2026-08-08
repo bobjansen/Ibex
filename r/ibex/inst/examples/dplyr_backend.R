@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Bob Jansen
 
 library(dplyr)
-library(ribex)
+library(ibex)
 
 trades <- tibble(
     symbol = c("AAPL", "MSFT", "AAPL"),

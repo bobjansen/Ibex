@@ -5,7 +5,7 @@
 session_table_schema(session, name)
 }
 \arguments{
-\item{session}{A persistent \code{ribex} session.}
+\item{session}{A persistent \code{ibex} session.}
 \item{name}{The name of a resident table binding.}
 }
 \value{

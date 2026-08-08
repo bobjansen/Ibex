@@ -32,7 +32,7 @@ default_plugin_paths <- function() {
     candidates[dir.exists(candidates)]
 }
 
-as_ribex_result <- function(payload, format) {
+as_ibex_result <- function(payload, format) {
     if (is.null(payload)) {
         return(invisible(NULL))
     }
@@ -114,7 +114,7 @@ normalize_table_binding <- function(value) {
 
     structure(
         list(array = array_export, schema = schema_export),
-        class = "ribex_arrow_export"
+        class = "ibex_arrow_export"
     )
 }
 
@@ -130,11 +130,11 @@ normalize_table_bindings <- function(tables) {
 }
 
 create_session <- function(plugin_paths = default_plugin_paths()) {
-    .Call(ribex_c_create_session, plugin_paths)
+    .Call(ibex_c_create_session, plugin_paths)
 }
 
 reset_session <- function(session) {
-    invisible(.Call(ribex_c_reset_session, session))
+    invisible(.Call(ibex_c_reset_session, session))
 }
 
 session_eval <- function(session,
@@ -144,8 +144,8 @@ session_eval <- function(session,
                          format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_session_eval_ibex, session, query, normalize_table_bindings(tables), scalars)
-    as_ribex_result(payload, format)
+    payload <- .Call(ibex_c_session_eval_ibex, session, query, normalize_table_bindings(tables), scalars)
+    as_ibex_result(payload, format)
 }
 
 session_eval_file <- function(session,
@@ -155,8 +155,8 @@ session_eval_file <- function(session,
                               format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_session_eval_file, session, path, normalize_table_bindings(tables), scalars)
-    as_ribex_result(payload, format)
+    payload <- .Call(ibex_c_session_eval_file, session, path, normalize_table_bindings(tables), scalars)
+    as_ibex_result(payload, format)
 }
 
 eval_ibex <- function(query,
@@ -166,8 +166,8 @@ eval_ibex <- function(query,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(query), length(query) == 1L)
-    payload <- .Call(ribex_c_eval_ibex, query, plugin_paths, normalize_table_bindings(tables), scalars)
-    as_ribex_result(payload, format)
+    payload <- .Call(ibex_c_eval_ibex, query, plugin_paths, normalize_table_bindings(tables), scalars)
+    as_ibex_result(payload, format)
 }
 
 eval_file <- function(path,
@@ -177,8 +177,8 @@ eval_file <- function(path,
                       format = c("data.frame", "nanoarrow")) {
     format <- match.arg(format)
     stopifnot(is.character(path), length(path) == 1L)
-    payload <- .Call(ribex_c_eval_file, path, plugin_paths, normalize_table_bindings(tables), scalars)
-    as_ribex_result(payload, format)
+    payload <- .Call(ibex_c_eval_file, path, plugin_paths, normalize_table_bindings(tables), scalars)
+    as_ibex_result(payload, format)
 }
 
 get_knitr_session <- function(name, plugin_paths) {

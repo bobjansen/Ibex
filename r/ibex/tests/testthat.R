@@ -2,6 +2,6 @@
 # Copyright (C) 2026 Bob Jansen
 
 library(testthat)
-library(ribex)
+library(ibex)
 
-test_check("ribex")
+test_check("ibex")

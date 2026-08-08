@@ -8,7 +8,7 @@ information.
 
 Ibex is licensed under the GNU Affero General Public License, version 3 only
 (`AGPL-3.0-only`). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md),
-including the separate MIT attribution for Poorman-derived ribex test material.
+including the separate MIT attribution for Poorman-derived ibex test material.
 Small pull requests are welcome under the contribution terms in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -142,13 +142,13 @@ separate plotting system or a full standalone kernel.
 
 ## R and dplyr
 
-The in-repo `ribex` package includes a lazy dplyr backend for in-memory R and
+The in-repo `ibex` package includes a lazy dplyr backend for in-memory R and
 nanoarrow tables. Supported verbs remain an immutable Ibex plan until a
 terminal operation executes it:
 
 ```r
 library(dplyr)
-library(ribex)
+library(ibex)
 
 query <- ibex_tbl(trades, fallback = "error") |>
   filter(price > 10) |>
@@ -168,7 +168,7 @@ Arbitrary R closures never run as Ibex worker kernels. The package compatibility
 matrix documents the exact native verb, type, null, grouping, and ordering
 contract.
 
-See [`examples/ribex_dplyr.R`](examples/ribex_dplyr.R) for a complete runnable
+See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
 example with scalar capture, lazy translation, grouped aggregation, and
 collection back into R.
 

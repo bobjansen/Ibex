@@ -9,7 +9,7 @@ ibex_quote_identifier <- function(name) {
     if (grepl("\\$\\{", name)) {
         rlang::abort(
             paste0("Ibex cannot currently quote a column name containing '${': ", encodeString(name)),
-            class = "ribex_unsupported"
+            class = "ibex_unsupported"
         )
     }
     characters <- strsplit(name, "", fixed = TRUE)[[1]]
@@ -35,9 +35,9 @@ ibex_quote_string <- function(value) {
 ibex_new_binding_name <- function(session, kind = "source") {
     repeat {
         ibex_dplyr_state$binding_id <- ibex_dplyr_state$binding_id + 1L
-        candidate <- sprintf("__ribex_dplyr_%s_%08d", kind, ibex_dplyr_state$binding_id)
+        candidate <- sprintf("__ibex_dplyr_%s_%08d", kind, ibex_dplyr_state$binding_id)
         occupied <- tryCatch({
-            .Call(ribex_c_session_table_info, session, candidate)
+            .Call(ibex_c_session_table_info, session, candidate)
             TRUE
         }, error = function(e) FALSE)
         if (!occupied) {
@@ -48,7 +48,7 @@ ibex_new_binding_name <- function(session, kind = "source") {
 
 session_table_schema <- function(session, name) {
     stopifnot(is.character(name), length(name) == 1L, !is.na(name), nzchar(name))
-    info <- .Call(ribex_c_session_table_info, session, name)
+    info <- .Call(ibex_c_session_table_info, session, name)
     schema <- tibble::tibble(
         name = info$names,
         type = info$types,
@@ -79,7 +79,7 @@ ibex_schema_from_info <- function(info) {
 }
 
 ibex_table_info <- function(session, source) {
-    .Call(ribex_c_session_table_info, session, source)
+    .Call(ibex_c_session_table_info, session, source)
 }
 
 ibex_assert_live <- function(x) {
@@ -89,14 +89,14 @@ ibex_assert_live <- function(x) {
             rlang::abort(
                 "This ibex_tbl was invalidated because its session was reset or finalized.",
                 parent = e,
-                class = "ribex_invalid_session"
+                class = "ibex_invalid_session"
             )
         }
     )
     if (!identical(as.numeric(info$generation), as.numeric(x$generation))) {
         rlang::abort(
             "This ibex_tbl was invalidated because its session was reset.",
-            class = "ribex_invalid_session"
+            class = "ibex_invalid_session"
         )
     }
     invisible(info)
@@ -126,7 +126,7 @@ new_ibex_tbl <- function(session, source, schema, generation, steps = list(), gr
 #' Create a lazy dplyr table backed by Ibex
 #'
 #' @param x An in-memory data frame, tibble, or nanoarrow-compatible table.
-#' @param session A persistent ribex session.
+#' @param session A persistent ibex session.
 #' @param name An optional display name. Native binding names are generated.
 #' @param fallback What to do when a verb cannot be translated: warn and collect,
 #'   error, or collect silently.
@@ -227,7 +227,7 @@ ibex_infer_nullable <- function(x) {
     unproven <- rep(TRUE, length(x$schema$names))
     inferred <- tryCatch(
         .Call(
-            ribex_c_session_infer_schema,
+            ibex_c_session_infer_schema,
             x$session,
             ibex_render_plan(x),
             names(x$captured_scalars) %||% character()
@@ -364,7 +364,7 @@ collect.ibex_tbl <- function(x, ..., format = c("tibble", "data.frame", "nanoarr
             format = native_format
         ),
         error = function(e) {
-            rlang::abort("Ibex failed while executing a lazy dplyr query.", parent = e, class = "ribex_execution_error")
+            rlang::abort("Ibex failed while executing a lazy dplyr query.", parent = e, class = "ibex_execution_error")
         }
     )
     if (identical(format, "nanoarrow")) return(result)
@@ -411,7 +411,7 @@ pull.ibex_tbl <- function(.data, var = -1, name = NULL, ...) {
 
 ibex_unsupported <- function(message, expr = NULL) {
     label <- if (is.null(expr)) NULL else rlang::expr_text(expr)
-    rlang::abort(message, class = "ribex_unsupported", expression = label)
+    rlang::abort(message, class = "ibex_unsupported", expression = label)
 }
 
 ibex_fallback <- function(x, verb, condition, replay) {
@@ -420,20 +420,20 @@ ibex_fallback <- function(x, verb, condition, replay) {
         rlang::abort(
             paste0("Cannot translate `", expression, "` in ", verb, "(). Call collect() explicitly or choose a collection fallback."),
             parent = condition,
-            class = "ribex_translation_error"
+            class = "ibex_translation_error"
         )
     }
     if (identical(x$fallback_policy, "warn")) {
         rlang::warn(
             paste0("Ibex cannot translate `", expression, "` in ", verb, "(); collected native prefix and continuing in local dplyr."),
-            class = "ribex_fallback_warning"
+            class = "ibex_fallback_warning"
         )
     }
     replay(collect(x))
 }
 
 ibex_with_fallback <- function(x, verb, native, replay) {
-    tryCatch(native(), ribex_unsupported = function(e) ibex_fallback(x, verb, e, replay))
+    tryCatch(native(), ibex_unsupported = function(e) ibex_fallback(x, verb, e, replay))
 }
 
 ibex_capture_scalar <- function(state, value, expr) {
@@ -445,7 +445,7 @@ ibex_capture_scalar <- function(state, value, expr) {
         !inherits(value, c("Date", "POSIXct"))) {
         ibex_unsupported("Captured value has no Ibex scalar representation.", expr)
     }
-    name <- sprintf("__ribex_dplyr_scalar_%04d", length(state$scalars) + 1L)
+    name <- sprintf("__ibex_dplyr_scalar_%04d", length(state$scalars) + 1L)
     state$scalars[[name]] <- value
     list(code = paste0("^", name), type = if (inherits(value, "Date")) "Date" else if (inherits(value, "POSIXct")) "Timestamp" else if (is.logical(value)) "Bool" else if (is.integer(value)) "Int64" else if (is.double(value)) "Float64" else "String", nullable = FALSE, aggregate = FALSE, refs = character())
 }
@@ -642,6 +642,35 @@ ibex_select_positions <- function(x, quos, strict = TRUE) {
     tidyselect::eval_select(rlang::expr(c(!!!quos)), data = ibex_schema_proxy(x), strict = strict)
 }
 
+# Resolve a `.by` argument to column names, or NULL when it was not supplied.
+#
+# `.by` is per-verb grouping: it names the keys for this one call and leaves the
+# result ungrouped, where `group_by()` sets grouping that persists. Ibex has one
+# grouping construct -- the `by` clause on the bracket a verb becomes -- so the
+# two spellings translate identically and differ only in what the *frontend*
+# records afterwards.
+#
+# The three rejections are dplyr's own, and they are raised rather than routed
+# through the fallback: each is a mistake in the call, not a limit of the
+# translation, so falling back would collect the whole input only for local
+# dplyr to raise the same error against it.
+ibex_resolve_by <- function(x, by) {
+    if (rlang::quo_is_null(by)) {
+        return(NULL)
+    }
+    if (length(x$groups)) {
+        rlang::abort("Can't supply `.by` when `.data` is a grouped data frame.")
+    }
+    positions <- tidyselect::eval_select(by, data = ibex_schema_proxy(x))
+    names <- x$schema$names[unname(positions)]
+    # `eval_select` accepts `c(new = old)`; dplyr does not allow it here, and a
+    # silent rename would put a name in the output that the plan never binds.
+    if (!identical(names(positions), names)) {
+        rlang::abort("Can't rename variables in this context.")
+    }
+    unique(names)
+}
+
 select.ibex_tbl <- function(.data, ...) {
     quos <- rlang::enquos(...)
     positions <- ibex_select_positions(.data, quos)
@@ -721,8 +750,13 @@ filter.ibex_tbl <- function(.data, ..., .by = NULL, .preserve = FALSE) {
     dots <- rlang::enquos(...)
     by <- rlang::enquo(.by)
     replay <- function(local) dplyr::filter(local, !!!dots, .by = !!by, .preserve = .preserve)
+    # `.by` is resolved for its checks, then discarded: a predicate with no
+    # aggregate in it asks the same question of a row whatever group the row is
+    # in, so grouping cannot change which rows survive. The aggregate case is
+    # the one where `.by` would matter, and native filter refuses it below.
+    ibex_resolve_by(.data, by)
     ibex_with_fallback(.data, "filter", function() {
-        if (!rlang::quo_is_null(by) || isTRUE(.preserve)) ibex_unsupported("`.by` and `.preserve = TRUE` are not native filter options.")
+        if (isTRUE(.preserve)) ibex_unsupported("`.preserve = TRUE` is not a native filter option.")
         state <- ibex_state(.data)
         translated <- lapply(dots, ibex_translate_quosure, x = .data, context = "filter", state = state)
         if (!length(translated)) return(.data)
@@ -734,15 +768,19 @@ filter.ibex_tbl <- function(.data, ..., .by = NULL, .preserve = FALSE) {
 }
 
 ibex_mutate_impl <- function(.data, dots, keep = "all", before = NULL, after = NULL,
-                             verb = "mutate", replay = NULL) {
+                             verb = "mutate", replay = NULL, by = NULL) {
     if (is.null(replay)) {
         replay <- function(local) dplyr::mutate(local, !!!dots, .keep = keep, .before = !!before, .after = !!after)
     }
+    # `.by` seeds the working copy's grouping, not `.data`'s: the table handed
+    # to the fallback must stay ungrouped, or `collect()` would hand local dplyr
+    # a grouped frame and `.by` would be an error there rather than a replay.
     ibex_with_fallback(.data, verb, function() {
         before_supplied <- !is.null(before) && !rlang::quo_is_null(before)
         after_supplied <- !is.null(after) && !rlang::quo_is_null(after)
         if (!identical(keep, "all") || before_supplied || after_supplied) ibex_unsupported("Native mutate() currently requires `.keep = \"all\"` and appends new columns.")
         out <- .data
+        if (!is.null(by)) out$groups <- by
         for (i in seq_along(dots)) {
             name <- names(dots)[[i]]
             if (!nzchar(name)) ibex_unsupported("Every native mutate expression must be named.", rlang::quo_get_expr(dots[[i]]))
@@ -768,6 +806,8 @@ ibex_mutate_impl <- function(.data, dots, keep = "all", before = NULL, after = N
             if (!is.null(ordering) && name %in% ordering$name) ordering <- NULL
             out <- ibex_append_step(out, list(kind = "update", fields = list(list(name = name, code = translated$code)), groups = step_groups), schema, ordering = ordering, scalars = state$scalars)
         }
+        # Grouping supplied per-call does not outlive the call.
+        if (!is.null(by)) out$groups <- character()
         out
     }, replay)
 }
@@ -777,15 +817,12 @@ mutate.ibex_tbl <- function(.data, ..., .by = NULL, .keep = c("all", "used", "un
     by <- rlang::enquo(.by)
     before <- rlang::enquo(.before)
     after <- rlang::enquo(.after)
-    if (!rlang::quo_is_null(by)) {
-        return(ibex_fallback(
-            .data,
-            "mutate",
-            structure(list(message = "`.by` is not a native mutate option.", expression = ".by"), class = c("ribex_unsupported", "error", "condition")),
-            function(local) dplyr::mutate(local, !!!dots, .by = !!by, .keep = match.arg(.keep), .before = !!before, .after = !!after)
-        ))
-    }
-    ibex_mutate_impl(.data, dots, match.arg(.keep), before, after)
+    keep <- match.arg(.keep)
+    by_cols <- ibex_resolve_by(.data, by)
+    ibex_mutate_impl(
+        .data, dots, keep, before, after, by = by_cols,
+        replay = function(local) dplyr::mutate(local, !!!dots, .by = !!by, .keep = keep, .before = !!before, .after = !!after)
+    )
 }
 
 transmute.ibex_tbl <- function(.data, ...) {
@@ -841,29 +878,33 @@ summarise.ibex_tbl <- function(.data, ..., .by = NULL, .groups = NULL) {
     by <- rlang::enquo(.by)
     replay <- function(local) dplyr::summarise(local, !!!dots, .by = !!by, .groups = .groups)
     ibex_with_fallback(.data, "summarise", function() {
-        if (!rlang::quo_is_null(by)) ibex_unsupported("`.by` is not a native summarise option.")
-        groups_mode <- .groups %||% if (length(.data$groups)) "drop_last" else "drop"
+        by_cols <- ibex_resolve_by(.data, by)
+        if (!is.null(by_cols) && !is.null(.groups)) rlang::abort("Can't supply both `.by` and `.groups`.")
+        # `.by` groups this call and nothing after it, so the result is always
+        # ungrouped -- there is no `.groups` to honour and no last key to drop.
+        keys <- by_cols %||% .data$groups
+        groups_mode <- if (!is.null(by_cols)) "drop" else .groups %||% if (length(.data$groups)) "drop_last" else "drop"
         if (!groups_mode %in% c("drop", "drop_last", "keep")) ibex_unsupported("Unsupported `.groups` value.")
         state <- ibex_state(.data)
         translated <- Map(function(quo, name) {
             if (!nzchar(name)) ibex_unsupported("Every native summarise expression must be named.", rlang::quo_get_expr(quo))
             value <- ibex_translate_quosure(quo, .data, "aggregate", state)
             if (!value$aggregate) ibex_unsupported("Native summarise expressions must contain an aggregate.", rlang::quo_get_expr(quo))
-            if (!all(value$refs %in% .data$groups)) ibex_unsupported("summarise() references non-group columns outside aggregate calls.", rlang::quo_get_expr(quo))
+            if (!all(value$refs %in% keys)) ibex_unsupported("summarise() references non-group columns outside aggregate calls.", rlang::quo_get_expr(quo))
             list(name = name, code = value$code, type = value$type)
         }, dots, names(dots))
-        group_pos <- match(.data$groups, .data$schema$names)
-        group_fields <- lapply(.data$groups, function(name) list(name = name, code = ibex_quote_identifier(name)))
+        group_pos <- match(keys, .data$schema$names)
+        group_fields <- lapply(keys, function(name) list(name = name, code = ibex_quote_identifier(name)))
         fields <- c(group_fields, translated)
         schema <- list(
-            names = c(.data$groups, names(dots)),
+            names = c(keys, names(dots)),
             types = c(.data$schema$types[group_pos], vapply(translated, `[[`, character(1), "type")),
             categorical = c(.data$schema$categorical[group_pos], rep(FALSE, length(translated))),
             timezone = c(.data$schema$timezone[group_pos], rep(NA_character_, length(translated))),
             rows = NA_real_
         )
-        groups <- switch(groups_mode, drop = character(), drop_last = head(.data$groups, -1L), keep = .data$groups)
-        ibex_append_step(.data, list(kind = "aggregate", fields = fields, groups = .data$groups), schema, groups, NULL, state$scalars)
+        groups <- switch(groups_mode, drop = character(), drop_last = head(keys, -1L), keep = keys)
+        ibex_append_step(.data, list(kind = "aggregate", fields = fields, groups = keys), schema, groups, NULL, state$scalars)
     }, replay)
 }
 
@@ -936,7 +977,7 @@ slice_tail.ibex_tbl <- function(.data, ..., n, prop, by = NULL) {
     by_quo <- rlang::enquo(by)
     condition <- structure(
         list(message = "slice_tail() is not in the native MVP.", expression = "slice_tail()"),
-        class = c("ribex_unsupported", "error", "condition")
+        class = c("ibex_unsupported", "error", "condition")
     )
     ibex_fallback(.data, "slice_tail", condition, function(local) {
         if (!rlang::quo_is_null(by_quo)) {
@@ -1006,7 +1047,7 @@ ibex_join_fallback <- function(x, y, verb, by, copy, suffix, ..., keep = NULL,
     na_matches <- match.arg(na_matches)
     condition <- structure(
         list(message = paste0(verb, "() is not in the native MVP."), expression = paste0(verb, "()")),
-        class = c("ribex_unsupported", "error", "condition")
+        class = c("ibex_unsupported", "error", "condition")
     )
     ibex_fallback(x, verb, condition, function(local) {
         right <- if (inherits(y, "ibex_tbl")) collect(y) else y
@@ -1106,7 +1147,18 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     }
     if (!inherits(y, "ibex_tbl")) y <- ibex_tbl(y, session = x$session, fallback = x$fallback_policy)
     if (!identical(x$session, y$session)) ibex_unsupported("Native joins require both inputs to use the same Ibex session.")
-    if (length(x$captured_scalars) || length(y$captured_scalars)) ibex_unsupported("Native joins with captured scalar prefixes are not supported yet.")
+    # A join renders the right input's plan inside the left one, so the result
+    # is evaluated with a single scalar environment and needs both sides'
+    # captures in it. They can be merged whenever their names are distinct.
+    #
+    # Names are handed out per table, counting from one, so two sides that both
+    # captured something claim the same names for different values. Renaming
+    # one side means rewriting the references inside its rendered plan, which
+    # is the part not done yet -- so that case, and only that case, declines.
+    if (length(intersect(names(x$captured_scalars), names(y$captured_scalars)))) {
+        ibex_unsupported("Native joins cannot yet merge captured scalars from both inputs.")
+    }
+    join_scalars <- c(x$captured_scalars, y$captured_scalars)
     # A cross join pairs every row with every row, so it has no keys to derive
     # and `cross_join()` has no `by` argument to derive them from. Every other
     # kind needs at least one key, which is what the block below insists on.
@@ -1191,7 +1243,7 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
         # other kinds cannot promise that, since a group column may be
         # suffixed or gain nulls.
         schema = schema, groups = if (filtering) x$groups else character(),
-        ordering = NULL
+        ordering = NULL, scalars = join_scalars
     )
     if (!any(mapped) || filtering) {
         return(joined)

@@ -13,4 +13,4 @@ build_dir="${IBEX_BUILD_DIR:-${repo_root}/build-release}"
 
 cmake --build "${build_dir}" --parallel --target ibex_runtime ibex_parquet_plugin ibex_lightgbm_plugin
 
-Rscript -e "renv::load('${repo_root}'); install.packages('${repo_root}/r/ribex', repos = NULL, type = 'source', INSTALL_opts = '--preclean'); rmarkdown::render('notebooks/baseline-lgb-xgb-and-catboost.Rmd', output_format='${output_format}')"
+Rscript -e "renv::load('${repo_root}'); install.packages('${repo_root}/r/ibex', repos = NULL, type = 'source', INSTALL_opts = '--preclean'); rmarkdown::render('notebooks/baseline-lgb-xgb-and-catboost.Rmd', output_format='${output_format}')"

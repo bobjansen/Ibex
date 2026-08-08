@@ -1,4 +1,4 @@
-# ribex dplyr compatibility
+# ibex dplyr compatibility
 
 This table describes the native `ibex_tbl` MVP. “Fallback” means the complete
 native prefix is collected once and the current verb is replayed by local
@@ -9,15 +9,15 @@ collection and `fallback = "collect"` makes it silent.
 |---|---|---|
 | Sources | In-memory data frames, tibbles, and nanoarrow-compatible tables; ordered schema and row count are read without a query | Session-resident/plugin sources are not public constructors yet |
 | `select`, `rename`, `relocate` | tidyselect is resolved against the stored schema in R; non-syntactic names are quoted centrally | A column name containing the Ibex template marker `${` is rejected until the lexer can quote it unambiguously |
-| `filter` | Arithmetic, comparison, `%in%` with an atomic candidate vector, `&`, `|`, `!`, registered scalar functions, `between()`, `is.na()`, and `is.nan()` | `.by`, `.preserve = TRUE`, unknown/masked calls, R recycling, and unsupported captures |
-| `mutate`, `transmute` | Named sequential fields, row-local registered expressions, captured length-one scalars; grouped aggregates broadcast with Ibex `by`; `min_rank(x)`, `dense_rank(x)`, `row_number(x)`, and `cume_dist(x)` | `.by`, `.keep` other than `"all"`, placement options, unknown/masked calls, arbitrary R closures, and unsupported rank helpers |
+| `filter` | Arithmetic, comparison, `%in%` with an atomic candidate vector, `&`, `|`, `!`, registered scalar functions, `between()`, `is.na()`, and `is.nan()`; `.by` | `.preserve = TRUE`, unknown/masked calls, R recycling, and unsupported captures |
+| `mutate`, `transmute` | Named sequential fields, row-local registered expressions, captured length-one scalars; grouped aggregates broadcast with Ibex `by`; `min_rank(x)`, `dense_rank(x)`, `row_number(x)`, and `cume_dist(x)`; `.by` | `.keep` other than `"all"`, placement options, unknown/masked calls, arbitrary R closures, and unsupported rank helpers |
 | `group_by`, `ungroup` | Existing columns, `.add`, `.drop = TRUE`; grouping remains lazy metadata | Computed grouping expressions and `.drop = FALSE` |
-| `summarise` | `sum`, `mean`, `min`, `max`, `first`, `last`, and `n`; `.groups = "drop"`, `"drop_last"`, or `"keep"` | `.by`, non-scalar summaries, unsupported aggregates |
+| `summarise` | `sum`, `mean`, `min`, `max`, `first`, `last`, and `n`; `.groups = "drop"`, `"drop_last"`, or `"keep"`; `.by` | Non-scalar summaries and unsupported aggregates |
 | `arrange` | Column names and registered `dplyr::desc(column)`; `.by_group` | Computed sort expressions and masked `desc()` |
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join`, `left_join`, `right_join` and `full_join` with character `by` keys, same-named or mapped (`by = c(a = "b")`), otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | `join_by()` and non-equality conditions, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, a mapped key whose name also occurs in the other input, and `nest_join`, which needs a list column Ibex has no representation for |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with character `by` keys, same-named or mapped (`by = c(a = "b")`), otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session; a captured scalar on one side survives the join | `join_by()` and non-equality conditions, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, a mapped key whose name also occurs in the other input, captured scalars on *both* sides, and `nest_join`, which needs a list column Ibex has no representation for |
 | `cross_join` | The Cartesian product, with `suffix`; it takes no `by` or `na_matches`, and every name both inputs hold is a collision, since no key folds two columns into one | `copy = TRUE`, and a collision under an empty suffix |
 | filtering joins | `semi_join` and `anti_join` under the same key and `na_matches` rules; they return the left columns unchanged and keep the input's grouping, since no column can be renamed or gain nulls | `copy = TRUE` and the key restrictions above, except that a mapped key cannot collide here |
 
@@ -25,7 +25,7 @@ collection and `fallback = "collect"` makes it silent.
 
 R integer and `bit64::integer64` both map to Ibex `Int64`; double, logical,
 character, factor/categorical, `Date`, and `POSIXct` use the existing
-ribex/Arrow bridge.
+ibex/Arrow bridge.
 
 Int64 comes back to R as a double, because R has no 64-bit integer vector.
 That widening is not undone when the values would fit in an `integer()`: a
@@ -60,6 +60,29 @@ shape that falls back is a mapped key whose name also occurs in the other
 input: Ibex reads that as a collision and suffixes it, while dplyr, which
 drops the right key outright, has nothing to resolve and leaves both names
 alone.
+
+`.by` and `group_by()` lower to the same Ibex `by` clause and differ only in
+what survives the call: `.by` leaves the result ungrouped, so there is no
+`.groups` to honour and no trailing key to drop. Its three misuses — `.by` on
+an already-grouped table, `.by` together with `.groups`, and renaming inside
+`.by` — raise dplyr's own errors rather than falling back, since each is a
+mistake in the call and not a limit of the translation. On `filter()` the
+argument is checked and then discarded: a predicate with no aggregate in it
+asks the same question of a row whatever group the row is in, and native
+`filter()` refuses aggregates anyway.
+
+Neither spelling makes a claim about the order of the groups in the result.
+dplyr sorts them under `group_by()` and reports them in order of first
+appearance under `.by`; Ibex is asked for neither, and an aggregate discards
+ordering (see below), so a pipeline that depends on group order should end in
+`arrange()`.
+
+A captured scalar — an R value that reached the plan through the scalar
+registry — is carried across a join, so a `filter(x > threshold)` before an
+`inner_join()` stays native. Both inputs are evaluated in one scalar
+environment, and captures are named per table counting from one, so two sides
+that each captured something claim the same name for different values. That
+case falls back; anything with captures on at most one side does not.
 
 Ibex aggregates skip nulls. For a nullable input, native aggregate translation
 therefore requires an explicit `na.rm = TRUE` (or `na_rm = TRUE` for

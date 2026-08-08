@@ -1,4 +1,4 @@
-# ribex
+# ibex
 
 Experimental pure-R bindings for Ibex.
 
@@ -6,7 +6,7 @@ The package also provides a lazy native dplyr backend:
 
 ```r
 library(dplyr)
-library(ribex)
+library(ibex)
 
 query <- ibex_tbl(trades) |>
   filter(price > 10) |>
@@ -85,13 +85,13 @@ Install from the repo checkout with an existing `build-release`:
 ```sh
 IBEX_ROOT=/path/to/ibex \
 IBEX_BUILD_DIR=/path/to/ibex/build-release \
-R CMD INSTALL r/ribex
+R CMD INSTALL r/ibex
 ```
 
 Example:
 
 ```r
-library(ribex)
+library(ibex)
 library(ggplot2)
 
 df <- eval_ibex('Table { x = [1, 2, 3], y = [10.0, 20.0, 30.0] };')
@@ -133,8 +133,8 @@ ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 R Markdown engine example:
 
 ```r
-library(ribex)
-ribex::register_knitr_engines()
+library(ibex)
+ibex::register_knitr_engines()
 ```
 
 ````

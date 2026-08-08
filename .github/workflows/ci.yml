@@ -14,7 +14,7 @@ jobs:
       - name: Check SPDX license headers
         run: python3 scripts/spdx-headers.py --check
 
-  ribex-dplyr:
+  ibex-dplyr:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
@@ -37,9 +37,9 @@ jobs:
           Rscript --vanilla -e 'install.packages(c("remotes", "nanoarrow", "rlang", "tibble", "tidyselect", "vctrs", "testthat"), repos = "https://cloud.r-project.org")'
           Rscript --vanilla -e 'remotes::install_version("dplyr", version = "${{ matrix.dplyr }}", upgrade = "never", repos = "https://cloud.r-project.org")'
 
-      - name: Build Ibex libraries for ribex
+      - name: Build Ibex libraries for ibex
         run: |
-          cmake -B build-ribex -G Ninja \
+          cmake -B build-ibex -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=clang-18 \
             -DCMAKE_CXX_COMPILER=clang++-18 \
@@ -47,18 +47,18 @@ jobs:
             -DIBEX_BUILD_TOOLS=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
             -DIBEX_BUILD_PARQUET=OFF
-          cmake --build build-ribex --parallel 2
+          cmake --build build-ibex --parallel 2
 
-      - name: Install and test ribex
+      - name: Install and test ibex
         env:
           IBEX_ROOT: ${{ github.workspace }}
-          IBEX_BUILD_DIR: ${{ github.workspace }}/build-ribex
+          IBEX_BUILD_DIR: ${{ github.workspace }}/build-ibex
           # Dependencies above are installed into the action's R library.
           # Do not switch to the repository's unpopulated renv library here.
           RENV_CONFIG_AUTOLOADER_ENABLED: "false"
         run: |
-          R CMD INSTALL r/ribex
-          Rscript --vanilla -e 'testthat::test_package("ribex")'
+          R CMD INSTALL r/ibex
+          Rscript --vanilla -e 'testthat::test_package("ibex")'
 
   build-and-test:
     strategy:

@@ -8,7 +8,7 @@ schema, row order, null equality, collision handling, and key typing are
 decisions the *language* owes every caller: the interpreter, the transpiled
 C++, the Python bridge, and any adapter written later.
 
-This plan fixes the contract on Ibex's own terms. `ribex` is one consumer of
+This plan fixes the contract on Ibex's own terms. `ibex` is one consumer of
 it, and gets one section near the end. Where dplyr made a good call, it is
 worth taking; where it made a call that suits R's dynamic, interactive style,
 it is worth declining. Both kinds are listed explicitly rather than absorbed by
@@ -540,7 +540,7 @@ than left to whoever reads the code.
 
 ### Schema nullability
 
-Status: implemented, and `ribex` is on it.
+Status: implemented, and `ibex` is on it.
 
 - ~~Add a nullability flag to `ir::SchemaField`.~~ `Nullability::{Maybe,
   Never}`, with `Maybe` as ⊥. Like `unique_keys` it is a *proof*, not a
@@ -562,7 +562,7 @@ Status: implemented, and `ribex` is on it.
   the rows that come out. The two questions are separate and answering the
   first with "no" is not a reason to answer the second with it.
 - ~~**Let adapters defer to the core once the core is authoritative.**~~ Done
-  for `ribex`. `ribex_c_session_infer_schema` lowers a rendered lazy plan and
+  for `ibex`. `ibex_c_session_infer_schema` lowers a rendered lazy plan and
   runs `infer_schema` over it without executing anything, and every verb takes
   its `nullable` vector from there — one call in `ibex_append_step`, which every
   verb already routes through, replacing a nullability rule restated per verb.
@@ -670,7 +670,7 @@ Found by putting dplyr's default `na_matches` on the native path, and older
 than any of this work. The materialized join builds a folded key per row,
 picking from whichever side is present — and that loop copied the *value*
 without the validity that went with it, so a null key came back as the type's
-zero: an empty string, a `0`. `ribex` surfaced it as an `id` of `""` where
+zero: an empty string, a `0`. `ibex` surfaced it as an `id` of `""` where
 dplyr had `NA`.
 
 This is the third of a family: the same defect was fixed for left columns and
@@ -685,7 +685,7 @@ which is the only way to tell the fix from the bug.
 
 ### The folded key's rule, corrected
 
-Putting `right_join()` into `ribex` immediately found the first version of the
+Putting `right_join()` into `ibex` immediately found the first version of the
 folded-key rule under-claiming. It asked "may this column's own side be
 missing?", and for a right join the answer is yes, so it weakened the key with
 both sides' proofs.
@@ -740,7 +740,7 @@ test added in both predicate and computed-field position.
    declared 1:1 was to unlock turned out to be reached dynamically already;
    only build-side biasing remains, as an optimizer item rather than a contract
    one.
-8. ~~**Schema nullability**~~ — done, in the core and in `ribex`. The outer-join
+8. ~~**Schema nullability**~~ — done, in the core and in `ibex`. The outer-join
    rules it was blocking are in place, so `right_join()` / `full_join()` are
    now reachable in the adapter.
 9. **Time-domain joins** — the largest new feature, and the one most worth
@@ -754,7 +754,7 @@ contract piece it depends on lands.
 The contract above serves the interpreter, the transpiled C++, the Python
 bridge and any adapter. Adapter-specific behaviour stays in the adapter.
 
-### ribex (dplyr)
+### ibex (dplyr)
 
 Currently native: `inner_join()`, `left_join()`, `right_join()` and
 `full_join()`, same-name keys, `na_matches = "never"`, both inputs in one
@@ -790,14 +790,14 @@ session.
   collisions possible. Not yet done, and worth noting that they do not
   currently *fall back* either — with no S3 method registered, dplyr's generic
   finds none applicable and raises a plain R error, which is not the
-  `ribex_translation_error` an unsupported form is supposed to raise.
+  `ibex_translation_error` an unsupported form is supposed to raise.
 - ~~**Then `right_join()`, `full_join()`**~~ — done, keyed on the nullability
   work. `cross_join()` remains; `nest_join()` stays on fallback, since Ibex has
   no list-column representation.
 - **Coercion.** vctrs common-type rules live here: lower proven cases to
   explicit Ibex casts, reject the rest before submitting.
 
-Unsupported forms must raise `ribex_translation_error` under
+Unsupported forms must raise `ibex_translation_error` under
 `fallback = "error"` so unsupported behaviour is never mistaken for native
 execution.
 
@@ -833,7 +833,7 @@ commit message which tests changed meaning and why.
 
 ### Frontend oracle tests
 
-For ribex, use local dplyr as the oracle for supported cases: run on a tibble,
+For ibex, use local dplyr as the oracle for supported cases: run on a tibble,
 run the same call on `ibex_tbl(..., fallback = "error")`, assert the result is
 still an `ibex_tbl`, then compare values, row order, names, types, suffixes,
 nulls, factor behaviour and grouping after collection.
@@ -844,7 +844,7 @@ null keys and partially null composite keys; same-name and mapped keys; grouped
 keys and grouped non-key collisions; categorical/string and numeric common
 types; collisions with and without a suffix clause; every supported kind and
 option combination. Keep unsupported forms in a classification block expecting
-`ribex_translation_error`.
+`ibex_translation_error`.
 
 Where a frontend reconstructs a guarantee Ibex declines — dplyr's row order —
 test that reconstruction, not just the final agreement.

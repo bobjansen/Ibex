@@ -4362,7 +4362,7 @@ matplotlib provide notebook ergonomics, plotting, and ecosystem integration.
 
 ## Appendix E: R and dplyr Integration (Non-Normative)
 
-The `ribex` package exposes both direct source evaluation and a native lazy
+The `ibex` package exposes both direct source evaluation and a native lazy
 dplyr backend. `ibex_tbl(x)` binds an in-memory R data frame, tibble, or
 nanoarrow-compatible table into a persistent Ibex session. Supported dplyr
 verbs append immutable R-side plan nodes; they do not execute or copy a preview.

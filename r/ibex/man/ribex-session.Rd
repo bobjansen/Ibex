@@ -1,4 +1,4 @@
-\name{ribex-session}
+\name{ibex-session}
 \alias{create_session}
 \alias{reset_session}
 \alias{session_eval}

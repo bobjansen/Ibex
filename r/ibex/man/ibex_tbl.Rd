@@ -11,7 +11,7 @@ ibex_tbl(
 }
 \arguments{
 \item{x}{An in-memory data frame, tibble, or nanoarrow-compatible table.}
-\item{session}{A persistent \code{ribex} session.}
+\item{session}{A persistent \code{ibex} session.}
 \item{name}{An optional display name. Native binding names are generated.}
 \item{fallback}{The policy for unsupported expressions. \code{"warn"} and
 \code{"collect"} collect the native prefix and replay the complete current

@@ -1454,8 +1454,7 @@ TEST_CASE("join: swapped-mode inner join names colliding right columns like the 
 
     CHECK(out.rows() == kLeftRows);
     CHECK(column_names(out) == std::vector<std::string>{"id", "val_l", "val_right", "val_r"});
-    CHECK(col_i64(out, "val_l") ==
-          std::vector<std::int64_t>{10, 11, 12, 13, 14, 15, 16, 17});
+    CHECK(col_i64(out, "val_l") == std::vector<std::int64_t>{10, 11, 12, 13, 14, 15, 16, 17});
     CHECK(col_i64(out, "val_r") == std::vector<std::int64_t>{0, 1, 2, 3, 4, 5, 6, 7});
 }
 
@@ -1481,16 +1480,16 @@ TEST_CASE("non-equijoin: left(col) and right(col) name the same column on both s
     // and the clause is what makes the output nameable. Predicate resolution
     // is independent of it — the qualifiers read the inputs, not the output.
     // left.v < right.v -> (10,15) (10,35) (20,35) (30,35)
-    auto out = interpret_expr(
-        R"(lhs join rhs on left(v) < right(v) suffix { "", "_right" };)", tables);
+    auto out =
+        interpret_expr(R"(lhs join rhs on left(v) < right(v) suffix { "", "_right" };)", tables);
     CHECK(out.rows() == 4);
     CHECK(col_i64(out, "v") == std::vector<std::int64_t>{10, 10, 20, 30});
     CHECK(col_i64(out, "v_right") == std::vector<std::int64_t>{15, 35, 35, 35});
 
     // The mirror image, to prove the sides are not simply swapped somewhere.
     // 10 > {5}; 20 > {15, 5}; 30 > {15, 5} — right rows in their own order.
-    auto flipped = interpret_expr(
-        R"(lhs join rhs on left(v) > right(v) suffix { "", "_right" };)", tables);
+    auto flipped =
+        interpret_expr(R"(lhs join rhs on left(v) > right(v) suffix { "", "_right" };)", tables);
     CHECK(flipped.rows() == 5);
     CHECK(col_i64(flipped, "v") == std::vector<std::int64_t>{10, 20, 20, 30, 30});
     CHECK(col_i64(flipped, "v_right") == std::vector<std::int64_t>{5, 15, 5, 15, 5});
@@ -1677,8 +1676,8 @@ TEST_CASE("join: a suffixed key column is claimed under its output name", "[join
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    auto out = interpret_expr(
-        R"(lhs[order { lval asc }] join rhs on id suffix { "_l", "_r" };)", tables);
+    auto out =
+        interpret_expr(R"(lhs[order { lval asc }] join rhs on id suffix { "_l", "_r" };)", tables);
     CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"lval_l", true}});
 }
 
@@ -1686,7 +1685,8 @@ TEST_CASE("join: an ordering key the output drops takes the claim with it", "[jo
     // An anti join emits left columns only, but the left was ordered by a
     // column projected away before the join, so nothing can be claimed.
     auto tables = big_left_registry();
-    auto out = interpret_expr("lhs[order { lval asc }][select { id }] anti join rhs on id;", tables);
+    auto out =
+        interpret_expr("lhs[order { lval asc }][select { id }] anti join rhs on id;", tables);
     CHECK(ordering_of(out).empty());
 }
 
@@ -1695,15 +1695,14 @@ TEST_CASE("join: a following order over a carried claim returns the same rows", 
     // the answer. Compare it against the same query over an unordered left,
     // which sorts for real.
     auto tables = big_left_registry();
-    auto elided = interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];",
-                                 tables);
+    auto elided =
+        interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];", tables);
     auto sorted = interpret_expr("(lhs join rhs on id)[order { id asc }];", tables);
 
     CHECK(col_i64(elided, "id") == col_i64(sorted, "id"));
     CHECK(col_i64(elided, "lval") == col_i64(sorted, "lval"));
     CHECK(col_i64(elided, "rval") == col_i64(sorted, "rval"));
 }
-
 
 // ── Build-side selection with a pending `order` ───────────────────────────
 //
@@ -1712,8 +1711,7 @@ TEST_CASE("join: a following order over a carried claim returns the same rows", 
 // the sort disappears. These pin the choice through its one observable
 // consequence: whether the result claims the ordering.
 
-TEST_CASE("join: a pending order flips the build side when the ratio allows",
-          "[join][order]") {
+TEST_CASE("join: a pending order flips the build side when the ratio allows", "[join][order]") {
     // Left is the smaller side, so the default is to index it and scan the
     // right -- which loses left-row order. The pending `order` asks for exactly
     // what the ordered left carries, and 3 rows against 9 is inside the ratio,
@@ -1728,8 +1726,7 @@ TEST_CASE("join: a pending order flips the build side when the ratio allows",
     tables.emplace("lhs", std::move(lhs));
     tables.emplace("rhs", std::move(rhs));
 
-    auto out =
-        interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];", tables);
+    auto out = interpret_expr("(lhs[order { id asc }] join rhs on id)[order { id asc }];", tables);
     REQUIRE(out.rows() == 3);
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
     CHECK(ordering_of(out) == std::vector<std::pair<std::string, bool>>{{"id", true}});
@@ -1891,8 +1888,7 @@ TEST_CASE("join: `nulls equal` pairs nulls with nulls only", "[join][nulls]") {
     CHECK(col_i64(out, "rv") == std::vector<std::int64_t>{200, 201, 201});
 }
 
-TEST_CASE("join: `nulls equal` keeps the key column null in the output",
-          "[join][nulls]") {
+TEST_CASE("join: `nulls equal` keeps the key column null in the output", "[join][nulls]") {
     auto tables = null_key_registry();
     auto out = interpret_expr("(lhs join rhs on k nulls equal)[order { lv asc }];", tables);
     const auto* entry = out.find_entry("k");
@@ -1903,8 +1899,7 @@ TEST_CASE("join: `nulls equal` keeps the key column null in the output",
     CHECK_FALSE((*entry->validity)[2]);
 }
 
-TEST_CASE("join: a left join under `nulls equal` matches instead of filling",
-          "[join][nulls]") {
+TEST_CASE("join: a left join under `nulls equal` matches instead of filling", "[join][nulls]") {
     // Without the policy a null-keyed left row survives with null right
     // columns; with it, the row finds its partner and carries real values.
     auto tables = null_key_registry();
@@ -1968,8 +1963,7 @@ TEST_CASE("join: a composite key needs every component to match", "[join][nulls]
     CHECK(col_i64(out, "rv") == std::vector<std::int64_t>{20, 21});
 }
 
-TEST_CASE("join: `nulls` is rejected where there are no keys to apply it to",
-          "[join][nulls]") {
+TEST_CASE("join: `nulls` is rejected where there are no keys to apply it to", "[join][nulls]") {
     auto tables = null_key_registry();
     auto cross = interpret_error_at_parse("lhs cross join rhs nulls equal;");
     CHECK(cross.find("cross join") != std::string::npos);
@@ -2025,8 +2019,8 @@ auto orders_registry() -> runtime::TableRegistry {
 
 TEST_CASE("join: expect n:1 holds when each left row matches once", "[join][expect]") {
     auto tables = orders_registry();
-    auto out = interpret_expr("(orders join customers on cust expect n:1)[order { id asc }];",
-                              tables);
+    auto out =
+        interpret_expr("(orders join customers on cust expect n:1)[order { id asc }];", tables);
     CHECK(col_i64(out, "id") == std::vector<std::int64_t>{1, 2, 3});
     CHECK(col_i64(out, "tier") == std::vector<std::int64_t>{7, 7, 8});
 }
@@ -2038,8 +2032,7 @@ TEST_CASE("join: expect 1:1 fails when a right row matches twice", "[join][expec
     CHECK(err.find("right row 0") != std::string::npos);
 }
 
-TEST_CASE("join: expect 1:n fails on the same data, naming the other side",
-          "[join][expect]") {
+TEST_CASE("join: expect 1:n fails on the same data, naming the other side", "[join][expect]") {
     // 1:n says each right row matches at most one left row — the half of 1:1
     // that this data breaks.
     auto tables = orders_registry();
@@ -2095,7 +2088,6 @@ TEST_CASE("join: expect takes only 1 or n", "[join][expect]") {
     auto err = interpret_error_at_parse("lhs join rhs on k expect 2:1;");
     CHECK(err.find("`1` or `n`") != std::string::npos);
 }
-
 
 // ── `take first` / `last` / `any` ─────────────────────────────────────────
 
@@ -2157,8 +2149,7 @@ let live = ordered[filter px > 0];
     CHECK(col_i64(out, "px") == std::vector<std::int64_t>{11, 20});
 }
 
-TEST_CASE("join: take first refuses a right input with no stated order",
-          "[join][take]") {
+TEST_CASE("join: take first refuses a right input with no stated order", "[join][take]") {
     auto tables = quotes_registry();
     auto err = interpret_error("trades join quotes on sym take first;", tables);
     CHECK(err.find("state an order") != std::string::npos);
@@ -2197,13 +2188,12 @@ let extra = Table { sym = ["a", "b", "c"] };
     CHECK(out.rows() == 3);
 }
 
-TEST_CASE("join: expect still describes the matching, not what take kept",
-          "[join][take]") {
+TEST_CASE("join: expect still describes the matching, not what take kept", "[join][take]") {
     // `take first` would satisfy every `expect n:1` by construction if the
     // declaration were checked after the drop, so it is checked before.
     auto tables = quotes_registry();
-    auto err = interpret_error(
-        "trades join quotes[order { ts asc }] on sym expect n:1 take first;", tables);
+    auto err = interpret_error("trades join quotes[order { ts asc }] on sym expect n:1 take first;",
+                               tables);
     CHECK(err.find("expect n:1") != std::string::npos);
 }
 

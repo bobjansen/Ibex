@@ -611,8 +611,9 @@ TEST_CASE("emitter: join node - suffix policy", "[codegen]") {
         join->add_child(make_source(b, "left.csv"));
         join->add_child(make_source(b, "right.csv"));
         const auto out = emit_to_string(*join);
-        CHECK(contains(out, "ibex::ir::JoinSuffixPolicy{.present = true, .left = \"_l\", "
-                            ".right = \"_r\"}"));
+        CHECK(contains(out,
+                       "ibex::ir::JoinSuffixPolicy{.present = true, .left = \"_l\", "
+                       ".right = \"_r\"}"));
     }
 
     SECTION("an absent clause emits no extra argument") {

@@ -687,7 +687,9 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                           << escape_string(key.right) << "\"}";
                 }
                 *out_ << "}, " << emit_filter_expr(*join.predicate())
-                      << emit_join_suffix(join.suffix(), join.null_match(), join.expect(), join.take()) << ");\n";
+                      << emit_join_suffix(join.suffix(), join.null_match(), join.expect(),
+                                          join.take())
+                      << ");\n";
                 return var;
             }
             *out_ << "    auto " << var << " = ibex::ops::" << fn << "(" << left << ", " << right;
@@ -703,7 +705,8 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                 }
                 *out_ << "}";
             }
-            *out_ << emit_join_suffix(join.suffix(), join.null_match(), join.expect(), join.take()) << ");\n";
+            *out_ << emit_join_suffix(join.suffix(), join.null_match(), join.expect(), join.take())
+                  << ");\n";
             return var;
         }
 
@@ -1156,23 +1159,22 @@ auto Emitter::emit_join_suffix(const ir::JoinSuffixPolicy& suffix, ir::NullMatch
                    ", .right = " + multiplicity(expect.right) + "}";
     }
     if (take != ir::MatchSelection::All) {
-        const auto* name = take == ir::MatchSelection::First   ? "First"
-                           : take == ir::MatchSelection::Last  ? "Last"
-                                                               : "Any";
+        const auto* name = take == ir::MatchSelection::First  ? "First"
+                           : take == ir::MatchSelection::Last ? "Last"
+                                                              : "Any";
         tail_arg += std::string(", ibex::ir::MatchSelection::") + name;
     }
-    const std::string null_arg =
-        null_match == ir::NullMatch::Equal ? ", ibex::ir::NullMatch::Equal"
-                                           : (tail_arg.empty() ? "" : ", ibex::ir::NullMatch::Never");
+    const std::string null_arg = null_match == ir::NullMatch::Equal
+                                     ? ", ibex::ir::NullMatch::Equal"
+                                     : (tail_arg.empty() ? "" : ", ibex::ir::NullMatch::Never");
     if (!suffix.present) {
         if (!null_arg.empty()) {
             return ", ibex::ir::JoinSuffixPolicy{}" + null_arg + tail_arg;
         }
         return "";
     }
-    return ", ibex::ir::JoinSuffixPolicy{.present = true, .left = \"" +
-           escape_string(suffix.left) + "\", .right = \"" + escape_string(suffix.right) + "\"}" +
-           null_arg + tail_arg;
+    return ", ibex::ir::JoinSuffixPolicy{.present = true, .left = \"" + escape_string(suffix.left) +
+           "\", .right = \"" + escape_string(suffix.right) + "\"}" + null_arg + tail_arg;
 }
 
 auto Emitter::emit_filter_expr(const ir::Expr& expr) -> std::string {

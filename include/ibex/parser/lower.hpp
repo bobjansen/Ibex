@@ -7,11 +7,10 @@
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/ast.hpp>
 
-#include <span>
-
 #include <expected>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -115,8 +114,7 @@ struct LowerContext {
 /// anything else contributes nothing.
 [[nodiscard]] auto lower_script(const Program& program,
                                 const ir::SourceSchemas& reader_schemas = {},
-                                std::span<const Program* const> prelude = {})
-    -> ScriptPlanResult;
+                                std::span<const Program* const> prelude = {}) -> ScriptPlanResult;
 
 /// Lower a single expression with an external context.
 [[nodiscard]] auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult;

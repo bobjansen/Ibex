@@ -56,11 +56,6 @@ class NoInitAllocator {
         }
     }
 
-    template <typename U, typename... Args>
-    void construct(U* p, Args&&... args) {
-        ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
-    }
-
     template <typename U>
     void destroy(U* p) noexcept {
         p->~U();

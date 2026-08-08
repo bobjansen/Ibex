@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Bob Jansen
 
 arrow_buffer_addresses <- function(array) {
-    .Call(ribex:::ribex_c_arrow_buffer_addresses, array)
+    .Call(ibex:::ibex_c_arrow_buffer_addresses, array)
 }
 
 supported_array <- function() {
@@ -81,13 +81,13 @@ test_that("session tables and exported results own nanoarrow leases independentl
 test_that("an exported lease survives host release before execution", {
     input <- supported_array()
     before <- arrow_buffer_addresses(input)
-    leased_tables <- ribex:::normalize_table_bindings(list(input = input))
+    leased_tables <- ibex:::normalize_table_bindings(list(input = input))
 
     rm(input)
     invisible(gc())
 
     payload <- .Call(
-        ribex:::ribex_c_eval_ibex,
+        ibex:::ibex_c_eval_ibex,
         "input;",
         character(),
         leased_tables,

@@ -1,4 +1,4 @@
-Package: ribex
+Package: ibex
 Type: Package
 Title: R Interface for Ibex
 Version: 0.0.1
@@ -21,7 +21,7 @@ Suggests:
     knitr,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
-Config/ribex/dplyr-version: >= 1.1.0, < 1.2.0
+Config/ibex/dplyr-version: >= 1.1.0, < 1.2.0
 SystemRequirements: C++23, an existing Ibex build tree
 License: AGPL-3 + file LICENSE
 Encoding: UTF-8

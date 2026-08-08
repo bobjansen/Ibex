@@ -26,7 +26,7 @@ knitr::opts_chunk$set(
 This R Markdown document translates the local Kaggle notebook
 `baseline-lgb-xgb-and-catboost.ipynb` into a pure R workflow that:
 
-- uses `ribex` to stage the Optiver CSV to Parquet once, then reuse Parquet on later runs
+- uses `ibex` to stage the Optiver CSV to Parquet once, then reuse Parquet on later runs
 - keeps the notebook's pairwise and triple-price imbalance features
 - fits the Ibex `lightgbm` plugin on each fold
 - scores the held-out folds in R from the returned coefficient table
@@ -49,15 +49,15 @@ Or choose another `rmarkdown` output format explicitly:
 ## Packages and Paths
 
 ```{r packages}
-library(ribex)
+library(ibex)
 library(ggplot2)
 
-ribex::register_knitr_engines()
+ibex::register_knitr_engines()
 
 resolve_repo_root <- function() {
   candidates <- c(getwd(), normalizePath("..", winslash = "/", mustWork = FALSE))
   for (candidate in unique(candidates)) {
-    if (file.exists(file.path(candidate, "r", "ribex", "DESCRIPTION"))) {
+    if (file.exists(file.path(candidate, "r", "ibex", "DESCRIPTION"))) {
       return(normalizePath(candidate, winslash = "/", mustWork = TRUE))
     }
   }
@@ -67,7 +67,7 @@ resolve_repo_root <- function() {
 repo_root <- resolve_repo_root()
 notebook_dir <- file.path(repo_root, "notebooks")
 train_csv <- normalizePath(file.path(notebook_dir, params$train_csv), winslash = "/", mustWork = TRUE)
-plugin_paths <- ribex::default_plugin_paths()
+plugin_paths <- ibex::default_plugin_paths()
 cache_dir <- file.path(notebook_dir, "_cache")
 train_parquet <- file.path(cache_dir, "optiver-train.parquet")
 
@@ -152,14 +152,14 @@ let train = read_parquet(train_parquet);
 ```{r define-train-work}
 if (!is.null(params$max_date_id)) {
   session_eval(
-    ribex::knitr_session("optiver", plugin_paths),
+    ibex::knitr_session("optiver", plugin_paths),
     "
     let train_work = train[filter date_id <= max_date_id];
     ",
     scalars = list(max_date_id = as.integer(params$max_date_id))
   )
 } else {
-  session_eval(ribex::knitr_session("optiver", plugin_paths), "let train_work = train;")
+  session_eval(ibex::knitr_session("optiver", plugin_paths), "let train_work = train;")
 }
 ```
 

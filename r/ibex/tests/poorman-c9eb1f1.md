@@ -1,6 +1,6 @@
 # poorman conformance source
 
-The ribex dplyr conformance cases in `testthat/test-poorman-conformance.R`
+The ibex dplyr conformance cases in `testthat/test-poorman-conformance.R`
 are adapted from the following immutable poorman snapshot:
 
 - Repository: <https://github.com/nathaneastwood/poorman>
@@ -12,7 +12,7 @@ this commit beside the test. The tests use the locally installed dplyr as the
 oracle, execute the equivalent operation on `ibex_tbl(..., fallback = "error")`,
 and assert the result remains an `ibex_tbl` before collection. Unsupported
 poorman cases are intentionally kept in a separate test and must produce a
-`ribex_translation_error`; they cannot pass through collection fallback.
+`ibex_translation_error`; they cannot pass through collection fallback.
 
 Excluded at this stage: `across()`, pivots, list columns, arbitrary R closures,
 and row-name behaviour. Native rank coverage includes `min_rank()`,

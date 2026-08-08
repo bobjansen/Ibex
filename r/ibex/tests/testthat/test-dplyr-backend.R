@@ -65,7 +65,7 @@ test_that("core analytical pipeline stays lazy and matches dplyr", {
     expect_s3_class(actual, "ibex_tbl")
     expect_equal(dplyr::collect(actual), expected)
     rendered <- paste(capture.output(dplyr::show_query(actual)), collapse = "\n")
-    expect_match(rendered, "\\^__ribex_dplyr_scalar_0001<numeric>")
+    expect_match(rendered, "\\^__ibex_dplyr_scalar_0001<numeric>")
     expect_false(any(grepl("10", rendered, fixed = TRUE)))
 })
 
@@ -100,9 +100,9 @@ test_that("select rename relocate transmute and distinct preserve names", {
 })
 
 test_that("identifier quoting and translation identity are conservative", {
-    quote_identifier <- getFromNamespace("ibex_quote_identifier", "ribex")
+    quote_identifier <- getFromNamespace("ibex_quote_identifier", "ibex")
     expect_identical(quote_identifier("a`b\\c"), "`a\\`b\\\\c`")
-    expect_error(quote_identifier("a${b}"), class = "ribex_unsupported")
+    expect_error(quote_identifier("a${b}"), class = "ibex_unsupported")
 
     input <- tibble::tibble(x = 1:3)
     source <- ibex_tbl(input, fallback = "error")
@@ -111,7 +111,7 @@ test_that("identifier quoting and translation identity are conservative", {
     mean <- function(...) 123
     expect_error(
         dplyr::summarise(source, avg = mean(x)),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })
 
@@ -138,7 +138,7 @@ test_that("fallback is visible, one-way, and policy controlled", {
         dplyr::filter(id > .env$cutoff)
     expect_warning(
         local <- dplyr::mutate(warn_source, upper = toupper(x)),
-        class = "ribex_fallback_warning"
+        class = "ibex_fallback_warning"
     )
     expect_s3_class(local, "tbl_df")
     expect_false(inherits(local, "ibex_tbl"))
@@ -147,7 +147,7 @@ test_that("fallback is visible, one-way, and policy controlled", {
     error_source <- ibex_tbl(input, fallback = "error")
     expect_error(
         dplyr::mutate(error_source, upper = toupper(x)),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })
 
@@ -162,14 +162,14 @@ test_that("nullable aggregate semantics require explicit na.rm", {
     expect_error(
         ibex_tbl(input, fallback = "error") |>
             dplyr::summarise(total = sum(x)),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })
 
 test_that("reset_session invalidates dependent lazy tables", {
     query <- ibex_tbl(tibble::tibble(x = 1:3))
     reset_session(query$session)
-    expect_error(dplyr::collect(query), class = "ribex_invalid_session")
+    expect_error(dplyr::collect(query), class = "ibex_invalid_session")
 })
 
 test_that("branches do not mutate one another", {
@@ -237,7 +237,7 @@ test_that("a proved column lifts the na.rm requirement on aggregates", {
         ibex_tbl(input, fallback = "error") |>
             dplyr::group_by(g) |>
             dplyr::summarise(m = mean(x)),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 
     native <- ibex_tbl(input, fallback = "error") |>
@@ -332,7 +332,7 @@ test_that("a floating-point key falls back rather than mismatching NaN", {
 
     expect_error(
         dplyr::inner_join(ibex_tbl(input, fallback = "error"), right, by = "id"),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
     # `never` matches no NaN on either side, so a float key is fine there.
     expect_s3_class(
@@ -511,7 +511,7 @@ test_that("a mapped key that the two would suffix differently falls back", {
     expect_error(
         dplyr::inner_join(ibex_tbl(left, session = session, fallback = "error"),
                           right, by = c(a = "b")),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
     # The mirror: the left key's name occurs on the right as a non-key.
     expect_error(
@@ -520,7 +520,7 @@ test_that("a mapped key that the two would suffix differently falls back", {
                      session = session, fallback = "error"),
             tibble::tibble(rid = 1:2, id = c(7L, 8L)), by = c(id = "rid")
         ),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
     # A filtering join emits no right column, so neither shape can arise and
     # the same `by` translates natively.
@@ -534,7 +534,7 @@ test_that("a mapped key that the two would suffix differently falls back", {
     expect_error(
         dplyr::inner_join(ibex_tbl(left, session = session, fallback = "error"),
                           right, by = c(a = "b", b = "b")),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })
 
@@ -589,7 +589,7 @@ test_that("a cross join suffixes every shared name, having no key to fold", {
     # Ibex would reject the join it produces, so refuse before submitting.
     expect_error(
         dplyr::cross_join(lt, right, suffix = c("", "")),
-        class = "ribex_translation_error"
+        class = "ibex_translation_error"
     )
 })
 

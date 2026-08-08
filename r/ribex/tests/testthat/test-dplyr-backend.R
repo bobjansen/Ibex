@@ -402,6 +402,142 @@ test_that("a full join's key is only as proved as the two sides together", {
     )
 })
 
+test_that("a mapped key joins columns whose names differ", {
+    session <- create_session()
+    left <- tibble::tibble(id = 1:3, v = c("a", "b", "c"))
+    right <- tibble::tibble(rid = c(2L, 3L, 4L), w = c(20, 30, 40))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    sorted <- function(data) {
+        data <- as.data.frame(dplyr::collect(data))
+        data[do.call(order, c(unname(as.list(data)), list(na.last = TRUE))), , drop = FALSE]
+    }
+
+    for (verb in c("inner_join", "left_join", "right_join", "full_join",
+                   "semi_join", "anti_join")) {
+        join <- getExportedValue("dplyr", verb)
+        actual <- join(lt, right, by = c(id = "rid"))
+        expect_s3_class(actual, "ibex_tbl")
+        expect_equal(
+            sorted(actual),
+            sorted(join(left, right, by = c(id = "rid"))),
+            ignore_attr = TRUE
+        )
+    }
+
+    # One key column out, under the left name: Ibex keeps both halves of a
+    # mapped pair, and dplyr keeps one.
+    expect_identical(
+        dplyr::inner_join(lt, right, by = c(id = "rid"))$schema$names,
+        c("id", "v", "w")
+    )
+    query <- paste(
+        capture.output(dplyr::show_query(dplyr::inner_join(lt, right, by = c(id = "rid")))),
+        collapse = "\n"
+    )
+    expect_true(grepl("on { `id` = `rid` }", query, fixed = TRUE))
+
+    # A bare name is Ibex's shorthand for a same-name pair, so a `by` mixing
+    # both forms renders as a mix of both spellings.
+    mixed_left <- tibble::tibble(g = c("p", "q"), id = 1:2, v = c(1, 2))
+    mixed_right <- tibble::tibble(g = c("p", "q"), rid = 1:2, w = c(5, 6))
+    mixed <- dplyr::inner_join(
+        ibex_tbl(mixed_left, session = session, fallback = "error"),
+        mixed_right, by = c("g", id = "rid")
+    )
+    expect_identical(mixed$schema$names, c("g", "id", "v", "w"))
+    expect_true(grepl(
+        "on { `g`, `id` = `rid` }",
+        paste(capture.output(dplyr::show_query(mixed)), collapse = "\n"),
+        fixed = TRUE
+    ))
+    expect_equal(
+        sorted(mixed),
+        sorted(dplyr::inner_join(mixed_left, mixed_right, by = c("g", id = "rid"))),
+        ignore_attr = TRUE
+    )
+})
+
+test_that("a mapped key merges to the right value where a row has no left side", {
+    session <- create_session()
+    left <- tibble::tibble(id = 1:3, v = c("a", "b", "c"))
+    right <- tibble::tibble(rid = c(2L, 3L, 4L), w = c(20, 30, 40))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    # The row that separates a correct translation from a plausible one. dplyr
+    # reports `id = 4` for the right-only row; the left key is null there, so
+    # simply dropping the right column would report NA. Ibex does this fold
+    # itself for a same-name key and declines to for a mapped pair, which is
+    # what leaves the coalesce to the backend.
+    right_only <- dplyr::collect(dplyr::right_join(lt, right, by = c(id = "rid")))
+    # Compared by value: an Int64 column comes back to R as a double, which is
+    # the bridge's business and not this test's.
+    expect_equal(right_only$id[is.na(right_only$v)], 4)
+    expect_equal(
+        right_only,
+        dplyr::right_join(left, right, by = c(id = "rid")),
+        ignore_attr = TRUE
+    )
+
+    plan_of <- function(query) {
+        paste(capture.output(dplyr::show_query(query)), collapse = "\n")
+    }
+    expect_true(grepl(
+        "`id` = coalesce(`id`, `rid`)",
+        plan_of(dplyr::right_join(lt, right, by = c(id = "rid"))), fixed = TRUE
+    ))
+    # An inner or left join emits no row without a left side, so the left key
+    # is already the answer and the coalesce would be dead weight.
+    expect_false(grepl(
+        "coalesce", plan_of(dplyr::left_join(lt, right, by = c(id = "rid"))), fixed = TRUE
+    ))
+
+    # The merge does not cost the key its proof: `coalesce` of a null-free
+    # right key is null-free, and the core says so.
+    expect_identical(
+        dplyr::right_join(lt, right, by = c(id = "rid"))$schema$nullable,
+        c(FALSE, TRUE, FALSE)
+    )
+})
+
+test_that("a mapped key that the two would suffix differently falls back", {
+    session <- create_session()
+    # Ibex sees the right key `b` as an ordinary column colliding with the
+    # left's `b`, and suffixes both. dplyr drops the right key outright and so
+    # leaves the left `b` alone. Suffixing a column the caller never mentioned
+    # is the wrong answer, not a different one.
+    left <- tibble::tibble(a = 1:2, b = c("x", "y"))
+    right <- tibble::tibble(b = 1:2, w = c(9, 8))
+    expect_error(
+        dplyr::inner_join(ibex_tbl(left, session = session, fallback = "error"),
+                          right, by = c(a = "b")),
+        class = "ribex_translation_error"
+    )
+    # The mirror: the left key's name occurs on the right as a non-key.
+    expect_error(
+        dplyr::inner_join(
+            ibex_tbl(tibble::tibble(id = 1:2, v = c("x", "y")),
+                     session = session, fallback = "error"),
+            tibble::tibble(rid = 1:2, id = c(7L, 8L)), by = c(id = "rid")
+        ),
+        class = "ribex_translation_error"
+    )
+    # A filtering join emits no right column, so neither shape can arise and
+    # the same `by` translates natively.
+    semi <- dplyr::semi_join(ibex_tbl(left, session = session, fallback = "error"),
+                             right, by = c(a = "b"))
+    expect_s3_class(semi, "ibex_tbl")
+    expect_equal(dplyr::collect(semi), dplyr::semi_join(left, right, by = c(a = "b")))
+
+    # Two left keys naming one right column: dplyr rejects this outright, so
+    # falling back is what reproduces its error rather than inventing one.
+    expect_error(
+        dplyr::inner_join(ibex_tbl(left, session = session, fallback = "error"),
+                          right, by = c(a = "b", b = "b")),
+        class = "ribex_translation_error"
+    )
+})
+
 test_that("a cross join pairs every row with every row", {
     session <- create_session()
     left <- tibble::tibble(id = c(1L, 2L), v = c("x", "y"))

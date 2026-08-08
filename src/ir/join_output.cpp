@@ -31,18 +31,27 @@ auto unresolved_after_suffix(std::string_view name) -> std::string {
 
 auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
                       std::span<const std::string_view> left_names,
-                      std::span<const std::string_view> right_names,
-                      const JoinSuffixPolicy& suffix)
+                      std::span<const std::string_view> right_names, const JoinSuffixPolicy& suffix)
     -> std::expected<std::vector<JoinOutputColumn>, std::string> {
     std::vector<JoinOutputColumn> plan;
     plan.reserve(left_names.size() + right_names.size());
 
+    const auto is_left_key = [&](std::string_view name) {
+        return std::ranges::any_of(keys, [&](const JoinKey& key) { return key.left == name; });
+    };
     for (std::size_t i = 0; i < left_names.size(); ++i) {
-        plan.push_back(JoinOutputColumn{
-            .side = JoinOutputSide::Left, .source_index = i, .name = std::string(left_names[i])});
+        plan.push_back(JoinOutputColumn{.side = JoinOutputSide::Left,
+                                        .source_index = i,
+                                        .name = std::string(left_names[i]),
+                                        .is_key = is_left_key(left_names[i]),
+                                        // Filled in below, once the right
+                                        // side's folds are known.
+                                        .folded_peer_index = std::nullopt});
     }
 
-    // Semi and anti emit no right columns, so nothing can collide.
+    // Semi and anti emit no right columns, so nothing can collide -- and
+    // nothing folds either: they emit whole left rows, never a value drawn
+    // from the right.
     if (kind == JoinKind::Semi || kind == JoinKind::Anti) {
         return plan;
     }
@@ -55,6 +64,20 @@ auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
         return std::ranges::any_of(
             keys, [&](const JoinKey& key) { return key.left == key.right && key.right == name; });
     };
+
+    // Record the fold on the surviving left column while the planner still has
+    // both sides in hand. This is the one place that knows a right column was
+    // dropped in favour of a left one.
+    for (auto& column : plan) {
+        if (!folds_into_left(left_names[column.source_index])) {
+            continue;
+        }
+        const auto peer = std::ranges::find(right_names, left_names[column.source_index]);
+        if (peer != right_names.end()) {
+            column.folded_peer_index =
+                static_cast<std::size_t>(std::distance(right_names.begin(), peer));
+        }
+    }
 
     std::vector<std::size_t> emitted_right;
     emitted_right.reserve(right_names.size());
@@ -87,13 +110,22 @@ auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
         }
     }
 
+    const auto is_right_key = [&](std::string_view name) {
+        return std::ranges::any_of(keys, [&](const JoinKey& key) { return key.right == name; });
+    };
     for (const std::size_t i : emitted_right) {
         std::string name(right_names[i]);
         if (collisions.contains(right_names[i])) {
             name += suffix.right;
         }
-        plan.push_back(JoinOutputColumn{
-            .side = JoinOutputSide::Right, .source_index = i, .name = std::move(name)});
+        plan.push_back(
+            JoinOutputColumn{.side = JoinOutputSide::Right,
+                             .source_index = i,
+                             .name = std::move(name),
+                             .is_key = is_right_key(right_names[i]),
+                             // A right column reaching the output natively did not fold -- that
+                             // is what `emitted_right` selected for -- so it has no peer.
+                             .folded_peer_index = std::nullopt});
     }
 
     // Catches an empty or shared suffix pair, a suffixed name that lands on an

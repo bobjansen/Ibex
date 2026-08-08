@@ -602,7 +602,7 @@ class Parser {
                               "not change how a join predicate compares nulls");
                     return nullptr;
                 }
-                null_match = *parsed;
+                null_match = parsed;
             }
             // `expect n:1` trails the lot. Contextual like `nulls`, for the
             // same reason: a trailing position after a key list is the only
@@ -643,7 +643,7 @@ class Parser {
                                         "join emits each left row at most once already");
                     return nullptr;
                 }
-                take = *parsed;
+                take = parsed;
             }
 
             auto join = std::make_unique<Expr>();

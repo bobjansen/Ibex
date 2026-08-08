@@ -36,13 +36,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <iterator>
 #include <memory>
-#include <signal.h>
-#include <string.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -53,7 +52,6 @@
 #define NOMINMAX
 #include <windows.h>
 #else
-#include <csignal>
 #include <dlfcn.h>
 #include <unistd.h>
 #endif

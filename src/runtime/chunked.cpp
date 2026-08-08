@@ -3828,8 +3828,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     auto order_preserving_pays(const Table& left_table, std::size_t n_left, std::size_t n_right)
         -> bool {
         constexpr std::size_t kMaxOrderPreservingBuildRatio = 4;
-        if (pending_order_ == nullptr || pending_order_->empty() ||
-            !left_table.properties().ordering().has_value() ||
+        const auto& left_ordering = left_table.properties().ordering();
+        if (pending_order_ == nullptr || pending_order_->empty() || !left_ordering.has_value() ||
             n_right > kMaxOrderPreservingBuildRatio * n_left) {
             return false;
         }
@@ -3839,7 +3839,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
         std::vector<ir::OrderKey> carried;
-        for (const auto& key : *left_table.properties().ordering()) {
+        for (const auto& key : *left_ordering) {
             std::size_t idx = left_table.columns.size();
             for (std::size_t i = 0; i < left_table.columns.size(); ++i) {
                 if (left_table.columns[i].name == key.name) {

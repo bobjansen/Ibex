@@ -1141,7 +1141,10 @@ auto import_with_claim(ibex::runtime::Table table)
     ArrowSchema schema{};
     auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
     REQUIRE(exported.has_value());
-    return ibex::interop::import_table_from_arrow(array, schema);
+    auto imported = ibex::interop::import_table_from_arrow(array, schema);
+    schema.release(&schema);
+    array.release(&array);
+    return imported;
 }
 
 }  // namespace

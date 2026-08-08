@@ -1286,6 +1286,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 /// The caches are `thread_local` rather than captured state because the
 /// resample paths are threaded. Offsets change twice a year and consecutive
 /// rows share a bucket, so both hit on nearly every row of sorted input.
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
 [[nodiscard]] auto zoned_bucket_start(const std::chrono::time_zone* zone, std::int64_t nanos,
                                       std::int64_t dur_ns) -> std::int64_t {
     thread_local const std::chrono::time_zone* cached_zone = nullptr;
@@ -1320,6 +1321,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         std::chrono::nanoseconds{q * dur_ns}};
     return zone->to_sys(boundary, std::chrono::choose::earliest).time_since_epoch().count();
 }
+#endif
 
 auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
                          const std::vector<ir::ColumnRef>& extra_group_by,
@@ -1342,23 +1344,36 @@ auto resample_table_impl(const Table& input, ir::Duration bucket_dur,
 
     // A zoned time index buckets on LOCAL boundaries; an unzoned one is an
     // instant with no wall clock attached, so it keeps the UTC grid (SPEC 2.4).
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
     const std::chrono::time_zone* zone = nullptr;
+#else
+    std::optional<std::string_view> zone;
+#endif
     if (const auto& zone_id = ts_col->meta().zone; zone_id.has_value()) {
         const std::string& name = zone_name(*zone_id);
-        try {
-            zone = std::chrono::locate_zone(name);
-        } catch (const std::exception&) {
+        if (!is_known_zone(name)) {
             return std::unexpected("resample: unknown time zone '" + name + "' on time index '" +
                                    ts_name + "'");
         }
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+        zone = std::chrono::locate_zone(name);
+#else
+        zone = name;
+#endif
     }
 
     const auto rows = input.rows();
     const auto bucket_of = [&](std::size_t i) -> std::int64_t {
         const std::int64_t nanos = (*ts_col)[i].nanos;
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
         if (zone != nullptr) {
             return zoned_bucket_start(zone, nanos, dur_ns);
         }
+#else
+        if (zone.has_value()) {
+            return local_bucket_start(*zone, nanos, dur_ns);
+        }
+#endif
         std::int64_t q = nanos / dur_ns;
         if (nanos < 0 && nanos % dur_ns != 0)
             --q;  // floor for negative timestamps

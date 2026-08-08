@@ -402,6 +402,61 @@ test_that("a full join's key is only as proved as the two sides together", {
     )
 })
 
+test_that("a cross join pairs every row with every row", {
+    session <- create_session()
+    left <- tibble::tibble(id = c(1L, 2L), v = c("x", "y"))
+    right <- tibble::tibble(k = c("p", "q", "r"), w = c(10, 20, 30))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    sorted <- function(data) {
+        data <- as.data.frame(dplyr::collect(data))
+        data[do.call(order, c(unname(as.list(data)), list(na.last = TRUE))), , drop = FALSE]
+    }
+
+    actual <- dplyr::cross_join(lt, right)
+    expect_s3_class(actual, "ibex_tbl")
+    expect_identical(nrow(dplyr::collect(actual)), nrow(left) * nrow(right))
+    expect_equal(sorted(actual), sorted(dplyr::cross_join(left, right)), ignore_attr = TRUE)
+
+    # Two clauses must be absent, and for opposite reasons: Ibex has no
+    # spelling for an empty `on`, and it rejects a `nulls` clause outright on a
+    # join with no equality keys rather than accepting an inert one.
+    query <- paste(capture.output(dplyr::show_query(actual)), collapse = "\n")
+    expect_false(grepl(" on ", query, fixed = TRUE))
+    expect_false(grepl("nulls", query, fixed = TRUE))
+
+    # An empty side makes an empty product, not an error.
+    expect_identical(nrow(dplyr::collect(dplyr::cross_join(lt, right[0, ]))), 0L)
+})
+
+test_that("a cross join suffixes every shared name, having no key to fold", {
+    session <- create_session()
+    left <- tibble::tibble(id = 1:2, v = c("a", "b"))
+    right <- tibble::tibble(id = 3:4, v = c("c", "d"))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    # `id` would be a folded key in any other kind. Here it is an ordinary
+    # collision on both counts, so all four columns survive under suffixes.
+    expect_identical(
+        dplyr::cross_join(lt, right)$schema$names,
+        c("id.x", "v.x", "id.y", "v.y")
+    )
+    expect_identical(
+        dplyr::cross_join(lt, right, suffix = c("_L", "_R"))$schema$names,
+        c("id_L", "v_L", "id_R", "v_R")
+    )
+    expect_equal(
+        as.data.frame(dplyr::collect(dplyr::cross_join(lt, right))),
+        as.data.frame(dplyr::cross_join(left, right)),
+        ignore_attr = TRUE
+    )
+    # Ibex would reject the join it produces, so refuse before submitting.
+    expect_error(
+        dplyr::cross_join(lt, right, suffix = c("", "")),
+        class = "ribex_translation_error"
+    )
+})
+
 test_that("the filtering joins keep left rows, and keep each of them once", {
     session <- create_session()
     # The right side repeats a key that the left also repeats. A filtering join

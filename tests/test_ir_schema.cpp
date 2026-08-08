@@ -838,11 +838,15 @@ TEST_CASE("schema: a left join withdraws every proof on its right side", "[ir][s
     CHECK(nulls_of(s, "id") == Nullability::Never);
 }
 
-TEST_CASE("schema: a right join's folded key needs both sides' proofs", "[ir][schema]") {
+TEST_CASE("schema: a right join's folded key takes the right side's proof", "[ir][schema]") {
     // A right join emits rows with no left row at all, and the executor fills
-    // the folded key column from the right key there. So the output column is
-    // null-free only if both sides' key columns are -- which is why it is not
-    // simply "a left column, and the left may be missing".
+    // the folded key column from the right key there -- so it is not simply "a
+    // left column, and the left may be missing".
+    //
+    // Nor is it "both sides", which is the trap: a right join keeps no
+    // left-only row, and a matched row's key matched, which under `nulls
+    // never` is already a proof. The left's key column never reaches the
+    // output unproved, so only the right's proof is load-bearing.
     auto both = join_of({{"id", "id"}}, ibex::ir::JoinKind::Right);
     auto proved =
         two_sources(SchemaInfo::known(
@@ -859,6 +863,22 @@ TEST_CASE("schema: a right join's folded key needs both sides' proofs", "[ir][sc
     auto one_sided = proved;
     one_sided["right"] = SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}});
     CHECK(nulls_of(ibex::ir::infer_schema(both, one_sided), "id") == Nullability::Maybe);
+
+    // Withdraw the *left* key's instead and the proof stands: the rows that
+    // could have carried a null in are exactly the ones a right join drops.
+    auto left_unproved = proved;
+    left_unproved["left"] = SchemaInfo::known(
+        {{.name = "id", .type = ColumnType::Int64}, {.name = "lv", .type = ColumnType::Float64}});
+    CHECK(nulls_of(ibex::ir::infer_schema(both, left_unproved), "id") == Nullability::Never);
+
+    // The mirror, and the reason this is not just "the preserved side's
+    // proof": an outer join keeps both sides' unmatched rows, so an unproved
+    // left key does reach the output.
+    auto outer = join_of({{"id", "id"}}, ibex::ir::JoinKind::Outer);
+    CHECK(nulls_of(ibex::ir::infer_schema(outer, left_unproved), "id") == Nullability::Maybe);
+    // And a left join, which drops the right-only rows, ignores the right's.
+    auto left_join = join_of({{"id", "id"}}, ibex::ir::JoinKind::Left);
+    CHECK(nulls_of(ibex::ir::infer_schema(left_join, one_sided), "id") == Nullability::Never);
 }
 
 TEST_CASE("schema: a mapped key in a right join is an ordinary left column", "[ir][schema]") {

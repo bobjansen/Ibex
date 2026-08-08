@@ -12,6 +12,9 @@
 #include <variant>
 #include <vector>
 
+#include "ibex/ir/node.hpp"
+#include "ibex/ir/schema.hpp"
+
 namespace ibex::ir {
 namespace {
 

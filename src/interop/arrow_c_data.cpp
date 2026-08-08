@@ -24,6 +24,9 @@
 #include <variant>
 #include <vector>
 
+#include "ibex/core/time_zone.hpp"
+#include "ibex/runtime/table_properties.hpp"
+
 namespace ibex::interop {
 
 namespace {

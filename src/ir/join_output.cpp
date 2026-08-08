@@ -56,7 +56,7 @@ auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
         return plan;
     }
 
-    std::unordered_set<std::string_view> left_set(left_names.begin(), left_names.end());
+    const std::unordered_set<std::string_view> left_set(left_names.begin(), left_names.end());
 
     // A same-name equijoin key folds into the single left column, so it is not
     // a collision; a mapped key keeps both native columns and may well be one.

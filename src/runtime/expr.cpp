@@ -1506,6 +1506,21 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     "alternative for '" +
                     std::string(name) + "'");
             }
+            // Same idea for null behaviour, which the IR side also cannot see.
+            // A scalar opts into receiving Null exactly when its result does
+            // not simply follow its arguments' presence, so the two tables have
+            // one answer between them and disagreeing is a bug in whichever was
+            // edited alone. Without this, adding the next `coalesce` and
+            // forgetting the IR entry would leave the schema pass quietly
+            // proving a column null-free that is not.
+            const auto behavior = ir::scalar_null_behavior(name);
+            if (behavior.has_value() && (fn.null_policy == NullPolicy::Handles) ==
+                                            (*behavior == ir::NullBehavior::Propagates)) {
+                invariant_violation(
+                    "builtins(): ir::NullBehavior disagrees with the registry's null policy "
+                    "for '" +
+                    std::string(name) + "'");
+            }
         }
 
         return m;

@@ -948,3 +948,134 @@ TEST_CASE("schema: a negation has one operand, and the fold must not read two", 
     // And in predicate position, where the proof rules read the same node.
     CHECK(schema_of("t[filter !(b > 0)];", nullable_sources()).is_known());
 }
+
+namespace {
+
+// The join matrix. Both inputs carry `k` (the equijoin key) and one non-key
+// column; `variant` says whether the inputs arrive with their key proved.
+struct JoinNullabilityCase {
+    ibex::ir::JoinKind kind;
+    const char* label;
+    Nullability key;
+    Nullability left_value;
+    Nullability right_value;  // ignored for semi/anti, which emit no right columns
+};
+
+auto join_matrix_sources(Nullability key_nulls) -> SourceSchemas {
+    return two_sources(
+        SchemaInfo::known(
+            {{.name = "k", .type = ColumnType::Int64, .nulls = key_nulls},
+             {.name = "lv", .type = ColumnType::Float64, .nulls = Nullability::Never}}),
+        SchemaInfo::known(
+            {{.name = "k", .type = ColumnType::Int64, .nulls = key_nulls},
+             {.name = "rv", .type = ColumnType::Float64, .nulls = Nullability::Never}}));
+}
+
+}  // namespace
+
+TEST_CASE("schema: join nullability across every kind, inputs proved", "[ir][schema]") {
+    // Both inputs arrive fully null-free, so anything Maybe here was produced
+    // by the join: a side that may be unmatched is filled with nulls.
+    const JoinNullabilityCase cases[] = {
+        {ibex::ir::JoinKind::Inner, "inner", Nullability::Never, Nullability::Never,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Left, "left", Nullability::Never, Nullability::Never,
+         Nullability::Maybe},
+        // The folded key survives a right join only because *both* sides are
+        // proved: unmatched right rows take their key from the right column.
+        {ibex::ir::JoinKind::Right, "right", Nullability::Never, Nullability::Maybe,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Outer, "outer", Nullability::Never, Nullability::Maybe,
+         Nullability::Maybe},
+        {ibex::ir::JoinKind::Semi, "semi", Nullability::Never, Nullability::Never,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Anti, "anti", Nullability::Never, Nullability::Never,
+         Nullability::Never},
+        // `asof` keeps every left row whether or not a right row precedes it,
+        // so its right columns null out exactly as a left join's do.
+        {ibex::ir::JoinKind::Asof, "asof", Nullability::Never, Nullability::Never,
+         Nullability::Maybe},
+    };
+
+    const auto sources = join_matrix_sources(Nullability::Never);
+    for (const auto& test : cases) {
+        CAPTURE(test.label);
+        auto join = join_of({{"k", "k"}}, test.kind);
+        const auto s = ibex::ir::infer_schema(join, sources);
+        REQUIRE(s.is_known());
+        CHECK(nulls_of(s, "k") == test.key);
+        CHECK(nulls_of(s, "lv") == test.left_value);
+        const bool left_only =
+            test.kind == ibex::ir::JoinKind::Semi || test.kind == ibex::ir::JoinKind::Anti;
+        CHECK((s.find("rv") != nullptr) == !left_only);
+        if (!left_only) {
+            CHECK(nulls_of(s, "rv") == test.right_value);
+        }
+    }
+}
+
+TEST_CASE("schema: join nullability across every kind, key unproved", "[ir][schema]") {
+    // Neither input proves its key, so a `Never` here is the join's own doing:
+    // under `nulls never` a null key matches nothing, so a join that emits only
+    // matched rows has a value in every key it emitted.
+    const JoinNullabilityCase cases[] = {
+        {ibex::ir::JoinKind::Inner, "inner", Nullability::Never, Nullability::Never,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Semi, "semi", Nullability::Never, Nullability::Never,
+         Nullability::Never},
+        // Anti keeps the rows that matched *nothing*, which is what a null key
+        // does. The proof must not carry over.
+        {ibex::ir::JoinKind::Anti, "anti", Nullability::Maybe, Nullability::Never,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Left, "left", Nullability::Maybe, Nullability::Never,
+         Nullability::Maybe},
+        {ibex::ir::JoinKind::Right, "right", Nullability::Maybe, Nullability::Maybe,
+         Nullability::Never},
+        {ibex::ir::JoinKind::Outer, "outer", Nullability::Maybe, Nullability::Maybe,
+         Nullability::Maybe},
+        {ibex::ir::JoinKind::Asof, "asof", Nullability::Maybe, Nullability::Never,
+         Nullability::Maybe},
+    };
+
+    const auto sources = join_matrix_sources(Nullability::Maybe);
+    for (const auto& test : cases) {
+        CAPTURE(test.label);
+        auto join = join_of({{"k", "k"}}, test.kind);
+        const auto s = ibex::ir::infer_schema(join, sources);
+        REQUIRE(s.is_known());
+        CHECK(nulls_of(s, "k") == test.key);
+        CHECK(nulls_of(s, "lv") == test.left_value);
+        if (test.kind != ibex::ir::JoinKind::Semi && test.kind != ibex::ir::JoinKind::Anti) {
+            CHECK(nulls_of(s, "rv") == test.right_value);
+        }
+    }
+}
+
+TEST_CASE("schema: an outer join's folded key needs both sides", "[ir][schema]") {
+    // An outer join can be missing either side, so the folded key column draws
+    // from both and one unproved side is enough to withdraw the claim. The
+    // asymmetry is what a single-sided rule would get wrong.
+    auto join = join_of({{"k", "k"}}, ibex::ir::JoinKind::Outer);
+    auto sources = join_matrix_sources(Nullability::Never);
+    CHECK(nulls_of(ibex::ir::infer_schema(join, sources), "k") == Nullability::Never);
+
+    sources["right"] = SchemaInfo::known(
+        {{.name = "k", .type = ColumnType::Int64}, {.name = "rv", .type = ColumnType::Float64}});
+    CHECK(nulls_of(ibex::ir::infer_schema(join, sources), "k") == Nullability::Maybe);
+}
+
+TEST_CASE("schema: a cross join preserves both sides' proofs", "[ir][schema]") {
+    // Every row pairs with every row, so no row is ever missing a side and
+    // nothing is filled. No keys either, so there is no key proof to make.
+    auto join = join_of({}, ibex::ir::JoinKind::Cross);
+    auto sources = two_sources(
+        SchemaInfo::known(
+            {{.name = "lv", .type = ColumnType::Float64, .nulls = Nullability::Never}}),
+        SchemaInfo::known({{.name = "rv", .type = ColumnType::Float64, .nulls = Nullability::Never},
+                           {.name = "ru", .type = ColumnType::Float64}}));
+    const auto s = ibex::ir::infer_schema(join, sources);
+    REQUIRE(s.is_known());
+    CHECK(nulls_of(s, "lv") == Nullability::Never);
+    CHECK(nulls_of(s, "rv") == Nullability::Never);
+    CHECK(nulls_of(s, "ru") == Nullability::Maybe);
+}

@@ -5,6 +5,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/nullability.hpp>
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
@@ -190,105 +191,6 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
     return std::nullopt;
 }
 
-/// Whether a computed field can hold a null, given the input schema.
-///
-/// The shape mirrors `expr_type`: `Maybe` is the answer for anything not
-/// argued, so an unmodelled expression costs precision and never soundness.
-/// The one structural rule is that Ibex's scalars propagate null -- a null
-/// operand yields a null result -- so an arithmetic or comparison expression is
-/// null-free exactly when all of its operands are. The exceptions are the
-/// functions whose *purpose* is null: `is_null`/`is_not_null` answer for a null
-/// rather than propagating it, and `coalesce`/`fill_null` consume one.
-auto expr_nullability(const Expr& expr, const SchemaInfo& input) -> Nullability {
-    // Fold over sub-expressions: null-free only if every operand is.
-    const auto all_of = [&](const auto&... operands) {
-        Nullability result = Nullability::Never;
-        ((result = weaker(result, expr_nullability(*operands, input))), ...);
-        return result;
-    };
-
-    if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
-        // A lexical `^name` is a scalar binding, not a column; this pass knows
-        // nothing about its value, exactly as `expr_type` knows nothing about
-        // its type.
-        if (col->lexical) {
-            return Nullability::Maybe;
-        }
-        const auto* field = input.find(col->name);
-        return field != nullptr ? field->nulls : Nullability::Maybe;
-    }
-    if (std::holds_alternative<Literal>(expr.node)) {
-        // There is no null literal in the surface language, so every literal
-        // that parsed is a value.
-        return Nullability::Never;
-    }
-    if (std::holds_alternative<IsNullExpr>(expr.node)) {
-        // `is_null(x)` / `is_not_null(x)` are total: they answer true or false
-        // for a null input rather than propagating it.
-        return Nullability::Never;
-    }
-    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
-        // Three-valued: a null operand makes the comparison null, not false.
-        return all_of(cmp->left, cmp->right);
-    }
-    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node)) {
-        // Deliberately not Kleene-precise. `false && null` is false whatever
-        // the right operand does, but proving that needs a value-level
-        // argument this pass does not make; the conservative fold under-claims.
-        //
-        // `Not` carries no right operand at all (see `LogicalExpr`), so the
-        // fold has to be written out rather than handed both unconditionally.
-        const Nullability left = expr_nullability(*logical->left, input);
-        return logical->right != nullptr ? weaker(left, expr_nullability(*logical->right, input))
-                                         : left;
-    }
-    if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
-        // Including Div: integer division by zero is an error and float
-        // division yields an infinity, so neither manufactures a null.
-        return all_of(bin->left, bin->right);
-    }
-    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-        // `coalesce(a, ..., z)` is the first non-null argument, so one
-        // null-free argument anywhere makes the result null-free.
-        if (call->callee == "coalesce") {
-            return std::ranges::any_of(call->args,
-                                       [&](const auto& arg) {
-                                           return expr_nullability(*arg, input) ==
-                                                  Nullability::Never;
-                                       })
-                       ? Nullability::Never
-                       : Nullability::Maybe;
-        }
-        // `fill_null(x, v)` is `x` when present and `v` otherwise, so it is
-        // null-free when the replacement is -- whatever `x` does.
-        if (call->callee == "fill_null" && call->args.size() == 2) {
-            return expr_nullability(*call->args[1], input);
-        }
-        // `null_if_nan(x)` and `null_if_not_finite(x)` manufacture a null from
-        // a perfectly present value, which is the whole point of them. They are
-        // `Scalar` like the rest, so they have to be named here.
-        if (call->callee == "null_if_nan" || call->callee == "null_if_not_finite") {
-            return Nullability::Maybe;
-        }
-        // Every other row-local builtin propagates: `sqrt(null)` is null, so
-        // `sqrt(x)` is null-free exactly when `x` is. Only `Scalar` qualifies.
-        // A `Transform` is excluded even when its argument is null-free --
-        // `lag(x)` is null in the first row of each group whatever `x` does,
-        // and so is every function with a warm-up -- and an unknown callee is
-        // a plugin, about which this pass assumes nothing (see
-        // `BuiltinFunctionInfo`).
-        if (call->args.empty() || fn_kind(call->callee) != FnKind::Scalar) {
-            return Nullability::Maybe;
-        }
-        Nullability result = Nullability::Never;
-        for (const auto& arg : call->args) {
-            result = weaker(result, expr_nullability(*arg, input));
-        }
-        return result;
-    }
-    return Nullability::Maybe;
-}
-
 /// Output type of an aggregate, when known with certainty.
 auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::optional<ColumnType> {
     switch (agg.func) {
@@ -315,54 +217,6 @@ auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::option
             return std::nullopt;
     }
     return std::nullopt;
-}
-
-/// Whether an aggregate's result column can hold a null.
-///
-/// Two conditions have to hold together, and `grouped` is the one that is easy
-/// to lose: an aggregate emits one row per group that *occurred*, so a grouped
-/// aggregate's every row summarizes at least one input row. An ungrouped one
-/// emits its single row even over an empty input, where `min` has no value to
-/// return -- so it proves nothing regardless of the column it reads.
-auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) -> Nullability {
-    if (agg.func == AggFunc::Count) {
-        // A count is a row count. Nothing it reads can make it absent, and an
-        // empty group counts zero rather than null.
-        return Nullability::Never;
-    }
-    if (!grouped) {
-        return Nullability::Maybe;
-    }
-    const auto* field = input.find(agg.column.name);
-    if (field == nullptr || !field->non_null()) {
-        return Nullability::Maybe;
-    }
-    switch (agg.func) {
-        case AggFunc::Sum:
-        case AggFunc::Min:
-        case AggFunc::Max:
-        case AggFunc::First:
-        case AggFunc::Last:
-        case AggFunc::Mean:
-        case AggFunc::Median:
-            // Each is a value drawn from, or an arithmetic mean over, at least
-            // one non-null input value.
-            return Nullability::Never;
-        case AggFunc::Stddev:
-        case AggFunc::Ewma:
-        case AggFunc::Quantile:
-        case AggFunc::Skew:
-        case AggFunc::Kurtosis:
-            // Deliberately under-claimed: each is undefined for a group below
-            // some size -- a sample stddev needs two rows, skew and kurtosis
-            // more -- and this pass has no bound on group size. Proving these
-            // means reading each kernel's small-group behaviour, which is a
-            // separate piece of work from establishing the flag.
-            return Nullability::Maybe;
-        case AggFunc::Count:
-            break;  // handled above
-    }
-    return Nullability::Maybe;
 }
 
 auto child_schema(const Node& node, const SourceSchemas& sources, std::size_t index = 0)
@@ -485,108 +339,12 @@ auto update_schema(const std::vector<FieldSpec>& fields,
     return result;
 }
 
-/// Collect the columns whose nullness would make `expr` evaluate to null,
-/// into `out`. The mirror of `expr_nullability`: that answers "is this
-/// null-free", this answers "which columns would have to be".
-void collect_null_propagating_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
-    if (const auto* col = std::get_if<ColumnRef>(&expr.node)) {
-        if (!col->lexical) {
-            out.insert(col->name);
-        }
-        return;
-    }
-    if (const auto* bin = std::get_if<BinaryExpr>(&expr.node)) {
-        collect_null_propagating_refs(*bin->left, out);
-        collect_null_propagating_refs(*bin->right, out);
-        return;
-    }
-    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
-        collect_null_propagating_refs(*cmp->left, out);
-        collect_null_propagating_refs(*cmp->right, out);
-        return;
-    }
-    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-        // The same three exclusions as `expr_nullability`, for the same
-        // reasons: a null-consuming function's argument need not be present,
-        // and a non-`Scalar` callee's relationship to its arguments is not
-        // row-local (or, for an unknown callee, not known at all).
-        if (call->callee == "coalesce" || call->callee == "fill_null" ||
-            fn_kind(call->callee) != FnKind::Scalar) {
-            return;
-        }
-        for (const auto& arg : call->args) {
-            collect_null_propagating_refs(*arg, out);
-        }
-        return;
-    }
-    // Literal: no column. IsNullExpr: total, so its operand's nullness does not
-    // reach the result. LogicalExpr and RankExpr: not descended into -- see
-    // `collect_filtered_non_null_refs`, which handles `&&` where it can say
-    // something stronger.
-}
-
-/// Collect the columns that `predicate` proves null-free in the rows it keeps.
-///
-/// `filter` keeps a row only when its predicate is *true*, and Ibex is
-/// three-valued everywhere: null is not true, so a row whose predicate went
-/// null is dropped along with the rows that went false. Every column the
-/// predicate had to read to reach true is therefore present in every surviving
-/// row.
-void collect_filtered_non_null_refs(const Expr& predicate,
-                                    robin_hood::unordered_set<std::string>& out) {
-    if (const auto* logical = std::get_if<LogicalExpr>(&predicate.node)) {
-        if (logical->op == LogicalOp::And) {
-            // Both conjuncts are true, so both prove.
-            collect_filtered_non_null_refs(*logical->left, out);
-            if (logical->right != nullptr) {
-                collect_filtered_non_null_refs(*logical->right, out);
-            }
-            return;
-        }
-        if (logical->op == LogicalOp::Not) {
-            // `!` proves nothing in general -- `!(x > 0)` is true for no null
-            // `x`, but it is *false* for one, and neither is a row this filter
-            // keeps. The exception is a null test, which is total: `!is_null(x)`
-            // is true exactly when `x` is present, so negating one is the same
-            // statement as the other spelled directly.
-            //
-            // Worth the special case rather than left to the general rule,
-            // because it is not an exotic spelling: `filter(!is.na(x))` is how
-            // dplyr says this, and `is.na()` lowers to `is_null()`, so a
-            // frontend cannot reach `is_not_null` from the idiom its users
-            // actually write.
-            if (const auto* inner = std::get_if<IsNullExpr>(&logical->left->node)) {
-                if (!inner->negated) {
-                    collect_null_propagating_refs(*inner->operand, out);
-                }
-            }
-            return;
-        }
-        // `||` proves only what both branches prove. Left unclaimed rather than
-        // intersected: an under-claim costs precision, and the intersection is
-        // worth writing when something needs it.
-        return;
-    }
-    if (const auto* is_null = std::get_if<IsNullExpr>(&predicate.node)) {
-        // `is_not_null(x)` true says exactly this and nothing else; `is_null(x)`
-        // true says the opposite, and there is no way to record that here.
-        if (is_null->negated) {
-            collect_null_propagating_refs(*is_null->operand, out);
-        }
-        return;
-    }
-    // Anything else -- a comparison, a bare Bool column, an arithmetic
-    // expression read as a predicate -- had to be non-null to be true.
-    collect_null_propagating_refs(predicate, out);
-}
-
 /// Apply a filter's proofs to the schema flowing through it.
 auto filtered_schema(const Expr& predicate, SchemaInfo input) -> SchemaInfo {
     if (!input.is_known()) {
         return input;
     }
-    robin_hood::unordered_set<std::string> proved;
-    collect_filtered_non_null_refs(predicate, proved);
+    const robin_hood::unordered_set<std::string> proved = filter_proved_non_null(predicate);
     if (proved.empty()) {
         return input;
     }
@@ -601,94 +359,6 @@ auto filtered_schema(const Expr& predicate, SchemaInfo input) -> SchemaInfo {
     // `inherit_unique_keys` gives.
     inherit_unique_keys(input, result);
     return result;
-}
-
-/// Whether a join may emit a row in which one side contributed nothing, per
-/// side. This is the only reason a join weakens a nullability proof: an
-/// unmatched row's columns on the absent side are filled with nulls, whatever
-/// that input's own schema said.
-struct JoinUnmatched {
-    bool left;   ///< An output row may have no left row (right/outer).
-    bool right;  ///< An output row may have no right row (left/outer/asof).
-};
-
-auto join_unmatched_sides(JoinKind kind) -> JoinUnmatched {
-    switch (kind) {
-        case JoinKind::Left:
-        case JoinKind::Asof:
-            // `asof` keeps every left row whether or not a right row precedes
-            // it, so its right columns null out exactly as a left join's do.
-            return {.left = false, .right = true};
-        case JoinKind::Right:
-            return {.left = true, .right = false};
-        case JoinKind::Outer:
-            return {.left = true, .right = true};
-        case JoinKind::Inner:
-        case JoinKind::Semi:
-        case JoinKind::Anti:
-        case JoinKind::Cross:
-            // Semi and anti emit left columns only, and emit whole left rows;
-            // cross pairs every row with every row. None of them fills.
-            return {.left = false, .right = false};
-    }
-    return {.left = true, .right = true};
-}
-
-/// Nullability of each planned output column of a join.
-///
-/// Two rules, in this order. First, an equijoin key column of a join that emits
-/// only matched rows is null-free: under `NullMatch::Never` a null key matches
-/// nothing, so every row that survived has a value in every key. This is a
-/// proof the inputs did not have, and the reason nullability is worth carrying
-/// through a join at all rather than just weakening it.
-///
-/// Second, a column on a side that may be unmatched loses whatever it had. The
-/// exception is a *folded* same-name key: `plan_join_output` emits one column
-/// for it, and the executor fills that column from the right key for rows with
-/// no left row (`materialize`, join.cpp), so it is null-free when both sides'
-/// keys are.
-void apply_join_nullability(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right,
-                            const std::vector<JoinOutputColumn>& plan,
-                            std::vector<SchemaField>& out) {
-    const JoinUnmatched unmatched = join_unmatched_sides(join.kind());
-    const bool only_matched_rows = join.kind() == JoinKind::Inner || join.kind() == JoinKind::Semi;
-    // `nulls equal` admits null keys into a match, which is exactly what the
-    // key proof below rests on being impossible.
-    const bool keys_are_null_free =
-        only_matched_rows && join.null_match() == NullMatch::Never && !join.keys().empty();
-
-    for (std::size_t i = 0; i < plan.size(); ++i) {
-        const JoinOutputColumn& column = plan[i];
-        const bool from_left = column.side == JoinOutputSide::Left;
-        const SchemaInfo& source = from_left ? left : right;
-        const std::string& source_name = source.fields()[column.source_index].name;
-
-        const auto key = std::ranges::find_if(join.keys(), [&](const JoinKey& k) {
-            return (from_left ? k.left : k.right) == source_name;
-        });
-        if (key == join.keys().end()) {
-            out[i].nulls =
-                (from_left ? unmatched.left : unmatched.right) ? Nullability::Maybe : out[i].nulls;
-            continue;
-        }
-
-        if (keys_are_null_free) {
-            out[i].nulls = Nullability::Never;
-            continue;
-        }
-        // A key folded into one output column (same name on both sides) draws
-        // from whichever side is present, so it needs both proofs -- but only
-        // when a left row can actually be missing.
-        if (from_left && unmatched.left && key->left == key->right) {
-            const auto* right_field = right.find(key->right);
-            out[i].nulls = weaker(out[i].nulls,
-                                  right_field != nullptr ? right_field->nulls : Nullability::Maybe);
-            continue;
-        }
-        if (from_left ? unmatched.left : unmatched.right) {
-            out[i].nulls = Nullability::Maybe;
-        }
-    }
 }
 
 /// Unique constraints a join's output inherits from its inputs. Each follows
@@ -939,12 +609,12 @@ auto check_one_join(const JoinNode& join, const SchemaInfo& left, const SchemaIn
         // Only a closed schema proves absence: an open one lists the columns it
         // knows about and admits others.
         if (left_field == nullptr && !left.is_open()) {
-            return "join key '" + key.left + "' not found on the left side (available: " +
-                   format_field_names(left) + ")";
+            return "join key '" + key.left +
+                   "' not found on the left side (available: " + format_field_names(left) + ")";
         }
         if (right_field == nullptr && !right.is_open()) {
-            return "join key '" + key.right + "' not found on the right side (available: " +
-                   format_field_names(right) + ")";
+            return "join key '" + key.right +
+                   "' not found on the right side (available: " + format_field_names(right) + ")";
         }
         if (left_field == nullptr || right_field == nullptr) {
             continue;

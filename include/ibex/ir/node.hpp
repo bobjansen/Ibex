@@ -453,12 +453,11 @@ enum class ColumnType : std::uint8_t {
 
 /// Whether a column may hold nulls.
 ///
-/// Like `SchemaInfo::unique_keys`, this is a *proof* carried by the schema, not
-/// a declaration to be trusted: `Never` means some operator's definition rules
-/// nulls out, never that a source promised it. So the lattice has only two
-/// points and only one of them says anything — `Maybe` is the ⊥ every rule
-/// falls back to, and no propagation rule may reach `Never` without an argument
-/// for it.
+/// A *proof*, like `SchemaInfo::unique_keys`: `Never` means an operator's
+/// definition rules nulls out, never that a source promised it. `Maybe` is the
+/// ⊥ every rule falls back to, so no rule may reach `Never` without an argument
+/// for it. The rules live in `ir/nullability.hpp`; `plans/joins.md` records why
+/// each holds.
 enum class Nullability : std::uint8_t {
     /// No proof; the column may hold nulls. Sound for any column whatever.
     Maybe,
@@ -469,14 +468,9 @@ enum class Nullability : std::uint8_t {
 /// One column in a schema. `type` is `nullopt` when the column is known to
 /// exist but its scalar type has not been inferred.
 ///
-/// `nulls` has a default member initializer where `JoinExpect`'s fields
-/// deliberately have none, and for the reason that argument turns on: there,
-/// silently defaulting a field an aggregate initializer forgot dropped a policy
-/// the *user wrote*, so silence was the bug. Here the default is the bottom of
-/// the lattice — a site that forgets `nulls` claims nothing, which loses
-/// precision and can never lose soundness. Making every one of the ~20 existing
-/// `SchemaField{...}` sites restate "I have no proof" would be noise that
-/// obscures the few that do.
+/// `nulls` defaults, unlike `JoinExpect`'s fields: its default is ⊥, so a
+/// construction site that omits it under-claims rather than dropping something
+/// a caller asked for.
 struct SchemaField {
     std::string name;
     std::optional<ColumnType> type;
@@ -484,6 +478,9 @@ struct SchemaField {
 
     /// True when this column is proved null-free.
     [[nodiscard]] auto non_null() const noexcept -> bool { return nulls == Nullability::Never; }
+    /// True when nothing rules a null out — the conservative reading, spelled
+    /// positively so a caller that wants it need not negate `non_null()`.
+    [[nodiscard]] auto may_be_null() const noexcept -> bool { return !non_null(); }
 };
 
 /// The weaker of two proofs: `Never` only when both sides are `Never`. Used

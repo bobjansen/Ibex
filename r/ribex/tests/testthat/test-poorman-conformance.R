@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+#
+# Portions Copyright (c) 2020 Nathan Eastwood
+# Modifications Copyright (C) 2026 Bob Jansen
+#
 # Adapted from poorman's tinytest suite at commit
 # c9eb1f1429e6934e1b3233bb10c50c82adf05bd2 (c9eb1f1).
 #

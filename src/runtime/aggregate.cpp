@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // aggregate.cpp — grouped and global aggregation: aggregate_table, the
 // aggregate-call parser/spec builder, compound aggregate scalar evaluation,
 // and the broadcast (update+by mixed aggregate) path.

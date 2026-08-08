@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Time the 9 implemented PDS-H queries against Polars, reading the same
 Parquet tables benchmarking/tpch/queries/*.ibex use. Mirrors Ibex's own
 query semantics (same filters, join structure, and standard TPC-H

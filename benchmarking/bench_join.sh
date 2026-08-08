@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # bench_join.sh — run ibex_join_bench and archive raw output in bench_results/.
 #
 # Usage:

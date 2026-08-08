@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Bundled Thrift's DefineOptions.cmake does:
 #   if(ZLIB_LIBRARY)
 #       file(TO_CMAKE_PATH ${ZLIB_LIBRARY} ZLIB_LIBRARY)

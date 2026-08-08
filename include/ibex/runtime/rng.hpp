@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 // Ibex RNG layer — delegates to zorro.hpp for SIMD-dispatched xoshiro256++.
 //

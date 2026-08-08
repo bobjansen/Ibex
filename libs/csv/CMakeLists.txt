@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # CURL powers optional HTTPS support in read_csv. It's not available on every
 # CI runner (Windows, the minimal clang-werror box), so treat it as optional:
 # build the plugin without HTTPS when it's missing rather than failing configure.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Benchmark SQLite on the same aggregation queries as ibex_bench.
 
 SQLite is a row-oriented database included as a baseline to show where

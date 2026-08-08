@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # R emits `tsu:<zone>` for a POSIXct -- microseconds, with an IANA zone. Ibex
 # stores an instant in nanoseconds, so the import rescales the unit and carries
 # the zone as column metadata. The instant needs no adjustment (an Arrow

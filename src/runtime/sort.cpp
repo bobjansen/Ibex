@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // sort.cpp — ordering and row-selection: LSD radix sort machinery,
 // order_table (single- and multi-key, pre-sorted fast path), and grouped
 // head/tail selection.

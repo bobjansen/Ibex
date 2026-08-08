@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # CompilerOptions.cmake — Shared compiler configuration for Ibex targets
 
 add_library(ibex_compiler_options INTERFACE)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #include <ibex/interop/arrow_c_data.hpp>
 #if defined(IBEX_HAS_PARQUET_BACKEND)
 #include <ibex/parquet/backend.hpp>

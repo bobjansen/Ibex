@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // expr.cpp — expression evaluation: the row-wise scalar-builtin registry
 // (single source of truth for infer + eval), type inference, per-row eval,
 // per-field column evaluation, lag/lead/cum/fill/float-clean transforms,

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # ibex-run.sh — transpile an .ibex file to C++, compile it, and run it.
 #
 # Usage:

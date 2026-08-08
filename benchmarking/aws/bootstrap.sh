@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # bootstrap.sh — runs on the EC2 instance after the repo is cloned/checked out.
 # Called from user-data (see lib.sh:bench_user_data); all output goes to
 # /var/log/ibex-bench.log and the serial console.

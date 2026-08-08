@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Benchmark pandas and polars on the same aggregation queries as ibex_bench.
 
 Two polars modes are available so the comparison covers both shapes a real

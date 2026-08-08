@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # ibex-plugin-build.sh — compile a C++ plugin source file into a loadable .so
 # for use with the Ibex REPL.
 #

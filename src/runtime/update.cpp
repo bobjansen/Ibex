@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // update.cpp — update/select field application: the scalar fast paths
 // (compiled numeric expression trees, SIMD unary/pmin/pmax kernels), plain,
 // grouped, windowed, and guarded update paths.

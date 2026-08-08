@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 // Ibex Parquet library — provides read_parquet() and write_parquet() for use in Ibex scripts.
 //

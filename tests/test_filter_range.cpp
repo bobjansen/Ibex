@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Range-aware filtering: `filter_table_range` must be indistinguishable from
 // gathering the range into a table of its own and filtering that.
 //

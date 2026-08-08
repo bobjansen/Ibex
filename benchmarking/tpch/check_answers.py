@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Run the implemented PDS-H queries through ibex_eval and diff their output
 against the official TPC-H SF-1 qualification answers (tpch-dbgen/answers/).
 

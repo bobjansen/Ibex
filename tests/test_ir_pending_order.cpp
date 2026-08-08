@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // `annotate_pending_orders` tells a join what a following `order` will ask
 // for, so the executor can weigh preserving the left's row order against a
 // larger hash index. The annotation is a cost hint: nothing here changes which

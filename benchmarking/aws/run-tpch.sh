@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # run-tpch.sh — run the TPC-H/PDS-H quartet on one clean EC2 benchmark box.
 #
 # The artifact contains per-query TSVs for Ibex, this tree's Polars and

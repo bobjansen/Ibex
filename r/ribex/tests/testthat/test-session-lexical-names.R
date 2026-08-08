@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # A session must carry its in-scope names into the lowerer. The static
 # column-ref check treats a bare name in a filter or update expression as a
 # column unless it is a known lexical binding, so a bound scalar used to be

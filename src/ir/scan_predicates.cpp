@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 

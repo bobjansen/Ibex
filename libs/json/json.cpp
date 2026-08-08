@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Ibex plugin entry point for json.hpp.
 //
 // Build as a shared library alongside json.hpp and place it in a directory

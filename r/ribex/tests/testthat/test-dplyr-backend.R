@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 test_that("ibex_tbl identity is lazy, repeatable, and schema-aware", {
     input <- tibble::tibble(
         symbol = c("A", "B", "A"),

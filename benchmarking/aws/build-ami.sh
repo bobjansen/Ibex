@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # build-ami.sh — bake a reusable benchmark AMI, repeatably.
 #
 # Launches one builder instance from the stock Ubuntu 24.04 image, runs

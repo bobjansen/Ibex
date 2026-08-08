@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # compare-git.sh — A/B two git commits of the SAME ibex code on a clean EC2 box.
 #
 # The local compare_ibex_git.sh is the tool for this, but a laptop / WSL2 box is

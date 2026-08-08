@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // tick_gen.cpp — multi-symbol geometric Brownian motion UDP tick generator.
 //
 // Sends a continuous stream of synthetic tick datagrams to a UDP port.

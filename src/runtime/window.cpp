@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // window.cpp — time-window operators: rolling aggregates over duration
 // windows (apply_rolling_func) and timeframe resampling (resample_table).
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.

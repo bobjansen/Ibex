@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # compare_ibex_compilers.sh — compare full Ibex builds with two C++ compilers.
 #
 # Builds/times the same compiled Ibex queries with Clang-built and GCC-built

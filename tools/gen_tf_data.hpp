@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 // gen_tf_data — synthetic TimeFrame data generator for .ibex script benchmarks.
 //

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Rules for `derive_table_properties`, the one place an operator's output
 // metadata is derived from its input. Every operator is meant to route through
 // it, so the rules are pinned here rather than re-verified through whichever

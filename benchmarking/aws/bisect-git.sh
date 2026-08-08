@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # bisect-git.sh — run a performance git bisect on one EC2 instance.
 #
 # The instance runs `git bisect` locally and, for each candidate, compares the

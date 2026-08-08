@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // filter.cpp — vectorized predicate evaluation and filtering: typed
 // arithmetic/comparison kernels, fused arith+compare and pair-compare
 // dispatch, eval_value_vec / compute_mask (3VL nulls), and the

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Auto-fix three low-risk, high-signal clang-tidy checks: missing includes
 # (misc-include-cleaner), local const-correctness (misc-const-correctness),
 # and brace-init field names (modernize-use-designated-initializers). Then

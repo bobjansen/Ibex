@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 add_library(ibex_json_plugin SHARED json.cpp)
 
 set_target_properties(ibex_json_plugin PROPERTIES

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # bench_ibex.sh — run ibex_bench and write results/ibex.tsv.
 #
 # ibex_bench output format:

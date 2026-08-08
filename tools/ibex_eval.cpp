@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Non-interactive script runner: same execution path as the REPL's `:load`
 // command, so model accessors (`model_coef`, `model_fitted`), CSV plugins,
 // and other REPL-bound vocabulary work in batch scripts. Replaces an older

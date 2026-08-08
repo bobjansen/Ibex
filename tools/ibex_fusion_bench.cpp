@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Benchmark harness for pipeline fusion.
 //
 // Targets the Scan -> Filter -> Project fusion: when a Project follows a

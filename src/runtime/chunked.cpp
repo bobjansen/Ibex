@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // chunked.cpp — streaming (chunked) operator pipeline: per-chunk operators,
 // rank evaluation, extern-call execution, and build_operator plan construction.
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.

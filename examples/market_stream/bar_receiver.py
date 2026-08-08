@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """
 bar_receiver.py — prints OHLC bars forwarded by the Ibex UDP stream demo.
 

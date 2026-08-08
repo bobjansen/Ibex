@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 
 // Scalar `let` bindings (`let k = (base * 2) + 5;`) are not lowered into IR as

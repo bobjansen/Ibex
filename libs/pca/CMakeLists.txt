@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 add_library(ibex_pca_plugin SHARED pca.cpp)
 
 set_target_properties(ibex_pca_plugin PROPERTIES

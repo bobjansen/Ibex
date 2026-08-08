@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // monitor.cpp — WebSocket bar monitor for the Ibex Brownian motion demo.
 //
 // Connects to the Ibex WebSocket stream (port 8765) and:

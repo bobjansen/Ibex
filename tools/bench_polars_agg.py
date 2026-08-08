@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Polars grouped central-moment aggregate benchmark.
 
 Companion to the `agg_moments_*` cases in `tools/ibex_fusion_bench`: same data

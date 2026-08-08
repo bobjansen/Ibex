@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 // Ibex JSON library — row-oriented JSON reading and writing via nlohmann/json.
 //

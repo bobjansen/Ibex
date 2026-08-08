@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 /// Comprehensive end-to-end tests: source text -> parse -> lower -> interpret.
 ///
 /// These tests exercise the full pipeline in a single step, ensuring that the

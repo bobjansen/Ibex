@@ -6,6 +6,12 @@ with a fast parallel interpreter and transpilation to C++23.
 See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
 information.
 
+Ibex is licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md),
+including the separate MIT attribution for Poorman-derived ribex test material.
+Small pull requests are welcome under the contribution terms in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 Notable language features:
 - bracket pipelines for filter/select/update/group/order/join flows
 - compile-time `map` expansion inside braced `select` / `update` blocks

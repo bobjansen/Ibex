@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Sanitizers.cmake — ASan + UBSan for Debug builds
 
 add_library(ibex_sanitizer_options INTERFACE)

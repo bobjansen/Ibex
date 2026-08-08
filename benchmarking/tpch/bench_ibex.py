@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Time the 22 implemented PDS-H queries in a single warm Ibex process.
 
 `ibex_eval` starts a fresh process per invocation, which pays Arrow/AWS-SDK

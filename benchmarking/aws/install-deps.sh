@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # install-deps.sh — install all benchmark dependencies on Ubuntu 22.04/24.04.
 #
 # This script installs everything needed to run the full benchmark suite:

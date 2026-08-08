@@ -288,8 +288,15 @@ ibex_render_plan <- function(x, redact = FALSE) {
             distinct = paste0(code, "[distinct { ", paste(vapply(step$names, ibex_quote_identifier, character(1)), collapse = ", "), " }]"),
             join = paste0(
                 "(", code, ibex_join_operator(step$join_kind),
-                sub(";$", "", ibex_render_plan(step$right)), " on { ",
-                paste(vapply(step$keys, ibex_quote_identifier, character(1)), collapse = ", "), " }",
+                sub(";$", "", ibex_render_plan(step$right)),
+                # A cross join has no keys, and Ibex has no spelling for an
+                # empty `on`. Every other kind carries at least one.
+                if (length(step$keys)) {
+                    paste0(" on { ",
+                           paste(vapply(step$keys, ibex_quote_identifier, character(1)),
+                                 collapse = ", "),
+                           " }")
+                } else "",
                 # Ibex refuses a non-key collision without this clause, and its
                 # two-suffix form is exactly dplyr's `suffix` argument, so the
                 # names come out right without a rename pass afterwards.
@@ -1021,7 +1028,8 @@ ibex_join_output_names <- function(x, y, keys, suffix) {
 ibex_join_operator <- function(kind) {
     c(inner = " join ", left = " left join ",
       right = " right join ", full = " outer join ",
-      semi = " semi join ", anti = " anti join ")[[kind]]
+      semi = " semi join ", anti = " anti join ",
+      cross = " cross join ")[[kind]]
 }
 
 # `semi join` and `anti join` return the left columns only. That one fact is
@@ -1084,16 +1092,23 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     if (!inherits(y, "ibex_tbl")) y <- ibex_tbl(y, session = x$session, fallback = x$fallback_policy)
     if (!identical(x$session, y$session)) ibex_unsupported("Native joins require both inputs to use the same Ibex session.")
     if (length(x$captured_scalars) || length(y$captured_scalars)) ibex_unsupported("Native joins with captured scalar prefixes are not supported yet.")
-    if (is.null(by)) by <- intersect(x$schema$names, y$schema$names)
-    if (!is.character(by) || !length(by)) {
-        ibex_unsupported("Native joins currently require same-named character `by` keys.")
-    }
-    keys <- if (is.null(names(by))) by else {
-        if (!identical(unname(by), names(by))) ibex_unsupported("Native joins require same-named keys.")
-        unname(by)
-    }
-    if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
-        ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
+    # A cross join pairs every row with every row, so it has no keys to derive
+    # and `cross_join()` has no `by` argument to derive them from. Every other
+    # kind needs at least one key, which is what the block below insists on.
+    cross <- identical(kind, "cross")
+    keys <- character()
+    if (!cross) {
+        if (is.null(by)) by <- intersect(x$schema$names, y$schema$names)
+        if (!is.character(by) || !length(by)) {
+            ibex_unsupported("Native joins currently require same-named character `by` keys.")
+        }
+        keys <- if (is.null(names(by))) by else {
+            if (!identical(unname(by), names(by))) ibex_unsupported("Native joins require same-named keys.")
+            unname(by)
+        }
+        if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
+            ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
+        }
     }
     filtering <- ibex_join_is_filtering(kind)
     overlap <- if (filtering) character() else {
@@ -1102,7 +1117,10 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     if (length(overlap) && (length(suffix) != 2L || any(!nzchar(suffix)))) {
         ibex_unsupported("Native joins require two non-empty suffixes.")
     }
-    null_match <- ibex_join_null_match(x, y, keys, na_matches)
+    # Ibex rejects a `nulls` clause on a join with no equality keys, rather
+    # than accepting one that could not do anything. Nothing is lost: with no
+    # key to compare, there is no null-matching question to answer.
+    null_match <- if (cross) NULL else ibex_join_null_match(x, y, keys, na_matches)
     # Only emit the clause when something actually collides: Ibex accepts it
     # either way, but a clause with nothing to rename is noise in the plan.
     step_suffix <- if (length(overlap)) suffix else NULL
@@ -1192,6 +1210,21 @@ full_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", "
         dplyr::full_join(local, right, by = by, copy = copy, suffix = suffix, ...,
                          keep = keep, na_matches = na_matches, multiple = multiple,
                          relationship = relationship)
+    })
+}
+
+# `cross_join()` takes neither `by` nor `na_matches`: with no keys there is
+# nothing to match on and so no null-matching question. It keeps `suffix`,
+# though, and needs it more than the others do -- a same-named column is a
+# plain collision here, since no key folds the two into one.
+cross_join.ibex_tbl <- function(x, y, ..., copy = FALSE, suffix = c(".x", ".y")) {
+    ibex_with_fallback(x, "cross_join", function() {
+        ibex_native_join(x, y, "cross", by = NULL, copy, suffix, ..., keep = NULL,
+                         na_matches = "never", multiple = "all",
+                         unmatched = "drop", relationship = NULL)
+    }, function(local) {
+        right <- if (inherits(y, "ibex_tbl")) collect(y) else y
+        dplyr::cross_join(local, right, ..., copy = copy, suffix = suffix)
     })
 }
 

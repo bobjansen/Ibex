@@ -17,7 +17,8 @@ collection and `fallback = "collect"` makes it silent.
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and the remaining kinds (`cross_join`, `nest_join`) |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and `nest_join`, which needs a list column Ibex has no representation for |
+| `cross_join` | The Cartesian product, with `suffix`; it takes no `by` or `na_matches`, and every name both inputs hold is a collision, since no key folds two columns into one | `copy = TRUE`, and a collision under an empty suffix |
 | filtering joins | `semi_join` and `anti_join` under the same key and `na_matches` rules; they return the left columns unchanged and keep the input's grouping, since no column can be renamed or gain nulls | `copy = TRUE` and the key restrictions above |
 
 ## Types and missing values

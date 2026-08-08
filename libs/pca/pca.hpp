@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 
 // Principal Component Analysis plugin (pure C++, Jacobi symmetric eigensolver).

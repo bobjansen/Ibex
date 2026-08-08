@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 
 // Canonical table/cell formatting shared by the interpreter REPL (and the

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 arrow_buffer_addresses <- function(array) {
     .Call(ribex:::ribex_c_arrow_buffer_addresses, array)
 }

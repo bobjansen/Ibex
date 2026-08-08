@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Worker-pool unit tests (runtime multithreading, Phase 1).
 //
 // The pool is deliberately tiny, so what is worth testing is its contract with

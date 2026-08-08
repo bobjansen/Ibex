@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Run the full quant demo end-to-end and print a side-by-side coefficient
 # comparison.  Assumes build-release/ exists.
 

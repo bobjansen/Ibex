@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # run-window-ohlc.sh — run the window-OHLC suite on one clean EC2 benchmark box.
 #
 # Two workloads across FOUR engines -- Ibex, Polars, DuckDB and ClickHouse

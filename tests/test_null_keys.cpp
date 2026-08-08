@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Does this operator's key or comparison consult the validity bitmap?
 //
 // A null cell holds its type's zero, so any code that compares VALUES alone

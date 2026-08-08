@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # compare_plugin_git.sh — A/B two git commits of ibex for a plugin-backed
 # extern function (read_parquet, read_adbc, kafka_recv, ...).
 #

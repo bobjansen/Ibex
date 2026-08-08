@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // like.hpp — SQL-LIKE pattern matching, the semantic core of the `like` builtin.
 //
 // A pattern is compiled once (compile_like_pattern) and then matched against

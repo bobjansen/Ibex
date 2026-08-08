@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 add_library(ibex_data_gen_plugin SHARED data_gen.cpp)
 
 set_target_properties(ibex_data_gen_plugin PROPERTIES

@@ -22,6 +22,6 @@ Suggests:
 Config/testthat/edition: 3
 Config/ribex/dplyr-version: >= 1.1.0, < 1.2.0
 SystemRequirements: C++23, an existing Ibex build tree
-License: file LICENSE
+License: AGPL-3 + file LICENSE
 Encoding: UTF-8
 LazyData: false

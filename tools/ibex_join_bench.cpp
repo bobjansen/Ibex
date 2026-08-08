@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Join-focused benchmark suite for Ibex.
 //
 // Generates synthetic tables in-memory (no CSV required) and exercises the

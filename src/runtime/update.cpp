@@ -3071,7 +3071,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // Resolve both ends once; see `ColumnAppender`. Only
                         // `Column<bool>` reaches this branch without a dense
                         // buffer, so it keeps the indexed path.
-                        typename Col::value_type const* out_values = nullptr;
+                        typename Col::value_type* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }
@@ -3108,7 +3108,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         out.resize(n);
                         ValidityBitmap valid(n, false);
                         bool any_invalid = matched_idx.size() < n;
-                        typename Col::value_type const* out_values = nullptr;
+                        typename Col::value_type* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }

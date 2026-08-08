@@ -272,8 +272,10 @@ auto row_at_or_before(const runtime::ColumnEntry& entry, std::size_t a, std::siz
         [&](const auto& col) -> bool {
             using ColT = std::decay_t<decltype(col)>;
             if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                const std::string_view lhs = col.dictionary()[static_cast<std::size_t>(col.code_at(a))];
-                const std::string_view rhs = col.dictionary()[static_cast<std::size_t>(col.code_at(b))];
+                const std::string_view lhs =
+                    col.dictionary()[static_cast<std::size_t>(col.code_at(a))];
+                const std::string_view rhs =
+                    col.dictionary()[static_cast<std::size_t>(col.code_at(b))];
                 return ascending ? lhs <= rhs : rhs <= lhs;
             } else if constexpr (std::is_same_v<ColT, Column<Timestamp>>) {
                 return ascending ? col[a].nanos <= col[b].nanos : col[b].nanos <= col[a].nanos;
@@ -316,8 +318,8 @@ auto validate_imported_claims(const runtime::Table& table,
         if (entry->validity.has_value()) {
             for (std::size_t row = 0; row < table.rows(); ++row) {
                 if (!(*entry->validity)[row]) {
-                    return std::unexpected("ibex.time_index '" + *time_index +
-                                           "' is null at row " + std::to_string(row) +
+                    return std::unexpected("ibex.time_index '" + *time_index + "' is null at row " +
+                                           std::to_string(row) +
                                            "; a TimeFrame's index must have no nulls");
                 }
             }

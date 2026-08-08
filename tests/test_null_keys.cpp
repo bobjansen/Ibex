@@ -80,8 +80,7 @@ auto null_vs_zero() -> runtime::TableRegistry {
 TEST_CASE("null keys: head N by keeps the null group separate", "[nulls][keys]") {
     auto tables = null_vs_zero();
     // Three groups: the genuine zeros, the nulls, and 5.
-    CHECK(ints(run("t[head 1, by { k }];", tables), "v") ==
-          std::vector<std::int64_t>{1, 10, 100});
+    CHECK(ints(run("t[head 1, by { k }];", tables), "v") == std::vector<std::int64_t>{1, 10, 100});
     CHECK(run("t[head 2, by { k }];", tables).rows() == 5);
 }
 
@@ -90,13 +89,11 @@ TEST_CASE("null keys: tail N by keeps the null group separate", "[nulls][keys]")
     // The last row of each of the three groups, the groups in first-encounter
     // order. Merging null into the zero group loses one group entirely, which
     // is how this was found.
-    CHECK(ints(run("t[tail 1, by { k }];", tables), "v") ==
-          std::vector<std::int64_t>{2, 20, 100});
+    CHECK(ints(run("t[tail 1, by { k }];", tables), "v") == std::vector<std::int64_t>{2, 20, 100});
     CHECK(run("t[tail 2, by { k }];", tables).rows() == 5);
 }
 
-TEST_CASE("null keys: order puts nulls last even when the values look sorted",
-          "[nulls][keys]") {
+TEST_CASE("null keys: order puts nulls last even when the values look sorted", "[nulls][keys]") {
     // The null is row 0 and holds the zero its type carries, so the VALUE
     // sequence 0, 1, 2 is ascending and a check that reads values alone calls
     // the column sorted — leaving the null exactly where it must not be.
@@ -185,8 +182,7 @@ TEST_CASE("null keys: dcast keeps distinct Float64 row keys apart", "[nulls][key
     CHECK(ints(out, "b") == std::vector<std::int64_t>{20, 40});
 }
 
-TEST_CASE("null keys: dcast separates a null row key from every real value",
-          "[nulls][keys]") {
+TEST_CASE("null keys: dcast separates a null row key from every real value", "[nulls][keys]") {
     // The null used to be encoded as INT64_MIN, a value a real key can hold —
     // so a row keyed INT64_MIN merged with the nulls. Null-ness now travels in
     // the key's mask, where no value can reach it.
@@ -236,8 +232,7 @@ TEST_CASE("null keys: a fully valid TimeFrame index is still accepted", "[nulls]
           std::vector<std::int64_t>{10, 20, 30});
 }
 
-TEST_CASE("null keys: an empty string key does not take the run-length sentinel",
-          "[nulls][keys]") {
+TEST_CASE("null keys: an empty string key does not take the run-length sentinel", "[nulls][keys]") {
     // The group-by run-length cache compared `key == prev_key` with `prev_key`
     // default-built — and a default string_view IS the empty string. So a first
     // row holding a GENUINE "" matched the empty cache and took the cache's

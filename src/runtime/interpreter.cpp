@@ -1532,8 +1532,8 @@ auto invoke_table_consumer(const ExternRegistry& externs, const std::string& cal
 auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                  const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
                  const ScalarRegistry* scalars, const ir::JoinSuffixPolicy& suffix,
-                 ir::NullMatch null_match, const ir::JoinExpect& expect,
-                 ir::MatchSelection take) -> std::expected<Table, std::string> {
+                 ir::NullMatch null_match, const ir::JoinExpect& expect, ir::MatchSelection take)
+    -> std::expected<Table, std::string> {
     return join_table_impl(left, right, kind, keys, predicate, scalars, compute_mask, suffix, {},
                            null_match, expect, take);
 }

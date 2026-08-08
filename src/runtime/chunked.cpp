@@ -1875,7 +1875,6 @@ class ChunkedAsTimeframeOperator final : public Operator {
             }
             rows_seen_ += chunk.rows();
 
-
             // Promote Int → Timestamp per chunk (cheap — same row count, same
             // layout — and keeps downstream operators seeing Timestamp).
             if (needs_promotion_) {
@@ -2937,7 +2936,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         const auto* right_entry = right_.find_entry(keys_->front().right);
         const ValidityBitmap* build_validity =
             right_entry != nullptr && right_entry->validity.has_value() ? &*right_entry->validity
-                                                                       : nullptr;
+                                                                        : nullptr;
         const auto build_is_null = [build_validity](std::size_t row) {
             return build_validity != nullptr && !(*build_validity)[row];
         };
@@ -3047,7 +3046,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         const auto* probe_entry = t.find_entry(keys_->front().left);
         const ValidityBitmap* probe_validity =
             probe_entry != nullptr && probe_entry->validity.has_value() ? &*probe_entry->validity
-                                                                       : nullptr;
+                                                                        : nullptr;
         const auto probe_is_null = [probe_validity](std::size_t row) {
             return probe_validity != nullptr && !(*probe_validity)[row];
         };
@@ -3107,7 +3106,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             col != nullptr &&
             static_cast<const void*>(col->dictionary_ptr().get()) == right_cat_dictionary_id_) {
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = !probe_is_null(row) && right_cat_codes_.contains(col->code_at(row));
+                const bool match =
+                    !probe_is_null(row) && right_cat_codes_.contains(col->code_at(row));
                 return keep_matches ? match : !match;
             });
         }
@@ -4306,7 +4306,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (!emitted.has_value()) {
                     return {};  // a key the output cannot name
                 }
-                out.push_back(ir::OrderKey{.name = std::move(*emitted), .ascending = key.ascending});
+                out.push_back(
+                    ir::OrderKey{.name = std::move(*emitted), .ascending = key.ascending});
             }
             return out;
         }();
@@ -8499,12 +8500,10 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         // one implementation that has it keeps a single definition of the
         // semantics -- and leaves this hot path bit-for-bit unchanged for every
         // join that does not ask for it.
-        const bool streamable_inner = join.kind() == ir::JoinKind::Inner &&
-                                      !join.predicate().has_value() &&
-                                      join.keys().size() == 1 &&
-                                      join.null_match() == ir::NullMatch::Never &&
-                                      !join.expect().asserts_anything() &&
-                                      join.take() == ir::MatchSelection::All;
+        const bool streamable_inner =
+            join.kind() == ir::JoinKind::Inner && !join.predicate().has_value() &&
+            join.keys().size() == 1 && join.null_match() == ir::NullMatch::Never &&
+            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
         if (streamable_inner) {
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);

@@ -4386,9 +4386,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         if (loaded.status == PluginLoadStatus::LoadError) {
             fmt::print("warning: {}\n", loaded.message);
         }
-        const auto& primary_paths = config.import_search_paths.empty()
-                                        ? config.plugin_search_paths
-                                        : config.import_search_paths;
+        const auto& primary_paths = config.import_search_paths.empty() ? config.plugin_search_paths
+                                                                       : config.import_search_paths;
         auto source = find_library_source(imp->name, primary_paths);
         if (!source.has_value() && !config.import_search_paths.empty()) {
             source = find_library_source(imp->name, config.plugin_search_paths);
@@ -4425,25 +4424,25 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
 
     std::set<std::string> lazy_callees;
     const auto scan_externs = [&](const parser::Program& unit) -> bool {
-    for (const auto& stmt : unit.statements) {
-        const auto* decl = std::get_if<parser::ExternDecl>(&stmt);
-        if (decl == nullptr) {
-            continue;
-        }
-        if (!decl->source_path.empty()) {
-            const auto loaded =
-                try_load_plugin(plugin_stem(decl->source_path), config.plugin_search_paths,
-                                loaded_plugins, externs);
-            if (loaded.status == PluginLoadStatus::LoadError) {
-                fmt::print("error: {}\n", loaded.message);
-                return false;
+        for (const auto& stmt : unit.statements) {
+            const auto* decl = std::get_if<parser::ExternDecl>(&stmt);
+            if (decl == nullptr) {
+                continue;
+            }
+            if (!decl->source_path.empty()) {
+                const auto loaded =
+                    try_load_plugin(plugin_stem(decl->source_path), config.plugin_search_paths,
+                                    loaded_plugins, externs);
+                if (loaded.status == PluginLoadStatus::LoadError) {
+                    fmt::print("error: {}\n", loaded.message);
+                    return false;
+                }
+            }
+            if (const auto* function = externs.find(decl->name);
+                function != nullptr && function->lazy_table_func) {
+                lazy_callees.insert(decl->name);
             }
         }
-        if (const auto* function = externs.find(decl->name);
-            function != nullptr && function->lazy_table_func) {
-            lazy_callees.insert(decl->name);
-        }
-    }
         return true;
     };
     for (const auto* unit : prelude) {

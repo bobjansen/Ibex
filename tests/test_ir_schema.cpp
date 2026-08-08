@@ -493,7 +493,8 @@ namespace {
 
 // A join of scans over "left" and "right", so the check can be driven by the
 // two source schemas alone.
-auto join_of(std::vector<ibex::ir::JoinKey> keys, ibex::ir::JoinKind kind = ibex::ir::JoinKind::Inner,
+auto join_of(std::vector<ibex::ir::JoinKey> keys,
+             ibex::ir::JoinKind kind = ibex::ir::JoinKind::Inner,
              ibex::ir::JoinSuffixPolicy suffix = {}) -> ibex::ir::JoinNode {
     ibex::ir::JoinNode join(ibex::ir::NodeId{3}, kind, std::move(keys), std::nullopt,
                             std::move(suffix));
@@ -510,10 +511,9 @@ auto two_sources(SchemaInfo left, SchemaInfo right) -> SourceSchemas {
 
 TEST_CASE("check_joins: a key absent from one side is named with its side", "[ir][schema]") {
     auto join = join_of({{"id", "id"}});
-    auto sources = two_sources(
-        SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
-        SchemaInfo::known({{.name = "other", .type = ColumnType::Int64},
-                           {.name = "v", .type = ColumnType::Float64}}));
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "other", .type = ColumnType::Int64},
+                                                  {.name = "v", .type = ColumnType::Float64}}));
     auto err = ibex::ir::check_joins(join, sources);
     REQUIRE(err.has_value());
     REQUIRE(err->find("'id'") != std::string::npos);
@@ -564,8 +564,9 @@ TEST_CASE("check_joins: an untyped or open side defers to the runtime", "[ir][sc
     REQUIRE_FALSE(ibex::ir::check_joins(join, untyped).has_value());
 
     // An open schema may carry the key among the columns it does not list.
-    auto open = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
-                            SchemaInfo::known({{.name = "v", .type = std::nullopt}}, /*open=*/true));
+    auto open =
+        two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                    SchemaInfo::known({{.name = "v", .type = std::nullopt}}, /*open=*/true));
     REQUIRE_FALSE(ibex::ir::check_joins(join, open).has_value());
 
     // An unknown source proves nothing either way.
@@ -587,14 +588,15 @@ TEST_CASE("check_joins: an unresolved output collision is reported here", "[ir][
     REQUIRE(err->find("v") != std::string::npos);
 
     // With suffixes it resolves, and the check passes.
-    auto suffixed = join_of({{"id", "id"}}, ibex::ir::JoinKind::Inner,
-                            ibex::ir::JoinSuffixPolicy{.present = true, .left = "_l", .right = "_r"});
+    auto suffixed =
+        join_of({{"id", "id"}}, ibex::ir::JoinKind::Inner,
+                ibex::ir::JoinSuffixPolicy{.present = true, .left = "_l", .right = "_r"});
     REQUIRE_FALSE(ibex::ir::check_joins(suffixed, sources).has_value());
 }
 
 TEST_CASE("check_joins: a join nested below another operator is still checked", "[ir][schema]") {
-    auto join = std::make_unique<ibex::ir::JoinNode>(
-        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner, std::vector<ibex::ir::JoinKey>{{"id", "id"}});
+    auto join = std::make_unique<ibex::ir::JoinNode>(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                                                     std::vector<ibex::ir::JoinKey>{{"id", "id"}});
     join->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
     join->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
     ibex::ir::HeadNode head(ibex::ir::NodeId{4}, std::size_t{5});
@@ -605,29 +607,26 @@ TEST_CASE("check_joins: a join nested below another operator is still checked", 
     REQUIRE(ibex::ir::check_joins(head, sources).has_value());
 }
 
-TEST_CASE("schema: a declared expect carries the proofs a join cannot prove",
-          "[ir][schema]") {
+TEST_CASE("schema: a declared expect carries the proofs a join cannot prove", "[ir][schema]") {
     // Neither side has a proven unique key here, so inference alone carries
     // nothing. `expect n:1` says each left row matches at most one right row,
     // which is exactly what keeps a left-side unique key unique in the output.
     // The executor checks the declaration, so relying on it cannot describe a
     // result that was actually produced -- a run whose data disagrees fails.
-    auto sources = two_sources(
-        SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
-                           {.name = "cust", .type = ColumnType::Int64}}),
-        SchemaInfo::known({{.name = "cust", .type = ColumnType::Int64},
-                           {.name = "tier", .type = ColumnType::Int64}}));
+    auto sources = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64},
+                                                  {.name = "cust", .type = ColumnType::Int64}}),
+                               SchemaInfo::known({{.name = "cust", .type = ColumnType::Int64},
+                                                  {.name = "tier", .type = ColumnType::Int64}}));
     sources["left"].add_unique_key({"id"});
 
     auto plain = join_of({{"cust", "cust"}});
     CHECK(ibex::ir::infer_schema(plain, sources).unique_keys().empty());
 
-    ibex::ir::JoinNode declared(
-        ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
-        std::vector<ibex::ir::JoinKey>{{"cust", "cust"}}, std::nullopt, {},
-        ibex::ir::NullMatch::Never,
-        ibex::ir::JoinExpect{.left = ibex::ir::JoinMultiplicity::Many,
-                             .right = ibex::ir::JoinMultiplicity::One});
+    ibex::ir::JoinNode declared(ibex::ir::NodeId{3}, ibex::ir::JoinKind::Inner,
+                                std::vector<ibex::ir::JoinKey>{{"cust", "cust"}}, std::nullopt, {},
+                                ibex::ir::NullMatch::Never,
+                                ibex::ir::JoinExpect{.left = ibex::ir::JoinMultiplicity::Many,
+                                                     .right = ibex::ir::JoinMultiplicity::One});
     declared.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "left"));
     declared.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{2}, "right"));
 

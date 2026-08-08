@@ -23,8 +23,8 @@
 #include <iterator>
 #include <memory>
 #include <optional>
-#include <span>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1897,10 +1897,10 @@ class Lowerer {
                 .present = true, .left = join.suffix->left, .right = join.suffix->right};
         }
 
-        const ir::NullMatch null_match = join.null_match.has_value() &&
-                                                 *join.null_match == JoinNullMatch::Equal
-                                             ? ir::NullMatch::Equal
-                                             : ir::NullMatch::Never;
+        const ir::NullMatch null_match =
+            join.null_match.has_value() && *join.null_match == JoinNullMatch::Equal
+                ? ir::NullMatch::Equal
+                : ir::NullMatch::Never;
         // Value-initialized, not default-initialized: `JoinExpect` has no
         // member defaults, so `ir::JoinExpect expect;` would leave it
         // indeterminate. `{}` is the neutral n:n.
@@ -1916,10 +1916,18 @@ class Lowerer {
         ir::MatchSelection take = ir::MatchSelection::All;
         if (join.take.has_value()) {
             switch (*join.take) {
-                case MatchSelection::All: take = ir::MatchSelection::All; break;
-                case MatchSelection::First: take = ir::MatchSelection::First; break;
-                case MatchSelection::Last: take = ir::MatchSelection::Last; break;
-                case MatchSelection::Any: take = ir::MatchSelection::Any; break;
+                case MatchSelection::All:
+                    take = ir::MatchSelection::All;
+                    break;
+                case MatchSelection::First:
+                    take = ir::MatchSelection::First;
+                    break;
+                case MatchSelection::Last:
+                    take = ir::MatchSelection::Last;
+                    break;
+                case MatchSelection::Any:
+                    take = ir::MatchSelection::Any;
+                    break;
             }
         }
         auto node = builder_.join(kind, std::move(keys), std::move(predicate), std::move(suffix),
@@ -4721,8 +4729,7 @@ class Lowerer {
                 const auto& join = static_cast<const ir::JoinNode&>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
                 clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
-                                      join.suffix(), join.null_match(), join.expect(),
-                                      join.take());
+                                      join.suffix(), join.null_match(), join.expect(), join.take());
                 break;
             }
             case ir::NodeKind::Melt: {

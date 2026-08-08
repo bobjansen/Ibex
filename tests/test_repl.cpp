@@ -2014,8 +2014,7 @@ rows[select { n = count() }];
     }
 }
 
-TEST_CASE("REPL keeps a join's clauses when a function body is inlined",
-          "[repl][join]") {
+TEST_CASE("REPL keeps a join's clauses when a function body is inlined", "[repl][join]") {
     // A join written inside a function body has to mean there what it means
     // anywhere else. `expect 1:1` makes that observable rather than silent:
     // customer 10 matches two orders, so the run must fail. A clause lost on

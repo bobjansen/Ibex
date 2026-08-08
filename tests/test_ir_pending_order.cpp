@@ -60,14 +60,12 @@ TEST_CASE("pending order: an order above a join reaches the join", "[ir][pending
     CHECK(keys == std::vector<std::pair<std::string, bool>>{{"id", true}});
 }
 
-TEST_CASE("pending order: direction and multiple keys carry through",
-          "[ir][pending_order]") {
+TEST_CASE("pending order: direction and multiple keys carry through", "[ir][pending_order]") {
     auto keys = pending_of("(lhs join rhs on id)[order { id asc, v desc }];");
     CHECK(keys == std::vector<std::pair<std::string, bool>>{{"id", true}, {"v", false}});
 }
 
-TEST_CASE("pending order: a join with no order above it is left alone",
-          "[ir][pending_order]") {
+TEST_CASE("pending order: a join with no order above it is left alone", "[ir][pending_order]") {
     CHECK(pending_of("lhs join rhs on id;").empty());
 }
 

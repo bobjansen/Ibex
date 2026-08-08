@@ -271,6 +271,66 @@ test_that("join nullability follows Ibex's rules, not the adapter's", {
     expect_identical(outer$schema$nullable, c(TRUE, FALSE, TRUE))
 })
 
+test_that("right and full joins run natively and agree with dplyr", {
+    session <- create_session()
+    # A duplicate left key, a left-only row and a right-only row, so each join
+    # differs from the others in what it keeps.
+    left <- tibble::tibble(id = c(1L, 2L, 2L, 4L), lv = c(10L, 20L, 21L, 40L))
+    right <- tibble::tibble(id = c(2L, 3L), rv = c(200L, 300L))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    # A join promises no row order, so compare as sets. dplyr's own order is
+    # not the contract being tested here.
+    sorted <- function(data) {
+        data <- as.data.frame(dplyr::collect(data))
+        data[do.call(order, c(unname(as.list(data)), list(na.last = TRUE))), , drop = FALSE]
+    }
+
+    for (verb in c("right_join", "full_join")) {
+        join <- getExportedValue("dplyr", verb)
+        actual <- join(lt, right, by = "id", na_matches = "never")
+        expect_s3_class(actual, "ibex_tbl")
+        expect_identical(actual$schema$names, c("id", "lv", "rv"))
+        expect_equal(
+            sorted(actual),
+            sorted(join(left, right, by = "id", na_matches = "never")),
+            ignore_attr = TRUE
+        )
+    }
+
+    # The key stays proved through both, which is what unblocked these verbs:
+    # an unmatched row's folded key comes from whichever side turned up, so it
+    # needs a proof from each -- and both inputs have one.
+    expect_identical(
+        dplyr::right_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(FALSE, TRUE, FALSE)
+    )
+    expect_identical(
+        dplyr::full_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(FALSE, TRUE, TRUE)
+    )
+})
+
+test_that("a full join's key is only as proved as the two sides together", {
+    # The mirror of the case above: one nullable input is enough to withdraw
+    # the folded key's proof, because that side's rows reach the output.
+    session <- create_session()
+    left <- tibble::tibble(id = c(1L, NA_integer_), lv = c(1, 2))
+    right <- tibble::tibble(id = 1L, rv = 10)
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    expect_identical(
+        dplyr::full_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(TRUE, TRUE, TRUE)
+    )
+    # A right join drops the left-only rows, so the left's missing proof
+    # cannot reach the key -- the right's proof carries every row.
+    expect_identical(
+        dplyr::right_join(lt, right, by = "id", na_matches = "never")$schema$nullable,
+        c(FALSE, TRUE, FALSE)
+    )
+})
+
 test_that("a captured scalar does not cost the plan its nullability proofs", {
     # The plan carries `^name` for a scalar bound at eval time rather than in
     # the session, so inference has to be told the name exists. Without that

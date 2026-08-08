@@ -17,7 +17,7 @@ collection and `fallback = "collect"` makes it silent.
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join` and `left_join` with same-named character keys, otherwise-default join options, and `na_matches = "never"`; a local right data frame is bound into the left session | Different key names / `join_by()`, dplyr's default NA matching, `keep`, multiplicity and relationship options, and other join kinds |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and `na_matches = "never"`; a local right data frame is bound into the left session | Different key names / `join_by()`, dplyr's default NA matching, `keep`, multiplicity and relationship options, and the remaining kinds (`semi_join`, `anti_join`, `cross_join`, `nest_join`) |
 
 ## Types and missing values
 
@@ -40,8 +40,12 @@ back. So a column the plan proves null-free needs no `na.rm`, and the proofs are
 the core's — a `filter` proves the columns its predicate had to read (`x > 0`
 and `!is.na(x)` alike, since a null predicate drops its row just as a false one
 does), an inner join proves its key columns, and a left join withdraws every
-proof on its right side. A plan the core cannot describe falls back to assuming
-every column nullable, which only ever costs native execution.
+proof on its right side. The key column a join folds is the interesting one:
+it holds a value from whichever side turned up, so it keeps its proof exactly
+when every side whose unmatched rows survive has one — both for `full_join`,
+only the right for `right_join`, only the left for `left_join`. A plan the
+core cannot describe falls back to assuming every column nullable, which only
+ever costs native execution.
 
 All-null and empty inputs can still differ: Ibex returns null
 for value-bearing aggregates, while some R aggregates return a sentinel such as

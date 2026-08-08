@@ -664,6 +664,28 @@ eight kinds in both directions — inputs proved, so only the join can weaken;
 and key unproved, so only the join can prove. `outer`, `asof` and `cross` had
 implementations and no tests.
 
+### The folded key's rule, corrected
+
+Putting `right_join()` into `ribex` immediately found the first version of the
+folded-key rule under-claiming. It asked "may this column's own side be
+missing?", and for a right join the answer is yes, so it weakened the key with
+both sides' proofs.
+
+The question is the wrong one. A folded key holds a value from whichever side
+turned up, so what can put a null in it is exactly what survives: a matched
+pair contributes a key that *matched*, and under `nulls never` a null key
+matches nothing. Only the unmatched rows a kind preserves can carry one in,
+each with its own side's key. So the rule is a weakening over the preserved
+sides — both for `outer`, the left only for `left` and `asof`, the right only
+for `right`, and neither for `inner`, which is the key proof already stated
+above arrived at from the other direction. `nulls equal` withdraws all of it,
+since a matched row then proves nothing.
+
+The C++ matrix could not have caught this: it varies both inputs together, so
+`right` reads the same either way. It took an asymmetric case — an unproved
+left key against a proved right one — which is what an adapter hands you and a
+matrix does not. Both directions are now pinned in `test_ir_schema.cpp`.
+
 Declined: renaming `Nullability::{Maybe, Never}` to `{Unknown, NonNull}`. The
 complaint was real at call sites that negate, so `may_be_null()` now spells the
 conservative reading positively; the enum keeps its name because `nulls =
@@ -715,8 +737,9 @@ bridge and any adapter. Adapter-specific behaviour stays in the adapter.
 
 ### ribex (dplyr)
 
-Currently native: `inner_join()` and `left_join()`, same-name keys,
-`na_matches = "never"`, both inputs in one session.
+Currently native: `inner_join()`, `left_join()`, `right_join()` and
+`full_join()`, same-name keys, `na_matches = "never"`, both inputs in one
+session.
 
 - **Mapped keys.** Lower character `by` mappings to `on { left = right }`
   instead of renaming whole inputs. Available now.
@@ -729,15 +752,21 @@ Currently native: `inner_join()` and `left_join()`, same-name keys,
   is the adapter's to reconstruct.
 - ~~**Nullability.**~~ Done: the backend asks the core for it rather than
   restating its rules per verb. See the schema-nullability package.
-- **`na_matches = "na"`.** Maps to the explicit `Equal` policy once it exists.
+- **`na_matches = "na"`.** Maps to the explicit `Equal` policy, which now
+  exists — so this is available, and it is worth more than its size suggests:
+  `"na"` is dplyr's *default*, so today every join written without the
+  argument falls back to local dplyr.
 - **Grouping.** Preserve `x$groups` for joins retaining the left columns; remap
   a group name if its column takes a suffix.
-- **Filtering joins first.** `semi_join()` and `anti_join()` need none of the
+- **Filtering joins.** `semi_join()` and `anti_join()` need none of the
   contract work above: left columns only, left grouping preserved, no
-  collisions possible. They can land ahead of everything else here.
-- **Then** `right_join()`, `full_join()`, `cross_join()`, keyed on nullability
-  and collision work. `nest_join()` stays on fallback — Ibex has no
-  list-column representation.
+  collisions possible. Not yet done, and worth noting that they do not
+  currently *fall back* either — with no S3 method registered, dplyr's generic
+  finds none applicable and raises a plain R error, which is not the
+  `ribex_translation_error` an unsupported form is supposed to raise.
+- ~~**Then `right_join()`, `full_join()`**~~ — done, keyed on the nullability
+  work. `cross_join()` remains; `nest_join()` stays on fallback, since Ibex has
+  no list-column representation.
 - **Coercion.** vctrs common-type rules live here: lower proven cases to
   explicit Ibex casts, reject the rest before submitting.
 

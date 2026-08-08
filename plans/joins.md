@@ -621,6 +621,45 @@ rather than riding along with the schema it was written on.
 No benchmark: this is plan-time inference only, and no runtime path reads the
 flag yet.
 
+Review found two places where the same fact was written down twice, which is
+the failure mode this whole area is prone to — a proof is only as sound as the
+least-maintained copy of the rule behind it:
+
+- **Null behaviour of built-ins.** The result-nullability walker and the
+  filter-proof walker each hard-coded `coalesce` / `fill_null` / `null_if_*`,
+  so a new null-consuming scalar had to be remembered in two places or `Never`
+  became unsound. It is now `BuiltinFunctionInfo::null_behavior`
+  (`Propagates` / `Absorbs` / `Introduces`), read by both, and `builtins()`
+  cross-checks it against each entry's runtime `NullPolicy` at startup — the
+  mechanism already used for `FnKind`. A scalar opts into receiving `Null`
+  exactly when its result does not follow its arguments' presence, so the two
+  tables have one answer between them and editing one alone aborts the process.
+  Unifying them also *improved* a rule: `fill_null(x, v)` had been read as "as
+  present as `v`", but it is `Absorbs` like `coalesce` — a present `x` carries
+  its own row.
+- **Join key provenance.** `apply_join_nullability` recovered "is this an
+  equijoin key" and "did the two sides fold" by matching output names against
+  `JoinKey`s, restating `plan_join_output`'s rules where it cannot see them.
+  `JoinOutputColumn` now carries `is_key` and `folded_peer_index`, set by the
+  planner while it still has both sides in hand.
+
+  The executor's `materialize` recovers the same fold by name and should read
+  the field too. Left alone here deliberately: it is a behaviour-preserving
+  change to the join path, which this plan's own rule says to land on its own.
+
+Also from review: the rules moved out of `infer_schema` into `ir/nullability`
+(schema.cpp 1739 → 1409 lines), since they are a body of semantics rather than
+a step of schema propagation; and the join matrix is now table-driven over all
+eight kinds in both directions — inputs proved, so only the join can weaken;
+and key unproved, so only the join can prove. `outer`, `asof` and `cross` had
+implementations and no tests.
+
+Declined: renaming `Nullability::{Maybe, Never}` to `{Unknown, NonNull}`. The
+complaint was real at call sites that negate, so `may_be_null()` now spells the
+conservative reading positively; the enum keeps its name because `nulls =
+Nullability::Never` reads as one phrase and matches `NullMatch::Never` next to
+it.
+
 The one bug found was in neither the design nor a rule: `LogicalExpr` carries a
 null `right` for `Not`, and the operand fold read both unconditionally. Every
 unit test passed — none had put a negation in a computed field — and the parity

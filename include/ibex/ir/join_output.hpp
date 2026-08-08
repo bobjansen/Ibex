@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,10 +23,26 @@ enum class JoinOutputSide : std::uint8_t {
 
 /// One column of a join's output, resolved to its source column and the name
 /// it carries in the result.
+///
+/// The last two fields are provenance the planner knows and no consumer should
+/// reconstruct. Recovering "is this an equijoin key" or "did the two sides fold
+/// together" by matching output names against `JoinKey`s means restating the
+/// planner's rules somewhere it cannot see them -- which is the drift this type
+/// exists to prevent, and which the schema pass and the executor were each
+/// doing separately.
 struct JoinOutputColumn {
     JoinOutputSide side = JoinOutputSide::Left;
     std::size_t source_index = 0;  ///< Index into that side's column list.
     std::string name;              ///< Output name after collision renaming.
+
+    /// True when this column is one side of an equijoin key.
+    bool is_key = false;
+
+    /// When a same-name equijoin key collapses both inputs' columns into this
+    /// single output column, the *other* input's index for it; `nullopt` when
+    /// nothing folded. A row missing this column's own side draws its value
+    /// from there, so the column's guarantees are the weaker of the two.
+    std::optional<std::size_t> folded_peer_index;
 
     auto operator==(const JoinOutputColumn&) const -> bool = default;
 };

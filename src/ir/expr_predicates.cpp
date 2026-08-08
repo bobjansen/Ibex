@@ -72,12 +72,12 @@ constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, 
     {"asin", {FnKind::Scalar}},
     {"atan", {FnKind::Scalar}},
     {"ceil", {FnKind::Scalar}},
-    {"coalesce", {FnKind::Scalar}},
+    {"coalesce", {.kind = FnKind::Scalar, .null_behavior = NullBehavior::Absorbs}},
     {"cos", {FnKind::Scalar}},
     {"cosh", {FnKind::Scalar}},
     {"day", {FnKind::Scalar}},
     {"exp", {FnKind::Scalar}},
-    {"fill_null", {FnKind::Scalar}},
+    {"fill_null", {.kind = FnKind::Scalar, .null_behavior = NullBehavior::Absorbs}},
     {"with_timezone", {.kind = FnKind::Transform}},
     {"in_timezone", {.kind = FnKind::Transform}},
     {"floor", {FnKind::Scalar}},
@@ -89,8 +89,8 @@ constexpr auto kBuiltinFunctionInfo = std::to_array<std::pair<std::string_view, 
     {"log2", {FnKind::Scalar}},
     {"minute", {FnKind::Scalar}},
     {"month", {FnKind::Scalar}},
-    {"null_if_nan", {FnKind::Scalar}},
-    {"null_if_not_finite", {FnKind::Scalar}},
+    {"null_if_nan", {.kind = FnKind::Scalar, .null_behavior = NullBehavior::Introduces}},
+    {"null_if_not_finite", {.kind = FnKind::Scalar, .null_behavior = NullBehavior::Introduces}},
     {"pmax", {FnKind::Scalar}},
     {"pmin", {FnKind::Scalar}},
     {"round", {FnKind::Scalar}},
@@ -142,6 +142,14 @@ auto is_order_dependent_func(std::string_view name) -> bool {
 auto fn_kind(std::string_view name) -> std::optional<FnKind> {
     const auto* info = builtin_function_info(name);
     return info != nullptr ? std::optional{info->kind} : std::nullopt;
+}
+
+auto scalar_null_behavior(std::string_view name) -> std::optional<NullBehavior> {
+    const auto* info = builtin_function_info(name);
+    if (info == nullptr || info->kind != FnKind::Scalar) {
+        return std::nullopt;
+    }
+    return info->null_behavior;
 }
 
 namespace {

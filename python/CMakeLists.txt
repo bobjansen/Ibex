@@ -1,10 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-set(IBEX_VENV_PYTHON "${PROJECT_SOURCE_DIR}/.venv/bin/python")
-if(EXISTS "${IBEX_VENV_PYTHON}")
-    set(Python3_EXECUTABLE "${IBEX_VENV_PYTHON}" CACHE FILEPATH
-        "Preferred Python interpreter for the Ibex pyarrow bridge" FORCE)
+# Select a single Python installation before asking FindPython for its headers
+# and extension-module support.  In particular, do not force the repository
+# venv when a Conda or virtualenv environment is active: doing so can pair the
+# venv interpreter with the active environment's headers and libraries.
+set(IBEX_PYTHON_EXECUTABLE "" CACHE FILEPATH
+    "Python interpreter used to build and test the Ibex pyarrow bridge")
+
+if(IBEX_PYTHON_EXECUTABLE)
+    set(Python3_EXECUTABLE "${IBEX_PYTHON_EXECUTABLE}")
+elseif(DEFINED ENV{CONDA_PREFIX} AND EXISTS "$ENV{CONDA_PREFIX}/bin/python")
+    set(Python3_ROOT_DIR "$ENV{CONDA_PREFIX}")
+    set(Python3_FIND_VIRTUALENV ONLY)
+elseif(DEFINED ENV{VIRTUAL_ENV} AND EXISTS "$ENV{VIRTUAL_ENV}/bin/python")
+    set(Python3_ROOT_DIR "$ENV{VIRTUAL_ENV}")
+    set(Python3_FIND_VIRTUALENV ONLY)
+else()
+    set(IBEX_VENV_PYTHON "${PROJECT_SOURCE_DIR}/.venv/bin/python")
+    if(EXISTS "${IBEX_VENV_PYTHON}")
+        set(Python3_EXECUTABLE "${IBEX_VENV_PYTHON}")
+    endif()
 endif()
 
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)

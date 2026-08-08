@@ -262,6 +262,13 @@ jobs:
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
             base="HEAD~1"
           fi
+          # A force-push can leave the push event's `before` SHA unreachable,
+          # even with a full checkout. Keep the changed-lines gate useful by
+          # diffing from the current commit's parent in that case.
+          if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "::warning::Diff base ${base} is unavailable; using HEAD^ instead"
+            base="HEAD^"
+          fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
 
       - name: Run clang-tidy on changed lines (gating)

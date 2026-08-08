@@ -1247,6 +1247,13 @@ class Column<std::string> {
         return chars_.data();
     }
 
+    // GCC 13 falsely reports stringop-overflow while inlining vector's
+    // relocation through NoInitAllocator<char>. This method writes every
+    // byte in the resized buffer before it can be observed.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
     // Resize to n rows, all filled with the same value.
     void resize(size_type n, std::string_view fill = {}) {
         drop_external();
@@ -1265,6 +1272,9 @@ class Column<std::string> {
             offsets_.push_back(static_cast<std::uint32_t>((i + 1) * fill_size));
         }
     }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
     // Allocate output storage for a gather of n_rows rows with total_chars bytes.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)

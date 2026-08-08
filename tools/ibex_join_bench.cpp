@@ -581,7 +581,13 @@ int main(int argc, char** argv) {
 
             fmt::print("-- hash_join: multikey mk_lhs({}) x mk_rhs({}) on {{key_a, key_b}} --\n",
                        multikey_rows, multikey_rows / 10);
-            status = run_suite_benchmarks({{"hj_multikey", "mk_lhs join mk_rhs on {key_a, key_b}"}},
+            // Both sides carry a `value` payload, which a same-name non-key
+            // column makes ambiguous. 1d renames the right side to dodge this;
+            // here the suffix clause does it, which is also what the join a
+            // dplyr user writes lowers to.
+            status = run_suite_benchmarks({{"hj_multikey",
+                                            "mk_lhs join mk_rhs on {key_a, key_b} "
+                                            "suffix { \"_lhs\", \"_rhs\" }"}},
                                           reg, warmup_iters, iters, verify);
         }
 
@@ -1067,7 +1073,9 @@ int main(int argc, char** argv) {
                 // Full as-of join with group key (ts + symbol).
                 {"asof_grouped", "quotes asof join ref on {ts, symbol}"},
                 // As-of join on ts only (no group key — tests pure binary search path).
-                {"asof_ts_only", "quotes asof join ref on ts"},
+                // `symbol` is a key above, so it folds; here it is an ordinary
+                // column both sides carry, and the suffix clause names them.
+                {"asof_ts_only", "quotes asof join ref on ts suffix { \"_q\", \"_r\" }"},
             },
             reg, warmup_iters, iters, verify);
     }

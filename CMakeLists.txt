@@ -70,20 +70,44 @@ include(Dependencies)
 # even when compiling as C++23.  Probe the library rather than using compiler
 # versions: the runtime has a POSIX tzdata fallback when this API is absent.
 include(CheckCXXSourceCompiles)
-set(_ibex_saved_required_standard "${CMAKE_REQUIRED_STANDARD}")
-# Do not add `-std=c++23` to CMAKE_REQUIRED_FLAGS here: MSVC ignores that
-# GCC/Clang spelling, which probes the default language mode rather than the
-# C++23 mode used by our targets. CMake selects the right flag for each
-# compiler (notably `/std:c++latest` for the MSVC toolset).
-set(CMAKE_REQUIRED_STANDARD 23)
+# The probe must compile as C++23, and it must ask for it in a way every
+# toolchain understands: `-std=c++23` in CMAKE_REQUIRED_FLAGS is the GCC/Clang
+# spelling that MSVC ignores, and `CMAKE_REQUIRED_STANDARD` is not a CMake
+# variable at all, so setting it probes the default language mode and quietly
+# answers "no" everywhere. `CMAKE_CXX_STANDARD` is the portable lever:
+# CMP0067 (NEW at our 3.26 minimum) makes check_cxx_source_compiles honor it,
+# and CMake picks each compiler's own flag. We set it here rather than reading
+# it back because the standard is carried by `target_compile_features` on the
+# ibex_compiler_options interface target, so there is no global to inherit.
+#
+# Getting this wrong is not visible at configure time: it disables the chrono
+# path and silently selects the POSIX tzdata fallback, and a stale cache in an
+# existing build tree keeps answering the old way. When changing it, verify
+# against a *fresh* build directory.
+set(_ibex_saved_cxx_standard "${CMAKE_CXX_STANDARD}")
+set(_ibex_saved_cxx_standard_required "${CMAKE_CXX_STANDARD_REQUIRED}")
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 check_cxx_source_compiles(
     "
     #include <chrono>
     int main() { (void)std::chrono::locate_zone(\"UTC\"); }
     "
     IBEX_HAS_STD_CHRONO_TIME_ZONES)
-set(CMAKE_REQUIRED_STANDARD "${_ibex_saved_required_standard}")
-unset(_ibex_saved_required_standard)
+# Restore by unsetting when there was nothing to restore: an empty-but-defined
+# CMAKE_CXX_STANDARD is not the same as an unset one.
+if(_ibex_saved_cxx_standard STREQUAL "")
+    unset(CMAKE_CXX_STANDARD)
+else()
+    set(CMAKE_CXX_STANDARD "${_ibex_saved_cxx_standard}")
+endif()
+if(_ibex_saved_cxx_standard_required STREQUAL "")
+    unset(CMAKE_CXX_STANDARD_REQUIRED)
+else()
+    set(CMAKE_CXX_STANDARD_REQUIRED "${_ibex_saved_cxx_standard_required}")
+endif()
+unset(_ibex_saved_cxx_standard)
+unset(_ibex_saved_cxx_standard_required)
 if(IBEX_HAS_STD_CHRONO_TIME_ZONES)
     add_compile_definitions(IBEX_HAS_STD_CHRONO_TIME_ZONES=1)
 endif()

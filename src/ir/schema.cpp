@@ -1189,7 +1189,8 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // against the update's output -- so type the update first, then
             // project it.
             const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
-            const SchemaInfo filtered = filtered_schema(fused.predicate(), child_schema(node, sources));
+            const SchemaInfo filtered =
+                filtered_schema(fused.predicate(), child_schema(node, sources));
             const SchemaInfo updated = update_schema(fused.fields(), {}, filtered);
             return project_schema(fused.project_columns(), updated);
         }

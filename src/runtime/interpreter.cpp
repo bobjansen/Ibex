@@ -10,6 +10,7 @@
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/query_lease.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <robin_hood.h>
+#include <set>
 #include <string>
 #include <string_view>
 #include <type_traits>

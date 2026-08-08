@@ -17,9 +17,8 @@
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/pipeline.hpp>
+#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
-
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -4153,7 +4152,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (head == kNil) {
                     continue;
                 }
-                hits.push_back(Hit{r, head});
+                hits.push_back(Hit{.rrow = r, .head = head});
                 for (std::size_t cur = head; cur != kNil; cur = chain_next_[cur]) {
                     ++total;
                 }

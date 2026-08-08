@@ -12,8 +12,8 @@
 
 #include <algorithm>
 #include <bit>
-#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,13 +23,19 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <robin_hood.h>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "ibex/core/time_zone.hpp"
+#include "ibex/runtime/table_properties.hpp"
+#include "runtime_internal.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
@@ -250,7 +256,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
         for (std::size_t i = 0; i < rows; ++i) {
             out[i] = Timestamp{bound((*ts)[i].nanos, dur)};
         }
-        return ComputedColumn{std::move(out), std::nullopt};
+        return ComputedColumn{.column = std::move(out), .validity = std::nullopt};
     }
     if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
         // Date time index: the duration is expressed in days.
@@ -265,7 +271,7 @@ auto window_bound_column(const Table& table, ir::Duration duration, bool aligned
         for (std::size_t i = 0; i < rows; ++i) {
             out[i] = Date{static_cast<std::int32_t>(bound((*dt)[i].days, dur_days))};
         }
-        return ComputedColumn{std::move(out), std::nullopt};
+        return ComputedColumn{.column = std::move(out), .validity = std::nullopt};
     }
     return std::unexpected(std::string(fn) + ": time index must be a Timestamp or Date column");
 }
@@ -547,13 +553,13 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     auto run_rows = [&](auto drop_pred, auto has_nulls_tag) {
                         constexpr bool kHasNulls = decltype(has_nulls_tag)::value;
                         T sum{};
-                        std::size_t val_cnt = 0;  // non-null, non-NaN in window
-                        std::size_t nan_cnt = 0;  // valid-but-NaN (Float only)
+                        std::size_t const val_cnt = 0;  // non-null, non-NaN in window
+                        std::size_t nan_cnt = 0;        // valid-but-NaN (Float only)
                         std::size_t lo = 0;
                         for (std::size_t i = 0; i < rows; ++i) {
                             if (!kHasNulls || valid_at(i)) {
                                 const T v = col_values[i];
-                                bool is_nan = false;
+                                bool const is_nan = false;
                                 if constexpr (std::is_floating_point_v<T>) {
                                     is_nan = std::isnan(v);
                                 }
@@ -569,7 +575,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             while (lo < i && drop_pred(lo, i)) {
                                 if (!kHasNulls || valid_at(lo)) {
                                     const T w = col_values[lo];
-                                    bool is_nan = false;
+                                    bool const is_nan = false;
                                     if constexpr (std::is_floating_point_v<T>) {
                                         is_nan = std::isnan(w);
                                     }
@@ -1189,7 +1195,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 // for `Column<bool>`, which is bit-packed and has no dense
                 // `data()`. The numeric instantiations still get the hoisted
                 // pointer; bool keeps the per-element path it has to use.
-                T* result_values = nullptr;
+                T const* result_values = nullptr;
                 if constexpr (is_dense_column_v<ColT>) {
                     result_values = result.data();
                 }

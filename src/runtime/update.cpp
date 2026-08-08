@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +39,7 @@
 #include <variant>
 #include <vector>
 
+#include "ibex/runtime/table_properties.hpp"
 #include "zorro.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -546,7 +549,7 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
     if (kernel == nullptr) {
         return std::nullopt;
     }
-    ColumnEvalCtx ctx{.scalars = scalars, .externs = nullptr, .window = std::nullopt};
+    ColumnEvalCtx const ctx{.scalars = scalars, .externs = nullptr, .window = std::nullopt};
     auto col = kernel(*kernel_call, input, input.rows(), ctx);
     if (!col.has_value()) {
         return std::nullopt;
@@ -1009,8 +1012,8 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
                     continue;
                 }
                 double* dst = idx == root ? out.data() + offset
-                                          : double_scratch.data() + static_cast<std::size_t>(idx) *
-                                                                        kNumericUpdateBlockRows;
+                                          : double_scratch.data() + (static_cast<std::size_t>(idx) *
+                                                                     kNumericUpdateBlockRows);
                 eval_numeric_double_node_block(nodes[idx], idx, double_values, dst, offset, count);
             }
             const auto root_value = double_values[root];
@@ -1030,15 +1033,15 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
         const std::size_t count = std::min(kNumericUpdateBlockRows, rows - offset);
         for (std::uint32_t idx = 0; idx <= root; ++idx) {
             if ((modes[idx] & kNumericEvalDouble) != 0U) {
-                double* dst =
-                    double_scratch.data() + static_cast<std::size_t>(idx) * kNumericUpdateBlockRows;
+                double* dst = double_scratch.data() +
+                              (static_cast<std::size_t>(idx) * kNumericUpdateBlockRows);
                 eval_numeric_double_node_block(nodes[idx], idx, double_values, dst, offset, count);
             }
             if ((modes[idx] & kNumericEvalInt) != 0U) {
-                std::int64_t* dst = idx == root
-                                        ? out.data() + offset
-                                        : int_scratch.data() + static_cast<std::size_t>(idx) *
-                                                                   kNumericUpdateBlockRows;
+                std::int64_t* dst =
+                    idx == root ? out.data() + offset
+                                : int_scratch.data() +
+                                      (static_cast<std::size_t>(idx) * kNumericUpdateBlockRows);
                 eval_numeric_int_node_block(nodes[idx], idx, int_values, double_values, dst, offset,
                                             count);
             }
@@ -2745,7 +2748,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
         }
     }
-    std::size_t rows = output.rows();
+    std::size_t const rows = output.rows();
     for (const auto& field : fields) {
         if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
             auto res = evaluate_rank_column(output, *rank, {}, exec);
@@ -3068,7 +3071,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // Resolve both ends once; see `ColumnAppender`. Only
                         // `Column<bool>` reaches this branch without a dense
                         // buffer, so it keeps the indexed path.
-                        typename Col::value_type* out_values = nullptr;
+                        typename Col::value_type const* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }
@@ -3105,7 +3108,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         out.resize(n);
                         ValidityBitmap valid(n, false);
                         bool any_invalid = matched_idx.size() < n;
-                        typename Col::value_type* out_values = nullptr;
+                        typename Col::value_type const* out_values = nullptr;
                         if constexpr (is_dense_column_v<Col>) {
                             out_values = out.data();
                         }

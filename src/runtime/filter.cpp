@@ -19,6 +19,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -36,6 +38,8 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "ibex/runtime/table_properties.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>

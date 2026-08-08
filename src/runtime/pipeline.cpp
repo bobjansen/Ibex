@@ -6,7 +6,6 @@
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
-#include <utility>
 
 namespace ibex::runtime {
 

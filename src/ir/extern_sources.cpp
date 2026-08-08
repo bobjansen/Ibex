@@ -3,14 +3,18 @@
 
 #include <ibex/ir/extern_sources.hpp>
 
-#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
+
+#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

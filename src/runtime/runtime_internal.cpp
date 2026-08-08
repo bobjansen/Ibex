@@ -7,6 +7,7 @@
 #include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <cctype>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 

@@ -10,9 +10,12 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -40,7 +43,7 @@ struct Task {
 /// captured rather than propagated: a throw out of a pool thread would
 /// terminate the process, and the batch's owner rethrows deterministically
 /// (lowest worker id wins) from `wait()`.
-void run_task(Task& task) {
+void run_task(Task const& task) {
     auto& state = *task.state;
     std::exception_ptr caught;
     try {

@@ -41,10 +41,14 @@
 #include <expected>
 #include <iterator>
 #include <memory>
+#include <signal.h>
+#include <string.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "ibex/ir/cardinality.hpp"
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -3193,8 +3197,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 auto temp_name = make_temp_table_name();
                 tables.insert_or_assign(temp_name,
                                         std::get<runtime::Table>(std::move(value.value())));
-                block->base =
-                    std::make_unique<parser::Expr>(parser::Expr{parser::IdentifierExpr{temp_name}});
+                block->base = std::make_unique<parser::Expr>(
+                    parser::Expr{parser::IdentifierExpr{.name = temp_name}});
             }
         }
     }
@@ -3919,7 +3923,7 @@ auto rewrite_inline_sources(parser::Expr& expr, InlineSourceRewrites& rewrites,
                 rewrites.temp_names.push_back(temp_name);
                 rewrites.replaced.emplace_back(&slot, std::move(slot));
                 slot = std::make_unique<parser::Expr>(
-                    parser::Expr{parser::IdentifierExpr{std::move(temp_name)}});
+                    parser::Expr{parser::IdentifierExpr{.name = std::move(temp_name)}});
                 return std::nullopt;
             }
         }

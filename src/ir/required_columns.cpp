@@ -3,12 +3,13 @@
 
 #include <ibex/ir/required_columns.hpp>
 
-#include <cstddef>
 #include <map>
 #include <string>
 #include <type_traits>
-#include <utility>
 #include <variant>
+#include <vector>
+
+#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

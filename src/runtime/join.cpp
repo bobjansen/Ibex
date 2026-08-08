@@ -6,6 +6,7 @@
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <bit>

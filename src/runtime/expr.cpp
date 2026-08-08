@@ -37,6 +37,8 @@
 #include <variant>
 #include <vector>
 
+#include <ibex/core/time_zone.hpp>
+
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif

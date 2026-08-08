@@ -4,8 +4,18 @@
 #include <ibex/runtime/table_compare.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <format>
+#include <optional>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "ibex/core/column.hpp"
+#include "ibex/ir/node.hpp"
+#include "ibex/runtime/interpreter.hpp"
 
 namespace ibex::runtime {
 
@@ -17,7 +27,9 @@ namespace {
 
 auto mismatch(std::string location, std::string expected, std::string actual)
     -> std::optional<TableMismatch> {
-    return TableMismatch{std::move(location), std::move(expected), std::move(actual)};
+    return TableMismatch{.location = std::move(location),
+                         .expected = std::move(expected),
+                         .actual = std::move(actual)};
 }
 
 auto validity_mismatch(const ColumnEntry& expected, const ColumnEntry& actual, std::size_t column)

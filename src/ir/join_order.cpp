@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+#include "ibex/ir/cardinality.hpp"
+#include "ibex/ir/node.hpp"
+#include "ibex/ir/schema.hpp"
+
 namespace ibex::ir {
 namespace {
 

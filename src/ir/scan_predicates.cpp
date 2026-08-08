@@ -9,11 +9,14 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast in this file

@@ -127,11 +127,27 @@ auto floor_div(std::int64_t value, std::int64_t divisor) -> std::int64_t {
 }
 
 auto gmtime_safe(const std::time_t& value, std::tm& out) -> bool {
+#ifdef _WIN32
+    return gmtime_s(&out, &value) == 0;
+#else
     return gmtime_r(&value, &out) != nullptr;
+#endif
 }
 
 auto localtime_safe(const std::time_t& value, std::tm& out) -> bool {
+#ifdef _WIN32
+    return localtime_s(&out, &value) == 0;
+#else
     return localtime_r(&value, &out) != nullptr;
+#endif
+}
+
+auto civil_time_to_utc(std::tm* value) -> std::time_t {
+#ifdef _WIN32
+    return _mkgmtime64(value);
+#else
+    return timegm(value);
+#endif
 }
 
 auto same_civil_time(const std::tm& lhs, const std::tm& rhs) -> bool {
@@ -149,15 +165,32 @@ auto with_zone(std::string_view zone, F&& fn) -> decltype(fn()) {
     const char* previous = std::getenv("TZ");
     const std::optional<std::string> saved =
         previous != nullptr ? std::optional<std::string>(previous) : std::nullopt;
+#ifdef _WIN32
+    _putenv_s("TZ", std::string(zone).c_str());
+    _tzset();
+#else
     setenv("TZ", std::string(zone).c_str(), 1);
     tzset();
+#endif
     auto result = fn();
     if (saved.has_value()) {
+#ifdef _WIN32
+        _putenv_s("TZ", saved->c_str());
+#else
         setenv("TZ", saved->c_str(), 1);
+#endif
     } else {
+#ifdef _WIN32
+        _putenv_s("TZ", "");
+#else
         unsetenv("TZ");
+#endif
     }
+#ifdef _WIN32
+    _tzset();
+#else
     tzset();
+#endif
     return result;
 }
 
@@ -220,7 +253,7 @@ auto local_bucket_start(std::string_view zone, std::int64_t nanos, std::int64_t 
         if (!localtime_safe(instant, local)) {
             return nanos;
         }
-        const std::time_t civil_seconds = timegm(&local);
+        const std::time_t civil_seconds = civil_time_to_utc(&local);
         return static_cast<std::int64_t>(civil_seconds) * nanos_per_second + remainder;
     });
     const std::int64_t boundary = floor_div(local_nanos, duration_nanos) * duration_nanos;

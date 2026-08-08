@@ -19,9 +19,21 @@
 #
 # misc-const-correctness has a known false-positive pattern: it misses
 # mutations that only happen inside a by-reference lambda capture, or inside
-# an `if constexpr` branch. Both have been hit in this codebase (window.cpp)
-# and would have been compile errors had the fix landed unreviewed. ALWAYS
-# rebuild + run tests after running this script, before committing.
+# an `if constexpr` branch. Both have been hit in this codebase (window.cpp,
+# update.cpp) and are compile errors if the fix lands unreviewed. Every file
+# is therefore recompiled (-fsyntax-only) after its fixes are applied, and a
+# file whose fixes do not compile is restored and reported. That check is what
+# makes this script safe to run unattended; it is not a substitute for
+# rebuilding and running the tests, since a fix can compile and still be wrong.
+#
+# Unused-include REMOVAL is deliberately off (misc-include-cleaner only adds
+# here). Removal is unsafe by construction in this codebase and the syntax
+# check above cannot catch it: whether an include is used depends on which
+# `#if` branches are live, and tidy sees exactly one configuration. Both
+# branches of `IBEX_HAS_STD_CHRONO_TIME_ZONES` and every `_WIN32`/macOS
+# fallback have includes that look unused from the other side — dropping one
+# breaks a platform nobody builds here. Adding an include is safe in every
+# configuration, which is the asymmetry this setting relies on.
 
 set -euo pipefail
 
@@ -82,10 +94,21 @@ fi
 # defaults to Leave) so it doesn't fight hand-written style elsewhere; add it
 # just for this pass, in a scratch copy so the checked-in file is untouched.
 STYLE_FILE="$(mktemp)"
-trap 'rm -f "$STYLE_FILE"' EXIT
+# Pristine copies of every input, taken before any tool touches them, so the
+# verification pass at the end can put back a file whose fixes do not compile.
+# Keyed by index rather than path: the inputs may sit in different directories
+# and share a basename.
+ORIGINALS_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$STYLE_FILE" "$ORIGINALS_DIR"' EXIT
 head -n -1 "$REPO_ROOT/.clang-format" > "$STYLE_FILE"  # drop trailing '...'
 echo "QualifierAlignment: Left" >> "$STYLE_FILE"
 echo "..." >> "$STYLE_FILE"
+
+original_index=0
+for f in "$@"; do
+    cp -- "$f" "$ORIGINALS_DIR/$original_index"
+    original_index=$((original_index + 1))
+done
 
 echo "Fixing includes, const-correctness, and designated initializers in: $*"
 # --header-filter='' restricts *fixes* (not just diagnostics) to the main
@@ -100,8 +123,12 @@ echo "Fixing includes, const-correctness, and designated initializers in: $*"
 # parameter mutations (currently triggered by interpreter.cpp).  Run it one
 # file at a time so one compiler bug neither prevents the other fixes nor
 # leaves us unable to identify the affected translation unit.
+# `UnusedIncludes: false` — see the note at the top of this script. Spelled as
+# --config rather than .clang-tidy so the repo-wide advisory CI sweep still
+# *reports* unused includes; it is only automatic removal that is unsafe.
 "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
-    --checks='-*,misc-include-cleaner,modernize-use-designated-initializers' \
+    --config="{Checks: '-*,misc-include-cleaner,modernize-use-designated-initializers',
+               CheckOptions: {misc-include-cleaner.UnusedIncludes: false}}" \
     --fix "$@"
 
 skipped_const_files=()
@@ -135,8 +162,79 @@ for f in "$@"; do
     "$CLANG_FORMAT_BIN" -style="file:$STYLE_FILE" -i "$f"
 done
 
-echo "Done. Review the diff, then REBUILD AND RUN TESTS before committing —"
-echo "misc-const-correctness has real known false positives (see script header)."
+# Verify each file still compiles, and put back the ones that do not. This is
+# the guard against misc-const-correctness's known false positives, which are
+# compile errors rather than subtle behaviour changes — a syntax-only rebuild
+# of the affected TU catches all of them in about a second per file.
+#
+# It proves only that the tidy build's configuration still compiles. Anything
+# configuration-dependent (a `#if`-guarded branch, a different platform) is
+# outside its reach, which is why unused-include removal is disabled instead of
+# being checked for.
+reverted_files=()
+verify_index=0
+for f in "$@"; do
+    original="$ORIGINALS_DIR/$verify_index"
+    verify_index=$((verify_index + 1))
+    if cmp -s -- "$f" "$original"; then
+        continue  # untouched, and it compiled before we started
+    fi
+    echo "Verifying $f compiles..."
+    if python3 - "$BUILD_DIR" "$f" <<'PY'
+import json, os, shlex, subprocess, sys
+
+build_dir, target = sys.argv[1], os.path.realpath(sys.argv[2])
+with open(os.path.join(build_dir, "compile_commands.json")) as handle:
+    entries = json.load(handle)
+
+entry = next(
+    (e for e in entries
+     if os.path.realpath(os.path.join(e["directory"], e["file"])) == target),
+    None,
+)
+if entry is None:
+    # clang-tidy needs a compile command too, so it cannot have fixed this
+    # file. Say so rather than reporting a pass nobody verified.
+    print(f"warning: no compile command for {target}; not verified", file=sys.stderr)
+    sys.exit(0)
+
+argv = entry.get("arguments") or shlex.split(entry["command"])
+# Drop the object-file output and the -c that goes with it: -fsyntax-only
+# writes nothing, and leaving them in earns an unused-argument warning on
+# every file, which would bury the diagnostics this pass exists to surface.
+command, skip = [], False
+for arg in argv:
+    if skip:
+        skip = False
+        continue
+    if arg in ("-o", "-c"):
+        skip = arg == "-o"
+        continue
+    if arg.startswith("-o") and len(arg) > 2:
+        continue
+    command.append(arg)
+command.append("-fsyntax-only")
+sys.exit(subprocess.call(command, cwd=entry["directory"]))
+PY
+    then
+        :
+    else
+        cp -- "$original" "$f"
+        reverted_files+=("$f")
+    fi
+done
+
+if [[ "${#reverted_files[@]}" -ne 0 ]]; then
+    echo >&2
+    echo "error: fixes did not compile and were reverted for: ${reverted_files[*]}" >&2
+    echo "       This is the misc-const-correctness false-positive pattern (a mutation" >&2
+    echo "       inside a lambda capture or an uninstantiated 'if constexpr' branch)." >&2
+    echo "       Other files kept their fixes; re-run after fixing these by hand." >&2
+    exit 1
+fi
+
+echo "Done. Every changed file was recompiled and still builds. Review the diff,"
+echo "then RUN THE TESTS before committing — compiling is not the same as correct."
 if [[ "${#skipped_const_files[@]}" -ne 0 ]]; then
     echo "warning: misc-const-correctness crashed and was skipped for: ${skipped_const_files[*]}" >&2
     echo "         Safe tidy fixes were still applied; retry those files with a newer clang-tidy." >&2

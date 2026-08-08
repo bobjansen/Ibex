@@ -1,9 +1,6 @@
-<<<<<<< HEAD
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-=======
->>>>>>> 5ab6755 (Make the nullability rules single-sourced and testable)
 #pragma once
 
 #include <ibex/ir/join_output.hpp>

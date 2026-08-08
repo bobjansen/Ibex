@@ -387,6 +387,29 @@ auto build_column_from_r_vector(const std::string& name, SEXP column_sexp) -> st
             });
         }
 
+        if (Rf_inherits(column_sexp, "integer64")) {
+            // bit64 stores 64-bit integers in the payload of a double vector:
+            // the SEXP is a REALSXP and only the class attribute says the bits
+            // are an int64. Without this branch the switch below reaches
+            // `case REALSXP` and reads each element as the double those bits
+            // happen to spell -- so 9007199254740993 arrives as 4.45e-308.
+            // Silent, and worst for exactly the values a caller reaches for
+            // bit64 to hold.
+            if (TYPEOF(column_sexp) != REALSXP) {
+                return std::unexpected("column '" + name + "' integer64 data must be numeric");
+            }
+            return build_column_with_validity<std::int64_t>(size, [&](R_xlen_t i) {
+                std::int64_t value = 0;
+                std::memcpy(&value, &REAL(column_sexp)[i], sizeof(value));
+                // bit64 spells NA as the smallest int64 rather than R's NA
+                // real, so ISNA() would not see it.
+                if (value == std::numeric_limits<std::int64_t>::min()) {
+                    return std::pair{std::int64_t{0}, false};
+                }
+                return std::pair{value, true};
+            });
+        }
+
         if (Rf_inherits(column_sexp, "factor")) {
             if (TYPEOF(column_sexp) != INTSXP) {
                 return std::unexpected("column '" + name + "' factor data must be integer");

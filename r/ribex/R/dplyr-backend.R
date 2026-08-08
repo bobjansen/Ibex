@@ -293,8 +293,19 @@ ibex_render_plan <- function(x, redact = FALSE) {
                 # empty `on`. Every other kind carries at least one.
                 if (length(step$keys)) {
                     paste0(" on { ",
-                           paste(vapply(step$keys, ibex_quote_identifier, character(1)),
-                                 collapse = ", "),
+                           paste(vapply(seq_along(step$keys), function(i) {
+                               left <- step$keys[[i]]
+                               right <- step$right_keys[[i]]
+                               # `a` is Ibex's shorthand for `a = a`. Spelling
+                               # the pair out only when it differs keeps the
+                               # rendered plan the one a reader would write.
+                               if (identical(left, right)) {
+                                   ibex_quote_identifier(left)
+                               } else {
+                                   paste0(ibex_quote_identifier(left), " = ",
+                                          ibex_quote_identifier(right))
+                               }
+                           }, character(1)), collapse = ", "),
                            " }")
                 } else "",
                 # Ibex refuses a non-key collision without this clause, and its
@@ -1051,12 +1062,12 @@ ibex_join_is_filtering <- function(kind) kind %in% c("semi", "anti")
 # caller would have no way to notice.
 #
 # `"never"` needs no such care: neither side matches a NaN under it.
-ibex_join_null_match <- function(x, y, keys, na_matches) {
+ibex_join_null_match <- function(x, y, left_keys, right_keys, na_matches) {
     if (identical(na_matches, "never")) {
         return("never")
     }
-    key_type <- function(tbl) tbl$schema$types[match(keys, tbl$schema$names)]
-    if (any(c(key_type(x), key_type(y)) == "Float64")) {
+    key_type <- function(tbl, keys) tbl$schema$types[match(keys, tbl$schema$names)]
+    if (any(c(key_type(x, left_keys), key_type(y, right_keys)) == "Float64")) {
         ibex_unsupported(paste(
             "Native joins cannot match NaN keys the way `na_matches = \"na\"` does;",
             "a floating-point key needs `na_matches = \"never\"` or local dplyr."
@@ -1069,6 +1080,10 @@ ibex_join_null_match <- function(x, y, keys, na_matches) {
 # into one column, so the output names do not depend on the kind. Which of
 # them can hold a null does, and that answer comes back from Ibex itself --
 # see `ibex_infer_nullable()`.
+#
+# `keys` here is the folded set only. A mapped pair (`on { a = b }`) folds
+# nothing and keeps both columns, so `b` is an ordinary right column as far as
+# these names are concerned; dropping it to match dplyr is a later step.
 ibex_join_schema <- function(x, y, keys, suffix) {
     right <- setdiff(y$schema$names, keys)
     names <- ibex_join_output_names(x, y, keys, suffix)
@@ -1096,23 +1111,55 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     # and `cross_join()` has no `by` argument to derive them from. Every other
     # kind needs at least one key, which is what the block below insists on.
     cross <- identical(kind, "cross")
-    keys <- character()
+    left_keys <- character()
+    right_keys <- character()
     if (!cross) {
         if (is.null(by)) by <- intersect(x$schema$names, y$schema$names)
         if (!is.character(by) || !length(by)) {
-            ibex_unsupported("Native joins currently require same-named character `by` keys.")
+            # `join_by()` and its non-equality conditions land here too.
+            ibex_unsupported("Native joins currently require character `by` keys.")
         }
-        keys <- if (is.null(names(by))) by else {
-            if (!identical(unname(by), names(by))) ibex_unsupported("Native joins require same-named keys.")
-            unname(by)
+        # dplyr writes a mapped pair as `c(left = "right")` and an unmapped one
+        # as a bare string, so an entry's name is its left column when it has
+        # one. `names()` is NULL when nothing is mapped and "" per unmapped
+        # entry otherwise, which is why both forms need handling.
+        right_keys <- unname(by)
+        left_keys <- if (is.null(names(by))) {
+            right_keys
+        } else {
+            ifelse(nzchar(names(by)), names(by), right_keys)
         }
-        if (any(!nzchar(keys)) || any(!keys %in% x$schema$names) || any(!keys %in% y$schema$names)) {
-            ibex_unsupported("Native joins require one or more same-named keys present in both inputs.")
+        if (any(!nzchar(left_keys)) || any(!nzchar(right_keys)) ||
+            any(!left_keys %in% x$schema$names) || any(!right_keys %in% y$schema$names)) {
+            ibex_unsupported("Native joins require every key column to be present in its own input.")
+        }
+        if (anyDuplicated(left_keys) || anyDuplicated(right_keys)) {
+            ibex_unsupported("Native joins require each key column to be named once per side.")
         }
     }
+    # A same-name pair folds into one output column; a mapped pair does not,
+    # and Ibex keeps both of its columns. dplyr keeps only the left one, so a
+    # mapped join needs a projection afterwards -- see below.
+    mapped <- left_keys != right_keys
+    folded <- left_keys[!mapped]
     filtering <- ibex_join_is_filtering(kind)
+    if (any(mapped) && !filtering) {
+        # Two shapes where Ibex's suffixing and dplyr's differ, rather than
+        # just its column count. Ibex sees a mapped key as an ordinary column
+        # and so as a collision; dplyr, which drops the right key outright,
+        # sees nothing to resolve and leaves both original names alone. The
+        # suffix would land on a column the caller never asked about, so these
+        # fall back rather than renaming something dplyr does not.
+        if (any(right_keys[mapped] %in% x$schema$names) ||
+            any(left_keys[mapped] %in% y$schema$names)) {
+            ibex_unsupported(paste(
+                "A mapped key whose name also exists in the other input would be",
+                "suffixed by Ibex but not by dplyr; this join needs local dplyr."
+            ))
+        }
+    }
     overlap <- if (filtering) character() else {
-        intersect(setdiff(x$schema$names, keys), setdiff(y$schema$names, keys))
+        intersect(setdiff(x$schema$names, folded), setdiff(y$schema$names, folded))
     }
     if (length(overlap) && (length(suffix) != 2L || any(!nzchar(suffix)))) {
         ibex_unsupported("Native joins require two non-empty suffixes.")
@@ -1120,7 +1167,9 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
     # Ibex rejects a `nulls` clause on a join with no equality keys, rather
     # than accepting one that could not do anything. Nothing is lost: with no
     # key to compare, there is no null-matching question to answer.
-    null_match <- if (cross) NULL else ibex_join_null_match(x, y, keys, na_matches)
+    null_match <- if (cross) NULL else {
+        ibex_join_null_match(x, y, left_keys, right_keys, na_matches)
+    }
     # Only emit the clause when something actually collides: Ibex accepts it
     # either way, but a clause with nothing to rename is noise in the plan.
     step_suffix <- if (length(overlap)) suffix else NULL
@@ -1131,12 +1180,12 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
         filtered$rows <- NA_real_
         filtered
     } else {
-        ibex_join_schema(x, y, keys, step_suffix)
+        ibex_join_schema(x, y, folded, step_suffix)
     }
-    ibex_append_step(
+    joined <- ibex_append_step(
         x,
-        list(kind = "join", join_kind = kind, right = y, keys = keys,
-             suffix = step_suffix, null_match = null_match),
+        list(kind = "join", join_kind = kind, right = y, keys = left_keys,
+             right_keys = right_keys, suffix = step_suffix, null_match = null_match),
         # A filtering join drops rows and touches nothing else, so it keeps the
         # grouping it was handed -- the columns naming it all survive. The
         # other kinds cannot promise that, since a group column may be
@@ -1144,6 +1193,45 @@ ibex_native_join <- function(x, y, kind, by, copy, suffix, ..., keep,
         schema = schema, groups = if (filtering) x$groups else character(),
         ordering = NULL
     )
+    if (!any(mapped) || filtering) {
+        return(joined)
+    }
+    # dplyr merges a mapped pair into one column under the left name; Ibex
+    # keeps both, deliberately, because for an unmatched row they differ. A
+    # projection reconciles the two. The gate above guarantees these names are
+    # unsuffixed, so they can be matched literally.
+    ibex_join_merge_mapped_keys(joined, left_keys[mapped], right_keys[mapped],
+                                merge = kind %in% c("right", "full"))
+}
+
+# The projection that turns Ibex's two key columns back into dplyr's one.
+#
+# `merge` is the whole subtlety. Where every output row has a left side --
+# inner and left joins -- the left key is the answer and the right one is
+# redundant, so dropping it loses nothing. A right or full join also emits
+# rows with no left side, and there the left key is null while the right key
+# holds the value dplyr reports. So the merged column is `coalesce(left,
+# right)`, which is precisely what the core does for itself when a same-name
+# key folds; a mapped pair asks the frontend to do it instead.
+ibex_join_merge_mapped_keys <- function(x, left_keys, right_keys, merge) {
+    keep <- setdiff(x$schema$names, right_keys)
+    positions <- match(keep, x$schema$names)
+    schema <- lapply(x$schema[c("names", "types", "categorical", "timezone")],
+                     function(values) values[positions])
+    schema$names <- keep
+    schema$rows <- x$schema$rows
+    fields <- lapply(keep, function(name) {
+        peer <- if (merge) right_keys[match(name, left_keys)] else NA_character_
+        code <- if (!is.na(peer)) {
+            paste0("coalesce(", ibex_quote_identifier(name), ", ",
+                   ibex_quote_identifier(peer), ")")
+        } else {
+            ibex_quote_identifier(name)
+        }
+        list(name = name, code = code)
+    })
+    ibex_append_step(x, list(kind = "project", fields = fields), schema = schema,
+                     groups = x$groups, ordering = x$ordering)
 }
 
 inner_join.ibex_tbl <- function(x, y, by = NULL, copy = FALSE, suffix = c(".x", ".y"), ...,

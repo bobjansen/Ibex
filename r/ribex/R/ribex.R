@@ -48,7 +48,45 @@ as_ribex_result <- function(payload, format) {
         return(array)
     }
 
-    as.data.frame(array)
+    warn_int64_precision(as.data.frame(array), schema)
+}
+
+# R has no 64-bit integer vector, so an Ibex Int64 column reaches R as a
+# double. That is the right trade -- the alternative, narrowing to `integer()`
+# when the values happen to fit, would make a column's R type depend on its
+# contents, so filtering out one large row would silently change it.
+#
+# What is not acceptable is losing a value in silence. A double represents
+# every integer up to 2^53 exactly and only some beyond it, so a magnitude of
+# at least that is the condition under which the conversion may not have
+# round-tripped. The bound is inclusive because this runs *after* the
+# conversion and can only see its output: 2^53 + 1 rounds to exactly 2^53, so
+# a column reading 2^53 is either an exact value or a rounded one and there is
+# no longer anything to tell them apart. Warn, name the columns, and leave the
+# data alone: a caller who needs those values intact can reach for bit64 on
+# the way in and knows to do something different on the way out.
+warn_int64_precision <- function(data, schema) {
+    children <- schema$children
+    if (!is.data.frame(data) || !length(children) || length(children) != length(data)) {
+        return(data)
+    }
+    limit <- 2^53
+    lossy <- vapply(seq_along(children), function(i) {
+        # "l" is Arrow's format string for int64. Timestamps are int64 too but
+        # spell themselves differently, and nanoarrow already warns for those.
+        if (!identical(children[[i]]$format, "l")) {
+            return(FALSE)
+        }
+        column <- data[[i]]
+        is.numeric(column) && any(is.finite(column) & abs(column) >= limit)
+    }, logical(1))
+    if (any(lossy)) {
+        rlang::warn(paste0(
+            "Int64 values at or beyond 2^53 were converted to double and may have ",
+            "lost precision: ", paste(names(data)[lossy], collapse = ", "), "."
+        ))
+    }
+    data
 }
 
 normalize_table_binding <- function(value) {

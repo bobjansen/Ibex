@@ -17,14 +17,24 @@ collection and `fallback = "collect"` makes it silent.
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and `nest_join`, which needs a list column Ibex has no representation for |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with character `by` keys, same-named or mapped (`by = c(a = "b")`), otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | `join_by()` and non-equality conditions, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, a mapped key whose name also occurs in the other input, and `nest_join`, which needs a list column Ibex has no representation for |
 | `cross_join` | The Cartesian product, with `suffix`; it takes no `by` or `na_matches`, and every name both inputs hold is a collision, since no key folds two columns into one | `copy = TRUE`, and a collision under an empty suffix |
-| filtering joins | `semi_join` and `anti_join` under the same key and `na_matches` rules; they return the left columns unchanged and keep the input's grouping, since no column can be renamed or gain nulls | `copy = TRUE` and the key restrictions above |
+| filtering joins | `semi_join` and `anti_join` under the same key and `na_matches` rules; they return the left columns unchanged and keep the input's grouping, since no column can be renamed or gain nulls | `copy = TRUE` and the key restrictions above, except that a mapped key cannot collide here |
 
 ## Types and missing values
 
-R integer maps to Ibex `Int64`; double, logical, character, factor/categorical,
-`Date`, and `POSIXct` use the existing ribex/Arrow bridge. The schema endpoint
+R integer and `bit64::integer64` both map to Ibex `Int64`; double, logical,
+character, factor/categorical, `Date`, and `POSIXct` use the existing
+ribex/Arrow bridge.
+
+Int64 comes back to R as a double, because R has no 64-bit integer vector.
+That widening is not undone when the values would fit in an `integer()`: a
+column's R type is taken from the schema, never from its contents, so
+filtering out one large row cannot change it. A double holds every integer up
+to 2^53 exactly and only some beyond, so collecting a column with a value at
+or past that bound warns and names the column. Values that need to survive
+intact should be carried with `bit64::integer64`, which binds as `Int64`
+exactly. The schema endpoint
 reports nullability, categorical encoding, time zone, ordering, and time-index
 metadata. Operator metadata propagation remains the authority after execution.
 
@@ -39,6 +49,17 @@ R keeps the two apart as well (a `NaN` key never matches an `NA` one), so no
 rewrite recovers dplyr's answer. A join with a floating-point key therefore
 falls back under `"na"`; `na_matches = "never"` matches no `NaN` on either
 side, so it stays native for every key type.
+
+A mapped key (`by = c(a = "b")`) is where the two column models differ rather
+than agree. Ibex keeps both halves of the pair, because for an unmatched row
+they hold different things; dplyr reports one column under the left name. The
+backend reconciles this by projecting the right key away — and, for the kinds
+that emit rows with no left side, by merging with `coalesce()` first, so a
+`right_join`'s key carries the right value exactly where dplyr's does. The one
+shape that falls back is a mapped key whose name also occurs in the other
+input: Ibex reads that as a collision and suffixes it, while dplyr, which
+drops the right key outright, has nothing to resolve and leaves both names
+alone.
 
 Ibex aggregates skip nulls. For a nullable input, native aggregate translation
 therefore requires an explicit `na.rm = TRUE` (or `na_rm = TRUE` for

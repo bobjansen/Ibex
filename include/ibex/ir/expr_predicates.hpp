@@ -25,6 +25,31 @@ namespace ibex::ir {
 ///   Aggregate — reduces a column or group (sum/mean/.../kurtosis).
 enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };
 
+/// How a built-in's result relates to nulls in its arguments.
+///
+/// Consulted only for `FnKind::Scalar`: a non-row-local function's result at
+/// row i does not stand in any fixed relation to its arguments at row i --
+/// `lag(x)` is null in the first row of each group however present `x` is --
+/// so the kind answers first and this never gets asked. Use
+/// `scalar_null_behavior()`, which enforces that.
+///
+/// This is the single source of truth for the question, read by every pass that
+/// reasons about nullability. `builtins()` cross-checks it against each entry's
+/// runtime `NullPolicy` at startup, so a new null-handling built-in cannot be
+/// added to one table and forgotten in the other.
+enum class NullBehavior : std::uint8_t {
+    /// Present exactly when every argument is present: a null argument yields a
+    /// null result. What arithmetic and the math built-ins do, and the default.
+    Propagates,
+    /// Present when *any* argument is present. `coalesce(a, ..., z)` takes the
+    /// first argument that has a value, and `fill_null(x, v)` is the two-
+    /// argument spelling of the same rule.
+    Absorbs,
+    /// May be null however present its arguments are -- `null_if_nan(x)` turns
+    /// a perfectly present NaN into a null, which is the point of it.
+    Introduces,
+};
+
 /// Metadata required by IR lowering and planning. Keep classification here,
 /// rather than scattering function-name lists through those passes. Runtime
 /// entries still carry their executable implementation in `BuiltinFn`.
@@ -35,6 +60,8 @@ enum class FnKind : std::uint8_t { Scalar, Transform, Generator, Aggregate };
 /// safe to duplicate.
 struct BuiltinFunctionInfo {
     FnKind kind;
+    /// Only meaningful for `kind == Scalar`; see `NullBehavior`.
+    NullBehavior null_behavior = NullBehavior::Propagates;
     bool rolling = false;
     /// True if the function's result at row i depends on rows other than i —
     /// it reads neighbours (lag/lead/rolling), accumulates along the row order
@@ -62,6 +89,12 @@ struct BuiltinFunctionInfo {
 /// `expr`, or empty if there is none. Used to name the offending function in
 /// the row-order diagnostic.
 [[nodiscard]] auto find_order_dependent_call(const Expr& expr) -> std::string;
+
+/// The null behaviour of a *row-local* built-in, or `nullopt` when the name is
+/// not one: an unknown callee (a plugin, about which nothing is assumed) or a
+/// function whose kind rules the question out. `nullopt` means "no claim",
+/// which every caller must treat as the conservative answer.
+[[nodiscard]] auto scalar_null_behavior(std::string_view name) -> std::optional<NullBehavior>;
 
 /// Classify a known built-in by name. Unknown names have no classification.
 /// The runtime builtin registry (builtins() in src/runtime/expr.cpp) checks at

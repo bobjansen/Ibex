@@ -12,6 +12,7 @@ add_library(ibex_ir STATIC
     join_output.cpp
     join_reorder.cpp
     node.cpp
+    nullability.cpp
     optimizer.cpp
     pending_order.cpp
     required_columns.cpp

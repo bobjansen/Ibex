@@ -1,9 +1,6 @@
-<<<<<<< HEAD
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-=======
->>>>>>> 5ab6755 (Make the nullability rules single-sourced and testable)
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/nullability.hpp>
 #include <ibex/ir/schema.hpp>
@@ -260,26 +257,49 @@ void apply_join_nullability(const JoinNode& join, const SchemaInfo& left, const 
         (join.kind() == JoinKind::Inner || join.kind() == JoinKind::Semi) &&
         join.null_match() == NullMatch::Never && !join.keys().empty();
 
+    // A folded key is one output column two inputs feed, so what can put a null
+    // in it is exactly what survives. A matched pair contributes a key that
+    // matched, and under `nulls never` a null key matches nothing -- leaving
+    // only the unmatched rows the kind preserves, each carrying its own side's
+    // key. So a kind that drops a side's unmatched rows does not inherit that
+    // side's missing proof: a right join's folded key is as proved as the right
+    // input's, whatever the left's says.
+    const auto folded_key_nullability = [&](Nullability own, Nullability peer) {
+        if (join.null_match() != NullMatch::Never) {
+            // `nulls equal` is the option that lets a null key match, so a
+            // matched row proves nothing here and both sides' rows count.
+            return weaker(own, peer);
+        }
+        Nullability result = Nullability::Never;
+        if (unmatched.right) {  // left-only rows, carrying the left key
+            result = weaker(result, own);
+        }
+        if (unmatched.left) {  // right-only rows, carrying the right key
+            result = weaker(result, peer);
+        }
+        return result;
+    };
+
     for (std::size_t i = 0; i < plan.size(); ++i) {
         const JoinOutputColumn& column = plan[i];
-        if (column.is_key && keys_are_null_free) {
-            out[i].nulls = Nullability::Never;
-            continue;
-        }
-        // A folded key draws from whichever side is present, so it needs both
-        // proofs -- but only where a row can actually be missing its own side.
-        const bool own_side_may_be_missing =
-            column.side == JoinOutputSide::Left ? unmatched.left : unmatched.right;
-        if (!own_side_may_be_missing) {
-            continue;
-        }
         if (column.folded_peer_index.has_value()) {
             const SchemaInfo& peer = column.side == JoinOutputSide::Left ? right : left;
             const auto& peer_fields = peer.fields();
             const Nullability peer_nulls = *column.folded_peer_index < peer_fields.size()
                                                ? peer_fields[*column.folded_peer_index].nulls
                                                : Nullability::Maybe;
-            out[i].nulls = weaker(out[i].nulls, peer_nulls);
+            out[i].nulls = folded_key_nullability(out[i].nulls, peer_nulls);
+            continue;
+        }
+        // An unfolded key column -- a mapped key, or either side's native
+        // column when the names differ -- still holds only keys that matched.
+        if (column.is_key && keys_are_null_free) {
+            out[i].nulls = Nullability::Never;
+            continue;
+        }
+        const bool own_side_may_be_missing =
+            column.side == JoinOutputSide::Left ? unmatched.left : unmatched.right;
+        if (!own_side_may_be_missing) {
             continue;
         }
         out[i].nulls = Nullability::Maybe;

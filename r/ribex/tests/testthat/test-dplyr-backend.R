@@ -199,9 +199,12 @@ test_that("join fallback applies the current verb once and stays local", {
     right <- tibble::tibble(id = 2L, y = "hit")
     source <- ibex_tbl(left, fallback = "collect")
 
-    result <- dplyr::left_join(source, right, by = "id")
+    # `keep = TRUE` asks for both key columns, which the native join has no
+    # spelling for. Any unsupported option would do -- what is under test is
+    # the fallback, not the gate.
+    result <- dplyr::left_join(source, right, by = "id", keep = TRUE)
     expect_false(inherits(result, "ibex_tbl"))
-    expect_equal(result, dplyr::left_join(left, right, by = "id"))
+    expect_equal(result, dplyr::left_join(left, right, by = "id", keep = TRUE))
 })
 
 # Nullability comes from Ibex's own schema inference rather than a rule written
@@ -269,6 +272,74 @@ test_that("join nullability follows Ibex's rules, not the adapter's", {
     outer <- dplyr::left_join(lt, rt, by = "id", na_matches = "never")
     expect_identical(outer$schema$names, c("id", "lv", "rv"))
     expect_identical(outer$schema$nullable, c(TRUE, FALSE, TRUE))
+})
+
+test_that("dplyr's default NA matching runs natively across every kind", {
+    # `na_matches = "na"` is dplyr's default, so this is the form nearly every
+    # join is written in. It maps to Ibex's `nulls equal`.
+    session <- create_session()
+    left <- tibble::tibble(id = c("a", NA, "b"), lv = 1:3)
+    right <- tibble::tibble(id = c("b", NA, "c"), rv = 4:6)
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+
+    sorted <- function(data) {
+        data <- as.data.frame(dplyr::collect(data))
+        data[do.call(order, c(unname(as.list(data)), list(na.last = TRUE))), , drop = FALSE]
+    }
+
+    for (verb in c("inner_join", "left_join", "right_join", "full_join")) {
+        join <- getExportedValue("dplyr", verb)
+        for (na_matches in c("na", "never")) {
+            actual <- join(lt, right, by = "id", na_matches = na_matches)
+            expect_s3_class(actual, "ibex_tbl")
+            expect_equal(
+                sorted(actual),
+                sorted(join(left, right, by = "id", na_matches = na_matches)),
+                ignore_attr = TRUE,
+                info = paste(verb, na_matches)
+            )
+        }
+    }
+
+    # The clause is only emitted when it says something: `never` is Ibex's
+    # default, so it would be noise in the plan.
+    rendered <- function(query) {
+        paste(capture.output(dplyr::show_query(query)), collapse = "\n")
+    }
+    expect_match(rendered(dplyr::inner_join(lt, right, by = "id")), "nulls equal", fixed = TRUE)
+    expect_false(grepl(
+        "nulls", rendered(dplyr::inner_join(lt, right, by = "id", na_matches = "never")),
+        fixed = TRUE
+    ))
+
+    # And a matching null key is a key that can be null, so the proof an inner
+    # join otherwise carries is withdrawn -- by the core, on reading the clause.
+    expect_identical(
+        dplyr::inner_join(lt, right, by = "id")$schema$nullable[[1]], TRUE
+    )
+    expect_identical(
+        dplyr::inner_join(lt, right, by = "id", na_matches = "never")$schema$nullable[[1]], FALSE
+    )
+})
+
+test_that("a floating-point key falls back rather than mismatching NaN", {
+    # `na_matches = "na"` matches NaN to NaN as well as NA to NA. Ibex's
+    # `nulls equal` is about the validity bitmap, and a NaN is a present
+    # value, so the two disagree on a float key -- and R keeps NaN and NA
+    # apart, so no rewrite recovers dplyr's answer.
+    input <- tibble::tibble(id = c(1, NA, 2), lv = 1:3)
+    right <- tibble::tibble(id = c(2, NA, 3), rv = 4:6)
+
+    expect_error(
+        dplyr::inner_join(ibex_tbl(input, fallback = "error"), right, by = "id"),
+        class = "ribex_translation_error"
+    )
+    # `never` matches no NaN on either side, so a float key is fine there.
+    expect_s3_class(
+        dplyr::inner_join(ibex_tbl(input, fallback = "error"), right,
+                          by = "id", na_matches = "never"),
+        "ibex_tbl"
+    )
 })
 
 test_that("right and full joins run natively and agree with dplyr", {

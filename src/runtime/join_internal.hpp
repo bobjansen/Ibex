@@ -34,15 +34,11 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
 /// (`ir::JoinNode::pending_order`), or empty. It can only shift which side is
 /// indexed, never the rows or their names -- see `choose_build_side` in
 /// join.cpp for the trade.
-[[nodiscard]] auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
-                                   const std::vector<ir::JoinKey>& keys, const ir::Expr* predicate,
-                                   const ScalarRegistry* scalars,
-                                   PredicateMaskEvaluator mask_evaluator,
-                                   const ir::JoinSuffixPolicy& suffix = {},
-                                   const std::vector<ir::OrderKey>& pending_order = {},
-                                   ir::NullMatch null_match = ir::NullMatch::Never,
-                                   const ir::JoinExpect& expect = {},
-                                   ir::MatchSelection take = ir::MatchSelection::All)
-    -> std::expected<Table, std::string>;
+[[nodiscard]] auto join_table_impl(
+    const Table& left, const Table& right, ir::JoinKind kind, const std::vector<ir::JoinKey>& keys,
+    const ir::Expr* predicate, const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
+    const ir::JoinSuffixPolicy& suffix = {}, const std::vector<ir::OrderKey>& pending_order = {},
+    ir::NullMatch null_match = ir::NullMatch::Never, const ir::JoinExpect& expect = {},
+    ir::MatchSelection take = ir::MatchSelection::All) -> std::expected<Table, std::string>;
 
 }  // namespace ibex::runtime

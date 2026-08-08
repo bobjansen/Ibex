@@ -5,9 +5,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <expected>
-
 #include <cstring>
+#include <expected>
 #include <interpreter_internal.hpp>
 #include <limits>
 #include <memory>
@@ -1136,7 +1135,8 @@ TEST_CASE("A dictionary-encoded index is still a categorical", "[interop][arrow]
 
 namespace {
 
-auto import_with_claim(ibex::runtime::Table table) -> std::expected<ibex::runtime::Table, std::string> {
+auto import_with_claim(ibex::runtime::Table table)
+    -> std::expected<ibex::runtime::Table, std::string> {
     ArrowArray array{};
     ArrowSchema schema{};
     auto exported = ibex::interop::export_table_to_arrow(table, &array, &schema);
@@ -1161,8 +1161,8 @@ TEST_CASE("Arrow import rejects a null in the time index", "[interop][arrow][cla
     ibex::runtime::Table table;
     ibex::runtime::ValidityBitmap tv(2, true);
     tv.set(1, false);
-    table.add_column("ts",
-                     ibex::Column<ibex::Timestamp>{ibex::Timestamp{100}, ibex::Timestamp{0}}, tv);
+    table.add_column("ts", ibex::Column<ibex::Timestamp>{ibex::Timestamp{100}, ibex::Timestamp{0}},
+                     tv);
     table.set_properties(ibex::runtime::TableProperties::recovered(std::nullopt, "ts", {}));
 
     auto imported = import_with_claim(std::move(table));
@@ -1170,8 +1170,7 @@ TEST_CASE("Arrow import rejects a null in the time index", "[interop][arrow][cla
     CHECK(imported.error().find("null at row 1") != std::string::npos);
 }
 
-TEST_CASE("Arrow import rejects an ordering the rows do not have",
-          "[interop][arrow][claims]") {
+TEST_CASE("Arrow import rejects an ordering the rows do not have", "[interop][arrow][claims]") {
     ibex::runtime::Table table;
     table.add_column("k", ibex::Column<std::int64_t>{3, 1, 2});
     table.set_properties(ibex::runtime::TableProperties::recovered(

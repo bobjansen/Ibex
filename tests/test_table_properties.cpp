@@ -287,8 +287,8 @@ TEST_CASE("An overwritten time index is no longer an index", "[runtime][properti
 // directions are not symmetric in cost: a false negative pays for a sort that
 // was not needed, a false positive returns unsorted rows as sorted.
 TEST_CASE("An ordering satisfies each of its own prefixes", "[runtime][properties][ordering]") {
-    const auto props = TableProperties::sorted_by({{.name = "a", .ascending = true},
-                                                   {.name = "b", .ascending = false}});
+    const auto props = TableProperties::sorted_by(
+        {{.name = "a", .ascending = true}, {.name = "b", .ascending = false}});
 
     CHECK(props.satisfies({}));
     CHECK(props.satisfies({{.name = "a", .ascending = true}}));
@@ -305,8 +305,8 @@ TEST_CASE("An ordering does not satisfy an extension of itself",
 }
 
 TEST_CASE("A direction or a name must match key for key", "[runtime][properties][ordering]") {
-    const auto props = TableProperties::sorted_by({{.name = "a", .ascending = true},
-                                                   {.name = "b", .ascending = true}});
+    const auto props = TableProperties::sorted_by(
+        {{.name = "a", .ascending = true}, {.name = "b", .ascending = true}});
     CHECK_FALSE(props.satisfies({{.name = "a", .ascending = false}}));
     CHECK_FALSE(props.satisfies({{.name = "b", .ascending = true}}));
     // Right names, wrong order of them.

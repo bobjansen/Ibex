@@ -1254,11 +1254,15 @@ class Column<std::string> {
         chars_.clear();
         offsets_.reserve(n + 1);
         offsets_.push_back(0);
-        if (n > 0 && !fill.empty())
-            chars_.reserve(n * fill.size());
+        const size_type fill_size = fill.size();
+        if (n > 0 && fill_size > 0) {
+            chars_.resize(n * fill_size);
+        }
         for (size_type i = 0; i < n; ++i) {
-            chars_.insert(chars_.end(), fill.begin(), fill.end());
-            offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
+            if (fill_size > 0) {
+                std::memcpy(chars_.data() + i * fill_size, fill.data(), fill_size);
+            }
+            offsets_.push_back(static_cast<std::uint32_t>((i + 1) * fill_size));
         }
     }
 

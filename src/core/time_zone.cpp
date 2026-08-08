@@ -18,11 +18,9 @@
 #include <optional>
 #include <robin_hood.h>
 #include <stdexcept>
-#include <stdlib.h>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <time.h>
 #include <utility>
 
 namespace ibex {

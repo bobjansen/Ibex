@@ -200,3 +200,81 @@ test_that("join fallback applies the current verb once and stays local", {
     expect_false(inherits(result, "ibex_tbl"))
     expect_equal(result, dplyr::left_join(left, right, by = "id"))
 })
+
+# Nullability comes from Ibex's own schema inference rather than a rule written
+# out again per verb. These tests assert the proofs the adapter could not make
+# for itself, and one that it must still not make.
+test_that("column nullability is inferred by Ibex for the whole plan", {
+    input <- tibble::tibble(g = c("a", "a", "b"), x = c(1, NA_real_, 3))
+    query <- ibex_tbl(input, fallback = "error")
+
+    # The base table is ground truth: a materialized column with no validity
+    # bitmap holds no nulls.
+    expect_identical(query$schema$nullable, c(FALSE, TRUE))
+
+    # A filter proves the columns its predicate had to read. Both spellings
+    # reach it -- `!is.na(x)` lowers to `!is_null(x)`, not to `is_not_null(x)`.
+    expect_identical(dplyr::filter(query, !is.na(x))$schema$nullable, c(FALSE, FALSE))
+    expect_identical(dplyr::filter(query, x > 0)$schema$nullable, c(FALSE, FALSE))
+
+    # A disjunction proves neither branch, so the proof must not appear.
+    expect_identical(dplyr::filter(query, x > 0 | g == "a")$schema$nullable, c(FALSE, TRUE))
+})
+
+test_that("a proved column lifts the na.rm requirement on aggregates", {
+    # The payoff, and the reason the accuracy matters rather than only the
+    # bookkeeping: the aggregate gate reads nullability, so a better proof is
+    # the difference between running natively and falling back to dplyr.
+    input <- tibble::tibble(g = c("a", "a", "b"), x = c(1, NA_real_, 3))
+
+    expect_error(
+        ibex_tbl(input, fallback = "error") |>
+            dplyr::group_by(g) |>
+            dplyr::summarise(m = mean(x)),
+        class = "ribex_translation_error"
+    )
+
+    native <- ibex_tbl(input, fallback = "error") |>
+        dplyr::filter(!is.na(x)) |>
+        dplyr::group_by(g) |>
+        dplyr::summarise(m = mean(x), .groups = "drop")
+    expect_s3_class(native, "ibex_tbl")
+    expect_equal(
+        dplyr::collect(native),
+        input |> dplyr::filter(!is.na(x)) |> dplyr::group_by(g) |>
+            dplyr::summarise(m = mean(x), .groups = "drop")
+    )
+})
+
+test_that("join nullability follows Ibex's rules, not the adapter's", {
+    session <- create_session()
+    left <- tibble::tibble(id = c(1L, NA_integer_, 2L), lv = c(1, 2, 3))
+    right <- tibble::tibble(id = c(2L, 3L), rv = c(10, 20))
+    lt <- ibex_tbl(left, session = session, fallback = "error")
+    rt <- ibex_tbl(right, session = session, fallback = "error")
+    expect_true(lt$schema$nullable[[match("id", lt$schema$names)]])
+
+    # An inner join proves its key null-free even though neither input did: a
+    # null key matches nothing, so no row carrying one survives. The adapter
+    # had no way to say this.
+    inner <- dplyr::inner_join(lt, rt, by = "id", na_matches = "never")
+    expect_identical(inner$schema$names, c("id", "lv", "rv"))
+    expect_identical(inner$schema$nullable, c(FALSE, FALSE, FALSE))
+
+    # A left join nulls the right side for unmatched rows, and leaves the key
+    # alone -- the folded key column takes the left value, which was nullable.
+    outer <- dplyr::left_join(lt, rt, by = "id", na_matches = "never")
+    expect_identical(outer$schema$names, c("id", "lv", "rv"))
+    expect_identical(outer$schema$nullable, c(TRUE, FALSE, TRUE))
+})
+
+test_that("a captured scalar does not cost the plan its nullability proofs", {
+    # The plan carries `^name` for a scalar bound at eval time rather than in
+    # the session, so inference has to be told the name exists. Without that
+    # the plan fails to lower and every column falls back to nullable.
+    input <- tibble::tibble(x = c(1, NA_real_, 3), y = c(5, 6, 7))
+    cutoff <- 0
+    query <- ibex_tbl(input, fallback = "error") |>
+        dplyr::filter(y > .env$cutoff & !is.na(x))
+    expect_identical(query$schema$nullable, c(FALSE, FALSE))
+})

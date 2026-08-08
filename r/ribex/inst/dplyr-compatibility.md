@@ -32,7 +32,18 @@ does not include `NaN`; use `is.nan(x)` when that distinction matters.
 
 Ibex aggregates skip nulls. For a nullable input, native aggregate translation
 therefore requires an explicit `na.rm = TRUE` (or `na_rm = TRUE` for
-`first`/`last`). All-null and empty inputs can still differ: Ibex returns null
+`first`/`last`).
+
+Whether an input *is* nullable is decided by Ibex, not by the backend: each verb
+hands the plan it has built to the core's schema inference and takes the answer
+back. So a column the plan proves null-free needs no `na.rm`, and the proofs are
+the core's — a `filter` proves the columns its predicate had to read (`x > 0`
+and `!is.na(x)` alike, since a null predicate drops its row just as a false one
+does), an inner join proves its key columns, and a left join withdraws every
+proof on its right side. A plan the core cannot describe falls back to assuming
+every column nullable, which only ever costs native execution.
+
+All-null and empty inputs can still differ: Ibex returns null
 for value-bearing aggregates, while some R aggregates return a sentinel such as
 zero or infinity. Pipelines that require R's empty-input sentinel should use
 local dplyr.

@@ -924,6 +924,106 @@ auto column_type_name(const ibex::runtime::ColumnValue& value) -> const char* {
         value);
 }
 
+auto ir_column_type(const ibex::runtime::ColumnValue& value)
+    -> std::optional<ibex::ir::ColumnType> {
+    return std::visit(
+        [](const auto& column) -> std::optional<ibex::ir::ColumnType> {
+            using Column = std::decay_t<decltype(column)>;
+            if constexpr (std::is_same_v<Column, ibex::Column<std::int64_t>>) {
+                return ibex::ir::ColumnType::Int64;
+            } else if constexpr (std::is_same_v<Column, ibex::Column<double>>) {
+                return ibex::ir::ColumnType::Float64;
+            } else if constexpr (std::is_same_v<Column, ibex::Column<bool>>) {
+                return ibex::ir::ColumnType::Bool;
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Date>>) {
+                return ibex::ir::ColumnType::Date;
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Timestamp>>) {
+                return ibex::ir::ColumnType::Timestamp;
+            } else if constexpr (std::is_same_v<Column, ibex::Column<ibex::Categorical>>) {
+                // The IR has no Categorical: it is a String with a dictionary,
+                // and every rule that reads the type treats it as one.
+                return ibex::ir::ColumnType::String;
+            } else {
+                return ibex::ir::ColumnType::String;
+            }
+        },
+        value);
+}
+
+/// Describe every table bound in the session so `infer_schema` can resolve the
+/// scans a rendered dplyr plan makes.
+///
+/// The nullability here is the strongest evidence there is, and it is evidence
+/// rather than a declaration: these are materialized columns, and a column with
+/// no validity bitmap holds no nulls. That is what seeds the core's propagation
+/// -- every proof downstream of a `filter` or a join is ultimately grounded in
+/// one of these.
+auto session_source_schemas(const SessionState& session) -> ibex::ir::SourceSchemas {
+    ibex::ir::SourceSchemas sources;
+    for (const auto& [name, table] : session.tables) {
+        std::vector<ibex::ir::SchemaField> fields;
+        fields.reserve(table.columns.size());
+        for (const auto& entry : table.columns) {
+            fields.push_back(ibex::ir::SchemaField{.name = entry.name,
+                                                   .type = ir_column_type(*entry.column),
+                                                   .nulls = entry.validity.has_value()
+                                                                ? ibex::ir::Nullability::Maybe
+                                                                : ibex::ir::Nullability::Never});
+        }
+        sources.emplace(name, ibex::ir::SchemaInfo::known(std::move(fields)));
+    }
+    return sources;
+}
+
+/// Infer the schema of a rendered lazy-plan query without executing it.
+///
+/// Deliberately total: every way this can fail to reach a Known schema returns
+/// `nullopt` rather than an error, because the caller's fallback -- assume
+/// every column nullable -- is sound for all of them. A plan shape this cannot
+/// lower is a plan the adapter should still be able to describe conservatively.
+auto infer_plan_schema(const SessionState& session, const std::string& source,
+                       const std::vector<std::string>& extra_lexical_names)
+    -> std::optional<ibex::ir::SchemaInfo> {
+    auto parsed = ibex::parser::parse(source);
+    if (!parsed.has_value() || parsed->statements.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* expr_stmt = std::get_if<ibex::parser::ExprStmt>(&parsed->statements.front());
+    if (expr_stmt == nullptr) {
+        return std::nullopt;
+    }
+
+    ibex::parser::LowerContext context;
+    context.compile_time_lists = session.compile_time_lists;
+    context.table_externs = session.table_externs;
+    context.sink_externs = session.sink_externs;
+    // Same reason as `eval_table_in_session`: without the in-scope names, a
+    // captured scalar in a filter reads as a missing column and lowering fails.
+    for (const auto& entry : session.tables) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : session.compile_time_lists) {
+        context.lexical_names.insert(entry.first);
+    }
+    context.lexical_names.insert(session.table_externs.begin(), session.table_externs.end());
+    context.lexical_names.insert(session.sink_externs.begin(), session.sink_externs.end());
+    // Scalars captured from the R environment (`.env$cutoff`) are supplied at
+    // eval time, not bound in the session, so the caller has to name them. A
+    // plan carrying one is ordinary, and without this every such plan would
+    // fail to lower and fall back to "everything nullable".
+    context.lexical_names.insert(extra_lexical_names.begin(), extra_lexical_names.end());
+
+    auto lowered = ibex::parser::lower_expr(*expr_stmt->expr, context);
+    if (!lowered.has_value() || lowered.value() == nullptr) {
+        return std::nullopt;
+    }
+    auto schema = ibex::ir::infer_schema(*lowered.value(), session_source_schemas(session));
+    if (!schema.is_known()) {
+        return std::nullopt;
+    }
+    return schema;
+}
+
 auto export_table_info(const SessionState& session, const std::string& name)
     -> std::expected<SEXP, std::string> {
     const auto it = session.tables.find(name);
@@ -1167,6 +1267,54 @@ extern "C" SEXP ribex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
         Rf_error("%s", make_error("session error", info.error()).c_str());
     }
     return *info;
+}
+
+extern "C" SEXP ribex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
+                                             SEXP lexical_names_sexp) {
+    auto session = session_from_sexp(session_sexp);
+    if (!session.has_value()) {
+        Rf_error("%s", session.error().c_str());
+    }
+    auto query = scalar_string(query_sexp, "'query'");
+    if (!query.has_value()) {
+        Rf_error("%s", query.error().c_str());
+    }
+
+    std::vector<std::string> lexical_names;
+    if (TYPEOF(lexical_names_sexp) == STRSXP) {
+        const R_xlen_t count = Rf_xlength(lexical_names_sexp);
+        lexical_names.reserve(static_cast<std::size_t>(count));
+        for (R_xlen_t i = 0; i < count; ++i) {
+            SEXP element = STRING_ELT(lexical_names_sexp, i);
+            if (element != NA_STRING) {
+                lexical_names.emplace_back(Rf_translateCharUTF8(element));
+            }
+        }
+    }
+
+    const auto schema = infer_plan_schema(**session, *query, lexical_names);
+    if (!schema.has_value()) {
+        return R_NilValue;
+    }
+
+    const auto column_count = static_cast<R_xlen_t>(schema->fields().size());
+    SEXP out = PROTECT(Rf_allocVector(VECSXP, 2));
+    SEXP out_names = PROTECT(Rf_allocVector(STRSXP, 2));
+    SET_STRING_ELT(out_names, 0, Rf_mkChar("names"));
+    SET_STRING_ELT(out_names, 1, Rf_mkChar("nullable"));
+    Rf_setAttrib(out, R_NamesSymbol, out_names);
+
+    SEXP names = PROTECT(Rf_allocVector(STRSXP, column_count));
+    SEXP nullable = PROTECT(Rf_allocVector(LGLSXP, column_count));
+    for (R_xlen_t i = 0; i < column_count; ++i) {
+        const auto& field = schema->fields()[static_cast<std::size_t>(i)];
+        SET_STRING_ELT(names, i, Rf_mkCharCE(field.name.c_str(), CE_UTF8));
+        LOGICAL(nullable)[i] = field.non_null() ? FALSE : TRUE;
+    }
+    SET_VECTOR_ELT(out, 0, names);
+    SET_VECTOR_ELT(out, 1, nullable);
+    UNPROTECT(4);
+    return out;
 }
 
 extern "C" SEXP ribex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,

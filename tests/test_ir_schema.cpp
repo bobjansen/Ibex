@@ -708,6 +708,27 @@ TEST_CASE("schema: is_not_null proves its column and is_null does not", "[ir][sc
     CHECK(nulls_of(negative, "b") == Nullability::Maybe);
 }
 
+TEST_CASE("schema: a negated null test proves its column", "[ir][schema]") {
+    // `!is_null(x)` says exactly what `is_not_null(x)` says: a null test is
+    // total, so negating one is still a statement about presence, not the
+    // ordinary `!` that proves nothing.
+    //
+    // This is not an exotic spelling to accommodate. dplyr's `filter(!is.na(x))`
+    // is *the* idiom for it, and `is.na()` lowers to `is_null()`, so a frontend
+    // cannot reach `is_not_null` from what its users write.
+    auto s = schema_of("t[filter !is_null(b)];", nullable_sources());
+    CHECK(nulls_of(s, "b") == Nullability::Never);
+
+    // The double negative is the `is_null` case again, and proves nothing.
+    auto doubled = schema_of("t[filter !is_not_null(b)];", nullable_sources());
+    CHECK(nulls_of(doubled, "b") == Nullability::Maybe);
+
+    // And an ordinary negated comparison still proves nothing: it is true for
+    // no null `b`, but false for one, and neither row is kept.
+    auto compared = schema_of("t[filter !(b > 0)];", nullable_sources());
+    CHECK(nulls_of(compared, "b") == Nullability::Maybe);
+}
+
 TEST_CASE("schema: a filter proves nothing about a column a null-consumer read", "[ir][schema]") {
     // `coalesce(b, 0) > 0` is true for a null `b`, so surviving says nothing
     // about `b`. Reading the argument list without minding the callee would

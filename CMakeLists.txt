@@ -70,16 +70,20 @@ include(Dependencies)
 # even when compiling as C++23.  Probe the library rather than using compiler
 # versions: the runtime has a POSIX tzdata fallback when this API is absent.
 include(CheckCXXSourceCompiles)
-set(_ibex_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-string(APPEND CMAKE_REQUIRED_FLAGS " -std=c++23")
+set(_ibex_saved_required_standard "${CMAKE_REQUIRED_STANDARD}")
+# Do not add `-std=c++23` to CMAKE_REQUIRED_FLAGS here: MSVC ignores that
+# GCC/Clang spelling, which probes the default language mode rather than the
+# C++23 mode used by our targets. CMake selects the right flag for each
+# compiler (notably `/std:c++latest` for the MSVC toolset).
+set(CMAKE_REQUIRED_STANDARD 23)
 check_cxx_source_compiles(
     "
     #include <chrono>
     int main() { (void)std::chrono::locate_zone(\"UTC\"); }
     "
     IBEX_HAS_STD_CHRONO_TIME_ZONES)
-set(CMAKE_REQUIRED_FLAGS "${_ibex_saved_required_flags}")
-unset(_ibex_saved_required_flags)
+set(CMAKE_REQUIRED_STANDARD "${_ibex_saved_required_standard}")
+unset(_ibex_saved_required_standard)
 if(IBEX_HAS_STD_CHRONO_TIME_ZONES)
     add_compile_definitions(IBEX_HAS_STD_CHRONO_TIME_ZONES=1)
 endif()

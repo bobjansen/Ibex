@@ -17,7 +17,7 @@ collection and `fallback = "collect"` makes it silent.
 | `slice_head`, `head` | Constant non-negative `n`, including current groups | `prop`, `by`, and `slice_tail` |
 | `distinct` | Existing selected columns; all columns by default | Computed/renamed keys and subset `.keep_all = TRUE` |
 | `count`, `tally` | Lower to native grouping, aggregate, and optional ordering | Same restrictions as `group_by`, `summarise`, and `arrange` |
-| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and `na_matches = "never"`; a local right data frame is bound into the left session | Different key names / `join_by()`, dplyr's default NA matching, `keep`, multiplicity and relationship options, and the remaining kinds (`semi_join`, `anti_join`, `cross_join`, `nest_join`) |
+| joins | `inner_join`, `left_join`, `right_join` and `full_join` with same-named character keys, otherwise-default join options, and either `na_matches`; a local right data frame is bound into the left session | Different key names / `join_by()`, `na_matches = "na"` on a floating-point key, `keep`, multiplicity and relationship options, and the remaining kinds (`semi_join`, `anti_join`, `cross_join`, `nest_join`) |
 
 ## Types and missing values
 
@@ -29,6 +29,14 @@ metadata. Operator metadata propagation remains the authority after execution.
 Ibex null is the native representation of R `NA`. IEEE `NaN` remains a present
 floating-point value. Consequently, translated `is.na(x)` tests Ibex nulls and
 does not include `NaN`; use `is.nan(x)` when that distinction matters.
+
+The same distinction bounds `na_matches = "na"`, dplyr's default. It maps to
+Ibex's `nulls equal`, which matches null keys to each other — but dplyr also
+matches `NaN` to `NaN`, and to Ibex a `NaN` is a present value like any other.
+R keeps the two apart as well (a `NaN` key never matches an `NA` one), so no
+rewrite recovers dplyr's answer. A join with a floating-point key therefore
+falls back under `"na"`; `na_matches = "never"` matches no `NaN` on either
+side, so it stays native for every key type.
 
 Ibex aggregates skip nulls. For a nullable input, native aggregate translation
 therefore requires an explicit `na.rm = TRUE` (or `na_rm = TRUE` for

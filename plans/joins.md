@@ -664,6 +664,25 @@ eight kinds in both directions — inputs proved, so only the join can weaken;
 and key unproved, so only the join can prove. `outer`, `asof` and `cross` had
 implementations and no tests.
 
+### A folded key could not hold a null
+
+Found by putting dplyr's default `na_matches` on the native path, and older
+than any of this work. The materialized join builds a folded key per row,
+picking from whichever side is present — and that loop copied the *value*
+without the validity that went with it, so a null key came back as the type's
+zero: an empty string, a `0`. `ribex` surfaced it as an `id` of `""` where
+dplyr had `NA`.
+
+This is the third of a family: the same defect was fixed for left columns and
+for right columns (*Stop the materialized join turning a source null into a
+zero*), and the folded key is the one column neither of those tests could
+reach, because it is the one column not produced by `gather_entry`.
+
+Reachable without `nulls equal` at all: an outer join keeps an unmatched row
+along with its own null key, so `nulls never` hits it too. The regression test
+uses that shape, and pits the null against a genuine `0` in the same column,
+which is the only way to tell the fix from the bug.
+
 ### The folded key's rule, corrected
 
 Putting `right_join()` into `ribex` immediately found the first version of the
@@ -752,10 +771,18 @@ session.
   is the adapter's to reconstruct.
 - ~~**Nullability.**~~ Done: the backend asks the core for it rather than
   restating its rules per verb. See the schema-nullability package.
-- **`na_matches = "na"`.** Maps to the explicit `Equal` policy, which now
-  exists — so this is available, and it is worth more than its size suggests:
-  `"na"` is dplyr's *default*, so today every join written without the
-  argument falls back to local dplyr.
+- ~~**`na_matches = "na"`.**~~ Done: it maps to `nulls equal`, so the form
+  nearly every dplyr join is written in — the default — now runs natively
+  instead of collecting.
+
+  With one exclusion, which is the interesting part. `"na"` also matches `NaN`
+  to `NaN`; `nulls equal` is about the validity bitmap, and a `NaN` is a
+  present value. R keeps the two apart as well (a `NaN` key never matches an
+  `NA` one), so there is no rewrite that recovers dplyr's answer — mapping
+  `NaN` to null would wrongly pair it with `NA`. A floating-point key falls
+  back under `"na"` rather than returning a differently-shaped result the
+  caller has no way to notice. `"never"` matches no `NaN` on either side, so
+  it stays native for every key type.
 - **Grouping.** Preserve `x$groups` for joins retaining the left columns; remap
   a group name if its column takes a suffix.
 - **Filtering joins.** `semi_join()` and `anti_join()` need none of the

@@ -832,6 +832,37 @@ TEST_CASE("join: outer join disjoint tables - all rows unmatched", "[join]") {
     CHECK_FALSE(runtime::is_null(rval_entry, 1));
 }
 
+TEST_CASE("join: outer join on a mapped key nulls each side's own key column", "[join]") {
+    // A mapped key keeps both native columns, so nothing folds and an unmatched
+    // row has no peer to fill its own key from -- unlike the same-name case
+    // above, where one column carries whichever side turned up.
+    runtime::Table lhs;
+    lhs.add_column("lid", Column<std::int64_t>{1});
+    lhs.add_column("lval", Column<std::int64_t>{10});
+
+    runtime::Table rhs;
+    rhs.add_column("rid", Column<std::int64_t>{2});
+    rhs.add_column("rval", Column<std::int64_t>{20});
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto out = interpret_expr("lhs outer join rhs on {lid = rid};", tables);
+
+    REQUIRE(out.rows() == 2);
+    const auto& lid = out.columns[out.index.at("lid")];
+    const auto& rid = out.columns[out.index.at("rid")];
+
+    // row 0: the left row, unmatched -> its own key present, the right's null.
+    CHECK_FALSE(runtime::is_null(lid, 0));
+    CHECK(runtime::is_null(rid, 0));
+
+    // row 1: the right row, unmatched -> the mirror image.
+    CHECK(runtime::is_null(lid, 1));
+    CHECK_FALSE(runtime::is_null(rid, 1));
+}
+
 TEST_CASE("join: outer join identical tables - all rows matched, no nulls", "[join]") {
     // When both tables have the same keys, every row matches -> no nulls
     runtime::Table lhs;

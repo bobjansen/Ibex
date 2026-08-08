@@ -193,7 +193,9 @@ struct LikeArg {
 
 /// The arguments common to the two zone casts, already validated and resolved.
 struct ZoneCallArgs {
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
     const std::chrono::time_zone* zone = nullptr;
+#endif
     const std::string* zone_text = nullptr;  // borrowed from the literal in `call`
     const ColumnEntry* entry = nullptr;
     const Column<Timestamp>* stamps = nullptr;
@@ -214,10 +216,7 @@ auto resolve_zone_call(std::string_view fn, const ir::CallExpr& call, const Tabl
         return std::unexpected(prefix + ": the zone must be a String literal");
     }
 
-    const std::chrono::time_zone* zone = nullptr;
-    try {
-        zone = std::chrono::locate_zone(*zone_text);
-    } catch (const std::exception&) {
+    if (!is_known_zone(*zone_text)) {
         return std::unexpected(prefix + ": unknown time zone '" + *zone_text + "'");
     }
 
@@ -233,7 +232,11 @@ auto resolve_zone_call(std::string_view fn, const ir::CallExpr& call, const Tabl
     if (stamps == nullptr) {
         return std::unexpected(prefix + ": '" + col_ref->name + "' is not a Timestamp column");
     }
-    return ZoneCallArgs{.zone = zone, .zone_text = zone_text, .entry = entry, .stamps = stamps};
+    ZoneCallArgs result{.zone_text = zone_text, .entry = entry, .stamps = stamps};
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+    result.zone = std::chrono::locate_zone(*zone_text);
+#endif
+    return result;
 }
 
 /// `in_timezone(ts, "Zone")` -- tag a Timestamp column with `Zone`, leaving every
@@ -283,7 +286,6 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
     if (!args) {
         return std::unexpected(args.error());
     }
-    const std::chrono::time_zone* zone = args->zone;
     const std::string* zone_text = args->zone_text;
     const auto* entry = args->entry;
     const auto* stamps = args->stamps;
@@ -300,12 +302,17 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
     // so the last answer is cached and reused while the value still falls inside
     // the local interval it covers. Timestamp columns are usually sorted, which
     // makes that nearly every row.
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+    const std::chrono::time_zone* zone = args->zone;
     std::chrono::nanoseconds cached_offset{};
     std::chrono::local_time<std::chrono::nanoseconds> cache_begin{};
     std::chrono::local_time<std::chrono::nanoseconds> cache_end{};
     bool cache_valid = false;
+#endif
 
     for (std::size_t row = 0; row < stamps->size(); ++row) {
+#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+
         const std::chrono::local_time<std::chrono::nanoseconds> wall{
             std::chrono::nanoseconds{(*stamps)[row].nanos}};
 
@@ -346,6 +353,18 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
         } else {
             cache_valid = false;
         }
+#else
+        const auto instant = local_time_to_sys(*zone_text, (*stamps)[row].nanos);
+        if (!instant.has_value()) {
+            if (!validity.has_value()) {
+                validity = ValidityBitmap(stamps->size(), true);
+            }
+            validity->set(row, false);
+            out.push_back(Timestamp{0});
+        } else {
+            out.push_back(Timestamp{*instant});
+        }
+#endif
     }
     out.set_meta(ColumnMeta{.zone = intern_zone(*zone_text)});
 

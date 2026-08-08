@@ -66,6 +66,24 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerOptions)
 include(Dependencies)
 
+# Apple Clang currently ships libc++ without the C++20 time-zone database,
+# even when compiling as C++23.  Probe the library rather than using compiler
+# versions: the runtime has a POSIX tzdata fallback when this API is absent.
+include(CheckCXXSourceCompiles)
+set(_ibex_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+string(APPEND CMAKE_REQUIRED_FLAGS " -std=c++23")
+check_cxx_source_compiles(
+    "
+    #include <chrono>
+    int main() { (void)std::chrono::locate_zone(\"UTC\"); }
+    "
+    IBEX_HAS_STD_CHRONO_TIME_ZONES)
+set(CMAKE_REQUIRED_FLAGS "${_ibex_saved_required_flags}")
+unset(_ibex_saved_required_flags)
+if(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+    add_compile_definitions(IBEX_HAS_STD_CHRONO_TIME_ZONES=1)
+endif()
+
 if(IBEX_ENABLE_SANITIZERS)
     include(Sanitizers)
 endif()

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 ibex_dplyr_state <- new.env(parent = emptyenv())
 ibex_dplyr_state$binding_id <- 0L
 

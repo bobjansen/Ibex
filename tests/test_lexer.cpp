@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #include <ibex/parser/lexer.hpp>
 
 #include <catch2/catch_test_macros.hpp>

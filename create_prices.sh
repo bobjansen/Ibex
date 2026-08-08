@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
 
 symbols="AAPL MSFT GOOG AMZN"; n=1000000; phi=0.9; mu=100; sigma=1; \
 awk -v syms="$symbols" -v n=$n -v phi=$phi -v mu=$mu -v sigma=$sigma '

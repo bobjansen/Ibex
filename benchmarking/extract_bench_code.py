@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 """Extract the *exact* per-engine code for every benchmark query, straight from
 the harness source files.
 

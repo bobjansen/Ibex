@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 #pragma once
 
 // Zorro — high-performance xoshiro256++ with automatic SIMD dispatch.

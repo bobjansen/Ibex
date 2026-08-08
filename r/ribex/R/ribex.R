@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 knitr_state <- new.env(parent = emptyenv())
 knitr_state$sessions <- new.env(parent = emptyenv())
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # run-per-engine.sh — run the scale benchmark with ONE EC2 instance per engine.
 #
 # Instead of run.sh's single box that runs every engine sequentially, this

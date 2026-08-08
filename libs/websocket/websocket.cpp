@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Ibex plugin entry point for the WebSocket plugin.
 //
 // Build as a shared library alongside websocket.hpp and place it (together

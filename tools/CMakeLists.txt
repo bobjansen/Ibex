@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # CURL is optional (see libs/csv/CMakeLists.txt): the bench executables below
 # only need it to exercise read_csv's HTTPS path, which is itself optional.
 find_package(CURL)

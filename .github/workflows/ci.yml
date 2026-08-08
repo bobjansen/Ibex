@@ -7,6 +7,13 @@ on:
     branches: [main]
 
 jobs:
+  spdx-headers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check SPDX license headers
+        run: python3 scripts/spdx-headers.py --check
+
   ribex-dplyr:
     runs-on: ubuntu-24.04
     strategy:

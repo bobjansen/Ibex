@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # Run supported dplyr pipelines with Ibex's native execution backend.
 library(dplyr)
 library(ribex)

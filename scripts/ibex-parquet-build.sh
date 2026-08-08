@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # ibex-parquet-build.sh — build the bundled parquet plugin in an existing Ibex build tree.
 #
 # Usage:

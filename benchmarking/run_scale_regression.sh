@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # run_scale_regression.sh — guard Ibex scale benchmark performance against README snapshot.
 #
 # Usage:

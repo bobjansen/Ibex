@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Bob Jansen
+
 # run_bench.sh — time TPC-H/PDS-H queries: Ibex, this tree's Polars implementation,
 # and the upstream Polars PDS-H Polars + DuckDB implementations.
 # Every engine is run in both its default multi-threaded configuration and a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Bob Jansen
+
 // Ibex UDP plugin — schema-driven streaming source and sink over UDP.
 //
 // Wire protocol: one JSON object per UDP datagram, newline-terminated.

@@ -4,6 +4,11 @@
 // Expected input:
 //   benchmarking/results/r_only/<rows>/r_only.tsv
 //
+// Point `read_csv` below at another size, or at the `r_only/<rows>/r_only.tsv`
+// inside an AWS artifact (benchmarking/aws/run-r-only.sh), to analyse those
+// instead. The artifact's `combined.tsv` carries an extra leading
+// `dataset_rows` column, so filter it to one size before joining on `query`.
+//
 // Interpreting speedup:
 //   speedup = competitor_ms / ibex_ms
 //   speedup > 1.0  -> Ibex is faster

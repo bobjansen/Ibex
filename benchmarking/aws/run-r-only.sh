@@ -71,6 +71,7 @@ bench_require_pushed "$IBEX_ROOT" "$COMMIT" "$BRANCH" "$REPO_URL" || exit 1
 
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%S)
 RESULT_KEY="benchmarks/${TIMESTAMP}_${COMMIT:0:8}/r_only.tar.gz"
+COMPLETE_KEY="${RESULT_KEY%.tar.gz}.complete"
 AMI=$(bench_resolve_ami "$REGION")
 SG_ID=$(bench_security_group "$REGION")
 KEY_ARGS=()
@@ -86,6 +87,7 @@ echo "Cores  : ${CORES} (process pinned; Ibex, data.table and OpenMP all held to
 echo "Iters  : ${ITERS} timed, ${WARMUP} warmup"
 echo "Type   : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot))"
 echo "Result : s3://$S3_BUCKET/$RESULT_KEY"
+echo "Complete: s3://$S3_BUCKET/$COMPLETE_KEY"
 echo "Partial: s3://$S3_BUCKET/${RESULT_KEY%.tar.gz}.partial.tar.gz (refreshed after each size)"
 
 ENV_ARGS=(
@@ -96,6 +98,7 @@ ENV_ARGS=(
     "IBEX_ITERS=${ITERS}"
     "IBEX_S3_BUCKET=${S3_BUCKET}"
     "IBEX_RESULT_KEY=${RESULT_KEY}"
+    "IBEX_R_ONLY_COMPLETE_KEY=${COMPLETE_KEY}"
     "IBEX_REGION=${REGION}"
 )
 
@@ -109,8 +112,8 @@ INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" --instance-type "$INSTANC
 
 echo "Instance: $INSTANCE_ID"
 echo "Log: aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
-echo "Waiting for artifact..."
-while ! aws s3 ls "s3://${S3_BUCKET}/${RESULT_KEY}" --region "$REGION" >/dev/null 2>&1; do
+echo "Waiting for completed artifact..."
+while ! aws s3 ls "s3://${S3_BUCKET}/${COMPLETE_KEY}" --region "$REGION" >/dev/null 2>&1; do
     state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
         --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)
     if [[ "$state" == "terminated" || "$state" == "shutting-down" ]]; then

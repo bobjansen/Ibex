@@ -781,19 +781,30 @@ if (!is.null(csv_events_path)) {
             function() dt_ev[amount > 500.0])
 
         # High-cardinality inner join: events |><| users on user_id (~100K keys).
+        #
+        # These use data.table's indexed join `y[x, on=]` rather than
+        # merge(x, y, by=): merge.data.table defaults to sort = TRUE, so it
+        # additionally establishes a total order on the join key that no other
+        # engine here was asked to produce (ibex promises no join row order;
+        # dplyr/polars/duckdb keep left-side order). Sorting 1M string keys was
+        # ~33% of the measured `inner_join_user` time — a benchmarking artifact,
+        # not a data.table weakness. `y[x, on=]` keeps x's row order, matching
+        # dplyr exactly; results were verified content-identical to both the
+        # merge() spelling and dplyr (row count, duplicate expansion and NA
+        # behaviour all equal; only column order differs, key-first either way).
         if (!is.null(csv_users_path)) {
             dt_users <- fread(csv_users_path)
             bench("data.table", "inner_join_user",
-                function() merge(dt_ev, dt_users, by = "user_id"))
+                function() dt_users[dt_ev, on = "user_id", nomatch = NULL])
 
             # Join-anchored pipelines (Tier 2): join -> derive -> roll up.
             bench("data.table", "join_update_group",
-                function() merge(dt_ev, dt_users, by = "user_id")[
+                function() dt_users[dt_ev, on = "user_id", nomatch = NULL][
                     , revenue := amount * user_tier_multiplier][
                     , .(total_rev = sum(revenue)), by = .(symbol, user_segment)])
 
             bench("data.table", "join_filter_rank",
-                function() merge(dt_ev, dt_users, by = "user_id")[
+                function() dt_users[dt_ev, on = "user_id", nomatch = NULL][
                     user_segment == "premium"][
                     , rk := frank(-amount, ties.method = "dense"), by = symbol][rk <= 5])
         }
@@ -850,8 +861,10 @@ if (!is.null(csv_lookup_path)) {
 
         message("\n=== data.table (null) ===")
 
+        # Indexed join, not merge(..., all.x = TRUE) — see the inner_join_user
+        # comment above: merge() would also sort the 1M-row result by symbol.
         bench("data.table", "null_left_join",
-            function() merge(dt, dt_lookup, by = "symbol", all.x = TRUE))
+            function() dt_lookup[dt, on = "symbol"])
 
         bench("data.table", "null_semi_join",
             function() dt[symbol %chin% lookup_symbols])
@@ -861,7 +874,7 @@ if (!is.null(csv_lookup_path)) {
 
         # Low-cardinality inner join: prices |><| lookup on symbol.
         bench("data.table", "inner_join_symbol",
-            function() merge(dt, dt_lookup, by = "symbol"))
+            function() dt_lookup[dt, on = "symbol", nomatch = NULL])
 
         bench("data.table", "null_cross_join_small",
             function() merge(left_small, right_small, by = "join_key", allow.cartesian = TRUE)

@@ -257,8 +257,13 @@ phase_prices_lookup <- function() {
         dt_lookup_symbols <- unique(dt_lookup$symbol)
         tb_lookup_symbols <- tb_lookup |> distinct(symbol)
         ib_lookup_symbols <- ib_lookup |> distinct(symbol) |> compute()
-        bench_three("null_left_join", function() merge(dt, dt_lookup, by = "symbol", all.x = TRUE), function() tb |> left_join(tb_lookup, by = "symbol"), function() ib |> left_join(ib_lookup, by = "symbol") |> collect())
-        bench_three("inner_join_symbol", function() merge(dt, dt_lookup, by = "symbol"), function() tb |> inner_join(tb_lookup, by = "symbol"), function() ib |> inner_join(ib_lookup, by = "symbol") |> collect())
+        # data.table joins are spelled as indexed joins `y[x, on=]`, not
+        # merge(x, y, by=): merge.data.table defaults to sort = TRUE and would
+        # additionally sort the result by the join key, which neither dplyr nor
+        # ibex is asked to do here. `y[x, on=]` preserves x's row order (same as
+        # dplyr) and is content-identical. See bench_r.R for the full rationale.
+        bench_three("null_left_join", function() dt_lookup[dt, on = "symbol"], function() tb |> left_join(tb_lookup, by = "symbol"), function() ib |> left_join(ib_lookup, by = "symbol") |> collect())
+        bench_three("inner_join_symbol", function() dt_lookup[dt, on = "symbol", nomatch = NULL], function() tb |> inner_join(tb_lookup, by = "symbol"), function() ib |> inner_join(ib_lookup, by = "symbol") |> collect())
         bench_three("null_semi_join", function() dt[symbol %chin% dt_lookup_symbols], function() tb |> semi_join(tb_lookup_symbols, by = "symbol"), function() ib |> semi_join(ib_lookup_symbols, by = "symbol") |> collect())
         bench_three("null_anti_join", function() dt[!symbol %chin% dt_lookup_symbols], function() tb |> anti_join(tb_lookup_symbols, by = "symbol"), function() ib |> anti_join(ib_lookup_symbols, by = "symbol") |> collect())
         rm(dt_lookup, tb_lookup, ib_lookup, dt_lookup_symbols, tb_lookup_symbols, ib_lookup_symbols)
@@ -307,8 +312,8 @@ phase_events_users <- function() {
         dt_users <- fread(csv_users_path)
         tb_users <- as_shared_tibble(dt_users)
         ib_users <- ibex_source(tb_users)
-        bench_three("inner_join_user", function() merge(dt_events, dt_users, by = "user_id"), function() tb_events |> inner_join(tb_users, by = "user_id"), function() ib_events |> inner_join(ib_users, by = "user_id") |> collect())
-        bench_three("join_update_group", function() merge(dt_events, dt_users, by = "user_id")[, revenue := amount * user_tier_multiplier][, .(total_rev = sum(revenue)), by = .(symbol, user_segment)], function() tb_events |> inner_join(tb_users, by = "user_id") |> mutate(revenue = amount * user_tier_multiplier) |> group_by(symbol, user_segment) |> summarise(total_rev = sum(revenue), .groups = "drop"), function() ib_events |> inner_join(ib_users, by = "user_id") |> mutate(revenue = amount * user_tier_multiplier) |> group_by(symbol, user_segment) |> summarise(total_rev = sum(revenue), .groups = "drop") |> collect())
+        bench_three("inner_join_user", function() dt_users[dt_events, on = "user_id", nomatch = NULL], function() tb_events |> inner_join(tb_users, by = "user_id"), function() ib_events |> inner_join(ib_users, by = "user_id") |> collect())
+        bench_three("join_update_group", function() dt_users[dt_events, on = "user_id", nomatch = NULL][, revenue := amount * user_tier_multiplier][, .(total_rev = sum(revenue)), by = .(symbol, user_segment)], function() tb_events |> inner_join(tb_users, by = "user_id") |> mutate(revenue = amount * user_tier_multiplier) |> group_by(symbol, user_segment) |> summarise(total_rev = sum(revenue), .groups = "drop"), function() ib_events |> inner_join(ib_users, by = "user_id") |> mutate(revenue = amount * user_tier_multiplier) |> group_by(symbol, user_segment) |> summarise(total_rev = sum(revenue), .groups = "drop") |> collect())
         rm(dt_users, tb_users, ib_users)
     }
     rm(dt_events, tb_events, ib_events)

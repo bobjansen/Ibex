@@ -87,6 +87,47 @@ CLANG_VERSION=21
 CMAKE_VERSION=3.31.6
 
 MARKER=/opt/ibex/.ami-provisioned
+MIN_R_VERSION=4.4.0
+
+r_is_supported() {
+    command -v Rscript >/dev/null 2>&1 \
+        && Rscript -e "quit(status = as.integer(getRversion() < \"${MIN_R_VERSION}\"))"
+}
+
+install_current_r() {
+    # Ubuntu Noble ships R 4.3, while ibex's R package requires R >= 4.4.
+    # Use CRAN's official Ubuntu repository rather than relying on the distro
+    # snapshot; `cran40` is the repository ABI name, not an R 4.0 pin.
+    apt_get_retry install -y --no-install-recommends dirmngr
+    wget -qO /etc/apt/trusted.gpg.d/cran_ubuntu_key.asc \
+        https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc
+    add_apt_repository_retry -y \
+        "deb https://cloud.r-project.org/bin/linux/ubuntu $(lsb_release -cs)-cran40/"
+    apt_get_retry update -qq
+    apt_get_retry install -y --no-install-recommends r-base r-base-dev
+
+    # Install these from the same repository as R. Ubuntu's prebuilt R
+    # packages target its older R 4.3 runtime and must not be mixed in.
+    Rscript -e '
+        needed <- c("data.table", "dplyr", "tidyr", "optparse")
+        missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
+        if (length(missing) > 0) {
+            install.packages(missing, repos = "https://cloud.r-project.org")
+        }
+    '
+    r_is_supported || {
+        echo "R ${MIN_R_VERSION} or newer is required, but installation did not provide it" >&2
+        return 1
+    }
+}
+
+ensure_current_r() {
+    if r_is_supported; then
+        return 0
+    fi
+    echo "Installing R ${MIN_R_VERSION} or newer from CRAN's Ubuntu repository"
+    install_current_r
+}
 
 # ── Provisioning ──────────────────────────────────────────────────────────────
 # Everything an instance needs before it can build + benchmark. Idempotent and
@@ -98,7 +139,6 @@ provision() {
         git ninja-build \
         libjemalloc-dev \
         libcurl4-openssl-dev libssl-dev zlib1g-dev \
-        r-base r-cran-data.table r-cran-optparse \
         python3 python3-dev curl unzip \
         time \
         wget gnupg lsb-release software-properties-common ca-certificates
@@ -138,15 +178,9 @@ provision() {
         apt_get_retry install -y gcc g++
     fi
 
-    # dplyr + tidyr aren't in apt; install from CRAN so the R bench's dplyr cells
-    # (and reshape) run. Matches install-deps.sh.
-    Rscript -e '
-        needed <- c("dplyr", "tidyr")
-        missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
-        if (length(missing) > 0) {
-            install.packages(missing, repos = "https://cloud.r-project.org")
-        }
-    '
+    # Install the R benchmark stack from CRAN so it matches the R runtime and
+    # prevents a stock Noble image's R 4.3 reaching the R-only runner.
+    ensure_current_r
 
     # AWS CLI v2 (for s3 cp to upload results / status). --update is a no-op on a
     # fresh box and lets provisioning re-run cleanly on a baked image.
@@ -171,6 +205,12 @@ elif [[ "${IBEX_PROVISION_ONLY:-0}" == "1" ]]; then
     : # provision-only handles its own provisioning below
 else
     provision
+fi
+
+# A pre-existing AMI marker means the base provisioning is skipped. Still
+# validate R here because older baked images were made with Noble's R 4.3.
+if [[ "${IBEX_PROVISION_ONLY:-0}" != "1" ]]; then
+    ensure_current_r
 fi
 
 # clang/cmake/uv live on the default PATH after provision (versioned clang +

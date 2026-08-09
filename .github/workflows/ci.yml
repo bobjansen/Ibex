@@ -46,7 +46,8 @@ jobs:
             -DIBEX_BUILD_TESTS=OFF \
             -DIBEX_BUILD_TOOLS=OFF \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_LIGHTGBM=OFF
           cmake --build build-ibex --parallel 2
 
       - name: Install and test ibex
@@ -86,7 +87,8 @@ jobs:
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_SANITIZERS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
             -DIBEX_BUILD_TESTS=ON \
-            -DIBEX_BUILD_TOOLS=ON
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_LIGHTGBM=OFF
       - name: Configure (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -97,7 +99,8 @@ jobs:
             -DIBEX_WARNINGS_AS_ERRORS=ON \
             -DIBEX_ENABLE_SANITIZERS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
             -DIBEX_BUILD_TESTS=ON \
-            -DIBEX_BUILD_TOOLS=ON
+            -DIBEX_BUILD_TOOLS=ON \
+            -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Build
         run: cmake --build build --parallel
@@ -139,7 +142,8 @@ jobs:
             -DIBEX_BUILD_TESTS=ON `
             -DIBEX_BUILD_TOOLS=ON `
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF `
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=OFF `
+            -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Build
         run: cmake --build build --config ${{ matrix.build_type }} --parallel
@@ -180,7 +184,8 @@ jobs:
             -DIBEX_BUILD_TESTS=ON \
             -DIBEX_BUILD_TOOLS=ON \
             -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-            -DIBEX_BUILD_PARQUET=OFF
+            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Build (everything incl. tests, under -Werror)
         run: cmake --build build --parallel
@@ -233,7 +238,8 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_C_COMPILER=$CC \
-            -DCMAKE_CXX_COMPILER=$CXX
+            -DCMAKE_CXX_COMPILER=$CXX \
+            -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Run clang-tidy (repo-wide, advisory)
         run: |

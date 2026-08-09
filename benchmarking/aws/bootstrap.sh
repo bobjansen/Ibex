@@ -317,6 +317,7 @@ build_ibex() {
         -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
         -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
         -DIBEX_PARQUET_S3=OFF \
+        -DIBEX_BUILD_LIGHTGBM=OFF \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
@@ -342,6 +343,7 @@ build_ibex_with_compiler() {
         -DIBEX_BUILD_PARQUET=OFF \
         -DIBEX_BUILD_ADBC=OFF \
         -DIBEX_BUILD_KAFKA=OFF \
+        -DIBEX_BUILD_LIGHTGBM=OFF \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
@@ -392,8 +394,7 @@ fi
 # which builds both commits in throwaway trees and times ibex_bench on each;
 # here we just regenerate the (untracked) benchmark CSVs, run it, upload the
 # report and self-terminate. compare_ibex_git.sh does its own build, so this
-# path deliberately skips build_ibex — but it reuses the baked lightgbm source
-# so the two throwaway builds don't each re-clone it.
+# path deliberately skips build_ibex.
 #
 #   IBEX_BASE / IBEX_TARGET — commits to compare (both must be on origin)
 #   IBEX_REPEATS, IBEX_ITERS, IBEX_WARMUP — passed through
@@ -439,9 +440,6 @@ if [[ "${IBEX_COMPARE_MODE:-0}" == "1" ]]; then
     # the same clang-${CLANG_VERSION} the normal build_ibex uses.
     export IBEX_CC="clang-${CLANG_VERSION}"
     export IBEX_CXX="clang++-${CLANG_VERSION}"
-    if [[ -d /ibex/build-release/_deps/lightgbm-src ]]; then
-        export IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src
-    fi
 
     COMPARE_ARGS=(--base "${IBEX_BASE}" --target "${IBEX_TARGET}"
         --repeats "${IBEX_REPEATS:-5}" --iters "${IBEX_ITERS:-7}" --warmup "${IBEX_WARMUP:-1}")
@@ -534,9 +532,6 @@ if [[ "${IBEX_BISECT_MODE:-0}" == "1" ]]; then
 
     export IBEX_CC="clang-${CLANG_VERSION}"
     export IBEX_CXX="clang++-${CLANG_VERSION}"
-    if [[ -d /ibex/build-release/_deps/lightgbm-src ]]; then
-        export IBEX_LIGHTGBM_SRC=/ibex/build-release/_deps/lightgbm-src
-    fi
 
     CHECK=/tmp/ibex-bisect-check.sh
     cat > "$CHECK" <<'EOF'

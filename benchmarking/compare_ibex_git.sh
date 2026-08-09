@@ -291,7 +291,7 @@ configure_and_build() {
         -DCMAKE_CXX_COMPILER="${IBEX_CXX:-clang++}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
-        ${IBEX_LIGHTGBM_SRC:+-DFETCHCONTENT_SOURCE_DIR_LIGHTGBM="$IBEX_LIGHTGBM_SRC"} \
+        -DIBEX_BUILD_LIGHTGBM=OFF \
         -DIBEX_BUILD_PARQUET=OFF \
         -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
         "${canonical_path_args[@]}" >"$log_file" 2>&1; then

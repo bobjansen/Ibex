@@ -164,16 +164,16 @@ if [[ $INSTALL_R -eq 1 ]]; then
     R_BENCH_LIB=/usr/local/lib/R/site-library
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"
-    R_LIBS_USER="$R_BENCH_LIB" Rscript -e '
+    R_LIBS_USER="$R_BENCH_LIB" Rscript --vanilla -e '
         needed <- c("data.table", "dplyr", "tidyr", "optparse")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org",
-                             dependencies = TRUE)
+                             dependencies = c("Depends", "Imports", "LinkingTo"))
         }
     '
 
-    Rscript -e 'if (getRversion() < "4.4.0") stop("R 4.4.0 or newer is required")'
+    Rscript --vanilla -e 'if (getRversion() < "4.4.0") stop("R 4.4.0 or newer is required")'
 
     echo "✓ R: $(Rscript --version 2>&1 | head -1)"
     echo "✓ data.table: $(Rscript -e 'cat(as.character(packageVersion("data.table")))')"

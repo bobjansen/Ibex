@@ -92,7 +92,7 @@ R_BENCH_LIB=/opt/ibex-r-packages
 
 r_is_supported() {
     command -v Rscript >/dev/null 2>&1 \
-        && Rscript -e "quit(status = as.integer(getRversion() < \"${MIN_R_VERSION}\"))"
+        && Rscript --vanilla -e "quit(status = as.integer(getRversion() < \"${MIN_R_VERSION}\"))"
 }
 
 install_current_r() {
@@ -119,12 +119,12 @@ install_r_benchmark_packages() {
     # R-only package library used by each benchmark run.
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"
-    R_LIBS_USER="$R_BENCH_LIB" Rscript -e '
+    R_LIBS_USER="$R_BENCH_LIB" Rscript --vanilla -e '
         needed <- c("data.table", "dplyr", "tidyr", "optparse")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org",
-                             dependencies = TRUE)
+                             dependencies = c("Depends", "Imports", "LinkingTo"))
         }
     '
 }
@@ -1012,7 +1012,7 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
             echo "completed_sizes=${R_ONLY_COMPLETED_SIZES[*]:-}"
             echo "failed_sizes=${R_ONLY_FAILED_SIZES[*]:-}"
             echo "R=$(Rscript --version 2>&1 | head -1)"
-            R_LIBS_USER="$R_ONLY_LIB" Rscript -e 'cat(sprintf("data.table=%s\ndplyr=%s\n", packageVersion("data.table"), packageVersion("dplyr")))' 2>/dev/null || true
+            R_LIBS_USER="$R_ONLY_LIB" Rscript --vanilla -e 'cat(sprintf("data.table=%s\ndplyr=%s\n", packageVersion("data.table"), packageVersion("dplyr")))' 2>/dev/null || true
         } > "$R_ONLY_OUT/versions.txt" 2>&1 || true
         if [[ "$code" -eq 0 ]]; then
             if pack_r_only && aws s3 cp "$ARTIFACT" \

@@ -251,14 +251,26 @@ if (!skip_data_table) {
                           last = data.table::last(price)),
                       by = symbol])
 
-    copies <- lapply(seq_len(warmup + iters), function(...) copy(dt))
-    copy_idx <- 0
+    # data.table's `:=` adds a column BY REFERENCE to the fixture, so without the
+    # trailing delete the column survives into the next iteration and every
+    # iteration after the first overwrites an already-allocated buffer. Every
+    # other engine here builds a new frame with a freshly allocated column
+    # (dplyr mutate, polars with_columns, pandas assign, ibex `update {}`), so
+    # the reuse was measuring strictly less work: abs_price ran 1.49ms reusing
+    # the buffer vs 2.06ms allocating it, against dplyr's 2.40ms.
+    #
+    # The `:= NULL` teardown restores the fresh allocation while keeping the
+    # fixture hot, which is what the other engines get. Note that pre-copying
+    # the whole table per iteration (what update_price_x2 used to do) over-
+    # corrects in the other direction — 4.05ms — because each copy is a cold
+    # 15MB region, so it also charges cache misses on `price` that dplyr never
+    # pays. Deleting the column costs a pointer removal.
+    #
+    # It also keeps the fixture 2 columns wide. It used to accumulate 13 columns
+    # (15MB -> 99MB) across the leg, inflating every data.table peak_rss_mb
+    # reading after the first mutation while dplyr's tibble stayed at 15MB.
     bench("data.table", "update_price_x2",
-        function() {
-            copy_idx <<- copy_idx + 1
-            tmp <- copies[[copy_idx]]
-            tmp[, price_x2 := price * 2][]
-        })
+        function() { dt[, price_x2 := price * 2]; dt[, price_x2 := NULL][] })
 
     bench("data.table", "distinct_symbol",
         function() unique(dt[, .(symbol)]))
@@ -293,13 +305,16 @@ if (!skip_data_table) {
 
     # Grouped window functions (per symbol).
     bench("data.table", "rank_by_symbol",
-        function() dt[, rk := frank(-price, ties.method = "dense"), by = symbol][])
+        function() { dt[, rk := frank(-price, ties.method = "dense"), by = symbol]
+                     dt[, rk := NULL][] })
 
     bench("data.table", "lag_by_symbol",
-        function() dt[, prev := shift(price, 1L), by = symbol][])
+        function() { dt[, prev := shift(price, 1L), by = symbol]
+                     dt[, prev := NULL][] })
 
     bench("data.table", "cumsum_by_symbol",
-        function() dt[, cs_sym := cumsum(price), by = symbol][])
+        function() { dt[, cs_sym := cumsum(price), by = symbol]
+                     dt[, cs_sym := NULL][] })
 
     # Expensive group aggregates (per symbol): median, p90 (type-7 linear), sd.
     bench("data.table", "median_by_symbol",
@@ -317,19 +332,31 @@ if (!skip_data_table) {
 
     # update by -> filter on derived column -> re-aggregate.
     bench("data.table", "update_group_filter",
-        function() dt[, lr := log(price / shift(price, 1L)), by = symbol][
-            lr > 0, .(pos_days = .N), by = symbol])
+        function() {
+            dt[, lr := log(price / shift(price, 1L)), by = symbol]
+            out <- dt[lr > 0, .(pos_days = .N), by = symbol]
+            dt[, lr := NULL]
+            out
+        })
 
     # rank within group -> top-N per group -> aggregate survivors.
     bench("data.table", "group_rank_filter",
-        function() dt[, rk := frank(-price, ties.method = "dense"), by = symbol][
-            rk <= 10, .(avg_top10 = mean(price)), by = symbol])
+        function() {
+            dt[, rk := frank(-price, ties.method = "dense"), by = symbol]
+            out <- dt[rk <= 10, .(avg_top10 = mean(price)), by = symbol]
+            dt[, rk := NULL]
+            out
+        })
 
     # grouped z-score -> clip to +/-3 -> re-aggregate.
     bench("data.table", "normalize_by_group",
-        function() dt[, z := (price - mean(price)) / sd(price), by = symbol][
-            , clipped := pmin(pmax(z, -3.0), 3.0)][
-            , .(mean_z = mean(clipped), sd_z = sd(clipped)), by = symbol])
+        function() {
+            dt[, z := (price - mean(price)) / sd(price), by = symbol]
+            dt[, clipped := pmin(pmax(z, -3.0), 3.0)]
+            out <- dt[, .(mean_z = mean(clipped), sd_z = sd(clipped)), by = symbol]
+            dt[, c("z", "clipped") := NULL]
+            out
+        })
 
     # Tier 3 funnel on the timestamped table: log returns -> 5-minute time-windowed
     # momentum -> Sharpe-like ratio per symbol. The first return per symbol is NA
@@ -366,34 +393,34 @@ if (!skip_data_table) {
             prev = fifelse(price > 900.0, shift(price, 1L), NA_real_))])
 
     bench("data.table", "cumsum_price",
-        function() dt[, cs := cumsum(price)][])
+        function() { dt[, cs := cumsum(price)]; dt[, cs := NULL][] })
 
     bench("data.table", "cumprod_price",
-        function() dt[, cp := cumprod(price)][])
+        function() { dt[, cp := cumprod(price)]; dt[, cp := NULL][] })
 
     bench("data.table", "rand_uniform",
-        function() dt[, r := runif(.N, 0.0, 1.0)][])
+        function() { dt[, r := runif(.N, 0.0, 1.0)]; dt[, r := NULL][] })
 
     bench("data.table", "rand_normal",
-        function() dt[, n := rnorm(.N, 0.0, 1.0)][])
+        function() { dt[, n := rnorm(.N, 0.0, 1.0)]; dt[, n := NULL][] })
 
     bench("data.table", "rand_int",
-        function() dt[, r := sample.int(100L, .N, replace = TRUE)][])
+        function() { dt[, r := sample.int(100L, .N, replace = TRUE)]; dt[, r := NULL][] })
 
     bench("data.table", "rand_bernoulli",
-        function() dt[, r := rbinom(.N, 1L, 0.3)][])
+        function() { dt[, r := rbinom(.N, 1L, 0.3)]; dt[, r := NULL][] })
 
     # Scalar row-wise math builtins.
-    bench("data.table", "abs_price",   function() dt[, v := abs(price)][])
-    bench("data.table", "sqrt_price",  function() dt[, v := sqrt(price)][])
-    bench("data.table", "log_price",   function() dt[, v := log(price)][])
-    bench("data.table", "exp_price",   function() dt[, v := exp(price / 1000.0)][])
-    bench("data.table", "round_price", function() dt[, v := as.integer(round(price))][])
-    bench("data.table", "floor_price", function() dt[, v := floor(price)][])
-    bench("data.table", "ceil_price",  function() dt[, v := ceiling(price)][])
-    bench("data.table", "sin_price",   function() dt[, v := sin(price)][])
-    bench("data.table", "cos_price",   function() dt[, v := cos(price)][])
-    bench("data.table", "tanh_price",  function() dt[, v := tanh(price / 1000.0)][])
+    bench("data.table", "abs_price",   function() { dt[, v := abs(price)]; dt[, v := NULL][] })
+    bench("data.table", "sqrt_price",  function() { dt[, v := sqrt(price)]; dt[, v := NULL][] })
+    bench("data.table", "log_price",   function() { dt[, v := log(price)]; dt[, v := NULL][] })
+    bench("data.table", "exp_price",   function() { dt[, v := exp(price / 1000.0)]; dt[, v := NULL][] })
+    bench("data.table", "round_price", function() { dt[, v := as.integer(round(price))]; dt[, v := NULL][] })
+    bench("data.table", "floor_price", function() { dt[, v := floor(price)]; dt[, v := NULL][] })
+    bench("data.table", "ceil_price",  function() { dt[, v := ceiling(price)]; dt[, v := NULL][] })
+    bench("data.table", "sin_price",   function() { dt[, v := sin(price)]; dt[, v := NULL][] })
+    bench("data.table", "cos_price",   function() { dt[, v := cos(price)]; dt[, v := NULL][] })
+    bench("data.table", "tanh_price",  function() { dt[, v := tanh(price / 1000.0)]; dt[, v := NULL][] })
 }
 
 if (!skip_dplyr) {
@@ -934,16 +961,16 @@ if (!is.null(csv_lookup_path)) {
         message("\n=== data.table (fill) ===")
 
         bench("data.table", "fill_null",
-            function() dt_fill[, v2 := nafill(val, fill = 0.0)][])
+            function() { dt_fill[, v2 := nafill(val, fill = 0.0)]; dt_fill[, v2 := NULL][] })
 
         bench("data.table", "where_update_nullable",
             function() dt_fill[, .(val = fifelse(is.na(val), 0.0, val))])
 
         bench("data.table", "fill_forward",
-            function() dt_fill[, v2 := nafill(val, type = "locf")][])
+            function() { dt_fill[, v2 := nafill(val, type = "locf")]; dt_fill[, v2 := NULL][] })
 
         bench("data.table", "fill_backward",
-            function() dt_fill[, v2 := nafill(val, type = "nocb")][])
+            function() { dt_fill[, v2 := nafill(val, type = "nocb")]; dt_fill[, v2 := NULL][] })
     }
 
     if (!skip_dplyr) {
@@ -982,28 +1009,30 @@ if (tf_rows > 0) {
     if (!skip_data_table) {
         dt_tf <- data.table(ts = ts_vec, price = price_vec)
         message("\n=== data.table (tf rolling) ===")
+        # `:= NULL` teardown throughout — see the update_price_x2 comment above.
         bench("data.table", "tf_lag1",
-            function() dt_tf[, prev := shift(price, 1L)][])
+            function() { dt_tf[, prev := shift(price, 1L)]; dt_tf[, prev := NULL][] })
         bench("data.table", "tf_rolling_count_1m",
-            function() dt_tf[, c := frollsum(rep(1.0, .N), 60L)][])
+            function() { dt_tf[, c := frollsum(rep(1.0, .N), 60L)]; dt_tf[, c := NULL][] })
         bench("data.table", "tf_rolling_sum_1m",
-            function() dt_tf[, s := frollsum(price, 60L)][])
+            function() { dt_tf[, s := frollsum(price, 60L)]; dt_tf[, s := NULL][] })
         bench("data.table", "tf_rolling_mean_5m",
-            function() dt_tf[, m := frollmean(price, 300L)][])
+            function() { dt_tf[, m := frollmean(price, 300L)]; dt_tf[, m := NULL][] })
         # frollapply is generic but ~100× slower than the optimized fns and
         # scales O(n*window); cost-cap so large sizes don't dominate the run.
         # Empirical on c7i.xlarge: ~18us/row (median), ~7us/row (sd).
         bench_capped("data.table", "tf_rolling_median_1m",
-            function() dt_tf[, med := frollapply(price, 60L, median)][],
+            function() { dt_tf[, med := frollapply(price, 60L, median)]; dt_tf[, med := NULL][] },
             per_row_us = 18, n = tf_rows)
         bench_capped("data.table", "tf_rolling_std_1m",
-            function() dt_tf[, s := frollapply(price, 60L, sd)][],
+            function() { dt_tf[, sd_ := frollapply(price, 60L, sd)]; dt_tf[, sd_ := NULL][] },
             per_row_us = 7, n = tf_rows)
         # Full-series EWMA (alpha=0.1, adjust=False) via TTR::EMA — matches the
         # pandas/polars ewm reference (n=1 seeds with the first value). Not
         # time-windowed (no engine here uses ibex's time-windowed EWMA math).
         bench("data.table", "tf_rolling_ewma_1m",
-            function() dt_tf[, e := suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))][])
+            function() { dt_tf[, e := suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))]
+                         dt_tf[, e := NULL][] })
         bench("data.table", "tf_resample_1m_ohlc",
             function() dt_tf[, .(open = data.table::first(price),
                                   high = max(price),

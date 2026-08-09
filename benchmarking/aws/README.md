@@ -143,6 +143,12 @@ than discarding the sizes below it.
 Downloads `benchmarking/results/r_only_aws_<timestamp>.tar.gz`: one TSV per
 size, a `combined.tsv` carrying a `dataset_rows` column, and a `versions.txt`
 recording the instance type, core count and R/data.table/dplyr versions.
+The launcher waits for a separate completion marker, so a bootstrap failure
+cannot be reported as a completed archive; on failure it instead recovers the
+latest partial archive. `versions.txt` records the runner exit code, stage,
+and any sizes that failed without discarding earlier measurements. Bootstrap
+failures also include `failure.txt` and the final 200 lines of the instance
+log as `failure.log` in that partial archive.
 Analyse it with Ibex itself — `benchmarking/analyze_r_only.ibex` reads a
 `r_only.tsv` and prints the win/loss table.
 

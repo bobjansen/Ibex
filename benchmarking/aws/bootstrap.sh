@@ -893,7 +893,27 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
     # soon as the final key appears, so publishing a first-size snapshot there
     # would masquerade as a finished sweep.
     PARTIAL_KEY="${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz"
+    # The launcher waits for this marker rather than merely for the archive.
+    # The EXIT trap can still package a useful partial artifact after a setup
+    # failure, but that must never be presented as a completed benchmark.
+    COMPLETE_KEY="${IBEX_R_ONLY_COMPLETE_KEY:?IBEX_R_ONLY_COMPLETE_KEY not set}"
     R_ONLY_LIB=/opt/ibex-rlib
+    R_ONLY_STAGE=bootstrap
+    R_ONLY_FAILED_SIZES=()
+    R_ONLY_COMPLETED_SIZES=()
+
+    record_r_only_failure() {
+        local code=$?
+        trap - ERR
+        mkdir -p "$R_ONLY_OUT"
+        {
+            echo "exit_code=${code}"
+            echo "stage=${R_ONLY_STAGE}"
+            echo "command=${BASH_COMMAND}"
+        } > "$R_ONLY_OUT/failure.txt"
+        return "$code"
+    }
+    trap record_r_only_failure ERR
 
     # Stitch every size that has finished into one TSV, then tar it. Rebuilt
     # from the per-size files each time rather than appended to, so it is
@@ -920,6 +940,11 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
     finish_r_only() {
         local code=$?
         mkdir -p "$R_ONLY_OUT"
+        if [[ "$code" -ne 0 && -f /var/log/ibex-bench.log ]]; then
+            # EC2 console output is finite and often truncates the command that
+            # failed. Keep its useful tail inside the recoverable partial tarball.
+            tail -n 200 /var/log/ibex-bench.log > "$R_ONLY_OUT/failure.log" || true
+        fi
         {
             echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
             # IMDSv2 is enforced, so the metadata call needs a token first — a
@@ -934,17 +959,36 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
             echo "cores_used=${IBEX_R_ONLY_CORES:-$(nproc)}"
             echo "sizes=${IBEX_SIZES:-}"
             echo "warmup=${IBEX_WARMUP:-1} iters=${IBEX_ITERS:-5}"
+            echo "runner_exit_code=${code}"
+            echo "runner_stage=${R_ONLY_STAGE}"
+            echo "completed_sizes=${R_ONLY_COMPLETED_SIZES[*]:-}"
+            echo "failed_sizes=${R_ONLY_FAILED_SIZES[*]:-}"
             echo "R=$(Rscript --version 2>&1 | head -1)"
             R_LIBS_USER="$R_ONLY_LIB" Rscript -e 'cat(sprintf("data.table=%s\ndplyr=%s\n", packageVersion("data.table"), packageVersion("dplyr")))' 2>/dev/null || true
         } > "$R_ONLY_OUT/versions.txt" 2>&1 || true
-        pack_r_only || true
-        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
+        if [[ "$code" -eq 0 ]]; then
+            if pack_r_only && aws s3 cp "$ARTIFACT" \
+                    "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}"; then
+                # This is written last. Its presence proves the archive was
+                # produced by a clean runner exit and uploaded successfully.
+                printf 'complete\n' | aws s3 cp - "s3://${IBEX_S3_BUCKET}/${COMPLETE_KEY}" \
+                    --region "${IBEX_REGION}" || true
+            else
+                push_partial_r_only
+            fi
+        else
+            # Keep diagnostic state and any already-finished sizes recoverable,
+            # but never publish either the final artifact or its completion marker.
+            push_partial_r_only
+        fi
         shutdown -h now
         return "$code"
     }
     trap finish_r_only EXIT
 
+    R_ONLY_STAGE=build
     build_ibex
+    R_ONLY_STAGE=python-environment
     uv sync --project /ibex   # gen_data.py runs under uv
 
     # Install the R package ONCE, into a lib that outlives each size's run, and
@@ -954,6 +998,7 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
     # benchmark a previous engine. `R CMD build` copies to a clean tree, which
     # is what makes the install honest.
     mkdir -p "$R_ONLY_LIB"
+    R_ONLY_STAGE=r-package-install
     (
         cd /tmp
         IBEX_ROOT=/ibex IBEX_BUILD_DIR=/ibex/build-release R CMD build /ibex/r/ibex
@@ -975,15 +1020,21 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
         echo "=== r-only suite: ${size} on ${R_ONLY_CORES} core(s)"
         # Non-fatal: one size running out of memory at the top of the sweep must
         # not discard the sizes below it, which are already on disk.
-        taskset -c "0-$((R_ONLY_CORES - 1))" \
-            bash /ibex/benchmarking/run_r_only.sh \
-                --sizes "$size" \
-                --warmup "${IBEX_WARMUP:-1}" \
-                --iters "${IBEX_ITERS:-5}" \
-                --skip-install \
-            || echo "WARNING: r-only suite failed at ${size}; keeping earlier sizes" >&2
+        R_ONLY_STAGE="benchmark-${size}"
+        if taskset -c "0-$((R_ONLY_CORES - 1))" \
+                bash /ibex/benchmarking/run_r_only.sh \
+                    --sizes "$size" \
+                    --warmup "${IBEX_WARMUP:-1}" \
+                    --iters "${IBEX_ITERS:-5}" \
+                    --skip-install; then
+            R_ONLY_COMPLETED_SIZES+=("$size")
+        else
+            R_ONLY_FAILED_SIZES+=("$size")
+            echo "WARNING: r-only suite failed at ${size}; keeping earlier sizes" >&2
+        fi
         push_partial_r_only
     done
+    R_ONLY_STAGE=complete
     exit 0
 fi
 

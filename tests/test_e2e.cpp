@@ -347,6 +347,93 @@ TEST_CASE("E2E: timestamp accessors year/month/day/hour/minute/second", "[e2e][t
     CHECK(s == std::vector<std::int64_t>{5, 45});
 }
 
+TEST_CASE("E2E: date/timestamp literal broadcast into a field", "[e2e][time]") {
+    // A literal field is typed by `infer_expr_type`, which allocates the output
+    // column before the per-row loop fills it. Its Literal arm used to fall
+    // through to String for anything that was not Int/Double/Bool, so a
+    // `date"..."`/`ts"..."` broadcast allocated a String column and then tripped
+    // eval_expr_column's invariant on the Date/Timestamp value it was handed.
+    runtime::Table t;
+    t.add_column("v", Column<std::int64_t>{1, 2});
+    runtime::TableRegistry tables;
+    tables.emplace("data", std::move(t));
+
+    auto out =
+        run("data[update { d = date\"2024-01-15\", ts = ts\"2024-01-15T03:04:05\" }]"
+            "[select { v, y = year(d), mo = month(d), h = hour(ts) }];",
+            tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "y") == std::vector<std::int64_t>{2024, 2024});
+    CHECK(col_i64(out, "mo") == std::vector<std::int64_t>{1, 1});
+    CHECK(col_i64(out, "h") == std::vector<std::int64_t>{3, 3});
+
+    // The broadcast column keeps its type, rather than becoming text.
+    auto typed = run("data[update { d = date\"2024-01-15\" }];", tables);
+    const auto* day = typed.find("d");
+    REQUIRE(day != nullptr);
+    CHECK(std::get_if<Column<Date>>(day) != nullptr);
+}
+
+TEST_CASE("E2E: Date() truncates a Timestamp to its UTC day", "[e2e][time][cast]") {
+    auto out =
+        run("Table { ts = [ts\"2024-01-15T00:00:00\", ts\"2024-01-15T23:59:59\","
+            "              ts\"2024-01-16T00:00:00\", ts\"1969-12-31T23:00:00\"] }"
+            "[select { d = Date(ts), y = year(Date(ts)), mo = month(Date(ts)),"
+            "          dy = day(Date(ts)) }];",
+            {});
+    REQUIRE(out.rows() == 4);
+    const auto* col = out.find("d");
+    REQUIRE(col != nullptr);
+    const auto* days = std::get_if<Column<Date>>(col);
+    REQUIRE(days != nullptr);
+    // The first two instants are the same day; the third is the next day. The
+    // last is before the epoch, where a truncating division would round *up*
+    // to 1970-01-01 -- the cast floors, so it stays on 1969-12-31.
+    CHECK((*days)[0] == (*days)[1]);
+    CHECK((*days)[2].days == (*days)[0].days + 1);
+    CHECK((*days)[3].days == -1);
+    CHECK(col_i64(out, "y") == std::vector<std::int64_t>{2024, 2024, 2024, 1969});
+    CHECK(col_i64(out, "mo") == std::vector<std::int64_t>{1, 1, 1, 12});
+    CHECK(col_i64(out, "dy") == std::vector<std::int64_t>{15, 15, 16, 31});
+}
+
+TEST_CASE("E2E: Date() groups an instant column by day", "[e2e][time][cast][groupby]") {
+    auto out =
+        run("Table { ts = [ts\"2024-01-15T01:00:00\", ts\"2024-01-15T22:00:00\","
+            "              ts\"2024-01-16T05:00:00\"],"
+            "        v = [1.0, 3.0, 5.0] }"
+            "[select { n = count(), total = sum(v) }, by { d = Date(ts) }, order { d asc }];",
+            {});
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "n") == std::vector<std::int64_t>{2, 1});
+    CHECK(col_dbl(out, "total")[0] == Catch::Approx(4.0));
+    CHECK(col_dbl(out, "total")[1] == Catch::Approx(5.0));
+}
+
+TEST_CASE("E2E: Date() is identity on a Date and rejects other types", "[e2e][time][cast]") {
+    auto out = run("Table { d = [date\"2024-03-01\"] }[select { same = Date(d) }];", {});
+    REQUIRE(out.rows() == 1);
+    const auto* col = out.find("same");
+    REQUIRE(col != nullptr);
+    const auto* days = std::get_if<Column<Date>>(col);
+    REQUIRE(days != nullptr);
+    CHECK((*days)[0] == Date{static_cast<std::int32_t>(std::chrono::sys_days{
+                            std::chrono::year{2024} / std::chrono::month{3} / std::chrono::day{1}}
+                                                           .time_since_epoch()
+                                                           .count())});
+
+    // An Int64 is days since the epoch; a Float64 or String has no meaning here.
+    auto from_days = run("Table { n = [19783] }[select { d = Date(n) }];", {});
+    REQUIRE(from_days.rows() == 1);
+    CHECK(std::get_if<Column<Date>>(from_days.find("d")) != nullptr);
+
+    CHECK(run_error("Table { s = [\"2024-01-15\"] }[select { d = Date(s) }];", {})
+              .find("cannot cast to Date") != std::string::npos);
+    CHECK(
+        run_error("Table { f = [1.5] }[select { d = Date(f) }];", {}).find("cannot cast to Date") !=
+        std::string::npos);
+}
+
 TEST_CASE("E2E: hour() inside computed group key", "[e2e][time][groupby]") {
     auto out =
         run("Table { ts = [ts\"2024-01-01T09:15:00\", ts\"2024-01-01T09:45:00\","

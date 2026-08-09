@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 
@@ -19,6 +20,19 @@ struct Timestamp {
     std::int64_t nanos = 0;
     auto operator<=>(const Timestamp&) const = default;
 };
+
+/// Truncate an instant to the UTC calendar day containing it.
+///
+/// A `Timestamp` carries no zone, so every calendar-boundary operation over one
+/// cuts on UTC (SPEC section 2) and this is no exception. `floor` rather than a
+/// division, so a pre-epoch instant lands on its own day instead of rounding
+/// toward the epoch. A `Timestamp` spans at most ~1.07e5 days, so the day count
+/// always fits `Date`'s int32.
+[[nodiscard]] inline auto timestamp_to_date(Timestamp ts) -> Date {
+    const std::chrono::sys_time<std::chrono::nanoseconds> point{std::chrono::nanoseconds{ts.nanos}};
+    return Date{static_cast<std::int32_t>(
+        std::chrono::floor<std::chrono::days>(point).time_since_epoch().count())};
+}
 
 }  // namespace ibex
 

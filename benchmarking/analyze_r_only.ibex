@@ -1,0 +1,61 @@
+// Analyze R-only benchmark results produced by:
+//   benchmarking/run_r_only.sh
+//
+// Expected input:
+//   benchmarking/results/r_only/<rows>/r_only.tsv
+//
+// Interpreting speedup:
+//   speedup = competitor_ms / ibex_ms
+//   speedup > 1.0  -> Ibex is faster
+//   speedup < 1.0  -> Ibex is slower
+//
+// min_ms rather than avg_ms is the statistic compared: the harness re-measures
+// samples the wall clock corrupts, but a forward clock step is indistinguishable
+// from a slow run and only inflates, so the minimum is the honest number.
+
+extern fn read_csv(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true,
+    schema: String = ""
+) -> DataFrame from "csv.hpp";
+
+let raw = read_csv("benchmarking/results/r_only/8000000/r_only.tsv", "", "\t", true, "");
+
+let ibex = raw[filter framework == "ibex-r"][select { query, ibex_ms = min_ms }];
+let data_table = raw[filter framework == "data.table"][select { query, dt_ms = min_ms }];
+let dplyr = raw[filter framework == "dplyr"][select { query, dplyr_ms = min_ms }];
+
+let vs_dt = (ibex join data_table on {query})[update { speedup = dt_ms / ibex_ms }];
+let vs_dplyr = (ibex join dplyr on {query})[update { speedup = dplyr_ms / ibex_ms }];
+
+// Headline: how many queries does Ibex win, and by how much.
+vs_dt[select {
+    queries = count(),
+    wins = sum(Int64(speedup > 1.0)),
+    losses = sum(Int64(speedup < 1.0)),
+    best = max(speedup),
+    worst = min(speedup)
+}];
+
+// Where Ibex wins, biggest margin first.
+vs_dt[filter speedup > 1.0]
+     [select { query, ibex_ms, dt_ms, speedup }]
+     [order { speedup desc }];
+
+// Where Ibex still loses, worst first -- this is the work queue.
+vs_dt[filter speedup < 1.0]
+     [select { query, ibex_ms, dt_ms, speedup }]
+     [order { speedup asc }];
+
+// Same against in-memory dplyr.
+vs_dplyr[select {
+    queries = count(),
+    wins = sum(Int64(speedup > 1.0)),
+    losses = sum(Int64(speedup < 1.0))
+}];
+
+vs_dplyr[filter speedup < 1.0]
+        [select { query, ibex_ms, dplyr_ms, speedup }]
+        [order { speedup asc }];

@@ -8,6 +8,7 @@
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 #include <ibex/ir/schema.hpp>
@@ -1542,12 +1543,29 @@ auto validate_table_type(const runtime::Table& table, const parser::Type& type)
 /// Returns true if `callee` is one of the type-name cast functions.
 auto is_cast_callee(std::string_view callee) -> bool {
     return callee == "Int64" || callee == "Int32" || callee == "Int" || callee == "Float64" ||
-           callee == "Float32";
+           callee == "Float32" || callee == "Date";
 }
 
 /// Applies a scalar type cast. `callee` must be a cast name (checked by is_cast_callee).
 auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
     -> std::expected<runtime::ScalarValue, std::string> {
+    if (callee == "Date") {
+        if (const auto* ts = std::get_if<Timestamp>(&val)) {
+            return runtime::ScalarValue{timestamp_to_date(*ts)};
+        }
+        if (std::holds_alternative<Date>(val)) {
+            return val;
+        }
+        if (const auto* days = std::get_if<std::int64_t>(&val)) {
+            if (*days < std::numeric_limits<std::int32_t>::min() ||
+                *days > std::numeric_limits<std::int32_t>::max()) {
+                return std::unexpected("Date(): date out of range");
+            }
+            return runtime::ScalarValue{Date{static_cast<std::int32_t>(*days)}};
+        }
+        return std::unexpected(std::string("Date(): cannot cast ") +
+                               std::string(scalar_value_type_name(val)) + " to Date");
+    }
     const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
     if (to_int) {
         if (std::holds_alternative<std::int64_t>(val)) {
@@ -1579,6 +1597,20 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
 /// Applies an element-wise column type cast.
 auto apply_column_cast(const runtime::ColumnValue& col, std::string_view callee)
     -> std::expected<runtime::ColumnValue, std::string> {
+    if (callee == "Date") {
+        if (const auto* src = std::get_if<Column<Timestamp>>(&col)) {
+            Column<Date> dst;
+            dst.reserve(src->size());
+            for (const Timestamp ts : *src) {
+                dst.push_back(timestamp_to_date(ts));
+            }
+            return runtime::ColumnValue{std::move(dst)};
+        }
+        if (std::holds_alternative<Column<Date>>(col)) {
+            return col;
+        }
+        return std::unexpected("Date(): cannot cast column to Date");
+    }
     const bool to_int = (callee == "Int64" || callee == "Int32" || callee == "Int");
     if (to_int) {
         if (std::holds_alternative<Column<std::int64_t>>(col)) {
@@ -2661,6 +2693,15 @@ auto eval_scalar_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (const auto* str_value = std::get_if<std::string>(&literal->value)) {
             return runtime::ScalarValue{*str_value};
         }
+        // `date"..."` / `ts"..."`. With these, the only LiteralExpr
+        // alternative ScalarValue cannot hold is DurationLiteral, which is a
+        // window/resample spec rather than a value, so it stays unsupported.
+        if (const auto* date_value = std::get_if<Date>(&literal->value)) {
+            return runtime::ScalarValue{*date_value};
+        }
+        if (const auto* timestamp_value = std::get_if<Timestamp>(&literal->value)) {
+            return runtime::ScalarValue{*timestamp_value};
+        }
         return std::unexpected("unsupported scalar literal");
     }
     if (const auto* ident = std::get_if<parser::IdentifierExpr>(&expr.node)) {
@@ -3333,6 +3374,30 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     auto lowered = parser::lower_expr(expr, context);
     if (!lowered) {
         return std::unexpected(lowered.error().message);
+    }
+
+    // Everything `parser::lower()` does after lowering a whole program, which
+    // `lower_expr` does not do for a single statement. Without it a REPL
+    // statement — and every query the R session runs, which lowers the same way
+    // — reached the runtime un-canonicalized: `[order …][head n]` stayed an
+    // Order feeding a Head and ran a full sort where R16's fused TopK does an
+    // O(n log k) heap-select, and a semi/anti join never moved below an inner
+    // join it could have filtered first.
+    //
+    // Order matters and follows the whole-script driver. The join rewrites are
+    // schema-aware and expect the un-fused `Filter(Join(...))` shape, so they
+    // must precede canonicalize; `push_semi_joins_down` reads what
+    // `push_filters_into_joins` leaves behind, and both must land before
+    // `required_columns` computes column demand below.
+    lowered.value() =
+        ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);
+    lowered.value() = ir::push_semi_joins_down(std::move(lowered.value()), context.source_schemas);
+    {
+        // Default-constructed on purpose: `unknown_callee` claims every effect,
+        // so the effect-sensitive passes stay conservative about the externs a
+        // session may have registered.
+        const ir::OptimizationContext optimization_context;
+        lowered.value() = ir::optimize_plan(std::move(lowered.value()), optimization_context);
     }
 
     // Projection pushdown. Ask the plan which columns it actually reads from

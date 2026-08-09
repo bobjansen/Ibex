@@ -4946,6 +4946,8 @@ class ChunkedAggregateOperator final : public Operator {
     /// group's key pair. Group ids themselves never move.
     template <typename ReaderA, typename ReaderB>
     auto try_process_rows_pair_dense(const ReaderA& key_a_at, const ReaderB& key_b_at,
+                                     // One caller
+                                     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                                      const std::vector<const ColumnEntry*>& group_entries,
                                      const std::vector<const ColumnEntry*>& agg_entries,
                                      std::size_t rows) -> bool {
@@ -4986,7 +4988,7 @@ class ChunkedAggregateOperator final : public Operator {
             pair_dense_gid_.assign(static_cast<std::size_t>(cells), kNoGid);
             for (std::size_t g = 0; g < pair_order_.size(); ++g) {
                 const auto cell =
-                    static_cast<std::uint64_t>(pair_order_[g].first - a_min) * b_span +
+                    (static_cast<std::uint64_t>(pair_order_[g].first - a_min) * b_span) +
                     static_cast<std::uint64_t>(pair_order_[g].second - b_min);
                 pair_dense_gid_[static_cast<std::size_t>(cell)] = static_cast<std::uint32_t>(g);
             }
@@ -5007,7 +5009,7 @@ class ChunkedAggregateOperator final : public Operator {
         for (std::size_t row = 0; row < rows; ++row) {
             const std::int64_t a = key_a_at(row);
             const std::int64_t b = key_b_at(row);
-            const auto cell = static_cast<std::uint64_t>(a - a_min) * b_span +
+            const auto cell = (static_cast<std::uint64_t>(a - a_min) * b_span) +
                               static_cast<std::uint64_t>(b - b_min);
             std::uint32_t gid = dense[cell];
             if (gid == kNoGid) {

@@ -4432,6 +4432,12 @@ class ChunkedInnerJoinOperator final : public Operator {
 /// chunks, matching MaterializeOperator's existing assumption.
 class ChunkedAggregateOperator final : public Operator {
    public:
+    /// `Cat` carries a Categorical's *code*, which the pair path may treat as
+    /// an integer for the same reason `process_rows_cat` may index an array
+    /// with it: within one operator a dictionary only ever grows and never
+    /// reorders, so a code identifies the same value in every chunk.
+    enum class IntKeyKind : std::uint8_t { Int64, Date, Ts, Cat };
+
     ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                              const std::vector<ir::AggSpec>* aggregations,
                              const ExecutionContext& exec)
@@ -4578,12 +4584,27 @@ class ChunkedAggregateOperator final : public Operator {
                 }
             } else if (group_entries.size() == 2 && !group_entries[0]->validity.has_value() &&
                        !group_entries[1]->validity.has_value()) {
-                auto ka = int_kind_of(*group_entries[0]->column);
-                auto kb = int_kind_of(*group_entries[1]->column);
+                // A Categorical joins the pair path as its code. `cat_fast_path_`
+                // already owns the all-Categorical case and is dispatched first,
+                // so this is reached only by a *mixed* pair — `by { symbol, day }`
+                // over a Categorical and a Date, which otherwise fell to the
+                // generic path and hashed the symbol as text once per row.
+                const auto pair_kind_of = [&](const ColumnValue& col) -> std::optional<IntKeyKind> {
+                    if (std::holds_alternative<Column<Categorical>>(col)) {
+                        return IntKeyKind::Cat;
+                    }
+                    return int_kind_of(col);
+                };
+                auto ka = pair_kind_of(*group_entries[0]->column);
+                auto kb = pair_kind_of(*group_entries[1]->column);
                 if (ka.has_value() && kb.has_value()) {
                     pair_int_fast_path_ = true;
                     int_key_kind_ = *ka;
                     int_key_kind_b_ = *kb;
+                    const auto is_32_bit = [](IntKeyKind k) {
+                        return k == IntKeyKind::Cat || k == IntKeyKind::Date;
+                    };
+                    pair_packs_u64_ = is_32_bit(*ka) && is_32_bit(*kb);
                 }
             }
             initialized_ = true;
@@ -4695,6 +4716,11 @@ class ChunkedAggregateOperator final : public Operator {
             case IntKeyKind::Ts:
                 stamps = std::get<Column<Timestamp>>(key_col).data();
                 break;
+            case IntKeyKind::Cat:
+                // A lone Categorical key never selects this path: it is
+                // all-Categorical by definition, so `cat_fast_path_` claims it
+                // and dispatches first. Only the pair path admits `Cat`.
+                return "ChunkedAggregateOperator: categorical key on the single-int path";
         }
         const auto key_at = [&](std::size_t row) -> std::int64_t {
             switch (int_key_kind_) {
@@ -4704,6 +4730,8 @@ class ChunkedAggregateOperator final : public Operator {
                     return dates[row].days;
                 case IntKeyKind::Ts:
                     return stamps[row].nanos;
+                case IntKeyKind::Cat:
+                    break;
             }
             return 0;
         };
@@ -4750,21 +4778,52 @@ class ChunkedAggregateOperator final : public Operator {
     auto process_rows_int_pair(const std::vector<const ColumnEntry*>& group_entries,
                                const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
-        const auto raw_reader = [](const ColumnValue& col, IntKeyKind kind) {
-            return [&col, kind](std::size_t row) -> std::int64_t {
+        // Bind the key column's buffer once, the way `process_rows_int` does.
+        // Reading it through `std::get` per row costs a variant index check per
+        // key per row and re-derives the pointer every time, which on 8M rows
+        // over two keys was most of this loop.
+        struct RawKeyReader {
+            const std::int64_t* i64 = nullptr;
+            const Date* dates = nullptr;
+            const Timestamp* stamps = nullptr;
+            const Column<Categorical>::code_type* codes = nullptr;
+            IntKeyKind kind = IntKeyKind::Int64;
+
+            [[nodiscard]] auto operator()(std::size_t row) const -> std::int64_t {
                 switch (kind) {
                     case IntKeyKind::Int64:
-                        return std::get<Column<std::int64_t>>(col).data()[row];
+                        return i64[row];
                     case IntKeyKind::Date:
-                        return std::get<Column<Date>>(col).data()[row].days;
+                        return dates[row].days;
                     case IntKeyKind::Ts:
-                        return std::get<Column<Timestamp>>(col).data()[row].nanos;
+                        return stamps[row].nanos;
+                    case IntKeyKind::Cat:
+                        return codes[row];
                 }
                 return 0;
-            };
+            }
         };
-        const auto key_a_at = raw_reader(*group_entries[0]->column, int_key_kind_);
-        const auto key_b_at = raw_reader(*group_entries[1]->column, int_key_kind_b_);
+        const auto bind_reader = [](const ColumnValue& col, IntKeyKind kind) -> RawKeyReader {
+            RawKeyReader reader;
+            reader.kind = kind;
+            switch (kind) {
+                case IntKeyKind::Int64:
+                    reader.i64 = std::get<Column<std::int64_t>>(col).data();
+                    break;
+                case IntKeyKind::Date:
+                    reader.dates = std::get<Column<Date>>(col).data();
+                    break;
+                case IntKeyKind::Ts:
+                    reader.stamps = std::get<Column<Timestamp>>(col).data();
+                    break;
+                case IntKeyKind::Cat:
+                    reader.codes = std::get<Column<Categorical>>(col).codes_data();
+                    break;
+            }
+            return reader;
+        };
+        const auto key_a_at = bind_reader(*group_entries[0]->column, int_key_kind_);
+        const auto key_b_at = bind_reader(*group_entries[1]->column, int_key_kind_b_);
         const auto pack = [](std::int64_t a, std::int64_t b) -> PairIntKey {
             return {.first = static_cast<std::uint64_t>(a),
                     .second = static_cast<std::uint64_t>(b)};
@@ -4772,6 +4831,57 @@ class ChunkedAggregateOperator final : public Operator {
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
+
+        // A Categorical code and a Date are both 32 bits wide, so when both
+        // keys are one of those the composite fits in 64 bits exactly and can
+        // be probed in the same flat int map the single-int path uses. That is
+        // the common shape of `by { symbol, day }`, and it halves the key
+        // width, the hash and the stored entry against the 128-bit form.
+        if (pair_packs_u64_) {
+            // Both key domains are narrow enough to enumerate: a Categorical
+            // spans its dictionary, and a Date column's span is measured. When
+            // the product fits, index a flat cell -> gid array and the per-row
+            // hash disappears entirely -- the same trick, and the same reason,
+            // as the all-Categorical Cartesian path. `by { day }` over 4
+            // distinct days was costing 34ms on 8M rows purely in hash probes.
+            if (try_process_rows_pair_dense(key_a_at, key_b_at, group_entries, agg_entries, rows)) {
+                return std::nullopt;
+            }
+            const auto pack_u64 = [](std::int64_t a, std::int64_t b) -> std::int64_t {
+                return static_cast<std::int64_t>(
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) << 32U) |
+                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(b)));
+            };
+            std::int64_t prev_packed = 0;
+            std::uint32_t prev_gid_u64 = std::numeric_limits<std::uint32_t>::max();
+            bool have_prev_u64 = false;
+            for (std::size_t row = 0; row < rows; ++row) {
+                const std::int64_t a = key_a_at(row);
+                const std::int64_t b = key_b_at(row);
+                const std::int64_t key = pack_u64(a, b);
+                std::uint32_t gid{};
+                if (have_prev_u64 && key == prev_packed) {
+                    gid = prev_gid_u64;
+                } else {
+                    auto it = int_index_.find(key);
+                    if (it == int_index_.end()) {
+                        gid = static_cast<std::uint32_t>(n_groups_);
+                        int_index_.emplace(key, gid);
+                        pair_order_.emplace_back(a, b);
+                        ++n_groups_;
+                        size_group_arrays();
+                    } else {
+                        gid = it->second;
+                    }
+                    prev_packed = key;
+                    prev_gid_u64 = gid;
+                    have_prev_u64 = true;
+                }
+                gids[row] = gid;
+            }
+            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+            return std::nullopt;
+        }
 
         PairIntKey prev_key{};
         std::uint32_t prev_gid = std::numeric_limits<std::uint32_t>::max();
@@ -4803,6 +4913,116 @@ class ChunkedAggregateOperator final : public Operator {
 
         accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
         return std::nullopt;
+    }
+
+    /// Bounds of one key column over a chunk, as the dense cell numbering needs
+    /// them. A Categorical answers from its dictionary without reading a row;
+    /// anything else is measured.
+    template <typename Reader>
+    auto key_bounds(const Reader& read, const ColumnValue& col, IntKeyKind kind, std::size_t rows)
+        -> std::pair<std::int64_t, std::int64_t> {
+        if (kind == IntKeyKind::Cat) {
+            const auto size = std::get<Column<Categorical>>(col).dictionary().size();
+            return {0, size == 0 ? 0 : static_cast<std::int64_t>(size) - 1};
+        }
+        std::int64_t lo = read(0);
+        std::int64_t hi = lo;
+        for (std::size_t row = 1; row < rows; ++row) {
+            const std::int64_t v = read(row);
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        return {lo, hi};
+    }
+
+    /// Group a packed 32-bit key pair through a flat cell array. Returns false
+    /// when the key domains are too large to enumerate, leaving the caller on
+    /// the hash path.
+    ///
+    /// The cell numbering is a function of the bounds, so a later chunk that
+    /// widens them invalidates every cell already handed out. That is handled
+    /// the way the multi-key Categorical path handles a stride change: widen to
+    /// the union and rebuild the array from `pair_order_`, which holds each
+    /// group's key pair. Group ids themselves never move.
+    template <typename ReaderA, typename ReaderB>
+    auto try_process_rows_pair_dense(const ReaderA& key_a_at, const ReaderB& key_b_at,
+                                     const std::vector<const ColumnEntry*>& group_entries,
+                                     const std::vector<const ColumnEntry*>& agg_entries,
+                                     std::size_t rows) -> bool {
+        if (rows == 0) {
+            return false;
+        }
+        const auto [a_lo, a_hi] =
+            key_bounds(key_a_at, *group_entries[0]->column, int_key_kind_, rows);
+        const auto [b_lo, b_hi] =
+            key_bounds(key_b_at, *group_entries[1]->column, int_key_kind_b_, rows);
+
+        std::int64_t a_min = a_lo;
+        std::int64_t b_min = b_lo;
+        std::int64_t a_max = a_hi;
+        std::int64_t b_max = b_hi;
+        if (pair_dense_active_) {
+            a_min = std::min(a_min, pair_dense_a_min_);
+            b_min = std::min(b_min, pair_dense_b_min_);
+            a_max = std::max(a_max, pair_dense_a_max_);
+            b_max = std::max(b_max, pair_dense_b_max_);
+        }
+
+        // Spans are computed in unsigned arithmetic so a domain that legitimately
+        // straddles zero cannot overflow the subtraction.
+        const auto a_span = static_cast<std::uint64_t>(a_max - a_min) + 1;
+        const auto b_span = static_cast<std::uint64_t>(b_max - b_min) + 1;
+        if (b_span != 0 && a_span > kDenseCellLimit / b_span) {
+            return false;  // product overflows the dense budget
+        }
+        const std::uint64_t cells = a_span * b_span;
+        if (cells > kDenseCellLimit) {
+            return false;
+        }
+
+        const bool bounds_changed = !pair_dense_active_ || a_min != pair_dense_a_min_ ||
+                                    b_min != pair_dense_b_min_ || b_span != pair_dense_b_span_;
+        if (bounds_changed) {
+            pair_dense_gid_.assign(static_cast<std::size_t>(cells), kNoGid);
+            for (std::size_t g = 0; g < pair_order_.size(); ++g) {
+                const auto cell =
+                    static_cast<std::uint64_t>(pair_order_[g].first - a_min) * b_span +
+                    static_cast<std::uint64_t>(pair_order_[g].second - b_min);
+                pair_dense_gid_[static_cast<std::size_t>(cell)] = static_cast<std::uint32_t>(g);
+            }
+            pair_dense_a_min_ = a_min;
+            pair_dense_b_min_ = b_min;
+            pair_dense_a_max_ = a_max;
+            pair_dense_b_max_ = b_max;
+            pair_dense_b_span_ = b_span;
+            pair_dense_active_ = true;
+        } else if (pair_dense_gid_.size() < cells) {
+            pair_dense_gid_.resize(static_cast<std::size_t>(cells), kNoGid);
+            pair_dense_a_max_ = a_max;
+        }
+
+        gids_buf_.resize(rows);
+        auto* gids = gids_buf_.data();
+        std::uint32_t* dense = pair_dense_gid_.data();
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::int64_t a = key_a_at(row);
+            const std::int64_t b = key_b_at(row);
+            const auto cell = static_cast<std::uint64_t>(a - a_min) * b_span +
+                              static_cast<std::uint64_t>(b - b_min);
+            std::uint32_t gid = dense[cell];
+            if (gid == kNoGid) {
+                gid = static_cast<std::uint32_t>(n_groups_);
+                dense[cell] = gid;
+                pair_order_.emplace_back(a, b);
+                ++n_groups_;
+                size_group_arrays();
+                dense = pair_dense_gid_.data();
+            }
+            gids[row] = gid;
+        }
+
+        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        return true;
     }
 
     /// Slot-indexed boxed value, grown on first use. `slot_index` is the same
@@ -5847,6 +6067,13 @@ class ChunkedAggregateOperator final : public Operator {
                 case IntKeyKind::Ts:
                     std::get<Column<Timestamp>>(col).push_back(Timestamp{raw});
                     return;
+                case IntKeyKind::Cat:
+                    // The output column is `make_empty_like` of the input, so it
+                    // shares the input's dictionary and the stored code resolves
+                    // against it.
+                    std::get<Column<Categorical>>(col).push_code(
+                        static_cast<Column<Categorical>::code_type>(raw));
+                    return;
             }
         };
 
@@ -6091,7 +6318,6 @@ class ChunkedAggregateOperator final : public Operator {
     // id>` is one of the most common shapes, and the generic path was building a
     // heap-allocated Key per group for it (117k allocations on TPC-H q02's
     // 117k-group min).
-    enum class IntKeyKind : std::uint8_t { Int64, Date, Ts };
     bool int_fast_path_ = false;
     IntKeyKind int_key_kind_ = IntKeyKind::Int64;
     robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> int_index_;
@@ -6121,6 +6347,20 @@ class ChunkedAggregateOperator final : public Operator {
     };
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
     std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
+    /// Both keys are 32 bits wide (Categorical code / Date), so the composite
+    /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
+    /// The two paths are mutually exclusive, so sharing that map is safe.
+    bool pair_packs_u64_ = false;
+    /// Flat cell -> gid for a packed pair whose domains are small enough to
+    /// enumerate. Cells are numbered from the mins below, so widening them
+    /// rebuilds the array.
+    std::vector<std::uint32_t> pair_dense_gid_;
+    std::int64_t pair_dense_a_min_ = 0;
+    std::int64_t pair_dense_a_max_ = 0;
+    std::int64_t pair_dense_b_min_ = 0;
+    std::int64_t pair_dense_b_max_ = 0;
+    std::uint64_t pair_dense_b_span_ = 0;
+    bool pair_dense_active_ = false;
 };
 
 /// Replays one buffered chunk ahead of the rest of a child stream. Used by

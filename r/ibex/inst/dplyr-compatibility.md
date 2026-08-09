@@ -27,6 +27,27 @@ R integer and `bit64::integer64` both map to Ibex `Int64`; double, logical,
 character, factor/categorical, `Date`, and `POSIXct` use the existing
 ibex/Arrow bridge.
 
+A `factor` binds as Ibex `Categorical` and collects back as a `factor`: the
+Arrow bridge carries a dictionary array in both directions, so the codes and
+levels survive the round trip rather than being decoded to one R string per
+row. A `character` column binds as Ibex `String` and collects back as
+`character`.
+
+`ibex_tbl(categorical_strings = TRUE)` binds `character` columns as
+`Categorical` instead. Grouping, `distinct()` and sorting then compare dense
+integer codes rather than hashing text per row, which on 8M rows over 252
+distinct symbols is 3ms against 100ms; the encoding itself is free, because R
+interns strings and the codes come from pointer identity. The cost is on the
+way back — those columns collect as factors, and a result that returns most of
+its rows pays to rebuild them — so it is off by default and worth turning on
+for grouping and sorting workloads.
+
+`as.Date(x)` on a `POSIXct` or `Date` column translates to Ibex's `Date()`
+cast, which truncates an instant to the calendar day containing it on **UTC** —
+the same boundary `as.Date.POSIXct` uses, since its own `tz` default is
+`"UTC"`. Passing any other `tz`, a `format`, or a character column is not
+translated, because each would cut days somewhere Ibex's cast does not.
+
 Int64 comes back to R as a double, because R has no 64-bit integer vector.
 That widening is not undone when the values would fit in an `integer()`: a
 column's R type is taken from the schema, never from its contents, so

@@ -108,6 +108,9 @@ auto cast_target(std::string_view callee) -> std::optional<ColumnType> {
     if (callee == "Float32") {
         return ColumnType::Float32;
     }
+    if (callee == "Date") {
+        return ColumnType::Date;
+    }
     return std::nullopt;
 }
 

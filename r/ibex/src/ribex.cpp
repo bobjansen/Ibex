@@ -4,6 +4,8 @@
 #define R_NO_REMAP
 
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/ir/join_pushdown.hpp>
+#include <ibex/ir/optimizer.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
@@ -24,6 +26,7 @@
 #include <R_ext/Arith.h>
 #include <R_ext/Error.h>
 #include <Rinternals.h>
+#include <robin_hood.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -62,6 +65,9 @@ struct SessionState {
 };
 
 std::atomic<std::uint64_t> next_session_generation{1};
+
+/// Defined below, next to the schema-inference helpers that share it.
+auto session_source_schemas(const SessionState& session) -> ibex::ir::SourceSchemas;
 
 auto try_load_plugin(const std::string& stem, const std::vector<std::string>& search_paths,
                      std::unordered_set<std::string>& loaded_plugins,
@@ -340,9 +346,111 @@ auto build_column_with_validity(R_xlen_t size, PushFn&& push)
                                : std::nullopt};
 }
 
-auto build_column_from_r_vector(const std::string& name, SEXP column_sexp) -> std::expected<
-    std::pair<ibex::runtime::ColumnValue, std::optional<ibex::runtime::ValidityBitmap>>,
-    std::string> {
+/// Bind an R character vector as a Categorical column.
+///
+/// Every other Ibex frontend already hands string columns over dictionary
+/// encoded -- `read_csv` and the Parquet reader both produce Categorical -- so
+/// binding R's character vector as a String column made the R path the only
+/// one whose group-by, distinct and sort hashed text per row. On 8M rows and
+/// 252 distinct symbols that was 100ms against 3ms for the same query over the
+/// same values as codes.
+///
+/// The encoding is cheap here in a way it would not be for an arbitrary string
+/// column: R interns strings in a global CHARSXP cache, so equal strings in a
+/// character vector are usually the same SEXP, and identity alone decides the
+/// code. That makes the common row a pointer hash rather than a string hash
+/// plus a string copy.
+///
+/// "Usually" is not "always" -- the cache is keyed by encoding as well as by
+/// text, so the same characters can arrive as two distinct CHARSXPs. Two
+/// dictionary entries holding equal text would split one group in two, so a
+/// pointer miss falls through to a lookup by text and only a text miss appends
+/// to the dictionary. The by-text map owns its keys: a `string_view` into
+/// `dictionary` would dangle the moment a short (SSO) entry moved under a
+/// reallocation.
+auto build_categorical_from_strings(SEXP column_sexp, R_xlen_t size)
+    -> std::pair<ibex::runtime::ColumnValue, std::optional<ibex::runtime::ValidityBitmap>> {
+    using code_type = ibex::Column<ibex::Categorical>::code_type;
+
+    std::vector<std::string> dictionary;
+    std::vector<code_type> codes;
+    codes.reserve(static_cast<std::size_t>(size));
+    // Keyed by the pointer's integer value, not by `const void*`: the pointer
+    // specialization hashes by identity, and CHARSXPs are aligned, so every
+    // key landed in a handful of buckets. That is not a slow hash, it is a
+    // quadratic scan -- 8M lookups against 252 colliding entries took 7.8s,
+    // against 25ms once the value is mixed.
+    robin_hood::unordered_map<std::uintptr_t, code_type> by_pointer;
+    robin_hood::unordered_map<std::string, code_type> by_text;
+
+    bool has_nulls = false;
+    ibex::runtime::ValidityBitmap validity;
+
+    for (R_xlen_t i = 0; i < size; ++i) {
+        SEXP value = STRING_ELT(column_sexp, i);
+        if (value == NA_STRING) {
+            if (!has_nulls) {
+                has_nulls = true;
+                validity.assign(static_cast<std::size_t>(size), true);
+            }
+            validity.set(static_cast<std::size_t>(i), false);
+            codes.push_back(0);
+            continue;
+        }
+
+        const auto [slot, inserted] =
+            by_pointer.try_emplace(reinterpret_cast<std::uintptr_t>(value), 0);
+        if (inserted) {
+            std::string text(CHAR(value));
+            if (const auto seen = by_text.find(text); seen != by_text.end()) {
+                slot->second = seen->second;
+            } else {
+                const auto code = static_cast<code_type>(dictionary.size());
+                by_text.emplace(text, code);
+                dictionary.push_back(std::move(text));
+                slot->second = code;
+            }
+        }
+        codes.push_back(slot->second);
+    }
+
+    ibex::Column<ibex::Categorical> column(std::move(dictionary), std::move(codes));
+    return std::pair{ibex::runtime::ColumnValue{std::move(column)},
+                     has_nulls ? std::optional<ibex::runtime::ValidityBitmap>(std::move(validity))
+                               : std::nullopt};
+}
+
+/// Run the plan optimizer over a lowered session expression.
+///
+/// `parser::lower()` (whole program) and `lower_script()` both optimize before
+/// handing a plan to the runtime. `lower_expr()`, which is what a session
+/// statement uses, does not -- so a session never saw canonicalize, and the
+/// fused shapes the runtime keeps fast paths for were never formed. The one
+/// that hurt: `[order { price desc }][head 100]` stayed an Order feeding a
+/// Head and ran a full sort of 8M rows, where canonicalize R16 fuses it into a
+/// TopK that the chunked operator answers with an O(n log k) heap-select --
+/// 182ms against 15ms on the same data.
+///
+/// The context is default-constructed deliberately. Its `unknown_callee`
+/// summary claims every effect, so the effect-sensitive passes stay
+/// conservative about externs the session may have registered.
+auto optimize_session_plan(ibex::ir::NodePtr node, const ibex::ir::SourceSchemas& sources)
+    -> ibex::ir::NodePtr {
+    // The schema-aware join rewrites run first and in this order: both expect
+    // the un-fused `Filter(Join(...))` shape that canonicalize consumes, and
+    // `push_semi_joins_down` reads what `push_filters_into_joins` leaves. A
+    // semi/anti join that stays above an inner join filters after paying for
+    // it instead of before.
+    node = ibex::ir::push_filters_into_joins(std::move(node), sources);
+    node = ibex::ir::push_semi_joins_down(std::move(node), sources);
+    const ibex::ir::OptimizationContext context;
+    return ibex::ir::optimize_plan(std::move(node), context);
+}
+
+auto build_column_from_r_vector(const std::string& name, SEXP column_sexp, bool encode_strings)
+    -> std::expected<
+        std::pair<ibex::runtime::ColumnValue, std::optional<ibex::runtime::ValidityBitmap>>,
+        std::string> {
     const auto size = XLENGTH(column_sexp);
     try {
         if (Rf_inherits(column_sexp, "POSIXct")) {
@@ -481,6 +589,9 @@ auto build_column_from_r_vector(const std::string& name, SEXP column_sexp) -> st
                     return std::pair{value, true};
                 });
             case STRSXP:
+                if (encode_strings) {
+                    return build_categorical_from_strings(column_sexp, size);
+                }
                 return build_column_with_validity<std::string>(size, [&](R_xlen_t i) {
                     SEXP value = STRING_ELT(column_sexp, i);
                     if (value == NA_STRING) {
@@ -557,6 +668,14 @@ auto build_runtime_table_from_r(SEXP table_obj)
 
     ibex::runtime::Table table;
     SEXP names = Rf_getAttrib(table_obj, R_NamesSymbol);
+    // Opt-in dictionary encoding for character columns, set by `ibex_tbl()`.
+    // It is an attribute rather than an argument because the binder is reached
+    // through three registered entry points that all take `tables` as a plain
+    // named list, and a per-binding switch does not belong in any of their
+    // signatures.
+    SEXP encode_flag = Rf_getAttrib(table_obj, Rf_install("ibex_categorical_strings"));
+    const bool encode_strings = TYPEOF(encode_flag) == LGLSXP && XLENGTH(encode_flag) == 1 &&
+                                LOGICAL(encode_flag)[0] == TRUE;
     std::optional<R_xlen_t> row_count;
     for (R_xlen_t i = 0; i < XLENGTH(table_obj); ++i) {
         auto name = named_list_name(names, i, "data.frame columns");
@@ -571,7 +690,7 @@ auto build_runtime_table_from_r(SEXP table_obj)
             return std::unexpected("data.frame columns must all have the same length");
         }
 
-        auto built = build_column_from_r_vector(*name, column);
+        auto built = build_column_from_r_vector(*name, column, encode_strings);
         if (!built.has_value()) {
             return std::unexpected(built.error());
         }
@@ -807,8 +926,10 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
                                "ibex sessions currently support only table-valued let bindings: " +
                                    lowered.error().message));
             }
-            auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
-                                                      &runtime_scalars, &session.externs);
+            auto plan =
+                optimize_session_plan(std::move(lowered.value()), session_source_schemas(session));
+            auto evaluated = ibex::runtime::interpret(*plan, runtime_registry, &runtime_scalars,
+                                                      &session.externs);
             if (!evaluated.has_value()) {
                 return std::unexpected(make_error("runtime error", evaluated.error()));
             }
@@ -831,8 +952,10 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
                            "ibex sessions currently support only table-valued expressions: " +
                                lowered.error().message));
         }
-        auto evaluated = ibex::runtime::interpret(*lowered.value(), runtime_registry,
-                                                  &runtime_scalars, &session.externs);
+        auto plan =
+            optimize_session_plan(std::move(lowered.value()), session_source_schemas(session));
+        auto evaluated =
+            ibex::runtime::interpret(*plan, runtime_registry, &runtime_scalars, &session.externs);
         if (!evaluated.has_value()) {
             return std::unexpected(make_error("runtime error", evaluated.error()));
         }
@@ -1172,7 +1295,7 @@ extern "C" SEXP ibex_c_arrow_buffer_addresses(SEXP array_sexp) {
 }
 
 extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
-                                  SEXP scalars_sexp) {
+                                 SEXP scalars_sexp) {
     auto query = scalar_string(query_sexp, "'query'");
     if (!query.has_value()) {
         Rf_error("%s", query.error().c_str());
@@ -1207,7 +1330,7 @@ extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP t
 }
 
 extern "C" SEXP ibex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP tables_sexp,
-                                  SEXP scalars_sexp) {
+                                 SEXP scalars_sexp) {
     auto path = scalar_string(path_sexp, "'path'");
     if (!path.has_value()) {
         Rf_error("%s", path.error().c_str());
@@ -1296,7 +1419,7 @@ extern "C" SEXP ibex_c_session_table_info(SEXP session_sexp, SEXP name_sexp) {
 }
 
 extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
-                                             SEXP lexical_names_sexp) {
+                                            SEXP lexical_names_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
         Rf_error("%s", session.error().c_str());
@@ -1344,7 +1467,7 @@ extern "C" SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp,
 }
 
 extern "C" SEXP ibex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEXP tables_sexp,
-                                          SEXP scalars_sexp) {
+                                         SEXP scalars_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
         Rf_error("%s", session.error().c_str());
@@ -1381,7 +1504,7 @@ extern "C" SEXP ibex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEX
 }
 
 extern "C" SEXP ibex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sexp,
-                                          SEXP scalars_sexp) {
+                                         SEXP scalars_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {
         Rf_error("%s", session.error().c_str());

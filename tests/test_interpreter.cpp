@@ -991,6 +991,174 @@ TEST_CASE("Interpret grouped head keeps first rows per group in encounter order"
     REQUIRE((*x)[3] == 50);
 }
 
+namespace {
+
+/// One chunk of (Categorical symbol, Date day, Int64 value) — the mixed key
+/// pair that `by { symbol, day }` produces when the table came from R, where a
+/// factor arrives as Categorical and an IDate as Date.
+auto make_cat_date_chunk(const std::shared_ptr<std::vector<std::string>>& dictionary,
+                         std::vector<Column<Categorical>::code_type> codes,
+                         std::vector<std::int32_t> days, std::vector<std::int64_t> values)
+    -> runtime::Chunk {
+    runtime::Chunk chunk;
+
+    runtime::ColumnEntry sym;
+    sym.name = "symbol";
+    sym.column = std::make_shared<runtime::ColumnValue>(
+        Column<Categorical>{dictionary, std::make_shared<Column<Categorical>::index_map>()});
+    auto& sym_col = std::get<Column<Categorical>>(*sym.column);
+    for (auto code : codes) {
+        sym_col.push_code(code);
+    }
+    chunk.columns.push_back(std::move(sym));
+
+    runtime::ColumnEntry day;
+    day.name = "day";
+    day.column = std::make_shared<runtime::ColumnValue>(Column<Date>{});
+    auto& day_col = std::get<Column<Date>>(*day.column);
+    for (auto d : days) {
+        day_col.push_back(Date{d});
+    }
+    chunk.columns.push_back(std::move(day));
+
+    runtime::ColumnEntry val;
+    val.name = "v";
+    val.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+    auto& val_col = std::get<Column<std::int64_t>>(*val.column);
+    for (auto v : values) {
+        val_col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(val));
+
+    return chunk;
+}
+
+}  // namespace
+
+// A Categorical key and a Date key both fit in 32 bits, so the pair groups
+// through the packed dense-cell path rather than the generic boxed-Key path.
+// The keys deliberately share values across dimensions -- (AAA, d0) and
+// (AAA, d1) share the symbol, (BBB, d1) and (AAA, d1) share the day -- so a
+// path that collapsed either dimension would merge groups that must stay apart.
+TEST_CASE("Interpret group-by on a Categorical and a Date key keeps the pair distinct") {
+    auto dict =
+        std::make_shared<std::vector<std::string>>(std::vector<std::string>{"AAA", "BBB", "CCC"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("cat_date_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(
+            make_cat_date_chunk(dict, {0, 0, 1, 1, 0}, {10, 11, 11, 11, 10}, {1, 2, 3, 4, 5}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn cat_date_src() -> DataFrame from \"x.hpp\"; "
+        "cat_date_src()[select { s = sum(v) }, by { symbol, day }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<Categorical>>(result->find("symbol"));
+    const auto* day = std::get_if<Column<Date>>(result->find("day"));
+    const auto* sum = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(day != nullptr);
+    REQUIRE(sum != nullptr);
+
+    // First-seen order: (AAA,10), (AAA,11), (BBB,11).
+    REQUIRE(sum->size() == 3);
+    CHECK((*symbol)[0] == "AAA");
+    CHECK((*day)[0].days == 10);
+    CHECK((*sum)[0] == 6);  // rows 1 and 5
+    CHECK((*symbol)[1] == "AAA");
+    CHECK((*day)[1].days == 11);
+    CHECK((*sum)[1] == 2);
+    CHECK((*symbol)[2] == "BBB");
+    CHECK((*day)[2].days == 11);
+    CHECK((*sum)[2] == 7);  // rows 3 and 4
+}
+
+// The dense cell numbering is derived from the key bounds seen so far, so a
+// later chunk carrying days outside them renumbers every cell. Group ids handed
+// out from the first chunk must survive that rebuild and keep accumulating into
+// the same groups.
+TEST_CASE("Interpret group-by on Categorical and Date rebuilds when a later chunk widens the key") {
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"AAA", "BBB"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("widening_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        // Chunk 1 sees days [100, 101] only.
+        chunks.push_back(make_cat_date_chunk(dict, {0, 1}, {100, 101}, {1, 2}));
+        // Chunk 2 goes below and above that range, forcing a renumber, and
+        // revisits (AAA, 100) so the surviving group id has to be found again.
+        chunks.push_back(make_cat_date_chunk(dict, {0, 1, 0}, {5, 900, 100}, {10, 20, 30}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn widening_src() -> DataFrame from \"x.hpp\"; "
+        "widening_src()[select { s = sum(v) }, by { symbol, day }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* symbol = std::get_if<Column<Categorical>>(result->find("symbol"));
+    const auto* day = std::get_if<Column<Date>>(result->find("day"));
+    const auto* sum = std::get_if<Column<std::int64_t>>(result->find("s"));
+    REQUIRE(symbol != nullptr);
+    REQUIRE(day != nullptr);
+    REQUIRE(sum != nullptr);
+    REQUIRE(sum->size() == 4);
+
+    // (AAA,100) collected 1 from chunk 1 and 30 from chunk 2 — the rebuild kept
+    // the group rather than starting a second one.
+    CHECK((*symbol)[0] == "AAA");
+    CHECK((*day)[0].days == 100);
+    CHECK((*sum)[0] == 31);
+    CHECK((*symbol)[1] == "BBB");
+    CHECK((*day)[1].days == 101);
+    CHECK((*sum)[1] == 2);
+    CHECK((*symbol)[2] == "AAA");
+    CHECK((*day)[2].days == 5);
+    CHECK((*sum)[2] == 10);
+    CHECK((*symbol)[3] == "BBB");
+    CHECK((*day)[3].days == 900);
+    CHECK((*sum)[3] == 20);
+}
+
+// Dates far enough apart that the cell product blows the dense budget must fall
+// back to the hash path and still group correctly.
+TEST_CASE("Interpret group-by on Categorical and Date falls back when the key domain is huge") {
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"AAA", "BBB"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("sparse_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(
+            make_cat_date_chunk(dict, {0, 1, 0, 1}, {0, 20'000'000, 0, 20'000'000}, {1, 2, 3, 4}));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn sparse_src() -> DataFrame from \"x.hpp\"; "
+        "sparse_src()[select { s = sum(v) }, by { symbol, day }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* sum = std::get_if<Column<std::int64_t>>(result->find("s"));
+    const auto* day = std::get_if<Column<Date>>(result->find("day"));
+    REQUIRE(sum != nullptr);
+    REQUIRE(day != nullptr);
+    REQUIRE(sum->size() == 2);
+    CHECK((*day)[0].days == 0);
+    CHECK((*sum)[0] == 4);
+    CHECK((*day)[1].days == 20'000'000);
+    CHECK((*sum)[1] == 6);
+}
+
 TEST_CASE("Interpret grouped head over chunked extern source tracks groups across chunks") {
     runtime::TableRegistry registry;
     runtime::ExternRegistry externs;

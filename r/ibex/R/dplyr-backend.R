@@ -105,11 +105,12 @@ ibex_assert_live <- function(x) {
 
 new_ibex_tbl <- function(session, source, schema, generation, steps = list(), groups = character(),
                          ordering = NULL, captured_scalars = list(), fallback_policy = "warn",
-                         display_name = NULL) {
+                         display_name = NULL, source_frame = NULL) {
     structure(
         list(
             session = session,
             source = source,
+            source_frame = source_frame,
             schema = schema,
             steps = steps,
             groups = groups,
@@ -169,9 +170,26 @@ ibex_reset_default_session <- function() {
 #' @param name An optional display name. Native binding names are generated.
 #' @param fallback What to do when a verb cannot be translated: warn and collect,
 #'   error, or collect silently.
+#' @param categorical_strings Bind `character` columns as Ibex `Categorical`
+#'   (dictionary-encoded) rather than `String`. Grouping, `distinct()` and
+#'   sorting on a dictionary-encoded key compare dense integer codes instead of
+#'   hashing text per row, which on 8M rows over 252 distinct symbols is 3ms
+#'   against 100ms. The cost is on the way back: a Categorical column collects
+#'   into R as a `factor`, and a large result pays to rebuild the levels, so a
+#'   query that returns most of its rows as strings is better off without it.
+#'   Off by default, because a `character` column collecting back as `character`
+#'   is the contract every other dplyr backend keeps. Columns already passed as
+#'   factors bind as Categorical either way.
 #' @export
 ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
-                     fallback = c("warn", "error", "collect")) {
+                     fallback = c("warn", "error", "collect"),
+                     categorical_strings = FALSE) {
+    # Capture the caller's expression before anything below rebinds `x`.
+    # `substitute(x)` reports the promise's expression only while `x` is still
+    # the untouched argument binding; after an assignment to `x` it reports the
+    # *value* instead, and deparsing a multi-million-row data frame to build a
+    # display name took 4 seconds on an 8M-row table.
+    default_display_name <- deparse1(substitute(x))
     fallback_missing <- missing(fallback)
     if (inherits(x, "ibex_tbl")) {
         if (!missing(session) && !identical(session, x$session)) {
@@ -187,6 +205,9 @@ ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
             rlang::abort("`x` must be a data frame, tibble, or nanoarrow-compatible table.")
         }
         x <- converted
+    }
+    if (isTRUE(categorical_strings) && inherits(x, "data.frame")) {
+        attr(x, "ibex_categorical_strings") <- TRUE
     }
     binding <- ibex_new_binding_name(session)
     input_name <- paste0(binding, "_input")
@@ -207,7 +228,11 @@ ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
             NULL
         },
         fallback_policy = fallback,
-        display_name = name %||% deparse1(substitute(x))
+        display_name = name %||% default_display_name,
+        # Held only while the plan can still use it; `ibex_append_step()` drops
+        # it at the first step that makes reuse impossible. See
+        # `ibex_reusable_source_columns()`.
+        source_frame = if (inherits(x, "data.frame")) x else NULL
     )
 }
 
@@ -239,6 +264,13 @@ ibex_schema_proxy <- function(x) {
 ibex_append_step <- function(x, step, schema = x$schema, groups = x$groups,
                              ordering = x$ordering, scalars = x$captured_scalars) {
     ibex_assert_live(x)
+    # Release the caller's table the moment the plan stops being one whose rows
+    # and row order match it. Reuse is the only reason it is held, so holding it
+    # past that point would extend a lifetime for nothing -- and a plan that
+    # filters, sorts, joins or aggregates can never use it again.
+    if (!identical(step$kind, "update") || length(step$groups) || length(groups)) {
+        x$source_frame <- NULL
+    }
     x$steps <- c(x$steps, list(step))
     x$schema <- schema
     x$groups <- groups
@@ -391,9 +423,102 @@ print.ibex_tbl <- function(x, ..., n = NULL, width = NULL) {
     invisible(x)
 }
 
+# The R class `collect()` produces for each Ibex column type. A source column
+# may only be handed back verbatim when its class already equals the one a full
+# collect would have produced -- otherwise the two paths would disagree about
+# the type of the same query's result. An R `integer` bound as Int64 comes back
+# as a double, for instance, and a `character` bound with
+# `categorical_strings = TRUE` comes back as a factor; neither is reusable.
+ibex_collect_class <- c(
+    Float64 = "numeric", Int64 = "numeric", String = "character",
+    Categorical = "factor", Bool = "logical", Date = "Date", Timestamp = "POSIXct"
+)
+
+# Which output columns can be served from the caller's own R vectors.
+#
+# Materializing a column out of Ibex costs what its bytes cost -- ~3ms per 8M
+# doubles, ~10ms for 8M dictionary codes -- and a `mutate` re-materializes every
+# column it did not touch. Those columns are, by construction, the ones the
+# caller already holds: same values, same order, same rows.
+#
+# The plan therefore has to be one that changes neither the row set nor its
+# order, which restricts this to a chain of ungrouped `update` steps. A filter,
+# a sort, a join, a distinct, an aggregate or a grouped update all break the
+# correspondence and disqualify the whole plan. Returns NULL when nothing can be
+# reused, in which case the caller collects normally.
+#
+# The reference to the caller's table is a strong one, and deliberately narrow
+# because of it: R can only weakly reference environments and external pointers,
+# never a data frame, so there is no way to hold one that a collection can take
+# back. `ibex_append_step()` therefore drops it at the first step that makes
+# reuse impossible, which bounds the retention to plans that can actually use
+# it. While the caller still holds the table -- the ordinary case, since they
+# are the one who passed it -- this costs nothing at all.
+ibex_reusable_source_columns <- function(x) {
+    if (is.null(x$source_frame) || !length(x$steps) || length(x$groups)) {
+        return(NULL)
+    }
+    derived <- character()
+    for (step in x$steps) {
+        if (!identical(step$kind, "update") || length(step$groups)) {
+            return(NULL)
+        }
+        derived <- c(derived, vapply(step$fields, `[[`, character(1), "name"))
+    }
+
+    source <- x$source_frame
+
+    candidates <- setdiff(x$schema$names, derived)
+    keep <- candidates[vapply(candidates, function(name) {
+        if (!name %in% names(source)) return(FALSE)
+        type <- x$schema$types[[match(name, x$schema$names)]]
+        expected <- ibex_collect_class[[type]] %||% NA_character_
+        !is.na(expected) && identical(class(source[[name]])[[1]], expected)
+    }, logical(1))]
+    if (!length(keep)) {
+        return(NULL)
+    }
+    list(source = source, reuse = keep)
+}
+
+# Collect a plan while serving `reusable$reuse` from the caller's own vectors.
+#
+# Ibex is asked for exactly the columns that are left, via a projection appended
+# to the plan, and the result is reassembled in the schema's column order so it
+# is indistinguishable from a full collect.
+ibex_collect_reusing <- function(x, reusable, format) {
+    wanted <- setdiff(x$schema$names, reusable$reuse)
+    computed <- NULL
+    if (length(wanted)) {
+        projected <- x
+        projected$steps <- c(
+            x$steps,
+            list(list(kind = "project", fields = lapply(wanted, function(name) {
+                list(name = name, code = ibex_quote_identifier(name))
+            })))
+        )
+        computed <- collect(projected, format = "data.frame")
+    }
+
+    columns <- lapply(x$schema$names, function(name) {
+        if (name %in% reusable$reuse) reusable$source[[name]] else computed[[name]]
+    })
+    names(columns) <- x$schema$names
+    if (identical(format, "data.frame")) {
+        return(as.data.frame(columns, stringsAsFactors = FALSE, optional = TRUE))
+    }
+    tibble::as_tibble(columns)
+}
+
 collect.ibex_tbl <- function(x, ..., format = c("tibble", "data.frame", "nanoarrow")) {
     format <- match.arg(format)
     ibex_assert_live(x)
+    if (!identical(format, "nanoarrow")) {
+        reusable <- ibex_reusable_source_columns(x)
+        if (!is.null(reusable)) {
+            return(ibex_collect_reusing(x, reusable, format))
+        }
+    }
     native_format <- if (identical(format, "nanoarrow")) "nanoarrow" else "data.frame"
     result <- tryCatch(
         session_eval(
@@ -517,7 +642,7 @@ ibex_call_identity <- function(head, env) {
         coalesce = dplyr::coalesce, between = dplyr::between, first = dplyr::first,
         last = dplyr::last, n = dplyr::n, min_rank = dplyr::min_rank,
         dense_rank = dplyr::dense_rank, row_number = dplyr::row_number,
-        cume_dist = dplyr::cume_dist
+        cume_dist = dplyr::cume_dist, as.Date = base::as.Date
     )
     if (!name %in% names(known)) return(NULL)
     resolved <- tryCatch(rlang::eval_bare(head, env), error = function(e) NULL)
@@ -654,6 +779,20 @@ ibex_translate_expr <- function(expr, quo_env, x, context, state, inside_aggrega
     if (identity == "base::is.na") {
         if (length(codes) != 1L) ibex_unsupported("`is.na()` requires one argument.", expr)
         return(ibex_expr_result(paste0("is_null(", codes[[1]], ")"), "Bool", FALSE, aggregate, refs))
+    }
+    if (identity == "base::as.Date") {
+        # Ibex's `Date()` cast truncates an instant to its UTC calendar day,
+        # which is exactly `as.Date.POSIXct`'s own default (`tz = "UTC"`). Any
+        # other `tz` would cut on different boundaries, so it is not translated;
+        # neither is parsing a character vector, which Ibex has no `Date()`
+        # overload for.
+        if (length(codes) != 1L || any(nzchar(arg_names))) {
+            ibex_unsupported("Only `as.Date(x)` with no further arguments translates natively; a `tz` or `format` changes the day boundaries Ibex cuts on.", expr)
+        }
+        if (!translated[[1]]$type %in% c("Timestamp", "Date")) {
+            ibex_unsupported(paste0("`as.Date()` needs a Timestamp or Date column, not ", translated[[1]]$type, "."), expr)
+        }
+        return(ibex_expr_result(paste0("Date(", codes[[1]], ")"), "Date", nullable, aggregate, refs))
     }
     if (identity == "base::is.nan") {
         if (length(codes) != 1L) ibex_unsupported("`is.nan()` requires one argument.", expr)

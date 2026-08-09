@@ -1225,10 +1225,11 @@ class Parser {
             expr->node = IdentifierExpr{.name = std::move(name)};
             return expr;
         }
-        // Type-name cast: Int64(expr), Float64(expr), Int32(expr), Float32(expr), Int(expr)
+        // Type-name cast: Int64(expr), Float64(expr), Int32(expr), Float32(expr),
+        // Int(expr), Date(expr)
         if (check(TokenKind::KeywordInt) || check(TokenKind::KeywordInt32) ||
             check(TokenKind::KeywordInt64) || check(TokenKind::KeywordFloat32) ||
-            check(TokenKind::KeywordFloat64)) {
+            check(TokenKind::KeywordFloat64) || check(TokenKind::KeywordDate)) {
             advance();
             std::string type_name(previous().lexeme);
             if (match(TokenKind::LParen)) {

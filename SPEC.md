@@ -385,6 +385,7 @@ A scalar type name followed by `(expr)` is an explicit cast:
 Int64(x)    Float64(x)
 Int32(x)    Float32(x)
 Int(x)      -- alias for Int64(x)
+Date(x)
 ```
 
 **Float → Int casts** succeed only when the value is already a whole number
@@ -399,6 +400,14 @@ convert to the nearest integer before casting.
 predicate countable: `sum(Int64(price > vwap))` counts the rows above VWAP. (A
 null stays null, as with every scalar function.)
 
+**Date casts** accept a `Timestamp`, a `Date` (identity), or an `Int64` read as
+days since the epoch. Casting a `Timestamp` truncates the instant to the
+calendar day containing it, and — like every calendar-boundary operation over a
+zone-less `Timestamp` — it cuts on **UTC**. The truncation floors, so an instant
+before the epoch lands on its own day rather than rounding toward the epoch.
+Other input types are a compile-time error; there is no `Date("2024-01-15")`
+parse (use the `date"..."` literal).
+
 **Column casts** apply element-wise: `Int64(price_col)` produces a
 `Series<Int64>` from a `Series<Float64>`, checking every element.
 
@@ -412,6 +421,9 @@ prices[update { vol_int = Int64(volume_f) }];
 
 // Round first, then cast
 prices[update { vol_int = Int64(round(volume_f, nearest)) }];
+
+// Instant -> UTC calendar day, e.g. to group by day
+flights[select { n = count() }, by { day = Date(time_hour) }];
 ```
 
 #### Arithmetic Type Rules

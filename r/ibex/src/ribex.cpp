@@ -19,7 +19,6 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -31,7 +30,6 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -73,7 +71,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
                      std::unordered_set<std::string>& loaded_plugins,
                      ibex::runtime::ExternRegistry& externs) -> PluginLoadResult {
     if (loaded_plugins.contains(stem)) {
-        return {PluginLoadStatus::Loaded, ""};
+        return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
 
     const std::string filename = stem + ".so";
@@ -121,7 +119,7 @@ auto load_source_plugins(const ibex::parser::Program& program,
     -> std::expected<void, std::string> {
     std::unordered_set<std::string> loaded_plugins;
     for (const auto& stmt : program.statements) {
-        if (auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
+        if (const auto* decl = std::get_if<ibex::parser::ExternDecl>(&stmt)) {
             if (decl->source_path.empty()) {
                 continue;
             }
@@ -217,8 +215,7 @@ auto parse_timestamp_seconds(double seconds, const std::string& context)
     if (ISNAN(seconds) || !std::isfinite(seconds)) {
         return std::unexpected(context + " must be finite");
     }
-    const long double nanos =
-        static_cast<long double>(seconds) * static_cast<long double>(1000000000.0L);
+    const long double nanos = static_cast<long double>(seconds) * 1000000000.0L;
     if (nanos < static_cast<long double>(std::numeric_limits<std::int64_t>::min()) ||
         nanos > static_cast<long double>(std::numeric_limits<std::int64_t>::max())) {
         return std::unexpected(context + " is out of range for Ibex Timestamp");
@@ -965,32 +962,37 @@ auto eval_table_in_session(SessionState& session, const std::string& source,
     return last_table;
 }
 
+// The finalizers below are where R hands ownership back. Between the export and
+// this call the object is owned by R's collector, through a raw `void*` in the
+// external pointer -- a smart pointer cannot live in that slot, which is the
+// contract `R_RegisterCFinalizerEx` is built on. What *can* be expressed is the
+// hand-back: adopt the pointer into a `unique_ptr` so the object is destroyed by
+// a destructor rather than a bare `delete`, matching the `make_unique(...)
+// .release()` (and `new`) that produced it.
+
 void schema_finalizer(SEXP ext) {
-    auto* schema = static_cast<ArrowSchema*>(R_ExternalPtrAddr(ext));
-    if (schema == nullptr) {
+    const std::unique_ptr<ArrowSchema> schema(static_cast<ArrowSchema*>(R_ExternalPtrAddr(ext)));
+    if (!schema) {
         return;
     }
-    ibex::interop::release_arrow_schema(schema);
-    delete schema;
+    ibex::interop::release_arrow_schema(schema.get());
     R_ClearExternalPtr(ext);
 }
 
 void array_finalizer(SEXP ext) {
-    auto* array = static_cast<ArrowArray*>(R_ExternalPtrAddr(ext));
-    if (array == nullptr) {
+    const std::unique_ptr<ArrowArray> array(static_cast<ArrowArray*>(R_ExternalPtrAddr(ext)));
+    if (!array) {
         return;
     }
-    ibex::interop::release_arrow_array(array);
-    delete array;
+    ibex::interop::release_arrow_array(array.get());
     R_ClearExternalPtr(ext);
 }
 
 void session_finalizer(SEXP ext) {
-    auto* session = static_cast<SessionState*>(R_ExternalPtrAddr(ext));
-    if (session == nullptr) {
+    const std::unique_ptr<SessionState> session(static_cast<SessionState*>(R_ExternalPtrAddr(ext)));
+    if (!session) {
         return;
     }
-    delete session;
     R_ClearExternalPtr(ext);
 }
 
@@ -1004,12 +1006,15 @@ auto make_nanoarrow_xptr(void* ptr, SEXP tag, R_CFinalizer_t finalizer, const ch
     return ext;
 }
 
-auto export_table_payload(std::shared_ptr<const ibex::runtime::Table> table)
+// Borrowed, not owned: `export_table_to_arrow` takes the handle by reference and
+// the exported Arrow structures take their own shared owners -- one for the
+// array plus one per column buffer -- so the payload keeps the table alive on
+// its own and outlives this call regardless of what the caller does next.
+auto export_table_payload(const std::shared_ptr<const ibex::runtime::Table>& table)
     -> std::expected<SEXP, std::string> {
     auto schema = std::make_unique<ArrowSchema>();
     auto array = std::make_unique<ArrowArray>();
-    auto exported =
-        ibex::interop::export_table_to_arrow(std::move(table), array.get(), schema.get());
+    auto exported = ibex::interop::export_table_to_arrow(table, array.get(), schema.get());
     if (!exported.has_value()) {
         return std::unexpected(exported.error());
     }
@@ -1271,6 +1276,10 @@ void collect_buffer_addresses(const ArrowArray& array, const std::string& path,
 
 }  // namespace
 
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
+// NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
+// These have SEXP's as arguments and use Rf_error, this is idiomatic R interfacing code but
+// triggers the lints.
 extern "C" SEXP ibex_c_arrow_buffer_addresses(SEXP array_sexp) {
     if (TYPEOF(array_sexp) != EXTPTRSXP || !Rf_inherits(array_sexp, "nanoarrow_array")) {
         Rf_error("'array' must be a nanoarrow_array");
@@ -1321,7 +1330,7 @@ extern "C" SEXP ibex_c_eval_ibex(SEXP query_sexp, SEXP plugin_paths_sexp, SEXP t
         Rf_error("%s", evaluated.error().c_str());
     }
 
-    auto payload = export_table_payload(std::move(*evaluated));
+    auto payload = export_table_payload(*evaluated);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
@@ -1361,7 +1370,7 @@ extern "C" SEXP ibex_c_eval_file(SEXP path_sexp, SEXP plugin_paths_sexp, SEXP ta
         Rf_error("%s", evaluated.error().c_str());
     }
 
-    auto payload = export_table_payload(std::move(*evaluated));
+    auto payload = export_table_payload(*evaluated);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
@@ -1496,7 +1505,7 @@ extern "C" SEXP ibex_c_session_eval_ibex(SEXP session_sexp, SEXP query_sexp, SEX
         return R_NilValue;
     }
 
-    auto payload = export_table_payload(std::move(*evaluated));
+    auto payload = export_table_payload(*evaluated);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
@@ -1538,9 +1547,11 @@ extern "C" SEXP ibex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP
         return R_NilValue;
     }
 
-    auto payload = export_table_payload(std::move(*evaluated));
+    auto payload = export_table_payload(*evaluated);
     if (!payload.has_value()) {
         Rf_error("%s", payload.error().c_str());
     }
     return *payload;
 }
+// NOLINTEND(cppcoreguidelines-pro-type-vararg)
+// NOLINTEND(bugprone-easily-swappable-parameters)

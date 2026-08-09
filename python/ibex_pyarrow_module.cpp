@@ -197,12 +197,14 @@ void array_capsule_destructor(PyObject* capsule) {
     delete array;
 }
 
-auto wrap_arrow_export(std::shared_ptr<const ibex::runtime::Table> table)
+// Borrowed, not owned -- see the note on ribex.cpp's export_table_payload: the
+// Arrow structures take their own shared owners, so the capsules outlive this
+// call without the wrapper holding a reference of its own.
+auto wrap_arrow_export(const std::shared_ptr<const ibex::runtime::Table>& table)
     -> std::expected<ExportedArrowCapsules, std::string> {
     auto schema = std::make_unique<ArrowSchema>();
     auto array = std::make_unique<ArrowArray>();
-    auto exported =
-        ibex::interop::export_table_to_arrow(std::move(table), array.get(), schema.get());
+    auto exported = ibex::interop::export_table_to_arrow(table, array.get(), schema.get());
     if (!exported.has_value()) {
         return std::unexpected(exported.error());
     }

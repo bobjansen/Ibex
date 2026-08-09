@@ -4,6 +4,7 @@ CompileFlags:
     - "-Wall"
     - "-Wextra"
     - "-std=c++23"
+    - "-I/usr/share/R/include"
 
 Diagnostics:
   ClangTidy:

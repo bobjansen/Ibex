@@ -199,8 +199,13 @@ phase_prices_lookup <- function() {
         function() tb |> group_by(symbol) |> summarise(open = dplyr::first(price), high = max(price), low = min(price), last = dplyr::last(price), .groups = "drop"),
         function() ib |> group_by(symbol) |> summarise(open = dplyr::first(price), high = max(price), low = min(price), last = dplyr::last(price), .groups = "drop") |> collect())
 
+    # `:=` adds the column BY REFERENCE, so without the trailing delete every
+    # iteration after the first overwrites an already-allocated buffer while
+    # dplyr and ibex allocate a fresh one — measuring strictly less work. The
+    # delete is a pointer removal, and it is safe against the shared columns
+    # above: as_shared_tibble() gave the tibble its own list and name vector.
     bench_three("update_price_x2",
-        function() dt[, price_x2 := price * 2][],
+        function() { dt[, price_x2 := price * 2]; dt[, price_x2 := NULL][] },
         function() tb |> mutate(price_x2 = price * 2),
         function() ib |> mutate(price_x2 = price * 2) |> collect())
 
@@ -245,12 +250,12 @@ phase_prices_lookup <- function() {
         function() tb |> mutate(clipped = pmin(price, 500.0)),
         function() ib |> mutate(clipped = pmin(price, 500.0)) |> collect())
 
-    bench_three("abs_price", function() dt[, v := abs(price)][], function() tb |> mutate(v = abs(price)), function() ib |> mutate(v = abs(price)) |> collect())
-    bench_three("sqrt_price", function() dt[, v := sqrt(price)][], function() tb |> mutate(v = sqrt(price)), function() ib |> mutate(v = sqrt(price)) |> collect())
-    bench_three("log_price", function() dt[, v := log(price)][], function() tb |> mutate(v = log(price)), function() ib |> mutate(v = log(price)) |> collect())
-    bench_three("exp_price", function() dt[, v := exp(price / 1000.0)][], function() tb |> mutate(v = exp(price / 1000.0)), function() ib |> mutate(v = exp(price / 1000.0)) |> collect())
-    bench_three("floor_price", function() dt[, v := floor(price)][], function() tb |> mutate(v = floor(price)), function() ib |> mutate(v = floor(price)) |> collect())
-    bench_three("ceil_price", function() dt[, v := ceiling(price)][], function() tb |> mutate(v = ceiling(price)), function() ib |> mutate(v = ceiling(price)) |> collect())
+    bench_three("abs_price", function() { dt[, v := abs(price)]; dt[, v := NULL][] }, function() tb |> mutate(v = abs(price)), function() ib |> mutate(v = abs(price)) |> collect())
+    bench_three("sqrt_price", function() { dt[, v := sqrt(price)]; dt[, v := NULL][] }, function() tb |> mutate(v = sqrt(price)), function() ib |> mutate(v = sqrt(price)) |> collect())
+    bench_three("log_price", function() { dt[, v := log(price)]; dt[, v := NULL][] }, function() tb |> mutate(v = log(price)), function() ib |> mutate(v = log(price)) |> collect())
+    bench_three("exp_price", function() { dt[, v := exp(price / 1000.0)]; dt[, v := NULL][] }, function() tb |> mutate(v = exp(price / 1000.0)), function() ib |> mutate(v = exp(price / 1000.0)) |> collect())
+    bench_three("floor_price", function() { dt[, v := floor(price)]; dt[, v := NULL][] }, function() tb |> mutate(v = floor(price)), function() ib |> mutate(v = floor(price)) |> collect())
+    bench_three("ceil_price", function() { dt[, v := ceiling(price)]; dt[, v := NULL][] }, function() tb |> mutate(v = ceiling(price)), function() ib |> mutate(v = ceiling(price)) |> collect())
 
     # The lookup joins are probed against prices, so they share this phase
     # rather than reloading the larger fixture.

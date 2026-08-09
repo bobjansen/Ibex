@@ -160,12 +160,16 @@ if [[ $INSTALL_R -eq 1 ]]; then
     apt_get_retry install -y --no-install-recommends r-base r-base-dev
 
     # Install every benchmark package against the CRAN R runtime, rather than
-    # mixing in Ubuntu packages compiled for the older distro R.
-    Rscript -e '
+    # loading Ubuntu packages compiled for the older distro R.
+    R_BENCH_LIB=/usr/local/lib/R/site-library
+    mkdir -p "$R_BENCH_LIB"
+    export R_LIBS_SITE="$R_BENCH_LIB"
+    R_LIBS_USER="$R_BENCH_LIB" Rscript -e '
         needed <- c("data.table", "dplyr", "tidyr", "optparse")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
-            install.packages(missing, repos = "https://cloud.r-project.org")
+            install.packages(missing, repos = "https://cloud.r-project.org",
+                             dependencies = TRUE)
         }
     '
 

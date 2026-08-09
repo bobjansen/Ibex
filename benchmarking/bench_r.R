@@ -67,10 +67,20 @@ suppressPackageStartupMessages({
 })
 
 # ── Timing helper ─────────────────────────────────────────────────────────────
-# proc.time()[["elapsed"]] uses gettimeofday() which is non-monotonic: an NTP
-# correction during a long benchmark run can step the clock backward, producing
-# a negative elapsed time.  Retry any such measurement up to 5 times before
-# clamping to 0 as a last resort.
+# Times come from Sys.time(), NOT proc.time()[["elapsed"]]: R rounds proc.time
+# to whole milliseconds, which is far too coarse for this suite. At 1M rows a
+# third of the R cells run under 10ms, so every one of them was being reported
+# with >=10% quantization error (and 14% of them under 5ms, >=20% error) while
+# the Python and C++ harnesses timed the same queries with nanosecond clocks —
+# a systematic distortion of the R engines against everyone else. Sys.time()
+# resolves ~2us, which is negligible against the fastest cell here.
+#
+# Both clocks read wall time and are non-monotonic: an NTP correction during a
+# long run can step the clock backward and produce a negative elapsed time.
+# Retry any such measurement up to 5 times before clamping to 0 as a last
+# resort. (A *forward* step is indistinguishable from a slow run, which is why
+# min_ms is the statistic to trust.)
+now_ms <- function() as.numeric(Sys.time()) * 1000
 # ── Peak-RSS measurement (Linux only) ─────────────────────────────────────────
 # Absolute peak RSS (VmHWM) during a query's measured iterations, in MiB.
 # Writing "5" to /proc/self/clear_refs resets the kernel's per-process peak;
@@ -102,9 +112,9 @@ cell_cutoff_ms <- as.numeric(Sys.getenv("IBEX_CELL_CUTOFF_MS", "30000"))
 timer <- function(fn) {
     r <- NULL
     for (i in seq_len(warmup)) {
-        t0 <- proc.time()[["elapsed"]]
+        t0 <- now_ms()
         r  <- fn()
-        if ((proc.time()[["elapsed"]] - t0) * 1000 > cell_cutoff_ms) {
+        if (now_ms() - t0 > cell_cutoff_ms) {
             return(list(avg_ms = -1, min_ms = -1, max_ms = -1, stddev_ms = 0,
                         p95_ms = -1, p99_ms = -1,
                         nrow = if (is.null(r)) 0L else nrow(r), peak_rss_mb = 0))
@@ -115,9 +125,9 @@ timer <- function(fn) {
     for (i in seq_len(iters)) {
         elapsed <- -1
         for (attempt in seq_len(5L)) {
-            t0      <- proc.time()[["elapsed"]]
+            t0      <- now_ms()
             r       <- fn()
-            elapsed <- (proc.time()[["elapsed"]] - t0) * 1000
+            elapsed <- now_ms() - t0
             if (elapsed >= 0) break
         }
         times[i] <- max(elapsed, 0)

@@ -57,11 +57,16 @@ collect_garbage <- function() invisible(gc(verbose = FALSE, full = TRUE))
 # min_ms that drags the average with it.  Discard and re-measure those samples.
 # A *forward* step is indistinguishable from a slow run, which is why min_ms is
 # the statistic to trust on such a host.
+#
+# Sys.time() rather than proc.time(): R rounds proc.time to whole milliseconds,
+# which silently quantizes every sub-10ms cell (see bench_r.R for the full
+# rationale). Sys.time() resolves ~2us.
+now_ms <- function() as.numeric(Sys.time()) * 1000
 time_once <- function(fn, attempts = 4L) {
     for (attempt in seq_len(attempts)) {
-        started <- proc.time()[["elapsed"]]
+        started <- now_ms()
         result <- fn()
-        elapsed_ms <- (proc.time()[["elapsed"]] - started) * 1000
+        elapsed_ms <- now_ms() - started
         if (elapsed_ms >= 0) return(list(ms = elapsed_ms, result = result))
         message("    (wall clock stepped backwards; re-measuring)")
         result <- NULL

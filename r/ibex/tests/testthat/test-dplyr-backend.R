@@ -40,6 +40,84 @@ test_that("R factors bind as categorical columns", {
     expect_equal(as.character(dplyr::collect(query)$symbol), as.character(input$symbol))
 })
 
+test_that("a categorical column collects back as a factor, levels intact", {
+    input <- tibble::tibble(
+        symbol = factor(c("A", NA, "B", "A"), levels = c("B", "A")),
+        value = 1:4
+    )
+    collected <- dplyr::collect(ibex_tbl(input, fallback = "error"))
+
+    # Decoding the dictionary to one R string per row loses the encoding and
+    # costs a per-row materialization; a Categorical is an R factor already.
+    expect_s3_class(collected$symbol, "factor")
+    expect_identical(levels(collected$symbol), c("B", "A"))
+    expect_identical(collected$symbol, input$symbol)
+})
+
+test_that("character columns stay String, and stay character on the way back", {
+    input <- tibble::tibble(g = c("a", "b", "a"), v = 1:3)
+    query <- ibex_tbl(input, fallback = "error")
+
+    expect_identical(session_table_schema(query$session, query$source)$type[[1]], "String")
+    expect_identical(dplyr::collect(query)$g, c("a", "b", "a"))
+})
+
+test_that("categorical_strings binds character columns as Categorical", {
+    input <- tibble::tibble(g = c("a", NA, "b", "a"), v = 1:4)
+    query <- ibex_tbl(input, fallback = "error", categorical_strings = TRUE)
+    schema <- session_table_schema(query$session, query$source)
+
+    expect_identical(schema$type, c("Categorical", "Int64"))
+    expect_identical(schema$nullable, c(TRUE, FALSE))
+
+    collected <- dplyr::collect(query)
+    expect_s3_class(collected$g, "factor")
+    expect_identical(as.character(collected$g), input$g)
+
+    # The point of the encoding is that grouping sees the codes; the answer
+    # must not change because of it.
+    expect_equal(
+        dplyr::collect(dplyr::summarise(dplyr::group_by(query, g), n = dplyr::n(),
+                                        .groups = "drop")) |>
+            dplyr::mutate(g = as.character(g)) |>
+            dplyr::arrange(g),
+        dplyr::arrange(dplyr::count(input, g, name = "n"), g),
+        ignore_attr = TRUE
+    )
+})
+
+test_that("the display name is the caller's expression, not the data", {
+    # `substitute(x)` reports the promise's expression only until something
+    # rebinds `x`. Both the nanoarrow conversion and `categorical_strings`
+    # rebind it, and deparsing the *value* names the table after its own
+    # contents -- and costs seconds on a large one.
+    prices <- tibble::tibble(g = c("a", "b"), v = 1:2)
+
+    expect_identical(ibex_tbl(prices, fallback = "error")$display_name, "prices")
+    expect_identical(
+        ibex_tbl(prices, fallback = "error", categorical_strings = TRUE)$display_name,
+        "prices"
+    )
+    expect_identical(ibex_tbl(prices, fallback = "error", name = "custom")$display_name, "custom")
+})
+
+test_that("string encoding survives duplicate text arriving as distinct CHARSXPs", {
+    # Two equal strings can reach C++ as different CHARSXPs when their
+    # encodings differ, and two dictionary entries with equal text would split
+    # one group in two.
+    native <- "café"
+    utf8 <- enc2utf8(native)
+    input <- tibble::tibble(g = c(native, utf8, "x"), v = c(1L, 1L, 1L))
+    query <- ibex_tbl(input, fallback = "error", categorical_strings = TRUE)
+
+    grouped <- dplyr::collect(
+        dplyr::summarise(dplyr::group_by(query, g), n = dplyr::n(), .groups = "drop")
+    )
+    expect_identical(nrow(grouped), 2L)
+    expect_setequal(as.character(grouped$g), c(native, "x"))
+    expect_identical(sort(grouped$n), c(1, 2))
+})
+
 test_that("core analytical pipeline stays lazy and matches dplyr", {
     input <- tibble::tibble(
         symbol = c("A", "B", "A", "B"),
@@ -66,7 +144,11 @@ test_that("core analytical pipeline stays lazy and matches dplyr", {
     expect_equal(dplyr::collect(actual), expected)
     rendered <- paste(capture.output(dplyr::show_query(actual)), collapse = "\n")
     expect_match(rendered, "\\^__ibex_dplyr_scalar_0001<numeric>")
-    expect_false(any(grepl("10", rendered, fixed = TRUE)))
+    # The captured value must not survive into the rendered plan. Anchor on the
+    # comparison rather than searching for "10" anywhere: generated binding
+    # names are zero-padded counters, so a bare substring search starts failing
+    # the moment the tenth binding of the session is rendered.
+    expect_false(any(grepl("> 10", rendered, fixed = TRUE)))
 })
 
 test_that("select rename relocate transmute and distinct preserve names", {
@@ -162,6 +244,61 @@ test_that("nullable aggregate semantics require explicit na.rm", {
     expect_error(
         ibex_tbl(input, fallback = "error") |>
             dplyr::summarise(total = sum(x)),
+        class = "ibex_translation_error"
+    )
+})
+
+test_that("as.Date translates to the native Date cast and buckets on UTC", {
+    # `as.Date.POSIXct` defaults to `tz = "UTC"`, and Ibex's `Date()` cast cuts
+    # on UTC too, so the two agree without either being told about a zone.
+    input <- tibble::tibble(
+        ts = as.POSIXct(
+            c("2024-01-15 00:00:00", "2024-01-15 23:59:59", "2024-01-16 00:00:00"),
+            tz = "UTC"
+        ),
+        v = c(1, 2, 4)
+    )
+    source <- ibex_tbl(input, fallback = "error")
+
+    day <- dplyr::mutate(source, day = as.Date(ts))
+    expect_s3_class(day, "ibex_tbl")
+    expect_match(
+        paste(capture.output(dplyr::show_query(day)), collapse = "\n"),
+        "Date(`ts`)",
+        fixed = TRUE
+    )
+    collected <- dplyr::collect(day)
+    expect_s3_class(collected$day, "Date")
+    expect_equal(collected$day, as.Date(input$ts))
+
+    # And it groups: the first two rows share a day, the third does not.
+    grouped <- dplyr::summarise(day, n = dplyr::n(), total = sum(v, na.rm = TRUE), .by = day)
+    expect_equal(
+        as.data.frame(dplyr::arrange(dplyr::collect(grouped), day)),
+        as.data.frame(
+            input |>
+                dplyr::mutate(day = as.Date(ts)) |>
+                dplyr::summarise(n = dplyr::n(), total = sum(v), .by = day) |>
+                dplyr::arrange(day)
+        )
+    )
+})
+
+test_that("as.Date declines the forms whose day boundaries would differ", {
+    input <- tibble::tibble(
+        ts = as.POSIXct("2024-01-15 23:00:00", tz = "UTC"),
+        text = "2024-01-15"
+    )
+    source <- ibex_tbl(input, fallback = "error")
+
+    # A non-UTC `tz` cuts on different boundaries than Ibex's cast.
+    expect_error(
+        dplyr::mutate(source, day = as.Date(ts, tz = "America/New_York")),
+        class = "ibex_translation_error"
+    )
+    # Ibex has no string parse for Date().
+    expect_error(
+        dplyr::mutate(source, day = as.Date(text)),
         class = "ibex_translation_error"
     )
 })
@@ -706,4 +843,68 @@ test_that("a captured scalar does not cost the plan its nullability proofs", {
     query <- ibex_tbl(input, fallback = "error") |>
         dplyr::filter(y > .env$cutoff & !is.na(x))
     expect_identical(query$schema$nullable, c(FALSE, FALSE))
+})
+
+test_that("a mutate serves untouched columns from the caller's own vectors", {
+    input <- tibble::tibble(g = factor(c("a", "b", "a")), v = c(1.5, 2.5, 3.5))
+    query <- ibex_tbl(input, fallback = "error") |> dplyr::mutate(w = v * 2)
+    collected <- dplyr::collect(query)
+
+    # Same answer, same column order, same types as a full materialization.
+    expect_identical(names(collected), c("g", "v", "w"))
+    expect_identical(collected$g, input$g)
+    expect_identical(collected$v, input$v)
+    expect_identical(collected$w, c(3, 5, 7))
+})
+
+test_that("a mutate that overwrites a column takes it from Ibex, not the source", {
+    # `v` is derived here, so serving it from the caller's vector would return
+    # the input values and silently drop the computation.
+    input <- tibble::tibble(g = c("a", "b"), v = c(1.5, 2.5))
+    collected <- dplyr::collect(
+        ibex_tbl(input, fallback = "error") |> dplyr::mutate(v = v * 10)
+    )
+    expect_identical(collected$v, c(15, 25))
+    expect_identical(collected$g, c("a", "b"))
+})
+
+test_that("a column whose R type differs from the collected type is not reused", {
+    # An R integer binds as Int64 and collects back as a double. Handing the
+    # caller's integer vector back would make the same query return a different
+    # type depending on whether the reuse path ran.
+    input <- tibble::tibble(i = c(1L, 2L, 3L), v = c(1.5, 2.5, 3.5))
+    collected <- dplyr::collect(
+        ibex_tbl(input, fallback = "error") |> dplyr::mutate(w = v * 2)
+    )
+    expect_type(collected$i, "double")
+    expect_identical(collected$i, c(1, 2, 3))
+})
+
+test_that("a step that breaks the row correspondence releases the caller's table", {
+    # The retained reference is strong, so it must not outlive its usefulness:
+    # anything that changes which rows come back, or their order, drops it.
+    input <- tibble::tibble(g = c("a", "b", "a"), v = c(1.5, 2.5, 3.5))
+    source <- ibex_tbl(input, fallback = "error")
+    expect_false(is.null(source$source_frame))
+
+    expect_null((source |> dplyr::filter(v > 2))$source_frame)
+    expect_null((source |> dplyr::arrange(v))$source_frame)
+    expect_null((source |> dplyr::distinct(g))$source_frame)
+    expect_null((source |> dplyr::group_by(g) |> dplyr::mutate(w = v * 2))$source_frame)
+    # A plain mutate keeps it, which is the whole point.
+    expect_false(is.null((source |> dplyr::mutate(w = v * 2))$source_frame))
+})
+
+test_that("filtering after a mutate still returns the filtered rows", {
+    # The reuse path must not fire once a filter is in the plan: the caller's
+    # vectors have every row, the answer does not.
+    input <- tibble::tibble(g = c("a", "b", "a"), v = c(1.5, 2.5, 3.5))
+    collected <- dplyr::collect(
+        ibex_tbl(input, fallback = "error") |>
+            dplyr::mutate(w = v * 2) |>
+            dplyr::filter(v > 2)
+    )
+    expect_identical(nrow(collected), 2L)
+    expect_identical(collected$v, c(2.5, 3.5))
+    expect_identical(collected$w, c(5, 7))
 })

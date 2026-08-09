@@ -228,6 +228,30 @@ TEST_CASE("REPL: integer literal does NOT auto-coerce to Bool or String", "[repl
     REQUIRE_FALSE(ibex::repl::execute_script("let s: String = 5;", registry));
 }
 
+TEST_CASE("REPL binds a date or timestamp literal as a scalar", "[repl][time]") {
+    // These parse into LiteralExpr like any other literal, but the top-level
+    // scalar binder only unpacked Int/Double/Bool/String and rejected the rest
+    // as an "unsupported scalar literal".
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let d = date\"2013-01-02\"; d;", registry));
+    REQUIRE(ibex::repl::execute_script("let t = ts\"2013-01-02T03:04:05\"; t;", registry));
+    REQUIRE(ibex::repl::execute_script("let d: Date = date\"2013-01-02\"; d;", registry));
+}
+
+TEST_CASE("REPL applies Date() to a top-level scalar and column", "[repl][time][cast]") {
+    // The REPL evaluates casts outside a table through its own scalar/column
+    // implementations, separate from the runtime's builtin registry.
+    ibex::runtime::ExternRegistry registry;
+    REQUIRE(ibex::repl::execute_script("let d = Date(ts\"2013-01-02T23:59:59\"); d;", registry));
+    REQUIRE(ibex::repl::execute_script("Date(date\"2013-01-02\");", registry));
+    REQUIRE(
+        ibex::repl::execute_script("let t = trades[select { ts = ts\"2013-01-02T23:59:59\" }];\n"
+                                   "let (c) = t;\n"
+                                   "Date(c);",
+                                   registry));
+    REQUIRE_FALSE(ibex::repl::execute_script("Date(\"2013-01-02\");", registry));
+}
+
 TEST_CASE("REPL executes multi-statement script with chained let bindings") {
     ibex::runtime::TableRegistry tables;
     ibex::runtime::Table t;
@@ -2044,4 +2068,100 @@ let customers = Table { cust = [10, 20], tier = [7, 8] };
 pair(orders, customers);
 )";
     CHECK(ibex::repl::execute_script(satisfied, registry, config));
+}
+
+// The REPL evaluates a statement through `lower_expr`, which — unlike
+// `parser::lower()` for a whole program — does no plan rewriting of its own.
+// The statement path therefore runs the schema-aware join pushdowns and the
+// optimizer itself. All three rewrites below are semantics-preserving, so what
+// these lock in is that enabling them did not change an answer: each query is
+// paired with a formulation the rewrite cannot apply to, and the two must agree.
+TEST_CASE("REPL statement path: semi join pushed under an inner join keeps its rows",
+          "[repl][join][semi]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+    std::vector<std::int64_t> pushed;
+    std::vector<std::int64_t> direct;
+
+    // `(events ⋈ users) ⋉ syms on sym` — the semi key lives entirely on the
+    // left of the inner join, so it may be pushed below it.
+    register_int_capture(registry, "amount", pushed);
+    const char* pushed_src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let events = Table { uid = [1, 2, 3, 4, 5], sym = ["A", "B", "A", "C", "B"], amount = [10, 20, 30, 40, 50] };
+let users = Table { uid = [1, 2, 3, 4, 5], tier = [7, 8, 9, 7, 8] };
+let syms = Table { sym = ["A", "C"] };
+let out = (events join users on { uid }) semi join syms on { sym };
+capture(out[order { amount }]);
+)";
+    REQUIRE(ibex::repl::execute_script(pushed_src, registry, config));
+
+    // The same answer written so no pushdown applies: filter first, then join.
+    register_int_capture(registry, "amount", direct);
+    const char* direct_src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let events = Table { uid = [1, 2, 3, 4, 5], sym = ["A", "B", "A", "C", "B"], amount = [10, 20, 30, 40, 50] };
+let users = Table { uid = [1, 2, 3, 4, 5], tier = [7, 8, 9, 7, 8] };
+let out = (events[filter sym != "B"]) join users on { uid };
+capture(out[order { amount }]);
+)";
+    REQUIRE(ibex::repl::execute_script(direct_src, registry, config));
+
+    CHECK(pushed == std::vector<std::int64_t>{10, 30, 40});
+    CHECK(pushed == direct);
+}
+
+TEST_CASE("REPL statement path: anti join pushed under an inner join keeps its rows",
+          "[repl][join][anti]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+    std::vector<std::int64_t> pushed;
+
+    register_int_capture(registry, "amount", pushed);
+    const char* src = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let events = Table { uid = [1, 2, 3, 4, 5], sym = ["A", "B", "A", "C", "B"], amount = [10, 20, 30, 40, 50] };
+let users = Table { uid = [1, 2, 3, 4, 5], tier = [7, 8, 9, 7, 8] };
+let syms = Table { sym = ["A", "C"] };
+let out = (events join users on { uid }) anti join syms on { sym };
+capture(out[order { amount }]);
+)";
+    REQUIRE(ibex::repl::execute_script(src, registry, config));
+
+    // The complement of the semi join above.
+    CHECK(pushed == std::vector<std::int64_t>{20, 50});
+}
+
+TEST_CASE("REPL statement path: order followed by head returns the true top rows",
+          "[repl][order][topk]") {
+    // Canonicalize R16 fuses this into a TopK the runtime answers with a
+    // partial heap-select instead of a full sort. Ties and the row count are
+    // where a heap-select and a sort-then-truncate could disagree.
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplConfig config;
+    config.persistent_history = false;
+    std::vector<std::int64_t> topk;
+    std::vector<std::int64_t> sorted_head;
+
+    register_int_capture(registry, "v", topk);
+    const char* fused = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let t = Table { v = [5, 1, 9, 3, 9, 7, 2] };
+capture(t[order { v desc }][head 3]);
+)";
+    REQUIRE(ibex::repl::execute_script(fused, registry, config));
+
+    register_int_capture(registry, "v", sorted_head);
+    const char* unfused = R"(
+extern fn capture(df: DataFrame) -> Int from "fake.hpp";
+let t = Table { v = [5, 1, 9, 3, 9, 7, 2] };
+let ordered = t[order { v desc }];
+capture(ordered[head 3]);
+)";
+    REQUIRE(ibex::repl::execute_script(unfused, registry, config));
+
+    CHECK(topk == std::vector<std::int64_t>{9, 9, 7});
+    CHECK(topk == sorted_head);
 }

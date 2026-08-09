@@ -955,6 +955,43 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         m.emplace("minute", date_part);
         m.emplace("second", date_part);
 
+        // Date: Timestamp|Date|Int -> Date. Truncating an instant to its
+        // calendar day cuts on UTC, like every other calendar-boundary
+        // operation over a zone-less Timestamp (SPEC section 2). An Int is
+        // read as days since the epoch, which is Date's storage.
+        m.emplace(
+            "Date",
+            BuiltinFn{
+                .min_args = 1,
+                .max_args = 1,
+                .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                    if (a[0] == ExprType::Timestamp || a[0] == ExprType::Date ||
+                        a[0] == ExprType::Int) {
+                        return ExprType::Date;
+                    }
+                    return std::unexpected(std::string(name) +
+                                           "(): cannot cast to Date (expected Timestamp, Date, or "
+                                           "Int days since the epoch)");
+                },
+                .exec = ScalarExec{.eval = [](std::string_view name,
+                                              const std::vector<ExprValue>& a) -> IV {
+                    if (const auto* ts = std::get_if<Timestamp>(a.data())) {
+                        return ExprValue{timestamp_to_date(*ts)};
+                    }
+                    if (const auto* d = std::get_if<Date>(a.data())) {
+                        return ExprValue{*d};
+                    }
+                    if (const auto* i = std::get_if<std::int64_t>(a.data())) {
+                        if (*i < std::numeric_limits<std::int32_t>::min() ||
+                            *i > std::numeric_limits<std::int32_t>::max()) {
+                            return std::unexpected(std::string(name) + "(): date out of range");
+                        }
+                        return ExprValue{Date{static_cast<std::int32_t>(*i)}};
+                    }
+                    return std::unexpected(std::string(name) + "(): cannot cast to Date");
+                }},
+            });
+
         // is_nan: Float64 -> Bool.
         m.emplace("is_nan",
                   BuiltinFn{
@@ -1630,16 +1667,31 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return expr_type_for_column(*source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
-        if (std::holds_alternative<std::int64_t>(lit->value)) {
-            return ExprType::Int;
-        }
-        if (std::holds_alternative<double>(lit->value)) {
-            return ExprType::Double;
-        }
-        if (std::holds_alternative<bool>(lit->value)) {
-            return ExprType::Bool;
-        }
-        return ExprType::String;
+        // Visited rather than tested alternative by alternative: a literal
+        // arm that falls through to String allocates a String column for a
+        // `date"..."`/`ts"..."` value that `eval_expr` then hands back as a
+        // Date/Timestamp, which trips eval_expr_column's invariant. An
+        // exhaustive visit makes a new Literal alternative a compile error
+        // instead.
+        return std::visit(
+            [](const auto& value) -> ExprType {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, std::int64_t>) {
+                    return ExprType::Int;
+                } else if constexpr (std::is_same_v<T, double>) {
+                    return ExprType::Double;
+                } else if constexpr (std::is_same_v<T, bool>) {
+                    return ExprType::Bool;
+                } else if constexpr (std::is_same_v<T, Date>) {
+                    return ExprType::Date;
+                } else if constexpr (std::is_same_v<T, Timestamp>) {
+                    return ExprType::Timestamp;
+                } else {
+                    static_assert(std::is_same_v<T, std::string>);
+                    return ExprType::String;
+                }
+            },
+            lit->value);
     }
     if (const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node)) {
         auto left = infer_expr_type(*bin->left, input, scalars, externs);

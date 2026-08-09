@@ -116,5 +116,7 @@ test_that("an R integer column binds through the Arrow path", {
 
     expect_equal(out$i, c(1, 2, NA))
     # The factor is also "i", but with dictionary storage: still a categorical.
-    expect_equal(out$f, c("a", "b", "a"))
+    # A Categorical collects back as the factor it was handed over as, rather
+    # than being decoded to one R string per row.
+    expect_equal(out$f, factor(c("a", "b", "a")))
 })

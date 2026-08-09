@@ -48,7 +48,37 @@ as_ibex_result <- function(payload, format) {
         return(array)
     }
 
-    warn_int64_precision(as.data.frame(array), schema)
+    warn_int64_precision(convert_ibex_array(array, schema), schema)
+}
+
+# An Ibex Categorical is exported as an Arrow dictionary array, which is
+# exactly what an R factor is: integer codes plus a levels vector. nanoarrow's
+# default conversion does not see it that way -- it decodes the dictionary and
+# materializes one R string per row, which costs 165ms on an 8M-row column
+# against 17ms for the factor it already had the parts for, and throws away the
+# encoding on the way.
+#
+# So name the ptype rather than letting it be inferred: `factor()` for the
+# dictionary columns, and the inferred ptype for every other column, which is
+# the same conversion `as.data.frame()` would have chosen for them.
+convert_ibex_array <- function(array, schema) {
+    children <- schema$children
+    if (!length(children)) {
+        return(as.data.frame(array))
+    }
+    is_dictionary <- vapply(children, function(child) !is.null(child$dictionary), logical(1))
+    if (!any(is_dictionary)) {
+        return(as.data.frame(array))
+    }
+
+    ptype <- lapply(seq_along(children), function(i) {
+        if (is_dictionary[[i]]) factor() else nanoarrow::infer_nanoarrow_ptype(children[[i]])
+    })
+    names(ptype) <- names(children)
+    nanoarrow::convert_array(
+        array,
+        to = structure(ptype, class = "data.frame", row.names = integer(0))
+    )
 }
 
 # R has no 64-bit integer vector, so an Ibex Int64 column reaches R as a

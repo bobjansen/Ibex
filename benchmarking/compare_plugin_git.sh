@@ -233,6 +233,7 @@ configure_and_build() {
         -DCMAKE_BUILD_TYPE=Release \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+        -DIBEX_BUILD_LIGHTGBM=OFF \
         "${launcher_args[@]}" \
         "${CONFIGURE_ARGS[@]}" >"$log_file" 2>&1; then
         cat "$log_file" >&2

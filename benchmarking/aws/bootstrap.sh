@@ -88,6 +88,7 @@ CMAKE_VERSION=3.31.6
 
 MARKER=/opt/ibex/.ami-provisioned
 MIN_R_VERSION=4.4.0
+R_BENCH_LIB=/opt/ibex-r-packages
 
 r_is_supported() {
     command -v Rscript >/dev/null 2>&1 \
@@ -105,28 +106,35 @@ install_current_r() {
         "deb https://cloud.r-project.org/bin/linux/ubuntu $(lsb_release -cs)-cran40/"
     apt_get_retry update -qq
     apt_get_retry install -y --no-install-recommends r-base r-base-dev
-
-    # Install these from the same repository as R. Ubuntu's prebuilt R
-    # packages target its older R 4.3 runtime and must not be mixed in.
-    Rscript -e '
-        needed <- c("data.table", "dplyr", "tidyr", "optparse")
-        missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
-        if (length(missing) > 0) {
-            install.packages(missing, repos = "https://cloud.r-project.org")
-        }
-    '
     r_is_supported || {
         echo "R ${MIN_R_VERSION} or newer is required, but installation did not provide it" >&2
         return 1
     }
 }
 
+install_r_benchmark_packages() {
+    # Do not load Noble's /usr/lib/R/site-library: it contains native packages
+    # compiled for R 4.3 (for example rlang), which fail to load in CRAN's newer
+    # R. This dedicated library persists in the AMI and precedes the temporary
+    # R-only package library used by each benchmark run.
+    mkdir -p "$R_BENCH_LIB"
+    export R_LIBS_SITE="$R_BENCH_LIB"
+    R_LIBS_USER="$R_BENCH_LIB" Rscript -e '
+        needed <- c("data.table", "dplyr", "tidyr", "optparse")
+        missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
+        if (length(missing) > 0) {
+            install.packages(missing, repos = "https://cloud.r-project.org",
+                             dependencies = TRUE)
+        }
+    '
+}
+
 ensure_current_r() {
-    if r_is_supported; then
-        return 0
+    if ! r_is_supported; then
+        echo "Installing R ${MIN_R_VERSION} or newer from CRAN's Ubuntu repository"
+        install_current_r
     fi
-    echo "Installing R ${MIN_R_VERSION} or newer from CRAN's Ubuntu repository"
-    install_current_r
+    install_r_benchmark_packages
 }
 
 # ── Provisioning ──────────────────────────────────────────────────────────────

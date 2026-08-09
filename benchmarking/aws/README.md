@@ -143,6 +143,8 @@ than discarding the sizes below it.
 Downloads `benchmarking/results/r_only_aws_<timestamp>.tar.gz`: one TSV per
 size, a `combined.tsv` carrying a `dataset_rows` column, and a `versions.txt`
 recording the instance type, core count and R/data.table/dplyr versions.
+AWS provisioning installs R from CRAN's Ubuntu repository (R 4.4 or newer),
+because Ubuntu 24.04's stock R 4.3 cannot install the Ibex R package.
 The launcher waits for a separate completion marker, so a bootstrap failure
 cannot be reported as a completed archive; on failure it instead recovers the
 latest partial archive. `versions.txt` records the runner exit code, stage,

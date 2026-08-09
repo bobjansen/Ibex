@@ -149,17 +149,27 @@ echo ""
 # ── R ────────────────────────────────────────────────────────────────────────
 if [[ $INSTALL_R -eq 1 ]]; then
     echo "━━━ R ━━━"
-    apt_get_retry install -y --no-install-recommends \
-        r-base r-cran-data.table r-cran-optparse
+    # Ubuntu Noble's archive has R 4.3, but ibex requires R >= 4.4. CRAN's
+    # `cran40` repository name denotes the R 4.x ABI, not an R 4.0 pin.
+    apt_get_retry install -y --no-install-recommends dirmngr
+    wget -qO /etc/apt/trusted.gpg.d/cran_ubuntu_key.asc \
+        https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc
+    add_apt_repository_retry -y \
+        "deb https://cloud.r-project.org/bin/linux/ubuntu $(lsb_release -cs)-cran40/"
+    apt_get_retry update -qq
+    apt_get_retry install -y --no-install-recommends r-base r-base-dev
 
-    # dplyr and tidyr may not be in apt; install from CRAN if missing
+    # Install every benchmark package against the CRAN R runtime, rather than
+    # mixing in Ubuntu packages compiled for the older distro R.
     Rscript -e '
-        needed <- c("dplyr", "tidyr")
+        needed <- c("data.table", "dplyr", "tidyr", "optparse")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org")
         }
     '
+
+    Rscript -e 'if (getRversion() < "4.4.0") stop("R 4.4.0 or newer is required")'
 
     echo "✓ R: $(Rscript --version 2>&1 | head -1)"
     echo "✓ data.table: $(Rscript -e 'cat(as.character(packageVersion("data.table")))')"

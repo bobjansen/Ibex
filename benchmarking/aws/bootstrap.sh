@@ -36,6 +36,8 @@
 #   IBEX_PREBUILD     — "1" (default) to build ibex during provisioning so the
 #                       baked AMI carries a warm Arrow/FetchContent tree
 #   IBEX_AMI_STATUS_KEY — S3 key to write "ok"/"fail" to (provision-only mode)
+#   IBEX_R_ONLY_MODE  — "1" to run the R-only suite (run-r-only.sh)
+#   IBEX_R_ONLY_CORES — cores the R-only sweep is pinned to (default: nproc)
 
 set -euo pipefail
 
@@ -871,6 +873,116 @@ if [[ "${IBEX_OHLC_MODE:-0}" == "1" ]]; then
             --rows "$OHLC_SWEEP_ROWS" --symbols "${OHLC_SYMBOLS[@]}"
         run_resample "$n" "resample_rows_c${n}" \
             --rows "${OHLC_ROWS[@]}" --symbols "$OHLC_SWEEP_SYMBOLS"
+    done
+    exit 0
+fi
+
+# ── R-only mode (run-r-only.sh) ───────────────────────────────────────────────
+# data.table vs in-memory dplyr vs Ibex's lazy dplyr backend, over the website
+# suite's fixtures, at one row count after another.
+#
+# The sweep is driven one size per invocation rather than handing the whole list
+# to run_r_only.sh, for two reasons: the artifact can then be refreshed after
+# every size, so an interrupted run still yields what finished; and each size's
+# generated fixtures are deleted before the next is generated, which is what
+# keeps a 32M sweep inside the box's disk.
+if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
+    R_ONLY_OUT=/ibex/benchmarking/results/r_only
+    ARTIFACT=/ibex/benchmarking/results/r_only.tar.gz
+    # Partial snapshots need their OWN key: the launcher's wait loop returns as
+    # soon as the final key appears, so publishing a first-size snapshot there
+    # would masquerade as a finished sweep.
+    PARTIAL_KEY="${IBEX_RESULT_KEY%.tar.gz}.partial.tar.gz"
+    R_ONLY_LIB=/opt/ibex-rlib
+
+    # Stitch every size that has finished into one TSV, then tar it. Rebuilt
+    # from the per-size files each time rather than appended to, so it is
+    # correct whether it runs after size three or after the last one.
+    pack_r_only() {
+        mkdir -p "$R_ONLY_OUT"
+        local combined="$R_ONLY_OUT/combined.tsv" dir rows
+        printf 'dataset_rows\tframework\tquery\tavg_ms\tmin_ms\tmax_ms\tstddev_ms\tp95_ms\tp99_ms\trows\tpeak_rss_mb\n' > "$combined"
+        for dir in "$R_ONLY_OUT"/*/; do
+            [[ -f "$dir/r_only.tsv" ]] || continue
+            rows="$(basename "$dir")"
+            tail -n +2 "$dir/r_only.tsv" \
+                | awk -v n="$rows" 'BEGIN { FS = OFS = "\t" } { print n, $0 }' >> "$combined"
+        done
+        tar -C /ibex/benchmarking/results -czf "$ARTIFACT" r_only
+    }
+
+    push_partial_r_only() {
+        pack_r_only 2>/dev/null || return 0
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
+            --region "${IBEX_REGION}" >/dev/null 2>&1 || true
+    }
+
+    finish_r_only() {
+        local code=$?
+        mkdir -p "$R_ONLY_OUT"
+        {
+            echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
+            # IMDSv2 is enforced, so the metadata call needs a token first — a
+            # plain GET returns 401 and the type silently reads "unknown".
+            imds_token=$(curl -fsS --max-time 5 -X PUT \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+                http://169.254.169.254/latest/api/token 2>/dev/null || true)
+            echo "instance_type=$(curl -fsS --max-time 5 \
+                -H "X-aws-ec2-metadata-token: ${imds_token}" \
+                http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+            echo "nproc=$(nproc)"
+            echo "cores_used=${IBEX_R_ONLY_CORES:-$(nproc)}"
+            echo "sizes=${IBEX_SIZES:-}"
+            echo "warmup=${IBEX_WARMUP:-1} iters=${IBEX_ITERS:-5}"
+            echo "R=$(Rscript --version 2>&1 | head -1)"
+            R_LIBS_USER="$R_ONLY_LIB" Rscript -e 'cat(sprintf("data.table=%s\ndplyr=%s\n", packageVersion("data.table"), packageVersion("dplyr")))' 2>/dev/null || true
+        } > "$R_ONLY_OUT/versions.txt" 2>&1 || true
+        pack_r_only || true
+        aws s3 cp "$ARTIFACT" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" --region "${IBEX_REGION}" || true
+        shutdown -h now
+        return "$code"
+    }
+    trap finish_r_only EXIT
+
+    build_ibex
+    uv sync --project /ibex   # gen_data.py runs under uv
+
+    # Install the R package ONCE, into a lib that outlives each size's run, and
+    # from a TARBALL rather than the source directory: `ibex.so` depends on the
+    # package's own objects and not on the static libraries it links, so
+    # installing the source tree in place can reuse stale objects and silently
+    # benchmark a previous engine. `R CMD build` copies to a clean tree, which
+    # is what makes the install honest.
+    mkdir -p "$R_ONLY_LIB"
+    (
+        cd /tmp
+        IBEX_ROOT=/ibex IBEX_BUILD_DIR=/ibex/build-release R CMD build /ibex/r/ibex
+        IBEX_ROOT=/ibex IBEX_BUILD_DIR=/ibex/build-release \
+            R CMD INSTALL --library="$R_ONLY_LIB" ibex_*.tar.gz
+    )
+    export R_LIBS_USER="$R_ONLY_LIB"
+
+    R_ONLY_CORES="${IBEX_R_ONLY_CORES:-$(nproc)}"
+    # Hold every framework to the same budget. `taskset` bounds the process, and
+    # the two variables stop Ibex's worker pool and data.table's OpenMP pool
+    # from each sizing themselves from nproc and oversubscribing the pinned set.
+    export IBEX_THREADS="$R_ONLY_CORES"
+    export OMP_NUM_THREADS="$R_ONLY_CORES"
+
+    mkdir -p "$R_ONLY_OUT"
+    IFS=',' read -r -a R_ONLY_SIZES <<< "${IBEX_SIZES:-1M,2M,4M,8M,16M,32M}"
+    for size in "${R_ONLY_SIZES[@]}"; do
+        echo "=== r-only suite: ${size} on ${R_ONLY_CORES} core(s)"
+        # Non-fatal: one size running out of memory at the top of the sweep must
+        # not discard the sizes below it, which are already on disk.
+        taskset -c "0-$((R_ONLY_CORES - 1))" \
+            bash /ibex/benchmarking/run_r_only.sh \
+                --sizes "$size" \
+                --warmup "${IBEX_WARMUP:-1}" \
+                --iters "${IBEX_ITERS:-5}" \
+                --skip-install \
+            || echo "WARNING: r-only suite failed at ${size}; keeping earlier sizes" >&2
+        push_partial_r_only
     done
     exit 0
 fi

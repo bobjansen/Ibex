@@ -11,6 +11,7 @@ pull the results back as a CSV. Three layers:
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
 | `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
 | `run-window-ohlc.sh` | local       | One instance runs the window-OHLC suite (Ibex/Polars/DuckDB) and downloads a TSV artifact. |
+| `run-r-only.sh`      | local       | One 8-core instance runs the R-only suite (data.table/dplyr/ibex-r) across a size sweep. |
 | `compare-git.sh`     | local       | A/B **two git commits** of ibex on one clean box (low-noise perf verdict). |
 | `bisect-git.sh`      | local       | Single-instance performance `git bisect` for one benchmark query. |
 | `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
@@ -103,6 +104,47 @@ Default instance is `m7i.8xlarge` (32 vCPU / 128 GiB): the memory is sized so a
 per core count, plus a `versions.txt` recording the instance type, core count
 and engine versions. Data files are generated on the box and are not part of
 the artifact.
+
+## 3a.3 R-only (data.table vs dplyr vs ibex-r)
+
+```bash
+git push
+./benchmarking/aws/run-r-only.sh
+```
+
+The three R-facing paths over identical fixtures: `data.table`, in-memory
+`dplyr`, and Ibex's native lazy dplyr backend. R against R, in one process,
+with no engine reading a different file format — the comparison the website's
+`data.table` column cannot make.
+
+Sizes sweep `1M,2M,4M,8M,16M,32M` (`--sizes`), five timed iterations after one
+warmup (`--iters`, `--warmup`).
+
+**Eight cores, deliberately** (`--cores`, default 8). The three frameworks
+scale differently with thread count, so an unpinned box turns a query
+comparison into a thread-count comparison. `taskset` bounds the process and
+`IBEX_THREADS`/`OMP_NUM_THREADS` stop Ibex's worker pool and data.table's
+OpenMP pool from each sizing themselves from `nproc` and oversubscribing the
+pinned set.
+
+The instance type is therefore chosen for **memory**, not cores: the default
+`r7i.2xlarge` is 8 vCPU / 64 GiB, because 32M rows has to fit in three
+frameworks at once and the `events`+`users` phase holds a 32M-row join output
+in both R and Ibex. `--type m7i.2xlarge` (8 vCPU / 32 GiB) is cheaper and fine
+up to 16M.
+
+One size is run per invocation of `run_r_only.sh`, which buys two things: the
+artifact is refreshed under a separate **partial** key after every size, so an
+interrupted sweep still yields everything that finished; and each size's
+fixtures are deleted before the next is generated, which is what keeps a 32M
+sweep inside the box's disk. A size that fails is logged and skipped rather
+than discarding the sizes below it.
+
+Downloads `benchmarking/results/r_only_aws_<timestamp>.tar.gz`: one TSV per
+size, a `combined.tsv` carrying a `dataset_rows` column, and a `versions.txt`
+recording the instance type, core count and R/data.table/dplyr versions.
+Analyse it with Ibex itself — `benchmarking/analyze_r_only.ibex` reads a
+`r_only.tsv` and prints the win/loss table.
 
 ## 3b. Run one instance per engine (parallel, isolated)
 

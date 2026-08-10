@@ -3821,6 +3821,110 @@ TEST_CASE("rolling_median odd window size") {
     CHECK((*m)[3] == Catch::Approx(30.0));
 }
 
+TEST_CASE("rolling_median matches a brute-force median across window sizes") {
+    // The sliding median is a pair of flat heaps with a FIFO slot index
+    // (SlidingMedian in window.cpp) — index arithmetic that no three-row test
+    // exercises. Cross-check it against sort-the-window over a pseudo-random
+    // walk, at window sizes that hit the interesting shapes: 1, even/odd small,
+    // one that straddles a cache level, one equal to the row count, and one
+    // wider than the table (the structure never fills). Values repeat often
+    // enough that duplicates land in both halves.
+    constexpr std::size_t kRows = 900;
+    std::vector<double> vals(kRows);
+    std::uint64_t state = 0x9E3779B97F4A7C15ULL;
+    double acc = 0.0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 21U) - 10.0;
+        vals[i] = acc;
+    }
+
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        val.push_back(vals[i]);
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    for (const std::size_t w : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{8},
+                                std::size_t{101}, std::size_t{512}, kRows, kRows + 137}) {
+        CAPTURE(w);
+        const std::string src =
+            "data[update { m = rolling_median(val, " + std::to_string(w) + ") }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* m = std::get_if<Column<double>>(result->find("m"));
+        REQUIRE(m != nullptr);
+
+        std::vector<double> scratch;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const std::size_t lo = i + 1 >= w ? i + 1 - w : 0;
+            scratch.assign(vals.begin() + static_cast<std::ptrdiff_t>(lo),
+                           vals.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            std::ranges::sort(scratch);
+            const std::size_t n = scratch.size();
+            const double want =
+                (n % 2 == 1) ? scratch[n / 2] : (scratch[(n / 2) - 1] + scratch[n / 2]) / 2.0;
+            CAPTURE(i);
+            REQUIRE((*m)[i] == Catch::Approx(want));
+        }
+    }
+}
+
+TEST_CASE("rolling_median skips nulls and propagates NaN") {
+    // Nulls never enter the structure and NaNs are counted beside it, so both
+    // paths make the values that DO enter leave in a different order than the
+    // rows do. That is exactly what the FIFO slot index depends on.
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    runtime::ValidityBitmap valid(12, true);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> raw{1.0, 5.0, 0.0, 3.0, 9.0, nan, 2.0, 7.0, 0.0, 4.0, 6.0, 8.0};
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        val.push_back(raw[i]);
+    }
+    valid.set(2, false);  // null
+    valid.set(8, false);  // null
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val), std::move(valid));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir("data[update { m = rolling_median(val, 3) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+
+    // Window of the last 3 rows, nulls dropped from it, NaN poisoning it.
+    CHECK((*m)[0] == Catch::Approx(1.0));  // {1}
+    CHECK((*m)[1] == Catch::Approx(3.0));  // {1,5}
+    CHECK((*m)[2] == Catch::Approx(3.0));  // {1,5} (row 2 null)
+    CHECK((*m)[3] == Catch::Approx(4.0));  // {5,3} (row 2 null)
+    CHECK((*m)[4] == Catch::Approx(6.0));  // {3,9} (row 2 null)
+    CHECK(std::isnan((*m)[5]));            // NaN in window
+    CHECK(std::isnan((*m)[6]));
+    CHECK(std::isnan((*m)[7]));
+    CHECK((*m)[8] == Catch::Approx(4.5));   // {2,7} (row 8 null), NaN aged out
+    CHECK((*m)[9] == Catch::Approx(5.5));   // {7,4}
+    CHECK((*m)[10] == Catch::Approx(5.0));  // {4,6} (row 8 null)
+    CHECK((*m)[11] == Catch::Approx(6.0));  // {4,6,8}
+}
+
 TEST_CASE("rolling_std with 2ns window") {
     // row 0: {10}      -> n<2, stddev = 0.0
     // row 1: {10,20}   -> mean=15, M2=50, sample std = sqrt(50/1)=sqrt(50)~7.071

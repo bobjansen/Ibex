@@ -3218,11 +3218,12 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 class ChunkedInnerJoinOperator final : public Operator {
    public:
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-                             ir::JoinSuffixPolicy suffix = {},
+                             const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr)
         : left_(std::move(left)),
           right_(std::move(right)),
           keys_(keys),
+          exec_(&exec),
           suffix_(std::move(suffix)),
           pending_order_(pending_order) {}
 
@@ -3246,6 +3247,7 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_scalars_(scalars),
           deferred_externs_(externs),
           deferred_exec_(&exec),
+          exec_(&exec),
           suffix_(std::move(suffix)),
           pending_order_(pending_order) {}
 
@@ -4256,7 +4258,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         auto gather_with_validity =
             [&](const ColumnValue& src_col, const std::optional<ValidityBitmap>& src_val,
                 const std::size_t* idx) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-            ColumnValue gathered = gather_column(src_col, idx, total);
+            ColumnValue gathered = gather_column(src_col, idx, total, exec_);
             std::optional<ValidityBitmap> val;
             if (src_val.has_value()) {
                 const auto& src_bm = *src_val;
@@ -4369,6 +4371,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     const ScalarRegistry* deferred_scalars_ = nullptr;
     const ExternRegistry* deferred_externs_ = nullptr;
     const ExecutionContext* deferred_exec_ = nullptr;
+    /// Set by both constructors; the deferred one aliases `deferred_exec_`.
+    const ExecutionContext* exec_ = nullptr;
 
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
@@ -8886,8 +8890,8 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
                 return std::unexpected(std::move(right.error()));
             }
             return std::make_unique<ChunkedInnerJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), &join.keys(), join.suffix(),
-                &join.pending_order());
+                std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
+                join.suffix(), &join.pending_order());
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(

@@ -5,7 +5,10 @@
 
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -105,10 +108,57 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
         out);
 }
 
+/// Run `body(begin, end)` over `n` rows, across workers when that is worth it.
+///
+/// The unit of work is a row range and every range writes a disjoint slice of
+/// an already-sized output, so there is no merge and the result is identical to
+/// running the ranges in order — which is what lets a gather be threaded without
+/// changing a single byte of its answer.
+/// The row floor is `exec.parallel_min_rows` — the same knob the rest of the
+/// engine gates on, rather than a private constant a test could not reach.
+template <typename Body>
+void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
+    constexpr std::size_t kMaxRanges = 64;
+    std::size_t ranges = 1;
+    if (exec != nullptr && exec->parallel && n >= exec->parallel_min_rows &&
+        !on_worker_pool_thread()) {
+        const std::size_t min_rows = std::max<std::size_t>(exec->parallel_min_rows, 1);
+        auto& pool = process_worker_pool();
+        const std::size_t budget =
+            exec->parallel_threads != 0 ? exec->parallel_threads : pool.size();
+        ranges = std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges);
+        ranges = std::min({ranges, budget, pool.size()});
+    }
+    if (ranges < 2) {
+        body(std::size_t{0}, n);
+        return;
+    }
+    const std::size_t grain = (n + ranges - 1) / ranges;
+    std::atomic<std::size_t> cursor{0};
+    auto batch = process_worker_pool().submit(ranges, [&](std::size_t) {
+        while (true) {
+            const std::size_t r = cursor.fetch_add(1, std::memory_order_relaxed);
+            const std::size_t begin = r * grain;
+            if (begin >= n) {
+                return;
+            }
+            body(begin, std::min(n, begin + grain));
+        }
+    });
+    batch.wait();
+}
+
 /// Bulk-gather rows from `src` into a new column using the index array.
 /// One std::visit per column, not per row — much faster for large gathers.
+///
+/// `exec` (when non-null and parallel) splits the fixed-width and Categorical
+/// gathers across row ranges. Strings are left serial: their destination
+/// offsets depend on every preceding row's length, so a range cannot know where
+/// to write without a prefix pass first. `bool` is left serial too — a bitmap
+/// packs 64 rows per word, so neighbouring ranges would write the same word.
 [[nodiscard]] inline auto gather_column(const ColumnValue& src, const std::size_t* indices,
-                                        std::size_t n) -> ColumnValue {
+                                        std::size_t n, const ExecutionContext* exec = nullptr)
+    -> ColumnValue {
     return with_meta_of(
         std::visit(
             [&](const auto& col) -> ColumnValue {
@@ -116,8 +166,10 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
                     std::vector<Column<Categorical>::code_type> codes(n);
                     const auto* sp = col.codes_data();
-                    for (std::size_t i = 0; i < n; ++i)
-                        codes[i] = sp[indices[i]];
+                    for_row_ranges(exec, n, [&](std::size_t begin, std::size_t end) {
+                        for (std::size_t i = begin; i < end; ++i)
+                            codes[i] = sp[indices[i]];
+                    });
                     return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
                                                std::move(codes));
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
@@ -147,11 +199,21 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
                     return dst;
                 } else {
                     ColT dst;
-                    dst.resize(n);
+                    // Every slot is written below, so value-initializing first
+                    // is a whole extra pass over the output. Date/Timestamp
+                    // carry default member initializers and so are not
+                    // trivially default constructible; they keep plain resize.
+                    if constexpr (requires { dst.resize_for_overwrite(n); }) {
+                        dst.resize_for_overwrite(n);
+                    } else {
+                        dst.resize(n);
+                    }
                     auto* dp = dst.data();
                     const auto* sp = col.data();
-                    for (std::size_t i = 0; i < n; ++i)
-                        dp[i] = sp[indices[i]];
+                    for_row_ranges(exec, n, [&](std::size_t begin, std::size_t end) {
+                        for (std::size_t i = begin; i < end; ++i)
+                            dp[i] = sp[indices[i]];
+                    });
                     return dst;
                 }
             },

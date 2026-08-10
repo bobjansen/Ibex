@@ -3309,3 +3309,61 @@ TEST_CASE("E2E: resample cuts on local boundaries for a zoned index", "[e2e][tim
         }
     }
 }
+
+TEST_CASE("E2E: a threaded gather returns exactly the serial rows", "[e2e][parallel][gather]") {
+    // `gather_column` fills disjoint row ranges of an already-sized output, so
+    // unlike a float reduction its result must be EXACTLY the serial one at any
+    // thread count. A range that mislaid its offset, or an output sized without
+    // being fully written (the resize_for_overwrite obligation), shows up here
+    // as wrong or uninitialized values rather than as a rounding difference.
+    //
+    // A join and a filter are both exercised: they gather through the same
+    // helper but supply very different index arrays — the join's repeats and
+    // reorders rows, the filter's is strictly ascending.
+    constexpr std::size_t kRows = 4000;
+    std::vector<std::int64_t> keys;
+    std::vector<std::int64_t> vals;
+    std::vector<double> weights;
+    keys.reserve(kRows);
+    vals.reserve(kRows);
+    weights.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        keys.push_back(static_cast<std::int64_t>(row % 97));
+        vals.push_back(static_cast<std::int64_t>(row));
+        weights.push_back(static_cast<double>(row) * 0.25);
+    }
+    runtime::Table probe;  // not `left`: that is a join keyword
+    probe.add_column("k", Column<std::int64_t>{keys});
+    probe.add_column("v", Column<std::int64_t>{std::move(vals)});
+    probe.add_column("w", Column<double>{std::move(weights)});
+
+    std::vector<std::int64_t> rkeys;
+    std::vector<std::int64_t> tags;
+    for (std::int64_t k = 0; k < 97; ++k) {
+        rkeys.push_back(k);
+        tags.push_back(k * 1000);
+    }
+    runtime::Table build;
+    build.add_column("k", Column<std::int64_t>{std::move(rkeys)});
+    build.add_column("tag", Column<std::int64_t>{std::move(tags)});
+
+    runtime::TableRegistry tables;
+    tables.emplace("probe", std::move(probe));
+    tables.emplace("build", std::move(build));
+
+    const std::string_view src =
+        "let j = probe join build on k;\n"
+        "j[filter v > 500, select { v, w, tag }, order { v }];";
+
+    // grain/min_rows are lifted so a 4000-row table actually fans out; without
+    // that the parallel runs would silently be the serial one and prove nothing.
+    const auto want = run_parallel(src, tables, 0, 1);
+    REQUIRE(want.rows() > 0);
+    for (const std::size_t threads : {std::size_t{2}, std::size_t{3}, std::size_t{8}}) {
+        const auto got = run_parallel(src, tables, 0, threads);
+        REQUIRE(got.rows() == want.rows());
+        CHECK(col_i64(got, "v") == col_i64(want, "v"));
+        CHECK(col_i64(got, "tag") == col_i64(want, "tag"));
+        CHECK(col_dbl(got, "w") == col_dbl(want, "w"));
+    }
+}

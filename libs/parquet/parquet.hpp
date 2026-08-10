@@ -32,6 +32,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <arrow/api.h>
@@ -39,6 +40,7 @@
 #include <arrow/io/api.h>
 #include <arrow/util/bitmap_ops.h>
 #include <arrow/util/formatting.h>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -59,6 +61,7 @@
 #include <parquet/file_reader.h>
 #include <parquet/statistics.h>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1558,10 +1561,31 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
     return entry;
 }
 
-inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow::Schema& schema,
-                                const std::vector<int>& field_indices,
+/// Decode `field_indices` using one reader per worker, columns in parallel.
+///
+/// **Columns are the parallel axis, not row groups.** A PDS-H-shaped file has
+/// very few row groups (SF-1 `lineitem` has 6; every dimension table has 1) but
+/// the projection pushdown hands us several columns, so columns are both the
+/// wider axis and the cheaper one: a column is decoded whole by a single worker
+/// straight into its final buffer, so the result needs no merge or concat step
+/// — which is what makes this bit-identical to the serial decode rather than
+/// merely equivalent. Row-group parallelism would need both a merge and a way
+/// to split the single-row-group files, and would still leave the dimension
+/// tables serial.
+///
+/// `readers` must hold one independent `FileReader` per worker. Page readers
+/// and decode cursors are mutable, so workers cannot share one — see
+/// `ParquetLazySourceReader`, which owns the pool these come from. `readers[0]`
+/// may be the caller's own reader: the calling thread blocks in `wait()` for
+/// the whole batch and so never touches it concurrently.
+inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> readers,
+                                const arrow::Schema& schema, const std::vector<int>& field_indices,
                                 const ibex::runtime::Selection* selection, std::size_t source_rows,
                                 const DirectDecodeGroups& groups) -> ibex::runtime::Table {
+    if (readers.empty()) {
+        throw std::runtime_error("read_parquet: no reader for decode");
+    }
+    auto& reader = *readers.front();
     if (selection != nullptr) {
         if (!std::is_sorted(selection->begin(), selection->end()) ||
             std::adjacent_find(selection->begin(), selection->end()) != selection->end() ||
@@ -1585,18 +1609,49 @@ inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow:
         output_rows = static_cast<std::size_t>(std::distance(selection_begin, selection_end));
     }
 
-    ibex::runtime::Table out;
+    // Resolve every leaf index up front. The schema checks are cheap and doing
+    // them here keeps the worker body free of anything that could throw for a
+    // reason unrelated to its own column.
     const auto& manifest = reader.manifest();
+    std::vector<int> leaves;
+    leaves.reserve(field_indices.size());
     for (int field_index : field_indices) {
         if (field_index < 0 || field_index >= schema.num_fields() ||
             field_index >= static_cast<int>(manifest.schema_fields.size()) ||
             !manifest.schema_fields[static_cast<std::size_t>(field_index)].is_leaf()) {
             throw std::runtime_error("read_parquet: nested columns are not supported");
         }
-        auto entry = direct_column(
-            reader, *schema.field(field_index),
-            manifest.schema_fields[static_cast<std::size_t>(field_index)].column_index, selection,
-            groups, output_rows);
+        leaves.push_back(
+            manifest.schema_fields[static_cast<std::size_t>(field_index)].column_index);
+    }
+
+    std::vector<ibex::runtime::ColumnEntry> entries(field_indices.size());
+    auto decode_one = [&](std::size_t i, parquet::arrow::FileReader& worker_reader) {
+        entries[i] = direct_column(worker_reader, *schema.field(field_indices[i]), leaves[i],
+                                   selection, groups, output_rows);
+    };
+
+    const std::size_t workers = std::min(readers.size(), field_indices.size());
+    if (workers <= 1) {
+        for (std::size_t i = 0; i < field_indices.size(); ++i) {
+            decode_one(i, reader);
+        }
+    } else {
+        // A shared cursor rather than a static split: a string column can cost
+        // an order of magnitude more than an int one, so a fixed assignment
+        // would leave workers idle behind whoever drew `l_comment`.
+        std::atomic<std::size_t> next{0};
+        auto batch = ibex::runtime::process_worker_pool().submit(workers, [&](std::size_t worker) {
+            for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed); i < entries.size();
+                 i = next.fetch_add(1, std::memory_order_relaxed)) {
+                decode_one(i, *readers[worker]);
+            }
+        });
+        batch.wait();
+    }
+
+    ibex::runtime::Table out;
+    for (auto& entry : entries) {
         out.add_column_shared(std::move(entry.name), std::move(entry.column),
                               std::move(entry.validity));
     }
@@ -1606,10 +1661,30 @@ inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow:
 
 inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow::Schema& schema,
                                 const std::vector<int>& field_indices,
+                                const ibex::runtime::Selection* selection, std::size_t source_rows,
+                                const DirectDecodeGroups& groups) -> ibex::runtime::Table {
+    parquet::arrow::FileReader* one = &reader;
+    return direct_decode_table(std::span{&one, 1}, schema, field_indices, selection, source_rows,
+                               groups);
+}
+
+inline auto direct_decode_table(parquet::arrow::FileReader& reader, const arrow::Schema& schema,
+                                const std::vector<int>& field_indices,
                                 const ibex::runtime::Selection* selection, std::size_t source_rows)
     -> ibex::runtime::Table {
     return direct_decode_table(reader, schema, field_indices, selection, source_rows,
                                all_decode_groups(*reader.parquet_reader()->metadata()));
+}
+
+inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> readers,
+                                const arrow::Schema& schema, const std::vector<int>& field_indices,
+                                const ibex::runtime::Selection* selection, std::size_t source_rows)
+    -> ibex::runtime::Table {
+    if (readers.empty()) {
+        throw std::runtime_error("read_parquet: no reader for decode");
+    }
+    return direct_decode_table(readers, schema, field_indices, selection, source_rows,
+                               all_decode_groups(*readers.front()->parquet_reader()->metadata()));
 }
 
 }  // namespace
@@ -1821,6 +1896,42 @@ inline auto filtered_key_selection_impl(parquet::arrow::FileReader& reader, int 
     return selected;
 }
 
+/// Immutable reader construction inputs plus the bind-time reader. The first
+/// consumer takes that already-open reader; later (including concurrent)
+/// consumers build independent readers from the shared, already-parsed footer.
+class ParquetLazyReaderFactoryState {
+   public:
+    ParquetLazyReaderFactoryState(std::shared_ptr<arrow::io::RandomAccessFile> input,
+                                  std::shared_ptr<parquet::FileMetaData> metadata,
+                                  std::unique_ptr<parquet::arrow::FileReader> first_reader,
+                                  std::string path)
+        : input_(std::move(input)),
+          metadata_(std::move(metadata)),
+          first_reader_(std::move(first_reader)),
+          path_(std::move(path)) {}
+
+    auto make_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
+        {
+            std::lock_guard lock(first_reader_mutex_);
+            if (first_reader_ != nullptr) {
+                return std::move(first_reader_);
+            }
+        }
+        std::call_once(dictionary_columns_once_,
+                       [&] { dictionary_columns_ = dictionary_column_indices(*metadata_); });
+        return make_parquet_reader(input_, path_, metadata_, dictionary_columns_);
+    }
+
+   private:
+    std::shared_ptr<arrow::io::RandomAccessFile> input_;
+    std::shared_ptr<parquet::FileMetaData> metadata_;
+    std::vector<int> dictionary_columns_;
+    std::once_flag dictionary_columns_once_;
+    std::unique_ptr<parquet::arrow::FileReader> first_reader_;
+    std::string path_;
+    std::mutex first_reader_mutex_;
+};
+
 /// One independent Parquet decoder product. The Arrow schema and name index are
 /// immutable and shared by every product; the FileReader is deliberately not.
 /// Its page readers and decode cursors are mutable, so sharing it would serialize
@@ -1828,10 +1939,12 @@ inline auto filtered_key_selection_impl(parquet::arrow::FileReader& reader, int 
 class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
    public:
     ParquetLazySourceReader(std::unique_ptr<parquet::arrow::FileReader> reader,
+                            std::shared_ptr<ParquetLazyReaderFactoryState> factory,
                             std::shared_ptr<const std::map<std::string, int>> indices,
                             std::shared_ptr<arrow::Schema> schema, std::size_t rows,
                             std::string path)
         : reader_(std::move(reader)),
+          factory_(std::move(factory)),
           indices_(std::move(indices)),
           schema_(std::move(schema)),
           rows_(rows),
@@ -1850,7 +1963,9 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         }
 
         try {
-            return direct_decode_table(*reader_, *schema_, column_indices, selection, rows_);
+            auto readers = decode_readers(column_indices.size());
+            return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
+                                       rows_);
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: failed to read columns from " + path_ + " (" +
                                    e.what() + ")");
@@ -1900,47 +2015,49 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     }
 
    private:
+    /// Readers to decode `columns` columns with: this product's own reader
+    /// first, then as many extra ones as the thread budget justifies.
+    ///
+    /// Extra readers are built once and kept, because a lazy source is decoded
+    /// repeatedly (a query re-scans it per statement) and re-parsing is pure
+    /// waste — the footer is already shared, so an extra reader is just page
+    /// readers and cursors.
+    ///
+    /// Serial when the budget is one, when a single column was asked for, or
+    /// when this call is already running on a pool thread: `submit` from a
+    /// worker deadlocks against a saturated pool.
+    auto decode_readers(std::size_t columns) -> std::vector<parquet::arrow::FileReader*> {
+        std::size_t want = 1;
+        if (factory_ != nullptr && columns > 1 && rows_ >= kParallelDecodeMinRows &&
+            !ibex::runtime::on_worker_pool_thread() &&
+            ibex::runtime::parallel_enabled_from_env().value_or(true)) {
+            want = std::min(columns, ibex::runtime::default_thread_count());
+        }
+
+        while (extra_readers_.size() + 1 < want) {
+            extra_readers_.push_back(factory_->make_reader());
+        }
+
+        std::vector<parquet::arrow::FileReader*> readers;
+        readers.reserve(want);
+        readers.push_back(reader_.get());
+        for (std::size_t i = 0; i + 1 < want; ++i) {
+            readers.push_back(extra_readers_[i].get());
+        }
+        return readers;
+    }
+
+    /// Below this the decode is short enough that spinning up the pool and
+    /// building extra readers costs more than it saves.
+    static constexpr std::size_t kParallelDecodeMinRows = 65536;
+
     std::unique_ptr<parquet::arrow::FileReader> reader_;
+    std::vector<std::unique_ptr<parquet::arrow::FileReader>> extra_readers_;
+    std::shared_ptr<ParquetLazyReaderFactoryState> factory_;
     std::shared_ptr<const std::map<std::string, int>> indices_;
     std::shared_ptr<arrow::Schema> schema_;
     std::size_t rows_;
     std::string path_;
-};
-
-/// Immutable reader construction inputs plus the bind-time reader. The first
-/// consumer takes that already-open reader; later (including concurrent)
-/// consumers build independent readers from the shared, already-parsed footer.
-class ParquetLazyReaderFactoryState {
-   public:
-    ParquetLazyReaderFactoryState(std::shared_ptr<arrow::io::RandomAccessFile> input,
-                                  std::shared_ptr<parquet::FileMetaData> metadata,
-                                  std::unique_ptr<parquet::arrow::FileReader> first_reader,
-                                  std::string path)
-        : input_(std::move(input)),
-          metadata_(std::move(metadata)),
-          first_reader_(std::move(first_reader)),
-          path_(std::move(path)) {}
-
-    auto make_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
-        {
-            std::lock_guard lock(first_reader_mutex_);
-            if (first_reader_ != nullptr) {
-                return std::move(first_reader_);
-            }
-        }
-        std::call_once(dictionary_columns_once_,
-                       [&] { dictionary_columns_ = dictionary_column_indices(*metadata_); });
-        return make_parquet_reader(input_, path_, metadata_, dictionary_columns_);
-    }
-
-   private:
-    std::shared_ptr<arrow::io::RandomAccessFile> input_;
-    std::shared_ptr<parquet::FileMetaData> metadata_;
-    std::vector<int> dictionary_columns_;
-    std::once_flag dictionary_columns_once_;
-    std::unique_ptr<parquet::arrow::FileReader> first_reader_;
-    std::string path_;
-    std::mutex first_reader_mutex_;
 };
 
 inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTablePtr {
@@ -1979,8 +2096,8 @@ inline auto read_parquet_lazy(std::string_view path) -> ibex::runtime::LazyTable
          path_string]() -> std::expected<ibex::runtime::LazySourceReaderPtr, std::string> {
         try {
             auto reader = factory_state->make_reader();
-            return std::make_unique<ParquetLazySourceReader>(std::move(reader), indices,
-                                                             arrow_schema, rows, path_string);
+            return std::make_unique<ParquetLazySourceReader>(
+                std::move(reader), factory_state, indices, arrow_schema, rows, path_string);
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: failed to create reader for " + path_string +
                                    " (" + e.what() + ")");

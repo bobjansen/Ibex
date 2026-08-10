@@ -5526,6 +5526,171 @@ TEST_CASE("rolling_kurtosis wide window") {
     CHECK((*kv)[4] == Catch::Approx(-1.2).epsilon(1e-5));
 }
 
+namespace {
+
+/// Independent two-pass reference for the centered-moment kernels.
+[[nodiscard]] auto brute_skew(const std::vector<double>& w) -> double {
+    const std::size_t n = w.size();
+    if (n < 3)
+        return 0.0;
+    double mean = 0.0;
+    for (const double v : w)
+        mean += v;
+    mean /= static_cast<double>(n);
+    double m2 = 0.0;
+    double m3 = 0.0;
+    for (const double v : w) {
+        const double d = v - mean;
+        m2 += d * d;
+        m3 += d * d * d;
+    }
+    if (m2 == 0.0)
+        return 0.0;
+    const auto dn = static_cast<double>(n);
+    return (dn * std::sqrt(dn - 1.0) / (dn - 2.0)) * (m3 / std::pow(m2, 1.5));
+}
+
+[[nodiscard]] auto brute_kurtosis(const std::vector<double>& w) -> double {
+    const std::size_t n = w.size();
+    if (n < 4)
+        return 0.0;
+    double mean = 0.0;
+    for (const double v : w)
+        mean += v;
+    mean /= static_cast<double>(n);
+    double m2 = 0.0;
+    double m4 = 0.0;
+    for (const double v : w) {
+        const double d = v - mean;
+        const double d2 = d * d;
+        m2 += d2;
+        m4 += d2 * d2;
+    }
+    if (m2 == 0.0)
+        return 0.0;
+    const auto dn = static_cast<double>(n);
+    return (dn - 1.0) / ((dn - 2.0) * (dn - 3.0)) *
+           (((dn + 1.0) * dn * m4 / (m2 * m2)) - (3.0 * (dn - 1.0)));
+}
+
+}  // namespace
+
+TEST_CASE("rolling_skew and rolling_kurtosis match a brute-force reference") {
+    // Coverage here was a handful of five-row cases. These kernels now take
+    // their mean from a running compensated sum rather than a second pass over
+    // the window, which is a change to how the window is tracked, not to the
+    // formula — so the thing to pin is that the tracked window still holds
+    // exactly the rows a from-scratch pass would use.
+    constexpr std::size_t kRows = 600;
+    std::vector<double> vals(kRows);
+    std::uint64_t state = 0x64C7D8B2F3A15E09ULL;
+    double acc = 0.0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 17U) - 8.0;
+        vals[i] = acc;
+    }
+
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        val.push_back(vals[i]);
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    for (const std::size_t w :
+         {std::size_t{3}, std::size_t{4}, std::size_t{5}, std::size_t{37}, std::size_t{256}}) {
+        CAPTURE(w);
+        const std::string src = "data[update { s = rolling_skew(val, " + std::to_string(w) +
+                                "), k = rolling_kurtosis(val, " + std::to_string(w) + ") }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* sv = std::get_if<Column<double>>(result->find("s"));
+        const auto* kv = std::get_if<Column<double>>(result->find("k"));
+        REQUIRE(sv != nullptr);
+        REQUIRE(kv != nullptr);
+
+        for (std::size_t i = 0; i < kRows; ++i) {
+            const std::size_t lo = i + 1 >= w ? i + 1 - w : 0;
+            const std::vector<double> window(vals.begin() + static_cast<std::ptrdiff_t>(lo),
+                                             vals.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            CAPTURE(i);
+            REQUIRE((*sv)[i] == Catch::Approx(brute_skew(window)).epsilon(1e-9));
+            REQUIRE((*kv)[i] == Catch::Approx(brute_kurtosis(window)).epsilon(1e-9));
+        }
+    }
+}
+
+TEST_CASE("rolling_skew and rolling_kurtosis are invariant under an affine shift") {
+    // Both are location- and scale-free, so shifting a series onto a large
+    // offset must not change them. That makes this an accuracy test with an
+    // exact expected answer and no reference implementation needed — and the
+    // large offset is precisely where a sloppy mean shows up, since the
+    // deviations are eleven orders of magnitude below the values.
+    //
+    // The tolerance is loose on purpose, and needs an absolute margin as well
+    // as a relative one: sitting at 1e9 with deviations around 0.01 costs
+    // eleven digits before any method starts, and skew passes through zero,
+    // where a relative bound means nothing. This is not measuring how good the
+    // current code is; it is a tripwire for anyone who tries carrying m2/m3/m4
+    // across rows incrementally, which fails this by ten orders of magnitude on
+    // exactly this data.
+    constexpr std::size_t kRows = 800;
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> plain;
+    Column<double> shifted;
+    ts.reserve(kRows);
+    plain.reserve(kRows);
+    shifted.reserve(kRows);
+    std::uint64_t state = 0xA0761D6478BD642FULL;
+    double acc = 0.0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 23U) - 11.0;
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        plain.push_back(acc);
+        shifted.push_back(1e9 + (acc * 0.01));
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("plain", std::move(plain));
+    table.add_column("shifted", std::move(shifted));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[update { sp = rolling_skew(plain, 60), ss = rolling_skew(shifted, 60), "
+        "kp = rolling_kurtosis(plain, 60), ks = rolling_kurtosis(shifted, 60) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* sp = std::get_if<Column<double>>(result->find("sp"));
+    const auto* ss = std::get_if<Column<double>>(result->find("ss"));
+    const auto* kp = std::get_if<Column<double>>(result->find("kp"));
+    const auto* ks = std::get_if<Column<double>>(result->find("ks"));
+    REQUIRE(sp != nullptr);
+    REQUIRE(ss != nullptr);
+    REQUIRE(kp != nullptr);
+    REQUIRE(ks != nullptr);
+
+    for (std::size_t i = 0; i < kRows; ++i) {
+        CAPTURE(i);
+        REQUIRE((*ss)[i] == Catch::Approx((*sp)[i]).epsilon(1e-4).margin(1e-3));
+        REQUIRE((*ks)[i] == Catch::Approx((*kp)[i]).epsilon(1e-4).margin(1e-3));
+    }
+}
+
 // --- Vectorized RNG -----------------------------------------------------------
 
 TEST_CASE("rand_uniform generates correct number of rows in bounds") {

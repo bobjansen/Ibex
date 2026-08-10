@@ -184,8 +184,17 @@ class IndexRingDeque {
     std::size_t mask_ = 0;
 };
 
-/// Sliding-window median held in flat arrays: `lo` is a max-heap of the lower
-/// half, `hi` a min-heap of the upper half, and the median is a heap root.
+/// Sliding-window quantile held in flat arrays: `lo` is a max-heap of the
+/// values below the split, `hi` a min-heap of those above, and the answer is
+/// read off the two roots.
+///
+/// The split is what the quantile chooses. Linear-interpolated quantiles want
+/// two ADJACENT order statistics, ranks `floor(p*(n-1))` and one above it, so
+/// sizing `lo` to exactly `floor(p*(n-1)) + 1` elements puts `max(lo)` and
+/// `min(hi)` on precisely that pair — already at the roots, already O(1) to
+/// read. The median is p = 0.5 of this, not a separate algorithm; kMedian
+/// selects it as its own instantiation only so its two arithmetic expressions
+/// stay bit-for-bit what they were, not because it works differently.
 ///
 /// The point of the design is that the window is FIFO — values enter in row
 /// order and leave in row order — so the departing element's location is
@@ -200,8 +209,11 @@ class IndexRingDeque {
 /// Measured 3.3x-4.4x faster across 60/600/6000-point windows on ~1M rows,
 /// bit-identical output, and the absolutes land on R's Turlach implementation
 /// (the same algorithm) rather than 4x behind it.
-class SlidingMedian {
+template <bool kMedian>
+class SlidingQuantile {
    public:
+    /// `p` is the quantile in [0, 1]; it is ignored when kMedian is set.
+    ///
     /// `initial_capacity` is a hint, not a bound: the slot ring grows on demand
     /// like IndexRingDeque's. Pass the widest row span when it is known cheaply
     /// (a count window knows it) to skip the growth entirely, and 0 when it is
@@ -210,7 +222,8 @@ class SlidingMedian {
     /// window, note that the caller pushes row i BEFORE trimming the trailing
     /// edge, so the structure transiently holds one more element than the
     /// window does; pass span + 1 to stay off the growth path.
-    explicit SlidingMedian(std::size_t initial_capacity = 0) : lo_(pos_, 0), hi_(pos_, 1) {
+    explicit SlidingQuantile(double p = 0.5, std::size_t initial_capacity = 0)
+        : lo_(pos_, 0), hi_(pos_, 1), p_(p) {
         if (initial_capacity > 0)
             set_capacity(initial_capacity);
     }
@@ -260,19 +273,36 @@ class SlidingMedian {
     /// the same half. The loops (rather than a single `if` each) are what the
     /// deferral costs: several pops can leave the halves more than one apart.
     void rebalance() {
-        while (lo_.size() > hi_.size() + 1) {
+        // Both loops move a root to the other heap, so invariant (2) survives:
+        // max(lo) is the smallest thing hi can receive and min(hi) the largest
+        // thing lo can. A general p can be far off centre (p = 0.99 leaves lo
+        // holding almost everything), which costs nothing — both sides are
+        // heaps, and neither cares how big it is relative to the other.
+        const std::size_t want = target_lo(lo_.size() + hi_.size());
+        while (lo_.size() > want) {
             hi_.push(lo_.top(), lo_.top_slot());
             lo_.remove(0);
         }
-        while (hi_.size() > lo_.size()) {
+        while (lo_.size() < want) {
             lo_.push(hi_.top(), hi_.top_slot());
             hi_.remove(0);
         }
     }
 
     /// Only valid on a non-empty structure that has been rebalanced.
-    [[nodiscard]] auto median() const noexcept -> double {
-        return lo_.size() > hi_.size() ? lo_.top() : (lo_.top() + hi_.top()) / 2.0;
+    [[nodiscard]] auto value() const noexcept -> double {
+        if constexpr (kMedian) {
+            return lo_.size() > hi_.size() ? lo_.top() : (lo_.top() + hi_.top()) / 2.0;
+        } else {
+            // rebalance() has put rank floor(p*(n-1)) at lo's root and the next
+            // rank at hi's. A zero fraction wants only the lower of the two,
+            // which is the p = 1 case as well — there `want` is the whole
+            // window and hi is empty, so the test is load-bearing, not tidiness.
+            const double frac = interp_frac(lo_.size() + hi_.size());
+            if (frac == 0.0 || hi_.empty())
+                return lo_.top();
+            return lo_.top() + (frac * (hi_.top() - lo_.top()));
+        }
     }
 
    private:
@@ -384,6 +414,26 @@ class SlidingMedian {
         std::size_t bit_;
     };
 
+    /// How many elements `lo` should hold for a window of `n`. The median's
+    /// ceil(n/2) is what its two-sided `if` amounted to; the general form is
+    /// rank floor(p*(n-1)) plus one, so that rank sits at lo's root.
+    [[nodiscard]] auto target_lo(std::size_t n) const noexcept -> std::size_t {
+        if constexpr (kMedian) {
+            return (n + 1) / 2;
+        } else {
+            if (n == 0)
+                return 0;
+            return static_cast<std::size_t>(p_ * static_cast<double>(n - 1)) + 1;
+        }
+    }
+
+    /// The weight on the upper of the two order statistics. Computed exactly as
+    /// the sort-the-window implementation did, so results carry over unchanged.
+    [[nodiscard]] auto interp_frac(std::size_t n) const noexcept -> double {
+        const double idx = p_ * static_cast<double>(n - 1);
+        return idx - static_cast<double>(static_cast<std::size_t>(idx));
+    }
+
     /// Round up to a power of two so slot arithmetic is a mask rather than a
     /// compare-and-wrap. Only ever called on an empty structure.
     void set_capacity(std::size_t n) {
@@ -434,7 +484,10 @@ class SlidingMedian {
     std::uint32_t mask_ = 0;        // cap_ - 1
     std::uint32_t head_ = 0;        // slot of the oldest live value
     std::uint32_t tail_ = 0;        // next free slot
+    double p_;                      // quantile in [0, 1]
 };
+
+using SlidingMedian = SlidingQuantile<true>;
 
 }  // namespace
 
@@ -913,7 +966,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // property of the data — so it starts empty and grows,
                     // which costs O(1) amortized per row and, unlike measuring
                     // the span first, asks nothing of rows not yet seen.
-                    SlidingMedian med(is_count ? std::min(count_n, rows) + 1 : 0);
+                    SlidingMedian med(0.5, is_count ? std::min(count_n, rows) + 1 : 0);
 
                     Column<double> result;
                     result.resize_for_overwrite(rows);
@@ -961,7 +1014,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
                         } else {
-                            result_values[i] = med.median();
+                            result_values[i] = med.value();
                         }
                     }
                     return ComputedColumn{.column = std::move(result),
@@ -1163,6 +1216,15 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
         } else {
             return std::unexpected("rolling_quantile: p must be a numeric literal");
         }
+        // Written as a negated range so NaN is rejected too. This is a new
+        // error: the sort-the-window version computed an index from p without
+        // checking it, so p > 1 read off the end of the window buffer and p < 0
+        // wrapped the unsigned cast. Both were out-of-bounds reads, silent
+        // whenever the memory happened to be mapped.
+        // NOLINTNEXTLINE(readability-simplify-boolean-expr) — DeMorgan admits NaN.
+        if (!(p >= 0.0 && p <= 1.0)) {
+            return std::unexpected("rolling_quantile: p must be between 0 and 1");
+        }
         return std::visit(
             [&](const auto& col) -> std::expected<ComputedColumn, std::string> {
                 using T = std::decay_t<decltype(col)>::value_type;
@@ -1170,45 +1232,59 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     return std::unexpected(
                         "rolling_quantile: column must be numeric (Int or Float)");
                 } else {
+                    // The same flat heaps rolling_median uses, split at p
+                    // instead of at the middle: rebalance() leaves rank
+                    // floor(p*(n-1)) at lo's root and the next rank at hi's, so
+                    // the interpolation reads two roots rather than sorting the
+                    // window. O(n log w) instead of O(n*w log w), and it drops
+                    // the per-row re-collection of the whole window with it.
+                    SlidingQuantile<false> q(p, is_count ? std::min(count_n, rows) + 1 : 0);
+
                     Column<double> result;
                     result.resize_for_overwrite(rows);
                     auto* result_values = result.data();
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
-                    std::vector<double> window;
+                    std::size_t nan_cnt = 0;  // valid-but-NaN values in window
+                    // As in rolling_median: only finite, non-null values enter
+                    // the heaps, and add/drop skip the same rows so what does
+                    // enter still leaves in arrival order.
+                    auto add = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        auto v = static_cast<double>(col_values[j]);
+                        if (std::isnan(v))
+                            ++nan_cnt;
+                        else
+                            q.push(v);
+                    };
+                    auto drop = [&](std::size_t j) {
+                        if (!valid_at(j))
+                            return;
+                        auto v = static_cast<double>(col_values[j]);
+                        if (std::isnan(v))
+                            --nan_cnt;
+                        else
+                            q.pop();
+                    };
+                    std::size_t lo_ptr = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
-                        const std::size_t lo = win_lo(i);
-                        // Collect finite, non-null values; flag any valid NaN.
-                        window.clear();
-                        bool has_nan = false;
-                        for (std::size_t j = lo; j <= i; ++j) {
-                            if (!valid_at(j))
-                                continue;
-                            auto v = static_cast<double>(col_values[j]);
-                            if (std::isnan(v))
-                                has_nan = true;
-                            else
-                                window.push_back(v);
+                        add(i);
+                        while (lo_ptr < i && should_drop(lo_ptr, i)) {
+                            drop(lo_ptr);
+                            ++lo_ptr;
                         }
-                        if (has_nan) {
+                        q.rebalance();  // once per row, after every mutation
+                        if (nan_cnt > 0) {
                             result_values[i] = std::numeric_limits<double>::quiet_NaN();
-                            continue;
-                        }
-                        if (window.empty()) {
+                        } else if (q.empty()) {
                             result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
-                            continue;
+                        } else {
+                            result_values[i] = q.value();
                         }
-                        std::ranges::sort(window);
-                        const std::size_t n = window.size();
-                        const double idx = p * static_cast<double>(n - 1);
-                        auto idx_lo = static_cast<std::size_t>(idx);
-                        const std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
-                        const double frac = idx - static_cast<double>(idx_lo);
-                        result_values[i] =
-                            window[idx_lo] + (frac * (window[idx_hi] - window[idx_lo]));
                     }
                     return ComputedColumn{.column = std::move(result),
                                           .validity = std::move(out_valid)};

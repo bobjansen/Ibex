@@ -5240,6 +5240,206 @@ TEST_CASE("rolling_quantile with 3ns window") {
     CHECK((*qv)[3] == Catch::Approx(25.0));
 }
 
+namespace {
+
+/// Sort-the-window quantile, the formula the incremental version replaced.
+[[nodiscard]] auto brute_quantile(std::vector<double> w, double p) -> double {
+    std::ranges::sort(w);
+    const std::size_t n = w.size();
+    const double idx = p * static_cast<double>(n - 1);
+    auto idx_lo = static_cast<std::size_t>(idx);
+    const std::size_t idx_hi = idx_lo + 1 < n ? idx_lo + 1 : idx_lo;
+    const double frac = idx - static_cast<double>(idx_lo);
+    return w[idx_lo] + (frac * (w[idx_hi] - w[idx_lo]));
+}
+
+}  // namespace
+
+TEST_CASE("rolling_quantile matches a brute-force quantile across p and window sizes") {
+    // rolling_quantile is the median's two heaps split off centre: lo holds
+    // floor(p*(n-1))+1 elements so the two roots are the order statistics the
+    // interpolation wants. That makes p the thing to sweep — an extreme p
+    // leaves one heap nearly empty and the other holding the window, and p of
+    // exactly 0 or 1 puts the answer at a boundary where one root is all there
+    // is. Windows of 1 and 2 rows hit those boundaries from the other side.
+    constexpr std::size_t kRows = 700;
+    std::vector<double> vals(kRows);
+    std::uint64_t state = 0x2545F4914F6CDD1DULL;
+    double acc = 0.0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 19U) - 9.0;
+        vals[i] = acc;
+    }
+
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        val.push_back(vals[i]);
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    for (const double p : {0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0}) {
+        for (const std::size_t w :
+             {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{50}, std::size_t{257}}) {
+            CAPTURE(p, w);
+            const std::string src = "data[update { q = rolling_quantile(val, " + std::to_string(p) +
+                                    ", " + std::to_string(w) + ") }];";
+            auto ir = require_ir(src.c_str());
+            auto result = runtime::interpret(*ir, registry);
+            REQUIRE(result.has_value());
+            const auto* qv = std::get_if<Column<double>>(result->find("q"));
+            REQUIRE(qv != nullptr);
+
+            for (std::size_t i = 0; i < kRows; ++i) {
+                const std::size_t lo = i + 1 >= w ? i + 1 - w : 0;
+                const std::vector<double> window(vals.begin() + static_cast<std::ptrdiff_t>(lo),
+                                                 vals.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+                CAPTURE(i);
+                REQUIRE((*qv)[i] == Catch::Approx(brute_quantile(window, p)));
+            }
+        }
+    }
+}
+
+TEST_CASE("rolling_quantile tracks a split point that moves with the window") {
+    // The median's split tracks window size symmetrically; a general p does
+    // not, so on a duration window — where n jumps around — the target size
+    // moves by an amount that depends on both p and the jump. No count-window
+    // test reaches that. Shrinking gaps make n climb while evictions run every
+    // row, which is also what forces the slot ring to grow (see the median's
+    // growth test), so this covers both at once.
+    constexpr std::size_t kRows = 1500;
+    std::vector<double> vals(kRows);
+    std::vector<std::int64_t> nanos(kRows);
+    std::uint64_t state = 0x14057B7EF767814FULL;
+    double acc = 0.0;
+    std::int64_t t = 0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 11U) - 5.0;
+        vals[i] = acc;
+        nanos[i] = t;
+        t += std::max<std::int64_t>(1, 1500 - static_cast<std::int64_t>(i));
+    }
+
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        ts.push_back(ts_from_nanos(nanos[i]));
+        val.push_back(vals[i]);
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    constexpr std::int64_t kWidth = 120000;
+    for (const double p : {0.05, 0.25, 0.9}) {
+        CAPTURE(p);
+        const std::string src = "data[window " + std::to_string(kWidth) +
+                                "ns, update { q = rolling_quantile(val, " + std::to_string(p) +
+                                ") }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* qv = std::get_if<Column<double>>(result->find("q"));
+        REQUIRE(qv != nullptr);
+
+        std::size_t widest = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            std::size_t lo = 0;
+            while (nanos[lo] <= nanos[i] - kWidth)
+                ++lo;
+            widest = std::max(widest, i - lo + 1);
+            const std::vector<double> window(vals.begin() + static_cast<std::ptrdiff_t>(lo),
+                                             vals.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            CAPTURE(i);
+            REQUIRE((*qv)[i] == Catch::Approx(brute_quantile(window, p)));
+        }
+        CAPTURE(widest);
+        REQUIRE(widest > 256);
+    }
+}
+
+TEST_CASE("rolling_quantile at p = 0.5 agrees with rolling_median") {
+    // Independent structures reading the same split. If the general target size
+    // and the median's ceil(n/2) ever disagree, one of them is wrong.
+    constexpr std::size_t kRows = 400;
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    std::uint64_t state = 0x853C49E6748FEA9BULL;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        ts.push_back(ts_from_nanos(static_cast<std::int64_t>(i)));
+        val.push_back(static_cast<double>((state >> 33U) % 1000U));
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    // Both parities of window size: the two roots are averaged only when even.
+    for (const std::size_t w : {std::size_t{7}, std::size_t{8}, std::size_t{64}}) {
+        CAPTURE(w);
+        const std::string src = "data[update { q = rolling_quantile(val, 0.5, " +
+                                std::to_string(w) + "), m = rolling_median(val, " +
+                                std::to_string(w) + ") }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* qv = std::get_if<Column<double>>(result->find("q"));
+        const auto* mv = std::get_if<Column<double>>(result->find("m"));
+        REQUIRE(qv != nullptr);
+        REQUIRE(mv != nullptr);
+        for (std::size_t i = 0; i < kRows; ++i) {
+            CAPTURE(i);
+            REQUIRE((*qv)[i] == (*mv)[i]);
+        }
+    }
+}
+
+TEST_CASE("rolling_quantile rejects a p outside [0, 1]") {
+    // The sort-the-window version computed an index from p without checking it,
+    // so these read off the end of the window buffer instead of erroring.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("val", Column<double>{1.0, 2.0, 3.0});
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    for (const char* p : {"1.5", "-0.25", "2"}) {
+        CAPTURE(p);
+        const std::string src =
+            "data[window 3ns, update { q = rolling_quantile(val, " + std::string(p) + ") }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("between 0 and 1") != std::string::npos);
+    }
+}
+
 TEST_CASE("rolling_skew with 1ns window (single element -> 0)") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

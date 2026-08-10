@@ -1950,7 +1950,8 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
           rows_(rows),
           path_(std::move(path)) {}
 
-    auto decode(const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+    auto decode(const std::vector<std::string>& names, const ibex::runtime::Selection* selection,
+                const ibex::runtime::ExecutionContext& exec)
         -> std::expected<ibex::runtime::Table, std::string> override {
         std::vector<int> column_indices;
         column_indices.reserve(names.size());
@@ -1963,7 +1964,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         }
 
         try {
-            auto readers = decode_readers(column_indices.size());
+            auto readers = decode_readers(column_indices.size(), exec);
             return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
                                        rows_);
         } catch (const std::exception& e) {
@@ -2023,15 +2024,24 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     /// waste — the footer is already shared, so an extra reader is just page
     /// readers and cursors.
     ///
-    /// Serial when the budget is one, when a single column was asked for, or
-    /// when this call is already running on a pool thread: `submit` from a
-    /// worker deadlocks against a saturated pool.
-    auto decode_readers(std::size_t columns) -> std::vector<parquet::arrow::FileReader*> {
+    /// Serial when the query is not parallel, when a single column was asked
+    /// for, or when this call is already running on a pool thread: `submit`
+    /// from a worker deadlocks against a saturated pool.
+    ///
+    /// The settings come from the query's `ExecutionContext`, never from the
+    /// environment — a decoder that read `IBEX_PARALLEL` itself would be a
+    /// second authority on whether the query is parallel, free to disagree
+    /// with the one the rest of the engine obeys.
+    auto decode_readers(std::size_t columns, const ibex::runtime::ExecutionContext& exec)
+        -> std::vector<parquet::arrow::FileReader*> {
+        auto& pool = ibex::runtime::process_worker_pool();
         std::size_t want = 1;
-        if (factory_ != nullptr && columns > 1 && rows_ >= kParallelDecodeMinRows &&
-            !ibex::runtime::on_worker_pool_thread() &&
-            ibex::runtime::parallel_enabled_from_env().value_or(true)) {
-            want = std::min(columns, ibex::runtime::default_thread_count());
+        if (factory_ != nullptr && columns > 1 && exec.parallel &&
+            rows_ >= std::max(exec.parallel_min_rows, kParallelDecodeMinRows) &&
+            !ibex::runtime::on_worker_pool_thread()) {
+            const std::size_t budget =
+                exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+            want = std::min({columns, budget, pool.size()});
         }
 
         while (extra_readers_.size() + 1 < want) {

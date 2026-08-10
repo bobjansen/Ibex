@@ -3414,6 +3414,12 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     // removed from the plan BEFORE column demand is computed, so a column
     // referenced only by that filter is decoded to compute the selection but
     // never gathered into the scan's output.
+    // Built before the lazy-source projection below, not just before
+    // `interpret`, because that projection runs a scan's filter — part of the
+    // query, not a prelude to it — and it should be parallel on the same terms.
+    runtime::ExecutionContext exec;
+    runtime::configure_parallel_from_env(exec);
+
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
     if (!lazy_tables.empty()) {
@@ -3473,7 +3479,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                         names.insert(field.name);
                     }
                 }
-                table = lazy->project_where(names, predicates.at(name), &scalars);
+                table = lazy->project_where(names, predicates.at(name), exec, &scalars);
             } else {
                 table = needed.all ? lazy->materialize() : lazy->project(needed.names);
             }
@@ -3486,8 +3492,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     }
 
     runtime::ModelResult captured_model;
-    runtime::ExecutionContext exec;
-    runtime::configure_parallel_from_env(exec);
     auto evaluated = runtime::interpret(*lowered.value(), *eval_tables, &scalars, &externs,
                                         model_out != nullptr ? &captured_model : nullptr, exec);
     if (!evaluated) {
@@ -4695,6 +4699,11 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             deferrable_names.insert(instance_name);
         }
         runtime::DeferredScanRegistry deferred_scans;
+        // Declared here, before the lazy-source projection below, because that
+        // projection runs a scan's filter under it — not only `interpret` at
+        // the end of this lambda.
+        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
+        runtime::configure_parallel_from_env(exec);
         for (auto& [name, info] : ir::deferrable_probe_scans(*rewritten, deferrable_names)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
@@ -4728,7 +4737,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                         names.insert(field.name);
                     }
                 }
-                table = lazy->project_where(names, predicates.at(name));
+                table = lazy->project_where(names, predicates.at(name), exec);
             } else {
                 table = needed.all ? lazy->materialize() : lazy->project(needed.names);
             }
@@ -4737,8 +4746,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
             tables.insert_or_assign(name, std::move(table.value()));
         }
-        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
-        runtime::configure_parallel_from_env(exec);
         return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
     };
 

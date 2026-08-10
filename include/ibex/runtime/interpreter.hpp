@@ -610,7 +610,7 @@ void configure_parallel_from_env(ExecutionContext& exec);
 /// Materialize a deferred scan now: static conjuncts plus whatever bounds its
 /// filter slot carries (if `ready`). The single decode path for deferred
 /// sources — both the chunked join and the interpret fallback use it.
-[[nodiscard]] auto materialize_deferred_scan(const DeferredScan& scan)
+[[nodiscard]] auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
 
 /// Opaque model result produced by the `model { ... }` clause.
@@ -672,7 +672,11 @@ class ExternRegistry;
 /// to late-materialize non-predicate columns without duplicating expression
 /// evaluation inside an I/O plugin. Later conjuncts compact their referenced
 /// columns once earlier conjuncts have made the candidate set selective.
+/// `exec` supplies the parallel settings: a fused-bounds scan splits into row
+/// ranges under it. Row indices are exact, so a range split reproduces the
+/// serial answer bit for bit.
 [[nodiscard]] auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
+                                    const ExecutionContext& exec,
                                     const ScalarRegistry* scalars = nullptr)
     -> std::expected<std::vector<std::size_t>, std::string>;
 

@@ -36,9 +36,10 @@ auto lit_d(double v) -> ir::Literal {
     return ir::Literal{.value = v};
 }
 
-auto select(const runtime::Table& table, const std::vector<ir::Expr>& conjuncts)
+auto select(const runtime::Table& table, const std::vector<ir::Expr>& conjuncts,
+            const runtime::ExecutionContext& exec = runtime::ExecutionContext{})
     -> std::vector<std::size_t> {
-    auto out = runtime::filter_selection(table, conjuncts, nullptr);
+    auto out = runtime::filter_selection(table, conjuncts, exec, nullptr);
     REQUIRE(out.has_value());
     return *out;
 }
@@ -373,4 +374,48 @@ TEST_CASE("filter_selection: the fused pass left-packs across block boundaries",
     // Everything, and nothing: the packing cursor's two extremes.
     CHECK(select(table, {cmp("i", ir::CompareOp::Ge, lit_i(0))}).size() == kRows);
     CHECK(select(table, {cmp("i", ir::CompareOp::Gt, lit_i(6))}).empty());
+}
+
+TEST_CASE("filter_selection: the fused pass splits into row ranges without changing its answer",
+          "[filter][selection][parallel]") {
+    // The parallel form runs the same blocked kernel over disjoint row ranges
+    // and concatenates them ascending. Survivors are row INDICES, so unlike a
+    // float reduction this must be EXACTLY equal to the serial answer, not
+    // merely close — that is the whole reason the range is the axis.
+    //
+    // The row count clears parallel_min_rows, and the stride is chosen so range
+    // boundaries land mid-run: a range that mislaid its base offset, or a
+    // concatenation in the wrong order, shows up as a reordered index list.
+    constexpr std::size_t kRows = 700000;
+    std::vector<std::int64_t> values;
+    std::vector<double> weights;
+    values.reserve(kRows);
+    weights.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        values.push_back(static_cast<std::int64_t>(row % 11));
+        weights.push_back(static_cast<double>(row % 23));
+    }
+    runtime::Table table;
+    table.add_column("i", Column<std::int64_t>{std::move(values)});
+    table.add_column("w", Column<double>{std::move(weights)});
+
+    const std::vector<ir::Expr> conjuncts{cmp("i", ir::CompareOp::Ge, lit_i(3)),
+                                          cmp("i", ir::CompareOp::Le, lit_i(9)),
+                                          cmp("w", ir::CompareOp::Lt, lit_d(17.0))};
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    const auto want = select(table, conjuncts, serial);
+    REQUIRE(!want.empty());
+    REQUIRE(want.size() < kRows);  // the predicate must actually reject rows
+
+    // Every thread budget agrees with the serial answer, and the partition
+    // really does change with the budget.
+    for (const std::size_t threads :
+         {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{8}}) {
+        runtime::ExecutionContext parallel;
+        parallel.parallel = true;
+        parallel.parallel_threads = threads;
+        CHECK(select(table, conjuncts, parallel) == want);
+    }
 }

@@ -3487,7 +3487,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::nullopt;
         }
 
-        auto phase = deferred_scan_key_selection(*deferred_probe_);
+        auto phase = deferred_scan_key_selection(*deferred_probe_, *deferred_exec_);
         if (!phase.has_value()) {
             return std::move(phase.error());
         }

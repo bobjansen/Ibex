@@ -187,7 +187,8 @@ static auto bounds_worth_applying(const DeferredScan& scan) -> bool {
     return kept_span / source_span <= 0.8;
 }
 
-auto materialize_deferred_scan(const DeferredScan& scan) -> std::expected<Table, std::string> {
+auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
     std::vector<ir::Expr> conjuncts = scan.conjuncts;
     const DynamicScanFilter* dynamic = nullptr;
     if (scan.filter != nullptr && scan.filter->ready) {
@@ -219,11 +220,11 @@ auto materialize_deferred_scan(const DeferredScan& scan) -> std::expected<Table,
             names.insert(field.name);
         }
     }
-    return scan.lazy->project_where(names, conjuncts, nullptr, dynamic,
+    return scan.lazy->project_where(names, conjuncts, exec, nullptr, dynamic,
                                     dynamic != nullptr ? &scan.key_column : nullptr);
 }
 
-auto deferred_scan_key_selection(const DeferredScan& scan)
+auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContext& exec)
     -> std::expected<std::optional<LazyTable::JoinKeySelection>, std::string> {
     if (scan.filter == nullptr || !scan.filter->ready) {
         return std::optional<LazyTable::JoinKeySelection>{};
@@ -231,7 +232,8 @@ auto deferred_scan_key_selection(const DeferredScan& scan)
     // Static conjuncts only — bound conjuncts are never synthesized when
     // membership exists (see materialize_deferred_scan), and phase A only
     // runs with membership.
-    return scan.lazy->join_key_selection(scan.conjuncts, nullptr, *scan.filter, scan.key_column);
+    return scan.lazy->join_key_selection(scan.conjuncts, exec, nullptr, *scan.filter,
+                                         scan.key_column);
 }
 
 auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
@@ -395,7 +397,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 // with whatever bounds its join has published so far.
                 if (const auto* deferred = exec.deferred_scan(scan.source_name());
                     deferred != nullptr) {
-                    auto table = materialize_deferred_scan(*deferred);
+                    auto table = materialize_deferred_scan(*deferred, exec);
                     if (!table.has_value()) {
                         return std::unexpected(std::move(table.error()));
                     }

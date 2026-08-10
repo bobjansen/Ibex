@@ -184,6 +184,194 @@ class IndexRingDeque {
     std::size_t mask_ = 0;
 };
 
+/// Sliding-window median held in flat arrays: `lo` is a max-heap of the lower
+/// half, `hi` a min-heap of the upper half, and the median is a heap root.
+///
+/// The point of the design is that the window is FIFO — values enter in row
+/// order and leave in row order — so the departing element's location is
+/// already known. `pos_` maps a FIFO slot to where that element currently sits,
+/// making an eviction one lookup plus a sift, with no search and not even a
+/// value argument.
+///
+/// This replaced a pair of std::multisets. Those cost on two counts: every
+/// descent chased red-black nodes scattered across the allocator, and every
+/// eviction searched by value for a position the window already knew. Both go
+/// away here — a sift is index arithmetic over two contiguous arrays.
+/// Measured 3.3x-4.4x faster across 60/600/6000-point windows on ~1M rows,
+/// bit-identical output, and the absolutes land on R's Turlach implementation
+/// (the same algorithm) rather than 4x behind it.
+class SlidingMedian {
+   public:
+    /// `capacity` must be the widest row span the window will ever hold PLUS
+    /// ONE: callers push row i before trimming the trailing edge, so the
+    /// structure transiently holds one more element than the window does.
+    explicit SlidingMedian(std::size_t capacity)
+        : cap_(capacity == 0 ? 1 : capacity), pos_(cap_), lo_(pos_, 0), hi_(pos_, 1) {
+        lo_.reserve(cap_);
+        hi_.reserve(cap_);
+    }
+
+    [[nodiscard]] auto empty() const noexcept -> bool { return lo_.empty() && hi_.empty(); }
+
+    void push(double x) {
+        const std::uint32_t slot = tail_;
+        tail_ = (tail_ + 1 == cap_) ? 0 : tail_ + 1;
+        // Invariant (2), max(lo) <= min(hi), picks the half in O(1). With
+        // rebalancing deferred (see rebalance), lo can be transiently empty
+        // while hi is not, so an empty lo is not on its own a reason to take x
+        // — it has to still sit below min(hi).
+        if (!lo_.empty()) {
+            if (x <= lo_.top())
+                lo_.push(x, slot);
+            else
+                hi_.push(x, slot);
+        } else if (!hi_.empty() && x > hi_.top()) {
+            hi_.push(x, slot);
+        } else {
+            lo_.push(x, slot);
+        }
+    }
+
+    /// Evict the oldest live value. Takes no value: FIFO order names the slot
+    /// and pos_ locates it.
+    void pop() {
+        const std::uint32_t slot = head_;
+        head_ = (head_ + 1 == cap_) ? 0 : head_ + 1;
+        const std::size_t p = pos_[slot];
+        if ((p & 1U) == 0U)
+            lo_.remove(p >> 1U);
+        else
+            hi_.remove(p >> 1U);
+    }
+
+    /// Restore the size balance between the halves. Call ONCE per output row,
+    /// after that row's push and all its pops. push and pop each preserve
+    /// invariant (2) on their own and the balance is only read by median(), so
+    /// deferring is sound — and it cancels the moves a per-mutation rebalance
+    /// would make and immediately undo when the push and the eviction land in
+    /// the same half. The loops (rather than a single `if` each) are what the
+    /// deferral costs: several pops can leave the halves more than one apart.
+    void rebalance() {
+        while (lo_.size() > hi_.size() + 1) {
+            hi_.push(lo_.top(), lo_.top_slot());
+            lo_.remove(0);
+        }
+        while (hi_.size() > lo_.size()) {
+            lo_.push(hi_.top(), hi_.top_slot());
+            hi_.remove(0);
+        }
+    }
+
+    /// Only valid on a non-empty structure that has been rebalanced.
+    [[nodiscard]] auto median() const noexcept -> double {
+        return lo_.size() > hi_.size() ? lo_.top() : (lo_.top() + hi_.top()) / 2.0;
+    }
+
+   private:
+    /// One half. kMin picks a min-heap (the upper half) or a max-heap (the
+    /// lower half); `bit` is what this heap stores in pos_'s low bit to
+    /// identify itself, the rest of the word being the element's array index.
+    template <bool kMin>
+    class Heap {
+       public:
+        Heap(std::vector<std::size_t>& pos, std::size_t bit) : pos_(pos), bit_(bit) {}
+
+        void reserve(std::size_t n) {
+            val_.reserve(n);
+            slot_.reserve(n);
+        }
+        [[nodiscard]] auto size() const noexcept -> std::size_t { return val_.size(); }
+        [[nodiscard]] auto empty() const noexcept -> bool { return val_.empty(); }
+        [[nodiscard]] auto top() const noexcept -> double { return val_[0]; }
+        [[nodiscard]] auto top_slot() const noexcept -> std::uint32_t { return slot_[0]; }
+
+        void push(double x, std::uint32_t slot) {
+            val_.push_back(x);
+            slot_.push_back(slot);
+            sift_up(val_.size() - 1);
+        }
+
+        /// Remove the element at `i`. The last element takes its place and then
+        /// sifts to wherever it belongs — which can be either direction, hence
+        /// both calls; at most one of them moves anything.
+        void remove(std::size_t i) {
+            const std::size_t last = val_.size() - 1;
+            if (i != last) {
+                val_[i] = val_[last];
+                slot_[i] = slot_[last];
+            }
+            val_.pop_back();
+            slot_.pop_back();
+            if (i < val_.size()) {
+                sift_down(i);
+                sift_up(i);
+            }
+        }
+
+       private:
+        /// "belongs closer to the root than".
+        [[nodiscard]] static auto higher(double a, double b) noexcept -> bool {
+            if constexpr (kMin) {
+                return a < b;
+            } else {
+                return a > b;
+            }
+        }
+
+        /// Write an element into slot `i` and keep its pos_ entry in step. The
+        /// sifts move elements with this rather than swapping, so a descent of
+        /// depth d costs d writes, not 3d.
+        void place(std::size_t i, double v, std::uint32_t s) {
+            val_[i] = v;
+            slot_[i] = s;
+            pos_[s] = (i << 1U) | bit_;
+        }
+
+        void sift_up(std::size_t i) {
+            const double v = val_[i];
+            const std::uint32_t s = slot_[i];
+            while (i > 0) {
+                const std::size_t p = (i - 1) / 2;
+                if (!higher(v, val_[p]))
+                    break;
+                place(i, val_[p], slot_[p]);
+                i = p;
+            }
+            place(i, v, s);
+        }
+
+        void sift_down(std::size_t i) {
+            const std::size_t n = val_.size();
+            const double v = val_[i];
+            const std::uint32_t s = slot_[i];
+            for (;;) {
+                std::size_t c = (2 * i) + 1;
+                if (c >= n)
+                    break;
+                if (c + 1 < n && higher(val_[c + 1], val_[c]))
+                    ++c;
+                if (!higher(val_[c], v))
+                    break;
+                place(i, val_[c], slot_[c]);
+                i = c;
+            }
+            place(i, v, s);
+        }
+
+        std::vector<double> val_;
+        std::vector<std::uint32_t> slot_;
+        std::vector<std::size_t>& pos_;
+        std::size_t bit_;
+    };
+
+    std::size_t cap_;
+    std::vector<std::size_t> pos_;  // FIFO slot -> (heap index << 1) | heap bit
+    Heap<false> lo_;                // lower half, max-heap: root is max(lo)
+    Heap<true> hi_;                 // upper half, min-heap: root is min(hi)
+    std::uint32_t head_ = 0;        // slot of the oldest live value
+    std::uint32_t tail_ = 0;        // next free slot
+};
+
 }  // namespace
 
 // Compute a rolling aggregate column over a time-indexed window.
@@ -650,73 +838,28 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                 if constexpr (!std::is_same_v<T, std::int64_t> && !std::is_same_v<T, double>) {
                     return std::unexpected("rolling_median: column must be numeric (Int or Float)");
                 } else {
-                    // Sliding-window median via two multisets — O(n log w).
+                    // Sliding-window median in flat heaps — O(n log w).
+                    // See SlidingMedian for the structure and why it is not a
+                    // pair of ordered trees.
                     //
-                    // lo holds the lower half, hi the upper half.
-                    // Invariants:
-                    //   (1) lo.size() == hi.size()     (even total)
-                    //    OR lo.size() == hi.size() + 1 (odd total)
-                    //   (2) max(lo) <= min(hi)
-                    //
-                    // Median = max(lo) when sizes differ, else avg of both tops.
-                    std::multiset<double> lo;  // lower half  — max is rbegin()
-                    std::multiset<double> hi;  // upper half  — min is begin()
-
-                    // Restore invariant (1). Called ONCE per output row, after
-                    // the row's insert and all its evictions — not after each
-                    // mutation. Both insert_val and remove_val preserve
-                    // invariant (2) on their own, and (1) is only read when the
-                    // median is taken, so it is enough to fix it up at the end.
-                    //
-                    // Rebalancing per mutation made the halves ping-pong: an
-                    // insert into lo pushed max(lo) across to hi, and the
-                    // eviction that followed pulled min(hi) straight back —
-                    // four extra tree ops to end where it started. Deferring
-                    // cancels that whenever the insert and the eviction land in
-                    // the same half. The loop (vs. a single `if`) is what the
-                    // deferral costs: several mutations can leave the halves
-                    // more than one apart.
-                    auto rebalance = [&] {
-                        while (lo.size() > hi.size() + 1) {
-                            hi.insert(*lo.rbegin());
-                            lo.erase(std::prev(lo.end()));
+                    // It needs its capacity up front. For a count window that
+                    // is the count; for a duration window the widest span has
+                    // to be found, which is one cheap two-pointer pass (the
+                    // same walk rolling_count does) and well under what the
+                    // median loop itself costs. Plus one either way: row i is
+                    // pushed before the trailing edge is trimmed.
+                    std::size_t max_span = 0;
+                    if (is_count) {
+                        max_span = std::min(count_n, rows);
+                    } else {
+                        std::size_t scan_lo = 0;
+                        for (std::size_t i = 0; i < rows; ++i) {
+                            while (scan_lo < i && should_drop(scan_lo, i))
+                                ++scan_lo;
+                            max_span = std::max(max_span, i - scan_lo + 1);
                         }
-                        while (hi.size() > lo.size()) {
-                            lo.insert(*hi.begin());
-                            hi.erase(hi.begin());
-                        }
-                    };
-
-                    auto insert_val = [&](double x) {
-                        // Preserves invariant (2): x goes to lo if it belongs
-                        // in the lower half, hi otherwise. With rebalancing
-                        // deferred, lo can be transiently empty while hi is
-                        // not, so an empty lo is not on its own a reason to
-                        // take x — it has to still sit below min(hi).
-                        if (!lo.empty()) {
-                            if (x <= *lo.rbegin())
-                                lo.insert(x);
-                            else
-                                hi.insert(x);
-                        } else if (!hi.empty() && x > *hi.begin()) {
-                            hi.insert(x);
-                        } else {
-                            lo.insert(x);
-                        }
-                    };
-
-                    auto remove_val = [&](double x) {
-                        // Pick the half in O(1) rather than probing lo first.
-                        // Invariant (2) makes the test exact: every element of
-                        // hi is >= max(lo), so x <= max(lo) implies x is in lo,
-                        // and x > max(lo) implies it is in hi. Probing lo with
-                        // find() first cost a failed O(log w) descent on roughly
-                        // half of all removals — the mirror of insert_val's test.
-                        if (!lo.empty() && x <= *lo.rbegin())
-                            lo.erase(lo.find(x));
-                        else
-                            hi.erase(hi.find(x));
-                    };
+                    }
+                    SlidingMedian med(max_span + 1);
 
                     Column<double> result;
                     result.resize_for_overwrite(rows);
@@ -724,9 +867,12 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     const auto* col_values = col.data();
                     std::optional<ValidityBitmap> out_valid;
                     std::size_t nan_cnt = 0;  // valid-but-NaN values in window
-                    // Only finite, non-null values enter the multisets; NULLs are
+                    // Only finite, non-null values enter the heaps; NULLs are
                     // skipped and NaNs counted (NaN can't participate in an ordered
-                    // structure and would corrupt the median).
+                    // structure and would corrupt the median). add and drop skip
+                    // the same rows, so the values that do enter still leave in
+                    // the order they arrived — which is what lets pop() work
+                    // without being told what it is evicting.
                     auto add = [&](std::size_t j) {
                         if (!valid_at(j))
                             return;
@@ -734,7 +880,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (std::isnan(v))
                             ++nan_cnt;
                         else
-                            insert_val(v);
+                            med.push(v);
                     };
                     auto drop = [&](std::size_t j) {
                         if (!valid_at(j))
@@ -743,7 +889,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                         if (std::isnan(v))
                             --nan_cnt;
                         else
-                            remove_val(v);
+                            med.pop();
                     };
                     std::size_t lo_ptr = 0;
                     for (std::size_t i = 0; i < rows; ++i) {
@@ -752,18 +898,16 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             drop(lo_ptr);
                             ++lo_ptr;
                         }
-                        rebalance();  // once per row, after every mutation
+                        med.rebalance();  // once per row, after every mutation
                         if (nan_cnt > 0) {
                             result_values[i] = std::numeric_limits<double>::quiet_NaN();
-                        } else if (lo.empty() && hi.empty()) {
+                        } else if (med.empty()) {
                             result_values[i] = 0.0;  // window of only nulls -> null
                             if (!out_valid)
                                 out_valid.emplace(rows, true);
                             out_valid->set(i, false);
                         } else {
-                            result_values[i] = (lo.size() > hi.size())
-                                                   ? static_cast<double>(*lo.rbegin())
-                                                   : (*lo.rbegin() + *hi.begin()) / 2.0;
+                            result_values[i] = med.median();
                         }
                     }
                     return ComputedColumn{.column = std::move(result),

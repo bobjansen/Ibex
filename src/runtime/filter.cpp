@@ -13,6 +13,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <array>
@@ -3144,20 +3145,16 @@ void apply_set_spec(const SetSpec& spec, std::size_t base, std::size_t len, std:
     }
 }
 
-auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
-                   std::size_t rows) -> std::vector<std::size_t> {
+/// Scan rows [begin, end) and append the survivors, ascending, to `selected`.
+///
+/// Split out of `select_bounds` so one worker can own a row range. The range is
+/// the only parallel axis that keeps this exact: survivors are row INDICES, so
+/// concatenating ranges in ascending order reproduces the serial answer bit for
+/// bit — there is no reduction and nothing to reassociate.
+void select_bounds_range(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
+                         std::size_t begin, std::size_t end, std::vector<std::size_t>& selected) {
     constexpr std::size_t kBlock = 4096;
-    std::vector<std::size_t> selected;
-    for (const auto& spec : specs) {
-        if (spec.unsatisfiable) {
-            return selected;
-        }
-    }
-    for (const auto& spec : sets) {
-        if (spec.unsatisfiable) {
-            return selected;  // e.g. `x == 'nope'` where 'nope' is not a value x takes
-        }
-    }
+    const std::size_t rows = end - begin;
     selected.reserve(std::min<std::size_t>(rows, kBlock));
 
     std::array<std::uint8_t, kBlock> mask{};
@@ -3170,8 +3167,8 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     // branch to miss; one slot of slack keeps the final rejected row in bounds.
     std::array<std::size_t, kBlock + 1> hits{};
 
-    for (std::size_t base = 0; base < rows; base += kBlock) {
-        const std::size_t len = std::min(kBlock, rows - base);
+    for (std::size_t base = begin; base < end; base += kBlock) {
+        const std::size_t len = std::min(kBlock, end - base);
         bool first = true;
         for (const auto& spec : specs) {
             apply_bounds_spec(spec, base, len, mask.data(), first);
@@ -3189,7 +3186,7 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
         }
         selected.insert(selected.end(), hits.begin(),
                         hits.begin() + static_cast<std::ptrdiff_t>(kept));
-        if (base == 0 && rows > kBlock) {
+        if (base == begin && rows > kBlock) {
             // One up-front capacity estimate from the first block's hit rate.
             // Growing by doubling instead re-copies the vector ~10 times on a
             // q03-shaped scan (3.2M survivors, up to 26MB per re-copy). The
@@ -3201,11 +3198,82 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
             selected.reserve(std::min(rows, estimated + (estimated / 8) + kBlock));
         }
     }
+}
+
+/// How many row ranges to split a fused-bounds scan into; 1 means run it here.
+///
+/// The settings come from the query's `ExecutionContext`, threaded in through
+/// `filter_selection`, so there is exactly one authority on whether a query is
+/// parallel — no second copy in the environment to disagree with it.
+auto select_bounds_morsels(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
+    constexpr std::size_t kMinRowsPerMorsel = 65536;
+    constexpr std::size_t kMaxMorsels = 64;
+    if (!exec.parallel || on_worker_pool_thread() || rows < exec.parallel_min_rows) {
+        return 1;
+    }
+    const std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+    const std::size_t budget =
+        exec.parallel_threads != 0 ? exec.parallel_threads : process_worker_pool().size();
+    return std::min({morsels, budget, process_worker_pool().size()});
+}
+
+auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSpec>& sets,
+                   const ExecutionContext& exec, std::size_t rows) -> std::vector<std::size_t> {
+    constexpr std::size_t kBlock = 4096;
+    std::vector<std::size_t> selected;
+    for (const auto& spec : specs) {
+        if (spec.unsatisfiable) {
+            return selected;
+        }
+    }
+    for (const auto& spec : sets) {
+        if (spec.unsatisfiable) {
+            return selected;  // e.g. `x == 'nope'` where 'nope' is not a value x takes
+        }
+    }
+
+    const std::size_t morsels = select_bounds_morsels(exec, rows);
+    if (morsels < 2) {
+        select_bounds_range(specs, sets, 0, rows, selected);
+        return selected;
+    }
+
+    // Ranges are whole blocks so every worker runs the same blocked kernel the
+    // serial path does, with a full mask buffer.
+    const std::size_t grain = ((rows / morsels) + kBlock - 1) / kBlock * kBlock;
+    const std::size_t used = (rows + grain - 1) / grain;
+    std::vector<std::vector<std::size_t>> parts(used);
+
+    std::atomic<std::size_t> cursor{0};
+    auto batch = process_worker_pool().submit(std::min(used, morsels), [&](std::size_t) {
+        while (true) {
+            const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (m >= used) {
+                return;
+            }
+            const std::size_t begin = m * grain;
+            select_bounds_range(specs, sets, begin, std::min(rows, begin + grain), parts[m]);
+        }
+    });
+    batch.wait();
+
+    std::size_t total = 0;
+    for (const auto& part : parts) {
+        total += part.size();
+    }
+    // One reserve then one append per range: `resize` would value-initialize
+    // the whole vector first, a second 8-bytes-per-row pass over a result that
+    // reaches 26MB on a q03-shaped scan.
+    selected.reserve(total);
+    for (const auto& part : parts) {
+        selected.insert(selected.end(), part.begin(), part.end());
+    }
     return selected;
 }
 
 auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conjuncts,
-                           const ScalarRegistry* scalars, std::vector<std::size_t> selected)
+                           const ExecutionContext& exec, const ScalarRegistry* scalars,
+                           std::vector<std::size_t> selected)
     -> std::expected<std::vector<std::size_t>, std::string> {
     constexpr std::size_t kCompactionFactor = 4;
     const std::size_t rows = input.rows();
@@ -3264,7 +3332,7 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
             std::vector<std::size_t> local(selected.size());
             std::iota(local.begin(), local.end(), std::size_t{0});
             auto local_selected =
-                filter_selection_impl(stage, stage_conjuncts, scalars, std::move(local));
+                filter_selection_impl(stage, stage_conjuncts, exec, scalars, std::move(local));
             if (!local_selected) {
                 return std::unexpected(local_selected.error());
             }
@@ -3302,15 +3370,15 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
 }  // namespace
 
 auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts,
-                      const ScalarRegistry* scalars)
+                      const ExecutionContext& exec, const ScalarRegistry* scalars)
     -> std::expected<std::vector<std::size_t>, std::string> {
     // Range conjuncts fuse into one blocked pass that yields the selection
     // directly; whatever doesn't fuse runs against that selection instead of
     // against every row.
     auto plan = build_bounds_plan(input, conjuncts);
     if (!plan.specs.empty() || !plan.sets.empty()) {
-        auto selected = select_bounds(plan.specs, plan.sets, input.rows());
-        return filter_selection_impl(input, plan.leftover, scalars, std::move(selected));
+        auto selected = select_bounds(plan.specs, plan.sets, exec, input.rows());
+        return filter_selection_impl(input, plan.leftover, exec, scalars, std::move(selected));
     }
 
     // Nothing fused — a string equality (`l_returnflag == "R"`) or an OR block.
@@ -3351,12 +3419,12 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
 
         using ConjunctDiff = std::vector<ir::Expr>::difference_type;
         const std::vector<ir::Expr> rest(conjuncts.begin() + ConjunctDiff{1}, conjuncts.end());
-        return filter_selection_impl(input, rest, scalars, std::move(selected));
+        return filter_selection_impl(input, rest, exec, scalars, std::move(selected));
     }
 
     std::vector<std::size_t> selected(input.rows());
     std::iota(selected.begin(), selected.end(), std::size_t{0});
-    return filter_selection_impl(input, conjuncts, scalars, std::move(selected));
+    return filter_selection_impl(input, conjuncts, exec, scalars, std::move(selected));
 }
 
 auto filter_project_table(const Table& input, const ir::Expr& predicate,

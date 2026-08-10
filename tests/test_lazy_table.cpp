@@ -18,6 +18,11 @@ using namespace ibex;
 
 namespace {
 
+/// Default execution settings for these tests. The tables here are far below
+/// the parallel row threshold, so this selects the serial path either way; it
+/// exists so the call sites name the context explicitly rather than defaulting.
+const runtime::ExecutionContext kExec{};
+
 /// A stand-in for a columnar file: records which columns each decode asked for,
 /// so a test can assert on what was read rather than only on what came back.
 struct FakeSource {
@@ -254,7 +259,7 @@ TEST_CASE("LazyTable: project_where decodes predicates before selected payload c
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    auto table = lazy.project_where({"a", "b"}, {greater_than("a", 1)});
+    auto table = lazy.project_where({"a", "b"}, {greater_than("a", 1)}, kExec);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     REQUIRE(source.decode_calls.size() == 2);
@@ -280,7 +285,7 @@ TEST_CASE("LazyTable: project_where evaluates staged predicates before selected 
     auto lazy = make_lazy(source);
 
     auto table = lazy.project_where(
-        {"a", "b", "c"}, {greater_than("a", 0), greater_than("a", 1), less_than("b", 3.0)});
+        {"a", "b", "c"}, {greater_than("a", 0), greater_than("a", 1), less_than("b", 3.0)}, kExec);
     REQUIRE(table);
     CHECK(table->rows() == 1);
     REQUIRE(source.decode_calls.size() == 2);
@@ -350,7 +355,7 @@ TEST_CASE("LazyTable: project_where compacts later predicate evaluation but keep
             return out;
         }};
 
-    auto table = lazy.project_where({"c"}, {greater_than("a", 6), less_than("b", 20.0)});
+    auto table = lazy.project_where({"c"}, {greater_than("a", 6), less_than("b", 20.0)}, kExec);
     REQUIRE(table);
     CHECK(table->rows() == 1);
     REQUIRE(calls.size() == 2);
@@ -366,7 +371,7 @@ TEST_CASE("LazyTable: project_where never poisons the whole-column cache",
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    REQUIRE(lazy.project_where({"a", "b"}, {greater_than("a", 1)}));
+    REQUIRE(lazy.project_where({"a", "b"}, {greater_than("a", 1)}, kExec));
     REQUIRE(source.decode_calls.size() == 2);
 
     // The predicate column was decoded whole-file for the selection, so it is
@@ -400,7 +405,7 @@ TEST_CASE("LazyTable: project_where reuses cached whole columns for predicates",
     REQUIRE(source.decode_calls.size() == 1);
 
     // `a` is already cached whole-file, so only the payload column is decoded.
-    auto table = lazy.project_where({"b"}, {greater_than("a", 1)});
+    auto table = lazy.project_where({"b"}, {greater_than("a", 1)}, kExec);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     REQUIRE(source.decode_calls.size() == 2);
@@ -507,7 +512,7 @@ TEST_CASE("LazyTable: project_where applies a membership filter without conjunct
     filter.in_list = {2, 3};
 
     const std::string key = "a";
-    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a", "b"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     const auto* a = std::get_if<Column<std::int64_t>>(&*table->find("a"));
@@ -537,7 +542,8 @@ TEST_CASE("LazyTable: membership composes with static conjuncts",
     // Static conjunct keeps a > 1 -> {2, 3}; membership keeps {1, 2}. The
     // intersection is exactly {2}.
     const std::string key = "a";
-    auto table = lazy.project_where({"a", "b"}, {greater_than("a", 1)}, nullptr, &filter, &key);
+    auto table =
+        lazy.project_where({"a", "b"}, {greater_than("a", 1)}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 1);
     const auto* a = std::get_if<Column<std::int64_t>>(&*table->find("a"));
@@ -557,7 +563,7 @@ TEST_CASE("LazyTable: a non-integer membership key is soundly ignored",
 
     // "b" is a double column: no filter applies, the projection is dense.
     const std::string key = "b";
-    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a", "b"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 3);
 }
@@ -587,7 +593,7 @@ TEST_CASE("LazyTable: membership drops rows whose key is null",
     filter.in_list = {7};
 
     const std::string key = "k";
-    auto table = lazy.project_where({"k"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"k"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 2);
 }
@@ -630,7 +636,7 @@ TEST_CASE("LazyTable: a barely-rejecting membership filter is abandoned",
     }
 
     const std::string key = "k";
-    auto table = lazy.project_where({"k", "v"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"k", "v"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == kRows);
     for (const auto& selection : selections) {
@@ -668,7 +674,7 @@ TEST_CASE("LazyTable: a selective membership filter prunes past the sample thres
     filter.in_list = {42};
 
     const std::string key = "k";
-    auto table = lazy.project_where({"k"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"k"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == kRows / 100);
 }
@@ -696,7 +702,7 @@ TEST_CASE("LazyTable: a fused key filter scan replaces the decode-then-filter pa
     filter.bloom->insert(3);
 
     const std::string key = "a";
-    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a", "b"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     CHECK(scanned_keys == std::vector<std::string>{"a"});
@@ -730,7 +736,7 @@ TEST_CASE("LazyTable: a fused scan with no answer falls back to decode-then-filt
     filter.in_list = {2, 3};
 
     const std::string key = "a";
-    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a", "b"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     // Ordinary path: key decoded whole-file first, payload through the
@@ -760,7 +766,7 @@ TEST_CASE("LazyTable: a fused scan error surfaces", "[runtime][lazy_table][defer
     filter.bloom->insert(2);
 
     const std::string key = "a";
-    auto table = lazy.project_where({"a"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE_FALSE(table);
     CHECK(table.error() == "fused scan boom");
 }
@@ -794,7 +800,7 @@ TEST_CASE("LazyTable: a cached key column bypasses the fused scan",
     filter.in_list = {2, 3};
 
     const std::string key = "a";
-    auto table = lazy.project_where({"a", "b"}, {}, nullptr, &filter, &key);
+    auto table = lazy.project_where({"a", "b"}, {}, kExec, nullptr, &filter, &key);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     CHECK_FALSE(fused_called);
@@ -827,7 +833,7 @@ TEST_CASE("LazyTable: join_key_selection returns the selection and its key value
     filter.bloom->insert(3);
     filter.in_list = {2, 3};
 
-    auto phase = lazy.join_key_selection({}, nullptr, filter, "a");
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, filter, "a");
     REQUIRE(phase);
     REQUIRE(phase->has_value());
     CHECK((*phase)->selected == runtime::Selection{1, 2});
@@ -853,7 +859,7 @@ TEST_CASE("LazyTable: join_key_selection composes static conjuncts with membersh
     filter.in_list = {1, 2};
 
     // Conjunct keeps a > 1 -> {2, 3}; membership keeps {1, 2} -> exactly {2}.
-    auto phase = lazy.join_key_selection({greater_than("a", 1)}, nullptr, filter, "a");
+    auto phase = lazy.join_key_selection({greater_than("a", 1)}, kExec, nullptr, filter, "a");
     REQUIRE(phase);
     REQUIRE(phase->has_value());
     CHECK((*phase)->selected == runtime::Selection{1});
@@ -869,14 +875,14 @@ TEST_CASE("LazyTable: join_key_selection declines without membership or on a non
     auto lazy = make_lazy(source);
 
     runtime::DynamicScanFilter empty_filter;
-    auto no_membership = lazy.join_key_selection({}, nullptr, empty_filter, "a");
+    auto no_membership = lazy.join_key_selection({}, kExec, nullptr, empty_filter, "a");
     REQUIRE(no_membership);
     CHECK_FALSE(no_membership->has_value());
 
     runtime::DynamicScanFilter filter;
     filter.bloom.emplace(1);
     filter.bloom->insert(2);
-    auto non_int = lazy.join_key_selection({}, nullptr, filter, "b");
+    auto non_int = lazy.join_key_selection({}, kExec, nullptr, filter, "b");
     REQUIRE(non_int);
     CHECK_FALSE(non_int->has_value());
 }
@@ -900,7 +906,7 @@ TEST_CASE("LazyTable: join_key_selection uses the fused scan when available",
     filter.bloom.emplace(1);
     filter.bloom->insert(3);
 
-    auto phase = lazy.join_key_selection({}, nullptr, filter, "a");
+    auto phase = lazy.join_key_selection({}, kExec, nullptr, filter, "a");
     REQUIRE(phase);
     REQUIRE(phase->has_value());
     CHECK((*phase)->selected == runtime::Selection{2});

@@ -246,9 +246,9 @@ auto membership_selection(const KeyColumn& key, const DynamicScanFilter& filter,
 }  // namespace
 
 auto LazyTable::project_where(const std::set<std::string>& names,
-                              const std::vector<ir::Expr>& conjuncts, const ScalarRegistry* scalars,
-                              const DynamicScanFilter* dynamic, const std::string* dynamic_key)
-    -> std::expected<Table, std::string> {
+                              const std::vector<ir::Expr>& conjuncts, const ExecutionContext& exec,
+                              const ScalarRegistry* scalars, const DynamicScanFilter* dynamic,
+                              const std::string* dynamic_key) -> std::expected<Table, std::string> {
     const bool membership =
         dynamic != nullptr && dynamic_key != nullptr && dynamic->has_membership();
     if (conjuncts.empty() && !membership) {
@@ -319,7 +319,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
 
     std::expected<std::vector<std::size_t>, std::string> selected;
     if (!conjuncts.empty()) {
-        selected = filter_selection(predicates, conjuncts, scalars);
+        selected = filter_selection(predicates, conjuncts, exec, scalars);
         if (!selected) {
             return std::unexpected(selected.error());
         }
@@ -513,8 +513,8 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
 }
 
 auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
-                                   const ScalarRegistry* scalars, const DynamicScanFilter& dynamic,
-                                   const std::string& key_name)
+                                   const ExecutionContext& exec, const ScalarRegistry* scalars,
+                                   const DynamicScanFilter& dynamic, const std::string& key_name)
     -> std::expected<std::optional<JoinKeySelection>, std::string> {
     if (!dynamic.has_membership()) {
         return std::optional<JoinKeySelection>{};
@@ -565,7 +565,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
 
     JoinKeySelection out;
     if (!conjuncts.empty()) {
-        auto selected = filter_selection(predicates, conjuncts, scalars);
+        auto selected = filter_selection(predicates, conjuncts, exec, scalars);
         if (!selected) {
             return std::unexpected(selected.error());
         }

@@ -131,8 +131,13 @@ class LazyTable {
     /// cannot match — when the key column is missing or not int64, and skipped
     /// when a sampled pass rate says the filter barely rejects (a near-full
     /// selection would gather-decode every other column for nothing).
+    ///
+    /// `exec` carries the parallel settings the scan's filter runs under. It is
+    /// required rather than defaulted: a scan that silently fell back to one
+    /// thread because a caller forgot it is exactly the bug this seam had.
     [[nodiscard]] auto project_where(const std::set<std::string>& names,
                                      const std::vector<ir::Expr>& conjuncts,
+                                     const ExecutionContext& exec,
                                      const ScalarRegistry* scalars = nullptr,
                                      const DynamicScanFilter* dynamic = nullptr,
                                      const std::string* dynamic_key = nullptr)
@@ -156,6 +161,7 @@ class LazyTable {
         ColumnEntry keys;    ///< key values for exactly those rows
     };
     [[nodiscard]] auto join_key_selection(const std::vector<ir::Expr>& conjuncts,
+                                          const ExecutionContext& exec,
                                           const ScalarRegistry* scalars,
                                           const DynamicScanFilter& dynamic,
                                           const std::string& key_name)
@@ -197,7 +203,8 @@ using LazyTablePtr = std::shared_ptr<LazyTable>;
 /// conjuncts + membership, or the fused key scan) plus the key values for
 /// exactly those rows. nullopt = no selective answer; fall back to
 /// `materialize_deferred_scan`.
-[[nodiscard]] auto deferred_scan_key_selection(const DeferredScan& scan)
+[[nodiscard]] auto deferred_scan_key_selection(const DeferredScan& scan,
+                                               const ExecutionContext& exec)
     -> std::expected<std::optional<LazyTable::JoinKeySelection>, std::string>;
 
 /// Phase B: materialize the scan's demanded columns through the survivor

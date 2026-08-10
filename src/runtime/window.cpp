@@ -662,12 +662,26 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     std::multiset<double> lo;  // lower half  — max is rbegin()
                     std::multiset<double> hi;  // upper half  — min is begin()
 
-                    // Restore invariant (1) after a single insert or erase.
+                    // Restore invariant (1). Called ONCE per output row, after
+                    // the row's insert and all its evictions — not after each
+                    // mutation. Both insert_val and remove_val preserve
+                    // invariant (2) on their own, and (1) is only read when the
+                    // median is taken, so it is enough to fix it up at the end.
+                    //
+                    // Rebalancing per mutation made the halves ping-pong: an
+                    // insert into lo pushed max(lo) across to hi, and the
+                    // eviction that followed pulled min(hi) straight back —
+                    // four extra tree ops to end where it started. Deferring
+                    // cancels that whenever the insert and the eviction land in
+                    // the same half. The loop (vs. a single `if`) is what the
+                    // deferral costs: several mutations can leave the halves
+                    // more than one apart.
                     auto rebalance = [&] {
-                        if (lo.size() > hi.size() + 1) {
+                        while (lo.size() > hi.size() + 1) {
                             hi.insert(*lo.rbegin());
                             lo.erase(std::prev(lo.end()));
-                        } else if (hi.size() > lo.size()) {
+                        }
+                        while (hi.size() > lo.size()) {
                             lo.insert(*hi.begin());
                             hi.erase(hi.begin());
                         }
@@ -675,22 +689,33 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
 
                     auto insert_val = [&](double x) {
                         // Preserves invariant (2): x goes to lo if it belongs
-                        // in the lower half, hi otherwise.
-                        if (lo.empty() || x <= *lo.rbegin())
-                            lo.insert(x);
-                        else
+                        // in the lower half, hi otherwise. With rebalancing
+                        // deferred, lo can be transiently empty while hi is
+                        // not, so an empty lo is not on its own a reason to
+                        // take x — it has to still sit below min(hi).
+                        if (!lo.empty()) {
+                            if (x <= *lo.rbegin())
+                                lo.insert(x);
+                            else
+                                hi.insert(x);
+                        } else if (!hi.empty() && x > *hi.begin()) {
                             hi.insert(x);
-                        rebalance();
+                        } else {
+                            lo.insert(x);
+                        }
                     };
 
                     auto remove_val = [&](double x) {
-                        // Remove one copy from whichever half contains it.
-                        auto it = lo.find(x);
-                        if (it != lo.end())
-                            lo.erase(it);
+                        // Pick the half in O(1) rather than probing lo first.
+                        // Invariant (2) makes the test exact: every element of
+                        // hi is >= max(lo), so x <= max(lo) implies x is in lo,
+                        // and x > max(lo) implies it is in hi. Probing lo with
+                        // find() first cost a failed O(log w) descent on roughly
+                        // half of all removals — the mirror of insert_val's test.
+                        if (!lo.empty() && x <= *lo.rbegin())
+                            lo.erase(lo.find(x));
                         else
                             hi.erase(hi.find(x));
-                        rebalance();
                     };
 
                     Column<double> result;
@@ -727,6 +752,7 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                             drop(lo_ptr);
                             ++lo_ptr;
                         }
+                        rebalance();  // once per row, after every mutation
                         if (nan_cnt > 0) {
                             result_values[i] = std::numeric_limits<double>::quiet_NaN();
                         } else if (lo.empty() && hi.empty()) {

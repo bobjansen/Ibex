@@ -4689,7 +4689,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
     }
 
@@ -4765,7 +4765,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
     }
 
@@ -4877,7 +4877,7 @@ class ChunkedAggregateOperator final : public Operator {
                 }
                 gids[row] = gid;
             }
-            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+            accumulate_gids(gids, agg_entries, rows);
             return std::nullopt;
         }
 
@@ -4909,7 +4909,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
     }
 
@@ -5021,7 +5021,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return true;
     }
 
@@ -5292,7 +5292,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
     }
 
@@ -5325,8 +5325,122 @@ class ChunkedAggregateOperator final : public Operator {
             });
         }
 
-        accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
+    }
+
+    /// Parallel scatter-accumulate of an already-assigned gid array — the
+    /// shared back half of every hash group-by fast path (string, int,
+    /// int-pair, generic). Returns false when the shape is not worth it and
+    /// the caller should accumulate serially into `flat_slots_`.
+    ///
+    /// **The gid pass stays serial on purpose.** It mutates the group index
+    /// and it is what defines group ORDER — Ibex reports groups in observed
+    /// first-occurrence order, so assigning gids concurrently would either
+    /// change the answer or need a reconciliation pass costing more than the
+    /// scan. Once every row carries a gid the rest is a pure scatter-reduce,
+    /// which is the part worth threading: for an 8-aggregate query like q01 it
+    /// is the dominant cost (24% of the whole query by profile), while the gid
+    /// probe is a single packed-integer lookup per row.
+    ///
+    /// Reproducibility, stated exactly, because the two halves get confused:
+    /// the partition is derived from row count and group count alone — both
+    /// properties of the DATA — and morsels merge in ascending order, so the
+    /// result does not depend on the machine, the thread count, or the
+    /// schedule (verified byte-identical across 2/3/5/8/16 threads). It DOES
+    /// differ from the serial path in the last ulp, because summing per morsel
+    /// and merging is not the same order as summing down the rows — q01's
+    /// sum_disc_price moves at the 11th significant digit. That is inherent to
+    /// any partitioned float reduction, it matches what
+    /// `try_process_rows_cat_parallel` has always done, and if anything the
+    /// partitioned sum is the more accurate of the two.
+    ///
+    /// This mirrors `try_process_rows_cat_parallel`, which can skip the gid
+    /// pass entirely because a Categorical code is already a dense index.
+    auto try_accumulate_parallel(const std::uint32_t* gids,
+                                 const std::vector<const ColumnEntry*>& agg_entries,
+                                 std::size_t rows) -> bool {
+        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows ||
+            n_groups_ == 0 || n_aggs_ == 0) {
+            return false;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (!agg_is_combinable(plan_[a].func)) {
+                return false;
+            }
+            // A boxed First/Last value lives outside the slot array, so a
+            // private copy would not capture it.
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return false;
+            }
+        }
+
+        // Same budget and morsel shape as the Categorical path, for the same
+        // reasons: partial state is bounded by GROUP COUNT, and the merge costs
+        // one agg_combine per (morsel, group) while the scan it replaces costs
+        // one update per row. Fanning out only pays when the merge stays small
+        // against the scan — a high-cardinality group-by would merge more slots
+        // than it saved row updates.
+        constexpr std::size_t kMinRowsPerMorsel = 65536;
+        constexpr std::size_t kMaxMorsels = 64;
+        constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
+        constexpr std::size_t kMergeToScanRatio = 4;
+        const std::size_t per_morsel_bytes = n_groups_ * n_aggs_ * sizeof(AggSlotCore);
+        if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
+            return false;
+        }
+        std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+        morsels = std::min(morsels, kPartialBudgetBytes / per_morsel_bytes);
+        if (morsels < 2 || morsels * n_groups_ > rows / kMergeToScanRatio) {
+            return false;
+        }
+
+        const std::size_t stride = n_groups_ * n_aggs_;
+        const std::size_t grain = (rows + morsels - 1) / morsels;
+        std::vector<AggSlotCore> partials(morsels * stride);
+
+        auto& pool = process_worker_pool();
+        const std::size_t threads =
+            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (m >= morsels) {
+                    return;
+                }
+                const std::size_t begin = m * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                if (begin >= end) {
+                    continue;
+                }
+                accumulate_columns_into(gids, agg_entries, begin, end, &partials[m * stride]);
+            }
+        });
+        batch.wait();
+
+        for (std::size_t m = 0; m < morsels; ++m) {
+            const AggSlotCore* src = &partials[m * stride];
+            for (std::size_t g = 0; g < n_groups_; ++g) {
+                AggSlotCore* dst = &flat_slots_[g * n_aggs_];
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    agg_combine(dst[a], src[(g * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+                }
+            }
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    /// Accumulate `gids` either across workers or, when that is not worth it,
+    /// serially — the one call every gid-assigning fast path ends with.
+    void accumulate_gids(const std::uint32_t* gids,
+                         const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) {
+        if (!try_accumulate_parallel(gids, agg_entries, rows)) {
+            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+        }
     }
 
     // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)

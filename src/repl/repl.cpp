@@ -974,6 +974,18 @@ void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry&
 /// Resolve a table name for a caller that needs the rows, not just the schema.
 /// A lazy binding is materialized in full: nothing about the caller bounds which
 /// columns it will look at.
+/// Execution settings for work that is not running inside a query plan — a
+/// REPL command that materializes a lazy binding whole, for instance. Built
+/// through `configure_parallel_from_env` like every other context, so the
+/// parallel switch still has exactly one source; the alternative (each such
+/// site reading the environment itself) is what the exec parameter exists to
+/// prevent.
+auto command_exec() -> runtime::ExecutionContext {
+    runtime::ExecutionContext exec;
+    runtime::configure_parallel_from_env(exec);
+    return exec;
+}
+
 auto resolve_table(const std::string& name, const runtime::TableRegistry& tables,
                    const LazyTableRegistry& lazy_tables)
     -> std::expected<runtime::Table, std::string> {
@@ -981,7 +993,7 @@ auto resolve_table(const std::string& name, const runtime::TableRegistry& tables
         return it->second;
     }
     if (auto it = lazy_tables.find(name); it != lazy_tables.end()) {
-        return it->second->materialize();
+        return it->second->materialize(command_exec());
     }
     return std::unexpected("unknown table '" + name + "'");
 }
@@ -3321,7 +3333,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         // A lazy binding named on its own — printed, passed to a function, written
         // out — is consumed whole, so there is nothing to push down. Force it.
         if (auto it = lazy_tables.find(ident->name); it != lazy_tables.end()) {
-            return it->second->materialize();
+            return it->second->materialize(command_exec());
         }
         return std::unexpected("unknown table: " + ident->name +
                                " (available: " + format_table_names(tables, lazy_tables) + ")");
@@ -3481,7 +3493,7 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
                 }
                 table = lazy->project_where(names, predicates.at(name), exec, &scalars);
             } else {
-                table = needed.all ? lazy->materialize() : lazy->project(needed.names);
+                table = needed.all ? lazy->materialize(exec) : lazy->project(needed.names, exec);
             }
             if (!table) {
                 return std::unexpected(table.error());
@@ -4739,7 +4751,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                 }
                 table = lazy->project_where(names, predicates.at(name), exec);
             } else {
-                table = needed.all ? lazy->materialize() : lazy->project(needed.names);
+                table = needed.all ? lazy->materialize(exec) : lazy->project(needed.names, exec);
             }
             if (!table.has_value()) {
                 return std::unexpected(table.error());

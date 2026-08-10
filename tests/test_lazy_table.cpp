@@ -81,7 +81,8 @@ class TrackingReader final : public runtime::LazySourceReader {
     TrackingReader(std::shared_ptr<ReaderFactoryState> state, std::size_t product)
         : state_(std::move(state)), product_(product) {}
 
-    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection)
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::ExecutionContext& /*exec*/)
         -> std::expected<runtime::Table, std::string> override {
         state_->decode_products.push_back(product_);
         const runtime::Selection all{0, 1, 2};
@@ -163,8 +164,8 @@ TEST_CASE("LazyTable: reader factory products own independent decoder state",
     schema.add_column("b", Column<std::int64_t>{});
     runtime::LazyTable lazy{std::move(schema), 3, factory};
 
-    REQUIRE(lazy.project({"a"}));
-    REQUIRE(lazy.project({"b"}));
+    REQUIRE(lazy.project({"a"}, kExec));
+    REQUIRE(lazy.project({"b"}, kExec));
     CHECK(state->decode_products == std::vector<std::size_t>{2, 2});
     CHECK(state->products == 3);
 }
@@ -182,7 +183,7 @@ TEST_CASE("LazyTable: project decodes only the columns asked for", "[runtime][la
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    auto table = lazy.project({"b"});
+    auto table = lazy.project({"b"}, kExec);
     REQUIRE(table);
     CHECK(names_of(table.value()) == std::vector<std::string>{"b"});
     CHECK(table->rows() == 3);
@@ -194,18 +195,18 @@ TEST_CASE("LazyTable: a decoded column is not decoded twice", "[runtime][lazy_ta
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    REQUIRE(lazy.project({"a", "b"}));
+    REQUIRE(lazy.project({"a", "b"}, kExec));
     REQUIRE(source.decode_calls.size() == 1);
 
     // Second query overlaps the first: only the genuinely new column is read.
-    auto table = lazy.project({"b", "c"});
+    auto table = lazy.project({"b", "c"}, kExec);
     REQUIRE(table);
     CHECK(names_of(table.value()) == std::vector<std::string>{"b", "c"});
     REQUIRE(source.decode_calls.size() == 2);
     CHECK(source.decode_calls[1] == std::vector<std::string>{"c"});
 
     // Fully cached: no decode at all.
-    REQUIRE(lazy.project({"a", "b"}));
+    REQUIRE(lazy.project({"a", "b"}, kExec));
     CHECK(source.decode_calls.size() == 2);
 }
 
@@ -214,8 +215,8 @@ TEST_CASE("LazyTable: projected columns come back in schema order", "[runtime][l
     auto lazy = make_lazy(source);
 
     // Decode `c` first, so cache insertion order differs from schema order.
-    REQUIRE(lazy.project({"c"}));
-    auto table = lazy.project({"a", "c"});
+    REQUIRE(lazy.project({"c"}, kExec));
+    auto table = lazy.project({"a", "c"}, kExec);
     REQUIRE(table);
     CHECK(names_of(table.value()) == std::vector<std::string>{"a", "c"});
 }
@@ -226,7 +227,7 @@ TEST_CASE("LazyTable: names outside the schema are ignored", "[runtime][lazy_tab
 
     // A join's demand is the union across both sides, so a source is routinely
     // asked for names it does not have.
-    auto table = lazy.project({"a", "not_here"});
+    auto table = lazy.project({"a", "not_here"}, kExec);
     REQUIRE(table);
     CHECK(names_of(table.value()) == std::vector<std::string>{"a"});
     CHECK(source.decode_calls[0] == std::vector<std::string>{"a"});
@@ -237,7 +238,7 @@ TEST_CASE("LazyTable: an empty projection still carries the row count", "[runtim
     auto lazy = make_lazy(source);
 
     // `count()` over an unfiltered scan needs the row count and no column.
-    auto table = lazy.project({});
+    auto table = lazy.project({}, kExec);
     REQUIRE(table);
     CHECK(table->columns.empty());
     CHECK(table->rows() == 3);
@@ -248,7 +249,7 @@ TEST_CASE("LazyTable: materialize decodes every column", "[runtime][lazy_table]"
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    auto table = lazy.materialize();
+    auto table = lazy.materialize(kExec);
     REQUIRE(table);
     CHECK(names_of(table.value()) == std::vector<std::string>{"a", "b", "c"});
     CHECK(table->rows() == 3);
@@ -377,7 +378,7 @@ TEST_CASE("LazyTable: project_where never poisons the whole-column cache",
     // The predicate column was decoded whole-file for the selection, so it is
     // a legitimate cache entry: projecting it later costs no decode and comes
     // back full-length.
-    auto whole_a = lazy.project({"a"});
+    auto whole_a = lazy.project({"a"}, kExec);
     REQUIRE(whole_a);
     CHECK(whole_a->rows() == 3);
     CHECK(source.decode_calls.size() == 2);
@@ -388,7 +389,7 @@ TEST_CASE("LazyTable: project_where never poisons the whole-column cache",
 
     // The payload column was decoded under a selection, so it must NOT be
     // cached: projecting it whole decodes it again, densely.
-    auto whole_b = lazy.project({"b"});
+    auto whole_b = lazy.project({"b"}, kExec);
     REQUIRE(whole_b);
     CHECK(whole_b->rows() == 3);
     REQUIRE(source.decode_calls.size() == 3);
@@ -401,7 +402,7 @@ TEST_CASE("LazyTable: project_where reuses cached whole columns for predicates",
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    REQUIRE(lazy.project({"a"}));
+    REQUIRE(lazy.project({"a"}, kExec));
     REQUIRE(source.decode_calls.size() == 1);
 
     // `a` is already cached whole-file, so only the payload column is decoded.
@@ -422,7 +423,7 @@ TEST_CASE("LazyTable: a decode failure surfaces as an error", "[runtime][lazy_ta
         [](const std::vector<std::string>&, const runtime::Selection*)
             -> std::expected<runtime::Table, std::string> { return std::unexpected("boom"); }};
 
-    auto table = lazy.project({"a"});
+    auto table = lazy.project({"a"}, kExec);
     REQUIRE_FALSE(table);
     CHECK(table.error() == "boom");
 }
@@ -791,7 +792,7 @@ TEST_CASE("LazyTable: a cached key column bypasses the fused scan",
             return std::optional{runtime::Selection{}};
         }};
 
-    REQUIRE(lazy.project({"a"}));
+    REQUIRE(lazy.project({"a"}, kExec));
 
     runtime::DynamicScanFilter filter;
     filter.bloom.emplace(2);
@@ -810,7 +811,7 @@ TEST_CASE("LazyTable: project_rows decodes only the selected rows",
           "[runtime][lazy_table][deferred_scan]") {
     FakeSource source;
     auto lazy = make_lazy(source);
-    auto table = lazy.project_rows({"a", "c"}, runtime::Selection{0, 2});
+    auto table = lazy.project_rows({"a", "c"}, runtime::Selection{0, 2}, kExec);
     REQUIRE(table);
     CHECK(table->rows() == 2);
     REQUIRE(source.selections.size() == 1);

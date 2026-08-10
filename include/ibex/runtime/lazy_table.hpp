@@ -45,8 +45,12 @@ class LazySourceReader {
    public:
     virtual ~LazySourceReader() = default;
 
+    /// `exec` carries the query's parallel settings. A decoder is free to use
+    /// them (the Parquet one decodes columns across workers) or ignore them,
+    /// but it must not consult the environment for the answer: the execution
+    /// context is the single authority on whether a query runs parallel.
     [[nodiscard]] virtual auto decode(const std::vector<std::string>& names,
-                                      const Selection* selection)
+                                      const Selection* selection, const ExecutionContext& exec)
         -> std::expected<Table, std::string> = 0;
 
     [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
@@ -116,7 +120,7 @@ class LazyTable {
     /// Materialize `names`, in schema order. Names not in the schema are
     /// ignored, so a caller may pass the union of the columns demanded across
     /// several sources without first splitting it per source.
-    [[nodiscard]] auto project(const std::set<std::string>& names)
+    [[nodiscard]] auto project(const std::set<std::string>& names, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
 
     /// Materialize `names` after applying row-local scan conjuncts. Predicate
@@ -147,7 +151,8 @@ class LazyTable {
     /// late materialization for a caller (the deferred-probe join) that
     /// already knows exactly which rows survive. Bypasses `cache_` like
     /// `project_where` does, and for the same reason.
-    [[nodiscard]] auto project_rows(const std::set<std::string>& names, const Selection& selected)
+    [[nodiscard]] auto project_rows(const std::set<std::string>& names, const Selection& selected,
+                                    const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
 
     /// Phase A of a two-phase deferred probe: compute the scan's selection
@@ -169,7 +174,8 @@ class LazyTable {
 
     /// Materialize every column — the fallback for anything that consumes the
     /// table whole rather than through a query plan.
-    [[nodiscard]] auto materialize() -> std::expected<Table, std::string>;
+    [[nodiscard]] auto materialize(const ExecutionContext& exec)
+        -> std::expected<Table, std::string>;
 
    private:
     class ReaderPool;
@@ -177,10 +183,10 @@ class LazyTable {
     /// Decode the referenced columns whole-file into `cache_` (they are
     /// legitimate whole-column entries) and return them as a table.
     [[nodiscard]] auto decode_whole_columns(
-        const robin_hood::unordered_set<std::string>& referenced)
+        const robin_hood::unordered_set<std::string>& referenced, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto decode_columns(const std::vector<std::string>& names,
-                                      const Selection* selection)
+                                      const Selection* selection, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter)
         -> std::expected<std::optional<Selection>, std::string>;
@@ -212,6 +218,7 @@ using LazyTablePtr = std::shared_ptr<LazyTable>;
 /// in hand from phase A) at its schema position so column order matches the
 /// ordinary path.
 [[nodiscard]] auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
+                                                  const ExecutionContext& exec,
                                                   ColumnEntry key_column)
     -> std::expected<Table, std::string>;
 

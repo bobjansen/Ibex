@@ -3497,8 +3497,8 @@ class ChunkedInnerJoinOperator final : public Operator {
         auto sel = std::move(**phase);
         const auto* keys_col = std::get_if<Column<std::int64_t>>(&*sel.keys.column);
         if (build.rows() > sel.selected.size() || keys_col == nullptr) {
-            auto right_rows =
-                materialize_deferred_scan_rows(*deferred_probe_, sel.selected, std::move(sel.keys));
+            auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, sel.selected,
+                                                             *deferred_exec_, std::move(sel.keys));
             if (!right_rows.has_value()) {
                 return std::move(right_rows.error());
             }
@@ -3576,8 +3576,8 @@ class ChunkedInnerJoinOperator final : public Operator {
             // Null keys never match, so every survivor's key is valid.
         }
 
-        auto right_rows =
-            materialize_deferred_scan_rows(*deferred_probe_, survivors, std::move(key_entry));
+        auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, survivors,
+                                                         *deferred_exec_, std::move(key_entry));
         if (!right_rows.has_value()) {
             return std::move(right_rows.error());
         }

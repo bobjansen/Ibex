@@ -3881,6 +3881,83 @@ TEST_CASE("rolling_median matches a brute-force median across window sizes") {
     }
 }
 
+TEST_CASE("rolling_median grows its slot ring on a widening duration window") {
+    // A duration window cannot know how many rows will fall inside its span, so
+    // SlidingMedian starts empty and doubles its slot ring on demand. Doubling
+    // renames every live slot, and the renaming is only interesting when the
+    // ring is WRAPPED at the moment it grows — head_ != 0, live elements split
+    // across the end of the buffer. A window of constant width never gets
+    // there: it fills once from head_ 0 and grows before it ever evicts.
+    //
+    // So the gaps here shrink steadily, from 2000ns down to 1ns. The window's
+    // width in rows climbs across the whole table while evictions run every
+    // row, which puts every doubling on a wrapped ring with a moving head.
+    constexpr std::size_t kRows = 2500;
+    std::vector<double> vals(kRows);
+    std::vector<std::int64_t> nanos(kRows);
+    std::uint64_t state = 0xD1B54A32D192ED03ULL;
+    double acc = 0.0;
+    std::int64_t t = 0;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        state = (state * 6364136223846793005ULL) + 1442695040888963407ULL;
+        acc += static_cast<double>((state >> 33U) % 15U) - 7.0;
+        vals[i] = acc;
+        nanos[i] = t;
+        t += std::max<std::int64_t>(1, 2000 - static_cast<std::int64_t>(i));
+    }
+
+    runtime::Table table;
+    Column<Timestamp> ts;
+    Column<double> val;
+    ts.reserve(kRows);
+    val.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        ts.push_back(ts_from_nanos(nanos[i]));
+        val.push_back(vals[i]);
+    }
+    table.add_column("ts", std::move(ts));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    for (const std::int64_t width : {std::int64_t{20000}, std::int64_t{100000}}) {
+        CAPTURE(width);
+        const std::string src =
+            "data[window " + std::to_string(width) + "ns, update { m = rolling_median(val) }];";
+        auto ir = require_ir(src.c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* m = std::get_if<Column<double>>(result->find("m"));
+        REQUIRE(m != nullptr);
+
+        std::vector<double> scratch;
+        std::size_t widest = 0;
+        for (std::size_t i = 0; i < kRows; ++i) {
+            // Trailing window is half-open on the left: (t - width, t].
+            std::size_t lo = 0;
+            while (nanos[lo] <= nanos[i] - width)
+                ++lo;
+            widest = std::max(widest, i - lo + 1);
+            scratch.assign(vals.begin() + static_cast<std::ptrdiff_t>(lo),
+                           vals.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+            std::ranges::sort(scratch);
+            const std::size_t n = scratch.size();
+            const double want =
+                (n % 2 == 1) ? scratch[n / 2] : (scratch[(n / 2) - 1] + scratch[n / 2]) / 2.0;
+            CAPTURE(i);
+            REQUIRE((*m)[i] == Catch::Approx(want));
+        }
+        // Guard the premise: the ring starts at 16 slots, so a window this wide
+        // can only have been served by several doublings. If a future change
+        // pre-sizes the structure this fires as a reminder that the growth path
+        // no longer has coverage here.
+        CAPTURE(widest);
+        REQUIRE(widest > 256);
+    }
+}
+
 TEST_CASE("rolling_median skips nulls and propagates NaN") {
     // Nulls never enter the structure and NaNs are counted beside it, so both
     // paths make the values that DO enter leave in a different order than the

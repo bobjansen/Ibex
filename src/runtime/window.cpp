@@ -202,20 +202,28 @@ class IndexRingDeque {
 /// (the same algorithm) rather than 4x behind it.
 class SlidingMedian {
    public:
-    /// `capacity` must be the widest row span the window will ever hold PLUS
-    /// ONE: callers push row i before trimming the trailing edge, so the
-    /// structure transiently holds one more element than the window does.
-    explicit SlidingMedian(std::size_t capacity)
-        : cap_(capacity == 0 ? 1 : capacity), pos_(cap_), lo_(pos_, 0), hi_(pos_, 1) {
-        lo_.reserve(cap_);
-        hi_.reserve(cap_);
+    /// `initial_capacity` is a hint, not a bound: the slot ring grows on demand
+    /// like IndexRingDeque's. Pass the widest row span when it is known cheaply
+    /// (a count window knows it) to skip the growth entirely, and 0 when it is
+    /// not — a duration window cannot know how many rows will fall inside its
+    /// span, and a streaming one cannot know even in principle. Sizing a count
+    /// window, note that the caller pushes row i BEFORE trimming the trailing
+    /// edge, so the structure transiently holds one more element than the
+    /// window does; pass span + 1 to stay off the growth path.
+    explicit SlidingMedian(std::size_t initial_capacity = 0) : lo_(pos_, 0), hi_(pos_, 1) {
+        if (initial_capacity > 0)
+            set_capacity(initial_capacity);
     }
 
     [[nodiscard]] auto empty() const noexcept -> bool { return lo_.empty() && hi_.empty(); }
 
     void push(double x) {
+        // The ring holds exactly the live elements, so it is full precisely
+        // when the halves account for every slot.
+        if (lo_.size() + hi_.size() == cap_)
+            grow();
         const std::uint32_t slot = tail_;
-        tail_ = (tail_ + 1 == cap_) ? 0 : tail_ + 1;
+        tail_ = (tail_ + 1) & mask_;
         // Invariant (2), max(lo) <= min(hi), picks the half in O(1). With
         // rebalancing deferred (see rebalance), lo can be transiently empty
         // while hi is not, so an empty lo is not on its own a reason to take x
@@ -236,7 +244,7 @@ class SlidingMedian {
     /// and pos_ locates it.
     void pop() {
         const std::uint32_t slot = head_;
-        head_ = (head_ + 1 == cap_) ? 0 : head_ + 1;
+        head_ = (head_ + 1) & mask_;
         const std::size_t p = pos_[slot];
         if ((p & 1U) == 0U)
             lo_.remove(p >> 1U);
@@ -308,6 +316,18 @@ class SlidingMedian {
             }
         }
 
+        /// Renumber every slot this heap holds against a ring that has just
+        /// been widened and rewound to head 0. A slot's new name is its FIFO
+        /// distance from the old head, which the old mask recovers. Heap order
+        /// is untouched — only the names of the slots change, so no sifting.
+        void relinearize(std::uint32_t old_head, std::uint32_t old_mask) {
+            for (std::size_t i = 0; i < slot_.size(); ++i) {
+                const auto s = static_cast<std::uint32_t>((slot_[i] - old_head) & old_mask);
+                slot_[i] = s;
+                pos_[s] = (i << 1U) | bit_;
+            }
+        }
+
        private:
         /// "belongs closer to the root than".
         [[nodiscard]] static auto higher(double a, double b) noexcept -> bool {
@@ -364,10 +384,54 @@ class SlidingMedian {
         std::size_t bit_;
     };
 
-    std::size_t cap_;
+    /// Round up to a power of two so slot arithmetic is a mask rather than a
+    /// compare-and-wrap. Only ever called on an empty structure.
+    void set_capacity(std::size_t n) {
+        constexpr std::size_t kMaxCap = std::size_t{1} << 31U;
+        if (n > kMaxCap)
+            throw std::length_error("rolling_median window capacity overflow");
+        const std::size_t cap = std::bit_ceil(n);
+        pos_.assign(cap, 0);
+        cap_ = static_cast<std::uint32_t>(cap);
+        mask_ = cap_ - 1;
+        lo_.reserve(cap);
+        hi_.reserve(cap);
+    }
+
+    /// Double the slot ring. The heaps themselves need nothing — they are
+    /// vectors and grow on their own; it is only `pos_`, the slot index, that
+    /// is sized. Widening it renames every live slot, so both halves get a
+    /// renumbering pass: O(w) work per doubling, hence O(1) amortized per
+    /// element, and it never runs at all for a window sized up front.
+    void grow() {
+        if (cap_ == 0) {
+            set_capacity(16);
+            return;
+        }
+        const std::uint32_t old_cap = cap_;
+        const std::uint32_t old_head = head_;
+        const std::uint32_t old_mask = mask_;
+        if (old_cap > (std::uint32_t{1} << 30U))
+            throw std::length_error("rolling_median window capacity overflow");
+        const std::size_t new_cap = std::size_t{old_cap} * 2;
+        pos_.assign(new_cap, 0);
+        cap_ = static_cast<std::uint32_t>(new_cap);
+        mask_ = cap_ - 1;
+        lo_.reserve(new_cap);
+        hi_.reserve(new_cap);
+        lo_.relinearize(old_head, old_mask);
+        hi_.relinearize(old_head, old_mask);
+        // The ring was full, so the renumbered slots are exactly [0, old_cap)
+        // and the new free space sits above them — no wrap to account for.
+        head_ = 0;
+        tail_ = old_cap;
+    }
+
     std::vector<std::size_t> pos_;  // FIFO slot -> (heap index << 1) | heap bit
     Heap<false> lo_;                // lower half, max-heap: root is max(lo)
     Heap<true> hi_;                 // upper half, min-heap: root is min(hi)
+    std::uint32_t cap_ = 0;         // slot ring size, a power of two
+    std::uint32_t mask_ = 0;        // cap_ - 1
     std::uint32_t head_ = 0;        // slot of the oldest live value
     std::uint32_t tail_ = 0;        // next free slot
 };
@@ -842,24 +906,14 @@ auto apply_rolling_func(const ir::CallExpr& call, const Table& table, WindowSpec
                     // See SlidingMedian for the structure and why it is not a
                     // pair of ordered trees.
                     //
-                    // It needs its capacity up front. For a count window that
-                    // is the count; for a duration window the widest span has
-                    // to be found, which is one cheap two-pointer pass (the
-                    // same walk rolling_count does) and well under what the
-                    // median loop itself costs. Plus one either way: row i is
-                    // pushed before the trailing edge is trimmed.
-                    std::size_t max_span = 0;
-                    if (is_count) {
-                        max_span = std::min(count_n, rows);
-                    } else {
-                        std::size_t scan_lo = 0;
-                        for (std::size_t i = 0; i < rows; ++i) {
-                            while (scan_lo < i && should_drop(scan_lo, i))
-                                ++scan_lo;
-                            max_span = std::max(max_span, i - scan_lo + 1);
-                        }
-                    }
-                    SlidingMedian med(max_span + 1);
+                    // A count window knows its widest span, so it can size the
+                    // structure once and never grow (plus one: row i is pushed
+                    // before the trailing edge is trimmed). A duration window
+                    // does not — how many rows land inside the span is a
+                    // property of the data — so it starts empty and grows,
+                    // which costs O(1) amortized per row and, unlike measuring
+                    // the span first, asks nothing of rows not yet seen.
+                    SlidingMedian med(is_count ? std::min(count_n, rows) + 1 : 0);
 
                     Column<double> result;
                     result.resize_for_overwrite(rows);

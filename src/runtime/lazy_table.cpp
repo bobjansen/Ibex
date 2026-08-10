@@ -47,14 +47,14 @@ LazyTable::LazyTable(Table schema, std::size_t rows, LazySourceReaderFactory rea
       reader_pool_(std::make_shared<ReaderPool>()),
       stats_(std::move(stats)) {}
 
-auto LazyTable::decode_columns(const std::vector<std::string>& names, const Selection* selection)
-    -> std::expected<Table, std::string> {
+auto LazyTable::decode_columns(const std::vector<std::string>& names, const Selection* selection,
+                               const ExecutionContext& exec) -> std::expected<Table, std::string> {
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->decode(names, selection);
+        auto result = (*reader)->decode(names, selection, exec);
         if (result) {
             release_reader(std::move(*reader));
         }
@@ -103,7 +103,8 @@ void LazyTable::release_reader(LazySourceReaderPtr reader) {
     reader_pool_->available.push_back(std::move(reader));
 }
 
-auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Table, std::string> {
+auto LazyTable::project(const std::set<std::string>& names, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
     std::vector<std::string> missing;
     for (const auto& entry : schema_.columns) {
         if (names.contains(entry.name) && !cache_.contains(entry.name)) {
@@ -112,7 +113,7 @@ auto LazyTable::project(const std::set<std::string>& names) -> std::expected<Tab
     }
 
     if (!missing.empty()) {
-        auto decoded = decode_columns(missing, nullptr);
+        auto decoded = decode_columns(missing, nullptr, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -252,7 +253,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     const bool membership =
         dynamic != nullptr && dynamic_key != nullptr && dynamic->has_membership();
     if (conjuncts.empty() && !membership) {
-        return project(names);
+        return project(names, exec);
     }
 
     // Fused path: the source evaluates the key filter inside its own decoder,
@@ -275,7 +276,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
                 }
             }
             if (!wanted.empty()) {
-                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected);
+                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, exec);
                 if (!decoded) {
                     return std::unexpected(decoded.error());
                 }
@@ -308,7 +309,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         referenced.insert(*dynamic_key);
     }
 
-    auto predicates_res = decode_whole_columns(referenced);
+    auto predicates_res = decode_whole_columns(referenced, exec);
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
@@ -328,11 +329,11 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         }
     } else {
         if (!key.has_value()) {
-            return project(names);  // key missing or non-int64: no filter to apply
+            return project(names, exec);  // key missing or non-int64: no filter to apply
         }
         auto from_membership = membership_selection(*key, *dynamic, rows_);
         if (!from_membership.has_value()) {
-            return project(names);  // escape hatch: the filter barely rejects
+            return project(names, exec);  // escape hatch: the filter barely rejects
         }
         selected = std::move(*from_membership);
     }
@@ -347,7 +348,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
 
     Table decoded_remaining;
     if (!remaining.empty()) {
-        auto decoded = decode_columns(remaining, all_rows ? nullptr : &*selected);
+        auto decoded = decode_columns(remaining, all_rows ? nullptr : &*selected, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -409,7 +410,8 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     return out;
 }
 
-auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string>& referenced)
+auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string>& referenced,
+                                     const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     // Predicate columns are decoded whole-file (the selection needs every
     // row), so they are legitimate cache entries: reuse any already cached,
@@ -422,7 +424,7 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
         }
     }
     if (!missing.empty()) {
-        auto decoded = decode_columns(missing, nullptr);
+        auto decoded = decode_columns(missing, nullptr, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -453,8 +455,8 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
     return out;
 }
 
-auto LazyTable::project_rows(const std::set<std::string>& names, const Selection& selected)
-    -> std::expected<Table, std::string> {
+auto LazyTable::project_rows(const std::set<std::string>& names, const Selection& selected,
+                             const ExecutionContext& exec) -> std::expected<Table, std::string> {
     const bool all_rows = selected.size() == rows_;
     // Columns already cached whole-file (predicate columns, or another scan
     // instance's decode) are gathered in memory — re-reading their pages
@@ -467,7 +469,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
     }
     Table decoded;
     if (!missing.empty()) {
-        auto res = decode_columns(missing, all_rows ? nullptr : &selected);
+        auto res = decode_columns(missing, all_rows ? nullptr : &selected, exec);
         if (!res) {
             return std::unexpected(res.error());
         }
@@ -534,7 +536,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         }
         JoinKeySelection out;
         out.selected = std::move(**scan);
-        auto keys = project_rows({key_name}, out.selected);
+        auto keys = project_rows({key_name}, out.selected, exec);
         if (!keys) {
             return std::unexpected(keys.error());
         }
@@ -552,7 +554,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     }
     referenced.insert(key_name);
 
-    auto predicates_res = decode_whole_columns(referenced);
+    auto predicates_res = decode_whole_columns(referenced, exec);
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
@@ -600,12 +602,12 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     return std::optional{std::move(out)};
 }
 
-auto LazyTable::materialize() -> std::expected<Table, std::string> {
+auto LazyTable::materialize(const ExecutionContext& exec) -> std::expected<Table, std::string> {
     std::set<std::string> names;
     for (const auto& entry : schema_.columns) {
         names.insert(entry.name);
     }
-    return project(names);
+    return project(names, exec);
 }
 
 }  // namespace ibex::runtime

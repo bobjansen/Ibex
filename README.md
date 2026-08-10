@@ -13,26 +13,31 @@ Small pull requests are welcome under the contribution terms in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Notable language features:
-- bracket pipelines for filter/select/update/group/order/join flows
-- parallel execution for sufficiently large eligible filters, updates, sorts,
-  and grouped window operations (set `IBEX_PARALLEL=0` to disable it)
-- grouped `rank(...)` inside `update`, including `rank(order { ... })` for
-  multi-key tie-breaking
-- `DataFrame<{...}>` contracts for minimum required columns on table arguments
-- `TimeFrame`s with rolling, aligned, and resampled time windows
-- null-aware expressions, reshaping, and inner/outer/semi/anti/as-of/theta joins
-- named arguments plus trailing default parameters for readable call sites
-- typed `fn` definitions with required parameter and return types
-- compile-time `map` expansion inside braced `select` / `update` blocks
+  - compact bracket syntax for filtering, selecting, updating, grouping, ordering, joining, and reshaping tables
+  - excellent columnar execution, with parallelism for eligible large operations
+  - static types and runtime-checked DataFrame<{...}> schemas at data boundaries
+  - TimeFrames for rolling, aligned, and resampled time-series analysis
+  - typed functions, native extensions, and C++23 transpilation for integration and deployment
+  - null-aware expressions, joins, and reshape operations
 
 ```
 import "csv";
 
-let prices = read_csv("prices.csv");
+// Declare the columns this example relies on; the CSV may contain others.
+let prices = as_timeframe(
+    read_csv("prices.csv") as DataFrame<{
+        ts: Timestamp,
+        symbol: String,
+        price: Float64,
+        volume: Int64
+    }>,
+    "ts"
+);
 
-// Filter, then group-by aggregation
+// Filter ticks, then resample them into one-minute OHLC bars per symbol.
 let ohlc = prices[
     filter price > 1.0,
+    resample 1m,
     select { open = first(price), high = max(price), low = min(price), close = last(price) },
     by symbol,
 ];
@@ -88,78 +93,61 @@ let tf = as_timeframe(
 );
 ```
 
-Array values infer `Int64`, `Float64`, `Bool`, `String`, `Date`, or
-`Timestamp`, and every element in one array must have the same type. Every
-column in the constructor must have the same row count. For expression-backed
-columns, a single-column result is used directly; a multi-column result must
-contain a column with the same name as the field being defined.
-
-### Load and filter
-
-```
-import "csv";
-
-let iris = read_csv("data/iris.csv");
-
-// Filter rows, select columns
-iris[filter `Sepal.Length` > 5.0, select { Species, `Sepal.Length` }];
-```
-
 ### Aggregation
 
 ```
-// Mean sepal length per species
-iris[select { mean_sl = mean(`Sepal.Length`) }, by Species];
+// Mean price per symbol
+prices[select { mean_price = mean(price) }, by symbol];
 ```
 
 ### Update (add / replace columns)
 
 ```
 // Add derived columns — all existing columns are preserved
-iris[update { sl_doubled = `Sepal.Length` * 2.0 }];
+prices[update { price_doubled = price * 2.0 }];
 ```
 
 ### Distinct
 
 ```
-// Unique species values
-iris[distinct `Species`];
+// Unique symbols
+prices[distinct symbol];
 
-// Unique (Species, Sepal.Length) pairs
-iris[distinct { `Species`, `Sepal.Length` }];
+// Unique (symbol, price) pairs
+prices[distinct { symbol, price }];
 ```
 
 ### Order
 
 ```
 // Order by a single key (ascending by default)
-iris[order `Species`];
+prices[order symbol];
 
 // Order by multiple keys with explicit directions
-iris[order { `Species` asc, `Sepal.Length` desc }];
+prices[order { symbol asc, price desc }];
 
 // Order by all columns (schema order)
-iris[order];
+prices[order];
 ```
 
 ### Head / Tail
 
 ```
 // First 10 rows in the current order
-iris[head 10];
+prices[head 10];
 
 // First n rows using a scalar binding
 let n = 10;
-iris[head n];
+prices[head n];
 
 // Top 3 rows per species after sorting
-iris[order { `Sepal.Length` desc }, head 3, by Species];
+prices[order { price desc }, head 3, by symbol];
 
 // Last 10 rows in the current order
-iris[tail 10];
+prices[tail 10];
 
 // Bottom 3 rows per species after sorting
-iris[order { `Sepal.Length` desc }, tail 3, by Species];
+prices[order { price desc }, tail 3, by symbol];
 ```
 
 ### Rank
@@ -207,7 +195,7 @@ let with_meta = prices left join metadata on symbol;
 
 ```
 // Rename columns — schema updated, data unchanged
-iris[rename { `Sepal.Length` -> sepal_length, `Sepal.Width` -> sepal_width }]
+prices[rename { price -> close, volume -> shares }]
 ```
 
 ### Grouped update (window-function equivalent)
@@ -218,7 +206,7 @@ back to every row in the group** — analogous to a SQL window function with
 
 ```
 // Attach group mean to every row (no row reduction)
-iris[update { group_mean = mean(`Sepal.Length`) }, by Species]
+prices[update { group_mean = mean(price) }, by symbol]
 ```
 
 ### Tuple assignment
@@ -1085,4 +1073,3 @@ cp -r editors/vscode ~/.vscode/extensions/ibex-language-0.1.0
 Fully restart VS Code after copying. `.ibex` files will be highlighted automatically.
 
 **Highlights:** keywords (`filter`, `select`, `by`, …), clause operators, type names, built-in functions (`mean`, `rolling_sum`, …), duration literals (`1m`, `5s`), backtick-quoted column names, strings, and comments.
-

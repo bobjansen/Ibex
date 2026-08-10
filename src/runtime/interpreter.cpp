@@ -212,7 +212,8 @@ auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext&
         }
     }
     if (conjuncts.empty() && dynamic == nullptr) {
-        return scan.demand_all ? scan.lazy->materialize() : scan.lazy->project(scan.demand);
+        return scan.demand_all ? scan.lazy->materialize(exec)
+                               : scan.lazy->project(scan.demand, exec);
     }
     std::set<std::string> names = scan.demand;
     if (scan.demand_all) {
@@ -237,7 +238,8 @@ auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContex
 }
 
 auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& rows,
-                                    ColumnEntry key_column) -> std::expected<Table, std::string> {
+                                    const ExecutionContext& exec, ColumnEntry key_column)
+    -> std::expected<Table, std::string> {
     std::set<std::string> names = scan.demand;
     if (scan.demand_all) {
         for (const auto& field : scan.lazy->schema().columns) {
@@ -245,7 +247,7 @@ auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& r
         }
     }
     names.erase(scan.key_column);
-    auto rest = scan.lazy->project_rows(names, rows);
+    auto rest = scan.lazy->project_rows(names, rows, exec);
     if (!rest) {
         return std::unexpected(rest.error());
     }

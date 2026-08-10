@@ -8,22 +8,22 @@ information.
 
 Ibex is licensed under the GNU Affero General Public License, version 3 only
 (`AGPL-3.0-only`). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md),
-including the separate MIT attribution for Poorman-derived ibex test material.
+including the separate MIT attribution for Poorman-derived Ibex test material.
 Small pull requests are welcome under the contribution terms in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Notable language features:
 - bracket pipelines for filter/select/update/group/order/join flows
-- compile-time `map` expansion inside braced `select` / `update` blocks
-- typed `fn` definitions with required parameter and return types
-- named arguments plus trailing default parameters for readable call sites
-- `DataFrame<{...}>` contracts for minimum required columns on table arguments
-- grouped `rank(...)` inside `update`, including `rank(order { ... })` for
-  multi-key tie-breaking
-- `TimeFrame`s with rolling, aligned, and resampled time windows
-- null-aware expressions, reshaping, and inner/outer/semi/anti/as-of/theta joins
 - parallel execution for sufficiently large eligible filters, updates, sorts,
   and grouped window operations (set `IBEX_PARALLEL=0` to disable it)
+- grouped `rank(...)` inside `update`, including `rank(order { ... })` for
+  multi-key tie-breaking
+- `DataFrame<{...}>` contracts for minimum required columns on table arguments
+- `TimeFrame`s with rolling, aligned, and resampled time windows
+- null-aware expressions, reshaping, and inner/outer/semi/anti/as-of/theta joins
+- named arguments plus trailing default parameters for readable call sites
+- typed `fn` definitions with required parameter and return types
+- compile-time `map` expansion inside braced `select` / `update` blocks
 
 ```
 import "csv";
@@ -43,134 +43,6 @@ let annotated = prices[update { price_k = price / 1000.0 }];
 // Join two tables
 let enriched = prices join ohlc on symbol;
 ```
-
-Compile-time field generation is available inside braced `select` and `update`
-blocks:
-
-```ibex
-let measures = ["price", "fee"];
-
-trades[select {
-    symbol,
-    map m in measures => `avg_${m}` = mean(get(m))
-}, by symbol];
-```
-
-This keeps feature-family generation in Ibex itself instead of pushing schema
-construction back out into Python or notebook host code.
-
-## IPython and Jupyter
-
-Ibex now has a Python bridge that returns `pyarrow.Table` objects and an
-IPython extension for notebook-style workflows. The intended split is simple:
-keep joins, filters, aggregations, and reshaping in Ibex; use Python for plots,
-notebooks, and downstream ML.
-
-Build the bridge first:
-
-```bash
-cmake --build build-release --parallel --target ibex_pyarrow
-uv sync
-```
-
-Then start IPython from the repository root and load the extension:
-
-```python
-%load_ext ibex_ipython
-```
-
-Inline cell example with a pandas table binding and a Python scalar binding:
-
-```python
-import pandas as pd
-
-trades = pd.DataFrame({
-    "symbol": ["AAPL", "AAPL", "MSFT"],
-    "qty": [10, 15, 7],
-    "px": [101.2, 101.5, 299.8],
-})
-offset = 10
-```
-
-```python
-%%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
-trades[
-    select { total_qty = sum(qty + offset), avg_px = mean(px) },
-    by symbol,
-    order symbol
-];
-```
-
-The result is stored in `grouped` as a pandas `DataFrame`. Use `--as pyarrow`
-to keep the result as a `pyarrow.Table`, or `%ibexfile` to run a checked-in
-`.ibex` script directly:
-
-```python
-%ibexfile --as pyarrow --out result python/plot_ibex_pyarrow_demo.ibex
-```
-
-Notebook cells are stateful by default. A `%%ibex` cell can define a table once
-and later cells can reuse it without rerunning the load:
-
-```python
-%%ibex --quiet
-import "csv";
-let train = read_csv("../../kaggle/data/train.csv", "<empty>");
-
-%%ibex --as pandas --out bucket_summary
-train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];
-```
-
-Reset the hidden Ibex session with:
-
-```python
-%ibexreset
-```
-
-Supported magic options:
-
-- `--bind ibex_name=python_var` to pass pandas/pyarrow tables or Python scalar values into Ibex
-- supported scalar bindings currently include `int`, `float`, `bool`, `str`, `datetime.date`, and `datetime.datetime`
-- Python `datetime.date` maps to Ibex `Date`, and `datetime.datetime` maps to Ibex `Timestamp`
-- `--as pyarrow|pandas` to control the returned result type
-- `--out var_name` to choose the output variable name
-- `--quiet` to suppress immediate display
-- `%ibexreset` to clear persisted Ibex notebook bindings
-
-This is the fastest way to get Ibex into a notebook today without inventing a
-separate plotting system or a full standalone kernel.
-
-## R and dplyr
-
-The in-repo `ibex` package includes a lazy dplyr backend for in-memory R and
-nanoarrow tables. Supported verbs remain an immutable Ibex plan until a
-terminal operation executes it:
-
-```r
-library(dplyr)
-library(ibex)
-
-query <- ibex_tbl(trades, fallback = "error") |>
-  filter(price > 10) |>
-  mutate(notional = price * size) |>
-  group_by(symbol) |>
-  summarise(total = sum(notional), .groups = "drop") |>
-  arrange(desc(total))
-
-show_query(query)
-result <- collect(query)
-```
-
-Captured R scalars cross as typed bindings, not interpolated source.
-Unsupported expressions use an explicit `"warn"`, `"error"`, or `"collect"`
-fallback policy; after a permitted fallback, execution stays in local dplyr.
-Arbitrary R closures never run as Ibex worker kernels. The package compatibility
-matrix documents the exact native verb, type, null, grouping, and ordering
-contract.
-
-See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
-example with scalar capture, lazy translation, grouped aggregation, and
-collection back into R.
 
 ## Language at a glance
 
@@ -606,6 +478,119 @@ Ibex uses a thread-local `xoshiro256++` scheme:
 
 This keeps parallel queries lock-free and reproducible when reseeded.
 
+## R and dplyr
+
+The in-repo `ibex` package includes a lazy dplyr backend for in-memory R and
+nanoarrow tables. Supported verbs remain an immutable Ibex plan until a
+terminal operation executes it:
+
+```r
+library(dplyr)
+library(ibex)
+
+query <- ibex_tbl(trades, fallback = "error") |>
+  filter(price > 10) |>
+  mutate(notional = price * size) |>
+  group_by(symbol) |>
+  summarise(total = sum(notional), .groups = "drop") |>
+  arrange(desc(total))
+
+show_query(query)
+result <- collect(query)
+```
+
+Captured R scalars cross as typed bindings, not interpolated source.
+Unsupported expressions use an explicit `"warn"`, `"error"`, or `"collect"`
+fallback policy; after a permitted fallback, execution stays in local dplyr.
+Arbitrary R closures never run as Ibex worker kernels. The package compatibility
+matrix documents the exact native verb, type, null, grouping, and ordering
+contract.
+
+See [`examples/ibex_dplyr.R`](examples/ibex_dplyr.R) for a complete runnable
+example with scalar capture, lazy translation, grouped aggregation, and
+collection back into R.
+
+## IPython and Jupyter
+
+Ibex now has a Python bridge that returns `pyarrow.Table` objects and an
+IPython extension for notebook-style workflows. The intended split is simple:
+keep joins, filters, aggregations, and reshaping in Ibex; use Python for plots,
+notebooks, and downstream ML.
+
+Build the bridge first:
+
+```bash
+cmake --build build-release --parallel --target ibex_pyarrow
+uv sync
+```
+
+Then start IPython from the repository root and load the extension:
+
+```python
+%load_ext ibex_ipython
+```
+
+Inline cell example with a pandas table binding and a Python scalar binding:
+
+```python
+import pandas as pd
+
+trades = pd.DataFrame({
+    "symbol": ["AAPL", "AAPL", "MSFT"],
+    "qty": [10, 15, 7],
+    "px": [101.2, 101.5, 299.8],
+})
+offset = 10
+```
+
+```python
+%%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
+trades[
+    select { total_qty = sum(qty + offset), avg_px = mean(px) },
+    by symbol,
+    order symbol
+];
+```
+
+The result is stored in `grouped` as a pandas `DataFrame`. Use `--as pyarrow`
+to keep the result as a `pyarrow.Table`, or `%ibexfile` to run a checked-in
+`.ibex` script directly:
+
+```python
+%ibexfile --as pyarrow --out result python/plot_ibex_pyarrow_demo.ibex
+```
+
+Notebook cells are stateful by default. A `%%ibex` cell can define a table once
+and later cells can reuse it without rerunning the load:
+
+```python
+%%ibex --quiet
+import "csv";
+let train = read_csv("../../kaggle/data/train.csv", "<empty>");
+
+%%ibex --as pandas --out bucket_summary
+train[select { rows = count() }, by seconds_in_bucket, order seconds_in_bucket];
+```
+
+Reset the hidden Ibex session with:
+
+```python
+%ibexreset
+```
+
+Supported magic options:
+
+- `--bind ibex_name=python_var` to pass pandas/pyarrow tables or Python scalar values into Ibex
+- supported scalar bindings currently include `int`, `float`, `bool`, `str`, `datetime.date`, and `datetime.datetime`
+- Python `datetime.date` maps to Ibex `Date`, and `datetime.datetime` maps to Ibex `Timestamp`
+- `--as pyarrow|pandas` to control the returned result type
+- `--out var_name` to choose the output variable name
+- `--quiet` to suppress immediate display
+- `%ibexreset` to clear persisted Ibex notebook bindings
+
+This is the fastest way to get Ibex into a notebook today without inventing a
+separate plotting system or a full standalone kernel.
+
 ## Benchmark
 
 **Reproducible and auditable by design.** The interactive results (Ibex vs
@@ -630,54 +615,10 @@ Know a faster way to write one of these queries? **Open a PR against
 Improvements to any engine's queries are welcome — the aim is an accurate
 comparison.
 
----
+## How to run the benchmarks
 
-4 M rows, release build (`-O2`), 15 iterations, 2 warmup, WSL2 / clang++.
-
-| query                        |      ibex |   polars |    pandas | data.table |     dplyr |
-| ---------------------------- | --------: | -------: | --------: | ---------: | --------: |
-| mean_by_symbol               |   27.4 ms |  23.3 ms |  174.2 ms |    21.4 ms |   44.0 ms |
-| ohlc_by_symbol               |   33.0 ms |  25.8 ms |  189.8 ms |    23.1 ms |   50.3 ms |
-| update_price_x2              |   3.32 ms |  2.87 ms |   2.92 ms |    13.4 ms |   5.07 ms |
-| cumsum_price                 |   3.19 ms |  12.2 ms |   11.0 ms |    13.6 ms |   8.67 ms |
-| cumprod_price                |   3.96 ms |  12.4 ms |   11.1 ms |   328.9 ms |  339.3 ms |
-| rand_uniform                 |   3.64 ms |  7.57 ms |   9.08 ms |    25.7 ms |   25.5 ms |
-| rand_normal                  |   25.1 ms |  29.7 ms |   31.1 ms |    83.7 ms |   74.7 ms |
-| rand_int                     |   3.91 ms |  7.45 ms |   9.23 ms |    59.3 ms |   63.3 ms |
-| rand_bernoulli               |   2.74 ms |  28.8 ms |   30.5 ms |    56.5 ms |   56.1 ms |
-| fill_null                    |   4.46 ms |  2.81 ms |   6.71 ms |    6.80 ms |   12.9 ms |
-| fill_forward                 |   3.73 ms |  8.41 ms |   7.24 ms |    14.2 ms |   10.5 ms |
-| fill_backward                |   7.91 ms |  8.21 ms |   7.61 ms |    5.33 ms |   10.9 ms |
-| null_left_join               |   54.9 ms |  29.1 ms |  216.0 ms |   158.9 ms |  169.7 ms |
-| null_semi_join               |   34.4 ms |  19.6 ms |  188.9 ms |    39.1 ms |   85.9 ms |
-| null_anti_join               |   34.5 ms |  18.4 ms |  100.0 ms |    63.1 ms |   97.0 ms |
-| null_cross_join_small        |   1.72 ms | 0.460 ms |   3.74 ms |    15.1 ms |   51.5 ms |
-| filter_simple                |   19.1 ms |  7.55 ms |   23.9 ms |    30.7 ms |   34.4 ms |
-| filter_and                   |   12.0 ms |  5.21 ms |   16.7 ms |    27.5 ms |   36.6 ms |
-| filter_arith                 |   20.3 ms |  8.24 ms |   35.8 ms |    33.1 ms |   28.9 ms |
-| filter_or                    |   12.3 ms |  5.22 ms |   14.0 ms |    26.6 ms |   30.4 ms |
-| count_by_symbol_day          |   7.42 ms |  51.1 ms |  318.4 ms |    22.9 ms |   91.8 ms |
-| mean_by_symbol_day           |   9.19 ms |  55.1 ms |  317.8 ms |    22.3 ms |  109.5 ms |
-| ohlc_by_symbol_day           |   14.4 ms |  55.2 ms |  336.0 ms |    26.1 ms |  125.6 ms |
-| sum_by_user                  |  134.3 ms |  45.3 ms |  272.3 ms |    43.3 ms |  309.4 ms |
-| filter_events                |   23.4 ms |  6.88 ms |   40.0 ms |    30.5 ms |   29.3 ms |
-| melt_wide_to_long            |  335.8 ms |  41.1 ms |  522.7 ms |   184.2 ms |  281.5 ms |
-| dcast_long_to_wide           | 1017.5 ms | 650.3 ms | 5111.5 ms |  1376.6 ms | 2007.1 ms |
-| dcast_long_to_wide_int_pivot |  744.4 ms |        - |         - |          - |         - |
-| dcast_long_to_wide_cat_pivot |  686.5 ms |        - |         - |          - |         - |
-
-## Speedup over ibex (geometric mean across available queries)
-
-- polars: ibex is 1.2× faster than polars  (over 27 queries)
-- pandas: ibex is 3.5× faster than pandas  (over 27 queries)
-- data.table: ibex is 2.6× faster than data.table  (over 27 queries)
-- dplyr: ibex is 4.4× faster than dplyr  (over 27 queries)
-
-Compiled code speed is comparable to interpreted in these benchmarks and
-parsing overhead is negligble.
-
-`ibex+parse` includes text parsing and IR lowering; the overhead is negligible.
-See [`benchmarking/`](benchmarking/) for methodology and reproduction instructions.
+`ibex+parse` includes text parsing and IR lowering; the overhead is negligible
+so runs are repeated for both.
 
 For scalability runs across dataset sizes (1M, 2M, 4M, 8M, 16M, 32M, 64M rows):
 
@@ -726,120 +667,6 @@ To analyze where ibex is faster/slower than polars and data.table:
 ibex> :load benchmarking/analyze_scales.ibex
 ```
 
-## Quant Example Benchmark (Compute-Only)
-
-`examples/quant.ibex` has equivalent pandas/polars scripts:
-- `examples/quant_pandas.py`
-- `examples/quant_polars.py`
-
-For fair comparison, use the compute-only harness:
-
-```bash
-uv run --project . benchmarking/bench_quant.py \
-  --min-seconds 3 --scale 50
-```
-
-This runs:
-- ibex (compute-only generated script, calibrated repeats)
-- polars multi-threaded (`polars-mt`)
-- polars single-threaded (`polars-st`, `POLARS_MAX_THREADS=1`)
-- pandas
-
-Recent run on this repo:
-
-```
-framework    iters    total_s     avg_ms    vs_ibex
---------------------------------------------------------
-ibex            21      2.881     137.17      1.00x
-polars-mt       29      3.054     105.31      0.77x
-polars-st       26      3.070     118.06      0.86x
-pandas          10      3.005     300.48      2.19x
-```
-
-At smaller scale (`--scale 10`), ibex and single-threaded polars are near parity:
-
-```
-framework    iters    total_s     avg_ms    vs_ibex
---------------------------------------------------------
-ibex           132      3.614      27.38      1.00x
-polars-mt       40      3.040      75.99      2.78x
-polars-st      112      3.006      26.84      0.98x
-pandas          35      3.034      86.70      3.17x
-```
-
-## TimeFrame Benchmark (historical single-thread baseline)
-
-Rolling-window operations on 1 M rows (1-second uniform spacing).
-Ibex release build (`-O2 -march=native`), Clang 20, WSL2.
-
-| Benchmark              |    Ibex |  Polars 1.38.1 | data.table 1.17.0 |
-|------------------------|--------:|---------------:|------------------:|
-| as_timeframe (sort)    | 0.28 ms |        4.78 ms |            6.2 ms |
-| tf_lag1                | 0.97 ms |        4.84 ms |           11.0 ms |
-| tf_rolling_count_1m    | 1.12 ms |       16.9 ms  |           12.2 ms |
-| tf_rolling_sum_1m      | 1.43 ms |       19.0 ms  |           10.9 ms |
-| tf_rolling_mean_5m     | 1.65 ms |       19.7 ms  |            9.6 ms |
-| resample 1m OHLC       | 24.7 ms |       14.6 ms  |           20.0 ms |
-
-Notes:
-- Ibex uses variable-width time-based rolling windows (two-pointer O(n)); Polars
-  uses the same semantics (`rolling_sum_by`); data.table uses fixed-width row
-  windows (`frollsum`/`frollmean`, n=60/300 rows — equivalent for uniform 1s data).
-- This snapshot predates Ibex's parallel runtime. It compares the former
-  single-threaded Ibex path with multi-threaded Polars and data.table.
-- Sort fast-path: ibex detects already-sorted input in O(n) without extracting keys
-  into a temporary buffer; Polars detects via a pre-set `is_sorted` flag (O(1)).
-- Rolling fast-path: ibex accesses the Timestamp column directly via pointer cast,
-  avoiding an 8 MB copy; result column allocation is the only dynamic allocation
-  per call.
-- Resample: this historical path floors timestamps into int64 bucket keys and
-  delegates to the standard aggregation path. Polars uses `group_by_dynamic`
-  and data.table uses integer-key `by=`.
-
-For current time-window results, including matched one-thread and default
-parallel runs against Polars, DuckDB, and ClickHouse, see
-[`benchmarking/window_ohlc/README.md`](benchmarking/window_ohlc/README.md).
-The 5M-row matched-thread suite currently has Ibex fastest in 10 of 12 cases;
-the exception is a three-symbol sliding window, whose available parallelism is
-limited by its three groups.
-
-## Architecture
-
-```
-ibex/
-├── include/ibex/          Public headers
-│   ├── core/              Column<T>, DataFrame<Schema>
-│   ├── ir/                Typed IR nodes (Scan, Filter, Project, Aggregate)
-│   ├── parser/            Lexer, recursive-descent parser
-│   ├── runtime/           Extern function registry, execution engine
-│   └── repl/              Interactive REPL session
-├── src/                   Implementation files (mirrors include/)
-├── libs/                  Bundled plugin sources (csv.hpp, csv.cpp -> csv.so)
-├── scripts/               Helper shell scripts (build, run, plugin-build)
-├── tests/                 Catch2 unit tests
-├── tools/                 CLI binaries (REPL, compiler, benchmark)
-├── examples/              Usage examples
-└── cmake/                 Build system modules
-```
-
-### Module Boundaries
-
-| Module    | Responsibility                               | Dependencies        |
-|-----------|----------------------------------------------|----------------------|
-| `core`    | Columnar storage (`Column<T>`, `DataFrame`)  | None                 |
-| `ir`      | Typed intermediate representation nodes       | `core`               |
-| `parser`  | Source text → IR tree                         | `ir`                 |
-| `runtime` | Extern function registry, execution           | `core`               |
-| `repl`    | Interactive read-eval-print loop              | `parser`, `runtime`  |
-
-## Design Goals
-
-- **Static typing**: Schema-level type safety for columns and DataFrames
-- **Relational IR**: Clean separation between parsing and execution via a typed IR layer
-- **C++ interop**: Register external C++ functions for use within Ibex queries
-- **Zero-copy where possible**: `std::span`-based access to columnar data
-- **Modern C++23**: Concepts, `std::expected`, `std::variant`, RAII, no raw `new`/`delete`
-
 ## Building
 
 Requirements: CMake 3.26+ and a C++23 compiler such as Clang 17+, GCC 13+,
@@ -878,6 +705,43 @@ cmake --build build-release --config Release
 | `IBEX_BUILD_TESTS`          | `ON`    | Build Catch2 test suite            |
 | `IBEX_BUILD_TOOLS`          | `ON`    | Build REPL binary                  |
 | `IBEX_BUILD_EXAMPLES`       | `ON`    | Build example programs             |
+
+## Architecture
+
+```
+ibex/
+├── include/ibex/          Public headers
+│   ├── core/              Column<T>, DataFrame<Schema>
+│   ├── ir/                Typed IR nodes (Scan, Filter, Project, Aggregate)
+│   ├── parser/            Lexer, recursive-descent parser
+│   ├── runtime/           Extern function registry, execution engine
+│   └── repl/              Interactive REPL session
+├── src/                   Implementation files (mirrors include/)
+├── libs/                  Bundled plugin sources (csv.hpp, csv.cpp -> csv.so)
+├── scripts/               Helper shell scripts (build, run, plugin-build)
+├── tests/                 Catch2 unit tests
+├── tools/                 CLI binaries (REPL, compiler, benchmark)
+├── examples/              Usage examples
+└── cmake/                 Build system modules
+```
+
+### Module Boundaries
+
+| Module    | Responsibility                               | Dependencies        |
+|-----------|----------------------------------------------|----------------------|
+| `core`    | Columnar storage (`Column<T>`, `DataFrame`)  | None                 |
+| `ir`      | Typed intermediate representation nodes       | `core`               |
+| `parser`  | Source text → IR tree                         | `ir`                 |
+| `runtime` | Extern function registry, execution           | `core`               |
+| `repl`    | Interactive read-eval-print loop              | `parser`, `runtime`  |
+
+## Design Goals
+
+- **Static typing**: Schema-level type safety for columns and DataFrames
+- **Relational IR**: Clean separation between parsing and execution via a typed IR layer
+- **C++ interop**: Register external C++ functions for use within Ibex queries
+- **Zero-copy where possible**: `std::span`-based access to columnar data
+- **Modern C++23**: Concepts, `std::expected`, `std::variant`, RAII, no raw `new`/`delete`
 
 ## Running the REPL
 
@@ -1221,12 +1085,3 @@ Fully restart VS Code after copying. `.ibex` files will be highlighted automatic
 
 **Highlights:** keywords (`filter`, `select`, `by`, …), clause operators, type names, built-in functions (`mean`, `rolling_sum`, …), duration literals (`1m`, `5s`), backtick-quoted column names, strings, and comments.
 
-## Roadmap
-
-- [x] Query optimization: predicate/projection pushdown, lazy Parquet scans,
-  late materialization, repeated-subplan sharing, and costed inner-join ordering
-- [x] Python `pyarrow` bridge and IPython/Jupyter magics
-- [x] Experimental R package and knitr engine
-- [x] Arrow C Data Interface export (zero-copy interop)
-- [x] REPL exploration commands (`:schema`, `:head`, `:describe`, `:scalars`,
-  `:tables`, and `:load`), history, and readline support

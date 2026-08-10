@@ -378,7 +378,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
             gathered.validity = entry.validity;
         } else {
             gathered.column = std::make_shared<ColumnValue>(
-                gather_column(*entry.column, selected->data(), selected->size()));
+                gather_column(*entry.column, selected->data(), selected->size(), &exec));
             if (entry.validity.has_value()) {
                 ValidityBitmap validity(selected->size(), true);
                 for (std::size_t row = 0; row < selected->size(); ++row) {
@@ -490,7 +490,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
                 out.add_column_from(entry.name, entry);
             } else {
                 auto column = std::make_shared<ColumnValue>(
-                    gather_column(*entry.column, selected.data(), selected.size()));
+                    gather_column(*entry.column, selected.data(), selected.size(), &exec));
                 std::optional<ValidityBitmap> validity;
                 if (entry.validity.has_value()) {
                     ValidityBitmap bits(selected.size(), true);
@@ -590,7 +590,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         out.keys.validity = entry->validity;
     } else {
         out.keys.column = std::make_shared<ColumnValue>(
-            gather_column(*entry->column, out.selected.data(), out.selected.size()));
+            gather_column(*entry->column, out.selected.data(), out.selected.size(), &exec));
         if (entry->validity.has_value()) {
             ValidityBitmap validity(out.selected.size(), true);
             for (std::size_t row = 0; row < out.selected.size(); ++row) {

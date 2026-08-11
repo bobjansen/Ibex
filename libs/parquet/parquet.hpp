@@ -880,30 +880,37 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
                                    const ibex::runtime::Selection* selection,
                                    const DirectDecodeGroups& groups, Emit&& emit) -> std::size_t;
 
+/// Rows a row-group range contributes: all of them, or the selected subset.
+inline auto decode_output_rows(const ibex::runtime::Selection* selection,
+                               const DirectDecodeGroups& groups) -> std::size_t {
+    if (selection == nullptr) {
+        return groups.rows;
+    }
+    const auto first = std::lower_bound(selection->begin(), selection->end(), groups.source_start);
+    const auto last = std::lower_bound(first, selection->end(), groups.source_start + groups.rows);
+    return static_cast<std::size_t>(std::distance(first, last));
+}
+
+/// Decode a row-group range into a buffer the caller already sized.
+///
+/// Split out from `decode_numeric_column` so that a caller holding the whole
+/// column can hand each row-group range its own slice and decode the ranges
+/// concurrently. It takes a raw pointer rather than the column on purpose:
+/// `Column::span()` detaches copy-on-write storage, which is not safe to call
+/// from several workers at once, so the destination pointer has to be taken
+/// once before any of them start.
+///
+/// `output_data` must have room for `decode_output_rows(selection, groups)`.
 template <typename DType, typename Out, bool SameLayout, typename Convert>
-inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_index,
-                                  const ibex::runtime::Selection* selection,
-                                  const DirectDecodeGroups& groups, ibex::Column<Out>& out,
-                                  DirectValidity& validity, Convert&& convert) -> std::size_t {
+inline auto decode_numeric_into(parquet::arrow::FileReader& reader, int leaf_index,
+                                const ibex::runtime::Selection* selection,
+                                const DirectDecodeGroups& groups, Out* output_data,
+                                std::size_t output_rows, DirectValidity& validity,
+                                Convert&& convert) -> std::size_t {
     using Raw = typename DType::c_type;
     const auto& metadata = *reader.parquet_reader()->metadata();
     const bool optional = metadata.schema()->Column(leaf_index)->max_definition_level() != 0;
     if (selection != nullptr || (optional && !groups_have_no_nulls(metadata, groups, leaf_index))) {
-        std::size_t output_rows = groups.rows;
-        if (selection != nullptr) {
-            const auto first =
-                std::lower_bound(selection->begin(), selection->end(), groups.source_start);
-            const auto last =
-                std::lower_bound(first, selection->end(), groups.source_start + groups.rows);
-            output_rows = static_cast<std::size_t>(std::distance(first, last));
-        }
-        const std::size_t output_start = out.size();
-        if constexpr (std::is_trivially_default_constructible_v<Out>) {
-            out.resize_for_overwrite(output_start + output_rows);
-        } else {
-            out.resize(output_start + output_rows);
-        }
-        Out* const output_data = out.span().data() + output_start;
         std::size_t output_pos = 0;
         const auto emitted = decode_physical_column<DType>(
             reader, leaf_index, selection, groups, [&](const Raw* value) {
@@ -917,13 +924,6 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
     }
 
     std::size_t emitted = 0;
-    const std::size_t output_start = out.size();
-    if constexpr (std::is_trivially_default_constructible_v<Out>) {
-        out.resize_for_overwrite(output_start + groups.rows);
-    } else {
-        out.resize(output_start + groups.rows);
-    }
-    Out* const output_data = out.span().data() + output_start;
     std::unique_ptr<Raw[]> converted_values;
     if constexpr (!SameLayout) {
         converted_values.reset(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
@@ -976,6 +976,25 @@ inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_i
         }
     }
     return emitted;
+}
+
+/// Decode a whole column, sizing its buffer first. The serial entry point;
+/// `decode_numeric_into` is the same decode against a caller-owned buffer.
+template <typename DType, typename Out, bool SameLayout, typename Convert>
+inline auto decode_numeric_column(parquet::arrow::FileReader& reader, int leaf_index,
+                                  const ibex::runtime::Selection* selection,
+                                  const DirectDecodeGroups& groups, ibex::Column<Out>& out,
+                                  DirectValidity& validity, Convert&& convert) -> std::size_t {
+    const std::size_t output_start = out.size();
+    const std::size_t output_rows = decode_output_rows(selection, groups);
+    if constexpr (std::is_trivially_default_constructible_v<Out>) {
+        out.resize_for_overwrite(output_start + output_rows);
+    } else {
+        out.resize(output_start + output_rows);
+    }
+    return decode_numeric_into<DType, Out, SameLayout>(
+        reader, leaf_index, selection, groups, out.span().data() + output_start, output_rows,
+        validity, std::forward<Convert>(convert));
 }
 
 /// Dense String decode — the counterpart of decode_numeric_column's bulk path,
@@ -1396,6 +1415,149 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
     return emitted;
 }
 
+/// Decodes one row-group range of a column into the slice starting at
+/// `output_start`. Returns the rows emitted.
+using ShardDecodeFn = std::function<std::size_t(
+    parquet::arrow::FileReader&, const DirectDecodeGroups&, std::size_t, std::size_t)>;
+
+/// A column whose row-group ranges can be decoded independently, with its
+/// buffer already allocated and its decoder bound to that buffer.
+///
+/// What makes the ranges independent is that every range's output row count is
+/// known before any decoding happens — from the footer, or from where the
+/// selection crosses the range's row bounds — so each range owns a disjoint
+/// slice of one flat buffer and there is nothing to merge afterwards. The
+/// result is the same bytes the serial decode would have written.
+///
+/// The types left out each fail that test for their own reason. A string's
+/// destination offset depends on the total length of every preceding row.
+/// A dictionary column's codes only mean anything against a per-row-group
+/// dictionary that has to be unified. `Column<bool>` packs 64 rows into a word,
+/// so neighbouring ranges would write the same word. And a column with nulls
+/// shares a validity bitmap, which has that same word-sharing problem — hence
+/// the null-free requirement rather than a null-handling shard path.
+struct ShardedColumn {
+    ibex::runtime::ColumnEntry entry;
+    ShardDecodeFn decode_range;
+};
+
+/// Size the destination buffer, hand its address to a decoder bound to it, and
+/// leave the column in `entry`.
+///
+/// The address is taken once, here, rather than inside each range: `span()`
+/// detaches copy-on-write storage, so several workers calling it at once would
+/// race.
+template <typename DType, typename Out, bool SameLayout, typename Convert>
+inline auto sharded_numeric(ibex::runtime::ColumnEntry& entry, int leaf_index,
+                            const ibex::runtime::Selection* selection, std::size_t output_rows,
+                            Convert convert) -> ShardDecodeFn {
+    entry.column = std::make_shared<ibex::runtime::ColumnValue>(ibex::Column<Out>{});
+    auto& out = std::get<ibex::Column<Out>>(*entry.column);
+    if constexpr (std::is_trivially_default_constructible_v<Out>) {
+        out.resize_for_overwrite(output_rows);
+    } else {
+        out.resize(output_rows);
+    }
+    Out* const base = out.span().data();
+    return [base, leaf_index, selection, convert](
+               parquet::arrow::FileReader& reader, const DirectDecodeGroups& range,
+               std::size_t output_start, std::size_t rows) -> std::size_t {
+        DirectValidity validity(rows);
+        const auto emitted = decode_numeric_into<DType, Out, SameLayout>(
+            reader, leaf_index, selection, range, base + output_start, rows, validity, convert);
+        if (emitted != rows || validity.position != rows || validity.has_null) {
+            throw std::runtime_error("read_parquet: sharded decode produced the wrong row count");
+        }
+        return emitted;
+    };
+}
+
+/// nullopt when this column cannot be split by row group — see `ShardedColumn`
+/// for which columns those are and why.
+inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow::Field& field,
+                                int leaf_index, const ibex::runtime::Selection* selection,
+                                const DirectDecodeGroups& groups, std::size_t output_rows)
+    -> std::optional<ShardedColumn> {
+    const auto& metadata = *reader.parquet_reader()->metadata();
+    if (metadata.schema()->Column(leaf_index)->max_definition_level() != 0 &&
+        !groups_have_no_nulls(metadata, groups, leaf_index)) {
+        return std::nullopt;
+    }
+
+    ShardedColumn planned;
+    planned.entry.name = field.name();
+    const auto id = field.type()->id();
+    switch (id) {
+        case arrow::Type::INT8:
+        case arrow::Type::INT16:
+        case arrow::Type::INT32:
+        case arrow::Type::UINT8:
+        case arrow::Type::UINT16:
+        case arrow::Type::UINT32:
+            planned.decode_range = sharded_numeric<parquet::Int32Type, std::int64_t, false>(
+                planned.entry, leaf_index, selection, output_rows, [id](std::int32_t value) {
+                    if (id == arrow::Type::UINT8 || id == arrow::Type::UINT16 ||
+                        id == arrow::Type::UINT32) {
+                        return static_cast<std::int64_t>(static_cast<std::uint32_t>(value));
+                    }
+                    return static_cast<std::int64_t>(value);
+                });
+            break;
+        case arrow::Type::INT64:
+        case arrow::Type::UINT64:
+            planned.decode_range = sharded_numeric<parquet::Int64Type, std::int64_t, true>(
+                planned.entry, leaf_index, selection, output_rows,
+                [](std::int64_t value) { return value; });
+            break;
+        case arrow::Type::FLOAT:
+            planned.decode_range = sharded_numeric<parquet::FloatType, double, false>(
+                planned.entry, leaf_index, selection, output_rows,
+                [](float value) { return static_cast<double>(value); });
+            break;
+        case arrow::Type::DOUBLE:
+            planned.decode_range = sharded_numeric<parquet::DoubleType, double, true>(
+                planned.entry, leaf_index, selection, output_rows,
+                [](double value) { return value; });
+            break;
+        case arrow::Type::DATE32:
+            planned.decode_range = sharded_numeric<parquet::Int32Type, ibex::Date, false>(
+                planned.entry, leaf_index, selection, output_rows,
+                [](std::int32_t value) { return ibex::Date{value}; });
+            break;
+        case arrow::Type::DATE64: {
+            constexpr std::int64_t kMillisPerDay = 86'400'000;
+            planned.decode_range = sharded_numeric<parquet::Int64Type, ibex::Date, false>(
+                planned.entry, leaf_index, selection, output_rows, [](std::int64_t value) {
+                    return ibex::Date{static_cast<std::int32_t>(value / kMillisPerDay)};
+                });
+            break;
+        }
+        case arrow::Type::TIMESTAMP: {
+            // INT96 timestamps go through the per-value physical path, which
+            // this does not cover.
+            if (metadata.schema()->Column(leaf_index)->physical_type() == parquet::Type::INT96) {
+                return std::nullopt;
+            }
+            const auto unit = static_cast<const arrow::TimestampType&>(*field.type()).unit();
+            std::int64_t scale = 1;
+            if (unit == arrow::TimeUnit::SECOND) {
+                scale = 1'000'000'000;
+            } else if (unit == arrow::TimeUnit::MILLI) {
+                scale = 1'000'000;
+            } else if (unit == arrow::TimeUnit::MICRO) {
+                scale = 1'000;
+            }
+            planned.decode_range = sharded_numeric<parquet::Int64Type, ibex::Timestamp, false>(
+                planned.entry, leaf_index, selection, output_rows,
+                [scale](std::int64_t value) { return ibex::Timestamp{value * scale}; });
+            break;
+        }
+        default:
+            return std::nullopt;
+    }
+    return planned;
+}
+
 inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field& field,
                           int leaf_index, const ibex::runtime::Selection* selection,
                           const DirectDecodeGroups& groups, std::size_t output_rows)
@@ -1561,17 +1723,29 @@ inline auto direct_column(parquet::arrow::FileReader& reader, const arrow::Field
     return entry;
 }
 
-/// Decode `field_indices` using one reader per worker, columns in parallel.
+/// One piece of decode work: a column, or one row-group range of one column.
+struct DecodeTask {
+    std::size_t column;
+    DirectDecodeGroups range;
+    std::size_t output_start;  ///< where this range's rows begin in the column
+    std::size_t rows;
+};
+
+/// Decode `field_indices` using one reader per worker.
 ///
-/// **Columns are the parallel axis, not row groups.** A PDS-H-shaped file has
-/// very few row groups (SF-1 `lineitem` has 6; every dimension table has 1) but
-/// the projection pushdown hands us several columns, so columns are both the
-/// wider axis and the cheaper one: a column is decoded whole by a single worker
-/// straight into its final buffer, so the result needs no merge or concat step
-/// — which is what makes this bit-identical to the serial decode rather than
-/// merely equivalent. Row-group parallelism would need both a merge and a way
-/// to split the single-row-group files, and would still leave the dimension
-/// tables serial.
+/// **The work is split by column and, where a column allows it, by row group.**
+/// Columns alone are the wider axis on a PDS-H-shaped file — projection
+/// pushdown asks for several of them — but they are a coarse one: a query that
+/// wants a single column (q06 filters on `l_shipdate` alone) had no parallelism
+/// at all, and three columns of very different sizes leave workers idle behind
+/// the largest. Splitting by row group fixes both, for the columns whose output
+/// layout can be worked out before decoding; `ShardedColumn` says which those
+/// are. Either way a worker writes only into its own slice of a buffer that was
+/// allocated up front, so nothing is merged or concatenated afterwards and the
+/// result is the same bytes as the serial decode.
+///
+/// Single-row-group files (every PDS-H dimension table) still split by column
+/// only. There is nothing else to split.
 ///
 /// `readers` must hold one independent `FileReader` per worker. Page readers
 /// and decode cursors are mutable, so workers cannot share one — see
@@ -1626,15 +1800,70 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
     }
 
     std::vector<ibex::runtime::ColumnEntry> entries(field_indices.size());
-    auto decode_one = [&](std::size_t i, parquet::arrow::FileReader& worker_reader) {
-        entries[i] = direct_column(worker_reader, *schema.field(field_indices[i]), leaves[i],
-                                   selection, groups, output_rows);
+
+    // Plan before dispatching. A column that can be split by row group gets its
+    // buffer allocated here and one task per row group; anything else stays one
+    // task for the whole column.
+    std::vector<std::optional<ShardedColumn>> planned(field_indices.size());
+    const bool may_shard = readers.size() > 1 && groups.end - groups.begin > 1;
+    if (may_shard) {
+        for (std::size_t i = 0; i < field_indices.size(); ++i) {
+            planned[i] = plan_sharded_column(reader, *schema.field(field_indices[i]), leaves[i],
+                                             selection, groups, output_rows);
+        }
+    }
+
+    // Whole-column tasks are queued FIRST, ahead of every split one. They are
+    // the indivisible ones — a dictionary or string column has to be decoded
+    // end to end by a single worker — so whichever starts last sets the finish
+    // time for the whole decode. Queued behind thirty shard tasks, q01's two
+    // dictionary columns started last and cost 6.5%; started first, they run
+    // under the split columns instead of after them.
+    std::vector<DecodeTask> tasks;
+    for (std::size_t i = 0; i < field_indices.size(); ++i) {
+        if (!planned[i].has_value()) {
+            tasks.push_back({.column = i, .range = groups, .output_start = 0, .rows = output_rows});
+        }
+    }
+    for (std::size_t i = 0; i < field_indices.size(); ++i) {
+        if (!planned[i].has_value()) {
+            continue;
+        }
+        std::size_t source_start = groups.source_start;
+        std::size_t output_start = 0;
+        for (int group = groups.begin; group < groups.end; ++group) {
+            const auto group_rows = static_cast<std::size_t>(
+                reader.parquet_reader()->metadata()->RowGroup(group)->num_rows());
+            const DirectDecodeGroups range{
+                .begin = group, .end = group + 1, .source_start = source_start, .rows = group_rows};
+            const std::size_t rows = decode_output_rows(selection, range);
+            if (rows != 0) {
+                tasks.push_back(
+                    {.column = i, .range = range, .output_start = output_start, .rows = rows});
+            }
+            source_start += group_rows;
+            output_start += rows;
+        }
+        if (output_start != output_rows) {
+            throw std::runtime_error("read_parquet: row-group split lost rows");
+        }
+    }
+
+    auto run_task = [&](const DecodeTask& task, parquet::arrow::FileReader& worker_reader) {
+        if (planned[task.column].has_value()) {
+            planned[task.column]->decode_range(worker_reader, task.range, task.output_start,
+                                               task.rows);
+            return;
+        }
+        entries[task.column] =
+            direct_column(worker_reader, *schema.field(field_indices[task.column]),
+                          leaves[task.column], selection, task.range, task.rows);
     };
 
-    const std::size_t workers = std::min(readers.size(), field_indices.size());
+    const std::size_t workers = std::min(readers.size(), tasks.size());
     if (workers <= 1) {
-        for (std::size_t i = 0; i < field_indices.size(); ++i) {
-            decode_one(i, reader);
+        for (const auto& task : tasks) {
+            run_task(task, reader);
         }
     } else {
         // A shared cursor rather than a static split: a string column can cost
@@ -1642,16 +1871,17 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
         // would leave workers idle behind whoever drew `l_comment`.
         std::atomic<std::size_t> next{0};
         auto batch = ibex::runtime::process_worker_pool().submit(workers, [&](std::size_t worker) {
-            for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed); i < entries.size();
+            for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed); i < tasks.size();
                  i = next.fetch_add(1, std::memory_order_relaxed)) {
-                decode_one(i, *readers[worker]);
+                run_task(tasks[i], *readers[worker]);
             }
         });
         batch.wait();
     }
 
     ibex::runtime::Table out;
-    for (auto& entry : entries) {
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto& entry = planned[i].has_value() ? planned[i]->entry : entries[i];
         out.add_column_shared(std::move(entry.name), std::move(entry.column),
                               std::move(entry.validity));
     }
@@ -2095,7 +2325,12 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         }
 
         try {
-            auto readers = parallel_readers(column_indices.size(), exec);
+            // Row groups multiply the units: a single-column decode still has
+            // one task per row group to hand out (see direct_decode_table).
+            const auto units = column_indices.size() *
+                               static_cast<std::size_t>(std::max(
+                                   1, reader_->parquet_reader()->metadata()->num_row_groups()));
+            auto readers = parallel_readers(units, exec);
             return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
                                        rows_);
         } catch (const std::exception& e) {

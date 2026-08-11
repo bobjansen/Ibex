@@ -53,6 +53,7 @@
 #include <immintrin.h>
 #endif
 
+#include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
 #include "model_internal.hpp"
@@ -7385,6 +7386,9 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     if (exec.parallel_stats == nullptr) {
         exec.parallel_stats = process_island_stats();
     }
+    if (exec.execution_profile == nullptr && execution_profile_requested()) {
+        exec.execution_profile = std::make_shared<ExecutionProfileState>();
+    }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
         exec.parallel_grain = grain;
         // An explicit grain is an explicit request to partition at that size,
@@ -8479,9 +8483,9 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
 }
 
-auto build_operator(const ir::Node& node, const TableRegistry& registry,
-                    const ScalarRegistry* scalars, const ExternRegistry* externs,
-                    const ExecutionContext& exec, ModelResult* model_out)
+auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
+                         const ScalarRegistry* scalars, const ExternRegistry* externs,
+                         const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
     // Runtime-multithreading Phase 1 seam. Only consult the island analysis
     // when a parallel executor is actually requested — build_operator() is a
@@ -9171,6 +9175,25 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
         return std::unexpected(std::move(table.error()));
     }
     return std::make_unique<TableSourceOperator>(std::move(table.value()));
+}
+
+auto build_operator(const ir::Node& node, const TableRegistry& registry,
+                    const ScalarRegistry* scalars, const ExternRegistry* externs,
+                    const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    if (exec.execution_profile == nullptr) {
+        return build_operator_impl(node, registry, scalars, externs, exec, model_out);
+    }
+    auto* entry = execution_profile_entry(exec.execution_profile, node);
+    std::expected<OperatorPtr, std::string> result;
+    {
+        ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        result = build_operator_impl(node, registry, scalars, externs, exec, model_out);
+    }
+    if (!result.has_value()) {
+        return result;
+    }
+    return profile_operator(std::move(result.value()), exec.execution_profile, node);
 }
 // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 

@@ -18,6 +18,7 @@
 #include <variant>
 #include <vector>
 
+#include "execution_profile_internal.hpp"
 #include "ibex/core/column.hpp"
 #include "ibex/ir/node.hpp"
 #include "ibex/runtime/interpreter.hpp"
@@ -49,6 +50,12 @@ LazyTable::LazyTable(Table schema, std::size_t rows, LazySourceReaderFactory rea
 
 auto LazyTable::decode_columns(const std::vector<std::string>& names, const Selection* selection,
                                const ExecutionContext& exec) -> std::expected<Table, std::string> {
+    auto* profile_entry =
+        exec.execution_profile == nullptr
+            ? nullptr
+            : exec.execution_profile->stage(selection == nullptr ? "source decode whole"
+                                                                 : "source decode selected");
+    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {
@@ -66,6 +73,10 @@ auto LazyTable::decode_columns(const std::vector<std::string>& names, const Sele
 auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                 const ExecutionContext& exec)
     -> std::expected<std::optional<Selection>, std::string> {
+    auto* profile_entry = exec.execution_profile == nullptr
+                              ? nullptr
+                              : exec.execution_profile->stage("source dynamic key scan");
+    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {

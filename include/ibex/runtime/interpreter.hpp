@@ -28,6 +28,8 @@
 
 namespace ibex::runtime {
 
+class ExecutionProfileState;
+
 enum class ScalarKind : std::uint8_t {
     Int,
     Double,
@@ -514,6 +516,12 @@ struct ExecutionContext {
     /// null when the query has none. Not owned: the driver keeps the registry
     /// alive for the whole `interpret()` call.
     const DeferredScanRegistry* deferred_scans = nullptr;
+
+    /// Opt-in internal operator/source profile, installed by
+    /// configure_parallel_from_env() when IBEX_PROFILE_OPERATORS is present.
+    /// Shared ownership keeps the report alive across streamed operators and
+    /// prints it when the query's last execution context/operator releases it.
+    std::shared_ptr<ExecutionProfileState> execution_profile{};
 
     /// Runtime-multithreading Phase 1. When set, `build_operator()` consults
     /// `analyze_parallel_island()` at its seam and, for an eligible row-local

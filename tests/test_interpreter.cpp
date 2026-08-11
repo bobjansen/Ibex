@@ -12407,7 +12407,7 @@ TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
     auto ir = require_ir("df[filter x > 0];");
 
     runtime::ParallelIslandStats stats;
-    runtime::ExecutionContext exec{.deferred_scans = &deferred};
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_grain = 256;
     exec.parallel_threads = 4;

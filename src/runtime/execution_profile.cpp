@@ -35,9 +35,11 @@ struct ExecutionProfileEntry {
 };
 
 struct ExecutionProfileState::Impl {
-    explicit Impl(bool should_report) : report(should_report) {}
+    Impl(std::size_t budget, bool should_report)
+        : worker_budget(budget == 0 ? 1 : budget), report(should_report) {}
 
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::size_t worker_budget = 1;
     bool report = true;
     mutable std::mutex mutex;
     std::map<std::pair<std::uint64_t, std::string>, std::unique_ptr<ExecutionProfileEntry>> entries;
@@ -205,7 +207,8 @@ struct ExecutionProfileScope::Frame {
     std::uint64_t child_ns = 0;
 };
 
-ExecutionProfileState::ExecutionProfileState(bool report) : impl_(std::make_unique<Impl>(report)) {}
+ExecutionProfileState::ExecutionProfileState(std::size_t worker_budget, bool report)
+    : impl_(std::make_unique<Impl>(worker_budget, report)) {}
 
 ExecutionProfileState::~ExecutionProfileState() {
     if (!impl_->report) {
@@ -228,12 +231,24 @@ ExecutionProfileState::~ExecutionProfileState() {
         };
         return cost(a) > cost(b);
     });
-    fmt::print(stderr, "operator profile: wall_ms={:.3f} entries={}\n", total_ms, rows.size());
+    const std::size_t budget = impl_->worker_budget;
+    const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
+    fmt::print(stderr,
+               "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
+               "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
+               "pool_work_ms={:.3f} occupancy={:.3f}\n",
+               total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
+               summary.serial_fraction, summary.amdahl_ceiling, summary.pool_work_ms,
+               summary.occupancy);
     for (const auto* row : rows) {
+        ExecutionProfileSnapshotRow occupancy_row;
+        occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
+        occupancy_row.pool_work_ns = row->pool_work_ns.load(std::memory_order_relaxed);
+        const double row_occupancy = profile_row_occupancy(occupancy_row, budget);
         fmt::print(stderr,
                    "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
                    "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} "
-                   "pool_work_ms={:.3f} calls={} "
+                   "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
                    "chunks={} rows={} pool_calls={} pool_tasks={}\n",
                    row->node_id, row->label,
                    static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
@@ -242,12 +257,48 @@ ExecutionProfileState::~ExecutionProfileState() {
                    static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
                    static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
                    static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   row->calls.load(std::memory_order_relaxed),
+                   row_occupancy, row->calls.load(std::memory_order_relaxed),
                    row->chunks.load(std::memory_order_relaxed),
                    row->rows.load(std::memory_order_relaxed),
                    row->pool_thread_calls.load(std::memory_order_relaxed),
                    row->pool_tasks.load(std::memory_order_relaxed));
     }
+}
+
+auto profile_row_occupancy(const ExecutionProfileSnapshotRow& row, std::size_t workers) -> double {
+    const std::size_t budget = workers == 0 ? 1 : workers;
+    if (row.span_ns == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(row.pool_work_ns) /
+           (static_cast<double>(row.span_ns) * static_cast<double>(budget));
+}
+
+auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>& rows,
+                                 double wall_ms, std::size_t workers) -> ExecutionProfileSummary {
+    const std::size_t budget = workers == 0 ? 1 : workers;
+    std::uint64_t self_total_ns = 0;
+    std::uint64_t serial_self_ns = 0;
+    std::uint64_t pool_total_ns = 0;
+    for (const auto& row : rows) {
+        const std::uint64_t self = row.build_self_ns + row.next_self_ns + row.source_self_ns;
+        self_total_ns += self;
+        pool_total_ns += row.pool_work_ns;
+        if (row.pool_work_ns == 0) {
+            serial_self_ns += self;  // this operator was handed no worker at all
+        }
+    }
+    ExecutionProfileSummary summary;
+    summary.self_ms = static_cast<double>(self_total_ns) / 1.0e6;
+    summary.serial_self_ms = static_cast<double>(serial_self_ns) / 1.0e6;
+    summary.pool_work_ms = static_cast<double>(pool_total_ns) / 1.0e6;
+    summary.serial_fraction = self_total_ns == 0 ? 0.0
+                                                 : static_cast<double>(serial_self_ns) /
+                                                       static_cast<double>(self_total_ns);
+    summary.amdahl_ceiling = summary.serial_fraction <= 0.0 ? 0.0 : 1.0 / summary.serial_fraction;
+    summary.occupancy =
+        wall_ms <= 0.0 ? 0.0 : summary.pool_work_ms / (wall_ms * static_cast<double>(budget));
+    return summary;
 }
 
 auto ExecutionProfileState::entry(std::uint64_t node_id, std::string label)

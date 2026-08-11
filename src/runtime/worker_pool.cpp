@@ -57,6 +57,17 @@ void run_task(Task const& task) {
     } catch (...) {
         caught = std::current_exception();
     }
+    // Attribute the worker's time BEFORE settling the batch. `profile_entry`
+    // points into the query's profile state, and nothing here keeps that alive:
+    // the moment `remaining` reaches zero the waiter may return, finish the
+    // query, and drop the last reference to it. Recording afterwards leaves a
+    // window — narrow, and only when profiling is on — in which this thread
+    // writes into freed memory.
+    if (state.profile_entry != nullptr) {
+        record_execution_profile_worker(state.profile_entry,
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - profile_start));
+    }
     {
         const std::lock_guard lock(state.mutex);
         if (caught != nullptr && (state.error == nullptr || task.worker_id < state.error_worker)) {
@@ -66,11 +77,6 @@ void run_task(Task const& task) {
         --state.remaining;
     }
     state.done.notify_all();
-    if (state.profile_entry != nullptr) {
-        record_execution_profile_worker(state.profile_entry,
-                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                            std::chrono::steady_clock::now() - profile_start));
-    }
 }
 
 [[nodiscard]] auto env_value(const char* name) -> std::string_view {

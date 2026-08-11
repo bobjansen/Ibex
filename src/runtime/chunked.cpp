@@ -4742,6 +4742,13 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
+        if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
+                key_at, rows, gids, int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
+                [&](std::int64_t key, std::uint32_t gid) { int_order_[gid] = key; })) {
+            accumulate_gids(gids, agg_entries, rows);
+            return std::nullopt;
+        }
+
         // Run-length shortcut, as in the string path: sorted/chunked input often
         // repeats the key, so skip the map lookup when it matches the last row.
         std::int64_t prev_key = 0;
@@ -5193,10 +5200,10 @@ class ChunkedAggregateOperator final : public Operator {
             batch.wait();
         }
 
-        // Pass 3: each worker owns whole partitions. New groups take an id from
-        // one atomic — once per GROUP, never per row — so ids stay dense and
-        // stable across chunks without a lock.
-        std::atomic<std::uint32_t> next_gid{static_cast<std::uint32_t>(n_groups_)};
+        // Pass 3: each worker owns whole partitions. Ids assigned here are
+        // partition-LOCAL — a plain counter, no atomic — because a global id
+        // cannot be handed out in first-occurrence order until every partition
+        // has been seen. `gids[row]` therefore holds a local id until pass 4.
         const std::uint64_t row_base = rows_seen_;
         {
             std::atomic<std::size_t> cursor{0};
@@ -5208,30 +5215,64 @@ class ChunkedAggregateOperator final : public Operator {
                         const std::size_t row = scatter_rows_[i];
                         const Key key = key_at(row);
                         auto it = partition.index.find(key);
-                        std::uint32_t gid{};
+                        std::uint32_t local{};
                         if (it == partition.index.end()) {
-                            gid = next_gid.fetch_add(1, std::memory_order_relaxed);
-                            partition.index.emplace(key, gid);
-                            partition.gids.push_back(gid);
+                            local = static_cast<std::uint32_t>(partition.gids.size());
+                            partition.index.emplace(key, local);
+                            partition.gids.push_back(0);  // filled below, in order
                             partition.first_rows.push_back(row_base + row);
                             partition.keys.push_back(key);
                         } else {
-                            gid = it->second;
+                            local = it->second;
                         }
-                        gids[row] = gid;
+                        gids[row] = local;
                     }
                 }
             });
             batch.wait();
         }
 
-        // Size the group arrays once, now that the count is final — the serial
-        // path resizes per group, which cannot be done from several workers.
-        const auto discovered = static_cast<std::size_t>(next_gid.load());
-        if (discovered > n_groups_) {
-            n_groups_ = discovered;
-            size_group_arrays();
+        // Number this chunk's new groups in first-occurrence order, so that gid
+        // order IS that order and nothing downstream has to compensate.
+        //
+        // Emitting in discovery order and permuting at the end was tried first
+        // and is a trap: the permutation turns the emit's sequential walk of the
+        // slot array into a random gather, which on q18's 1.5m-group aggregate
+        // cost more than the parallel discovery saved (+25% median). Paying one
+        // ordered pass here instead keeps every later pass sequential.
+        //
+        // Each partition's new entries are already ascending by first row, so
+        // this is a P-way merge. Groups carried over from earlier chunks keep
+        // their ids: a group first seen in a later chunk necessarily has a later
+        // first row, so appending after them preserves the global order.
+        const std::size_t base = n_groups_;
+        {
+            std::vector<std::size_t> cursors(part_count);
+            for (std::size_t p = 0; p < part_count; ++p) {
+                cursors[p] = partitions[p].stored;
+            }
+            std::uint32_t next = static_cast<std::uint32_t>(base);
+            while (true) {
+                std::size_t best = part_count;
+                std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
+                for (std::size_t p = 0; p < part_count; ++p) {
+                    if (cursors[p] >= partitions[p].first_rows.size()) {
+                        continue;
+                    }
+                    if (partitions[p].first_rows[cursors[p]] < best_row) {
+                        best_row = partitions[p].first_rows[cursors[p]];
+                        best = p;
+                    }
+                }
+                if (best == part_count) {
+                    break;
+                }
+                partitions[best].gids[cursors[best]] = next++;
+                ++cursors[best];
+            }
+            n_groups_ = next;
         }
+        size_group_arrays();
         // The caller's gid-indexed key vector has to cover the ids just handed
         // out before any of them is written back.
         resize_keys(n_groups_);
@@ -5241,39 +5282,21 @@ class ChunkedAggregateOperator final : public Operator {
             }
             partition.stored = partition.gids.size();
         }
-        partitioned_ = true;
+
+        // Pass 4: local id -> global gid. The partition a row belongs to is
+        // already recorded, so this is a lookup, not a re-probe.
+        {
+            auto batch = pool.submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                for (std::size_t row = begin; row < end; ++row) {
+                    gids[row] = partitions[part_of_row_[row]].gids[gids[row]];
+                }
+            });
+            batch.wait();
+        }
         rows_seen_ += rows;
         return true;
-    }
-
-    /// Groups in first-occurrence order, merged from the partitions' already
-    /// ascending lists. Empty when no partitioned discovery ran, in which case
-    /// gid order is already first-occurrence order.
-    template <typename Key, typename Hash>
-    auto merged_group_order(const std::vector<KeyPartition<Key, Hash>>& partitions) const
-        -> std::vector<std::uint32_t> {
-        std::vector<std::uint32_t> order;
-        order.reserve(n_groups_);
-        std::vector<std::size_t> cursors(partitions.size(), 0);
-        while (order.size() < n_groups_) {
-            std::size_t best = partitions.size();
-            std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
-            for (std::size_t p = 0; p < partitions.size(); ++p) {
-                if (cursors[p] >= partitions[p].first_rows.size()) {
-                    continue;
-                }
-                if (partitions[p].first_rows[cursors[p]] < best_row) {
-                    best_row = partitions[p].first_rows[cursors[p]];
-                    best = p;
-                }
-            }
-            if (best == partitions.size()) {
-                break;  // fewer recorded groups than n_groups_: not our ordering
-            }
-            order.push_back(partitions[best].gids[cursors[best]]);
-            ++cursors[best];
-        }
-        return order;
     }
 
     void size_group_arrays() {
@@ -6423,17 +6446,9 @@ class ChunkedAggregateOperator final : public Operator {
             }
         };
 
-        // Parallel discovery hands out gids from an atomic, so gid order is a
-        // race. Groups are emitted in first-occurrence order regardless, merged
-        // back from the row each group was first seen at. Empty for every other
-        // path, where gid order already IS first-occurrence order.
-        const std::vector<std::uint32_t> emit_order =
-            partitioned_ ? merged_group_order(pair_partitions_) : std::vector<std::uint32_t>{};
-        const bool reordered = emit_order.size() == n_groups_;
-
         const AggSlotCore* fs = flat_slots_.data();
         for (std::size_t out_row = 0; out_row < n_groups_; ++out_row) {
-            const std::size_t g = reordered ? emit_order[out_row] : out_row;
+            const std::size_t g = out_row;
             if (cat_fast_path_) {
                 const bool single_key = group_by_->size() == 1;
                 if (single_key) {
@@ -6702,15 +6717,14 @@ class ChunkedAggregateOperator final : public Operator {
     };
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
     std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
-    /// Parallel group discovery (see `try_discover_partitioned`). `partitioned_`
-    /// records that gids were handed out by an atomic and so are NOT in
-    /// first-occurrence order; the emit path recovers that order from
-    /// `first_rows`. `rows_seen_` makes a first-row index global across chunks.
+    /// Parallel group discovery (see `try_discover_partitioned`). `rows_seen_`
+    /// makes a group's first-row index global across chunks, which is what the
+    /// first-occurrence numbering is merged on.
     std::vector<KeyPartition<PairIntKey, PairIntKeyHash>> pair_partitions_;
+    std::vector<KeyPartition<std::int64_t, robin_hood::hash<std::int64_t>>> int_partitions_;
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::size_t> scatter_rows_;
     std::uint64_t rows_seen_ = 0;
-    bool partitioned_ = false;
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
     /// The two paths are mutually exclusive, so sharing that map is safe.

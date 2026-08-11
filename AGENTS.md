@@ -10,6 +10,21 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - Release: `cmake -B build-release -S . -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DIBEX_ENABLE_MARCH_NATIVE=ON`
 - `cmake --build build --parallel && ctest --test-dir build --output-on-failure`
 - **Always benchmark against `build-release/`, not `build/` (debug is ~4× slower)**
+- Fast inner loop: build just the test binary (`cmake --build build --target ibex_tests --parallel`)
+  rather than the full `--build build`, which also relinks tools/examples/plugins you likely
+  didn't touch. Then run `ctest --test-dir build --output-on-failure -LE slow` to skip
+  `ibex_parity_interpreter_vs_transpiled` (~5 min, compiles+runs every parity case from
+  scratch). Run plain `ctest --test-dir build --output-on-failure` (no `-LE slow`) before
+  declaring parser/lexer/IR/codegen work done — that test is the interpreter-vs-transpiled
+  behavior check and small `-LE slow` loops won't catch what it catches.
+- ccache is wired in automatically (`IBEX_USE_CCACHE`, default `ON`) when `ccache` is on
+  `PATH` — install it once (`apt install ccache` / `brew install ccache`) and clean/fresh
+  build dirs (new worktrees, branch switches, `-DCMAKE_BUILD_TYPE` changes) reuse object
+  files instead of recompiling from scratch.
+- If `cmake --build` keeps re-running the CMake configure step, that's Ninja noticing a
+  changed `CMakeLists.txt` somewhere in the tree (e.g. after adding a new source file) — it's
+  a real dependency, not a bug, but it only happens on the *first* build after such an edit,
+  not every build.
 - Fix build warnings as they pop up
 - LTO (`-DIBEX_ENABLE_LTO=ON`) gives negligible benefit — hot paths are within single TUs
 - Parquet plugin is built as part of the normal CMake build; `scripts/ibex-parquet-build.sh` rebuilds just that target.

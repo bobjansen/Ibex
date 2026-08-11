@@ -61,6 +61,7 @@ column from:
 ```
 // Small in-memory data, useful for examples and joins
 let prices = Table {
+    ts     = [ts "2026-01-02T09:30:00Z", ts "2026-01-02T09:31:00Z", ts "2026-01-02T09:32:00Z"],
     symbol = ["AAPL", "GOOG", "MSFT"],
     price  = [150.0, 140.0, 300.0],
     volume = [1000, 2000, 1500]
@@ -68,22 +69,28 @@ let prices = Table {
 
 // Build a new table from columns produced by existing pipelines
 let quote_view = Table {
+    ts       = prices[select { ts }],
     symbol   = prices[select { symbol }],       // single-column result
     price    = prices[select { price }],
+    volume   = prices[select { volume }],
     notional = prices[select { notional = price * volume }]
 };
 
 // A multi-column expression is matched by the field name
 let copied = Table {
+    ts     = prices,
     symbol = prices,
-    price  = prices
+    price  = prices,
+    volume = prices
 };
 
 // Mix literals and expression-backed columns freely
 let enriched = Table {
+    ts     = prices[select { ts }],
     symbol = prices[select { symbol }],
     tier   = ["mega", "search", "software"],
-    price  = prices[select { price }]
+    price  = prices[select { price }],
+    volume = prices[select { volume }]
 };
 
 // Inline tables are ordinary DataFrames

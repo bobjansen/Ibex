@@ -35,7 +35,7 @@ using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
 /// stopped rejecting partway through — and the caller must fall back to the
 /// ordinary decode-then-filter path, which is always correct.
 using KeyFilterScanFn = std::function<std::expected<std::optional<Selection>, std::string>(
-    const std::string&, const DynamicScanFilter&)>;
+    const std::string&, const DynamicScanFilter&, const ExecutionContext&)>;
 
 /// One independently mutable reader/decoder for a lazy source.
 ///
@@ -54,7 +54,8 @@ class LazySourceReader {
         -> std::expected<Table, std::string> = 0;
 
     [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
-                                               const DynamicScanFilter& /*filter*/)
+                                               const DynamicScanFilter& /*filter*/,
+                                               const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
@@ -188,7 +189,8 @@ class LazyTable {
     [[nodiscard]] auto decode_columns(const std::vector<std::string>& names,
                                       const Selection* selection, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
-    [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter)
+    [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
+                                       const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
     [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
     void release_reader(LazySourceReaderPtr reader);

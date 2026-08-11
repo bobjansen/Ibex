@@ -206,6 +206,39 @@ if [[ "$SKIP_REPL" == false ]]; then
         exit 1
     fi
     rm -f "$repl_out"
+
+    echo "▸ whole-script (parquet plugin, fused key scan across row groups)"
+    # Run through ibex_eval, not the REPL: the fused key scan only exists on the
+    # whole-script planner's path (it comes from dynamic filter pushdown, which
+    # needs the whole plan), and a `:load` in the REPL never reaches it.
+    #
+    # Run it twice, single- and multi-threaded, and require the SAME BYTES. The
+    # scan hands one row group to each worker, so a merge in completion order
+    # rather than file order would permute the selection — which changes the
+    # key/payload totals but not the row count.
+    scan_st="$(mktemp)"
+    scan_mt="$(mktemp)"
+    IBEX_THREADS=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_key_scan_check.ibex" \
+        >"$scan_st" 2>&1
+    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_key_scan_check.ibex" \
+        >"$scan_mt" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_key_scan_facts.parquet" \
+        "$IBEX_ROOT/tests/data/parquet_key_scan_dims.parquet"
+    # 13 rows / key total 10047253 / payload total 48 — see the .ibex file for
+    # where each number comes from.
+    if rg -n "error:" "$scan_st" >/dev/null \
+        || ! rg -n "\| 13 +\| 10047253 +\| 1 +\| 1300000 +\| 48 +\|" "$scan_st" >/dev/null \
+        || ! diff -q "$scan_st" "$scan_mt" >/dev/null; then
+        echo "--- single-threaded ---" >&2
+        cat "$scan_st" >&2
+        echo "--- multi-threaded ---" >&2
+        cat "$scan_mt" >&2
+        rm -f "$scan_st" "$scan_mt"
+        exit 1
+    fi
+    rm -f "$scan_st" "$scan_mt"
 fi
 
 if [[ "$SKIP_COMPILE" == false ]]; then

@@ -691,7 +691,8 @@ TEST_CASE("LazyTable: a fused key filter scan replaces the decode-then-filter pa
             return source.decode(names, selection);
         },
         {},
-        [&scanned_keys](const std::string& key, const runtime::DynamicScanFilter&)
+        [&scanned_keys](const std::string& key, const runtime::DynamicScanFilter&,
+                        const runtime::ExecutionContext&)
             -> std::expected<std::optional<runtime::Selection>, std::string> {
             scanned_keys.push_back(key);
             return std::optional{runtime::Selection{1, 2}};
@@ -725,7 +726,7 @@ TEST_CASE("LazyTable: a fused scan with no answer falls back to decode-then-filt
             return source.decode(names, selection);
         },
         {},
-        [](const std::string&, const runtime::DynamicScanFilter&)
+        [](const std::string&, const runtime::DynamicScanFilter&, const runtime::ExecutionContext&)
             -> std::expected<std::optional<runtime::Selection>, std::string> {
             return std::optional<runtime::Selection>{};  // no fused answer
         }};
@@ -757,7 +758,7 @@ TEST_CASE("LazyTable: a fused scan error surfaces", "[runtime][lazy_table][defer
             return source.decode(names, selection);
         },
         {},
-        [](const std::string&, const runtime::DynamicScanFilter&)
+        [](const std::string&, const runtime::DynamicScanFilter&, const runtime::ExecutionContext&)
             -> std::expected<std::optional<runtime::Selection>, std::string> {
             return std::unexpected("fused scan boom");
         }};
@@ -786,7 +787,8 @@ TEST_CASE("LazyTable: a cached key column bypasses the fused scan",
             return source.decode(names, selection);
         },
         {},
-        [&fused_called](const std::string&, const runtime::DynamicScanFilter&)
+        [&fused_called](const std::string&, const runtime::DynamicScanFilter&,
+                        const runtime::ExecutionContext&)
             -> std::expected<std::optional<runtime::Selection>, std::string> {
             fused_called = true;
             return std::optional{runtime::Selection{}};
@@ -898,7 +900,7 @@ TEST_CASE("LazyTable: join_key_selection uses the fused scan when available",
             return source.decode(names, selection);
         },
         {},
-        [](const std::string&, const runtime::DynamicScanFilter&)
+        [](const std::string&, const runtime::DynamicScanFilter&, const runtime::ExecutionContext&)
             -> std::expected<std::optional<runtime::Selection>, std::string> {
             return std::optional{runtime::Selection{2}};
         }};

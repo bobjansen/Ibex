@@ -63,20 +63,21 @@ auto LazyTable::decode_columns(const std::vector<std::string>& names, const Sele
     return decode_(names, selection);
 }
 
-auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter)
+auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
+                                const ExecutionContext& exec)
     -> std::expected<std::optional<Selection>, std::string> {
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->key_filter_scan(key, filter);
+        auto result = (*reader)->key_filter_scan(key, filter, exec);
         if (result) {
             release_reader(std::move(*reader));
         }
         return result;
     }
-    return key_filter_scan_(key, filter);
+    return key_filter_scan_(key, filter, exec);
 }
 
 auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
@@ -262,7 +263,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     // in-memory filter pass below is cheaper than re-reading pages.
     if (membership && conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(*dynamic_key)) {
-        auto scan = scan_key_filter(*dynamic_key, *dynamic);
+        auto scan = scan_key_filter(*dynamic_key, *dynamic, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }
@@ -527,7 +528,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // values are decoded at all.
     if (conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(key_name)) {
-        auto scan = scan_key_filter(key_name, dynamic);
+        auto scan = scan_key_filter(key_name, dynamic, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }

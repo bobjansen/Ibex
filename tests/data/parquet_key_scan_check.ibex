@@ -1,0 +1,54 @@
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// A join whose build side is small enough to publish an exact key set turns the
+// probe-side Parquet scan into a FUSED KEY SCAN: the key column is filtered
+// inside the page decoder and only the passing row indices come out, so the
+// column is never materialized whole (dynamic filter pushdown, stage 4).
+//
+// That scan runs one ROW GROUP per worker. This file is sized to have more than
+// one: Parquet's max_row_group_length is 1048576 rows, so 1,300,000 rows are
+// written as row group 0 (1048576 rows) and row group 1 (251424 rows), and the
+// scan's per-group results have to be concatenated back in FILE order. A scan
+// that merged them in completion order instead would return the same row COUNT
+// with the rows permuted — which is why the checks below sum a key-derived
+// payload and take min/max of the key rather than counting rows.
+//
+// Row groups also fall on the wrong side of the escape hatch to be interesting:
+// the filter here rejects ~99.9% of rows, so the scan never abandons and every
+// group is decoded.
+let fact_base = Table(1300000)[update {
+    one = rep([1], length_out = 1300000),
+    payload = rep([1, 2, 3, 4, 5, 6, 7], length_out = 1300000)
+}];
+let facts = fact_base[update { fact_key = rank(one, method = first) }];
+write_parquet(facts, "tests/data/parquet_key_scan_facts.parquet");
+
+// 13 keys spread across BOTH row groups: 9 land in row group 0 (key <= 1048576)
+// and 4 in row group 1. A scan that dropped, duplicated or reordered a group
+// shows up in the sums below.
+let dims = Table(13)[update {
+    fact_key = rep([1, 100, 50000, 400000, 700000, 900000, 1000000, 1048576, 1048577,
+                    1100000, 1200000, 1299999, 1300000], length_out = 13)
+}];
+write_parquet(dims, "tests/data/parquet_key_scan_dims.parquet");
+
+let dim = read_parquet("tests/data/parquet_key_scan_dims.parquet");
+let fact = read_parquet("tests/data/parquet_key_scan_facts.parquet");
+
+// payload is `rep([1..7])` over a rank-ordered key, so payload = ((key - 1) % 7) + 1.
+// Summing it proves the selection carries the right ROWS and not merely the
+// right count: a permuted or off-by-a-group selection pairs keys with other
+// rows' payloads, which moves payload_total while leaving rows and key_total
+// alone. Expected: 13 / 10047253 / 1 / 1300000 / 48.
+//
+// One statement, because ibex_eval prints only the last one.
+(dim join fact on fact_key)[
+    select {
+        rows = count(),
+        key_total = sum(fact_key),
+        lo = min(fact_key),
+        hi = max(fact_key),
+        payload_total = sum(payload)
+    }
+];

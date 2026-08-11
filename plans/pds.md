@@ -157,6 +157,50 @@ IBEX_PROFILE_OPERATORS=1 IBEX_THREADS=8 IBEX_PARALLEL=1 \
 clock starts when the execution context is configured, so it covers lazy
 decode and execution but not earlier schema/footer planning.
 
+Each row also carries `occupancy` — `pool_work_ms / (span_ms × workers)` — the
+share of the machine that operator kept busy while it ran. 0 means it was handed
+no worker at all; 1 means it filled every one for its whole span. It turns the
+binary "no worker work" observation into a number, so an operator that got
+*partial* help stops looking like one that got none.
+
+The header line summarises the plan:
+
+```
+operator profile: wall_ms=… entries=… workers=8 self_ms=… serial_self_ms=…
+                  serial_fraction=… amdahl_ceiling=…x pool_work_ms=… occupancy=…
+```
+
+`serial_fraction` is the share of profiled main-thread work that drew no worker
+help, and `amdahl_ceiling` is `1 / serial_fraction` — the speedup this query can
+*ever* reach on unbounded cores. Both are computed from **self** time, never
+from `span_ms`: spans are inclusive and nest, so summing them across rows
+double-counts every parent, while self times are exclusive and add up.
+
+Two honest limits. The serial classifier is binary — an operator that drew even
+a little worker help counts as fully parallel — so `amdahl_ceiling` is
+optimistic. And `wall_ms` under instrumentation runs well above the benchmark
+timings (q10 reads 205 ms against a 92 ms benchmark), so treat the ratios as the
+signal and the absolute times as attribution only.
+
+Measured at SF-1, 8 workers:
+
+| query | serial_fraction | amdahl_ceiling | occupancy |
+|---|---:|---:|---:|
+| q06 | 0.003 | 363x | 0.51 |
+| q10 | 0.190 | 5.3x | 0.20 |
+| q20 | 0.621 | 1.6x | 0.16 |
+| q16 | 0.794 | 1.3x | 0.03 |
+| q13 | 0.897 | **1.1x** | 0.02 |
+
+This sharpens the ranking below considerably. **q13 and q16 cannot be rescued by
+more cores at all** — at ceilings of 1.1× and 1.3×, the only route is removing
+serial work, which is what items 2 and 4 propose. q20 at 1.6× is the same story
+one step less severe. q10 is a different problem: it has 5.3× of headroom and
+uses only 20% of the machine, so its issue is that the parallel parts are
+inefficient rather than that too much is serial. And q06 — the query this
+round's decode work targeted — comes out at 0.3% serial and 51% occupancy,
+which is what "done" looks like.
+
 One diagnostic trace at each scale factor gave the following leading serial
 stages. These numbers are for attribution under instrumentation, not replacement
 benchmark timings:

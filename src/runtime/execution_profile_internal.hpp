@@ -34,12 +34,46 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t pool_tasks = 0;
 };
 
+/// Share of the machine an operator kept busy while it ran: 0 means it was
+/// handed no worker at all, 1 means it filled every one of them for its whole
+/// span. Turns the binary "no worker work" observation into a number, so an
+/// operator that got partial help stops looking like one that got none.
+[[nodiscard]] auto profile_row_occupancy(const ExecutionProfileSnapshotRow& row,
+                                         std::size_t workers) -> double;
+
+/// Plan-level totals derived from a profile.
+///
+/// Everything here is computed from SELF time, never from `span_ns`. Spans are
+/// inclusive and nest, so summing them across rows double-counts every parent.
+/// Self times are exclusive by construction, so they add up: their total is the
+/// profiled main-thread work, and the share of it that drew no worker help is
+/// the *measured* serial fraction — which is what predicts the ceiling on a
+/// wider machine, rather than inferring it backwards from an observed speedup.
+struct ExecutionProfileSummary {
+    double self_ms = 0.0;
+    double serial_self_ms = 0.0;
+    /// `serial_self_ms / self_ms`.
+    double serial_fraction = 0.0;
+    /// Amdahl's limit at unbounded cores, `1 / serial_fraction`. Zero when
+    /// nothing serial was measured, meaning "no ceiling observed".
+    double amdahl_ceiling = 0.0;
+    double pool_work_ms = 0.0;
+    /// Whole-query occupancy: `pool_work_ms / (wall_ms * workers)`.
+    double occupancy = 0.0;
+};
+
+[[nodiscard]] auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>& rows,
+                                               double wall_ms, std::size_t workers)
+    -> ExecutionProfileSummary;
+
 /// Query-scoped state behind the opt-in IBEX_PROFILE_OPERATORS report.
 /// Kept internal so profiling adds no public API surface beyond the opaque
 /// pointer carried by ExecutionContext.
 class ExecutionProfileState {
    public:
-    explicit ExecutionProfileState(bool report = true);
+    /// `worker_budget` is the thread count occupancy is measured against —
+    /// how many workers this query was allowed, not how many exist.
+    explicit ExecutionProfileState(std::size_t worker_budget = 1, bool report = true);
     ExecutionProfileState(const ExecutionProfileState&) = delete;
     auto operator=(const ExecutionProfileState&) -> ExecutionProfileState& = delete;
     ~ExecutionProfileState();

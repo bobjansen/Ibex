@@ -7387,7 +7387,13 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         exec.parallel_stats = process_island_stats();
     }
     if (exec.execution_profile == nullptr && execution_profile_requested()) {
-        exec.execution_profile = std::make_shared<ExecutionProfileState>();
+        // The budget occupancy is measured against. Read from the context or
+        // the environment rather than `process_worker_pool().size()`, so that
+        // asking for a profile never constructs a pool a serial query would
+        // otherwise never have built.
+        const std::size_t budget =
+            exec.parallel_threads != 0 ? exec.parallel_threads : default_thread_count();
+        exec.execution_profile = std::make_shared<ExecutionProfileState>(budget);
     }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
         exec.parallel_grain = grain;

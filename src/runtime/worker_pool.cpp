@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "execution_profile_internal.hpp"
+
 namespace ibex::runtime {
 
 struct WorkerPool::Batch::State {
@@ -30,6 +32,7 @@ struct WorkerPool::Batch::State {
     std::size_t remaining = 0;
     std::exception_ptr error;
     std::size_t error_worker = 0;
+    ExecutionProfileEntry* profile_entry = nullptr;
 };
 
 namespace {
@@ -45,6 +48,9 @@ struct Task {
 /// (lowest worker id wins) from `wait()`.
 void run_task(Task const& task) {
     auto& state = *task.state;
+    const auto profile_start = state.profile_entry == nullptr
+                                   ? std::chrono::steady_clock::time_point{}
+                                   : std::chrono::steady_clock::now();
     std::exception_ptr caught;
     try {
         state.body(task.worker_id);
@@ -60,6 +66,11 @@ void run_task(Task const& task) {
         --state.remaining;
     }
     state.done.notify_all();
+    if (state.profile_entry != nullptr) {
+        record_execution_profile_worker(state.profile_entry,
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - profile_start));
+    }
 }
 
 [[nodiscard]] auto env_value(const char* name) -> std::string_view {
@@ -166,6 +177,7 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
+    state->profile_entry = current_execution_profile_entry();
     {
         const std::lock_guard lock(impl_->mutex);
         for (std::size_t i = 0; i < count; ++i) {

@@ -4714,7 +4714,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // Declared here, before the lazy-source projection below, because that
         // projection runs a scan's filter under it — not only `interpret` at
         // the end of this lambda.
-        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans};
+        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans,
+                                       .execution_profile = nullptr};
         runtime::configure_parallel_from_env(exec);
         for (auto& [name, info] : ir::deferrable_probe_scans(*rewritten, deferrable_names)) {
             const auto needed = demand.find(name);

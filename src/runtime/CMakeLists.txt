@@ -5,6 +5,7 @@ add_library(ibex_runtime STATIC
     aggregate.cpp
     chunked.cpp
     env.cpp
+    execution_profile.cpp
     expr.cpp
     extern_registry.cpp
     filter.cpp

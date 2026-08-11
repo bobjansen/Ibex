@@ -227,9 +227,64 @@ The default-off cost was checked against `f916e13` with 11 interleaved repeats
 of the `core,scalar,pipeline` release suites pinned to one CPU: all 26 cases
 were classified as noise (total target time −1.15%).
 
+## Re-measured after parallel group discovery (commits `1d8b1a1`, `00abeae`)
+
+Group discovery now hash-partitions rows across workers for the one- and
+two-integer-key paths. Measured, SF-1, 8 cores, 6 interleaved rounds:
+**q18 −20.0%, q20 −12.5%, q13 −10.0%**, everything else neutral.
+
+| query | serial_fraction | amdahl_ceiling |
+|---|---:|---:|
+| q20 | 0.621 → **0.099** | 1.6x → **10.1x** |
+| q18 | 0.897 → **0.106** | 1.1x → **9.5x** |
+| q13 | 0.897 → 0.786 | 1.1x → 1.3x |
+
+**This reorders what is left.** q13's aggregate is fixed, and its top item is no
+longer the join. Its profile now reads:
+
+| stage | self | pool_work | note |
+|---|---:|---:|---|
+| `source decode whole` | 126 ms | **0.000** | `o_comment` for the LIKE filter |
+| `join left keys=1` (build) | 89 ms | 0.000 | emits 1.53m rows |
+| `aggregate keys=1` | 26 ms | 66.8 ms | occupancy 0.263 — now threaded |
+
+`pool_work=0.000` on the decode is not a rounding artefact: the column is a
+string, strings are excluded from row-group splitting, so that decode is one
+indivisible task and gets no worker at all.
+
+### NEXT: parallel string-column decode
+
+The largest single serial item left in q13, and `source decode whole` carries
+40–126 ms of self time in eight of the 22 queries. Strings were excluded from
+the row-group split because a shard's destination offset depends on the total
+length of every preceding row.
+
+Two ways to lift it, both costing one extra pass over the character data
+(~20 ms for `o_comment`, against a 126 ms serial decode — so roughly
+126 ms → 16 ms parallel + 20 ms copy):
+
+- decode each row-group range into a local `Column<std::string>` and concatenate;
+- or give each shard a disjoint char region sized from the footer's
+  `total_uncompressed_size` upper bound, then compact.
+
+Either needs a bulk block-append on `Column<std::string>` — a core public
+header, so plugins must be rebuilt (ABI).
+
+### Item 2 below is now q13's SECOND item, not its first
+
+Fusing the join into the aggregation still removes ~95 ms (the 89 ms build plus
+the 1.53m-row materialisation and the 6 ms update). It is the classic eager
+aggregation rewrite — Yan & Larson, *Eager Aggregation and Lazy Aggregation*
+(VLDB 1995) — pushing the group-by below the join: count orders per `o_custkey`
+first, then join the 150k counts to customer. Correctness conditions are the
+usual ones (group key must contain the join key, aggregate must be decomposable,
+left-join non-matches must still produce 0), which makes it a riskier change
+than the decode work and narrower in reach — in PDS-H it is essentially q13
+alone.
+
 ## Open levers, ranked
 
-### 1. Parallel high-cardinality group discovery
+### 1. Parallel high-cardinality group discovery — DONE for integer keys
 
 The largest measured reusable item. q20 spends 239 ms at SF-2 discovering and
 aggregating 1.09m two-column groups; q13 spends 87 ms on 300k groups; q10

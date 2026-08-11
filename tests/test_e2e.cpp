@@ -3367,3 +3367,42 @@ TEST_CASE("E2E: a threaded gather returns exactly the serial rows", "[e2e][paral
         CHECK(col_dbl(got, "w") == col_dbl(want, "w"));
     }
 }
+
+TEST_CASE("partitioned group discovery matches the serial groups exactly",
+          "[runtime][parallel][aggregate]") {
+    // High-cardinality two-integer-key grouping: the shape that used to run
+    // wholly serially because the parallel-accumulate gate declines once groups
+    // are numerous. Discovery now hash-partitions the rows across workers, which
+    // hands out group ids from an atomic — so gid order is a race, and the
+    // first-occurrence order the language promises has to be rebuilt from the
+    // row each group was first seen at.
+    //
+    // Comparing against the serial run byte for byte is what tests that: the
+    // group ORDER, the group membership, and each group's accumulated values.
+    constexpr std::size_t kRows = 300'000;  // over the 2^18 row floor for the path
+    std::vector<std::int64_t> parts(kRows);
+    std::vector<std::int64_t> supps(kRows);
+    std::vector<std::int64_t> qty(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Coprime strides: every row is its own group, and the keys arrive in
+        // an order unrelated to their sort order — so a merge that reordered
+        // the groups, or fell back to gid order, shows up immediately.
+        parts[i] = static_cast<std::int64_t>((i * 7919) % 40'009);
+        supps[i] = static_cast<std::int64_t>((i * 104'729) % 13);
+        qty[i] = static_cast<std::int64_t>(i % 97);
+    }
+    runtime::Table table;
+    table.add_column("p", Column<std::int64_t>{std::move(parts)});
+    table.add_column("s", Column<std::int64_t>{std::move(supps)});
+    table.add_column("q", Column<std::int64_t>{std::move(qty)});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(table));
+
+    constexpr std::string_view src = "t[select { total = sum(q), n = count() }, by { p, s }];";
+    const auto serial = run_parallel(src, tables, 0, 1);
+    const auto parallel = run_parallel(src, tables, 0, 4);
+    // Guards the test itself: with these strides every row is a distinct group,
+    // so a run that quietly grouped differently is not silently compared.
+    REQUIRE(serial.rows() == kRows);
+    require_tables_equal(serial, parallel);
+}

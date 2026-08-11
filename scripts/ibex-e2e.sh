@@ -207,6 +207,30 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    echo "▸ whole-script (parquet plugin, fixed-width decode split across row groups)"
+    dec_st="$(mktemp)"
+    dec_mt="$(mktemp)"
+    IBEX_THREADS=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" \
+        "$IBEX_ROOT/tests/data/parquet_row_group_decode_check.ibex" >"$dec_st" 2>&1
+    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" \
+        "$IBEX_ROOT/tests/data/parquet_row_group_decode_check.ibex" >"$dec_mt" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_row_group_decode_out.parquet"
+    # Every value moves if a row-group range writes at the wrong offset — see
+    # the .ibex file. The two runs must also be byte-identical.
+    if rg -n "error:" "$dec_st" >/dev/null \
+        || ! rg -n "\| 1300000 +\| 845000650000 +\| 1 +\| 1300000 +\| 2762500 +\| 433334 +\| 433333 +\| 650000 +\|" "$dec_st" >/dev/null \
+        || ! diff -q "$dec_st" "$dec_mt" >/dev/null; then
+        echo "--- single-threaded ---" >&2
+        cat "$dec_st" >&2
+        echo "--- multi-threaded ---" >&2
+        cat "$dec_mt" >&2
+        rm -f "$dec_st" "$dec_mt"
+        exit 1
+    fi
+    rm -f "$dec_st" "$dec_mt"
+
     echo "▸ whole-script (parquet plugin, fused key scan across row groups)"
     # Run through ibex_eval, not the REPL: the fused key scan only exists on the
     # whole-script planner's path (it comes from dynamic filter pushdown, which

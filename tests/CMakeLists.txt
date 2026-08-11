@@ -157,4 +157,10 @@ if(TARGET ibex_eval_bin AND TARGET ibex_compile_bin AND NOT WIN32)
             "PARITY_LDFLAGS=${_parity_ldflags}"
             "${PROJECT_SOURCE_DIR}/tests/parity/run_parity.sh"
     )
+    # This test builds and runs both the interpreter and every transpiled case
+    # from scratch (~5 min), unlike the Catch2 tests it runs alongside, which
+    # finish in seconds. Label it so the fast inner loop can skip it
+    # (`ctest -LE slow`) while CI and pre-push runs still include it via a
+    # plain `ctest`.
+    set_tests_properties(ibex_parity_interpreter_vs_transpiled PROPERTIES LABELS "slow")
 endif()

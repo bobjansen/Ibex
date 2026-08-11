@@ -705,6 +705,7 @@ cmake --build build-release --config Release
 | `IBEX_BUILD_TESTS`          | `ON`    | Build Catch2 test suite            |
 | `IBEX_BUILD_TOOLS`          | `ON`    | Build REPL binary                  |
 | `IBEX_BUILD_EXAMPLES`       | `ON`    | Build example programs             |
+| `IBEX_USE_CCACHE`           | `ON`    | Use ccache if found, to speed up rebuilds |
 
 ## Architecture
 

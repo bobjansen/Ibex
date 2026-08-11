@@ -5,6 +5,17 @@
 
 include(FetchContent)
 
+# Every dependency below is pinned to a fixed GIT_TAG, so once it has been
+# populated into _deps/ once, there is nothing new to fetch. Without this,
+# FetchContent still does a git update check (a network round-trip per
+# dependency) on *every* CMake configure/reconfigure — including the
+# reconfigure Ninja triggers automatically whenever a CMakeLists.txt changes
+# mid-build — which is most of what makes reconfigures feel slow. A user
+# override on the command line/cache still wins, since this only seeds the
+# cache entry rather than forcing it.
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+    "Skip FetchContent update checks for already-populated dependencies")
+
 function(ibex_mark_target_system_headers target_name)
     if(NOT TARGET "${target_name}")
         return()

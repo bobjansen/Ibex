@@ -25,6 +25,22 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Wire up ccache when available so that clean builds (fresh build dirs, branch
+# switches, `git clean`) reuse object files from prior builds instead of
+# recompiling from scratch. This must run before any target is declared
+# (including the FetchContent'd dependencies pulled in below) so their TUs are
+# cached too. Only set the launcher when the user hasn't already picked one
+# (e.g. via -DCMAKE_CXX_COMPILER_LAUNCHER=... or a toolchain file).
+option(IBEX_USE_CCACHE "Use ccache to speed up recompiles, if found" ON)
+if(IBEX_USE_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        message(STATUS "Ibex: using ccache (${CCACHE_PROGRAM})")
+        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "" FORCE)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "" FORCE)
+    endif()
+endif()
+
 # Project options
 option(IBEX_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(IBEX_ENABLE_LTO "Enable link-time optimization in Release" OFF)

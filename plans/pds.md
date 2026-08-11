@@ -270,6 +270,29 @@ Two ways to lift it, both costing one extra pass over the character data
 Either needs a bulk block-append on `Column<std::string>` — a core public
 header, so plugins must be rebuilt (ABI).
 
+**But probably neither.** In q13 `o_comment` appears ONLY in the filter: ~160MB
+of characters are materialised into a flat `Column<std::string>`, tested with
+`!like(...)`, and discarded. The predicate result is one bit per row.
+
+That matters beyond the wasted stores. Strings resist row-group splitting solely
+because a shard's destination offset depends on every preceding row's length —
+and a predicate result has no offsets. It is fixed-width, so it shards exactly
+like the numeric columns: no concat, no compaction, no extra pass over the
+character data, and no bulk-append on `Column<std::string>`, hence no core
+header change and no plugin ABI break. All three costs above disappear.
+
+Nor is it a new mechanism: `filtered_key_selection` already evaluates a
+join-key filter as values leave the page decoder and emits row indices instead
+of a column, and it is parallel by row group as of `1d8b1a1`. This is the same
+shape with the compile-once `like` kernel.
+
+To check first: (a) the demand analysis — this applies only when a column is
+referenced SOLELY by scan conjuncts, which must be a real query against the plan
+rather than an assumption; (b) `LazyTable`'s column cache, where poisoning is
+already a recorded trap. And size the prize honestly: q13's filter passes ~99%
+of rows, so this saves the MATERIALISATION, not the decode — measure that split
+before assuming it is the whole 126 ms.
+
 ### Item 2 below is now q13's SECOND item, not its first
 
 Fusing the join into the aggregation still removes ~95 ms (the 89 ms build plus

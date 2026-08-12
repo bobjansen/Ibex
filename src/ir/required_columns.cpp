@@ -108,10 +108,24 @@ void add_refs(const std::vector<ColumnRef>& columns, ColumnDemand& demand) {
 
 using DemandMap = std::map<std::string, ColumnDemand>;
 
-void visit(const Node& node, const ColumnDemand& need, DemandMap& out);
+/// Both answers this one downward walk can give: what each **source** is read
+/// for, and what each **join's own output** is read for.
+///
+/// They deliberately come from the same walk. A caller asking "does anything
+/// above this join read that column?" is asking to *act* on the answer being
+/// no, and a second demand model — even a careful one — would eventually be a
+/// shade more permissive than this one and license dropping a column something
+/// reads. There is one answer, computed once, or there is a latent wrong-answer
+/// bug.
+struct DemandSink {
+    DemandMap sources;
+    std::map<const Node*, ColumnDemand> joins;
+};
+
+void visit(const Node& node, const ColumnDemand& need, DemandSink& out);
 
 /// Recurse into every child carrying `need`.
-void visit_children(const Node& node, const ColumnDemand& need, DemandMap& out) {
+void visit_children(const Node& node, const ColumnDemand& need, DemandSink& out) {
     for (const auto& child : node.children()) {
         if (child != nullptr) {
             visit(*child, need, out);
@@ -122,7 +136,7 @@ void visit_children(const Node& node, const ColumnDemand& need, DemandMap& out) 
 /// Recurse into every child, demanding all of their columns. Used for nodes
 /// this pass does not model: it cannot prove which columns they read, so it
 /// assumes they read everything.
-void visit_children_widened(const Node& node, DemandMap& out) {
+void visit_children_widened(const Node& node, DemandSink& out) {
     ColumnDemand all;
     all.widen();
     visit_children(node, all, out);
@@ -130,10 +144,10 @@ void visit_children_widened(const Node& node, DemandMap& out) {
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
 // guarded by the switch on node.kind() matching the target node type.
-void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
+void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
     switch (node.kind()) {
         case NodeKind::Scan: {
-            out[static_cast<const ScanNode&>(node).source_name()].merge(need);
+            out.sources[static_cast<const ScanNode&>(node).source_name()].merge(need);
             return;
         }
 
@@ -340,6 +354,10 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
                 visit_children_widened(node, out);
                 return;
             }
+            // What the plan reads from THIS join's output, before the keys are
+            // added below. Recorded for `join_output_demand`, whose callers ask
+            // whether a key column is read above the join at all.
+            out.joins[&node].merge(need);
             ColumnDemand left_below = need;
             ColumnDemand right_below = need;
             for (const auto& key : join.keys()) {
@@ -398,11 +416,19 @@ void visit(const Node& node, const ColumnDemand& need, DemandMap& out) {
 }  // namespace
 
 auto required_columns(const Node& root) -> DemandMap {
-    DemandMap out;
+    DemandSink out;
     ColumnDemand all;
     all.widen();
     visit(root, all, out);
-    return out;
+    return std::move(out.sources);
+}
+
+auto join_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand> {
+    DemandSink out;
+    ColumnDemand all;
+    all.widen();
+    visit(root, all, out);
+    return std::move(out.joins);
 }
 
 }  // namespace ibex::ir

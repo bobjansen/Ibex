@@ -3,6 +3,7 @@
 
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_pushdown.hpp>
+#include <ibex/ir/mapped_join_keys.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
@@ -139,7 +140,14 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
         return node;  // Outer/Semi/Anti/Cross/Asof: see the header's safety table.
     }
     if (!join_keys_are_same_named(join.keys())) {
-        return node;  // Moving a predicate would require remapping its column refs per side.
+        // Moving a predicate would require remapping its column refs per side.
+        //
+        // `normalize_mapped_join_keys` has already folded away every mapped key
+        // whose fold is unobservable, so a mapped key still here means it was
+        // NOT: a Right/Outer join, a key column read on both spellings above
+        // the join, a name that collides across the two sides, or a side whose
+        // schema is not Known and closed. Those cases keep their source order.
+        return node;
     }
     if (join.children().size() != 2 || join.children()[0] == nullptr ||
         join.children()[1] == nullptr) {
@@ -254,6 +262,10 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 /// keeps 57 orders, versus filtering to 57 orders and joining a few hundred.
 auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     auto& outer = static_cast<JoinNode&>(*node);
+    // Same-named keys: the push moves the semi join onto X or Y, and the key
+    // names it carries have to mean the same column there. Mapped keys that
+    // could be folded already were, by `normalize_mapped_join_keys`; one still
+    // here could not be (see `rewrite_filter_over_join` for the list of why).
     if ((outer.kind() != JoinKind::Semi && outer.kind() != JoinKind::Anti) ||
         outer.predicate().has_value() || outer.keys().empty() ||
         !join_keys_are_same_named(outer.keys())) {
@@ -345,6 +357,12 @@ auto semi_walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 }  // namespace
 
 auto push_filters_into_joins(NodePtr root, const SourceSchemas& sources) -> NodePtr {
+    // Normalize mapped join keys here rather than at each caller. This pass
+    // runs before every other join pass at all six call sites, so landing the
+    // normalizer on its way in means no caller can forget it — and a caller
+    // forgetting it would be a silent, benchmark-only deoptimization, which is
+    // the exact failure this normalizer exists to remove.
+    root = normalize_mapped_join_keys(std::move(root), sources);
     if (root) {
         std::uint64_t max_id = 0;
         collect_max_id(*root, max_id);

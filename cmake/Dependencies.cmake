@@ -62,14 +62,6 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-# spdlog — structured logging (uses fmt)
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.1
-    GIT_SHALLOW    TRUE
-)
-
 # CLI11 — command-line parsing
 FetchContent_Declare(
     CLI11
@@ -78,12 +70,8 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-# Use external fmt for spdlog
-set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
-
-FetchContent_MakeAvailable(fmt spdlog CLI11)
+FetchContent_MakeAvailable(fmt CLI11)
 ibex_silence_external_target(fmt)
-ibex_silence_external_target(spdlog)
 ibex_silence_external_target(CLI11)
 
 # robin-hood-hashing — fast open-addressing hash map (header-only)

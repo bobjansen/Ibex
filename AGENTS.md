@@ -41,7 +41,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `include/ibex/` — public headers (all under `ibex` namespace)
 - `src/{core,ir,parser,runtime,repl}/` — each has own CMakeLists.txt + static library
 - Targets: `Ibex::core`, `Ibex::ir`, `Ibex::parser`, `Ibex::runtime`, `Ibex::repl`
-- Dependencies: fmt, spdlog, CLI11, Catch2 v3 (all via FetchContent)
+- Dependencies: fmt, CLI11, Catch2 v3 (all via FetchContent)
 
 ## Key Design Decisions
 - Language keywords: `filter` (not `where`), `select`, `update`, `by`, `window`

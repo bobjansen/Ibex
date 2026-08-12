@@ -218,13 +218,11 @@ if(IBEX_PARQUET_STANDALONE)
     target_include_directories(ibex_parquet
         PRIVATE
             "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
-            "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"
             "${IBEX_BUILD_DIR}/_deps/robin_hood-src/src/include"
     )
     target_include_directories(ibex_parquet_plugin
         PRIVATE
             "${IBEX_BUILD_DIR}/_deps/fmt-src/include"
-            "${IBEX_BUILD_DIR}/_deps/spdlog-src/include"
             "${IBEX_BUILD_DIR}/_deps/robin_hood-src/src/include"
     )
 
@@ -232,18 +230,12 @@ if(IBEX_PARQUET_STANDALONE)
     if(NOT EXISTS "${_ibex_fmt_lib}")
         set(_ibex_fmt_lib "${IBEX_BUILD_DIR}/_deps/fmt-build/libfmtd.a")
     endif()
-    set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlog.a")
-    if(NOT EXISTS "${_ibex_spdlog_lib}")
-        set(_ibex_spdlog_lib "${IBEX_BUILD_DIR}/_deps/spdlog-build/libspdlogd.a")
-    endif()
-
     target_link_libraries(ibex_parquet
         PRIVATE
             ${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a
             ${IBEX_BUILD_DIR}/src/ir/libibex_ir.a
             ${IBEX_BUILD_DIR}/src/core/libibex_core.a
             ${_ibex_fmt_lib}
-            ${_ibex_spdlog_lib}
     )
 else()
     target_link_libraries(ibex_parquet

@@ -42,7 +42,6 @@ target_link_libraries(ibex_runtime
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt
-        spdlog::spdlog
         robin_hood::robin_hood
         pdqsort
 )

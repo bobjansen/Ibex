@@ -73,7 +73,6 @@ IBEX_INCS=(
     "-I$ROOT_DIR/include"
     "-I$ROOT_DIR/libraries"
     "-I$BUILD_DIR/_deps/fmt-src/include"
-    "-I$BUILD_DIR/_deps/spdlog-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 
@@ -86,16 +85,12 @@ fi
 _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
 [[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
 
-_spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlog.a"
-[[ -f "$_spdlog_lib" ]] || _spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlogd.a"
-
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/parser/libibex_parser.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
     "$_fmt_lib"
-    "$_spdlog_lib"
 )
 
 TMPDIR_WORK="$(mktemp -d)"

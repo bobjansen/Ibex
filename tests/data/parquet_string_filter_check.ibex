@@ -1,0 +1,46 @@
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// A `like` over a column the rest of the query never reads is evaluated inside
+// the page decoder (LazyTable::project_where -> string_filter_scan): the text is
+// matched where it lands and only row indices come out, so no
+// Column<std::string> is ever built for it.
+//
+// That scan runs one ROW GROUP per worker, so this file is sized to have more
+// than one: Parquet's max_row_group_length is 1048576 rows, and 1,300,000 rows
+// are written as row group 0 (1048576 rows) and row group 1 (251424 rows). The
+// per-group results have to be concatenated in FILE order — a merge in
+// completion order would return the same row COUNT with the rows permuted,
+// which is why the checks below sum the key rather than counting rows.
+//
+// `text` is distinct per row and far too large to fit a dictionary page, so the
+// column really is PLAIN-encoded — a dictionary column is decoded to codes
+// instead and deliberately does not take this path at all.
+let base = Table(1300000)[update {
+    one = rep([1], length_out = 1300000)
+}];
+let rows = base[update { id = rank(one, method = first) }];
+let facts = rows[update { text = `comment ${id} tag${id % 7} end` }];
+write_parquet(facts, "tests/data/parquet_string_filter.parquet");
+
+let fact = read_parquet("tests/data/parquet_string_filter.parquet");
+
+// "tag" occurs once per value, so "%tag3%" matches exactly the rows with
+// id % 7 == 3: ids 3, 10, ..., 1299996, which is 185714 of the 1300000. The
+// negation therefore keeps 1114286 rows.
+//
+// Expected: 1114286 / 724286828571 / 1 / 1300000.
+//   sum(1..1300000)                             = 845000650000
+//   sum of the 185714 ids ≡ 3 (mod 7)
+//     = 185714*3 + 7*(185713*185714/2)          = 120713821429
+//   845000650000 - 120713821429                 = 724286828571
+//
+// One statement, because ibex_eval prints only the last one.
+fact[filter !like(text, "%tag3%")][
+    select {
+        rows = count(),
+        id_total = sum(id),
+        lo = min(id),
+        hi = max(id)
+    }
+];

@@ -2257,6 +2257,154 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
     return merge_key_scan_parts(parts);
 }
 
+/// ── Fused string filter scan ────────────────────────────────────────────────
+///
+/// The same trade as the key scan, for the column a query references only from
+/// its filter: match the pattern against the bytes the page decoder hands back
+/// and emit row indices, so no `Column<std::string>` is ever built. On TPC-H's
+/// `o_comment` that is 79MB of characters copied and 1.5m offsets written, for
+/// an answer that is one bit per row.
+///
+/// It is also what makes a string column splittable at all. Strings are
+/// excluded from the row-group decode split because a shard's destination
+/// offset depends on the total length of every preceding row; a predicate
+/// result has no offsets, so the groups are independent and this scan is
+/// parallel by row group like the key scan is.
+///
+/// Two differences from the key scan, both because this predicate is the
+/// query's own rather than a speculative join filter: every row group is
+/// scanned (footer statistics prune nothing here, and the answer is needed for
+/// every row), and there is no abandon rule — a filter that passes almost
+/// everything still has to be evaluated.
+
+/// One row group's contribution, appended as absolute row indices. False means
+/// the column is nested, which has no fused answer at all.
+inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int leaf_index,
+                                       int group, std::size_t group_rows, std::size_t base,
+                                       const ibex::runtime::StringScanFilter& filter,
+                                       ibex::runtime::Selection& selected) -> bool {
+    auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
+    if (column->type() != parquet::ByteArrayType::type_num) {
+        throw std::runtime_error("read_parquet: physical column type does not match schema");
+    }
+    const auto* descriptor = column->descr();
+    if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1) {
+        return false;  // nested columns: no fused answer
+    }
+    const bool optional = descriptor->max_definition_level() != 0;
+    auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
+
+    std::unique_ptr<parquet::ByteArray[]> values(
+        new parquet::ByteArray[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<std::int16_t[]> definitions(
+        new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+
+    // The ByteArray points into the page buffer, which the next ReadBatch
+    // reuses — matching within the batch is exactly why nothing needs copying.
+    const auto view = [](const parquet::ByteArray& value) {
+        return std::string_view{
+            reinterpret_cast<const char*>(value.ptr),  // NOLINT(*-reinterpret-cast)
+            value.len};
+    };
+
+    std::size_t row = 0;
+    while (row < group_rows && typed->HasNext()) {
+        const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
+            static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+        std::int64_t values_read = 0;
+        const std::int64_t levels_read = typed->ReadBatch(
+            request, optional ? definitions.get() : nullptr, nullptr, values.get(), &values_read);
+        if (levels_read <= 0) {
+            throw std::runtime_error("read_parquet: string column ended before its row group");
+        }
+        if (!optional || values_read == levels_read) {
+            for (std::int64_t i = 0; i < values_read; ++i) {
+                if (filter.passes(view(values[static_cast<std::size_t>(i)]))) {
+                    selected.push_back(base + row + static_cast<std::size_t>(i));
+                }
+            }
+        } else {
+            // Nulls present: values are compacted, definition levels map them
+            // back to rows. `like(null, p)` is null and a filter keeps only
+            // true, so a null row fails whichever way the predicate is signed.
+            std::size_t value_index = 0;
+            for (std::int64_t i = 0; i < levels_read; ++i) {
+                if (definitions[static_cast<std::size_t>(i)] == 0) {
+                    continue;
+                }
+                if (filter.passes(view(values[value_index]))) {
+                    selected.push_back(base + row + static_cast<std::size_t>(i));
+                }
+                ++value_index;
+            }
+        }
+        row += static_cast<std::size_t>(levels_read);
+    }
+    if (row != group_rows) {
+        throw std::runtime_error("read_parquet: string column ended before its row group");
+    }
+    return true;
+}
+
+/// Every row group, in file order, with the file row index each starts at.
+inline auto whole_file_scan_groups(const parquet::FileMetaData& metadata)
+    -> std::vector<KeyScanGroup> {
+    std::vector<KeyScanGroup> groups;
+    groups.reserve(static_cast<std::size_t>(metadata.num_row_groups()));
+    std::size_t base = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        const auto rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+        groups.push_back(KeyScanGroup{.index = group, .base = base, .rows = rows});
+        base += rows;
+    }
+    return groups;
+}
+
+/// Drives the fused string scan over `groups`, one reader per worker. Workers
+/// claim groups from a shared cursor and write only their own slot, so the
+/// parts need no locking, and concatenating them in file order reproduces the
+/// serial scan's answer exactly rather than merely equivalently.
+inline auto filtered_string_selection(std::span<parquet::arrow::FileReader* const> readers,
+                                      int leaf_index, const ibex::runtime::StringScanFilter& filter,
+                                      const std::vector<KeyScanGroup>& groups)
+    -> std::optional<ibex::runtime::Selection> {
+    std::vector<ibex::runtime::Selection> parts(groups.size());
+
+    if (readers.size() <= 1 || groups.size() <= 1) {
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            if (!filtered_string_group_scan(*readers.front(), leaf_index, groups[i].index,
+                                            groups[i].rows, groups[i].base, filter, parts[i])) {
+                return std::nullopt;
+            }
+        }
+        return merge_key_scan_parts(parts);
+    }
+
+    std::atomic<std::size_t> cursor{0};
+    std::atomic<bool> nested{false};
+
+    auto batch =
+        ibex::runtime::process_worker_pool().submit(readers.size(), [&](std::size_t worker) {
+            while (!nested.load(std::memory_order_relaxed)) {
+                const std::size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (i >= groups.size()) {
+                    return;
+                }
+                if (!filtered_string_group_scan(*readers[worker], leaf_index, groups[i].index,
+                                                groups[i].rows, groups[i].base, filter, parts[i])) {
+                    nested.store(true, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    batch.wait();
+
+    if (nested.load(std::memory_order_relaxed)) {
+        return std::nullopt;
+    }
+    return merge_key_scan_parts(parts);
+}
+
 /// Immutable reader construction inputs plus the bind-time reader. The first
 /// consumer takes that already-open reader; later (including concurrent)
 /// consumers build independent readers from the shared, already-parsed footer.
@@ -2386,6 +2534,41 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: fused key filter scan failed on " + path_ + " (" +
                                    e.what() + ")");
+        }
+    }
+
+    auto string_filter_scan(const std::string& column,
+                            const ibex::runtime::StringScanFilter& filter,
+                            const ibex::runtime::ExecutionContext& exec)
+        -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
+        auto it = indices_->find(column);
+        if (it == indices_->end()) {
+            return std::unexpected("read_parquet: no column '" + column + "' in " + path_);
+        }
+        // Plain strings only. A dictionary column arrives as DICTIONARY here
+        // and decodes to codes plus one small dictionary, which is cheap to
+        // materialize and would be *slower* matched value by value.
+        const auto id = schema_->field(it->second)->type()->id();
+        const auto& manifest = reader_->manifest();
+        if ((id != arrow::Type::STRING && id != arrow::Type::LARGE_STRING) ||
+            it->second >= static_cast<int>(manifest.schema_fields.size()) ||
+            !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
+            return std::optional<ibex::runtime::Selection>{};
+        }
+        const int leaf_index =
+            manifest.schema_fields[static_cast<std::size_t>(it->second)].column_index;
+        try {
+            const auto& metadata = *reader_->parquet_reader()->metadata();
+            if (metadata.schema()->Column(leaf_index)->physical_type() !=
+                parquet::Type::BYTE_ARRAY) {
+                return std::optional<ibex::runtime::Selection>{};
+            }
+            const auto groups = whole_file_scan_groups(metadata);
+            auto readers = parallel_readers(groups.size(), exec);
+            return filtered_string_selection(std::span{readers}, leaf_index, filter, groups);
+        } catch (const std::exception& e) {
+            return std::unexpected("read_parquet: fused string filter scan failed on " + path_ +
+                                   " (" + e.what() + ")");
         }
     }
 

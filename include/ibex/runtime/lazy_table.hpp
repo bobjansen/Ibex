@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/like.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,28 @@ using ColumnDecodeFn = std::function<std::expected<Table, std::string>(
 using KeyFilterScanFn = std::function<std::expected<std::optional<Selection>, std::string>(
     const std::string&, const DynamicScanFilter&, const ExecutionContext&)>;
 
+/// A `like` / `not like` predicate over one string column, in a form a source
+/// can evaluate inside its own decoder.
+///
+/// This exists for the column a query references *only* from its filter. Such a
+/// column is decoded whole, tested once, and thrown away — and for a wide text
+/// column (TPC-H's `o_comment`) that materialization dominates the query. The
+/// predicate's result is one bit per row, so evaluating it as values leave the
+/// page decoder skips the materialization entirely.
+///
+/// Null is not a value the pattern is matched against: `like(null, p)` is null,
+/// and a filter keeps only true, so a null row fails **both** polarities. That
+/// is why `negated` sits here rather than being applied by the caller.
+struct StringScanFilter {
+    LikePattern pattern;
+    bool negated = false;
+
+    /// Only for non-null values; see the note on nulls above.
+    [[nodiscard]] auto passes(std::string_view value) const -> bool {
+        return like_match(pattern, value) != negated;
+    }
+};
+
 /// One independently mutable reader/decoder for a lazy source.
 ///
 /// Implementations may share immutable file handles and schema metadata, but
@@ -56,6 +79,23 @@ class LazySourceReader {
     [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
                                                const DynamicScanFilter& /*filter*/,
                                                const ExecutionContext& /*exec*/)
+        -> std::expected<std::optional<Selection>, std::string> {
+        return std::optional<Selection>{};
+    }
+
+    /// Evaluate `filter` against `column` during its decode and return the
+    /// passing rows, without materializing the column. nullopt means the
+    /// source has no fused answer for this column (a nested or unsupported
+    /// encoding), and the caller falls back to decode-then-filter, which is
+    /// always correct.
+    ///
+    /// Unlike `key_filter_scan` this never gives up on a high pass rate. That
+    /// escape hatch protects a *speculative* filter, which the caller could
+    /// choose not to apply; this predicate is the query's own, so its answer is
+    /// needed whatever fraction of rows survives.
+    [[nodiscard]] virtual auto string_filter_scan(const std::string& /*column*/,
+                                                  const StringScanFilter& /*filter*/,
+                                                  const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
     }
@@ -181,6 +221,25 @@ class LazyTable {
    private:
     class ReaderPool;
 
+    /// A conjunct this scan will hand to the source instead of evaluating it
+    /// over a materialized column.
+    struct FusedStringConjunct {
+        std::string column;
+        StringScanFilter filter;
+    };
+
+    /// The conjuncts eligible for the fused string scan, and the columns they
+    /// consume. A conjunct qualifies only when it is `like`/`not like` over a
+    /// String column against a literal pattern, and that column is read by
+    /// nothing else: not by another conjunct, not by the projection, and not
+    /// already sitting in `cache_` (where testing it in memory beats re-reading
+    /// its pages). Returns nullopt when nothing qualifies, so the caller keeps
+    /// its existing path unchanged.
+    [[nodiscard]] auto fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
+                                                const std::set<std::string>& names,
+                                                std::vector<FusedStringConjunct>& fused,
+                                                std::vector<ir::Expr>& remaining) const -> bool;
+
     /// Decode the referenced columns whole-file into `cache_` (they are
     /// legitimate whole-column entries) and return them as a table.
     [[nodiscard]] auto decode_whole_columns(
@@ -191,6 +250,13 @@ class LazyTable {
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                        const ExecutionContext& exec)
+        -> std::expected<std::optional<Selection>, std::string>;
+    /// Run every conjunct that `fusable_string_conjuncts` claimed through the
+    /// source's fused scan, intersecting their selections. nullopt = at least
+    /// one had no fused answer, so the caller must evaluate them all the
+    /// ordinary way (a partial answer would silently drop the rest).
+    [[nodiscard]] auto scan_string_filters(const std::vector<FusedStringConjunct>& fused,
+                                           const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
     [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
     void release_reader(LazySourceReaderPtr reader);

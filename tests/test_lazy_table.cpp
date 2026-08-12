@@ -5,12 +5,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -133,6 +136,111 @@ auto less_than(std::string name, double value) -> ir::Expr {
                         .op = ir::CompareOp::Lt,
                         .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = name}}),
                         .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = value}})}};
+}
+
+auto like_call(std::string name, std::string pattern) -> ir::Expr {
+    ir::CallExpr call;
+    call.callee = "like";
+    call.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}}));
+    call.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::move(pattern)}}));
+    return ir::Expr{.node = std::move(call)};
+}
+
+auto not_like(std::string name, std::string pattern) -> ir::Expr {
+    ir::LogicalExpr negation;
+    negation.op = ir::LogicalOp::Not;
+    negation.left = ir::make_expr_ptr(like_call(std::move(name), std::move(pattern)));
+    return ir::Expr{.node = std::move(negation)};
+}
+
+/// A source with one text column, standing in for the shape this optimization
+/// exists for: `s` is wide, the query only filters on it, and materializing it
+/// is the expensive part.
+///
+/// Records every decode and every fused scan, so a test can assert that the
+/// text column was *not* read rather than only that the answer came out right.
+struct TextSourceState {
+    std::vector<std::vector<std::string>> decode_calls;
+    std::vector<std::string> scan_calls;
+    /// When false the reader declines the fused scan, exercising the fallback.
+    bool fused = true;
+};
+
+constexpr std::array<std::string_view, 6> kText{"alpha",    "bad apple", "cherry",
+                                                "very bad", "date",      "elder"};
+
+class TextReader final : public runtime::LazySourceReader {
+   public:
+    explicit TextReader(std::shared_ptr<TextSourceState> state) : state_(std::move(state)) {}
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<runtime::Table, std::string> override {
+        state_->decode_calls.push_back(names);
+        runtime::Selection all(kText.size());
+        std::iota(all.begin(), all.end(), std::size_t{0});
+        const auto& rows = selection == nullptr ? all : *selection;
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name == "s") {
+                std::vector<std::string> values;
+                values.reserve(rows.size());
+                for (auto row : rows) {
+                    values.emplace_back(kText[row]);
+                }
+                out.add_column("s", Column<std::string>{std::move(values)});
+            } else {
+                std::vector<std::int64_t> values;
+                values.reserve(rows.size());
+                for (auto row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row));
+                }
+                out.add_column(name, Column<std::int64_t>{std::move(values)});
+            }
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+    auto string_filter_scan(const std::string& column, const runtime::StringScanFilter& filter,
+                            const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        state_->scan_calls.push_back(column);
+        if (!state_->fused) {
+            return std::optional<runtime::Selection>{};
+        }
+        runtime::Selection selected;
+        for (std::size_t row = 0; row < kText.size(); ++row) {
+            if (filter.passes(kText[row])) {
+                selected.push_back(row);
+            }
+        }
+        return std::optional{std::move(selected)};
+    }
+
+   private:
+    std::shared_ptr<TextSourceState> state_;
+};
+
+auto make_text_lazy(const std::shared_ptr<TextSourceState>& state) -> runtime::LazyTable {
+    runtime::Table schema;
+    schema.add_column("n", Column<std::int64_t>{});
+    schema.add_column("s", Column<std::string>{});
+    return runtime::LazyTable{
+        std::move(schema), kText.size(),
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<TextReader>(state)};
+        }};
+}
+
+auto int_column(const runtime::Table& table, const std::string& name) -> std::vector<std::int64_t> {
+    const auto* entry = table.find_entry(name);
+    REQUIRE(entry != nullptr);
+    const auto* column = std::get_if<Column<std::int64_t>>(&*entry->column);
+    REQUIRE(column != nullptr);
+    return std::vector<std::int64_t>{column->begin(), column->end()};
 }
 
 auto names_of(const runtime::Table& table) -> std::vector<std::string> {
@@ -921,4 +1029,90 @@ TEST_CASE("LazyTable: join_key_selection uses the fused scan when available",
     REQUIRE(keys != nullptr);
     REQUIRE(keys->size() == 1);
     CHECK((*keys)[0] == 3);
+}
+
+TEST_CASE("LazyTable: a filter-only string column is never materialized",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    // `s` is read by the filter and by nothing else, so the source evaluates
+    // the pattern during its own decode and hands back rows.
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(not_like("s", "%bad%"));
+    auto table = lazy.project_where({"n"}, conjuncts, kExec);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{0, 2, 4, 5});
+
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    for (const auto& call : state->decode_calls) {
+        CHECK(std::ranges::find(call, "s") == call.end());
+    }
+}
+
+TEST_CASE("LazyTable: a string column the projection wants is still materialized",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    // Same predicate, but now `s` is in the output. The fused scan would
+    // answer the filter and leave the column undecodable in one pass, so the
+    // ordinary decode-then-filter path has to stand.
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(not_like("s", "%bad%"));
+    auto table = lazy.project_where({"n", "s"}, conjuncts, kExec);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{0, 2, 4, 5});
+    CHECK(state->scan_calls.empty());
+}
+
+TEST_CASE("LazyTable: a fused string filter ANDs with the conjuncts left behind",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(not_like("s", "%bad%"));
+    conjuncts.push_back(greater_than("n", 1));
+    auto table = lazy.project_where({"n"}, conjuncts, kExec);
+    REQUIRE(table);
+    // rows 0,2,4,5 pass the pattern; n > 1 keeps 2,4,5.
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{2, 4, 5});
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    for (const auto& call : state->decode_calls) {
+        CHECK(std::ranges::find(call, "s") == call.end());
+    }
+}
+
+TEST_CASE("LazyTable: a source that declines the fused scan still filters correctly",
+          "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    state->fused = false;
+    auto lazy = make_text_lazy(state);
+
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(not_like("s", "%bad%"));
+    auto table = lazy.project_where({"n"}, conjuncts, kExec);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{0, 2, 4, 5});
+
+    // Asked, declined, fell back to reading the column whole.
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+    bool decoded_text = false;
+    for (const auto& call : state->decode_calls) {
+        decoded_text = decoded_text || std::ranges::find(call, "s") != call.end();
+    }
+    CHECK(decoded_text);
+}
+
+TEST_CASE("LazyTable: an unnegated like fuses too", "[runtime][lazy_table][string_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(like_call("s", "%bad%"));
+    auto table = lazy.project_where({"n"}, conjuncts, kExec);
+    REQUIRE(table);
+    CHECK(int_column(*table, "n") == std::vector<std::int64_t>{1, 3});
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
 }

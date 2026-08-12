@@ -66,6 +66,38 @@ labels, not positions in a sequence. Remaining work is named, not numbered.
   side, the key and the type in the message. It runs at all three lowering
   entry points and again in the driver once reader footers have supplied the
   source schemas.
+- **Mapped keys no longer cost the join optimizer.** Writing `on { a = b }`
+  used to be a silent deoptimization: five passes decline on keys that are not
+  same-named — filter pushdown and semi/anti pushdown
+  (`src/ir/join_pushdown.cpp`), the reorder cost model
+  (`src/ir/join_reorder.cpp`), join ordering (`src/ir/join_order.cpp`) and
+  deferrable probe scans (`src/ir/scan_predicates.cpp`) — so PDS-H q03 ran
+  13-16% slower for the spelling alone, and q13 4-10% slower purely from the
+  extra output column SPEC 12.3 keeps. `ir::normalize_mapped_join_keys` renames
+  the right side's key column to the left's where the fold is unobservable, so
+  those passes see the shape they already handle. Commit *Normalize mapped join
+  keys instead of declining on them*.
+
+### Named, not scheduled: mapped keys the normalizer cannot fold
+
+Two cases still decline, and each gate now says so rather than leaving it to be
+discovered by benchmarking:
+
+- **Right and Outer joins.** Their surviving key column is filled from the
+  RIGHT row when a right row goes unmatched, so folding it into the left's name
+  changes values. Nothing can normalize this; the passes would have to handle
+  mapped keys natively.
+- **A join whose right key column really is read above it.** For an Inner join
+  this is fixable — rename below, then an order-restoring `Project` above to
+  put the column back where SPEC 12.3 says it goes. For a Left join it is not:
+  the right key must be null on unmatched rows and is not a copy of the left's.
+
+The general alternative to both is an **equivalence-class key model** in
+`join_reorder`/`join_order`: `Edge::keys` and every distinct estimate hanging
+off them are keyed by bare column name today, which is why one name has to mean
+one column across a whole chain. Union-find over `(relation, column)` would
+lift that, at the cost of rebuilding the `(left, right)` pair for every join
+the reorder emits. Worth doing when a real query wants it, not before.
 
 ## The contract
 

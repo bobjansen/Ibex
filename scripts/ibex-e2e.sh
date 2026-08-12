@@ -263,6 +263,65 @@ if [[ "$SKIP_REPL" == false ]]; then
         exit 1
     fi
     rm -f "$scan_st" "$scan_mt"
+
+    echo "▸ whole-script (parquet plugin, fused string filter across row groups)"
+    # Same shape for the `like` a query never reads its column outside the
+    # filter: matched inside the decoder, one row group per worker. Run
+    # single- and multi-threaded and require the SAME BYTES, because a merge in
+    # completion order would permute the selection and move the id total.
+    #
+    # The profile is checked too, not only the answer: without the fused scan
+    # this query still returns exactly these numbers, just by materializing the
+    # text column first. "source string filter scan" is what says the
+    # optimization ran at all.
+    str_st="$(mktemp)"
+    str_mt="$(mktemp)"
+    IBEX_THREADS=1 IBEX_PARALLEL=0 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_string_filter_check.ibex" \
+        >"$str_st" 2>&1
+    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_string_filter_check.ibex" \
+        >"$str_mt" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_string_filter.parquet"
+    # 1114286 rows / id total 724286828571 — see the .ibex file for the
+    # arithmetic behind both.
+    if rg -n "error:" "$str_st" >/dev/null \
+        || ! rg -n "source string filter scan" "$str_st" >/dev/null \
+        || ! rg -n "\| 1114286 +\| 724286828571 +\| 1 +\| 1300000 +\|" "$str_st" >/dev/null \
+        || ! diff -q <(rg -v "^(operator )?profile" "$str_st") "$str_mt" >/dev/null; then
+        echo "--- single-threaded ---" >&2
+        cat "$str_st" >&2
+        echo "--- multi-threaded ---" >&2
+        cat "$str_mt" >&2
+        rm -f "$str_st" "$str_mt"
+        exit 1
+    fi
+    rm -f "$str_st" "$str_mt"
+
+    if command -v uv >/dev/null 2>&1; then
+        echo "▸ whole-script (parquet plugin, fused string filter over a nullable column)"
+        # The fixture needs pyarrow to write a PLAIN *nullable* string column
+        # over several row groups; write_parquet cannot. Nulls send the fused
+        # scan down its level-aware branch, where values arrive compacted and
+        # definition levels map them back to rows.
+        uv run --project "$IBEX_ROOT" python \
+            "$IBEX_ROOT/tests/data/gen_parquet_string_filter_nulls.py" \
+            "$IBEX_ROOT/tests/data/parquet_string_filter_nulls_out.parquet" >/dev/null
+        null_out="$(mktemp)"
+        IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
+            --plugin-path "$BUILD_DIR/tools" \
+            "$IBEX_ROOT/tests/data/parquet_string_filter_nulls_check.ibex" >"$null_out" 2>&1
+        rm -f "$IBEX_ROOT/tests/data/parquet_string_filter_nulls_out.parquet"
+        # 400 + 800 = 1200 of 1500 rows; the 300 null rows fail both polarities.
+        if rg -n "error:" "$null_out" >/dev/null \
+            || ! rg -n "source string filter scan" "$null_out" >/dev/null \
+            || ! rg -n "\| 400 +\| 300000 +\| 800 +\| 600000 +\|" "$null_out" >/dev/null; then
+            cat "$null_out" >&2
+            rm -f "$null_out"
+            exit 1
+        fi
+        rm -f "$null_out"
+    fi
 fi
 
 if [[ "$SKIP_COMPILE" == false ]]; then

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -256,7 +257,126 @@ auto membership_selection(const KeyColumn& key, const DynamicScanFilter& filter,
     return selected;
 }
 
+/// `like(col, "pattern")`, possibly under any number of `not`s. Returns the
+/// column and the compiled filter, or nullopt when the expression is any other
+/// shape — including a `like` whose pattern is not a literal (it would have to
+/// be evaluated per row) or does not compile (the ordinary path reports that
+/// error, and reporting it from here would change nothing but the blame).
+auto as_like_predicate(const ir::Expr& expr, bool negated)
+    -> std::optional<std::pair<std::string, StringScanFilter>> {
+    if (const auto* logical = std::get_if<ir::LogicalExpr>(&expr.node)) {
+        if (logical->op != ir::LogicalOp::Not || logical->left == nullptr) {
+            return std::nullopt;
+        }
+        return as_like_predicate(*logical->left, !negated);
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->callee != "like" || call->args.size() != 2 ||
+        !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto* column = call->args[0] == nullptr ? nullptr : ir::as_column_ref(*call->args[0]);
+    const auto* pattern_expr =
+        call->args[1] == nullptr ? nullptr : std::get_if<ir::Literal>(&call->args[1]->node);
+    if (column == nullptr || pattern_expr == nullptr) {
+        return std::nullopt;
+    }
+    const auto* pattern = std::get_if<std::string>(&pattern_expr->value);
+    if (pattern == nullptr) {
+        return std::nullopt;
+    }
+    auto compiled = compile_like_pattern(*pattern);
+    if (!compiled) {
+        return std::nullopt;
+    }
+    return std::pair{column->name,
+                     StringScanFilter{.pattern = std::move(*compiled), .negated = negated}};
+}
+
 }  // namespace
+
+auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
+                                         const std::set<std::string>& names,
+                                         std::vector<FusedStringConjunct>& fused,
+                                         std::vector<ir::Expr>& remaining) const -> bool {
+    // Only the reader-backed sources implement the fused scan; the plain
+    // `ColumnDecodeFn` constructor has no seam to offer it through.
+    if (!reader_factory_) {
+        return false;
+    }
+
+    // How many conjuncts read each column, so "read by nothing else" is a
+    // lookup rather than a rescan per candidate.
+    robin_hood::unordered_map<std::string, std::size_t> readers;
+    std::vector<robin_hood::unordered_set<std::string>> refs(conjuncts.size());
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        ir::collect_expr_column_refs(conjuncts[i], refs[i]);
+        for (const auto& name : refs[i]) {
+            ++readers[name];
+        }
+    }
+
+    for (std::size_t i = 0; i < conjuncts.size(); ++i) {
+        auto predicate = as_like_predicate(conjuncts[i], false);
+        // The conjunct must read its column and nothing else, that column must
+        // be a plain String in the source (a dictionary column decodes to
+        // codes, which is already cheap and would be *slower* value by value),
+        // and no one else may want it: not the projection, not another
+        // conjunct, and not a past query that left it in the cache.
+        if (predicate.has_value() && refs[i].size() == 1 && refs[i].contains(predicate->first) &&
+            readers[predicate->first] == 1 && !names.contains(predicate->first) &&
+            !cache_.contains(predicate->first)) {
+            const auto* entry = schema_.find_entry(predicate->first);
+            if (entry != nullptr && entry->column != nullptr &&
+                std::holds_alternative<Column<std::string>>(*entry->column)) {
+                fused.push_back(FusedStringConjunct{.column = std::move(predicate->first),
+                                                    .filter = std::move(predicate->second)});
+                continue;
+            }
+        }
+        remaining.push_back(conjuncts[i]);
+    }
+    return !fused.empty();
+}
+
+auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fused,
+                                    const ExecutionContext& exec)
+    -> std::expected<std::optional<Selection>, std::string> {
+    auto* profile_entry = exec.execution_profile == nullptr
+                              ? nullptr
+                              : exec.execution_profile->stage("source string filter scan");
+    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+
+    auto reader = acquire_reader();
+    if (!reader) {
+        return std::unexpected(reader.error());
+    }
+    std::optional<Selection> selected;
+    for (const auto& conjunct : fused) {
+        auto part = (*reader)->string_filter_scan(conjunct.column, conjunct.filter, exec);
+        if (!part) {
+            return std::unexpected(part.error());
+        }
+        if (!part->has_value()) {
+            // No fused answer: all or nothing, since a partial one would drop
+            // the conjuncts already consumed. The reader goes back to the pool
+            // because the fallback is about to decode through it.
+            release_reader(std::move(*reader));
+            return std::optional<Selection>{};
+        }
+        if (!selected.has_value()) {
+            selected = std::move(**part);
+            continue;
+        }
+        // Both are ascending source-row indices, so ANDing them is a merge.
+        Selection both;
+        both.reserve(std::min(selected->size(), (*part)->size()));
+        std::ranges::set_intersection(*selected, **part, std::back_inserter(both));
+        selected = std::move(both);
+    }
+    release_reader(std::move(*reader));
+    return selected;
+}
 
 auto LazyTable::project_where(const std::set<std::string>& names,
                               const std::vector<ir::Expr>& conjuncts, const ExecutionContext& exec,
@@ -313,8 +433,25 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         // rejecting): the ordinary decode-then-filter path below stands.
     }
 
+    // A conjunct whose column the rest of the query never looks at does not
+    // need that column at all — only its answer. Hand those to the source to
+    // evaluate inside its decoder, and let the conjuncts they did not claim go
+    // on being evaluated the ordinary way below. A source that declines gives
+    // back no selection at all, and then every conjunct takes that path.
+    std::vector<FusedStringConjunct> fused;
+    std::vector<ir::Expr> unfused;
+    std::optional<Selection> fused_selection;
+    if (fusable_string_conjuncts(conjuncts, names, fused, unfused)) {
+        auto scan = scan_string_filters(fused, exec);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        fused_selection = std::move(*scan);
+    }
+    const std::vector<ir::Expr>& applied = fused_selection.has_value() ? unfused : conjuncts;
+
     robin_hood::unordered_set<std::string> referenced;
-    for (const auto& conjunct : conjuncts) {
+    for (const auto& conjunct : applied) {
         ir::collect_expr_column_refs(conjunct, referenced);
     }
     if (membership) {
@@ -330,24 +467,36 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     const auto key =
         membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
 
-    std::expected<std::vector<std::size_t>, std::string> selected;
-    if (!conjuncts.empty()) {
-        selected = filter_selection(predicates, conjuncts, exec, scalars);
-        if (!selected) {
-            return std::unexpected(selected.error());
+    std::optional<std::vector<std::size_t>> selected;
+    if (!applied.empty()) {
+        auto from_conjuncts = filter_selection(predicates, applied, exec, scalars);
+        if (!from_conjuncts) {
+            return std::unexpected(from_conjuncts.error());
         }
+        selected = std::move(*from_conjuncts);
         if (key.has_value()) {
             apply_membership_filter(*key, *dynamic, *selected);
         }
-    } else {
-        if (!key.has_value()) {
-            return project(names, exec);  // key missing or non-int64: no filter to apply
+    } else if (membership && key.has_value()) {
+        // nullopt here is the escape hatch (the filter barely rejects) or a
+        // key that is missing/non-int64; either way membership contributes
+        // nothing and `selected` stays empty.
+        selected = membership_selection(*key, *dynamic, rows_);
+    }
+
+    if (fused_selection.has_value()) {
+        if (!selected.has_value()) {
+            selected = std::move(*fused_selection);
+        } else {
+            // Both are ascending source-row indices, so ANDing them is a merge.
+            Selection both;
+            both.reserve(std::min(selected->size(), fused_selection->size()));
+            std::ranges::set_intersection(*selected, *fused_selection, std::back_inserter(both));
+            selected = std::move(both);
         }
-        auto from_membership = membership_selection(*key, *dynamic, rows_);
-        if (!from_membership.has_value()) {
-            return project(names, exec);  // escape hatch: the filter barely rejects
-        }
-        selected = std::move(*from_membership);
+    }
+    if (!selected.has_value()) {
+        return project(names, exec);  // nothing left to filter by
     }
     const bool all_rows = selected->size() == rows_;
 

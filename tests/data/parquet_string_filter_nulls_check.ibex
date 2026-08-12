@@ -1,0 +1,29 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// Nulls through the fused string filter. The fixture
+// (gen_parquet_string_filter_nulls.py) is a PLAIN string column with a null
+// every 5th row across three row groups, so the scan takes its level-aware
+// branch: values arrive compacted and definition levels map them back to rows.
+// Getting that wrong slides every value after the first null onto the wrong
+// row, which is why both checks sum `id` instead of counting rows.
+//
+// `like(null, p)` is null and a filter keeps only true, so the 300 null rows
+// must be absent from BOTH answers — the one place a predicate and its
+// negation agree rather than partitioning the input.
+let fact = read_parquet("tests/data/parquet_string_filter_nulls_out.parquet");
+
+// Every 3rd row carries the needle; every 5th is null. 400 of the 1500 rows
+// are non-null and divisible by 3; 800 are non-null and not; the remaining
+// 300 are null and belong to neither.
+let matched = fact[filter like(s, "%needle%")][
+    select { m_rows = count(), m_total = sum(id), k = 1 }
+];
+let rest = fact[filter !like(s, "%needle%")][
+    select { r_rows = count(), r_total = sum(id), k = 1 }
+];
+
+// Expected: 400 / 300000 / 800 / 600000. The two row counts must sum to 1200,
+// not 1500: a scan that let nulls through one polarity would show up here.
+(matched join rest on k)[
+    select { m_rows, m_total, r_rows, r_total }
+];

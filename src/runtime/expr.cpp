@@ -14,6 +14,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/like.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
@@ -43,7 +44,6 @@
 #endif
 
 #include "interpreter_internal.hpp"
-#include "like.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {

@@ -41,6 +41,14 @@ target_link_libraries(ibex_pyarrow
 if(TARGET Ibex::parquet)
     target_link_libraries(ibex_pyarrow PRIVATE Ibex::parquet)
     target_compile_definitions(ibex_pyarrow PRIVATE IBEX_HAS_PARQUET_BACKEND=1)
+
+    # The Parquet plugin copies Arrow's shared libraries into the plugin output
+    # directory. The extension links Arrow through Ibex::parquet, so its build
+    # tree RPATH must name that directory as well; otherwise Python cannot
+    # import ibex_pyarrow without callers manually setting LD_LIBRARY_PATH.
+    set_target_properties(ibex_pyarrow PROPERTIES
+        BUILD_RPATH "${IBEX_PLUGIN_OUTPUT_DIR}"
+    )
 endif()
 
 target_include_directories(ibex_pyarrow
@@ -85,6 +93,7 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0)
         NAME ibex_pyarrow_smoke
         COMMAND "${CMAKE_COMMAND}" -E env
             "PYTHONPATH=${PROJECT_BINARY_DIR}/python"
+            "IBEX_PYARROW_MODULE_DIR=${PROJECT_BINARY_DIR}/python"
             "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_pyarrow.py"
     )
 elseif(IBEX_BUILD_TESTS)
@@ -97,6 +106,7 @@ if(IBEX_BUILD_TESTS AND IBEX_PYARROW_IMPORT_RESULT EQUAL 0 AND IBEX_IPYTHON_IMPO
         NAME ibex_ipython_smoke
         COMMAND "${CMAKE_COMMAND}" -E env
             "PYTHONPATH=${PROJECT_BINARY_DIR}/python:${PROJECT_SOURCE_DIR}/python"
+            "IBEX_PYARROW_MODULE_DIR=${PROJECT_BINARY_DIR}/python"
             "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/test_ibex_ipython.py"
     )
 elseif(IBEX_BUILD_TESTS)

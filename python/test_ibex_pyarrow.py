@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +26,13 @@ def module_build_root() -> Path | None:
 
 
 def add_bridge_module_path() -> None:
+    configured_module_dir = os.environ.get("IBEX_PYARROW_MODULE_DIR")
+    if configured_module_dir:
+        candidate = Path(configured_module_dir)
+        if candidate.is_dir():
+            sys.path.insert(0, str(candidate))
+            return
+
     root = repo_root()
     for build_dir_name in ("build-release", "build"):
         candidate = root / build_dir_name / "python"

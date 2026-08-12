@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -27,6 +28,15 @@ def module_build_root() -> Path | None:
 
 
 def add_bridge_module_path() -> None:
+    configured_module_dir = os.environ.get("IBEX_PYARROW_MODULE_DIR")
+    if configured_module_dir:
+        candidate = Path(configured_module_dir)
+        if candidate.is_dir():
+            path = str(candidate)
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            return
+
     root = repo_root()
     for build_dir_name in ("build-release", "build"):
         candidate = root / build_dir_name / "python"

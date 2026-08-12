@@ -16,7 +16,6 @@ target_link_libraries(ibex_repl_bin
         Ibex::repl
         Ibex::CompilerOptions
         CLI11::CLI11
-        fmt::fmt
 )
 
 if(TARGET Ibex::parquet)
@@ -42,7 +41,6 @@ target_link_libraries(ibex_bench
         Ibex::runtime
         Ibex::CompilerOptions
         CLI11::CLI11
-        fmt::fmt
         fast_float
 )
 
@@ -101,7 +99,6 @@ target_link_libraries(ibex_join_bench
         Ibex::runtime
         Ibex::CompilerOptions
         CLI11::CLI11
-        fmt::fmt
 )
 
 if(IBEX_TARGETS_X86 AND IBEX_HAS_AVX2)
@@ -136,7 +133,6 @@ target_link_libraries(ibex_fusion_bench
         Ibex::runtime
         Ibex::CompilerOptions
         CLI11::CLI11
-        fmt::fmt
 )
 
 if(TARGET Ibex::Sanitizers)

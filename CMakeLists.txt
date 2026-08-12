@@ -114,6 +114,18 @@ check_cxx_source_compiles(
     int main() { (void)std::chrono::locate_zone(\"UTC\"); }
     "
     IBEX_HAS_STD_CHRONO_TIME_ZONES)
+check_cxx_source_compiles(
+    "
+    #include <cstdio>
+    #include <format>
+    #include <print>
+    int main() {
+        auto text = std::format(\"{:04d} {:.3f} {:-<{}}\", 7, 1.25, \"\", 4);
+        std::print(\"{}\", text);
+        std::print(stderr, \"{}\", text);
+    }
+    "
+    IBEX_HAS_STD_FORMAT_AND_PRINT)
 # Restore by unsetting when there was nothing to restore: an empty-but-defined
 # CMAKE_CXX_STANDARD is not the same as an unset one.
 if(_ibex_saved_cxx_standard STREQUAL "")
@@ -128,6 +140,11 @@ else()
 endif()
 unset(_ibex_saved_cxx_standard)
 unset(_ibex_saved_cxx_standard_required)
+if(NOT IBEX_HAS_STD_FORMAT_AND_PRINT)
+    message(FATAL_ERROR
+        "Ibex requires C++23 <format> and <print>. Install a newer standard library "
+        "(for macOS, Xcode 15.3 or later).")
+endif()
 if(IBEX_HAS_STD_CHRONO_TIME_ZONES)
     add_compile_definitions(IBEX_HAS_STD_CHRONO_TIME_ZONES=1)
 endif()

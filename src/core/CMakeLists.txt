@@ -22,7 +22,6 @@ target_link_libraries(ibex_core
         robin_hood::robin_hood
     PRIVATE
         Ibex::CompilerOptions
-        fmt::fmt
 )
 
 if(TARGET Ibex::Sanitizers)

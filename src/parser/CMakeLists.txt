@@ -20,7 +20,6 @@ target_link_libraries(ibex_parser
         Ibex::ir
     PRIVATE
         Ibex::CompilerOptions
-        fmt::fmt
 )
 
 if(TARGET Ibex::Sanitizers)

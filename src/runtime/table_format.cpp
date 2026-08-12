@@ -2,11 +2,9 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/time.hpp>
+#include <ibex/format.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_format.hpp>
-
-#include <fmt/format.h>
-#include <fmt/ostream.h>
 
 #include <algorithm>
 #include <array>
@@ -79,7 +77,7 @@ auto format_date(Date date) -> std::string {
     using namespace std::chrono;
     const sys_days day = sys_days{days{date.days}};
     const year_month_day ymd{day};
-    return fmt::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
+    return ibex::formatting::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
                        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
 }
 
@@ -90,7 +88,7 @@ auto format_timestamp(Timestamp ts) -> std::string {
     const year_month_day ymd{day};
     auto tod = tp - day;
     const hh_mm_ss<nanoseconds> hms{tod};
-    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
+    return ibex::formatting::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
                        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
                        hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
                        hms.subseconds().count());
@@ -109,7 +107,7 @@ auto format_float_mixed(double value) -> std::string {
     if (ec == std::errc{}) {
         return normalize_float_text(std::string(buffer.data(), ptr));
     }
-    return normalize_float_text(fmt::format("{:.7g}", value));
+    return normalize_float_text(ibex::formatting::format("{:.7g}", value));
 }
 
 auto quote_and_escape(std::string_view text) -> std::string {
@@ -159,7 +157,7 @@ auto format_cell(const ColumnEntry& entry, std::size_t row) -> std::string {
             } else if constexpr (std::is_same_v<T, double>) {
                 return format_float_mixed(col[row]);
             } else {
-                return fmt::format("{}", col[row]);
+                return ibex::formatting::format("{}", col[row]);
             }
         },
         column);
@@ -170,13 +168,13 @@ void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
         // A column-less frame may still carry a logical row count (e.g. from
         // `Table(n)`); report it rather than the bare "<empty>".
         if (table.rows() > 0) {
-            fmt::print(out, "rows: {}\n(no columns)\n", table.rows());
+            ibex::formatting::print(out, "rows: {}\n(no columns)\n", table.rows());
         } else {
-            fmt::print(out, "<empty>\n");
+            ibex::formatting::print(out, "<empty>\n");
         }
         return;
     }
-    fmt::print(out, "rows: {}\n", table.rows());
+    ibex::formatting::print(out, "rows: {}\n", table.rows());
 
     const std::size_t col_count = table.columns.size();
     const std::size_t shown_rows = std::min(table.rows(), max_rows);
@@ -194,32 +192,32 @@ void format_table(const Table& table, std::ostream& out, std::size_t max_rows) {
     }
 
     auto print_sep = [&]() {
-        fmt::print(out, "+");
+        ibex::formatting::print(out, "+");
         for (std::size_t c = 0; c < col_count; ++c) {
-            fmt::print(out, "{:-<{}}+", "", widths[c] + 2);
+            ibex::formatting::print(out, "{:-<{}}+", "", widths[c] + 2);
         }
-        fmt::print(out, "\n");
+        ibex::formatting::print(out, "\n");
     };
 
     print_sep();
-    fmt::print(out, "|");
+    ibex::formatting::print(out, "|");
     for (std::size_t c = 0; c < col_count; ++c) {
-        fmt::print(out, " {:<{}} |", table.columns[c].name, widths[c]);
+        ibex::formatting::print(out, " {:<{}} |", table.columns[c].name, widths[c]);
     }
-    fmt::print(out, "\n");
+    ibex::formatting::print(out, "\n");
     print_sep();
 
     for (std::size_t r = 0; r < shown_rows; ++r) {
-        fmt::print(out, "|");
+        ibex::formatting::print(out, "|");
         for (std::size_t c = 0; c < col_count; ++c) {
-            fmt::print(out, " {:<{}} |", cells[c][r], widths[c]);
+            ibex::formatting::print(out, " {:<{}} |", cells[c][r], widths[c]);
         }
-        fmt::print(out, "\n");
+        ibex::formatting::print(out, "\n");
     }
     print_sep();
 
     if (table.rows() > shown_rows) {
-        fmt::print(out, "... ({} more rows)\n", table.rows() - shown_rows);
+        ibex::formatting::print(out, "... ({} more rows)\n", table.rows() - shown_rows);
     }
 }
 

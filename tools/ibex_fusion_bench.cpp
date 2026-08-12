@@ -14,7 +14,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <CLI/CLI.hpp>
-#include <fmt/core.h>
+#include <ibex/format.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -58,7 +58,7 @@ auto make_wide_table(std::size_t rows, std::size_t n_cols, std::uint64_t seed)
         for (std::size_t i = 0; i < rows; ++i) {
             p[i] = static_cast<std::int64_t>(rng() % 1000);
         }
-        t.add_column(fmt::format("c{}", c), std::move(col));
+        t.add_column(ibex::formatting::format("c{}", c), std::move(col));
     }
     return t;
 }
@@ -72,19 +72,19 @@ auto run(const std::string& name, const std::string& src,
     }
     auto parsed = ibex::parser::parse(normalized);
     if (!parsed) {
-        fmt::print("parse failed: {}\n", parsed.error().format());
+        ibex::formatting::print("parse failed: {}\n", parsed.error().format());
         return 1;
     }
     auto lowered = ibex::parser::lower(*parsed);
     if (!lowered) {
-        fmt::print("lower failed: {}\n", lowered.error().message);
+        ibex::formatting::print("lower failed: {}\n", lowered.error().message);
         return 1;
     }
     ibex::runtime::ScalarRegistry scalars;
     for (std::size_t i = 0; i < warmup; ++i) {
         auto r = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         if (!r) {
-            fmt::print("interpret failed: {}\n", r.error());
+            ibex::formatting::print("interpret failed: {}\n", r.error());
             return 1;
         }
     }
@@ -95,7 +95,7 @@ auto run(const std::string& name, const std::string& src,
         auto r = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         auto t1 = std::chrono::steady_clock::now();
         if (!r) {
-            fmt::print("interpret failed: {}\n", r.error());
+            ibex::formatting::print("interpret failed: {}\n", r.error());
             return 1;
         }
         last_rows = r->rows();
@@ -103,7 +103,7 @@ auto run(const std::string& name, const std::string& src,
             std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
     auto s = stats(std::move(times));
-    fmt::print("bench {}: iters={}, avg_ms={:.3f}, min_ms={:.3f}, max_ms={:.3f}, rows={}\n", name,
+    ibex::formatting::print("bench {}: iters={}, avg_ms={:.3f}, min_ms={:.3f}, max_ms={:.3f}, rows={}\n", name,
                iters, s.avg_ms, s.min_ms, s.max_ms, last_rows);
     if (mins != nullptr) {
         (*mins)[name] = s.min_ms;
@@ -163,24 +163,24 @@ const std::vector<Guard>& fusion_guards() {
 
 // Returns the number of failed guards (0 == all invariants hold).
 auto check_guards(const std::map<std::string, double>& mins) -> int {
-    fmt::print("\n--- fusion guards ---\n");
+    ibex::formatting::print("\n--- fusion guards ---\n");
     int failures = 0;
     for (const auto& g : fusion_guards()) {
         auto fast_it = mins.find(g.fast);
         auto slow_it = mins.find(g.slow);
         if (fast_it == mins.end() || slow_it == mins.end()) {
-            fmt::print("SKIP {} vs {}: case not run\n", g.fast, g.slow);
+            ibex::formatting::print("SKIP {} vs {}: case not run\n", g.fast, g.slow);
             continue;
         }
         const double ratio = slow_it->second / fast_it->second;
         const bool ok = ratio >= g.min_ratio;
-        fmt::print("{} {}: {:.1f}x faster than {} (require >= {:.1f}x) — {}\n",
+        ibex::formatting::print("{} {}: {:.1f}x faster than {} (require >= {:.1f}x) — {}\n",
                    ok ? "PASS" : "FAIL", g.fast, ratio, g.slow, g.min_ratio, g.reason);
         if (!ok) {
             ++failures;
         }
     }
-    fmt::print("{} guard(s) failed\n", failures);
+    ibex::formatting::print("{} guard(s) failed\n", failures);
     return failures;
 }
 
@@ -203,39 +203,39 @@ auto check_sorted_aggregate_invariants(const ibex::runtime::TableRegistry& table
          "sorted[order k asc][by k, select { k, fi = first(v), la = last(v) }]", "k"},
     };
 
-    fmt::print("\n--- sorted aggregate invariants ---\n");
+    ibex::formatting::print("\n--- sorted aggregate invariants ---\n");
     int failures = 0;
     ibex::runtime::ScalarRegistry scalars;
     for (const auto& invariant : invariants) {
         auto parsed = ibex::parser::parse(invariant.source + ";");
         if (!parsed) {
-            fmt::print("FAIL {}: parse failed: {}\n", invariant.name, parsed.error().format());
+            ibex::formatting::print("FAIL {}: parse failed: {}\n", invariant.name, parsed.error().format());
             ++failures;
             continue;
         }
         auto lowered = ibex::parser::lower(*parsed);
         if (!lowered) {
-            fmt::print("FAIL {}: lower failed: {}\n", invariant.name, lowered.error().message);
+            ibex::formatting::print("FAIL {}: lower failed: {}\n", invariant.name, lowered.error().message);
             ++failures;
             continue;
         }
         auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         if (!result) {
-            fmt::print("FAIL {}: interpret failed: {}\n", invariant.name, result.error());
+            ibex::formatting::print("FAIL {}: interpret failed: {}\n", invariant.name, result.error());
             ++failures;
             continue;
         }
         const bool ordered = result->ordering().has_value() && !result->ordering()->empty() &&
                              result->ordering()->front().name == invariant.group_key &&
                              result->ordering()->front().ascending;
-        fmt::print("{} {}: output {} ordered by group key — {}\n", ordered ? "PASS" : "FAIL",
+        ibex::formatting::print("{} {}: output {} ordered by group key — {}\n", ordered ? "PASS" : "FAIL",
                    invariant.name, ordered ? "is" : "is not",
                    "sorted aggregate must not fall back to hash");
         if (!ordered) {
             ++failures;
         }
     }
-    fmt::print("{} invariant(s) failed\n", failures);
+    ibex::formatting::print("{} invariant(s) failed\n", failures);
     return failures;
 }
 

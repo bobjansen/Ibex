@@ -63,6 +63,12 @@ auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vec
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
+    // `Edge::keys` are bare column names, which only identify a column
+    // unambiguously across the whole chain when every join is same-named.
+    // Mapped keys reach here only when `normalize_mapped_join_keys` could not
+    // fold them (Right/Outer — excluded above anyway — a key read on both
+    // spellings above the join, a cross-side name collision, or an unknown
+    // schema), and then the chain keeps the order its author wrote.
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
         !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
         join.children()[0] == nullptr || join.children()[1] == nullptr ||
@@ -84,6 +90,8 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     auto* join = static_cast<JoinNode*>(node.get());
+    // Must stay in lockstep with `scan_left_deep` above, including its reason
+    // for rejecting mapped keys.
     if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
         !join_keys_are_same_named(join->keys()) || join->mutable_children().size() != 2 ||
         join->mutable_children()[0] == nullptr || join->mutable_children()[1] == nullptr ||

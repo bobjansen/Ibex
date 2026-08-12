@@ -52,6 +52,11 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
+    // `JoinEdge::keys` and every distinct estimate hanging off them are keyed
+    // by bare column name, so one name has to mean one column across the whole
+    // chain. `normalize_mapped_join_keys` folds mapped keys away wherever the
+    // fold is unobservable; one that survives to here could not be folded, and
+    // the chain keeps its source order rather than being costed on a guess.
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
         !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
         join.children()[0] == nullptr || join.children()[1] == nullptr ||

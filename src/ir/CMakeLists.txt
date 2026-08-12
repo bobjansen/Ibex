@@ -11,6 +11,7 @@ add_library(ibex_ir STATIC
     join_order.cpp
     join_output.cpp
     join_reorder.cpp
+    mapped_join_keys.cpp
     node.cpp
     nullability.cpp
     optimizer.cpp

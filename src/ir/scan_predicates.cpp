@@ -368,6 +368,12 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         std::map<std::string, DeferrableProbeScan>& out) {
     if (node.kind() == NodeKind::Join) {
         const auto& join = static_cast<const JoinNode&>(node);
+        // The build side publishes its key values under the LEFT name and the
+        // deferred scan is bounded under the RIGHT one, so the runtime already
+        // handles a mapped key here. The equality is a planning guard, not an
+        // execution one: it keeps this analysis in step with the join passes
+        // that do need same-named keys, and mapped keys that could be folded
+        // already were by `normalize_mapped_join_keys`.
         if (join.kind() == JoinKind::Inner && join.keys().size() == 1 &&
             join.keys().front().left == join.keys().front().right &&
             !join.predicate().has_value() && join.children().size() == 2 &&

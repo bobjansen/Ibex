@@ -29,7 +29,6 @@ target_link_libraries(ibex_repl
         Ibex::runtime
     PRIVATE
         Ibex::CompilerOptions
-        fmt::fmt
         $<$<NOT:$<PLATFORM_ID:Windows>>:dl>
 )
 

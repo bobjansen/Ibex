@@ -54,14 +54,6 @@ function(ibex_silence_external_target target_name)
     endif()
 endfunction()
 
-# fmt — modern formatting library
-FetchContent_Declare(
-    fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG        11.1.4
-    GIT_SHALLOW    TRUE
-)
-
 # CLI11 — command-line parsing
 FetchContent_Declare(
     CLI11
@@ -70,8 +62,7 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(fmt CLI11)
-ibex_silence_external_target(fmt)
+FetchContent_MakeAvailable(CLI11)
 ibex_silence_external_target(CLI11)
 
 # robin-hood-hashing — fast open-addressing hash map (header-only)

@@ -7,6 +7,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
@@ -19,9 +20,6 @@
 #include <ibex/runtime/pipeline.hpp>
 #include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
-
-// The `IBEX_PARALLEL_STATS` reporter prints with `fmt::print`.
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -7250,7 +7248,7 @@ auto process_island_stats() -> ParallelIslandStats* {
             if (!enabled) {
                 return;
             }
-            fmt::print(stderr,
+            ibex::formatting::print(stderr,
                        "island stats: parallel={} serial={} morsels={} range_heads={} "
                        "two_phase={} parallel_fields={}\n",
                        stats.parallel_islands.load(), stats.serial_islands.load(),

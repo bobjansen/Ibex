@@ -18,7 +18,6 @@ target_link_libraries(ibex_interop
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt
-        spdlog::spdlog
 )
 
 if(TARGET Ibex::Sanitizers)

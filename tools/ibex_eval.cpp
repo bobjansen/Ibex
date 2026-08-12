@@ -16,7 +16,6 @@
 #endif
 
 #include <CLI/CLI.hpp>
-#include <spdlog/spdlog.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -59,12 +58,6 @@ auto main(int argc, char** argv) -> int {
     app.add_flag("-v,--verbose", verbose, "Enable verbose output");
 
     CLI11_PARSE(app, argc, argv);
-
-    if (verbose) {
-        spdlog::set_level(spdlog::level::debug);
-    } else {
-        spdlog::set_level(spdlog::level::warn);
-    }
 
     if (plugin_path.empty()) {
         if (const char* env = std::getenv("IBEX_LIBRARY_PATH"); env != nullptr) {

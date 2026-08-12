@@ -9,7 +9,6 @@
 #endif
 
 #include <CLI/CLI.hpp>
-#include <spdlog/spdlog.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -49,12 +48,6 @@ auto main(int argc, char** argv) -> int {
                    "or ~/.ibex_history.");
 
     CLI11_PARSE(app, argc, argv);
-
-    if (verbose) {
-        spdlog::set_level(spdlog::level::debug);
-    } else {
-        spdlog::set_level(spdlog::level::info);
-    }
 
     // Resolve plugin search path: --plugin-path flag takes precedence, then
     // IBEX_LIBRARY_PATH, then the directory holding this executable (where

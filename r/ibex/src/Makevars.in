@@ -7,5 +7,4 @@ PKG_LIBS = @IBEX_BUILD_DIR@/src/parser/libibex_parser.a \
 	@IBEX_BUILD_DIR@/src/ir/libibex_ir.a \
 	@IBEX_BUILD_DIR@/src/core/libibex_core.a \
 	@IBEX_BUILD_DIR@/_deps/fmt-build/libfmt.a \
-	@IBEX_BUILD_DIR@/_deps/spdlog-build/libspdlog.a \
 	-ldl

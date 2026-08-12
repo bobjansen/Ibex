@@ -74,7 +74,6 @@ fi
 IBEX_INCS=(
     "-I$IBEX_ROOT/include"
     "-I$BUILD_DIR/_deps/fmt-src/include"
-    "-I$BUILD_DIR/_deps/spdlog-src/include"
     "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 # Add each plugin source directory so plugins can include sibling headers
@@ -86,15 +85,11 @@ done
 _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
 [[ -f "$_fmt_lib" ]] || _fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
 
-_spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlog.a"
-[[ -f "$_spdlog_lib" ]] || _spdlog_lib="$BUILD_DIR/_deps/spdlog-build/libspdlogd.a"
-
 IBEX_LIBS=(
     "$BUILD_DIR/src/runtime/libibex_runtime.a"
     "$BUILD_DIR/src/ir/libibex_ir.a"
     "$BUILD_DIR/src/core/libibex_core.a"
     "$_fmt_lib"
-    "$_spdlog_lib"
 )
 
 

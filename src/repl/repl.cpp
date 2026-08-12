@@ -27,10 +27,10 @@
 #include <fmt/base.h>
 #include <fmt/core.h>
 #include <fmt/format.h>
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -88,6 +88,14 @@ using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnVal
 using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
+std::atomic_bool verbose_logging{false};
+
+template <typename... Args>
+void debug_log(fmt::format_string<Args...> format, Args&&... args) {
+    if (verbose_logging.load(std::memory_order_relaxed)) {
+        std::clog << fmt::format(format, std::forward<Args>(args)...) << '\n';
+    }
+}
 using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::string>;
 using DeclarationDocRegistry = robin_hood::unordered_map<std::string, std::string>;
 using ImportRegistry = robin_hood::unordered_set<std::string>;
@@ -449,7 +457,7 @@ void load_history_file(const std::string& path, std::size_t limit) {
     }
     const int rc = ::read_history(path.c_str());
     if (rc != 0 && rc != ENOENT) {
-        spdlog::debug("failed to read REPL history '{}': {}", path, std::strerror(rc));
+        debug_log("failed to read REPL history '{}': {}", path, std::strerror(rc));
     }
 }
 
@@ -461,14 +469,14 @@ void save_history_file(const std::string& path, std::size_t limit) {
     if (auto parent = std::filesystem::path(path).parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent, ec);
         if (ec) {
-            spdlog::debug("failed to create REPL history directory '{}': {}", parent.string(),
-                          ec.message());
+            debug_log("failed to create REPL history directory '{}': {}", parent.string(),
+                      ec.message());
             return;
         }
     }
     const int write_rc = ::write_history(path.c_str());
     if (write_rc != 0) {
-        spdlog::debug("failed to write REPL history '{}': {}", path, std::strerror(write_rc));
+        debug_log("failed to write REPL history '{}': {}", path, std::strerror(write_rc));
         return;
     }
     if (limit > 0) {
@@ -476,8 +484,7 @@ void save_history_file(const std::string& path, std::size_t limit) {
             path.c_str(), static_cast<int>(std::min<std::size_t>(
                               limit, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
         if (truncate_rc != 0) {
-            spdlog::debug("failed to truncate REPL history '{}': {}", path,
-                          std::strerror(truncate_rc));
+            debug_log("failed to truncate REPL history '{}': {}", path, std::strerror(truncate_rc));
         }
     }
 }
@@ -3874,7 +3881,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
 #endif
         fn(&externs);
         loaded_plugins.insert(stem);
-        spdlog::debug("loaded plugin: {}", full_path.string());
+        debug_log("loaded plugin: {}", full_path.string());
         return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
     if (!last_candidate.empty()) {
@@ -3897,7 +3904,7 @@ auto find_library_source(const std::string& name, const std::vector<std::string>
             continue;
         }
         std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        spdlog::debug("import: found library '{}' at {}", name, full_path.string());
+        debug_log("import: found library '{}' at {}", name, full_path.string());
         return source;
     }
     return std::nullopt;
@@ -4812,6 +4819,7 @@ auto normalize_input(std::string_view input) -> std::string {
 
 auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
                     const ReplConfig& config) -> bool {
+    verbose_logging.store(config.verbose, std::memory_order_relaxed);
     auto parsed = parser::parse(source);
     if (!parsed) {
         fmt::print("error: {}\n", parsed.error().format());
@@ -4922,8 +4930,9 @@ auto delimiter_depth(std::string_view src) -> int {
 }  // namespace
 
 void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
+    verbose_logging.store(config.verbose, std::memory_order_relaxed);
     if (config.verbose) {
-        spdlog::info("Ibex REPL started (verbose={})", config.verbose);
+        std::clog << "Ibex REPL started (verbose=true)\n";
     }
 
     auto tables = build_builtin_tables();
@@ -5344,7 +5353,9 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
 
     save_history_file(history_path, config.history_limit);
 
-    spdlog::info("Ibex REPL exiting");
+    if (config.verbose) {
+        std::clog << "Ibex REPL exiting\n";
+    }
 }
 
 }  // namespace ibex::repl

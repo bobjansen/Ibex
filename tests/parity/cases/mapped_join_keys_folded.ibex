@@ -1,0 +1,32 @@
+// The companion to mapped_join_keys.ibex, which reads BOTH spellings of every
+// key and so keeps the join mapped. Here nothing above the join reads the
+// right-hand key columns, which lets `normalize_mapped_join_keys` rename them
+// away and fold each pair into one output column.
+//
+// The join therefore runs same-named, with the whole join optimizer available
+// to it, and this case exists to prove that rewrite changes no answer: the
+// left join's unmatched rows in particular, where the folded key column must
+// still carry the LEFT row's value and the right's columns must still be null.
+let lhs = Table {
+    account_id = [1, 1, 2, 3],
+    region = [10, 20, 10, 30],
+    amount = [100, 200, 300, 400]
+};
+let rhs = Table {
+    client_id = [1, 2, 2],
+    area = [20, 10, 30],
+    label = [7, 8, 9]
+};
+
+// Inner: every surviving row has account_id == client_id, so folding is exact.
+let matched = (lhs join rhs on { account_id = client_id, region = area })[
+    select { account_id, region, amount, label }
+][order { account_id asc, region asc }];
+
+// Left: account_id = 3 matches nothing and must survive with a null label,
+// while its account_id keeps the left row's own value.
+let kept = (lhs left join rhs on { account_id = client_id, region = area })[
+    select { account_id, region, amount, label }
+][order { account_id asc, region asc }];
+
+rbind(matched[update { side = 1 }], kept[update { side = 2 }]);

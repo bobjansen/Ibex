@@ -877,6 +877,13 @@ class JoinNode final : public Node {
     }
     void set_pending_order(std::vector<OrderKey> keys) { pending_order_ = std::move(keys); }
 
+    /// Rewrite the key list in place. The one caller is
+    /// `normalize_mapped_join_keys`, which pairs it with a `Rename` inserted
+    /// below the right child so the join reads the same columns under new
+    /// names. Changing keys without that rename changes what the join matches
+    /// on, so this is not a general-purpose setter.
+    void set_keys(std::vector<JoinKey> keys) { keys_ = std::move(keys); }
+
    private:
     JoinKind kind_;
     std::vector<JoinKey> keys_;

@@ -55,4 +55,15 @@ struct ColumnDemand {
 /// the scan actually references.
 [[nodiscard]] auto required_columns(const Node& root) -> std::map<std::string, ColumnDemand>;
 
+/// What the plan reads from each `Join` node's own output, keyed by node
+/// address in `root`. Same walk, same demand model, same asymmetry as
+/// `required_columns`: a join this pass could not reach or model is absent from
+/// the map, and an absent join must be read as "nothing is proven", never as
+/// "nothing is read".
+///
+/// This exists so `normalize_mapped_join_keys` can ask whether a mapped key's
+/// right-hand column is read above its join. The pointers are only valid while
+/// `root` is unmodified, so compute the map, then rewrite.
+[[nodiscard]] auto join_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>;
+
 }  // namespace ibex::ir

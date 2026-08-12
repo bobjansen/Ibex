@@ -30,7 +30,6 @@ target_link_libraries(ibex_repl
     PRIVATE
         Ibex::CompilerOptions
         fmt::fmt
-        spdlog::spdlog
         $<$<NOT:$<PLATFORM_ID:Windows>>:dl>
 )
 

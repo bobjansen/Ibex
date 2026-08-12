@@ -17,7 +17,6 @@ target_link_libraries(ibex_repl_bin
         Ibex::CompilerOptions
         CLI11::CLI11
         fmt::fmt
-        spdlog::spdlog
 )
 
 if(TARGET Ibex::parquet)
@@ -231,7 +230,6 @@ target_link_libraries(ibex_eval_bin
         Ibex::runtime
         Ibex::CompilerOptions
         CLI11::CLI11
-        spdlog::spdlog
 )
 
 if(TARGET Ibex::parquet)

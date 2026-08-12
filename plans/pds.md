@@ -252,7 +252,13 @@ longer the join. Its profile now reads:
 string, strings are excluded from row-group splitting, so that decode is one
 indivisible task and gets no worker at all.
 
-### NEXT: parallel string-column decode
+### DONE: the filter-only column is never materialised (`2975559`)
+
+Shipped, and it is the second option below rather than the first. See
+"Measured, and what it cost" at the end of this section for the numbers — the
+prize was NOT where the estimate below put it.
+
+### The two options, as they looked beforehand
 
 The largest single serial item left in q13, and `source decode whole` carries
 40–126 ms of self time in eight of the 22 queries. Strings were excluded from
@@ -292,6 +298,60 @@ rather than an assumption; (b) `LazyTable`'s column cache, where poisoning is
 already a recorded trap. And size the prize honestly: q13's filter passes ~99%
 of rows, so this saves the MATERIALISATION, not the decode — measure that split
 before assuming it is the whole 126 ms.
+
+### Measured, and what it cost
+
+**q13 165.2 ms → 135.8 ms (−17.8%)**, SF-1, 8 cores, 6 interleaved rounds, the
+two ranges disjoint (old 151–181, new 129–146). Nothing else moves outside
+run-to-run noise, which is the right shape: q13 is the only PDS-H query whose
+filter column is both large and unread. (q02 and q09 also fuse — `p_type`,
+`p_name` — but `part` is 200k rows.)
+
+`o_comment` is UNCOMPRESSED PLAIN, 79MB of characters over two row groups. The
+stage breakdown, from a `%`-only pattern against the real one:
+
+| | CPU | span |
+|---|---:|---:|
+| `ReadBatch` alone (`like(c, "%")`) | 62 ms | 46 ms |
+| `+ %special%requests%` matching | 114 ms | 84 ms |
+| old: decode whole + `like` + gather | ~166 ms | ~166 ms (serial) |
+
+**The estimate above was wrong about where the cost was.** Materialisation was
+assumed to dominate; it is about 50 ms of CPU, while `ByteArrayReader::ReadBatch`
+is 62 ms and the pattern matching is 52 ms — and matching is work the old path
+did too. So roughly half the win is removing the `Column<std::string>` build and
+half is the two-way row-group split that removing it made possible. The lesson
+is the recurring one: `begin_bulk_append` had already made the string decode a
+straight-line copy, so the thing that looked wasteful was no longer the
+expensive part.
+
+**Where the remaining time is.** The scan is now 62 ms of `ReadBatch` plus 52 ms
+of matching. The matcher runs at ~1.4 GB/s: `LikeKind::Fragments` walks
+`std::string_view::find` per fragment per value, which is memchr-then-memcmp
+rather than a tuned `memmem`. That is worth perhaps 25 ms of CPU and it would
+help the ordinary `like` column kernel too, which is a wider blast radius than
+this scan. Not attempted.
+
+**Parallelism is capped at 2 here.** `orders.parquet` has two row groups
+(1048576 + 451424), so the split is 2-way and uneven — a 1.43x ceiling, and the
+span tracks the larger group. A file written with more row groups would do
+better; this is a property of the data, not the scan.
+
+**Traps hit while building it.**
+
+- Mutation-testing the Parquet header requires rebuilding **`ibex_eval`**, not
+  `ibex_parquet_plugin`. `libs/parquet/backend.cpp` compiles the same
+  `parquet.hpp` into the binary, and that is the copy an
+  `extern fn read_parquet ... from "parquet.hpp"` actually runs. Two mutations
+  looked "benign" for exactly this reason before the third one exposed it.
+- Dictionary string columns are excluded deliberately. They decode to codes plus
+  one small dictionary, so materialising them is cheap and matching them value by
+  value would be *slower*. The gate is free: a dictionary column arrives as
+  `Column<Categorical>` in the source schema, so testing for `Column<std::string>`
+  excludes it without asking the plugin anything.
+- No abandon rule, unlike the key scan. That escape hatch protects a
+  *speculative* filter the caller may decline; this predicate is the query's
+  own, so its answer is needed at any pass rate.
 
 ### Item 2 below is now q13's SECOND item, not its first
 

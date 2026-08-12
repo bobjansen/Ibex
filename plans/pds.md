@@ -504,3 +504,35 @@ Every change in this round held to the same bar, and anything landed here should
 - **Full test suite** (currently 1540 tests) and the e2e script, which now includes two
   Parquet checks that each run single- and multi-threaded and require identical
   bytes.
+
+## Mapped join keys were a silent deoptimization (`465d0d3`)
+
+Not a PDS-H finding as such — the 22 queries all use the rename-to-match idiom —
+but it changes what is safe to write. `a join b on { id_1 = id_2 }` was
+answer-equivalent to renaming and joining on the shared name, and slower:
+
+| pass | site | what was lost |
+|---|---|---|
+| filter pushdown | `join_pushdown.cpp` `rewrite_filter_over_join` | predicates stay above the join |
+| semi/anti pushdown | `join_pushdown.cpp` `rewrite_semi_over_join` | q18's essential rewrite |
+| reorder cost model | `join_reorder.cpp` | the pass behind q03 −23%, q02 −29% |
+| join ordering | `join_order.cpp` | minimax ordering |
+| deferrable probe scans | `scan_predicates.cpp` `collect_deferrable` | dynamic filter pushdown |
+
+Rewriting q03 to the mapped spelling cost **+13.4% min / +16.4% median** and its
+plan gained a 3.24m-row and a 727k-row scan the other spelling never
+materializes. q13 cost +4.2%/+9.7% with *no* pass declining at all — that one is
+SPEC 12.3, which keeps both key columns in a mapped join's output.
+
+**The passes were not wrong; nothing normalized their input.**
+`ir::normalize_mapped_join_keys` renames the right side's key column to the
+left's, so they see the shape they already handle and the join folds the two
+keys into one column. It fires only where the fold is unobservable —
+Inner/Left/Semi/Anti, right key unread above, no cross-side name collision — and
+runs from `push_filters_into_joins`, which precedes every other join pass at all
+six call sites. Both spellings now emit stage-for-stage identical plans.
+
+Residual, documented at each gate rather than left to be benchmarked: Right and
+Outer joins, and any join whose right key column really is read above it. Those
+need an order-restoring Project or an equivalence-class key model in
+`join_reorder`/`join_order`, where edges are keyed by bare column name.

@@ -24,9 +24,7 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
-#include <fmt/base.h>
-#include <fmt/core.h>
-#include <fmt/format.h>
+#include <ibex/format.hpp>
 
 #include <algorithm>
 #include <array>
@@ -91,9 +89,9 @@ using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vect
 std::atomic_bool verbose_logging{false};
 
 template <typename... Args>
-void debug_log(fmt::format_string<Args...> format, Args&&... args) {
+void debug_log(ibex::formatting::format_string<Args...> format, Args&&... args) {
     if (verbose_logging.load(std::memory_order_relaxed)) {
-        std::clog << fmt::format(format, std::forward<Args>(args)...) << '\n';
+        std::clog << ibex::formatting::format(format, std::forward<Args>(args)...) << '\n';
     }
 }
 using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::string>;
@@ -606,7 +604,7 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStat
     if (runtime::consume_interrupt()) {
         // Covers both the event-hook path (emptied line) and readline
         // variants that surface the EINTR as a null return.
-        fmt::print("^C\n");
+        ibex::formatting::print("^C\n");
         return ReadLineStatus::Interrupted;
     }
     if (raw == nullptr) {
@@ -629,7 +627,7 @@ void set_completion_context(CompletionContext) {}
 
 auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStatus {
     runtime::clear_interrupt();
-    fmt::print("{}", prompt);
+    ibex::formatting::print("{}", prompt);
     if (std::getline(std::cin, out)) {
         return ReadLineStatus::Line;
     }
@@ -637,7 +635,7 @@ auto read_repl_line(const std::string& prompt, std::string& out) -> ReadLineStat
         // The read was EINTR'd by Ctrl+C: clear the stream error and hand
         // control back to the loop instead of treating it as EOF.
         std::cin.clear();
-        fmt::print("^C\n");
+        ibex::formatting::print("^C\n");
         return ReadLineStatus::Interrupted;
     }
     return ReadLineStatus::Eof;
@@ -839,11 +837,11 @@ void print_comment_group(const std::vector<std::string>& comments) {
     if (comments.empty()) {
         return;
     }
-    fmt::print("script comments:\n");
+    ibex::formatting::print("script comments:\n");
     for (const auto& line : comments) {
-        fmt::print("  {}\n", line);
+        ibex::formatting::print("  {}\n", line);
     }
-    fmt::print("\n");
+    ibex::formatting::print("\n");
 }
 
 auto doc_from_comment_group(const std::vector<std::string>& comments) -> std::string {
@@ -918,7 +916,7 @@ auto format_scalar(const runtime::ScalarValue& value) -> std::string {
             } else if constexpr (std::is_same_v<T, double>) {
                 return runtime::format_float_mixed(v);
             } else {
-                return fmt::format("{}", v);
+                return ibex::formatting::format("{}", v);
             }
         },
         value);
@@ -942,7 +940,7 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
 // the top-level statement printer and the `print(...)` builtin.
 void render_eval_value(const EvalValue& value) {
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
-        fmt::print("{}\n", format_scalar(*scalar));
+        ibex::formatting::print("{}\n", format_scalar(*scalar));
     } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
         runtime::Table temp;
         temp.add_column("column", *col);
@@ -954,7 +952,7 @@ void render_eval_value(const EvalValue& value) {
 
 void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry& lazy_tables) {
     if (tables.empty() && lazy_tables.empty()) {
-        fmt::print("tables: <none>\n");
+        ibex::formatting::print("tables: <none>\n");
         return;
     }
     std::vector<std::string> names;
@@ -966,11 +964,11 @@ void print_tables(const runtime::TableRegistry& tables, const LazyTableRegistry&
         names.push_back(entry.first);
     }
     std::ranges::sort(names);
-    fmt::print("tables:");
+    ibex::formatting::print("tables:");
     for (const auto& name : names) {
-        fmt::print(" {}", name);
+        ibex::formatting::print(" {}", name);
     }
-    fmt::print("\n");
+    ibex::formatting::print("\n");
 }
 
 /// Resolve a table name for a caller that needs the rows, not just the schema.
@@ -990,7 +988,7 @@ auto resolve_table(const std::string& name, const runtime::TableRegistry& tables
 
 void print_scalars(const runtime::ScalarRegistry& scalars) {
     if (scalars.empty()) {
-        fmt::print("scalars: <none>\n");
+        ibex::formatting::print("scalars: <none>\n");
         return;
     }
     std::vector<std::string> names;
@@ -999,12 +997,12 @@ void print_scalars(const runtime::ScalarRegistry& scalars) {
         names.push_back(entry.first);
     }
     std::sort(names.begin(), names.end());
-    fmt::print("scalars:\n");
+    ibex::formatting::print("scalars:\n");
     for (const auto& name : names) {
-        fmt::print("  {} = ", name);
+        ibex::formatting::print("  {} = ", name);
         const auto& value = scalars.at(name);
-        fmt::print("{}", format_scalar(value));
-        fmt::print("\n");
+        ibex::formatting::print("{}", format_scalar(value));
+        ibex::formatting::print("\n");
     }
 }
 
@@ -1714,9 +1712,9 @@ auto apply_column_round(const Column<double>& src, std::string_view mode) -> Col
 }
 
 void print_schema(const runtime::Table& table) {
-    fmt::print("columns:\n");
+    ibex::formatting::print("columns:\n");
     for (const auto& entry : table.columns) {
-        fmt::print("  {}: {}\n", entry.name, column_type_name(*entry.column));
+        ibex::formatting::print("  {}: {}\n", entry.name, column_type_name(*entry.column));
     }
 }
 
@@ -1823,34 +1821,34 @@ auto find_builtin_doc(std::string_view name) -> const BuiltinDoc* {
 }
 
 void print_help() {
-    fmt::print("Ibex REPL help\n");
-    fmt::print("  :help                 Show this help\n");
-    fmt::print("  :tables               List table bindings\n");
-    fmt::print("  :scalars              List scalar bindings\n");
-    fmt::print("  :functions            List user and extern functions\n");
-    fmt::print("  :imports              List imported libraries and extern origins\n");
-    fmt::print("  :schema <table>       Show column names and types\n");
-    fmt::print("  :head <table> [n]     Show first n rows\n");
-    fmt::print(
+    ibex::formatting::print("Ibex REPL help\n");
+    ibex::formatting::print("  :help                 Show this help\n");
+    ibex::formatting::print("  :tables               List table bindings\n");
+    ibex::formatting::print("  :scalars              List scalar bindings\n");
+    ibex::formatting::print("  :functions            List user and extern functions\n");
+    ibex::formatting::print("  :imports              List imported libraries and extern origins\n");
+    ibex::formatting::print("  :schema <table>       Show column names and types\n");
+    ibex::formatting::print("  :head <table> [n]     Show first n rows\n");
+    ibex::formatting::print(
         "  :peek <expr>          Evaluate and compactly display an expression, with any\n"
         "                        order-sensitive claims it carries (time index, ordering,\n"
         "                        grouping)\n");
-    fmt::print("  :describe <table>     Schema + first rows\n");
-    fmt::print("  :doc <name>           Show docs/signature for a binding or built-in\n");
-    fmt::print("  ?name                 Shorthand for :doc name\n");
-    fmt::print("  :source <fn>          Show source for a user-defined function\n");
-    fmt::print("  :load <file>          Load and execute an .ibex script\n");
-    fmt::print(
+    ibex::formatting::print("  :describe <table>     Schema + first rows\n");
+    ibex::formatting::print("  :doc <name>           Show docs/signature for a binding or built-in\n");
+    ibex::formatting::print("  ?name                 Shorthand for :doc name\n");
+    ibex::formatting::print("  :source <fn>          Show source for a user-defined function\n");
+    ibex::formatting::print("  :load <file>          Load and execute an .ibex script\n");
+    ibex::formatting::print(
         "  :run <file>           Execute a script whole (batch-planned), in a fresh scope\n");
-    fmt::print("  :time <command>       Time exactly one command\n");
-    fmt::print("  :timing [on|off]      Toggle command timing\n");
-    fmt::print("  :comments [on|off]    Toggle script comment echo during :load\n");
-    fmt::print("  :quit                 Exit\n");
+    ibex::formatting::print("  :time <command>       Time exactly one command\n");
+    ibex::formatting::print("  :timing [on|off]      Toggle command timing\n");
+    ibex::formatting::print("  :comments [on|off]    Toggle script comment echo during :load\n");
+    ibex::formatting::print("  :quit                 Exit\n");
 }
 
 void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls) {
     if (functions.empty() && extern_decls.empty()) {
-        fmt::print("functions: <none>\n");
+        ibex::formatting::print("functions: <none>\n");
         return;
     }
     std::vector<std::string> names;
@@ -1860,9 +1858,9 @@ void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry
     }
     std::sort(names.begin(), names.end());
     if (!names.empty()) {
-        fmt::print("user functions:\n");
+        ibex::formatting::print("user functions:\n");
         for (const auto& name : names) {
-            fmt::print("  {}\n", function_signature(functions.at(name)));
+            ibex::formatting::print("  {}\n", function_signature(functions.at(name)));
         }
     }
     names.clear();
@@ -1872,24 +1870,24 @@ void print_functions(const FunctionRegistry& functions, const ExternDeclRegistry
     }
     std::sort(names.begin(), names.end());
     if (!names.empty()) {
-        fmt::print("extern functions:\n");
+        ibex::formatting::print("extern functions:\n");
         for (const auto& name : names) {
-            fmt::print("  {}\n", extern_signature(extern_decls.at(name)));
+            ibex::formatting::print("  {}\n", extern_signature(extern_decls.at(name)));
         }
     }
 }
 
 void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& extern_decls) {
     if (imports.empty()) {
-        fmt::print("imports: <none>\n");
+        ibex::formatting::print("imports: <none>\n");
     } else {
         std::vector<std::string> names(imports.begin(), imports.end());
         std::sort(names.begin(), names.end());
-        fmt::print("imports:");
+        ibex::formatting::print("imports:");
         for (const auto& name : names) {
-            fmt::print(" {}", name);
+            ibex::formatting::print(" {}", name);
         }
-        fmt::print("\n");
+        ibex::formatting::print("\n");
     }
 
     robin_hood::unordered_map<std::string, std::vector<std::string>> by_source;
@@ -1907,15 +1905,15 @@ void print_imports(const ImportRegistry& imports, const ExternDeclRegistry& exte
         sources.push_back(source);
     }
     std::sort(sources.begin(), sources.end());
-    fmt::print("extern origins:\n");
+    ibex::formatting::print("extern origins:\n");
     for (const auto& source : sources) {
         auto& names = by_source[source];
         std::sort(names.begin(), names.end());
-        fmt::print("  {}:", source);
+        ibex::formatting::print("  {}:", source);
         for (const auto& name : names) {
-            fmt::print(" {}", name);
+            ibex::formatting::print(" {}", name);
         }
-        fmt::print("\n");
+        ibex::formatting::print("\n");
     }
 }
 
@@ -1924,12 +1922,12 @@ void print_doc_text(const DeclarationDocRegistry& declaration_docs, const std::s
     if (doc_it == declaration_docs.end() || doc_it->second.empty()) {
         return;
     }
-    fmt::print("doc:\n");
+    ibex::formatting::print("doc:\n");
     std::string_view text = doc_it->second;
     while (!text.empty()) {
         auto newline = text.find('\n');
         auto line = newline == std::string_view::npos ? text : text.substr(0, newline);
-        fmt::print("  {}\n", line);
+        ibex::formatting::print("  {}\n", line);
         if (newline == std::string_view::npos) {
             break;
         }
@@ -1943,87 +1941,87 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
                const FunctionRegistry& functions, const ExternDeclRegistry& extern_decls,
                const DeclarationDocRegistry& declaration_docs, const ImportRegistry& imports) {
     if (name.empty()) {
-        fmt::print("usage: :doc <name>\n");
+        ibex::formatting::print("usage: :doc <name>\n");
         return;
     }
     const std::string key{name};
     if (auto it = tables.find(key); it != tables.end()) {
-        fmt::print("table {}\n", key);
+        ibex::formatting::print("table {}\n", key);
         print_schema(it->second);
-        fmt::print("rows: {}\n", it->second.rows());
+        ibex::formatting::print("rows: {}\n", it->second.rows());
         return;
     }
     if (auto it = lazy_tables.find(key); it != lazy_tables.end()) {
-        fmt::print("table {}\n", key);
+        ibex::formatting::print("table {}\n", key);
         print_schema(it->second->schema());
-        fmt::print("rows: {}\n", it->second->rows());
+        ibex::formatting::print("rows: {}\n", it->second->rows());
         return;
     }
     if (auto it = scalars.find(key); it != scalars.end()) {
-        fmt::print("scalar {}: {} = {}\n", key, scalar_value_type_name(it->second),
+        ibex::formatting::print("scalar {}: {} = {}\n", key, scalar_value_type_name(it->second),
                    format_scalar(it->second));
         return;
     }
     if (auto it = columns.find(key); it != columns.end()) {
-        fmt::print("column {}: {}\n", key, column_type_name(it->second));
+        ibex::formatting::print("column {}: {}\n", key, column_type_name(it->second));
         return;
     }
     if (auto it = models.find(key); it != models.end()) {
-        fmt::print("model {}\n", key);
-        fmt::print("  method: {}\n", it->second.method);
-        fmt::print("  observations: {}\n", it->second.n_obs);
-        fmt::print("  r_squared: {}\n", runtime::format_float_mixed(it->second.r_squared));
+        ibex::formatting::print("model {}\n", key);
+        ibex::formatting::print("  method: {}\n", it->second.method);
+        ibex::formatting::print("  observations: {}\n", it->second.n_obs);
+        ibex::formatting::print("  r_squared: {}\n", runtime::format_float_mixed(it->second.r_squared));
         return;
     }
     if (auto it = functions.find(key); it != functions.end()) {
-        fmt::print("{}\n", function_signature(it->second));
+        ibex::formatting::print("{}\n", function_signature(it->second));
         print_doc_text(declaration_docs, key);
-        fmt::print("source: use :source {}\n", key);
+        ibex::formatting::print("source: use :source {}\n", key);
         return;
     }
     if (auto it = extern_decls.find(key); it != extern_decls.end()) {
-        fmt::print("{}\n", extern_signature(it->second));
+        ibex::formatting::print("{}\n", extern_signature(it->second));
         print_doc_text(declaration_docs, key);
         if (!it->second.source_path.empty()) {
-            fmt::print("origin: {}\n", it->second.source_path);
+            ibex::formatting::print("origin: {}\n", it->second.source_path);
         }
         return;
     }
     if (imports.contains(key)) {
-        fmt::print("import \"{}\"\n", key);
+        ibex::formatting::print("import \"{}\"\n", key);
         return;
     }
     if (const auto* doc = find_builtin_doc(name); doc != nullptr) {
-        fmt::print("{}\n", doc->signature);
-        fmt::print("{}\n", doc->summary);
+        ibex::formatting::print("{}\n", doc->signature);
+        ibex::formatting::print("{}\n", doc->summary);
         if (!doc->example.empty()) {
-            fmt::print("example: {}\n", doc->example);
+            ibex::formatting::print("example: {}\n", doc->example);
         }
         return;
     }
-    fmt::print("no documentation for '{}'\n", name);
+    ibex::formatting::print("no documentation for '{}'\n", name);
 }
 
 void print_source(std::string_view name, const FunctionRegistry& functions,
                   const FunctionSourceRegistry& sources) {
     if (name.empty()) {
-        fmt::print("usage: :source <function>\n");
+        ibex::formatting::print("usage: :source <function>\n");
         return;
     }
     const std::string key{name};
     auto fn_it = functions.find(key);
     if (fn_it == functions.end()) {
-        fmt::print("error: unknown user function '{}'\n", name);
+        ibex::formatting::print("error: unknown user function '{}'\n", name);
         return;
     }
     auto source_it = sources.find(key);
     if (source_it != sources.end() && !source_it->second.empty()) {
-        fmt::print("{}\n", source_it->second);
+        ibex::formatting::print("{}\n", source_it->second);
         return;
     }
-    fmt::print("{} {{\n", function_signature(fn_it->second));
-    fmt::print("  <source unavailable>\n");
-    fmt::print("}}\n");
+    ibex::formatting::print("{} {{\n", function_signature(fn_it->second));
+    ibex::formatting::print("  <source unavailable>\n");
+    ibex::formatting::print("}}\n");
 }
 
 auto column_bytes(const runtime::ColumnEntry& entry) -> std::size_t {
@@ -2059,28 +2057,28 @@ auto format_bytes(std::size_t bytes) -> std::string {
     constexpr double kGiB = kMiB * 1024.0;
     auto b = static_cast<double>(bytes);
     if (b >= kGiB) {
-        return fmt::format("{:.2f} GiB", b / kGiB);
+        return ibex::formatting::format("{:.2f} GiB", b / kGiB);
     }
     if (b >= kMiB) {
-        return fmt::format("{:.1f} MiB", b / kMiB);
+        return ibex::formatting::format("{:.1f} MiB", b / kMiB);
     }
     if (b >= kKiB) {
-        return fmt::format("{:.1f} KiB", b / kKiB);
+        return ibex::formatting::format("{:.1f} KiB", b / kKiB);
     }
-    return fmt::format("{} B", bytes);
+    return ibex::formatting::format("{} B", bytes);
 }
 
 /// Compact one-shot inspection: types + first rows + total row count + an
 /// estimated in-memory footprint. Replaces the `:schema` / `:head` /
 /// length-query loop a typical exploratory session leans on.
 void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
-    fmt::print("rows: {}", table.rows());
+    ibex::formatting::print("rows: {}", table.rows());
     if (!table.columns.empty()) {
         std::size_t total = 0;
         for (const auto& entry : table.columns) {
             total += column_bytes(entry);
         }
-        fmt::print("  cols: {}  ~{}", table.columns.size(), format_bytes(total));
+        ibex::formatting::print("  cols: {}  ~{}", table.columns.size(), format_bytes(total));
         // The order-sensitive claims a table carries. They decide real
         // behaviour -- `order` skips its work when the ordering already
         // satisfies it, `take first` reads the ordering and refuses a value
@@ -2088,7 +2086,7 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
         // rolling -- so a session needs a way to see them rather than
         // inferring them from how a binding was built.
         if (table.time_index().has_value()) {
-            fmt::print("  time_index: {}", *table.time_index());
+            ibex::formatting::print("  time_index: {}", *table.time_index());
         }
         if (table.ordering().has_value() && !table.ordering()->empty()) {
             std::string keys;
@@ -2099,7 +2097,7 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
                 keys += key.name;
                 keys += key.ascending ? " asc" : " desc";
             }
-            fmt::print("  ordered by: {}", keys);
+            ibex::formatting::print("  ordered by: {}", keys);
         }
         if (!table.grouped_by().empty()) {
             std::string keys;
@@ -2109,12 +2107,12 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
                 }
                 keys += key;
             }
-            fmt::print("  grouped by: {}", keys);
+            ibex::formatting::print("  grouped by: {}", keys);
         }
     }
-    fmt::print("\n");
+    ibex::formatting::print("\n");
     if (table.columns.empty()) {
-        fmt::print("<empty>\n");
+        ibex::formatting::print("<empty>\n");
         return;
     }
 
@@ -2136,34 +2134,34 @@ void peek_table(const runtime::Table& table, std::size_t max_rows = 5) {
     }
 
     auto print_sep = [&]() {
-        fmt::print("+");
+        ibex::formatting::print("+");
         for (std::size_t c = 0; c < col_count; ++c) {
-            fmt::print("{:-<{}}+", "", widths[c] + 2);
+            ibex::formatting::print("{:-<{}}+", "", widths[c] + 2);
         }
-        fmt::print("\n");
+        ibex::formatting::print("\n");
     };
 
     print_sep();
-    fmt::print("|");
+    ibex::formatting::print("|");
     for (std::size_t c = 0; c < col_count; ++c) {
-        fmt::print(" {:<{}} |", table.columns[c].name, widths[c]);
+        ibex::formatting::print(" {:<{}} |", table.columns[c].name, widths[c]);
     }
-    fmt::print("\n|");
+    ibex::formatting::print("\n|");
     for (std::size_t c = 0; c < col_count; ++c) {
-        fmt::print(" {:<{}} |", type_row[c], widths[c]);
+        ibex::formatting::print(" {:<{}} |", type_row[c], widths[c]);
     }
-    fmt::print("\n");
+    ibex::formatting::print("\n");
     print_sep();
     for (std::size_t r = 0; r < shown_rows; ++r) {
-        fmt::print("|");
+        ibex::formatting::print("|");
         for (std::size_t c = 0; c < col_count; ++c) {
-            fmt::print(" {:<{}} |", cells[c][r], widths[c]);
+            ibex::formatting::print(" {:<{}} |", cells[c][r], widths[c]);
         }
-        fmt::print("\n");
+        ibex::formatting::print("\n");
     }
     print_sep();
     if (table.rows() > shown_rows) {
-        fmt::print("... ({} more rows)\n", table.rows() - shown_rows);
+        ibex::formatting::print("... ({} more rows)\n", table.rows() - shown_rows);
     }
 }
 
@@ -2230,14 +2228,14 @@ void print_elapsed(std::chrono::steady_clock::duration elapsed) {
     using namespace std::chrono;
     auto micros = duration_cast<microseconds>(elapsed).count();
     if (micros < 1000) {
-        fmt::print("time: {} us\n", micros);
+        ibex::formatting::print("time: {} us\n", micros);
         return;
     }
     if (micros < 1000L * 1000L) {
-        fmt::print("time: {:.3f} ms\n", static_cast<double>(micros) / 1000.0);
+        ibex::formatting::print("time: {:.3f} ms\n", static_cast<double>(micros) / 1000.0);
         return;
     }
-    fmt::print("time: {:.3f} s\n", static_cast<double>(micros) / 1'000'000.0);
+    ibex::formatting::print("time: {:.3f} s\n", static_cast<double>(micros) / 1'000'000.0);
 }
 
 auto make_temp_table_name() -> std::string {
@@ -3745,7 +3743,7 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 return std::unexpected("tuple binding requires a DataFrame on the right-hand side");
             }
             if (table->columns.size() != tlet.names.size()) {
-                return std::unexpected(fmt::format("tuple binding expects {} column(s), got {}",
+                return std::unexpected(ibex::formatting::format("tuple binding expects {} column(s), got {}",
                                                    tlet.names.size(), table->columns.size()));
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
@@ -3843,7 +3841,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
         HMODULE handle = LoadLibraryA(full_path.string().c_str());
         if (handle == nullptr) {
             if (std::filesystem::exists(full_path)) {
-                last_error = fmt::format("error code {}", GetLastError());
+                last_error = ibex::formatting::format("error code {}", GetLastError());
                 last_candidate = full_path.string();
             }
             continue;
@@ -3886,7 +3884,7 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
     }
     if (!last_candidate.empty()) {
         return {.status = PluginLoadStatus::LoadError,
-                .message = fmt::format("failed to load '{}': {}", last_candidate,
+                .message = ibex::formatting::format("failed to load '{}': {}", last_candidate,
                                        last_error.empty() ? "unknown error" : last_error)};
     }
     return {.status = PluginLoadStatus::NotFound, .message = ""};
@@ -4074,7 +4072,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
         // Statement-level interruption boundary: a Ctrl+C during a multi
         // statement batch (:load, script) stops before the next statement.
         if (runtime::interrupt_requested()) {
-            fmt::print("error: interrupted\n");
+            ibex::formatting::print("error: interrupted\n");
             return false;
         }
         if (print_comment_groups != nullptr && stmt_index < print_comment_groups->size()) {
@@ -4097,12 +4095,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
                 if (result.status == PluginLoadStatus::NotFound) {
 #ifdef _WIN32
-                    fmt::print("warning: could not find plugin '{}.dll' in search path\n", stem);
+                    ibex::formatting::print("warning: could not find plugin '{}.dll' in search path\n", stem);
 #else
-                    fmt::print("warning: could not find plugin '{}.so' in search path\n", stem);
+                    ibex::formatting::print("warning: could not find plugin '{}.so' in search path\n", stem);
 #endif
                 } else if (result.status == PluginLoadStatus::LoadError) {
-                    fmt::print("warning: {}\n", result.message);
+                    ibex::formatting::print("warning: {}\n", result.message);
                 }
             }
             continue;
@@ -4112,7 +4110,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             auto plugin_result =
                 try_load_plugin(imp.name, plugin_search_paths, loaded_plugins, externs);
             if (plugin_result.status == PluginLoadStatus::LoadError) {
-                fmt::print("warning: {}\n", plugin_result.message);
+                ibex::formatting::print("warning: {}\n", plugin_result.message);
             }
             // Prefer explicit import_search_paths; fall back to plugin_search_paths so
             // that .ibex stubs can live alongside their .so files in the same directory.
@@ -4125,7 +4123,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 source = find_library_source(imp.name, plugin_search_paths);
             }
             if (!source.has_value()) {
-                fmt::print("error: import '{}': could not find '{}.ibex' in search path\n",
+                ibex::formatting::print("error: import '{}': could not find '{}.ibex' in search path\n",
                            imp.name, imp.name);
                 return false;
             }
@@ -4134,7 +4132,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             auto parsed = parser::parse(*source);
             if (!parsed) {
-                fmt::print("error: import '{}': {}\n", imp.name, parsed.error().format());
+                ibex::formatting::print("error: import '{}': {}\n", imp.name, parsed.error().format());
                 return false;
             }
             auto import_comments = collect_script_comment_lines(*source);
@@ -4162,7 +4160,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                      columns, models, functions, compile_time_lists,
                                                      extern_decls, externs)) {
                     if (!*lazy) {
-                        fmt::print("error: {}\n", lazy->error());
+                        ibex::formatting::print("error: {}\n", lazy->error());
                         return false;
                     }
                     lazy_tables.insert_or_assign(let_stmt.name, std::move(lazy->value()));
@@ -4186,7 +4184,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                   columns, models, functions, compile_time_lists,
                                                   extern_decls, externs);
                     if (!value) {
-                        fmt::print("error: {}\n", value.error());
+                        ibex::formatting::print("error: {}\n", value.error());
                         return false;
                     }
                     const auto* st = std::get_if<parser::ScalarType>(&let_stmt.type->arg);
@@ -4194,7 +4192,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         try_widen_int_to_float(value.value(), *st);
                     }
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
-                        fmt::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
+                        ibex::formatting::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
                                    scalar_type_name(*st), scalar_value_type_name(value.value()));
                         return false;
                     }
@@ -4210,11 +4208,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                  columns, models, functions, compile_time_lists,
                                                  extern_decls, externs, &model_value);
                     if (!value) {
-                        fmt::print("error: {}\n", value.error());
+                        ibex::formatting::print("error: {}\n", value.error());
                         return false;
                     }
                     if (auto err = validate_table_type(value.value(), *let_stmt.type)) {
-                        fmt::print("error: '{}': {}\n", let_stmt.name, *err);
+                        ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                         return false;
                     }
                     auto table_value = std::move(value.value());
@@ -4242,7 +4240,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         auto series = eval_series_literal(
                             *array, st != nullptr ? std::optional{*st} : std::nullopt);
                         if (!series) {
-                            fmt::print("error: {}\n", series.error());
+                            ibex::formatting::print("error: {}\n", series.error());
                             return false;
                         }
                         value = EvalValue{std::move(series.value())};
@@ -4252,12 +4250,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                                                 extern_decls, externs);
                     }
                     if (!value) {
-                        fmt::print("error: {}\n", value.error());
+                        ibex::formatting::print("error: {}\n", value.error());
                         return false;
                     }
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         if (auto err = validate_column_type(*col, *let_stmt.type)) {
-                            fmt::print("error: '{}': {}\n", let_stmt.name, *err);
+                            ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
                         lazy_tables.erase(let_stmt.name);
@@ -4268,12 +4266,12 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                         if (table->columns.size() != 1) {
-                            fmt::print("error: Series return must have exactly one column\n");
+                            ibex::formatting::print("error: Series return must have exactly one column\n");
                             return false;
                         }
                         if (auto err = validate_column_type(*table->columns.front().column,
                                                             *let_stmt.type)) {
-                            fmt::print("error: '{}': {}\n", let_stmt.name, *err);
+                            ibex::formatting::print("error: '{}': {}\n", let_stmt.name, *err);
                             return false;
                         }
                         lazy_tables.erase(let_stmt.name);
@@ -4282,7 +4280,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         models.erase(let_stmt.name);
                         continue;
                     }
-                    fmt::print("error: expected Series return for {}\n", let_stmt.name);
+                    ibex::formatting::print("error: expected Series return for {}\n", let_stmt.name);
                     return false;
                 }
             }
@@ -4292,7 +4290,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 eval_expr_value(*let_stmt.value, tables, lazy_tables, scalars, columns, models,
                                 functions, compile_time_lists, extern_decls, externs, &model_value);
             if (!value) {
-                fmt::print("error: {}\n", value.error());
+                ibex::formatting::print("error: {}\n", value.error());
                 return false;
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
@@ -4333,16 +4331,16 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             auto value = eval_expr_value(*tlet.value, tables, lazy_tables, scalars, columns, models,
                                          functions, compile_time_lists, extern_decls, externs);
             if (!value) {
-                fmt::print("error: {}\n", value.error());
+                ibex::formatting::print("error: {}\n", value.error());
                 return false;
             }
             auto* table = std::get_if<runtime::Table>(&value.value());
             if (table == nullptr) {
-                fmt::print("error: tuple binding requires a DataFrame on the right-hand side\n");
+                ibex::formatting::print("error: tuple binding requires a DataFrame on the right-hand side\n");
                 return false;
             }
             if (table->columns.size() != tlet.names.size()) {
-                fmt::print("error: tuple binding expects {} column(s), got {}\n", tlet.names.size(),
+                ibex::formatting::print("error: tuple binding expects {} column(s), got {}\n", tlet.names.size(),
                            table->columns.size());
                 return false;
             }
@@ -4358,7 +4356,7 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 eval_expr_value(*expr_stmt.expr, tables, lazy_tables, scalars, columns, models,
                                 functions, compile_time_lists, extern_decls, externs);
             if (!value) {
-                fmt::print("error: {}\n", value.error());
+                ibex::formatting::print("error: {}\n", value.error());
                 return false;
             }
             // A top-level `print(...)` already rendered its argument; rendering
@@ -4432,7 +4430,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             let != nullptr && let->type.has_value() &&
             let->type->kind != parser::Type::Kind::DataFrame &&
             let->type->kind != parser::Type::Kind::TimeFrame) {
-            return decline(fmt::format("`let {}` has a non-DataFrame type annotation", let->name));
+            return decline(ibex::formatting::format("`let {}` has a non-DataFrame type annotation", let->name));
         }
     }
 
@@ -4458,7 +4456,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         const auto loaded =
             try_load_plugin(imp->name, config.plugin_search_paths, loaded_plugins, externs);
         if (loaded.status == PluginLoadStatus::LoadError) {
-            fmt::print("warning: {}\n", loaded.message);
+            ibex::formatting::print("warning: {}\n", loaded.message);
         }
         const auto& primary_paths = config.import_search_paths.empty() ? config.plugin_search_paths
                                                                        : config.import_search_paths;
@@ -4508,7 +4506,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                     try_load_plugin(plugin_stem(decl->source_path), config.plugin_search_paths,
                                     loaded_plugins, externs);
                 if (loaded.status == PluginLoadStatus::LoadError) {
-                    fmt::print("error: {}\n", loaded.message);
+                    ibex::formatting::print("error: {}\n", loaded.message);
                     return false;
                 }
             }
@@ -4584,7 +4582,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
 
     auto script = parser::lower_script(program, reader_schemas, prelude);
     if (!script.has_value()) {
-        return decline(fmt::format("script did not lower: {}", script.error().message));
+        return decline(ibex::formatting::format("script did not lower: {}", script.error().message));
     }
     if (!script->preamble.empty()) {
         return decline("script has statements that must run before the plan");
@@ -4752,7 +4750,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     for (auto& shared : script->shared_bindings) {
         auto table = evaluate(std::move(shared.plan), base_tables);
         if (!table.has_value()) {
-            fmt::print("error: {}\n", table.error());
+            ibex::formatting::print("error: {}\n", table.error());
             return false;
         }
         base_tables.insert_or_assign(shared.name, std::move(table.value()));
@@ -4774,17 +4772,17 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
         }
         if (!input.has_value()) {
-            fmt::print("error: {}\n", input.error());
+            ibex::formatting::print("error: {}\n", input.error());
             return false;
         }
         auto args = literal_args(sink.args);
         if (!args.has_value()) {
-            fmt::print("error: {}\n", args.error());
+            ibex::formatting::print("error: {}\n", args.error());
             return false;
         }
         auto invoked = runtime::invoke_table_consumer(externs, sink.callee, *input, *args);
         if (!invoked.has_value()) {
-            fmt::print("error: {}\n", invoked.error());
+            ibex::formatting::print("error: {}\n", invoked.error());
             return false;
         }
     }
@@ -4799,7 +4797,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         result = evaluate(std::move(script->result), base_tables);
     }
     if (!result.has_value()) {
-        fmt::print("error: {}\n", result.error());
+        ibex::formatting::print("error: {}\n", result.error());
         return false;
     }
     render_eval_value(EvalValue{std::move(result.value())});
@@ -4822,19 +4820,19 @@ auto execute_script(std::string_view source, runtime::ExternRegistry& registry,
     verbose_logging.store(config.verbose, std::memory_order_relaxed);
     auto parsed = parser::parse(source);
     if (!parsed) {
-        fmt::print("error: {}\n", parsed.error().format());
+        ibex::formatting::print("error: {}\n", parsed.error().format());
         return false;
     }
     std::string decline_reason;
     if (auto planned = try_execute_whole_script(*parsed, registry, config, &decline_reason);
         planned.has_value()) {
         if (config.report_planner) {
-            fmt::print(stderr, "planner: whole-script\n");
+            ibex::formatting::print(stderr, "planner: whole-script\n");
         }
         return *planned;
     }
     if (config.report_planner) {
-        fmt::print(stderr, "planner: statements ({})\n", decline_reason);
+        ibex::formatting::print(stderr, "planner: statements ({})\n", decline_reason);
     }
     auto tables = build_builtin_tables();
     LazyTableRegistry lazy_tables;
@@ -4865,7 +4863,7 @@ auto run_file(const std::string& path, const ReplConfig& config, runtime::Extern
     -> bool {
     std::ifstream input{path};
     if (!input) {
-        fmt::print("error: failed to open '{}'\n", path);
+        ibex::formatting::print("error: failed to open '{}'\n", path);
         return false;
     }
     const std::string source((std::istreambuf_iterator<char>(input)),
@@ -4964,7 +4962,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         auto normalized = normalize_input(buffer);
         auto parsed = parser::parse(normalized);
         if (!parsed) {
-            fmt::print("error: {}\n", parsed.error().format());
+            ibex::formatting::print("error: {}\n", parsed.error().format());
             return;
         }
         execute_statements(parsed->statements, tables, lazy_tables, scalars, columns, models,
@@ -5001,7 +4999,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             continue;
         }
         if (status == ReadLineStatus::Eof) {
-            fmt::print("\n");
+            ibex::formatting::print("\n");
             if (!pending.empty()) {
                 submit_buffer(pending);  // surface the error in the unterminated buffer
             }
@@ -5047,7 +5045,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (starts_with_command(line_view, ":functions")) {
             auto arg = trim(line_view.substr(std::string_view(":functions").size()));
             if (!arg.empty()) {
-                fmt::print("usage: :functions\n");
+                ibex::formatting::print("usage: :functions\n");
                 continue;
             }
             print_functions(functions, extern_decls);
@@ -5056,7 +5054,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (starts_with_command(line_view, ":imports")) {
             auto arg = trim(line_view.substr(std::string_view(":imports").size()));
             if (!arg.empty()) {
-                fmt::print("usage: :imports\n");
+                ibex::formatting::print("usage: :imports\n");
                 continue;
             }
             print_imports(imports, extern_decls);
@@ -5082,10 +5080,10 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             } else if (arg == "off") {
                 timing_enabled = false;
             } else {
-                fmt::print("usage: :timing [on|off]\n");
+                ibex::formatting::print("usage: :timing [on|off]\n");
                 continue;
             }
-            fmt::print("timing: {}\n", timing_enabled ? "on" : "off");
+            ibex::formatting::print("timing: {}\n", timing_enabled ? "on" : "off");
             continue;
         }
         if (starts_with_command(line_view, ":comments")) {
@@ -5097,10 +5095,10 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             } else if (arg == "off") {
                 load_comments_enabled = false;
             } else {
-                fmt::print("usage: :comments [on|off]\n");
+                ibex::formatting::print("usage: :comments [on|off]\n");
                 continue;
             }
-            fmt::print("load comments: {}\n", load_comments_enabled ? "on" : "off");
+            ibex::formatting::print("load comments: {}\n", load_comments_enabled ? "on" : "off");
             continue;
         }
 
@@ -5108,7 +5106,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (starts_with_command(line_view, ":time")) {
             auto timed_input = trim(line_view.substr(std::string_view(":time").size()));
             if (timed_input.empty()) {
-                fmt::print("usage: :time <command>\n");
+                ibex::formatting::print("usage: :time <command>\n");
                 continue;
             }
             line = std::string(timed_input);
@@ -5134,7 +5132,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (starts_with_command(line_view, ":tables")) {
             auto arg = trim(line_view.substr(std::string_view(":tables").size()));
             if (!arg.empty()) {
-                fmt::print("usage: :tables\n");
+                ibex::formatting::print("usage: :tables\n");
                 continue;
             }
             print_tables(tables, lazy_tables);
@@ -5143,7 +5141,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (starts_with_command(line_view, ":scalars")) {
             auto arg = trim(line_view.substr(std::string_view(":scalars").size()));
             if (!arg.empty()) {
-                fmt::print("usage: :scalars\n");
+                ibex::formatting::print("usage: :scalars\n");
                 continue;
             }
             print_scalars(scalars);
@@ -5152,7 +5150,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (line_view.starts_with(":schema")) {
             auto arg = trim(line_view.substr(std::string_view(":schema").size()));
             if (arg.empty()) {
-                fmt::print("usage: :schema <table>\n");
+                ibex::formatting::print("usage: :schema <table>\n");
                 continue;
             }
             if (auto lazy = lazy_tables.find(std::string(arg)); lazy != lazy_tables.end()) {
@@ -5162,7 +5160,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             }
             auto it = tables.find(std::string(arg));
             if (it == tables.end()) {
-                fmt::print("error: unknown table '{}'\n", arg);
+                ibex::formatting::print("error: unknown table '{}'\n", arg);
                 continue;
             }
             print_schema(it->second);
@@ -5178,12 +5176,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 count_text = trim(rest.substr(space + 1));
             }
             if (name.empty()) {
-                fmt::print("usage: :head <table> [n]\n");
+                ibex::formatting::print("usage: :head <table> [n]\n");
                 continue;
             }
             auto table = resolve_table(std::string(name), tables, lazy_tables);
             if (!table) {
-                fmt::print("error: {}\n", table.error());
+                ibex::formatting::print("error: {}\n", table.error());
                 continue;
             }
             const std::size_t count = parse_optional_size(count_text, 10);
@@ -5198,13 +5196,13 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (is_peek || is_peak) {
             auto rest = std::string(trim(line_view.substr(5)));
             if (rest.empty()) {
-                fmt::print("usage: :peek <expr>\n");
+                ibex::formatting::print("usage: :peek <expr>\n");
                 continue;
             }
             if (tables.contains(rest) || lazy_tables.contains(rest)) {
                 auto table = resolve_table(rest, tables, lazy_tables);
                 if (!table) {
-                    fmt::print("error: {}\n", table.error());
+                    ibex::formatting::print("error: {}\n", table.error());
                     continue;
                 }
                 peek_table(table.value());
@@ -5213,12 +5211,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto normalized = normalize_input(rest);
             auto parsed = parser::parse(normalized);
             if (!parsed) {
-                fmt::print("error: {}\n", parsed.error().format());
+                ibex::formatting::print("error: {}\n", parsed.error().format());
                 continue;
             }
             if (parsed->statements.size() != 1 ||
                 !std::holds_alternative<parser::ExprStmt>(parsed->statements.front())) {
-                fmt::print("error: :peek expects a single expression\n");
+                ibex::formatting::print("error: :peek expects a single expression\n");
                 continue;
             }
             auto& expr_stmt = std::get<parser::ExprStmt>(parsed->statements.front());
@@ -5226,11 +5224,11 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 eval_expr_value(*expr_stmt.expr, tables, lazy_tables, scalars, columns, models,
                                 functions, compile_time_lists, extern_decls, registry);
             if (!value) {
-                fmt::print("error: {}\n", value.error());
+                ibex::formatting::print("error: {}\n", value.error());
                 continue;
             }
             if (auto* scalar = std::get_if<runtime::ScalarValue>(&value.value())) {
-                fmt::print("{}\n", format_scalar(*scalar));
+                ibex::formatting::print("{}\n", format_scalar(*scalar));
             } else if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                 runtime::Table temp;
                 temp.add_column("column", *col);
@@ -5250,12 +5248,12 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                 count_text = trim(rest.substr(space + 1));
             }
             if (name.empty()) {
-                fmt::print("usage: :describe <table> [n]\n");
+                ibex::formatting::print("usage: :describe <table> [n]\n");
                 continue;
             }
             auto table = resolve_table(std::string(name), tables, lazy_tables);
             if (!table) {
-                fmt::print("error: {}\n", table.error());
+                ibex::formatting::print("error: {}\n", table.error());
                 continue;
             }
             const std::size_t count = parse_optional_size(count_text, 10);
@@ -5271,7 +5269,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             auto arg_view = trim(line_view.substr(std::string_view(":run").size()));
             std::string path = parse_load_path(arg_view);
             if (path.empty()) {
-                fmt::print("usage: :run <file>\n");
+                ibex::formatting::print("usage: :run <file>\n");
                 report_timing();
                 continue;
             }
@@ -5283,19 +5281,19 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (line_view.starts_with(":load")) {
             auto arg_view = trim(line_view.substr(std::string_view(":load").size()));
             if (arg_view.empty()) {
-                fmt::print("usage: :load <file>\n");
+                ibex::formatting::print("usage: :load <file>\n");
                 report_timing();
                 continue;
             }
             std::string path = parse_load_path(arg_view);
             if (path.empty()) {
-                fmt::print("usage: :load <file>\n");
+                ibex::formatting::print("usage: :load <file>\n");
                 report_timing();
                 continue;
             }
             std::ifstream input{path};
             if (!input) {
-                fmt::print("error: failed to open '{}'\n", path);
+                ibex::formatting::print("error: failed to open '{}'\n", path);
                 report_timing();
                 continue;
             }
@@ -5303,7 +5301,7 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
                                      std::istreambuf_iterator<char>());
             auto parsed = parser::parse(source);
             if (!parsed) {
-                fmt::print("error: {}\n", parsed.error().format());
+                ibex::formatting::print("error: {}\n", parsed.error().format());
                 report_timing();
                 continue;
             }
@@ -5333,8 +5331,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
         if (line_view.starts_with(':')) {
             auto cmd_end = line_view.find_first_of(" \t");
             auto cmd = cmd_end == std::string_view::npos ? line_view : line_view.substr(0, cmd_end);
-            fmt::print("error: unknown REPL command '{}'\n", cmd);
-            fmt::print(
+            ibex::formatting::print("error: unknown REPL command '{}'\n", cmd);
+            ibex::formatting::print(
                 "known: :help, :tables, :scalars, :functions, :imports, :schema, :head, "
                 ":peek, :describe, :doc, :source, :load, :timing, :time, :comments, :quit\n");
             continue;

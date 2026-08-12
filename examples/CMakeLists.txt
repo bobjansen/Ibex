@@ -9,7 +9,6 @@ target_link_libraries(ibex_example_basic
         Ibex::ir
         Ibex::runtime
         Ibex::CompilerOptions
-        fmt::fmt
 )
 
 if(TARGET Ibex::Sanitizers)

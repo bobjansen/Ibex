@@ -5,9 +5,7 @@
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lexer.hpp>
 #include <ibex/parser/parser.hpp>
-
-#include <fmt/core.h>
-#include <fmt/format.h>
+#include <ibex/format.hpp>
 
 #include <cctype>
 #include <charconv>
@@ -38,7 +36,7 @@ class Parser {
         while (!is_at_end()) {
             if (peek().kind == TokenKind::Error) {
                 return std::unexpected(
-                    make_error(peek(), fmt::format("invalid token {}", format_token(peek()))));
+                    make_error(peek(), ibex::formatting::format("invalid token {}", format_token(peek()))));
             }
             auto stmt = parse_statement();
             if (!stmt.has_value()) {
@@ -472,7 +470,7 @@ class Parser {
         }
         if (!check(TokenKind::Semicolon)) {
             error_ = make_error(
-                peek(), fmt::format("unexpected token {} after expression", format_token(peek())));
+                peek(), ibex::formatting::format("unexpected token {} after expression", format_token(peek())));
             return std::nullopt;
         }
         if (!consume(TokenKind::Semicolon, "expected ';' after expression")) {
@@ -1100,11 +1098,11 @@ class Parser {
             advance();  // 'left' / 'right'
             advance();  // '('
             auto column =
-                consume_column_identifier(fmt::format("expected a column name in {}(...)", word));
+                consume_column_identifier(ibex::formatting::format("expected a column name in {}(...)", word));
             if (!column.has_value()) {
                 return nullptr;
             }
-            if (!consume(TokenKind::RParen, fmt::format("expected ')' after {}(column)", word))) {
+            if (!consume(TokenKind::RParen, ibex::formatting::format("expected ')' after {}(column)", word))) {
                 return nullptr;
             }
             auto arg = std::make_unique<Expr>();
@@ -2366,7 +2364,7 @@ class Parser {
         if (token.kind == TokenKind::Eof || token.lexeme.empty()) {
             return "'<eof>'";
         }
-        return fmt::format("'{}'", std::string(token.lexeme));
+        return ibex::formatting::format("'{}'", std::string(token.lexeme));
     }
 
     auto fail_expr(const Token& token, std::string_view message) -> ExprPtr {
@@ -2761,7 +2759,7 @@ class Parser {
 }  // namespace
 
 auto ParseError::format() const -> std::string {
-    return fmt::format("{}:{}: {}", line, column, message);
+    return ibex::formatting::format("{}:{}: {}", line, column, message);
 }
 
 auto parse(std::string_view source) -> ParseResult {

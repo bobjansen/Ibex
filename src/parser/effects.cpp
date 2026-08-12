@@ -5,8 +5,7 @@
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/parser.hpp>
 
-#include <fmt/core.h>
-#include <fmt/format.h>
+#include <ibex/format.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -378,7 +377,7 @@ class EffectAnalyzer {
                 continue;
             }
             return ParseError{
-                .message = fmt::format("function '{}' effect annotation missing: {}", fn->name,
+                .message = ibex::formatting::format("function '{}' effect annotation missing: {}", fn->name,
                                        format_effect_summary(missing)),
                 .line = fn->start_line,
                 .column = 1,

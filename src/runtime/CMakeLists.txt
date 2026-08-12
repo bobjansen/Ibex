@@ -41,7 +41,6 @@ target_link_libraries(ibex_runtime
         Threads::Threads
     PRIVATE
         Ibex::CompilerOptions
-        fmt::fmt
         robin_hood::robin_hood
         pdqsort
 )

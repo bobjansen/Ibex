@@ -57,8 +57,8 @@
     <div class="grid-3">
       <article class="card">
         <span class="tour-tag">Performance</span>
-        <h3>Single-core speed that still shows up at scale</h3>
-        <p>Ibex is currently single-threaded, yet stays competitive with engines using all cores on many common columnar queries.</p>
+        <h3>Fast per core, and it scales across them</h3>
+        <p>Ibex parallelises group-by, scans, filters and transforms across cores, and stays competitive with every engine on many common columnar queries even before those threads are counted.</p>
       </article>
       <article class="card">
         <span class="tour-tag">Language</span>
@@ -83,6 +83,13 @@
       <a href="benchmarks.html"> benchmark suite</a> compares each query against the same operation in Polars,
       DuckDB, ClickHouse, DataFusion, pandas, data.table, and dplyr.
     </p>
+    <!-- These headline figures are copied by hand from the published run behind
+         benchmarks.html. That run predates Ibex's operator threading — its ibex
+         column scales dead-linearly with row count (1.9ms at 1M through 111.9ms
+         at 50M for mean by symbol), which is the signature of a single-threaded
+         engine. Refresh all three from the next AWS sweep, which will carry the
+         threaded numbers; do not hand-edit them from a developer box, because
+         the table beside them comes from the r7i box and the two must agree. -->
     <div class="grid-3 proof-grid">
       <article class="card proof-card">
         <span class="proof-stat">33.6 ms</span>
@@ -105,8 +112,10 @@
       <a class="button" href="./comparison.html">Compare query syntax</a>
     </div>
     <p class="bench-note">
-      Ibex currently runs on one thread. The benchmark page shows both default
-      engine settings and single-threaded Polars for a same-core comparison.
+      Ibex parallelises some operators by default. The benchmark page shows every
+      engine at its default settings alongside a single-threaded run of each —
+      including <code>ibex-st</code>, which makes Ibex's own threading gain
+      visible and gives a same-core comparison against the other engines.
     </p>
   </section>
 

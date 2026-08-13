@@ -1,2 +1,3 @@
 #!/bin/sh
 rm -f src/Makevars
+rm -rf src/ibex-src src/ibex-build

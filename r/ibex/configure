@@ -1,27 +1,68 @@
 #!/bin/sh
 set -eu
 
-if [ -z "${IBEX_ROOT:-}" ]; then
-  echo "configure: error: IBEX_ROOT is required (path to the Ibex repo root)" >&2
-  exit 1
+# A remote R install contains only r/ibex, so fetch and build the small Ibex
+# runtime closure here. Users developing from an existing checkout can still
+# override both locations to reuse it.
+if [ -z "${IBEX_GITHUB_REF:-}" ]; then
+  # remotes records this field for GitHub installs. Prefer the exact source
+  # revision so the R bridge and downloaded C++ runtime cannot drift apart.
+  IBEX_GITHUB_REF=$(sed -n 's/^RemoteSha:[[:space:]]*//p' DESCRIPTION | head -n 1)
+  IBEX_GITHUB_REF=${IBEX_GITHUB_REF:-main}
 fi
-
-if [ -z "${IBEX_BUILD_DIR:-}" ]; then
-  echo "configure: error: IBEX_BUILD_DIR is required (path to the Ibex build tree)" >&2
-  exit 1
-fi
+IBEX_SOURCE_URL=${IBEX_SOURCE_URL:-"https://github.com/bobjansen/Ibex/archive/${IBEX_GITHUB_REF}.tar.gz"}
+IBEX_ROOT=${IBEX_ROOT:-"$(pwd)/src/ibex-src"}
+IBEX_BUILD_DIR=${IBEX_BUILD_DIR:-"$(pwd)/src/ibex-build"}
 
 if [ ! -d "${IBEX_ROOT}/include/ibex" ]; then
-  echo "configure: error: IBEX_ROOT does not look like an Ibex checkout: ${IBEX_ROOT}" >&2
-  exit 1
+  command -v curl >/dev/null 2>&1 || {
+    echo "configure: error: curl is required to download Ibex from GitHub" >&2
+    exit 1
+  }
+  command -v tar >/dev/null 2>&1 || {
+    echo "configure: error: tar is required to unpack Ibex" >&2
+    exit 1
+  }
+  echo "configure: downloading Ibex (${IBEX_GITHUB_REF})" >&2
+  rm -rf "${IBEX_ROOT}"
+  mkdir -p "${IBEX_ROOT}"
+  curl -fsSL "${IBEX_SOURCE_URL}" \
+    | tar -xz --strip-components=1 -C "${IBEX_ROOT}"
 fi
 
-if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
-  echo "configure: error: IBEX_BUILD_DIR is missing libibex_runtime.a: ${IBEX_BUILD_DIR}" >&2
+command -v cmake >/dev/null 2>&1 || {
+  echo "configure: error: CMake 3.26 or newer is required" >&2
   exit 1
+}
+
+if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
+  echo "configure: building the minimal Ibex runtime" >&2
+  cmake -S "${IBEX_ROOT}" -B "${IBEX_BUILD_DIR}" \
+    -DIBEX_MINIMAL_RUNTIME=ON \
+    -DIBEX_BUILD_TESTS=OFF \
+    -DIBEX_BUILD_TOOLS=OFF \
+    -DIBEX_BUILD_EXAMPLES=OFF \
+    -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+    -DIBEX_BUILD_PARQUET=OFF \
+    -DIBEX_BUILD_LIGHTGBM=OFF \
+    -DIBEX_USE_CCACHE=OFF
+  cmake --build "${IBEX_BUILD_DIR}" --target \
+    ibex_core ibex_ir ibex_parser ibex_runtime ibex_interop --parallel
 fi
+
+IBEX_SYSTEM_LIBS='-pthread -lm'
+case "$(uname -s)" in
+  Linux*)
+    IBEX_SYSTEM_LIBS="${IBEX_SYSTEM_LIBS} -ldl"
+    if [ -f "${IBEX_BUILD_DIR}/CMakeCache.txt" ] \
+      && grep -q '^IBEX_LIBMVEC:FILEPATH=' "${IBEX_BUILD_DIR}/CMakeCache.txt"; then
+      IBEX_SYSTEM_LIBS="${IBEX_SYSTEM_LIBS} $(sed -n 's|^IBEX_LIBMVEC:FILEPATH=||p' "${IBEX_BUILD_DIR}/CMakeCache.txt")"
+    fi
+    ;;
+esac
 
 sed \
   -e "s|@IBEX_ROOT@|${IBEX_ROOT}|g" \
   -e "s|@IBEX_BUILD_DIR@|${IBEX_BUILD_DIR}|g" \
+  -e "s|@IBEX_SYSTEM_LIBS@|${IBEX_SYSTEM_LIBS}|g" \
   src/Makevars.in > src/Makevars

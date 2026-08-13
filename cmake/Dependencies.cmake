@@ -54,16 +54,17 @@ function(ibex_silence_external_target target_name)
     endif()
 endfunction()
 
-# CLI11 — command-line parsing
-FetchContent_Declare(
-    CLI11
-    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-    GIT_TAG        v2.4.2
-    GIT_SHALLOW    TRUE
-)
-
-FetchContent_MakeAvailable(CLI11)
-ibex_silence_external_target(CLI11)
+if(NOT IBEX_MINIMAL_RUNTIME)
+    # CLI11 — command-line parsing
+    FetchContent_Declare(
+        CLI11
+        GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+        GIT_TAG        v2.4.2
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(CLI11)
+    ibex_silence_external_target(CLI11)
+endif()
 
 # robin-hood-hashing — fast open-addressing hash map (header-only)
 FetchContent_Declare(
@@ -90,28 +91,30 @@ if(NOT TARGET pdqsort)
     target_include_directories(pdqsort SYSTEM INTERFACE ${pdqsort_SOURCE_DIR})
 endif()
 
-# fast_float — drop-in std::from_chars replacement for floats (Apache 2.0).
-# Much faster than libstdc++'s from_chars<double> on hot CSV ingest paths.
-FetchContent_Declare(
-    fast_float
-    GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
-    GIT_TAG        v6.1.6
-    GIT_SHALLOW    TRUE
-)
-set(FASTFLOAT_TEST OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(fast_float)
-ibex_mark_target_system_headers(fast_float)
+if(NOT IBEX_MINIMAL_RUNTIME)
+    # fast_float — drop-in std::from_chars replacement for floats (Apache 2.0).
+    # Much faster than libstdc++'s from_chars<double> on hot CSV ingest paths.
+    FetchContent_Declare(
+        fast_float
+        GIT_REPOSITORY https://github.com/fastfloat/fast_float.git
+        GIT_TAG        v6.1.6
+        GIT_SHALLOW    TRUE
+    )
+    set(FASTFLOAT_TEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(fast_float)
+    ibex_mark_target_system_headers(fast_float)
 
-# nlohmann/json — header-only JSON library (MIT)
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE
-)
-set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(nlohmann_json)
-ibex_mark_target_system_headers(nlohmann_json::nlohmann_json)
+    # nlohmann/json — header-only JSON library (MIT)
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE
+    )
+    set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(nlohmann_json)
+    ibex_mark_target_system_headers(nlohmann_json::nlohmann_json)
+endif()
 
 # Catch2 — testing framework (only when tests enabled)
 if(IBEX_BUILD_TESTS)

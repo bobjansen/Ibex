@@ -1,2 +1,4 @@
 ^src/Makevars$
 ^src/symbols\\.rds$
+^src/ibex-src$
+^src/ibex-build$

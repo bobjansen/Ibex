@@ -15,7 +15,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -74,26 +78,48 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
         return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
 
+#ifdef _WIN32
+    const std::string filename = stem + ".dll";
+#else
     const std::string filename = stem + ".so";
+#endif
     std::string last_error;
     std::string last_candidate;
     for (const auto& dir : search_paths) {
         auto full_path = std::filesystem::path(dir) / filename;
-        void* handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        void* handle = nullptr;
+#ifdef _WIN32
+        handle = static_cast<void*>(LoadLibraryA(full_path.string().c_str()));
+#else
+        handle = dlopen(full_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
         if (handle == nullptr) {
             if (std::filesystem::exists(full_path)) {
+#ifdef _WIN32
+                last_error = "Windows error " + std::to_string(GetLastError());
+#else
                 if (const char* err = dlerror()) {
                     last_error = err;
                 }
+#endif
                 last_candidate = full_path.string();
             }
             continue;
         }
 
         using RegisterFn = void (*)(ibex::runtime::ExternRegistry*);
+#ifdef _WIN32
+        auto* fn = reinterpret_cast<RegisterFn>(
+            GetProcAddress(static_cast<HMODULE>(handle), "ibex_register"));
+#else
         auto* fn = reinterpret_cast<RegisterFn>(dlsym(handle, "ibex_register"));
+#endif
         if (fn == nullptr) {
+#ifdef _WIN32
+            FreeLibrary(static_cast<HMODULE>(handle));
+#else
             dlclose(handle);
+#endif
             last_candidate = full_path.string();
             last_error = "missing ibex_register symbol";
             continue;
@@ -126,7 +152,11 @@ auto load_source_plugins(const ibex::parser::Program& program,
             auto stem = plugin_stem(decl->source_path);
             auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
             if (result.status == PluginLoadStatus::NotFound) {
+#ifdef _WIN32
+                return std::unexpected("could not find plugin '" + stem + ".dll' in search path");
+#else
                 return std::unexpected("could not find plugin '" + stem + ".so' in search path");
+#endif
             }
             if (result.status == PluginLoadStatus::LoadError) {
                 return std::unexpected(result.message);

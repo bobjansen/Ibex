@@ -4664,6 +4664,20 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
+        // High-cardinality string keys are where this path pays: discovery is
+        // the serial half, and a string group-by has nothing else to hide it
+        // behind. Probing with a view keeps the owning copy per GROUP, as the
+        // serial loop below does.
+        const auto key_at = [&](std::size_t row) -> std::string_view {
+            return std::string_view{src_chars + src_off[row], src_off[row + 1] - src_off[row]};
+        };
+        if (try_discover_partitioned<std::string, StrViewHash, StrViewEq>(
+                key_at, rows, gids, str_partitions_, [&](std::size_t n) { str_order_.resize(n); },
+                [&](const std::string& key, std::uint32_t gid) { str_order_[gid] = key; })) {
+            accumulate_gids(gids, agg_entries, rows);
+            return std::nullopt;
+        }
+
         // Run-length shortcut: sorted or chunked CSV often has adjacent
         // repeats; skip the hash lookup when the key matches the previous row.
         std::string_view prev_key;
@@ -5071,9 +5085,13 @@ class ChunkedAggregateOperator final : public Operator {
     /// construction — a key's partition is a function of its hash — so a worker
     /// owning a partition owns every row and every group in it, and needs no
     /// lock and no merge against the others.
-    template <typename Key, typename Hash>
+    /// `Eq` is spelled out so a transparent hash/equal pair can be used: the
+    /// string path stores owning `std::string` keys but probes with
+    /// `std::string_view`, and only pays the copy on a genuinely new group —
+    /// exactly what the serial `str_index_` does.
+    template <typename Key, typename Hash, typename Eq = std::equal_to<Key>>
     struct KeyPartition {
-        robin_hood::unordered_flat_map<Key, std::uint32_t, Hash> index;
+        robin_hood::unordered_flat_map<Key, std::uint32_t, Hash, Eq> index;
         /// This partition's groups, in the order they were first seen — which,
         /// because rows are scattered in row order, is ascending by first row.
         /// That is what makes the final ordering a merge of already-sorted
@@ -5117,9 +5135,10 @@ class ChunkedAggregateOperator final : public Operator {
     /// in row order, so each group's values accumulate in exactly the order the
     /// serial path would use. The output is byte-identical, not merely
     /// equivalent — including the float sums.
-    template <typename Key, typename Hash, typename KeyAt, typename ResizeKeys, typename StoreKey>
+    template <typename Key, typename Hash, typename Eq = std::equal_to<Key>, typename KeyAt,
+              typename ResizeKeys, typename StoreKey>
     auto try_discover_partitioned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
-                                  std::vector<KeyPartition<Key, Hash>>& partitions,
+                                  std::vector<KeyPartition<Key, Hash, Eq>>& partitions,
                                   const ResizeKeys& resize_keys, const StoreKey& store_key)
         -> bool {
         // Below this the partition and scatter passes cost more than the serial
@@ -5127,8 +5146,16 @@ class ChunkedAggregateOperator final : public Operator {
         // what discovery is about to find out — so row count is the only gate
         // available, and a low-cardinality run of this size still wins from the
         // smaller per-partition tables.
+        //
+        // Once this path HAS run, every later chunk must take it too, however
+        // small. The groups it discovered live in `partitions`, and the serial
+        // loops probe `int_index_` / `str_index_`, which this path never
+        // populates — so a small trailing chunk falling back would not find the
+        // existing groups and would allocate second ids for them. The row gate
+        // therefore only guards the first use.
         constexpr std::size_t kMinRows = 1U << 18U;
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || rows < kMinRows) {
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
+            (rows < kMinRows && !partitioned_active_)) {
             return false;
         }
         auto& pool = process_worker_pool();
@@ -5213,15 +5240,19 @@ class ChunkedAggregateOperator final : public Operator {
                     auto& partition = partitions[p];
                     for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
                         const std::size_t row = scatter_rows_[i];
-                        const Key key = key_at(row);
+                        // `auto`, not `Key`: the probe type may be a view onto
+                        // the key column (strings), and materializing an owning
+                        // key per ROW rather than per GROUP is the whole cost
+                        // this path exists to avoid.
+                        const auto key = key_at(row);
                         auto it = partition.index.find(key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
                             local = static_cast<std::uint32_t>(partition.gids.size());
-                            partition.index.emplace(key, local);
+                            partition.index.emplace(Key(key), local);
                             partition.gids.push_back(0);  // filled below, in order
                             partition.first_rows.push_back(row_base + row);
-                            partition.keys.push_back(key);
+                            partition.keys.emplace_back(key);
                         } else {
                             local = it->second;
                         }
@@ -5296,6 +5327,7 @@ class ChunkedAggregateOperator final : public Operator {
             batch.wait();
         }
         rows_seen_ += rows;
+        partitioned_active_ = true;
         return true;
     }
 
@@ -6722,9 +6754,13 @@ class ChunkedAggregateOperator final : public Operator {
     /// first-occurrence numbering is merged on.
     std::vector<KeyPartition<PairIntKey, PairIntKeyHash>> pair_partitions_;
     std::vector<KeyPartition<std::int64_t, robin_hood::hash<std::int64_t>>> int_partitions_;
+    std::vector<KeyPartition<std::string, StrViewHash, StrViewEq>> str_partitions_;
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::size_t> scatter_rows_;
     std::uint64_t rows_seen_ = 0;
+    /// Set once `try_discover_partitioned` has run; see the gate there for why
+    /// a later chunk may then never fall back to the serial loop.
+    bool partitioned_active_ = false;
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
     /// The two paths are mutually exclusive, so sharing that map is safe.

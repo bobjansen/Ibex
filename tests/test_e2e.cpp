@@ -3406,3 +3406,40 @@ TEST_CASE("partitioned group discovery matches the serial groups exactly",
     REQUIRE(serial.rows() == kRows);
     require_tables_equal(serial, parallel);
 }
+
+TEST_CASE("partitioned group discovery matches the serial groups on string keys",
+          "[runtime][parallel][aggregate]") {
+    // The string counterpart of the case above, and the one that matters most:
+    // a high-cardinality STRING key is where discovery has nothing else to hide
+    // behind, and it ran wholly serially until the partitioned path learned to
+    // probe with a `std::string_view` while storing an owning key per group.
+    //
+    // That split is exactly what this guards. Probing with a view means the
+    // key handed to the hash map does not own its bytes, so a partition that
+    // kept the view instead of copying would compare against freed or reused
+    // storage and merge unrelated groups — which shows up here as a differing
+    // group count or a differing total, not as a crash.
+    constexpr std::size_t kRows = 300'000;  // over the 2^18 row floor for the path
+    std::vector<std::string> keys(kRows);
+    std::vector<std::int64_t> qty(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Coprime stride again, and a key long enough to defeat libstdc++'s
+        // 15-char SSO: a heap-allocating key is the one whose ownership bugs
+        // are visible, since an inline one survives being copied wrongly.
+        keys[i] = "symbol-" + std::to_string((i * 7919) % 40'009) + "-padding-to-defeat-sso";
+        qty[i] = static_cast<std::int64_t>(i % 97);
+    }
+    runtime::Table table;
+    table.add_column("k", Column<std::string>{std::move(keys)});
+    table.add_column("q", Column<std::int64_t>{std::move(qty)});
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(table));
+
+    constexpr std::string_view src = "t[select { total = sum(q), n = count() }, by { k }];";
+    const auto serial = run_parallel(src, tables, 0, 1);
+    const auto parallel = run_parallel(src, tables, 0, 4);
+    // 40'009 is prime and the stride is coprime to it, so the keys cycle through
+    // every residue: exactly 40'009 groups, and each seen many times.
+    REQUIRE(serial.rows() == 40'009);
+    require_tables_equal(serial, parallel);
+}

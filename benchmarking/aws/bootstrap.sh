@@ -1081,6 +1081,92 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
     exit 0
 fi
 
+# ── Thread-scaling mode (run-thread-scaling.sh) ───────────────────────────────
+# The same suite at one dataset size, once per thread count, so each engine's
+# per-query curve across core counts is measurable rather than inferred from two
+# points (`ibex` and `ibex-st`).
+#
+# The box facts written here are the point of the artifact as much as the
+# timings are: a scaling curve without the physical-core count beside it cannot
+# be read, because the knee where the sweep starts filling SMT siblings instead
+# of cores is otherwise invisible.
+if [[ "${IBEX_SCALING_MODE:-0}" == "1" ]]; then
+    build_ibex
+
+    SCALING_CSV=/ibex/benchmarking/results/thread_scaling.csv
+    PARTIAL_KEY="${IBEX_RESULT_KEY%.csv}.partial.csv"
+    BOX_KEY="${IBEX_RESULT_KEY%.csv}.box.txt"
+    BOX_FACTS=/ibex/benchmarking/results/thread_scaling.box.txt
+
+    write_box_facts() {
+        mkdir -p "$(dirname "$BOX_FACTS")"
+        {
+            echo "ibex_commit=$(git -C /ibex rev-parse HEAD)"
+            # IMDSv2 is enforced: a plain GET returns 401 and the type would
+            # silently read "unknown".
+            imds_token=$(curl -fsS --max-time 5 -X PUT \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+                http://169.254.169.254/latest/api/token 2>/dev/null || true)
+            echo "instance_type=$(curl -fsS --max-time 5 \
+                -H "X-aws-ec2-metadata-token: ${imds_token}" \
+                http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || echo unknown)"
+            echo "nproc=$(nproc)"
+            # lscpu is the authority on the box itself; describe-instance-types
+            # is the launcher's view. When CpuOptions disabled SMT they disagree,
+            # and the box wins.
+            echo "physical_cores=$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
+            echo "threads_per_core=$(lscpu 2>/dev/null | awk -F: '/Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}' || echo unknown)"
+            echo "model_name=$(lscpu 2>/dev/null | awk -F: '/Model name/ {sub(/^ +/,"",$2); print $2; exit}')"
+            echo "mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+            echo "thread_sweep=${IBEX_SCALING_THREADS:-}"
+            echo "dataset_rows=${IBEX_SCALING_ROWS:-}"
+            echo "engines=${IBEX_SCALING_ENGINES:-}"
+            echo "warmup=${IBEX_WARMUP:-1} iters=${IBEX_ITERS:-5}"
+            echo "clang=$(clang++-${CLANG_VERSION} --version 2>/dev/null | head -1)"
+        } > "$BOX_FACTS" 2>/dev/null || true
+    }
+
+    finish_scaling() {
+        local code=$?
+        [[ -n "${SCALING_UPLOADER_PID:-}" ]] && kill "${SCALING_UPLOADER_PID}" 2>/dev/null || true
+        write_box_facts
+        aws s3 cp "$BOX_FACTS" "s3://${IBEX_S3_BUCKET}/${BOX_KEY}" \
+            --region "${IBEX_REGION}" --only-show-errors || true
+        if [[ -f "$SCALING_CSV" ]]; then
+            aws s3 cp "$SCALING_CSV" "s3://${IBEX_S3_BUCKET}/${IBEX_RESULT_KEY}" \
+                --region "${IBEX_REGION}" \
+                && echo "Results uploaded (sweep exit ${code})" \
+                || echo "WARNING: result upload failed (sweep exit ${code})"
+        else
+            echo "No results to upload (sweep exit ${code})"
+        fi
+        shutdown -h now
+    }
+    trap finish_scaling EXIT
+
+    ( while sleep 60; do
+          [[ -f "$SCALING_CSV" ]] && aws s3 cp "$SCALING_CSV" \
+              "s3://${IBEX_S3_BUCKET}/${PARTIAL_KEY}" \
+              --region "${IBEX_REGION}" --only-show-errors || true
+      done ) &
+    SCALING_UPLOADER_PID=$!
+
+    # The sweep exits non-zero when any pass is incomplete. That must not skip
+    # the upload — a curve with one hole is still the run's whole output — so
+    # the EXIT trap above owns the upload and the failure is only reported.
+    IBEX_ROOT=/ibex BUILD_DIR=/ibex/build-release \
+        bash /ibex/benchmarking/run_thread_scaling.sh \
+            --threads "${IBEX_SCALING_THREADS:-1,2,4,8}" \
+            --rows "${IBEX_SCALING_ROWS:-16M}" \
+            --engines "${IBEX_SCALING_ENGINES:-ibex,python,duckdb}" \
+            --warmup "${IBEX_WARMUP:-1}" \
+            --iters "${IBEX_ITERS:-5}" \
+            --out "$SCALING_CSV" \
+        || echo "WARNING: thread sweep reported failures; uploading what completed" >&2
+
+    exit 0
+fi
+
 if [[ "${IBEX_BUILD_REQUIRED:-1}" == "1" ]]; then
     build_ibex
 else

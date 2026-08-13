@@ -2432,10 +2432,14 @@ class ChunkedDistinctOperator final : public Operator {
             // (byte equality would split -0.0 from 0.0 and merge NaNs) and so are
             // categoricals (a code names different values across chunks).
             if (auto plan = build_packed_key(t); plan.has_value()) {
-                std::optional<Table> out =
-                    plan->width <= sizeof(std::uint64_t)
-                        ? process_packed<std::uint64_t>(std::move(t), plan->cols, seen_packed64_)
-                        : process_packed<Packed128>(std::move(t), plan->cols, seen_packed128_);
+                std::optional<Table> out;
+                if (plan->width <= sizeof(std::uint64_t)) {
+                    out = process_packed<std::uint64_t>(std::move(t), plan->cols, seen_packed64_);
+                } else if (plan->width <= sizeof(Packed128)) {
+                    out = process_packed<Packed128>(std::move(t), plan->cols, seen_packed128_);
+                } else {
+                    out = process_packed<Packed256>(std::move(t), plan->cols, seen_packed256_);
+                }
                 if (!out.has_value()) {
                     continue;
                 }
@@ -2632,32 +2636,53 @@ class ChunkedDistinctOperator final : public Operator {
         return gather_rows(t, idx);
     }
 
-    // MSVC has no __uint128_t. This is only a packed identity key, so a pair
+    // MSVC has no __uint128_t. This is only a packed identity key, so an array
     // of words is both portable and avoids pulling a compiler-specific integer
     // type into the distinct fast path.
-    struct Packed128 {
-        std::uint64_t lo = 0;
-        std::uint64_t hi = 0;
+    template <std::size_t Words>
+    struct PackedWords {
+        std::array<std::uint64_t, Words> w{};
 
-        [[nodiscard]] friend auto operator==(const Packed128&, const Packed128&) -> bool = default;
+        [[nodiscard]] friend auto operator==(const PackedWords&, const PackedWords&)
+            -> bool = default;
     };
-    struct Packed128Hash {
-        auto operator()(const Packed128& value) const noexcept -> std::size_t {
-            auto lo = value.lo;
-            const auto hi = value.hi;
-            lo ^= hi + 0x9e3779b97f4a7c15ULL + (lo << 6) + (lo >> 2);
-            return static_cast<std::size_t>(lo);
+    template <std::size_t Words>
+    struct PackedWordsHash {
+        auto operator()(const PackedWords<Words>& value) const noexcept -> std::size_t {
+            std::uint64_t acc = 0;
+            for (const auto word : value.w) {
+                acc ^= word + 0x9e3779b97f4a7c15ULL + (acc << 6U) + (acc >> 2U);
+            }
+            return static_cast<std::size_t>(acc);
         }
     };
+    using Packed128 = PackedWords<2>;
+    using Packed256 = PackedWords<4>;
+
+    /// OR `cell` into the packed key at bit offset `shift`. A cell never spans
+    /// more than two words because no cell is wider than 64 bits.
+    template <std::size_t Words>
+    static void splice(PackedWords<Words>& key, std::uint64_t cell, unsigned shift) {
+        const unsigned word = shift / 64U;
+        const unsigned off = shift % 64U;
+        key.w[word] |= cell << off;
+        // `cell >> 64` is UB, so the carry into the next word is only taken when
+        // the cell actually straddles the boundary.
+        if (off != 0 && word + 1 < Words) {
+            key.w[word + 1] |= cell >> (64U - off);
+        }
+    }
 
     /// One fixed-width integral key column, resolved to its raw storage and the
     /// bit offset it occupies in the packed key.
     struct PackCol {
-        enum class Kind : std::uint8_t { Int64, Date, Ts, Bool } kind{Kind::Int64};
+        enum class Kind : std::uint8_t { Int64, Date, Ts, Bool, Cat } kind{Kind::Int64};
         const std::int64_t* i64 = nullptr;
         const Date* date = nullptr;
         const Timestamp* ts = nullptr;
         const Column<bool>* boolean = nullptr;
+        const Column<Categorical>* cat = nullptr;
+        const std::uint32_t* remap = nullptr;  ///< local code -> operator-global id
         unsigned shift = 0;  ///< bit offset of this column's cell in the packed key
     };
     struct PackedPlan {
@@ -2665,15 +2690,36 @@ class ChunkedDistinctOperator final : public Operator {
         unsigned width = 0;  ///< total packed width in bytes
     };
 
-    /// A key is packable iff every column is a fixed-width INTEGRAL type (byte
-    /// equality equals value equality — so no double, whose -0.0/NaN break that,
-    /// and no categorical, whose code names a different value in a later chunk)
-    /// with no nulls, and the columns together fit in 16 bytes.
-    static auto build_packed_key(const Table& t) -> std::optional<PackedPlan> {
+    /// Per-key-column interning state for Categorical columns.
+    ///
+    /// A categorical code is only meaningful against ITS OWN chunk's dictionary,
+    /// so packing the raw code would merge two different values that happen to
+    /// share a code in different chunks. Resolving each dictionary entry to an
+    /// operator-global id fixes that, and costs one lookup per DICTIONARY ENTRY
+    /// per chunk rather than one per row: the row loop then reads `remap[code]`,
+    /// a single array index with no hashing and no allocation at all.
+    struct CatIntern {
+        /// Views point into `arena`, whose deque never invalidates references.
+        robin_hood::unordered_flat_map<std::string_view, std::uint32_t> ids;
+        std::deque<std::string> arena;
+        std::vector<std::uint32_t> remap;  ///< rebuilt per chunk, indexed by local code
+    };
+
+    /// A key is packable iff every column reduces to a fixed-width INTEGRAL cell
+    /// whose byte equality equals value equality, with no nulls, and the columns
+    /// together fit in 32 bytes.
+    ///
+    /// Doubles are excluded (-0.0/NaN break byte equality). Strings are excluded
+    /// because interning one per row would cost the hash lookup this path exists
+    /// to avoid. Categoricals ARE included: their dictionary is interned once per
+    /// chunk into operator-global ids (see `CatIntern`), which is what makes a
+    /// code comparable across chunks.
+    auto build_packed_key(const Table& t) -> std::optional<PackedPlan> {
         PackedPlan plan;
         plan.cols.reserve(t.columns.size());
         unsigned bytes = 0;
-        for (const auto& entry : t.columns) {
+        for (std::size_t k = 0; k < t.columns.size(); ++k) {
+            const auto& entry = t.columns[k];
             if (entry.validity.has_value()) {
                 return std::nullopt;
             }
@@ -2696,16 +2742,57 @@ class ChunkedDistinctOperator final : public Operator {
                 col.kind = PackCol::Kind::Bool;
                 col.boolean = c_bool;
                 bytes += 1;
+            } else if (const auto* c_cat = std::get_if<Column<Categorical>>(&column)) {
+                col.remap = intern_categorical(k, *c_cat);
+                // An empty dictionary would leave the row loop indexing a remap
+                // that has no entry for any code. Declining here keeps the hot
+                // loop free of a per-row range check.
+                if (col.remap == nullptr) {
+                    return std::nullopt;
+                }
+                col.kind = PackCol::Kind::Cat;
+                col.cat = c_cat;
+                bytes += 4;
             } else {
                 return std::nullopt;
             }
-            if (bytes > sizeof(Packed128)) {
+            if (bytes > sizeof(Packed256)) {
                 return std::nullopt;
             }
             plan.cols.push_back(col);
         }
         plan.width = bytes;
         return plan;
+    }
+
+    /// Resolve chunk-local codes of key column `k` to operator-global ids,
+    /// returning the remap, or nullptr when the dictionary is empty. Runs once
+    /// per chunk per categorical key column.
+    auto intern_categorical(std::size_t k, const Column<Categorical>& cat) -> const std::uint32_t* {
+        if (cat_interns_.size() <= k) {
+            cat_interns_.resize(k + 1);
+        }
+        auto& state = cat_interns_[k];
+        const auto& dict = cat.dictionary();
+        const std::size_t dict_size = dict.size();
+        if (dict_size == 0) {
+            return nullptr;
+        }
+        state.remap.resize(dict_size);
+        for (std::size_t code = 0; code < dict_size; ++code) {
+            const std::string_view value = dict[code];
+            if (const auto it = state.ids.find(value); it != state.ids.end()) {
+                state.remap[code] = it->second;
+                continue;
+            }
+            const auto id = static_cast<std::uint32_t>(state.ids.size());
+            // The view must outlive the chunk's dictionary, so the map keys are
+            // views into this deque rather than into the column.
+            state.arena.emplace_back(value);
+            state.ids.emplace(std::string_view{state.arena.back()}, id);
+            state.remap[code] = id;
+        }
+        return state.remap.data();
     }
 
     template <typename Packed, typename Set>
@@ -2731,18 +2818,14 @@ class ChunkedDistinctOperator final : public Operator {
                     case PackCol::Kind::Bool:
                         cell = (*col.boolean)[row] ? 1U : 0U;
                         break;
+                    case PackCol::Kind::Cat:
+                        cell = col.remap[static_cast<std::size_t>(col.cat->code_at(row))];
+                        break;
                 }
-                if constexpr (std::is_same_v<Packed, Packed128>) {
-                    if (col.shift < 64) {
-                        key.lo |= cell << col.shift;
-                        if (col.shift != 0) {
-                            key.hi |= cell >> (64 - col.shift);
-                        }
-                    } else {
-                        key.hi |= cell << (col.shift - 64);
-                    }
+                if constexpr (std::is_same_v<Packed, std::uint64_t>) {
+                    key |= cell << col.shift;
                 } else {
-                    key |= static_cast<Packed>(cell) << col.shift;
+                    splice(key, cell, col.shift);
                 }
             }
             if (seen.insert(key).second) {
@@ -2796,7 +2879,13 @@ class ChunkedDistinctOperator final : public Operator {
     KeyRowIndex key_index_;
     std::vector<Key> group_order_;
     robin_hood::unordered_flat_set<std::uint64_t> seen_packed64_;
-    robin_hood::unordered_flat_set<Packed128, Packed128Hash> seen_packed128_;
+    robin_hood::unordered_flat_set<Packed128, PackedWordsHash<2>> seen_packed128_;
+    robin_hood::unordered_flat_set<Packed256, PackedWordsHash<4>> seen_packed256_;
+    /// Categorical interning state, indexed by KEY COLUMN POSITION. Position is
+    /// the right index because a chunk's columns are the same key columns in the
+    /// same order every time, and two different key columns may well share
+    /// values without sharing an id space.
+    std::vector<CatIntern> cat_interns_;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
     robin_hood::unordered_flat_set<double> seen_f64_;

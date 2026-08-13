@@ -246,7 +246,15 @@ append_tagged_results() {
 # A benchmark engine crashing (e.g. an OS-OOM at the largest scale) must not
 # abort the whole sweep under `set -e`: log it and continue so the remaining
 # engines and sizes still run. The engine's cells are simply blank for this size.
+#
+# Continuing is not the same as succeeding, though. Every failure is recorded
+# here, summarised at the end, and turned into a non-zero exit — an unattended
+# run that published a size-shaped hole used to be indistinguishable, from the
+# outside, from one where that engine genuinely had nothing to say.
+ENGINE_FAILURES=()
+
 engine_failed() {
+    ENGINE_FAILURES+=("${1} @ ${rows} rows")
     echo "  \u26a0 ${1} failed at ${rows} rows — continuing (cells blank for this size)" >&2
 }
 
@@ -410,6 +418,19 @@ for rows in "${SIZES[@]}"; do
     fi
 
     uv run --project "$IBEX_ROOT" "$GEN_DATA" "$size_data_dir" --rows "$rows"
+
+    # gen_data.py skips any file that already exists, so a directory left behind
+    # by an interrupted run is reused as-is — and a truncated CSV in it fails
+    # every engine at that size while the sweep reports success. Check the row
+    # counts the generator was asked for before handing them to any harness.
+    for expected_file in prices prices_multi trades; do
+        actual_rows=$(($(wc -l < "$size_data_dir/${expected_file}.csv") - 1))
+        if [[ "$actual_rows" -ne "$rows" ]]; then
+            echo "error: $size_data_dir/${expected_file}.csv has ${actual_rows} rows, expected ${rows}." >&2
+            echo "       Leftover data from an interrupted run — delete $size_data_dir and re-run." >&2
+            exit 1
+        fi
+    done
 
     csv="$size_data_dir/prices.csv"
     csv_multi="$size_data_dir/prices_multi.csv"
@@ -649,4 +670,16 @@ if [[ $TO_README -eq 1 ]]; then
     echo
     echo "README markdown written to:"
     echo "  $TO_README_OUT"
+fi
+
+# Exit non-zero on any engine failure, AFTER the results are combined and
+# written — a partial sweep is still worth having, it just must not be mistaken
+# for a complete one.
+if [[ ${#ENGINE_FAILURES[@]} -gt 0 ]]; then
+    echo >&2
+    echo "error: ${#ENGINE_FAILURES[@]} engine/size combination(s) failed; results are INCOMPLETE:" >&2
+    for failure in "${ENGINE_FAILURES[@]}"; do
+        echo "  - ${failure}" >&2
+    done
+    exit 1
 fi

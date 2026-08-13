@@ -2799,6 +2799,19 @@ class ChunkedDistinctOperator final : public Operator {
     auto process_packed(Table t, const std::vector<PackCol>& cols, Set& seen)
         -> std::optional<Table> {
         const std::size_t rows = t.rows();
+        // Growing to 118k entries one doubling at a time costs more than the
+        // probing does: every rehash re-inserts everything already there, and a
+        // packed key is wide enough that the table leaves cache early.
+        //
+        // Sizing for `rows` is exactly right when the input is all-distinct
+        // (the table reaches that size anyway; only the rehashes are saved) and
+        // wasteful in proportion to how duplicated the input is. Nothing here
+        // knows the cardinality yet -- that is what the pass is about to find
+        // out -- so the speculative part is capped by BYTES. A 50M-row chunk of
+        // one repeated value would otherwise reserve well over a gigabyte.
+        constexpr std::size_t kMaxSpeculativeBytes = 64UL << 20U;
+        const std::size_t cap = kMaxSpeculativeBytes / sizeof(Packed);
+        seen.reserve(seen.size() + std::min(rows, cap));
         std::vector<std::size_t> idx;
         idx.reserve(rows);
         for (std::size_t row = 0; row < rows; ++row) {

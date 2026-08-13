@@ -22,7 +22,7 @@ Suggests:
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
 Config/ibex/dplyr-version: >= 1.1.0, < 1.2.0
-SystemRequirements: CMake (>= 3.26), C++23 compiler and standard library with <format> and <print>, curl, tar
+SystemRequirements: CMake (>= 3.26), C++23 compiler and standard library with <format>, curl, tar
 License: AGPL-3 + file LICENSE
 Encoding: UTF-8
 LazyData: false

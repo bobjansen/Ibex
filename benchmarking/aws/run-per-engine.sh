@@ -136,6 +136,9 @@ echo "Engines : ${ENGINE_LIST[*]}"
 echo "Sizes   : $SIZES"
 echo "AMI     : $AMI"
 echo "Type    : $INSTANCE_TYPE ($([[ "$ON_DEMAND" -eq 1 ]] && echo on-demand || echo spot)), one per engine"
+# vCPUs are hyperthreads. Printing the physical core count here is what stops
+# the published result being described with twice the cores it actually had.
+echo "Box     : $(bench_topology_line "$REGION" "$INSTANCE_TYPE")"
 echo "Bucket  : s3://$S3_BUCKET/$RUN_PREFIX"
 echo ""
 
@@ -301,10 +304,39 @@ for engine in "${ENGINE_LIST[@]}"; do
     fi
 done
 
+# Provenance travels WITH the CSV. A combined result whose commit and box are
+# only in this terminal's scrollback becomes unattributable the moment the
+# scrollback is gone — which is how docs/window-ohlc.html ended up published
+# with a bare date and no commit.
+MANIFEST="${COMBINED%.csv}.manifest.json"
+COMPLETE_ENGINES=()
+PARTIAL_ENGINES=()
+MISSING_ENGINES=()
+for engine in "${ENGINE_LIST[@]}"; do
+    case "${STATUS_OF[$engine]}" in
+        complete) COMPLETE_ENGINES+=("$engine") ;;
+        partial)  PARTIAL_ENGINES+=("$engine") ;;
+        *)        MISSING_ENGINES+=("$engine") ;;
+    esac
+done
+bench_write_manifest "$MANIFEST" "scale-suite" "$COMMIT" "$BRANCH" \
+    "$REGION" "$INSTANCE_TYPE" \
+    "topology=one instance per engine" \
+    "sizes=${SIZES}" \
+    "engines_requested=${ENGINE_LIST[*]}" \
+    "engines_complete=${COMPLETE_ENGINES[*]:-}" \
+    "engines_partial=${PARTIAL_ENGINES[*]:-}" \
+    "engines_missing=${MISSING_ENGINES[*]:-}" \
+    "thread_budget=per-engine default (each engine sizes from nproc)" \
+    "warmup=${WARMUP}" \
+    "iters=${ITERS}" \
+    "result_prefix=${RUN_PREFIX}"
+
 echo ""
 ELAPSED=$(( ($(date +%s) - START) / 60 ))
 echo "Done in ${ELAPSED}m. Combined ${got}/${#ENGINE_LIST[@]} engine(s):"
 echo "  $COMBINED"
+echo "  $MANIFEST"
 if (( partial > 0 )); then
     # Say it loudly: a partial engine is missing its LARGEST sizes, which is
     # exactly where cross-engine comparisons are usually drawn.

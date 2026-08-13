@@ -92,6 +92,7 @@ if [[ "$ON_DEMAND" -eq 0 ]]; then
 fi
 
 echo "Commit : ${COMMIT:0:8} ($BRANCH)"
+echo "Box    : $(bench_topology_line "$REGION" "$INSTANCE_TYPE")"
 echo "Rows   : ${ROWS} (at ${SWEEP_SYMBOLS} symbols)"
 echo "Symbols: ${SYMBOLS} (at ${SWEEP_ROWS} rows)"
 echo "Cores  : ${CORES:-all vCPUs on the box}"
@@ -125,6 +126,24 @@ INSTANCE_ID=$(aws ec2 run-instances --region "$REGION" --instance-type "$INSTANC
 
 echo "Instance: $INSTANCE_ID"
 echo "Log: aws ec2 get-console-output --instance-id $INSTANCE_ID --region $REGION --latest --output text"
+
+# Written at launch so a run that dies is still attributable. docs/window-ohlc.html
+# was published carrying only a date, and nothing afterwards could say which
+# commit or which box produced it.
+MANIFEST="$IBEX_ROOT/benchmarking/results/window_ohlc_aws_${TIMESTAMP}.manifest.json"
+mkdir -p "$(dirname "$MANIFEST")"
+bench_write_manifest "$MANIFEST" "window-ohlc" "$COMMIT" "$BRANCH" \
+    "$REGION" "$INSTANCE_TYPE" \
+    "rows=${ROWS}" \
+    "symbols=${SYMBOLS}" \
+    "sweep_rows=${SWEEP_ROWS}" \
+    "sweep_symbols=${SWEEP_SYMBOLS}" \
+    "cores=${CORES:-all vCPUs on the box}" \
+    "iters=${ITERS}" \
+    "budget_s=${BUDGET_S}" \
+    "instance_id=${INSTANCE_ID}" \
+    "result_key=${RESULT_KEY}"
+echo "Manifest: $MANIFEST"
 echo "Waiting for artifact..."
 while ! aws s3 ls "s3://${S3_BUCKET}/${RESULT_KEY}" --region "$REGION" >/dev/null 2>&1; do
     state=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \

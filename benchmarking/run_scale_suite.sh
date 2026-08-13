@@ -14,6 +14,7 @@
 #
 # Usage:
 #   ./run_scale_suite.sh [--sizes 1M,2M,4M,...,64M] [--warmup N] [--iters N]
+#                        [--threads N]
 #                        [--skip-ibex] [--skip-ibex-st] [--skip-ibex-compiled]
 #                        [--skip-python] [--skip-r]
 #                        [--skip-duckdb] [--skip-duckdb-st] [--duckdb-all-sizes]
@@ -50,6 +51,12 @@ fi
 
 WARMUP=1
 ITERS=5
+# Uniform thread budget for EVERY engine. Unset (the default) is the published
+# behaviour: each engine sizes its own pool from nproc. Set it and no engine is
+# left to guess — which is the whole point of the thread-scaling sweep, where a
+# single engine reading nproc instead of the budget silently invalidates the
+# entire curve. The -st variants below still pin themselves to 1 regardless.
+THREADS=""
 # Above LARGE_ITERS_ROWS, drop to ITERS_LARGE measured iterations: the slow
 # large-size cells have negligible variance, so 5 reps just burns wall-clock
 # (warmup stays 1).
@@ -156,6 +163,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --warmup)      WARMUP="$2"; shift 2 ;;
         --iters)       ITERS="$2"; shift 2 ;;
+        --threads)     THREADS="$2"; shift 2 ;;
         # Override the per-scale TF row count; unset (default) uses each scale's
         # own row count for TF benches.
         --tf-rows)     TF_ROWS_OVERRIDE="$2"; shift 2 ;;
@@ -198,6 +206,37 @@ done
 if [[ "${#SIZES[@]}" -eq 0 ]]; then
     echo "error: no sizes configured" >&2
     exit 1
+fi
+
+# ── Uniform thread budget ─────────────────────────────────────────────────────
+# Every engine gets the SAME number of threads, via whichever knob it reads.
+# Exported once rather than per-invocation because the budget applies to the
+# whole sweep, and because an engine we forget to thread through would quietly
+# fall back to nproc — the failure mode that makes a scaling curve a lie.
+#
+#   IBEX_THREADS           ibex          (src/runtime/worker_pool.cpp)
+#   POLARS_MAX_THREADS     polars
+#   RAYON_NUM_THREADS      datafusion's rayon pool, under its target-partitions
+#   OMP_NUM_THREADS        data.table / OpenMP-backed R and BLAS paths
+#   R_DATATABLE_NUM_THREADS data.table specifically (it ignores OMP when set)
+#   --threads N            duckdb, datafusion, clickhouse harness flag
+#
+# Pinning is the CALLER's job (taskset): a budget of N threads on a box with
+# more cores than that still lets the scheduler spread them, which is usually
+# what you want to measure but never what you want to compare against a pin.
+THREAD_ARGS=()
+if [[ -n "$THREADS" ]]; then
+    if ! [[ "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: --threads must be a positive integer, got '$THREADS'" >&2
+        exit 1
+    fi
+    export IBEX_THREADS="$THREADS"
+    export POLARS_MAX_THREADS="$THREADS"
+    export RAYON_NUM_THREADS="$THREADS"
+    export OMP_NUM_THREADS="$THREADS"
+    export R_DATATABLE_NUM_THREADS="$THREADS"
+    THREAD_ARGS=(--threads "$THREADS")
+    echo "Thread budget: ${THREADS} per engine"
 fi
 
 DATA_ROOT="$SCRIPT_DIR/data/scales"
@@ -556,6 +595,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
+            "${THREAD_ARGS[@]}" \
             --out "$size_result_dir/duckdb.tsv" || engine_failed "duckdb"
         append_tagged_results "$rows" "$size_result_dir/duckdb.tsv"
 
@@ -585,6 +625,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
+            "${THREAD_ARGS[@]}" \
             --out "$size_result_dir/datafusion.tsv" || engine_failed "datafusion"
         append_tagged_results "$rows" "$size_result_dir/datafusion.tsv"
 
@@ -614,6 +655,7 @@ for rows in "${SIZES[@]}"; do
             --reshape-rows "$RESHAPE_ROWS" --tf-rows "${TF_ROWS_OVERRIDE:-$rows}" \
             --fill-rows "$rows" \
             --warmup "$WARMUP" --iters "$EFF_ITERS" \
+            "${THREAD_ARGS[@]}" \
             --out "$size_result_dir/clickhouse.tsv" || engine_failed "clickhouse"
         append_tagged_results "$rows" "$size_result_dir/clickhouse.tsv"
 

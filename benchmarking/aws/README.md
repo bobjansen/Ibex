@@ -7,8 +7,10 @@ pull the results back as a CSV. Three layers:
 |----------------------|------------|--------------|
 | `setup.sh`           | once, local | Creates the S3 bucket, IAM role/profile and security group. |
 | `build-ami.sh`       | local       | Bakes a reusable AMI (toolchain + R + uv + a warm ibex/Arrow build). Repeatable. |
+| `run-all.sh`         | local       | **Orchestrator**: launches every website suite in parallel under one run id + index manifest. |
 | `run.sh`             | local       | One instance runs the **whole** suite. |
 | `run-per-engine.sh`  | local       | **One instance per engine**, in parallel, then combines results. |
+| `run-thread-scaling.sh` | local    | One box, the suite once per thread count — how each engine converts cores into throughput. |
 | `run-tpch.sh`        | local       | One instance runs the TPC-H/PDS-H quartet and downloads a TSV artifact. |
 | `run-window-ohlc.sh` | local       | One instance runs the window-OHLC suite (Ibex/Polars/DuckDB) and downloads a TSV artifact. |
 | `run-r-only.sh`      | local       | One 8-core instance runs the R-only suite (data.table/dplyr/ibex-r) across a size sweep. |
@@ -16,10 +18,59 @@ pull the results back as a CSV. Three layers:
 | `bisect-git.sh`      | local       | Single-instance performance `git bisect` for one benchmark query. |
 | `compare-compilers.sh` | local     | A/B latest **Clang vs GCC** full Ibex builds for one commit. |
 | `bootstrap.sh`       | on instance | Provision (if needed) → build ibex → run suite (or compare) → upload → self-terminate. |
-| `lib.sh`             | sourced     | Shared helpers (config, AMI resolution, user-data builder). |
+| `lib.sh`             | sourced     | Shared helpers (config, AMI resolution, user-data builder, topology, manifests). |
 
 All scripts read `S3_BUCKET` / `AWS_REGION` / `IBEX_AMI` from `.config` (written
 by `setup.sh` and `build-ami.sh`); override via env or `--region`.
+
+## vCPUs are hyperthreads
+
+Read this before quoting a core count. On every current x86 instance family a
+vCPU is one SMT thread, so an instance advertises **twice** the physical cores
+it has:
+
+| Type          | vCPU | Physical cores | RAM |
+|---------------|-----:|---------------:|----:|
+| `r7i.2xlarge` |    8 |          **4** |  64 GiB |
+| `r7i.4xlarge` |   16 |          **8** | 128 GiB |
+| `r7i.8xlarge` |   32 |         **16** | 256 GiB |
+
+Every runner now prints the real topology in its launch banner and records it in
+a manifest, because "8 cores" and "8 vCPU on 4 cores" are different claims and
+only one of them is true of the published numbers.
+
+`run-thread-scaling.sh --threads-per-core 1` launches with SMT **disabled**
+(`CpuOptions`), which is how you measure physical-core scaling without a sibling
+thread quietly doing part of the work.
+
+## Provenance manifests
+
+Every runner writes a `*.manifest.json` next to its artifact recording commit,
+branch, UTC timestamp, region, instance type, vCPU/physical-core/threads-per-core
+counts, and the suite's own settings. It is written at **launch**, so a run that
+dies is still attributable. A published chart whose numbers cannot be traced to
+a commit and a box is a screenshot, not a measurement.
+
+## 0. Run everything (orchestrator)
+
+```bash
+git push
+./benchmarking/aws/run-all.sh                       # main + window-ohlc + thread-scaling
+./benchmarking/aws/run-all.sh --suites main
+./benchmarking/aws/run-all.sh --suites thread-scaling --scaling-threads 1,2,4,8,16
+```
+
+Launches each suite on its own box **in parallel** and waits for all of them,
+under one run id and one index manifest at
+`benchmarking/results/runs/<timestamp>_<commit>/manifest.json`. That is what
+makes the website's pages citable as one result rather than three measurements
+that happen to sit near each other. One suite failing does not abandon the
+others; per-suite logs land in the same directory.
+
+Two tiers, deliberately. `main` carries every engine and is the headline
+cross-engine comparison. The deep dives (`window-ohlc`, `thread-scaling`) drop
+pandas, dplyr and rivals' `-st` variants: they exist to answer one question
+well, and an engine that loses by 50x on every cell is a column nobody reads.
 
 ## 1. One-time setup
 
@@ -104,6 +155,44 @@ Default instance is `m7i.8xlarge` (32 vCPU / 128 GiB): the memory is sized so a
 per core count, plus a `versions.txt` recording the instance type, core count
 and engine versions. Data files are generated on the box and are not part of
 the artifact.
+
+## 3a.4 Thread scaling (how cores turn into throughput)
+
+```bash
+git push
+./benchmarking/aws/run-thread-scaling.sh --on-demand
+./benchmarking/aws/run-thread-scaling.sh --threads 1,2,4,8,16 --rows 16M
+./benchmarking/aws/run-thread-scaling.sh --type r7i.8xlarge --threads 1,2,4,8,16,32
+./benchmarking/aws/run-thread-scaling.sh --threads-per-core 1 --threads 1,2,4,8
+```
+
+One box, one dataset size, the **whole suite run once per thread count**. The
+per-query curve across the `threads` column is the deliverable: it separates the
+queries that scale from the ones that are still serial, which a single geomean
+cannot do. Default box is `r7i.4xlarge` (16 vCPU / **8 physical cores**) —
+double the physical cores of the published `r7i.2xlarge`.
+
+Varying the *thread budget* on a fixed box, rather than varying the instance
+size, is the point: changing instance type confounds software scaling with
+memory bandwidth, sustained clocks and NUMA. Holding the box fixed makes the
+answer a property of the engines.
+
+Every engine gets the same budget at each point (`run_scale_suite.sh --threads`
+sets `IBEX_THREADS`, `POLARS_MAX_THREADS`, `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`,
+`R_DATATABLE_NUM_THREADS` and the SQL harnesses' `--threads`), and each pass is
+pinned to cores `0..T-1`. Linux numbers one thread per physical core first, so
+the low half of the sweep is physical cores and the SMT knee stays visible
+instead of smeared.
+
+Engines default to `ibex,python,duckdb` — the three that thread and whose curves
+are comparable. The `-st` variants are skipped because **`threads=1` is that
+measurement**; running both would be the same number under two names.
+
+The launcher refuses a sweep point larger than the box's vCPU count *before*
+launching, and warns when a sweep tops out below the physical core count.
+Downloads `benchmarking/results/thread_scaling_aws_<timestamp>.csv` plus a
+`.box.txt` of `lscpu`-derived facts (the box, not the launcher, is the authority
+on core counts once `CpuOptions` is in play) and a `.manifest.json`.
 
 ## 3a.3 R-only (data.table vs dplyr vs ibex-r)
 

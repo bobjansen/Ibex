@@ -84,27 +84,25 @@
       DuckDB, ClickHouse, DataFusion, pandas, data.table, and dplyr.
     </p>
     <!-- These headline figures are copied by hand from the published run behind
-         benchmarks.html. That run predates Ibex's operator threading — its ibex
-         column scales dead-linearly with row count (1.9ms at 1M through 111.9ms
-         at 50M for mean by symbol), which is the signature of a single-threaded
-         engine. Refresh all three from the next AWS sweep, which will carry the
-         threaded numbers; do not hand-edit them from a developer box, because
-         the table beside them comes from the r7i box and the two must agree. -->
+         benchmarks.html — currently benchmarking/results/scales_aws_20260813T070455.csv,
+         the 16M rows. Refresh them from the same sweep that regenerates that
+         page; never hand-edit them from a developer box, because the table
+         beside them comes from the r7i box and the two must agree. -->
     <div class="grid-3 proof-grid">
       <article class="card proof-card">
-        <span class="proof-stat">33.6 ms</span>
+        <span class="proof-stat">7.2 ms</span>
         <h3>mean by symbol, 16M rows</h3>
-        <p>Polars: 60.5 ms. Polars single-threaded: 216 ms.</p>
+        <p>Polars: 63.8 ms. DataFusion: 35.2 ms. Ibex single-threaded: 34.4 ms.</p>
       </article>
       <article class="card proof-card">
-        <span class="proof-stat">30.6 ms</span>
+        <span class="proof-stat">18.9 ms</span>
         <h3>count by symbol x day, 16M rows</h3>
-        <p>Polars: 220 ms. DuckDB: 77.6 ms. DataFusion: 58.1 ms.</p>
+        <p>Polars: 290 ms. DuckDB: 66.1 ms. DataFusion: 49.1 ms.</p>
       </article>
       <article class="card proof-card">
-        <span class="proof-stat">49.7 ms</span>
+        <span class="proof-stat">50.5 ms</span>
         <h3>rolling sum 1m, 16M rows</h3>
-        <p>Polars: 152 ms. Polars single-threaded: 283 ms.</p>
+        <p>Polars: 146 ms. DuckDB: 1.24 s. DataFusion: 14.0 s.</p>
       </article>
     </div>
     <div class="cta-row">

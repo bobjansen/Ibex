@@ -165,7 +165,7 @@ if [[ $INSTALL_R -eq 1 ]]; then
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"
     R_LIBS_USER="$R_BENCH_LIB" Rscript --vanilla -e '
-        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow")
+        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow", "slider")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org",

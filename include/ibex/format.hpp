@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <format>
 #include <ostream>
-#include <print>
 #include <string>
 #include <utility>
 
@@ -24,18 +23,18 @@ auto format(format_string<Args...> pattern, Args&&... args) -> std::string {
 }
 
 template <typename... Args>
-void print(format_string<Args...> pattern, Args&&... args) {
-    std::print(pattern, std::forward<Args>(args)...);
+void print(std::FILE* stream, format_string<Args...> pattern, Args&&... args) {
+    const auto text = std::format(pattern, std::forward<Args>(args)...);
+    std::fputs(text.c_str(), stream);
 }
 
 template <typename... Args>
-void print(std::FILE* stream, format_string<Args...> pattern, Args&&... args) {
-    std::print(stream, pattern, std::forward<Args>(args)...);
+void print(format_string<Args...> pattern, Args&&... args) {
+    print(stdout, pattern, std::forward<Args>(args)...);
 }
 
-// Apple's initial std::print implementation omitted this overload. Formatting
-// into the stream explicitly provides the same behaviour on every supported
-// standard library.
+// Formatting into streams explicitly keeps this surface independent from the
+// still uneven C++23 std::print implementation across standard libraries.
 template <typename... Args>
 void print(std::ostream& stream, format_string<Args...> pattern, Args&&... args) {
     stream << std::format(pattern, std::forward<Args>(args)...);

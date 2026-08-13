@@ -81,8 +81,8 @@ before binding it. Descriptor-only nanoarrow operations such as creating a
 shallow slice do not mutate the shared buffers.
 
 Install directly from GitHub (the configure step downloads and builds the
-minimal Ibex runtime; this needs CMake 3.26+, a C++23 toolchain with `<format>`
-and `<print>`, `curl`, and `tar):
+minimal Ibex runtime; this needs CMake 3.26+, a C++23 toolchain with `<format>`,
+`curl`, and `tar):
 
 ```r
 remotes::install_github("bobjansen/Ibex", subdir = "r/ibex")

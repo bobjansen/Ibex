@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/format.hpp>
 #include <ibex/runtime/worker_pool.hpp>
-
-#include <fmt/format.h>
 
 #include <algorithm>
 #include <atomic>
@@ -154,20 +153,21 @@ thread_local ExecutionProfileScope::Frame* current_frame = nullptr;
 [[nodiscard]] auto node_label(const ir::Node& node) -> std::string {
     if (node.kind() == ir::NodeKind::Scan) {
         const auto& scan = static_cast<const ir::ScanNode&>(node);
-        return fmt::format("scan {}", scan.source_name());
+        return ibex::formatting::format("scan {}", scan.source_name());
     }
     if (node.kind() == ir::NodeKind::ExternCall) {
         const auto& call = static_cast<const ir::ExternCallNode&>(node);
-        return fmt::format("extern {}", call.callee());
+        return ibex::formatting::format("extern {}", call.callee());
     }
     if (node.kind() == ir::NodeKind::Join) {
         const auto& join = static_cast<const ir::JoinNode&>(node);
-        return fmt::format("join {} keys={}", join_kind_name(join.kind()), join.keys().size());
+        return ibex::formatting::format("join {} keys={}", join_kind_name(join.kind()),
+                                        join.keys().size());
     }
     if (node.kind() == ir::NodeKind::Aggregate) {
         const auto& aggregate = static_cast<const ir::AggregateNode&>(node);
-        return fmt::format("aggregate keys={} aggs={}", aggregate.group_by().size(),
-                           aggregate.aggregations().size());
+        return ibex::formatting::format("aggregate keys={} aggs={}", aggregate.group_by().size(),
+                                        aggregate.aggregations().size());
     }
     return std::string(node_kind_name(node.kind()));
 }
@@ -233,35 +233,35 @@ ExecutionProfileState::~ExecutionProfileState() {
     });
     const std::size_t budget = impl_->worker_budget;
     const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
-    fmt::print(stderr,
-               "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
-               "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
-               "pool_work_ms={:.3f} occupancy={:.3f}\n",
-               total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
-               summary.serial_fraction, summary.amdahl_ceiling, summary.pool_work_ms,
-               summary.occupancy);
+    ibex::formatting::print(stderr,
+                            "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
+                            "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
+                            "pool_work_ms={:.3f} occupancy={:.3f}\n",
+                            total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
+                            summary.serial_fraction, summary.amdahl_ceiling, summary.pool_work_ms,
+                            summary.occupancy);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
         occupancy_row.pool_work_ns = row->pool_work_ns.load(std::memory_order_relaxed);
         const double row_occupancy = profile_row_occupancy(occupancy_row, budget);
-        fmt::print(stderr,
-                   "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
-                   "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} "
-                   "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
-                   "chunks={} rows={} pool_calls={} pool_tasks={}\n",
-                   row->node_id, row->label,
-                   static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   static_cast<double>(row->source_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
-                   row_occupancy, row->calls.load(std::memory_order_relaxed),
-                   row->chunks.load(std::memory_order_relaxed),
-                   row->rows.load(std::memory_order_relaxed),
-                   row->pool_thread_calls.load(std::memory_order_relaxed),
-                   row->pool_tasks.load(std::memory_order_relaxed));
+        ibex::formatting::print(
+            stderr,
+            "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
+            "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} "
+            "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
+            "chunks={} rows={} pool_calls={} pool_tasks={}\n",
+            row->node_id, row->label,
+            static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->source_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            row_occupancy, row->calls.load(std::memory_order_relaxed),
+            row->chunks.load(std::memory_order_relaxed), row->rows.load(std::memory_order_relaxed),
+            row->pool_thread_calls.load(std::memory_order_relaxed),
+            row->pool_tasks.load(std::memory_order_relaxed));
     }
 }
 

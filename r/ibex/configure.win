@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+# R runs configure.win rather than configure on Windows. Rtools provides the
+# POSIX shell tools used here (curl, tar, sed, and CMake), so keep this in sync
+# with configure while writing the Windows-specific Makevars name.
+if [ -z "${IBEX_GITHUB_REF:-}" ]; then
+  IBEX_GITHUB_REF=$(sed -n 's/^RemoteSha:[[:space:]]*//p' DESCRIPTION | head -n 1)
+  IBEX_GITHUB_REF=${IBEX_GITHUB_REF:-main}
+fi
+IBEX_SOURCE_URL=${IBEX_SOURCE_URL:-"https://github.com/bobjansen/Ibex/archive/${IBEX_GITHUB_REF}.tar.gz"}
+IBEX_ROOT=${IBEX_ROOT:-"$(pwd)/src/ibex-src"}
+IBEX_BUILD_DIR=${IBEX_BUILD_DIR:-"$(pwd)/src/ibex-build"}
+
+if [ ! -d "${IBEX_ROOT}/include/ibex" ]; then
+  command -v curl >/dev/null 2>&1 || {
+    echo "configure.win: error: curl is required to download Ibex from GitHub" >&2
+    exit 1
+  }
+  command -v tar >/dev/null 2>&1 || {
+    echo "configure.win: error: tar is required to unpack Ibex" >&2
+    exit 1
+  }
+  echo "configure.win: downloading Ibex (${IBEX_GITHUB_REF})" >&2
+  rm -rf "${IBEX_ROOT}"
+  mkdir -p "${IBEX_ROOT}"
+  curl -fsSL "${IBEX_SOURCE_URL}" \
+    | tar -xz --strip-components=1 -C "${IBEX_ROOT}"
+fi
+
+command -v cmake >/dev/null 2>&1 || {
+  echo "configure.win: error: CMake 3.26 or newer is required" >&2
+  exit 1
+}
+
+if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
+  echo "configure.win: building the minimal Ibex runtime" >&2
+  cmake -S "${IBEX_ROOT}" -B "${IBEX_BUILD_DIR}" \
+    -DIBEX_MINIMAL_RUNTIME=ON \
+    -DIBEX_BUILD_TESTS=OFF \
+    -DIBEX_BUILD_TOOLS=OFF \
+    -DIBEX_BUILD_EXAMPLES=OFF \
+    -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+    -DIBEX_BUILD_PARQUET=OFF \
+    -DIBEX_BUILD_LIGHTGBM=OFF \
+    -DIBEX_USE_CCACHE=OFF
+  cmake --build "${IBEX_BUILD_DIR}" --target \
+    ibex_core ibex_ir ibex_parser ibex_runtime ibex_interop --parallel
+fi
+
+sed \
+  -e "s|@IBEX_ROOT@|${IBEX_ROOT}|g" \
+  -e "s|@IBEX_BUILD_DIR@|${IBEX_BUILD_DIR}|g" \
+  -e 's|@IBEX_SYSTEM_LIBS@|-pthread -lm|g' \
+  src/Makevars.in > src/Makevars.win

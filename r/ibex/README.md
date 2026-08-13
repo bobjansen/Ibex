@@ -80,7 +80,15 @@ outside either binding. Copy such writable foreign data to a `data.frame`
 before binding it. Descriptor-only nanoarrow operations such as creating a
 shallow slice do not mutate the shared buffers.
 
-Install from the repo checkout with an existing `build-release`:
+Install directly from GitHub (the configure step downloads and builds the
+minimal Ibex runtime; this needs CMake 3.26+, a C++23 toolchain with `<format>`
+and `<print>`, `curl`, and `tar):
+
+```r
+remotes::install_github("bobjansen/Ibex", subdir = "r/ibex")
+```
+
+For development, an existing build tree can be reused:
 
 ```sh
 IBEX_ROOT=/path/to/ibex \

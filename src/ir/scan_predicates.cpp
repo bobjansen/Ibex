@@ -397,6 +397,26 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
 
 }  // namespace
 
+auto plan_join_key_columns(const Node& root) -> std::set<std::string> {
+    std::set<std::string> out;
+    const auto walk = [&out](const Node& node, const auto& self) -> void {
+        if (node.kind() == NodeKind::Join) {
+            const auto& join = static_cast<const JoinNode&>(node);
+            for (const auto& key : join.keys()) {
+                out.insert(key.left);
+                out.insert(key.right);
+            }
+        }
+        for (const auto& child : node.children()) {
+            if (child != nullptr) {
+                self(*child, self);
+            }
+        }
+    };
+    walk(root, walk);
+    return out;
+}
+
 auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
     -> std::map<std::string, DeferrableProbeScan> {
     std::map<std::string, DeferrableProbeScan> out;

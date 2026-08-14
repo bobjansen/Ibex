@@ -525,23 +525,7 @@ class ChunkedFilterTailOperator final : public Operator {
                 }
                 append_validity(out.columns[i].validity, dst_rows, src_t.columns[i].validity,
                                 src_rows);
-                auto& dst_col = out.mutable_column(i);
-                std::visit(
-                    [&](auto& dst) {
-                        using Col = std::decay_t<decltype(dst)>;
-                        auto& src = std::get<Col>(*src_t.columns[i].column);
-                        dst.reserve(dst.size() + src.size());
-                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_code(src.code_at(r));
-                            }
-                        } else {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_back(src[r]);
-                            }
-                        }
-                    },
-                    dst_col);
+                append_column_values(out.mutable_column(i), *src_t.columns[i].column);
             }
             buffered_.pop_front();
         }
@@ -1782,23 +1766,7 @@ class ChunkedOrderOperator final : public Operator {
                 }
                 append_validity(out.columns[i].validity, dst_rows, chunk.columns[i].validity,
                                 src_rows);
-                auto& dst_col = out.mutable_column(i);
-                std::visit(
-                    [&](auto& dst) {
-                        using Col = std::decay_t<decltype(dst)>;
-                        auto& src = std::get<Col>(*chunk.columns[i].column);
-                        dst.reserve(dst.size() + src.size());
-                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_code(src.code_at(r));
-                            }
-                        } else {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_back(src[r]);
-                            }
-                        }
-                    },
-                    dst_col);
+                append_column_values(out.mutable_column(i), *chunk.columns[i].column);
             }
         }
         return {};

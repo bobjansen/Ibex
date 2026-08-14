@@ -253,12 +253,35 @@ island cost", and it says the wins track *output* size — which is exactly the
 observed split, since every query that gains reduces its rows sharply (q06,
 q12) and every one that loses binds a large intermediate.
 
-Still open: **q20 +23%**, which is a different cause — its high-cardinality
-group-by on `(l_partkey, l_suppkey)` costs 40ms -> 68ms when fed six chunks
-rather than one, with no concat involved. That is the chunked aggregate's own
-merge, and it connects to the existing high-cardinality group-by gap. **q21
-+9%** and **q22 +7%** are the concat above. The scan itself is now faster than
-materializing on every query measured.
+**q20, run down — and the general lesson.** Its high-cardinality group-by cost
+50ms -> 79ms under streaming, and the cause was not the aggregate's merge but
+its **gate**: `pool_tasks` went 32 -> 0, i.e. partitioned group discovery
+declined outright. The gate asks "are there enough rows here to be worth
+partitioning", and it asked it of the CURRENT CALL. q20's aggregate sees 909k
+rows over 543k groups — comfortably qualifying — but as six chunks that is
+~151k per call, under the 262144 threshold, so it declined on every one.
+
+**Chunking divides every per-chunk row gate by the number of chunks.** That is
+the systemic consequence of this phase and it will keep biting; q20 is simply
+where it bit first. The engine's other row gates use `parallel_min_rows`
+(65536) and still clear it at these sizes, which is why only this one showed.
+
+Fixed by counting the rows the *operator* has been offered rather than the rows
+in this call. The threshold itself is unchanged — lowering it is a measured
+dead end, because the break-even is set by group cardinality, not row count
+(`plans/` history: q13 +9.3%). Starting part-way through a stream then means
+groups already exist in the serial index, which the partitioned path neither
+reads nor writes, so they are seeded into the partitions keeping their existing
+ids. Only the packed path cannot do this — its key is built from a row and is
+not invertible — so it declines to start late, which is the previous behaviour.
+
+q20 +23% -> +10%, q21 +9% -> +5%, suite geomean unchanged at 0.921. What is
+left on q20 is that its first chunk is still discovered serially and its groups
+then seeded; closing that needs the aggregate to defer its first chunk until
+the decision is made.
+
+**q22 +7%** and the rest of **q21** are the concat above. The scan itself is
+now faster than materializing on every query measured.
 
 The rest of this phase — a scheduler that runs the whole operator chain
 concurrently rather than just the scan — is unstarted, and the table below is

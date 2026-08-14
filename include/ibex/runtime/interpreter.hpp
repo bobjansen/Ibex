@@ -656,11 +656,16 @@ struct DeferredScanPlan {
 /// Whether a lazy source should be streamed through its scan operator rather
 /// than decoded whole before the plan runs.
 ///
-/// Off by default while Phase 1 of `plans/pipelined-execution-plan.md` is
-/// measured; `IBEX_STREAM_SCAN=1` turns it on. Read fresh each call so a test
-/// can flip it, and consulted in exactly two places — the driver that decides
-/// whether to defer a source, and the scan operator builder — which must agree,
-/// hence one function rather than two `getenv`s.
+/// **On by default** (`plans/pipelined-execution-plan.md`, Phases 1-2):
+/// streaming measures 7.8% faster than materializing on PDS-H at 8 cores and
+/// 5.7% faster on one, and it bounds how much of a source is decoded at once.
+/// `IBEX_STREAM_SCAN=0` (or `off`/`false`/`no`) turns it off, which is the
+/// escape hatch for a bug in it or an A/B against it.
+///
+/// Read fresh each call so a test can flip it, and consulted in exactly two
+/// places — the driver that decides whether to defer a source, and the scan
+/// operator builder — which must agree, hence one function rather than two
+/// `getenv`s.
 [[nodiscard]] auto stream_scans_enabled() -> bool;
 
 /// The scan's streaming decomposition, or empty when its source has none (a

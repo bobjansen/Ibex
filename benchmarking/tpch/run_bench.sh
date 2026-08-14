@@ -16,9 +16,16 @@
 # at parquet_sf<scale>/ for the scale it is timing. Correctness (check_answers.py)
 # is only defined at SF-1; higher scales are timing-only.
 #
+# Every run is also ARCHIVED under results/runs/<utc>_<commit>/ with a manifest
+# recording the commit, the settings and the box. results/ itself keeps holding
+# the latest run under fixed names, because print_table.py and the website
+# generator read those — the archive is what makes two runs comparable, which
+# fixed names alone can never be: a rerun silently overwrites the numbers you
+# wanted to compare against. Use compare_runs.py to diff two archived runs.
+#
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
-#                  [--skip-pdsh] [--cores N]
+#                  [--skip-pdsh] [--cores N] [--label TEXT] [--no-archive]
 
 set -euo pipefail
 
@@ -31,6 +38,8 @@ SCALE=1
 WARMUP=1
 ITERS=5
 SKIP_PDSH=0
+ARCHIVE=1
+LABEL=""
 # Cores the whole comparison is pinned to. Unset means "every core on the box",
 # which is the wrong default for a CROSS-ENGINE run on a big local machine:
 # Polars sizes its pool from nproc and thrashes above ~8, which inflates Ibex's
@@ -45,6 +54,8 @@ while [[ $# -gt 0 ]]; do
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
         --skip-pdsh) SKIP_PDSH=1; shift ;;
         --cores)  CORES="$2"; shift 2 ;;
+        --label)  LABEL="$2"; shift 2 ;;
+        --no-archive) ARCHIVE=0; shift ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -72,6 +83,69 @@ if [[ -n "$CORES" ]]; then
     export POLARS_MAX_THREADS="$CORES"
     echo "=== pinned to ${CORES} cores (of $(nproc)) ==="
 fi
+
+# ── Archiving ────────────────────────────────────────────────────────────────
+# Copy this run's TSVs somewhere a later run cannot overwrite, next to a
+# manifest saying what produced them.
+#
+# The manifest records the things that silently invalidate a comparison. The
+# commit and the dirty flag, because a number from an uncommitted tree cannot be
+# reproduced. The core count and scale, because the same query at 8 and 24 cores
+# is two different measurements. Which engine rows were MEASURED versus carried
+# forward from an earlier run, because `--skip-pdsh` leaves real-looking columns
+# in the table that this run did not produce. And the CPU, since these land in
+# the repo and get read on other machines.
+archive_run() {
+    [[ "$ARCHIVE" -eq 1 ]] || return 0
+    local commit branch dirty stamp dir
+    commit=$(git -C "$IBEX_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+    branch=$(git -C "$IBEX_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+    dirty=false
+    [[ -n "$(git -C "$IBEX_ROOT" status --porcelain 2>/dev/null)" ]] && dirty=true
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dir="$RESULTS/runs/${stamp}_${commit:0:8}_sf${SCALE}"
+    mkdir -p "$dir"
+
+    local measured=("ibex" "ibex-st" "polars" "polars-st") carried=()
+    if [[ "$SKIP_PDSH" -eq 1 ]]; then
+        carried=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
+    else
+        measured+=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
+    fi
+
+    local f
+    for f in "$RESULTS"/*"${SUFFIX}.tsv"; do
+        [[ -e "$f" ]] && cp "$f" "$dir/"
+    done
+
+    local join_list
+    join_list() { local IFS=,; echo "$*"; }
+    {
+        printf '{\n'
+        printf '  "suite": "pdsh",\n'
+        printf '  "commit": "%s",\n' "$commit"
+        printf '  "branch": "%s",\n' "$branch"
+        printf '  "dirty": %s,\n' "$dirty"
+        printf '  "generated_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '  "scale_factor": %s,\n' "$SCALE"
+        printf '  "cores": "%s",\n' "${CORES:-all:$(nproc)}"
+        printf '  "warmup": %s,\n' "$WARMUP"
+        printf '  "iters": %s,\n' "$ITERS"
+        printf '  "measured": "%s",\n' "$(join_list "${measured[@]}")"
+        printf '  "carried_forward": "%s",\n' "$(join_list "${carried[@]}")"
+        printf '  "host": "%s",\n' "$(uname -n)"
+        printf '  "kernel": "%s",\n' "$(uname -r)"
+        printf '  "cpu": "%s",\n' "$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name: *//p' | head -1)"
+        printf '  "nproc": %s,\n' "$(nproc)"
+        printf '  "label": "%s"\n' "$LABEL"
+        printf '}\n'
+    } > "$dir/manifest.json"
+
+    echo
+    echo "archived to ${dir#"$IBEX_ROOT"/}"
+    [[ "$dirty" == true ]] && echo "  WARNING: working tree was dirty — this run is not reproducible"
+    return 0
+}
 
 # Point the path the queries read at this scale's data.
 ln -sfn "parquet_sf${SCALE}" "$DATA_ROOT/parquet"
@@ -115,6 +189,7 @@ if [[ "$SKIP_PDSH" -eq 1 ]]; then
     done
     echo
     python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*"${SUFFIX}.tsv"
+    archive_run
     exit 0
 fi
 
@@ -140,3 +215,4 @@ uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --thre
 
 echo
 python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*"${SUFFIX}.tsv"
+archive_run

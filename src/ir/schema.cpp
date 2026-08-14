@@ -171,6 +171,9 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         if (call->callee == "rolling_count") {
             return ColumnType::Int64;
         }
+        if (call->callee == "length" || call->callee == "byte_length") {
+            return ColumnType::Int64;
+        }
         if (call->callee == "like" || call->callee == "is_nan") {
             return ColumnType::Bool;
         }

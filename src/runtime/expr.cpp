@@ -606,6 +606,9 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
     return std::unexpected(call.callee + "(): cannot cast non-numeric to Float");
 }
 
+auto string_length_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
+                          const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string>;
+
 }  // namespace
 
 auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
@@ -620,6 +623,8 @@ auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn {
             return &coalesce_kernel;
         case ScalarKernel::Like:
             return &like_kernel;
+        case ScalarKernel::StringLength:
+            return &string_length_kernel;
         case ScalarKernel::NumericCast:
             return &numeric_cast_kernel;
     }
@@ -678,25 +683,37 @@ auto validate_builtin(std::string_view name, const BuiltinFn& fn) -> void {
 /// codepoint `i` spans `[out[i], out[i + 1])`. A malformed lead or truncated
 /// sequence is treated as a single-byte codepoint, which keeps the walk in
 /// bounds rather than reading past the end.
-auto utf8_codepoint_offsets(const std::string& s) -> std::vector<std::size_t> {
+auto utf8_codepoint_advance(std::string_view s, std::size_t i) -> std::size_t {
+    const auto lead = static_cast<unsigned char>(s[i]);
+    std::size_t advance = 1;
+    if (lead >= 0xF0) {
+        advance = 4;
+    } else if (lead >= 0xE0) {
+        advance = 3;
+    } else if (lead >= 0xC0) {
+        advance = 2;
+    }
+    return std::min(advance, s.size() - i);
+}
+
+auto utf8_codepoint_offsets(std::string_view s) -> std::vector<std::size_t> {
     std::vector<std::size_t> offsets;
     offsets.reserve(s.size() + 1);
     std::size_t i = 0;
     while (i < s.size()) {
         offsets.push_back(i);
-        const auto lead = static_cast<unsigned char>(s[i]);
-        std::size_t advance = 1;
-        if (lead >= 0xF0) {
-            advance = 4;
-        } else if (lead >= 0xE0) {
-            advance = 3;
-        } else if (lead >= 0xC0) {
-            advance = 2;
-        }
-        i += std::min(advance, s.size() - i);
+        i += utf8_codepoint_advance(s, i);
     }
     offsets.push_back(s.size());
     return offsets;
+}
+
+[[nodiscard]] auto utf8_codepoint_count(std::string_view s) -> std::int64_t {
+    std::int64_t count = 0;
+    for (std::size_t i = 0; i < s.size(); i += utf8_codepoint_advance(s, i)) {
+        ++count;
+    }
+    return count;
 }
 
 /// `substring(s, start[, length])` on Unicode codepoints, Polars `str.slice`
@@ -718,6 +735,51 @@ auto utf8_substring(const std::string& s, std::int64_t start, std::optional<std:
     return s.substr(
         offsets[static_cast<std::size_t>(begin)],
         offsets[static_cast<std::size_t>(end)] - offsets[static_cast<std::size_t>(begin)]);
+}
+
+auto string_length_kernel(const ir::CallExpr& call, const Table& input, std::size_t rows,
+                          const ColumnEvalCtx& ctx) -> std::expected<ComputedColumn, std::string> {
+    if (call.args.size() != 1) {
+        return std::unexpected(call.callee + ": expected 1 String argument");
+    }
+    auto value = resolve_like_arg(*call.args[0], input, ctx.scalars);
+    if (!value) {
+        return std::unexpected(call.callee + ": " + value.error());
+    }
+
+    const bool bytes = call.callee == "byte_length";
+    const auto measure = [bytes](std::string_view text) -> std::int64_t {
+        return bytes ? static_cast<std::int64_t>(text.size()) : utf8_codepoint_count(text);
+    };
+
+    Column<std::int64_t> out;
+    if (value->categorical != nullptr) {
+        out.resize(rows);
+        auto* values = out.data();
+        const auto& dict = value->categorical->dictionary();
+        std::vector<std::int64_t> dictionary_lengths(dict.size());
+        for (std::size_t i = 0; i < dict.size(); ++i) {
+            dictionary_lengths[i] = measure(dict[i]);
+        }
+        const auto* codes = value->categorical->codes_data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            values[i] = dictionary_lengths[static_cast<std::size_t>(codes[i])];
+        }
+    } else if (value->dense != nullptr) {
+        out.resize(rows);
+        auto* values = out.data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            values[i] = measure((*value->dense)[i]);
+        }
+    } else {
+        out.resize(rows, measure(value->scalar));
+    }
+
+    std::optional<ValidityBitmap> validity;
+    if (value->validity != nullptr) {
+        validity = *value->validity;
+    }
+    return ComputedColumn{.column = ColumnValue{std::move(out)}, .validity = std::move(validity)};
 }
 
 }  // namespace
@@ -1078,6 +1140,33 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           return ExprValue{utf8_substring(*value, *start, length)};
                       }},
                   });
+
+        for (const std::string_view name : {"length", "byte_length"}) {
+            m.emplace(
+                name,
+                BuiltinFn{
+                    .min_args = 1,
+                    .max_args = 1,
+                    .scalar_kernel = ScalarKernel::StringLength,
+                    .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                        if (a[0] != ExprType::String) {
+                            return std::unexpected(std::string(name) + ": argument must be String");
+                        }
+                        return ExprType::Int;
+                    },
+                    .exec = ScalarExec{.eval = [](std::string_view name,
+                                                  const std::vector<ExprValue>& a) -> IV {
+                        const auto* value = std::get_if<std::string>(a.data());
+                        if (value == nullptr) {
+                            return std::unexpected(std::string(name) + ": argument must be String");
+                        }
+                        if (name == "byte_length") {
+                            return ExprValue{static_cast<std::int64_t>(value->size())};
+                        }
+                        return ExprValue{utf8_codepoint_count(*value)};
+                    }},
+                });
+        }
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).
         const BuiltinFn pminmax{

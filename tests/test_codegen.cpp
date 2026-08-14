@@ -747,6 +747,19 @@ TEST_CASE("emitter: like as an update field emits a value-position call", "[code
     CHECK(contains(out, "\"%green%\""));
 }
 
+TEST_CASE("emitter: string length calls use the generic value-call path", "[codegen][string]") {
+    ir::Builder b;
+    auto update = b.update({
+        {"chars", ops::fn_call("length", {ops::col_ref("name")})},
+        {"bytes", ops::fn_call("byte_length", {ops::col_ref("name")})},
+    });
+    update->add_child(make_source(b, "part.csv"));
+
+    const auto out = emit_to_string(*update);
+    CHECK(contains(out, "ibex::ops::fn_call(\"length\""));
+    CHECK(contains(out, "ibex::ops::fn_call(\"byte_length\""));
+}
+
 TEST_CASE("emitter: a boolean-valued field emits its predicate node", "[codegen]") {
     // Boolean nodes are legal in value position (`flag = !like(...)`), and the
     // interpreter builds a Bool column from them — codegen must emit the same

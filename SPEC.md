@@ -3447,6 +3447,8 @@ extern implementations. The recommended path for custom scalar logic is
 | `pmax(x, y, ...)`| `Comparable{2+} -> Comparable`    |
 | `is_nan(x)`     | `Float64 -> Bool`                  |
 | `like(s, pattern)` | `(String, String) -> Bool` (SQL-LIKE matching, see below) |
+| `length(s)` | `String -> Int64` (Unicode code-point count, see below) |
+| `byte_length(s)` | `String -> Int64` (UTF-8 byte count, see below) |
 | `substring(s, start[, len])` | `(String, Int[, Int]) -> String` (0-based codepoint slice, see below) |
 | `is_null(x)` / `is_not_null(x)` | `Any -> Bool` (tests the value's null bit; never null itself) |
 | `coalesce(a, b, ...)` | `T{1+} -> T` (first non-null argument per row; args share one type) |
@@ -3553,6 +3555,22 @@ Semantics:
 
 Case-insensitive matching, regular expressions, and collation are deliberately
 out of scope.
+
+#### String Length — `length` and `byte_length`
+
+`length(s)` returns the number of Unicode code points in `s`, matching the
+unit used by `substring`. `byte_length(s)` returns the number of UTF-8 bytes
+instead. Both have signature `(String) -> Int64` and propagate null.
+
+```
+let labels = Table { name = ["café", "日本語"] };
+labels[update { characters = length(name), bytes = byte_length(name) }];
+// café: characters = 4, bytes = 5
+// 日本語: characters = 3, bytes = 9
+```
+
+Use `length` for user-facing text. `byte_length` is for byte-oriented formats
+and SQL compatibility; it is the direct translation of ClickBench `STRLEN`.
 
 #### String Slicing — `substring`
 

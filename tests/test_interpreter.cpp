@@ -12193,6 +12193,26 @@ auto substring_over(const std::vector<std::string>& values, const std::string& c
     return out;
 }
 
+auto string_length_over(const std::vector<std::string>& values, std::string_view function)
+    -> std::vector<std::int64_t> {
+    Column<std::string> col;
+    for (const auto& value : values) {
+        col.push_back(value);
+    }
+    runtime::Table t;
+    t.add_column("v", std::move(col));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    const std::string source = "t[update { m = " + std::string(function) + "(v) }][select { m }];";
+    auto ir = require_ir(source.c_str());
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<std::int64_t>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    return {m->begin(), m->end()};
+}
+
 }  // namespace
 
 TEST_CASE("table consumer dispatches a planned script sink", "[interpreter][extern]") {
@@ -12276,6 +12296,80 @@ TEST_CASE("substring propagates null", "[interpreter][substring]") {
     REQUIRE(out->validity.has_value());
     CHECK((*out->validity)[0] == true);
     CHECK((*out->validity)[1] == false);  // null in -> null out
+}
+
+TEST_CASE("length counts Unicode codepoints while byte_length counts UTF-8 bytes",
+          "[interpreter][string]") {
+    const std::vector<std::string> values{"", "abc", "café", "日本語"};
+    CHECK(string_length_over(values, "length") == std::vector<std::int64_t>{0, 3, 4, 3});
+    CHECK(string_length_over(values, "byte_length") == std::vector<std::int64_t>{0, 3, 5, 9});
+}
+
+TEST_CASE("string lengths preserve nulls and use categorical dictionaries",
+          "[interpreter][string]") {
+    std::vector<std::string> dict{"é", "日本", "plain"};
+    Column<Categorical> category(dict);
+    for (const auto code : {0, 1, 0, 2}) {
+        category.push_code(static_cast<Column<Categorical>::code_type>(code));
+    }
+    runtime::Table t;
+    t.add_column("c", std::move(category), std::vector<bool>{true, true, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(R"(t[update { chars = length(c), bytes = byte_length(c) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* chars = std::get_if<Column<std::int64_t>>(result->find("chars"));
+    const auto* bytes = std::get_if<Column<std::int64_t>>(result->find("bytes"));
+    REQUIRE(chars != nullptr);
+    REQUIRE(bytes != nullptr);
+    CHECK(std::vector<std::int64_t>{chars->begin(), chars->end()} ==
+          std::vector<std::int64_t>{1, 2, 1, 5});
+    CHECK(std::vector<std::int64_t>{bytes->begin(), bytes->end()} ==
+          std::vector<std::int64_t>{2, 6, 2, 5});
+    const auto* chars_entry = result->find_entry("chars");
+    REQUIRE(chars_entry != nullptr);
+    REQUIRE(chars_entry->validity.has_value());
+    CHECK((*chars_entry->validity)[0] == true);
+    CHECK((*chars_entry->validity)[1] == true);
+    CHECK((*chars_entry->validity)[2] == false);
+    CHECK((*chars_entry->validity)[3] == true);
+}
+
+TEST_CASE("string length functions reject non-String arguments", "[interpreter][string]") {
+    runtime::Table t;
+    t.add_column("n", Column<std::int64_t>{1});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    for (const std::string_view function : {"length", "byte_length"}) {
+        auto ir = require_ir(("t[update { m = " + std::string(function) + "(n) }];").c_str());
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find(std::string(function)) != std::string::npos);
+    }
+}
+
+TEST_CASE("string lengths support scalar broadcast and computed expressions",
+          "[interpreter][string]") {
+    runtime::Table t;
+    t.add_column("v", Column<std::string>{"éclair", "日本語"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        R"(t[update { literal = byte_length("é"), prefix = length(substring(v, 0, 1)) }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* literal = std::get_if<Column<std::int64_t>>(result->find("literal"));
+    const auto* prefix = std::get_if<Column<std::int64_t>>(result->find("prefix"));
+    REQUIRE(literal != nullptr);
+    REQUIRE(prefix != nullptr);
+    CHECK(std::vector<std::int64_t>{literal->begin(), literal->end()} ==
+          std::vector<std::int64_t>{2, 2});
+    CHECK(std::vector<std::int64_t>{prefix->begin(), prefix->end()} ==
+          std::vector<std::int64_t>{1, 1});
 }
 
 TEST_CASE("QueryExecutionLease grants the single slot exclusively", "[runtime][lease]") {

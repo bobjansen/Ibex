@@ -5230,6 +5230,12 @@ class ChunkedAggregateOperator final : public Operator {
         // be probed in the same flat int map the single-int path uses. That is
         // the common shape of `by { symbol, day }`, and it halves the key
         // width, the hash and the stored entry against the 128-bit form.
+        // Both key domains are 32 bits wide here, so the composite is exact.
+        const auto pack_u64 = [](std::int64_t a, std::int64_t b) -> std::int64_t {
+            return static_cast<std::int64_t>(
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) << 32U) |
+                static_cast<std::uint64_t>(static_cast<std::uint32_t>(b)));
+        };
         if (pair_packs_u64_) {
             // Both key domains are narrow enough to enumerate: a Categorical
             // spans its dictionary, and a Date column's span is measured. When
@@ -5240,11 +5246,46 @@ class ChunkedAggregateOperator final : public Operator {
             if (try_process_rows_pair_dense(key_a_at, key_b_at, group_entries, agg_entries, rows)) {
                 return std::nullopt;
             }
-            const auto pack_u64 = [](std::int64_t a, std::int64_t b) -> std::int64_t {
-                return static_cast<std::int64_t>(
-                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) << 32U) |
-                    static_cast<std::uint64_t>(static_cast<std::uint32_t>(b)));
-            };
+            // Discovery across workers, for the case the dense array cannot
+            // hold: the cell budget is a product, so a wide symbol domain times
+            // a wide day domain overflows it long before either alone is
+            // remarkable, and the u64 key that falls out is the CHEAPEST key in
+            // this file to partition. Until now this branch returned before ever
+            // reaching `try_discover_partitioned` — a `by { symbol, day }` over
+            // 5000 symbols and 1000 days ran wholly serially.
+            //
+            // Only while the dense path has never run. Dense numbers groups in
+            // its own array and rebuilds that array from `pair_order_`, so it
+            // can safely take over from partitioned discovery; the reverse is
+            // not true, because the partitions would not know the groups dense
+            // had already numbered and would issue second ids for them.
+            if (!pair_dense_active_ &&
+                try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
+                    [&](std::size_t row) { return pack_u64(key_a_at(row), key_b_at(row)); }, rows,
+                    gids, int_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
+                    [&](std::int64_t, std::uint32_t gid, std::size_t row) {
+                        // From the row, not by unpacking: `pair_order_` holds the
+                        // reader's own values, and the pack truncates to 32 bits.
+                        pair_order_[gid] = {key_a_at(row), key_b_at(row)};
+                    })) {
+                accumulate_gids(gids, agg_entries, rows);
+                return std::nullopt;
+            }
+
+            // Falling here with groups already numbered means the dense path ran
+            // on an earlier chunk and this chunk's domains overflowed its budget.
+            // `int_index_` has no record of those groups, so without this it
+            // would issue a second id for each and the output would carry two
+            // rows per key. `pair_order_` is the pair path's source of truth —
+            // this is the same rebuild dense itself does when its bounds move.
+            if (int_index_.size() < pair_order_.size()) {
+                int_index_.reserve(pair_order_.size());
+                for (std::size_t g = 0; g < pair_order_.size(); ++g) {
+                    int_index_.emplace(pack_u64(pair_order_[g].first, pair_order_[g].second),
+                                       static_cast<std::uint32_t>(g));
+                }
+            }
+
             std::int64_t prev_packed = 0;
             std::uint32_t prev_gid_u64 = std::numeric_limits<std::uint32_t>::max();
             bool have_prev_u64 = false;

@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
 #include <ibex/ir/join_pushdown.hpp>
@@ -23,8 +24,6 @@
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
-
-#include <ibex/format.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1846,7 +1845,8 @@ void print_help() {
         "                        order-sensitive claims it carries (time index, ordering,\n"
         "                        grouping)\n");
     ibex::formatting::print("  :describe <table>     Schema + first rows\n");
-    ibex::formatting::print("  :doc <name>           Show docs/signature for a binding or built-in\n");
+    ibex::formatting::print(
+        "  :doc <name>           Show docs/signature for a binding or built-in\n");
     ibex::formatting::print("  ?name                 Shorthand for :doc name\n");
     ibex::formatting::print("  :source <fn>          Show source for a user-defined function\n");
     ibex::formatting::print("  :load <file>          Load and execute an .ibex script\n");
@@ -1971,7 +1971,7 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
     }
     if (auto it = scalars.find(key); it != scalars.end()) {
         ibex::formatting::print("scalar {}: {} = {}\n", key, scalar_value_type_name(it->second),
-                   format_scalar(it->second));
+                                format_scalar(it->second));
         return;
     }
     if (auto it = columns.find(key); it != columns.end()) {
@@ -1982,7 +1982,8 @@ void print_doc(std::string_view name, const runtime::TableRegistry& tables,
         ibex::formatting::print("model {}\n", key);
         ibex::formatting::print("  method: {}\n", it->second.method);
         ibex::formatting::print("  observations: {}\n", it->second.n_obs);
-        ibex::formatting::print("  r_squared: {}\n", runtime::format_float_mixed(it->second.r_squared));
+        ibex::formatting::print("  r_squared: {}\n",
+                                runtime::format_float_mixed(it->second.r_squared));
         return;
     }
     if (auto it = functions.find(key); it != functions.end()) {
@@ -3759,8 +3760,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 return std::unexpected("tuple binding requires a DataFrame on the right-hand side");
             }
             if (table->columns.size() != tlet.names.size()) {
-                return std::unexpected(ibex::formatting::format("tuple binding expects {} column(s), got {}",
-                                                   tlet.names.size(), table->columns.size()));
+                return std::unexpected(
+                    ibex::formatting::format("tuple binding expects {} column(s), got {}",
+                                             tlet.names.size(), table->columns.size()));
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
                 local_columns.insert_or_assign(tlet.names[i], *table->columns[i].column);
@@ -3899,9 +3901,10 @@ auto try_load_plugin(const std::string& stem, const std::vector<std::string>& se
         return {.status = PluginLoadStatus::Loaded, .message = ""};
     }
     if (!last_candidate.empty()) {
-        return {.status = PluginLoadStatus::LoadError,
-                .message = ibex::formatting::format("failed to load '{}': {}", last_candidate,
-                                       last_error.empty() ? "unknown error" : last_error)};
+        return {
+            .status = PluginLoadStatus::LoadError,
+            .message = ibex::formatting::format("failed to load '{}': {}", last_candidate,
+                                                last_error.empty() ? "unknown error" : last_error)};
     }
     return {.status = PluginLoadStatus::NotFound, .message = ""};
 }
@@ -4111,9 +4114,11 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 auto result = try_load_plugin(stem, plugin_search_paths, loaded_plugins, externs);
                 if (result.status == PluginLoadStatus::NotFound) {
 #ifdef _WIN32
-                    ibex::formatting::print("warning: could not find plugin '{}.dll' in search path\n", stem);
+                    ibex::formatting::print(
+                        "warning: could not find plugin '{}.dll' in search path\n", stem);
 #else
-                    ibex::formatting::print("warning: could not find plugin '{}.so' in search path\n", stem);
+                    ibex::formatting::print(
+                        "warning: could not find plugin '{}.so' in search path\n", stem);
 #endif
                 } else if (result.status == PluginLoadStatus::LoadError) {
                     ibex::formatting::print("warning: {}\n", result.message);
@@ -4139,8 +4144,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                 source = find_library_source(imp.name, plugin_search_paths);
             }
             if (!source.has_value()) {
-                ibex::formatting::print("error: import '{}': could not find '{}.ibex' in search path\n",
-                           imp.name, imp.name);
+                ibex::formatting::print(
+                    "error: import '{}': could not find '{}.ibex' in search path\n", imp.name,
+                    imp.name);
                 return false;
             }
             if (imports != nullptr) {
@@ -4148,7 +4154,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             auto parsed = parser::parse(*source);
             if (!parsed) {
-                ibex::formatting::print("error: import '{}': {}\n", imp.name, parsed.error().format());
+                ibex::formatting::print("error: import '{}': {}\n", imp.name,
+                                        parsed.error().format());
                 return false;
             }
             auto import_comments = collect_script_comment_lines(*source);
@@ -4208,8 +4215,9 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         try_widen_int_to_float(value.value(), *st);
                     }
                     if (st != nullptr && !scalar_type_matches(value.value(), *st)) {
-                        ibex::formatting::print("error: '{}' declared as {} but value is {}\n", let_stmt.name,
-                                   scalar_type_name(*st), scalar_value_type_name(value.value()));
+                        ibex::formatting::print("error: '{}' declared as {} but value is {}\n",
+                                                let_stmt.name, scalar_type_name(*st),
+                                                scalar_value_type_name(value.value()));
                         return false;
                     }
                     lazy_tables.erase(let_stmt.name);
@@ -4282,7 +4290,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                     }
                     if (auto* table = std::get_if<runtime::Table>(&value.value())) {
                         if (table->columns.size() != 1) {
-                            ibex::formatting::print("error: Series return must have exactly one column\n");
+                            ibex::formatting::print(
+                                "error: Series return must have exactly one column\n");
                             return false;
                         }
                         if (auto err = validate_column_type(*table->columns.front().column,
@@ -4296,7 +4305,8 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
                         models.erase(let_stmt.name);
                         continue;
                     }
-                    ibex::formatting::print("error: expected Series return for {}\n", let_stmt.name);
+                    ibex::formatting::print("error: expected Series return for {}\n",
+                                            let_stmt.name);
                     return false;
                 }
             }
@@ -4352,12 +4362,13 @@ auto execute_statements(std::vector<parser::Stmt>& statements, runtime::TableReg
             }
             auto* table = std::get_if<runtime::Table>(&value.value());
             if (table == nullptr) {
-                ibex::formatting::print("error: tuple binding requires a DataFrame on the right-hand side\n");
+                ibex::formatting::print(
+                    "error: tuple binding requires a DataFrame on the right-hand side\n");
                 return false;
             }
             if (table->columns.size() != tlet.names.size()) {
-                ibex::formatting::print("error: tuple binding expects {} column(s), got {}\n", tlet.names.size(),
-                           table->columns.size());
+                ibex::formatting::print("error: tuple binding expects {} column(s), got {}\n",
+                                        tlet.names.size(), table->columns.size());
                 return false;
             }
             for (std::size_t i = 0; i < tlet.names.size(); ++i) {
@@ -4446,7 +4457,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             let != nullptr && let->type.has_value() &&
             let->type->kind != parser::Type::Kind::DataFrame &&
             let->type->kind != parser::Type::Kind::TimeFrame) {
-            return decline(ibex::formatting::format("`let {}` has a non-DataFrame type annotation", let->name));
+            return decline(ibex::formatting::format("`let {}` has a non-DataFrame type annotation",
+                                                    let->name));
         }
     }
 
@@ -4598,7 +4610,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
 
     auto script = parser::lower_script(program, reader_schemas, prelude);
     if (!script.has_value()) {
-        return decline(ibex::formatting::format("script did not lower: {}", script.error().message));
+        return decline(
+            ibex::formatting::format("script did not lower: {}", script.error().message));
     }
     if (!script->preamble.empty()) {
         return decline("script has statements that must run before the plan");

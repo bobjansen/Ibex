@@ -9,12 +9,12 @@
 // sweeps wide tables where `select` keeps a small fraction of columns, which
 // is the shape that benefits most.
 
+#include <ibex/format.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <CLI/CLI.hpp>
-#include <ibex/format.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -103,8 +103,9 @@ auto run(const std::string& name, const std::string& src,
             std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
     }
     auto s = stats(std::move(times));
-    ibex::formatting::print("bench {}: iters={}, avg_ms={:.3f}, min_ms={:.3f}, max_ms={:.3f}, rows={}\n", name,
-               iters, s.avg_ms, s.min_ms, s.max_ms, last_rows);
+    ibex::formatting::print(
+        "bench {}: iters={}, avg_ms={:.3f}, min_ms={:.3f}, max_ms={:.3f}, rows={}\n", name, iters,
+        s.avg_ms, s.min_ms, s.max_ms, last_rows);
     if (mins != nullptr) {
         (*mins)[name] = s.min_ms;
     }
@@ -175,7 +176,7 @@ auto check_guards(const std::map<std::string, double>& mins) -> int {
         const double ratio = slow_it->second / fast_it->second;
         const bool ok = ratio >= g.min_ratio;
         ibex::formatting::print("{} {}: {:.1f}x faster than {} (require >= {:.1f}x) — {}\n",
-                   ok ? "PASS" : "FAIL", g.fast, ratio, g.slow, g.min_ratio, g.reason);
+                                ok ? "PASS" : "FAIL", g.fast, ratio, g.slow, g.min_ratio, g.reason);
         if (!ok) {
             ++failures;
         }
@@ -209,28 +210,32 @@ auto check_sorted_aggregate_invariants(const ibex::runtime::TableRegistry& table
     for (const auto& invariant : invariants) {
         auto parsed = ibex::parser::parse(invariant.source + ";");
         if (!parsed) {
-            ibex::formatting::print("FAIL {}: parse failed: {}\n", invariant.name, parsed.error().format());
+            ibex::formatting::print("FAIL {}: parse failed: {}\n", invariant.name,
+                                    parsed.error().format());
             ++failures;
             continue;
         }
         auto lowered = ibex::parser::lower(*parsed);
         if (!lowered) {
-            ibex::formatting::print("FAIL {}: lower failed: {}\n", invariant.name, lowered.error().message);
+            ibex::formatting::print("FAIL {}: lower failed: {}\n", invariant.name,
+                                    lowered.error().message);
             ++failures;
             continue;
         }
         auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         if (!result) {
-            ibex::formatting::print("FAIL {}: interpret failed: {}\n", invariant.name, result.error());
+            ibex::formatting::print("FAIL {}: interpret failed: {}\n", invariant.name,
+                                    result.error());
             ++failures;
             continue;
         }
         const bool ordered = result->ordering().has_value() && !result->ordering()->empty() &&
                              result->ordering()->front().name == invariant.group_key &&
                              result->ordering()->front().ascending;
-        ibex::formatting::print("{} {}: output {} ordered by group key — {}\n", ordered ? "PASS" : "FAIL",
-                   invariant.name, ordered ? "is" : "is not",
-                   "sorted aggregate must not fall back to hash");
+        ibex::formatting::print("{} {}: output {} ordered by group key — {}\n",
+                                ordered ? "PASS" : "FAIL", invariant.name,
+                                ordered ? "is" : "is not",
+                                "sorted aggregate must not fall back to hash");
         if (!ordered) {
             ++failures;
         }

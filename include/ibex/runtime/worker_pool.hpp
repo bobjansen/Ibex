@@ -116,6 +116,16 @@ class WorkerPool {
 /// `0`/`off`/`false`/`no`.
 [[nodiscard]] auto parallel_enabled_from_env() -> std::optional<bool>;
 
+/// Rows per SOURCE chunk from `IBEX_CHUNK_ROWS`, or 0 when unset/invalid.
+///
+/// Zero means "one chunk", which is what production does today. A non-zero
+/// value makes every materialized source emit successive row ranges instead —
+/// see `make_table_source` and Phase 0 of `plans/pipelined-execution-plan.md`.
+/// It exists to EXERCISE the operators' cross-chunk paths, which no production
+/// query has ever reached, and is read fresh on every call so a test can change
+/// it between pipelines.
+[[nodiscard]] auto source_chunk_rows_from_env() -> std::size_t;
+
 /// Morsel row-grain override from `IBEX_MORSEL_ROWS`, or 0 when unset/invalid
 /// (meaning: keep the `ExecutionContext` default).
 [[nodiscard]] auto morsel_rows_from_env() -> std::size_t;

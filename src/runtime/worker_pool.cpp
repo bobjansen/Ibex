@@ -265,6 +265,20 @@ auto parallel_enabled_from_env() -> std::optional<bool> {
     return std::nullopt;
 }
 
+auto source_chunk_rows_from_env() -> std::size_t {
+    const auto raw = env_value("IBEX_CHUNK_ROWS");
+    if (raw.empty()) {
+        return 0;
+    }
+    std::size_t parsed = 0;
+    const auto* end = raw.data() + raw.size();
+    const auto result = std::from_chars(raw.data(), end, parsed);
+    if (result.ec == std::errc{} && result.ptr == end) {
+        return parsed;
+    }
+    return 0;
+}
+
 auto morsel_rows_from_env() -> std::size_t {
     const auto raw = env_value("IBEX_MORSEL_ROWS");
     if (raw.empty()) {

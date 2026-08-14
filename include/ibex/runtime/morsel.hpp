@@ -6,6 +6,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -119,6 +120,65 @@ struct TableRangeMorsel {
     chunk.sequence = sequence;
     chunk.row_offset = begin;
     return chunk;
+}
+
+/// A source over an OWNED table, emitted as successive `grain`-row chunks.
+///
+/// Phase 0 of `plans/pipelined-execution-plan.md`. Production has never emitted
+/// more than one chunk from anything — `chunks=1` on every operator of every
+/// PDS-H query — so every cross-chunk path in every operator is dead code that
+/// has never executed: `KeyPartition::stored`, `partitioned_active_`, the
+/// distinct operator's pinned partition count, the pair path's dense-array
+/// rebuild, the categorical dictionary-identity check. All of it is written for
+/// multi-chunk input and none of it has run. This is the switch that wakes it
+/// up so it can be tested, ahead of anything being built on top.
+///
+/// It differs from `PartitionedTableSource` in owning its table rather than
+/// borrowing one: an island's morsel sources sit under a table the island
+/// materialized and holds, while a plain source has nowhere else to put it.
+/// Chunks are built by `make_morsel_chunk`, the same construction point, so a
+/// chunk from here is byte-identical to the island's for the same range.
+class ChunkedTableSource final : public Operator {
+   public:
+    ChunkedTableSource(Table table, std::size_t grain)
+        : table_(std::move(table)), grain_(grain == 0 ? 1 : grain) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        const std::size_t rows = table_.rows();
+        if (rows == 0) {
+            // The zero-row schema/metadata carrier, emitted once.
+            if (emitted_) {
+                return std::optional<Chunk>{};
+            }
+            emitted_ = true;
+            return std::optional<Chunk>{make_morsel_chunk(table_, 0, 0, 0)};
+        }
+        if (next_row_ >= rows) {
+            return std::optional<Chunk>{};
+        }
+        const std::size_t end = std::min(rows, next_row_ + grain_);
+        auto chunk = make_morsel_chunk(table_, next_row_, end, sequence_++);
+        next_row_ = end;
+        return std::optional<Chunk>{std::move(chunk)};
+    }
+
+   private:
+    Table table_;
+    std::size_t grain_;
+    std::size_t next_row_ = 0;
+    std::uint64_t sequence_ = 0;
+    bool emitted_ = false;
+};
+
+/// Wrap a materialized table as a source: one chunk normally, `IBEX_CHUNK_ROWS`
+/// grains when that is set. The single call site for "this table is now a
+/// source", so the switch reaches every one of them.
+[[nodiscard]] inline auto make_table_source(Table table) -> OperatorPtr {
+    const std::size_t grain = source_chunk_rows_from_env();
+    if (grain == 0 || table.rows() <= grain) {
+        return std::make_unique<TableSourceOperator>(std::move(table));
+    }
+    return std::make_unique<ChunkedTableSource>(std::move(table), grain);
 }
 
 /// Number of morsels `PartitionedTableSource` (or a parallel island over the

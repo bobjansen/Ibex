@@ -64,6 +64,39 @@ namespace ibex::runtime {
 
 namespace {
 
+/// Append `src`'s validity for `src_rows` rows onto `dst`, which currently
+/// describes `dst_rows` rows.
+///
+/// Concatenating chunks cannot leave this implicit. A validity bitmap is not
+/// carried by the column, so appending values alone leaves a bitmap describing
+/// only the FIRST chunk while the column grows past it — and every row beyond
+/// it then reads as null. A chunk with no bitmap is all-valid, so a column that
+/// only gains nulls in a later chunk still needs one backfilled for the rows
+/// already appended.
+///
+/// Latent until `IBEX_CHUNK_ROWS` existed: production never emitted a second
+/// chunk, so no concat ever ran with one. It surfaced as an `order` over a
+/// null-bearing column disagreeing with itself between the serial and parallel
+/// gather, both of which were faithfully reading a bitmap that had run out.
+void append_validity(std::optional<ValidityBitmap>& dst, std::size_t dst_rows,
+                     const std::optional<ValidityBitmap>& src, std::size_t src_rows) {
+    if (!dst.has_value() && !src.has_value()) {
+        return;  // both all-valid — the common case needs no bitmap at all
+    }
+    if (!dst.has_value()) {
+        ValidityBitmap filled;
+        filled.reserve(dst_rows + src_rows);
+        for (std::size_t r = 0; r < dst_rows; ++r) {
+            filled.push_back(true);
+        }
+        dst = std::move(filled);
+    }
+    dst->reserve(dst_rows + src_rows);
+    for (std::size_t r = 0; r < src_rows; ++r) {
+        dst->push_back(src.has_value() ? (*src)[r] : true);
+    }
+}
+
 auto chunk_to_table(Chunk chunk) -> Table {
     Table t;
     t.columns = std::move(chunk.columns);
@@ -478,6 +511,11 @@ class ChunkedFilterTailOperator final : public Operator {
             if (src_t.columns.size() != n_cols) {
                 return std::unexpected("tail: chunk schema mismatch (column count)");
             }
+            // Taken BEFORE any column is appended: `rows()` reads column 0, so
+            // reading it inside the loop would report the new length to every
+            // column after the first.
+            const std::size_t dst_rows = out.rows();
+            const std::size_t src_rows = src_t.rows();
             for (std::size_t i = 0; i < n_cols; ++i) {
                 if (src_t.columns[i].name != out.columns[i].name) {
                     return std::unexpected("tail: chunk schema mismatch (column name)");
@@ -485,6 +523,8 @@ class ChunkedFilterTailOperator final : public Operator {
                 if (src_t.columns[i].column->index() != out.columns[i].column->index()) {
                     return std::unexpected("tail: chunk schema mismatch (column type)");
                 }
+                append_validity(out.columns[i].validity, dst_rows, src_t.columns[i].validity,
+                                src_rows);
                 auto& dst_col = out.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
@@ -1730,6 +1770,9 @@ class ChunkedOrderOperator final : public Operator {
             if (chunk.columns.size() != n_cols) {
                 return std::unexpected("order: chunk schema mismatch (column count)");
             }
+            // Before any column is appended — see the matching note above.
+            const std::size_t dst_rows = out.rows();
+            const std::size_t src_rows = chunk.rows();
             for (std::size_t i = 0; i < n_cols; ++i) {
                 if (chunk.columns[i].name != out.columns[i].name) {
                     return std::unexpected("order: chunk schema mismatch (column name)");
@@ -1737,6 +1780,8 @@ class ChunkedOrderOperator final : public Operator {
                 if (chunk.columns[i].column->index() != out.columns[i].column->index()) {
                     return std::unexpected("order: chunk schema mismatch (column type)");
                 }
+                append_validity(out.columns[i].validity, dst_rows, chunk.columns[i].validity,
+                                src_rows);
                 auto& dst_col = out.mutable_column(i);
                 std::visit(
                     [&](auto& dst) {
@@ -2483,6 +2528,23 @@ struct PackedKeyEncoder {
     /// code comparable across chunks.
     auto build_packed_key(const std::vector<const ColumnEntry*>& entries)
         -> std::optional<PackedPlan> {
+        // Size the interning state ONCE, before any of it is pointed at.
+        //
+        // `intern_categorical` hands back `remap.data()`, and `PackCol` holds
+        // that pointer for the rest of the chunk. Growing `cat_interns_` while
+        // those pointers are live reallocates the vector, and `CatIntern` holds
+        // a robin_hood map whose move constructor is not noexcept — so
+        // `move_if_noexcept` COPIES, `remap` gets a fresh buffer, and column
+        // 0's pointer is left dangling the moment column 1 is interned.
+        //
+        // The symptom was a second categorical key column silently reading
+        // freed memory: PDS-H q7's `by { supp_nation, cust_nation, l_year }`
+        // emitted 8 groups instead of 4, the first chunk's four separated from
+        // the rest, because only the first chunk paid a reallocation. It needed
+        // multi-chunk input to show at all (`IBEX_CHUNK_ROWS`).
+        if (cat_interns_.size() < entries.size()) {
+            cat_interns_.resize(entries.size());
+        }
         PackedPlan plan;
         plan.cols.reserve(entries.size());
         unsigned bytes = 0;
@@ -2537,9 +2599,8 @@ struct PackedKeyEncoder {
     /// returning the remap, or nullptr when the dictionary is empty. Runs once
     /// per chunk per categorical key column.
     auto intern_categorical(std::size_t k, const Column<Categorical>& cat) -> const std::uint32_t* {
-        if (cat_interns_.size() <= k) {
-            cat_interns_.resize(k + 1);
-        }
+        // Never grows `cat_interns_` — `build_packed_key` sized it before any
+        // caller took a pointer into it, and growing here would dangle those.
         auto& state = cat_interns_[k];
         const auto& dict = cat.dictionary();
         const std::size_t dict_size = dict.size();
@@ -7964,7 +8025,7 @@ auto build_unary_materializing_operator(const ir::Node& child_node, const TableR
     if (!result.has_value()) {
         return std::unexpected(std::move(result.error()));
     }
-    return std::make_unique<TableSourceOperator>(std::move(result.value()));
+    return make_table_source(std::move(result.value()));
 }
 
 }  // namespace
@@ -7999,7 +8060,7 @@ auto build_binary_materializing_operator(const ir::Node& left_node, const ir::No
     if (!result.has_value()) {
         return std::unexpected(std::move(result.error()));
     }
-    return std::make_unique<TableSourceOperator>(std::move(result.value()));
+    return make_table_source(std::move(result.value()));
 }
 
 auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
@@ -9272,7 +9333,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         // one chunk out — so it costs exactly what not forming an island costs.
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
-        OperatorPtr serial = std::make_unique<TableSourceOperator>(std::move(*owned));
+        OperatorPtr serial = make_table_source(std::move(*owned));
         for (const ir::Node* op_node : candidate.operators) {
             auto next = build_row_local_map_operator(*op_node, std::move(serial), scalars, externs,
                                                      exec, false);
@@ -9836,7 +9897,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 }
             }
         }
-        return std::make_unique<TableSourceOperator>(std::move(result.value()));
+        return make_table_source(std::move(result.value()));
     }
 
     if (node.kind() == ir::NodeKind::Resample) {
@@ -9919,7 +9980,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             }
             result = std::move(projected);
         }
-        return std::make_unique<TableSourceOperator>(std::move(result.value()));
+        return make_table_source(std::move(result.value()));
     }
 
     if (node.kind() == ir::NodeKind::AsTimeframe) {
@@ -9964,7 +10025,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (model_out != nullptr) {
             *model_out = std::move(result.value());
         }
-        return std::make_unique<TableSourceOperator>(std::move(primary));
+        return make_table_source(std::move(primary));
     }
 
     if (node.kind() == ir::NodeKind::Construct || node.kind() == ir::NodeKind::Stream) {
@@ -9972,7 +10033,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (!table.has_value()) {
             return std::unexpected(std::move(table.error()));
         }
-        return std::make_unique<TableSourceOperator>(std::move(table.value()));
+        return make_table_source(std::move(table.value()));
     }
 
     if (node.kind() == ir::NodeKind::Program) {
@@ -9990,7 +10051,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));
     }
-    return std::make_unique<TableSourceOperator>(std::move(table.value()));
+    return make_table_source(std::move(table.value()));
 }
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,

@@ -164,6 +164,20 @@ class LazyTable {
     [[nodiscard]] auto project(const std::set<std::string>& names, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
 
+    /// Decode `names` WITHOUT populating the column cache, for a caller that
+    /// wants to LOOK at a column without committing the source to eager
+    /// decoding.
+    ///
+    /// A cached column is not free: `project_where` and the deferred probe both
+    /// decline their fused / dynamic-key scan when the key column is already in
+    /// `cache_` (deliberately — a whole-file column left by an earlier query
+    /// must never masquerade as this query's selection). So plan-time key
+    /// verification, which reads exactly the columns those scans care about,
+    /// would silently disable them by using `project`.
+    [[nodiscard]] auto project_uncached(const std::set<std::string>& names,
+                                        const ExecutionContext& exec)
+        -> std::expected<Table, std::string>;
+
     /// Materialize `names` after applying row-local scan conjuncts. Predicate
     /// columns are decoded first to compute a selection; all other columns are
     /// decoded with that selection. This deliberately bypasses `cache_`: a

@@ -1380,6 +1380,110 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
 /// safe for ranking: overestimating a fact table's key distinctness makes its
 /// joins look larger, never smaller, so the planner errs toward NOT trusting it
 /// to shrink a join -- the conservative direction.
+/// Columns of `lazy` PROVED to hold no duplicate value.
+///
+/// The footer cannot settle this on its own. `min`/`max` bound the value SPAN,
+/// and a span equal to the row count is necessary but not sufficient — `1,1,3`
+/// spans 3 over 3 rows, the counterexample `UniqueKey`'s own documentation
+/// names. Parquet has an optional `distinct_count` that would settle it, but no
+/// mainstream writer emits one: parquet-cpp-arrow leaves it unset at format
+/// version 1.0 and 2.6 alike, and so do the engines built on it, so there is
+/// nothing to read.
+///
+/// So the footer is used only as a SCREEN and the answer is then proved
+/// exhaustively against the data. A bounded integer span admits a bitset — one
+/// bit per possible value, one pass, no hashing — and the screen is what makes
+/// that affordable: `span < rows` means duplicates are certain (pigeonhole) and
+/// is rejected without decoding anything, which is every column of a fact table
+/// including `l_orderkey`. What survives is a candidate key, and a query that
+/// cares about a candidate key almost always joins on it, so the decode is one
+/// the executor pays anyway and `LazyTable` caches.
+///
+/// **This is the one place a `SchemaInfo` constraint is drawn from data rather
+/// than from an operator's construction.** It keeps the invariant that a wrong
+/// answer is impossible, because what enters the schema is the verdict of an
+/// exhaustive check and never a statistic — the footer only decides whether the
+/// check is worth running.
+auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>& wanted,
+                          const runtime::ExecutionContext& exec) -> std::vector<std::string> {
+    /// Cap on the bitset, in values. A candidate wider than this is left
+    /// unproven rather than allocating without bound for a plan-time fact.
+    constexpr std::uint64_t kMaxSpanValues = 1ULL << 28U;  // 32 MiB of bits
+    /// Rows above which a source is not worth proving anything about.
+    ///
+    /// The proof costs a whole-column decode, and measured across PDS-H that
+    /// came to +5.5% geomean when spent on every join key in the plan --
+    /// `o_orderkey` alone is 3M rows at SF-2. What uniqueness is FOR is the
+    /// dimension side of a join: a fact table's key is not unique, and a fact
+    /// table proved unique (a 1:1 relationship) is not a shape any pass here
+    /// exploits. Dimensions are small by definition, so a row cap buys back
+    /// nearly all of that cost without giving up a fact anything would read.
+    constexpr std::size_t kMaxProofRows = 1U << 20U;  // 8 MiB of int64
+    std::vector<std::string> proved;
+    const auto rows = lazy.rows();
+    if (rows == 0 || rows > kMaxProofRows) {
+        return proved;
+    }
+    for (const auto& [name, stats] : lazy.column_stats()) {
+        // Only columns a consumer can actually use. Uniqueness earns its keep
+        // on a join key and nowhere else, and the proof costs a full column
+        // decode -- so proving it for every integer column in the file would
+        // spend the decode budget on facts no pass would ever read.
+        if (!wanted.contains(name)) {
+            continue;
+        }
+        if (!stats.min.has_value() || !stats.max.has_value() || *stats.max < *stats.min) {
+            continue;  // no integer range -> nothing to screen with
+        }
+        // A column with nulls is not a key, and nulls sit outside the integer
+        // range anyway, so the span would not describe them.
+        if (stats.null_count.value_or(1) != 0) {
+            continue;
+        }
+        const auto span = static_cast<std::uint64_t>(*stats.max - *stats.min) + 1;
+        if (span < rows || span > kMaxSpanValues) {
+            continue;
+        }
+        auto decoded = lazy.project_uncached({name}, exec);
+        if (!decoded.has_value()) {
+            continue;  // the executor will report its own error
+        }
+        const auto* column = decoded->find(name);
+        if (column == nullptr) {
+            continue;
+        }
+        const auto* values = std::get_if<Column<std::int64_t>>(column);
+        if (values == nullptr || values->size() != rows) {
+            continue;
+        }
+        std::vector<bool> seen(static_cast<std::size_t>(span), false);
+        const std::int64_t base = *stats.min;
+        bool unique = true;
+        const auto* data = values->data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            const auto offset = static_cast<std::uint64_t>(data[i] - base);
+            if (offset >= span) {
+                unique = false;  // outside the footer's own range: trust nothing
+                break;
+            }
+            const auto slot = static_cast<std::size_t>(offset);
+            if (seen[slot]) {
+                unique = false;
+                break;
+            }
+            seen[slot] = true;
+        }
+        if (unique) {
+            if (std::getenv("IBEX_UNIQUE_KEY_STATS") != nullptr) {
+                std::fprintf(stderr, "[unique] %s rows=%zu span=%llu\n", name.c_str(), rows,
+                             static_cast<unsigned long long>(span));
+            }
+            proved.push_back(name);
+        }
+    }
+    return proved;
+}
+
 auto derive_column_distinct(const runtime::LazyTable& lazy) -> ir::ColumnDistinct {
     ir::ColumnDistinct out;
     const auto rows = lazy.rows();
@@ -4623,6 +4727,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         runtime::TableRegistry tables = base_tables;
         LazyTableRegistry lazy_sources;
         ir::SourceStats source_stats;
+        // Threaded like any other decode: proving a key is a full column scan.
+        const runtime::ExecutionContext proof_exec = command_exec();
+        const std::set<std::string> join_key_columns = ir::plan_join_key_columns(*rewritten);
         ir::SourceSchemas& schemas = source_stats.schemas;
         ir::SourceRowCounts& row_counts = source_stats.rows;
         // Materialized shared bindings participate in schema-aware rewrites
@@ -4645,7 +4752,17 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             if (!lazy.has_value()) {
                 return std::unexpected(lazy.error());
             }
-            schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
+            // Uniqueness is the one thing the planner cannot infer about a base
+            // table from its own construction, and without it the `|PK ⋈ FK| <=
+            // |FK|` bound in `estimate_cardinality` never applies to a scan —
+            // every base source reached the cost model with no unique key at
+            // all. Proving it here is what puts a real bound under join
+            // ordering rather than an estimate.
+            ir::SchemaInfo schema = table_schema_info(lazy.value()->schema());
+            for (auto& column : prove_unique_columns(*lazy.value(), join_key_columns, proof_exec)) {
+                schema.add_unique_key(ir::UniqueKey{std::move(column)});
+            }
+            schemas.insert_or_assign(source.source_name, std::move(schema));
             row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
             source_stats.distinct.insert_or_assign(source.source_name,
                                                    derive_column_distinct(*lazy.value()));

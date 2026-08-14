@@ -116,6 +116,51 @@ void LazyTable::release_reader(LazySourceReaderPtr reader) {
     reader_pool_->available.push_back(std::move(reader));
 }
 
+auto LazyTable::project_uncached(const std::set<std::string>& names, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    std::vector<std::string> wanted;
+    for (const auto& entry : schema_.columns) {
+        if (names.contains(entry.name)) {
+            wanted.push_back(entry.name);
+        }
+    }
+    if (wanted.empty()) {
+        Table empty;
+        empty.logical_rows = rows_;
+        return empty;
+    }
+    // Reuse anything already cached — reading it costs nothing and does not
+    // make the cache any more poisoned than it already is — but never insert.
+    std::vector<std::string> missing;
+    for (const auto& name : wanted) {
+        if (!cache_.contains(name)) {
+            missing.push_back(name);
+        }
+    }
+    Table out;
+    if (!missing.empty()) {
+        auto decoded = decode_columns(missing, nullptr, exec);
+        if (!decoded) {
+            return std::unexpected(decoded.error());
+        }
+        for (auto& entry : decoded->columns) {
+            out.add_column_from(entry.name, entry);
+        }
+    }
+    for (const auto& name : wanted) {
+        if (out.find(name) != nullptr) {
+            continue;
+        }
+        const auto it = cache_.find(name);
+        if (it == cache_.end()) {
+            return std::unexpected("lazy source did not produce requested column '" + name + "'");
+        }
+        out.add_column_from(it->second.name, it->second);
+    }
+    out.logical_rows = rows_;
+    return out;
+}
+
 auto LazyTable::project(const std::set<std::string>& names, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     std::vector<std::string> missing;

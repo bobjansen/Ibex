@@ -6,6 +6,7 @@
 #include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
+#include <ibex/ir/group_key_reduction.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_reorder.hpp>
 #include <ibex/ir/node.hpp>
@@ -4798,6 +4799,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
+        // After the reorder, so it sees the join shape that will actually run,
+        // and after the uniqueness proofs above, which are its whole premise.
+        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
         // A source scanned twice in the plan (nation on both join sides, a
         // self-joined fact table) gets one instance name per scan, so each
         // scan keeps its own pushed selection and column demand.

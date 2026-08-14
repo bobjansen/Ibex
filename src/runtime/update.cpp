@@ -530,6 +530,7 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
     const auto preserves_input_validity = [](ScalarKernel kernel) {
         switch (kernel) {
             case ScalarKernel::Like:
+            case ScalarKernel::StringLength:
             case ScalarKernel::NumericCast:
                 return true;
             case ScalarKernel::FillNull:

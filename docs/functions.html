@@ -216,6 +216,8 @@
             <tr><td><code>second(t)</code></td><td>Second component from Timestamp.</td></tr>
             <tr><td><code>round(x, mode)</code></td><td>Round Float to Int with mode: <code>nearest</code>, <code>bankers</code>, <code>floor</code>, <code>ceil</code>, or <code>trunc</code>.</td></tr>
             <tr><td><code>like(s, pattern)</code></td><td><code>Bool</code>: SQL-LIKE match over the whole string. See below.</td></tr>
+            <tr><td><code>length(s)</code></td><td><code>Int64</code>: Unicode code-point count.</td></tr>
+            <tr><td><code>byte_length(s)</code></td><td><code>Int64</code>: UTF-8 byte count; use for wire/SQL compatibility.</td></tr>
             <tr><td><code>substring(s, start[, len])</code></td><td><code>String</code>: 0-based codepoint slice, Polars <code>str.slice</code> semantics. See below.</td></tr>
           </tbody>
         </table>
@@ -259,6 +261,9 @@
         </tbody>
       </table>
       <p>Case-insensitive matching, regular expressions, and collation are out of scope.</p>
+      <h3><code>length</code> and <code>byte_length</code></h3>
+      <p><code>length(s)</code> counts Unicode code points, matching <code>substring</code>: <code>length("café")</code> is <code>4</code>. <code>byte_length(s)</code> counts UTF-8 bytes instead: <code>byte_length("café")</code> is <code>5</code>. Both return <code>Int64</code> and propagate null.</p>
+      <p>Use <code>length</code> for normal text. <code>byte_length</code> is for byte-oriented formats and SQL compatibility, including ClickBench's <code>STRLEN</code>.</p>
       <h3><code>substring</code></h3>
       <p><code>substring(s, start[, length])</code> extracts a run of Unicode <strong>codepoints</strong>: <code>(String, Int[, Int]) -&gt; String</code>. It follows Polars <code>str.slice</code>, not SQL — <code>start</code> is <strong>0-based</strong> and may be negative (counted from the end), and <code>length</code> is optional (to the end of the string when omitted).</p>
       <table class="repl-table">

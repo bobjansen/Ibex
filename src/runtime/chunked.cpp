@@ -3219,21 +3219,27 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             initialized_ = true;
         }
 
-        // Swapped mode: the left side was materialized during `initialize` (the
+        // Swapped mode: the left side was buffered during `initialize` (the
         // right was too large to set-ify cheaply), and the right-key set now
-        // holds only the intersection of the two key columns, so one pass of
-        // `filter_chunk` over the whole materialized left produces the result.
+        // holds only the intersection of the two key columns, so a pass of
+        // `filter_chunk` over the buffered left produces the result.
+        //
+        // Buffered as a LIST of chunks, not concatenated into one table. The
+        // swap needs the left twice — once for its keys, once for its rows —
+        // which is why it buffers at all, but it never needs the pieces glued
+        // together. Gluing them cost a full copy of the left the moment sources
+        // started arriving in more than one chunk: on q21 the semi join's own
+        // time went 113ms -> 211ms, which was that copy and nothing else.
         if (swapped_) {
-            if (swapped_emitted_) {
-                return std::optional<Chunk>{};
+            while (swapped_next_ < left_buffered_.size()) {
+                auto filtered = filter_chunk(std::move(left_buffered_[swapped_next_++]));
+                if (!filtered.has_value()) {
+                    continue;
+                }
+                return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
             }
-            swapped_emitted_ = true;
-            auto filtered = filter_chunk(std::move(*left_swapped_));
-            left_swapped_.reset();
-            if (!filtered.has_value()) {
-                return std::optional<Chunk>{};
-            }
-            return std::optional<Chunk>{table_to_chunk(std::move(*filtered))};
+            left_buffered_.clear();
+            return std::optional<Chunk>{};
         }
 
         while (true) {
@@ -3267,11 +3273,19 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     // keeps the rest). Restricted to integer keys, which every TPC-H join uses
     // and where the win is; other key types keep the streaming build-on-right.
     auto init_int_swapped(const Column<std::int64_t>& rcol) -> std::optional<std::string> {
-        auto left_res = MaterializeOperator(std::move(left_)).run();
-        if (!left_res.has_value()) {
-            return std::move(left_res.error());
+        // Drain the left into a list of chunks. Deliberately NOT
+        // `MaterializeOperator`: see the note in `next()` — concatenating them
+        // is a full copy of the left that nothing here needs.
+        while (true) {
+            auto chunk = left_->next();
+            if (!chunk.has_value()) {
+                return std::move(chunk.error());
+            }
+            if (!chunk->has_value()) {
+                break;
+            }
+            left_buffered_.push_back(chunk_to_table(std::move(**chunk)));
         }
-        left_swapped_ = std::move(*left_res);
         swapped_ = true;
 
         const auto* rentry = right_.find_entry(keys_->front().right);
@@ -3280,14 +3294,31 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         const auto rnull = [rvalidity](std::size_t row) {
             return rvalidity != nullptr && !(*rvalidity)[row];
         };
-        const ColumnValue* lkey = left_swapped_->find(keys_->front().left);
-        const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
-        if (lcol != nullptr && lcol->size() < rcol.size()) {
+        // The left key column, chunk by chunk. Every chunk must carry it as an
+        // int64 for the intersection build to be worth taking; one that does not
+        // falls back to the plain right set below, exactly as a missing key
+        // column did when the left was one table.
+        std::vector<const Column<std::int64_t>*> lcols;
+        lcols.reserve(left_buffered_.size());
+        std::size_t left_rows = 0;
+        for (const auto& part : left_buffered_) {
+            const ColumnValue* lkey = part.find(keys_->front().left);
+            const auto* lcol = lkey != nullptr ? std::get_if<Column<std::int64_t>>(lkey) : nullptr;
+            if (lcol == nullptr) {
+                lcols.clear();
+                break;
+            }
+            lcols.push_back(lcol);
+            left_rows += lcol->size();
+        }
+        if (!lcols.empty() && left_rows < rcol.size()) {
             // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
             robin_hood::unordered_flat_map<std::int64_t, char> seen;
-            seen.reserve(lcol->size());
-            for (const std::int64_t v : *lcol) {
-                seen.try_emplace(v, char{0});
+            seen.reserve(left_rows);
+            for (const auto* lcol : lcols) {
+                for (const std::int64_t v : *lcol) {
+                    seen.try_emplace(v, char{0});
+                }
             }
             for (std::size_t i = 0; i < rcol.size(); ++i) {
                 if (rnull(i)) {
@@ -3304,7 +3335,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             }
         } else {
             // Left is not the smaller side (or its key vanished); the plain
-            // right set is as good, and the materialized left still emits once.
+            // right set is as good, and the buffered left still emits.
             right_i64_.reserve(rcol.size());
             for (std::size_t i = 0; i < rcol.size(); ++i) {
                 if (!rnull(i)) {
@@ -3540,8 +3571,9 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const std::vector<ir::JoinKey>* keys_;
     bool initialized_ = false;
     bool swapped_ = false;
-    bool swapped_emitted_ = false;
-    std::optional<Table> left_swapped_;
+    /// The left side, buffered as chunks rather than concatenated.
+    std::vector<Table> left_buffered_;
+    std::size_t swapped_next_ = 0;
     ExprType right_kind_ = ExprType::Int;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
@@ -9377,46 +9409,165 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
 /// The plan is fixed once, at construction, for the reason `DeferredScanPlan`
 /// documents: re-reading the shared filter slot per unit could apply to unit 3
 /// a bound that units 0-2 never saw.
+///
+/// **Phase 2 (concurrent units).** Units are decoded a WINDOW at a time on
+/// worker threads rather than one after another, and the window after the one
+/// being served is already decoding. Phase 1 measured why: decoding units
+/// serially cut total work (pool work on q01 fell 234ms -> 125ms) but raised
+/// 8-core wall, because the pool saw one short burst per unit with a serial
+/// phase between and occupancy fell to 0.14. Nothing was too small to
+/// parallelize — there was just never more than one unit's worth of work
+/// available at a time.
+///
+/// Decoding a unit on a worker is safe, and specifically so:
+///
+///   * `LazyTable::acquire_reader` hands each concurrent acquisition its OWN
+///     reader product, under a mutex, and a product owns all the mutable
+///     decoder state. That is exactly what the reader pool was built for.
+///   * `project_where_unit` never WRITES `cache_` — a unit holds a fragment of
+///     a column, so it must not — and concurrent reads of it are fine. This is
+///     load-bearing now, not just a correctness nicety: routing any part of the
+///     unit path back through `project()`, which does cache, would turn this
+///     into a data race.
+///   * Every inner parallel path (`parallel_readers`, `for_row_ranges`,
+///     `filter_selection`) checks `on_worker_pool_thread()` and runs serial
+///     inside a task, so the outer window is the only level of parallelism and
+///     nothing submits from a worker into a saturated pool.
+///
+/// Ordering is preserved exactly: workers claim units from a shared cursor and
+/// write only their own slot, and chunks are served in unit order with
+/// `sequence` / `row_offset` assigned on the calling thread. The categorical
+/// remap also stays on the calling thread, in unit order, because it folds each
+/// chunk into a dictionary shared with every earlier one.
 class DeferredScanSourceOperator final : public Operator {
    public:
     DeferredScanSourceOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
                                const ExecutionContext& exec)
-        : scan_(&scan), plan_(plan_deferred_scan(scan)), units_(std::move(units)), exec_(&exec) {}
+        : scan_(&scan),
+          plan_(plan_deferred_scan(scan)),
+          units_(std::move(units)),
+          exec_(&exec),
+          window_(unit_window(exec)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        while (next_unit_ < units_.size()) {
-            const auto& unit = units_[next_unit_++];
-            auto table = materialize_deferred_scan_unit(*scan_, plan_, unit, *exec_);
-            if (!table.has_value()) {
-                return std::unexpected(std::move(table.error()));
+        while (true) {
+            if (served_ < ready_.size()) {
+                auto& slot = ready_[served_++];
+                if (!slot.has_value()) {
+                    return std::unexpected(std::move(slot.error()));
+                }
+                auto chunk = emit(std::move(*slot));
+                if (!chunk.has_value()) {
+                    continue;  // the unit's rows were all filtered out
+                }
+                return std::optional<Chunk>{std::move(*chunk)};
             }
-            normalize_time_index(*table);
-            // A unit whose every row the scan's predicates rejected carries
-            // nothing. Skipping it is not just an optimization: an empty chunk
-            // with columns is a shape some operators would rather not meet, and
-            // dropping it changes no result. A column-less chunk is a different
-            // thing — it carries a row count for `count()` — and is kept.
-            if (!table->columns.empty() && table->rows() == 0) {
-                continue;
+            // Out of decoded units. Wait for whatever is in flight, then put
+            // the window after it in flight before serving this one, so the
+            // consumer's work overlaps the next decode.
+            if (!batch_.has_value()) {
+                if (dispatched_ >= units_.size()) {
+                    return std::optional<Chunk>{};
+                }
+                dispatch();
             }
-            unify_categorical_dictionaries(*table);
-
-            Chunk chunk;
-            const std::size_t rows = table->rows();
-            chunk.set_properties(table->properties());
-            chunk.columns = std::move(table->columns);
-            if (chunk.columns.empty()) {
-                chunk.logical_rows = table->logical_rows;
+            harvest();
+            if (dispatched_ < units_.size()) {
+                dispatch();
             }
-            chunk.sequence = sequence_++;
-            chunk.row_offset = emitted_rows_;
-            emitted_rows_ += rows;
-            return std::optional<Chunk>{std::move(chunk)};
         }
-        return std::optional<Chunk>{};
     }
 
    private:
+    /// How many units to decode at once. One means serial, which is what a
+    /// non-parallel query, a single-thread budget, and a call already running
+    /// inside a pool task all get — the last because submitting from a worker
+    /// deadlocks against a saturated pool.
+    static auto unit_window(const ExecutionContext& exec) -> std::size_t {
+        if (!exec.parallel || on_worker_pool_thread()) {
+            return 1;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t budget = exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+        return std::max<std::size_t>(1, std::min(budget, pool.size()));
+    }
+
+    /// Put the next window of units in flight. Returns without blocking:
+    /// `WorkerPool::submit` is asynchronous, which is what makes the overlap
+    /// possible — and which is also why everything the body touches is a
+    /// member rather than a local.
+    void dispatch() {
+        window_begin_ = dispatched_;
+        window_count_ = std::min(window_, units_.size() - dispatched_);
+        dispatched_ += window_count_;
+        inflight_.clear();
+        inflight_.resize(window_count_);
+        if (window_count_ == 1) {
+            // Nothing to overlap and no reason to pay for a pool round trip.
+            inflight_[0] = decode_unit(0);
+            return;
+        }
+        cursor_.store(0, std::memory_order_relaxed);
+        batch_ = process_worker_pool().submit(window_count_, [this](std::size_t /*worker*/) {
+            for (std::size_t i = cursor_.fetch_add(1, std::memory_order_relaxed); i < window_count_;
+                 i = cursor_.fetch_add(1, std::memory_order_relaxed)) {
+                inflight_[i] = decode_unit(i);
+            }
+        });
+    }
+
+    /// One unit's decode, as run by a worker. Never throws out of the body: a
+    /// `Batch` rethrows the first escaped exception at `wait()`, which would
+    /// lose the other units' errors and unwind through the pool.
+    auto decode_unit(std::size_t slot) -> std::expected<Table, std::string> {
+        try {
+            auto table =
+                materialize_deferred_scan_unit(*scan_, plan_, units_[window_begin_ + slot], *exec_);
+            if (table.has_value()) {
+                normalize_time_index(*table);
+            }
+            return table;
+        } catch (const std::exception& e) {
+            return std::unexpected(std::string("streamed scan: ") + e.what());
+        }
+    }
+
+    void harvest() {
+        if (batch_.has_value()) {
+            batch_->wait();
+            batch_.reset();
+        }
+        ready_ = std::move(inflight_);
+        inflight_.clear();
+        served_ = 0;
+    }
+
+    /// Turn a decoded unit into the chunk to hand upward, or nullopt when it
+    /// carries no rows.
+    ///
+    /// A unit whose every row the scan's predicates rejected carries nothing.
+    /// Skipping it is not just an optimization: an empty chunk with columns is
+    /// a shape some operators would rather not meet, and dropping it changes no
+    /// result. A column-less chunk is a different thing — it carries a row
+    /// count for `count()` — and is kept.
+    auto emit(Table table) -> std::optional<Chunk> {
+        if (!table.columns.empty() && table.rows() == 0) {
+            return std::nullopt;
+        }
+        unify_categorical_dictionaries(table);
+        Chunk chunk;
+        const std::size_t rows = table.rows();
+        chunk.set_properties(table.properties());
+        chunk.columns = std::move(table.columns);
+        if (chunk.columns.empty()) {
+            chunk.logical_rows = table.logical_rows;
+        }
+        chunk.sequence = sequence_++;
+        chunk.row_offset = emitted_rows_;
+        emitted_rows_ += rows;
+        return chunk;
+    }
+
     /// Remap every Categorical column onto a dictionary shared by all this
     /// source's chunks.
     ///
@@ -9427,7 +9578,18 @@ class DeferredScanSourceOperator final : public Operator {
     /// comparing codes across dictionaries that disagree. The whole-file decode
     /// never had this problem because it merged the groups' dictionaries
     /// itself. `ChunkedParquetSourceOperator` solves it the same way.
+    ///
+    /// **One lookup per dictionary ENTRY, never per row.** Interning row by row
+    /// is a string hash per row, and it does not announce itself: TPC-H's
+    /// `l_returnflag` and `l_linestatus` are plain `string` in the Arrow schema
+    /// and only become Categorical because the writer dictionary-encoded them,
+    /// so a query that never mentions a categorical type still pays. Measured
+    /// on q01, per-row interning cost 114ms of the scan's 160ms — the entire
+    /// regression against the materialized path, on the calling thread where
+    /// nothing could overlap it. A dictionary has a handful of entries and a
+    /// unit has a million rows; the difference is the whole cost.
     void unify_categorical_dictionaries(Table& table) {
+        using code_type = Column<Categorical>::code_type;
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
             auto* local = std::get_if<Column<Categorical>>(table.columns[i].column.get());
             if (local == nullptr) {
@@ -9440,12 +9602,30 @@ class DeferredScanSourceOperator final : public Operator {
             if (!state.has_value()) {
                 state.emplace();
             }
-            Column<Categorical> remapped{state->dictionary_ptr(), state->index_ptr(), {}};
-            remapped.reserve(local->size());
-            for (std::size_t row = 0; row < local->size(); ++row) {
-                remapped.push_back((*local)[row]);
+            if (state->dictionary_ptr() == local->dictionary_ptr()) {
+                continue;  // already speaks the shared dictionary
             }
-            table.columns[i].column = std::make_shared<ColumnValue>(std::move(remapped));
+            // Intern this chunk's dictionary into the shared one, reading back
+            // the code each entry landed on. `clear()` drops the codes and
+            // keeps the dictionary, which is exactly what an accumulator wants.
+            const auto& dictionary = local->dictionary();
+            state->clear();
+            for (const auto& value : dictionary) {
+                state->push_back(value);
+            }
+            std::vector<code_type> remap(dictionary.size());
+            for (std::size_t entry = 0; entry < dictionary.size(); ++entry) {
+                remap[entry] = state->code_at(entry);
+            }
+            state->clear();
+
+            const auto& local_codes = local->codes();
+            std::vector<code_type> codes(local_codes.size());
+            for (std::size_t row = 0; row < local_codes.size(); ++row) {
+                codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
+            }
+            table.columns[i].column = std::make_shared<ColumnValue>(
+                Column<Categorical>{state->dictionary_ptr(), state->index_ptr(), std::move(codes)});
         }
     }
 
@@ -9454,9 +9634,23 @@ class DeferredScanSourceOperator final : public Operator {
     std::vector<SourceUnit> units_;
     const ExecutionContext* exec_;
     std::vector<std::optional<Column<Categorical>>> cat_states_;
-    std::size_t next_unit_ = 0;
+
+    /// Units decoded and waiting to be served, in unit order, and how many of
+    /// them have been.
+    std::vector<std::expected<Table, std::string>> ready_;
+    std::size_t served_ = 0;
+    /// The window currently being decoded. Workers write disjoint slots of
+    /// this, so it must not be resized while `batch_` is live.
+    std::vector<std::expected<Table, std::string>> inflight_;
+    std::optional<WorkerPool::Batch> batch_;
+    std::atomic<std::size_t> cursor_{0};
+    std::size_t window_begin_ = 0;
+    std::size_t window_count_ = 0;
+
+    std::size_t dispatched_ = 0;
     std::size_t emitted_rows_ = 0;
     std::uint64_t sequence_ = 0;
+    std::size_t window_ = 1;
 };
 
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,

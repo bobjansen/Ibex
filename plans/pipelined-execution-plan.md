@@ -126,7 +126,7 @@ No performance goal. Get more than one chunk flowing and find out what breaks.
 Exit criterion: every query is byte-identical at every grain. Expect real bugs
 here — this machinery has never executed.
 
-### Phase 1 — a streaming scan that keeps its pushdowns — **DONE, off by default**
+### Phase 1 — a streaming scan that keeps its pushdowns — **DONE, on by default**
 
 - Give `LazyTable` a way to yield its planned decode in units (row group, or
   Arrow batch) instead of one table, with projection, conjuncts, dynamic key
@@ -148,8 +148,10 @@ group) and `decode` / `key_filter_scan` / `string_filter_scan` all take one.
 every pushdown applied to that unit rather than declined — the fused scans
 included, because both already plan over the whole file and answer in
 source-global indices, so restricting them is a filter on their group list.
-`DeferredScanSourceOperator` drives it. `IBEX_STREAM_SCAN=1` turns it on; the
-default path is untouched.
+`DeferredScanSourceOperator` drives it. **Streaming is the default**;
+`IBEX_STREAM_SCAN=0` opts out, and answers both ways for the same reason
+`IBEX_PARALLEL` does — a switch that could only turn it on leaves no way to
+turn it off.
 
 Two things had to be got right and are worth remembering. Selections stay
 source-global at every boundary, which is what lets the unit path reuse the
@@ -282,6 +284,42 @@ the decision is made.
 
 **q22 +7%** and the rest of **q21** are the concat above. The scan itself is
 now faster than materializing on every query measured.
+
+### Turning it on by default
+
+Flipping it found a **data-loss bug** that every measurement up to that point
+had missed: the window loop asked `batch_.has_value()` to decide whether a
+window was in flight, and a ONE-UNIT window is decoded inline and never
+submits. So a serial query dropped every unit after the first, and a parallel
+one dropped any trailing single-unit window. The PDS-H suite never saw it —
+lineitem's 6 units fit one window of 8 exactly — and only the e2e's
+`IBEX_PARALLEL=0` leg, which asserts a row total, caught it. The e2e streaming
+check now runs serially on purpose rather than by luck.
+
+The lesson: **the shapes that break streaming are window remainders and serial
+execution**, and neither is exercised by the benchmark suite.
+
+### Memory: not the free win it looks like
+
+Streaming was expected to bound peak memory. It does — but only below the
+window. Peak RSS scales with the window, which is the thread budget:
+
+| PDS-H SF-1 | materialized | streamed w1 | streamed w8 |
+|---|---|---|---|
+| q04 | 193M | 127M | 268M |
+| q19 | 137M | 57M | 170M |
+
+So `IBEX_THREADS` now bounds peak decode memory as well as parallelism, and at
+the default window several queries use 20-47% MORE than materializing. Much of
+that excess is not live data: it is glibc growing a free list per worker arena,
+since decoding moved onto the pool. `MALLOC_ARENA_MAX=1` takes q13's +33% down
+to +2% and q04's +45% to +20%.
+
+A lookahead window — dispatching window k+1 before serving window k — was built
+and **reverted as a measured dead end**: +52% peak RSS on a 25-row-group scan
+(161MB -> 244MB) for zero wall-clock change, because the consumer is a blocking
+operator that eats chunks faster than they decode. There is no consumer work to
+overlap with until the rest of the pipeline runs concurrently.
 
 The rest of this phase — a scheduler that runs the whole operator chain
 concurrently rather than just the scan — is unstarted, and the table below is

@@ -238,8 +238,19 @@ auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext&
 }
 
 auto stream_scans_enabled() -> bool {
-    const char* value = std::getenv("IBEX_STREAM_SCAN");
-    return value != nullptr && *value != '\0' && *value != '0';
+    // On by default, so this has to answer BOTH ways — a switch that could only
+    // turn streaming on would leave no way to turn it off, which is what
+    // someone hitting a bug in it, or A/B-ing it, actually needs. Same spelling
+    // and same reasoning as `IBEX_PARALLEL`.
+    const char* raw = std::getenv("IBEX_STREAM_SCAN");  // NOLINT(concurrency-mt-unsafe)
+    if (raw == nullptr) {
+        return true;
+    }
+    const std::string_view value{raw};
+    if (value == "0" || value == "off" || value == "false" || value == "no") {
+        return false;
+    }
+    return true;
 }
 
 auto deferred_scan_units(const DeferredScan& scan) -> std::vector<SourceUnit> {

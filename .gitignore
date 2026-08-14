@@ -60,3 +60,8 @@ examples/measurements*.txt
 
 # Generated example output
 examples/nycflights13/plots*/
+
+# Archived benchmark runs: local provenance for comparing one run against
+# another on the same box. The TSVs are already ignored by *.tsv; this also
+# covers the manifests that make them comparable.
+benchmarking/tpch/results/runs/

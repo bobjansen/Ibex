@@ -20,12 +20,12 @@
 //   ibex_join_bench [--rows N] [--iters N] [--warmup N] [--suite name,...]
 //                   [--verify] [--max-output-rows N]
 
+#include <ibex/format.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <CLI/CLI.hpp>
-#include <ibex/format.hpp>
 
 // jemalloc: unlike ibex_bench, some join workloads have quadratic fan-out and
 // can briefly materialize very large outputs. Keep a short decay so warm
@@ -132,8 +132,9 @@ void print_rows_cap(std::string_view bench_name, std::size_t requested_rows,
     if (requested_rows == capped_rows) {
         return;
     }
-    ibex::formatting::print("  note: {} capped rows from {} to {} to keep expected output <= {} rows\n",
-               bench_name, requested_rows, capped_rows, max_output_rows);
+    ibex::formatting::print(
+        "  note: {} capped rows from {} to {} to keep expected output <= {} rows\n", bench_name,
+        requested_rows, capped_rows, max_output_rows);
 }
 
 auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& tables,
@@ -143,19 +144,22 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
 
     auto parsed = ibex::parser::parse(normalized);
     if (!parsed) {
-        ibex::formatting::print("error: parse failed for {}: {}\n", query.name, parsed.error().format());
+        ibex::formatting::print("error: parse failed for {}: {}\n", query.name,
+                                parsed.error().format());
         return 1;
     }
     auto lowered = ibex::parser::lower(*parsed);
     if (!lowered) {
-        ibex::formatting::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
+        ibex::formatting::print("error: lower failed for {}: {}\n", query.name,
+                                lowered.error().message);
         return 1;
     }
 
     for (std::size_t i = 0; i < warmup_iters; ++i) {
         auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         if (!result) {
-            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                    result.error());
             return 1;
         }
     }
@@ -167,7 +171,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         auto t1 = std::chrono::steady_clock::now();
         if (!result) {
-            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                    result.error());
             return 1;
         }
         last_rows = result->rows();
@@ -193,19 +198,19 @@ auto run_suite_benchmarks(const std::vector<BenchQuery>& queries,
             auto parsed = ibex::parser::parse(normalized);
             if (!parsed) {
                 ibex::formatting::print("error: verify parse failed for {}: {}\n", query.name,
-                           parsed.error().format());
+                                        parsed.error().format());
                 return 1;
             }
             auto lowered = ibex::parser::lower(*parsed);
             if (!lowered) {
                 ibex::formatting::print("error: verify lower failed for {}: {}\n", query.name,
-                           lowered.error().message);
+                                        lowered.error().message);
                 return 1;
             }
             auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
             if (!result) {
                 ibex::formatting::print("error: verify interpret failed for {}: {}\n", query.name,
-                           result.error());
+                                        result.error());
                 return 1;
             }
             ibex::formatting::print("  verify {}: {} rows OK\n", query.name, result->rows());
@@ -528,8 +533,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact", std::move(fact));
             reg.emplace("dim", std::move(dim));
 
-            ibex::formatting::print("-- hash_join: fact({}, {} distinct) x dim({}) — 50%% match --\n", rows,
-                       kFactKeys, kDimKeys);
+            ibex::formatting::print(
+                "-- hash_join: fact({}, {} distinct) x dim({}) — 50%% match --\n", rows, kFactKeys,
+                kDimKeys);
             status = run_suite_benchmarks(
                 {
                     {"hj_inner_low_sel", "fact join dim on key"},
@@ -550,8 +556,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact_small", std::move(fact_small));
             reg.emplace("dim_large", std::move(dim_large));
 
-            ibex::formatting::print("-- hash_join: fact_small({}) x dim_large({}) on key --\n", small_left_rows,
-                       rows);
+            ibex::formatting::print("-- hash_join: fact_small({}) x dim_large({}) on key --\n",
+                                    small_left_rows, rows);
             status = run_suite_benchmarks(
                 {
                     {"hj_inner_small_left", "fact_small join dim_large on key"},
@@ -579,8 +585,9 @@ int main(int argc, char** argv) {
             reg.emplace("mk_lhs", std::move(mk_left));
             reg.emplace("mk_rhs", std::move(mk_right));
 
-            ibex::formatting::print("-- hash_join: multikey mk_lhs({}) x mk_rhs({}) on {{key_a, key_b}} --\n",
-                       multikey_rows, multikey_rows / 10);
+            ibex::formatting::print(
+                "-- hash_join: multikey mk_lhs({}) x mk_rhs({}) on {{key_a, key_b}} --\n",
+                multikey_rows, multikey_rows / 10);
             // Both sides carry a `value` payload, which a same-name non-key
             // column makes ambiguous. 1d renames the right side to dodge this;
             // here the suffix clause does it, which is also what the join a
@@ -638,7 +645,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- int_join: fact_i64({}) x dim_i64({}) on id --\n", rows, dim_ids);
+            ibex::formatting::print("-- int_join: fact_i64({}) x dim_i64({}) on id --\n", rows,
+                                    dim_ids);
             status = run_suite_benchmarks(
                 {
                     {"i64_inner_high_sel", "fact_i64 join dim_i64 on id"},
@@ -659,8 +667,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- int_join: fact_i64({}, {} distinct) x dim_i64({}) — 50%% match --\n",
-                       rows, rows, dim_ids);
+            ibex::formatting::print(
+                "-- int_join: fact_i64({}, {} distinct) x dim_i64({}) — 50%% match --\n", rows,
+                rows, dim_ids);
             status = run_suite_benchmarks(
                 {
                     {"i64_inner_low_sel", "fact_i64 join dim_i64 on id"},
@@ -683,8 +692,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_small_i64", std::move(fact_small));
             reg.emplace("dim_large_i64", std::move(dim_large));
 
-            ibex::formatting::print("-- int_join: fact_small_i64({}) x dim_large_i64({}) on id --\n",
-                       small_left_rows, rows);
+            ibex::formatting::print(
+                "-- int_join: fact_small_i64({}) x dim_large_i64({}) on id --\n", small_left_rows,
+                rows);
             status = run_suite_benchmarks(
                 {
                     {"i64_inner_small_left", "fact_small_i64 join dim_large_i64 on id"},
@@ -706,8 +716,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_small_i64", std::move(fact_small));
             reg.emplace("dim_large_miss_i64", std::move(dim_large_miss));
 
-            ibex::formatting::print("-- int_join: fact_small_i64({}) anti dim_large_miss_i64({}) on id --\n",
-                       small_left_rows, rows);
+            ibex::formatting::print(
+                "-- int_join: fact_small_i64({}) anti dim_large_miss_i64({}) on id --\n",
+                small_left_rows, rows);
             status = run_suite_benchmarks(
                 {
                     {"i64_anti_small_left", "fact_small_i64 anti join dim_large_miss_i64 on id"},
@@ -726,8 +737,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- int_join: fact_i64({}) x dim_i64({}) on id with extra right ids --\n",
-                       rows, kDimIds);
+            ibex::formatting::print(
+                "-- int_join: fact_i64({}) x dim_i64({}) on id with extra right ids --\n", rows,
+                kDimIds);
             status = run_suite_benchmarks(
                 {
                     {"i64_right_extra_rhs", "fact_i64 right join dim_i64 on id"},
@@ -753,8 +765,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact", std::move(fact));
             reg.emplace("dim", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: string-key full-match fact({}) x dim({}) --\n", rows,
-                       kKeys);
+            ibex::formatting::print(
+                "-- preserving_join: string-key full-match fact({}) x dim({}) --\n", rows, kKeys);
             status = run_suite_benchmarks(
                 {
                     {"pj_str_left_full", "fact left join dim on key"},
@@ -773,8 +785,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact", std::move(fact));
             reg.emplace("dim", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: string-key 50%%-match fact({}, {}) x dim({}) --\n",
-                       rows, kFactKeys, kDimKeys);
+            ibex::formatting::print(
+                "-- preserving_join: string-key 50%%-match fact({}, {}) x dim({}) --\n", rows,
+                kFactKeys, kDimKeys);
             status = run_suite_benchmarks(
                 {
                     {"pj_str_left_half", "fact left join dim on key"},
@@ -791,8 +804,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact", std::move(fact));
             reg.emplace("dim", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: string-key extra-right fact({}) x dim({}) --\n", rows,
-                       rows + rows / 2);
+            ibex::formatting::print(
+                "-- preserving_join: string-key extra-right fact({}) x dim({}) --\n", rows,
+                rows + rows / 2);
             status = run_suite_benchmarks(
                 {
                     {"pj_str_right_extra_rhs", "fact right join dim on key"},
@@ -808,8 +822,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact", std::move(fact));
             reg.emplace("dim", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: string-key all-miss fact({}) x dim({}) --\n", rows,
-                       rows);
+            ibex::formatting::print(
+                "-- preserving_join: string-key all-miss fact({}) x dim({}) --\n", rows, rows);
             status = run_suite_benchmarks(
                 {
                     {"pj_str_left_all_miss", "fact left join dim on key"},
@@ -827,8 +841,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: Int64 full-match fact_i64({}) x dim_i64({}) --\n", rows,
-                       dim_ids);
+            ibex::formatting::print(
+                "-- preserving_join: Int64 full-match fact_i64({}) x dim_i64({}) --\n", rows,
+                dim_ids);
             status = run_suite_benchmarks(
                 {
                     {"pj_i64_left_full", "fact_i64 left join dim_i64 on id"},
@@ -846,8 +861,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: Int64 50%%-match fact_i64({}, {}) x dim_i64({}) --\n",
-                       rows, rows, dim_ids);
+            ibex::formatting::print(
+                "-- preserving_join: Int64 50%%-match fact_i64({}, {}) x dim_i64({}) --\n", rows,
+                rows, dim_ids);
             status = run_suite_benchmarks(
                 {
                     {"pj_i64_left_half", "fact_i64 left join dim_i64 on id"},
@@ -864,8 +880,9 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: Int64 extra-right fact_i64({}) x dim_i64({}) --\n",
-                       rows, rows + rows / 2);
+            ibex::formatting::print(
+                "-- preserving_join: Int64 extra-right fact_i64({}) x dim_i64({}) --\n", rows,
+                rows + rows / 2);
             status = run_suite_benchmarks(
                 {
                     {"pj_i64_right_extra_rhs", "fact_i64 right join dim_i64 on id"},
@@ -881,8 +898,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact_i64", std::move(fact));
             reg.emplace("dim_i64", std::move(dim));
 
-            ibex::formatting::print("-- preserving_join: Int64 all-miss fact_i64({}) x dim_i64({}) --\n", rows,
-                       rows);
+            ibex::formatting::print(
+                "-- preserving_join: Int64 all-miss fact_i64({}) x dim_i64({}) --\n", rows, rows);
             status = run_suite_benchmarks(
                 {
                     {"pj_i64_left_all_miss", "fact_i64 left join dim_i64 on id"},
@@ -1089,7 +1106,8 @@ int main(int argc, char** argv) {
         const std::size_t theta_left = std::min(rows, std::size_t{5000});
         const std::size_t theta_right = std::min(rows, std::size_t{1000});
 
-        ibex::formatting::print("\n══ theta_join suite (left={}, right={}) ══\n", theta_left, theta_right);
+        ibex::formatting::print("\n══ theta_join suite (left={}, right={}) ══\n", theta_left,
+                                theta_right);
 
         ibex::runtime::Table lhs;
         {
@@ -1165,8 +1183,8 @@ int main(int argc, char** argv) {
             small_reg.emplace("dim_large", std::move(dim_large));
             small_reg.emplace("dim_large_miss", std::move(dim_large_miss));
 
-            ibex::formatting::print("-- semi_anti: fact_small({}) vs dim_large({}) on key --\n", small_left_rows,
-                       rows);
+            ibex::formatting::print("-- semi_anti: fact_small({}) vs dim_large({}) on key --\n",
+                                    small_left_rows, rows);
             status = run_suite_benchmarks(
                 {
                     {"sa_semi_small_left", "fact_small semi join dim_large on key"},
@@ -1191,7 +1209,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact_miss", std::move(fact_miss));
             reg.emplace("dim_miss", std::move(dim_miss));
 
-            ibex::formatting::print("-- join_defaults: string-key all-miss joins at {} rows --\n", rows);
+            ibex::formatting::print("-- join_defaults: string-key all-miss joins at {} rows --\n",
+                                    rows);
             status = run_suite_benchmarks(
                 {
                     {"jd_left_all_miss", "fact_miss left join dim_miss on key"},
@@ -1208,7 +1227,8 @@ int main(int argc, char** argv) {
             reg.emplace("fact_miss_i64", std::move(fact_miss_i64));
             reg.emplace("dim_miss_i64", std::move(dim_miss_i64));
 
-            ibex::formatting::print("-- join_defaults: Int64-key all-miss joins at {} rows --\n", rows);
+            ibex::formatting::print("-- join_defaults: Int64-key all-miss joins at {} rows --\n",
+                                    rows);
             status = run_suite_benchmarks(
                 {
                     {"jd_i64_left_all_miss", "fact_miss_i64 left join dim_miss_i64 on id"},

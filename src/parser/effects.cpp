@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/parser.hpp>
-
-#include <ibex/format.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -377,8 +376,8 @@ class EffectAnalyzer {
                 continue;
             }
             return ParseError{
-                .message = ibex::formatting::format("function '{}' effect annotation missing: {}", fn->name,
-                                       format_effect_summary(missing)),
+                .message = ibex::formatting::format("function '{}' effect annotation missing: {}",
+                                                    fn->name, format_effect_summary(missing)),
                 .line = fn->start_line,
                 .column = 1,
             };

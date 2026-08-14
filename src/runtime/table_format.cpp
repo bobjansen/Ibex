@@ -78,7 +78,8 @@ auto format_date(Date date) -> std::string {
     const sys_days day = sys_days{days{date.days}};
     const year_month_day ymd{day};
     return ibex::formatting::format("{:04}-{:02}-{:02}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
+                                    static_cast<unsigned>(ymd.month()),
+                                    static_cast<unsigned>(ymd.day()));
 }
 
 auto format_timestamp(Timestamp ts) -> std::string {
@@ -88,10 +89,10 @@ auto format_timestamp(Timestamp ts) -> std::string {
     const year_month_day ymd{day};
     auto tod = tp - day;
     const hh_mm_ss<nanoseconds> hms{tod};
-    return ibex::formatting::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
-                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()),
-                       hms.hours().count(), hms.minutes().count(), hms.seconds().count(),
-                       hms.subseconds().count());
+    return ibex::formatting::format(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:09}", static_cast<int>(ymd.year()),
+        static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()), hms.hours().count(),
+        hms.minutes().count(), hms.seconds().count(), hms.subseconds().count());
 }
 
 auto format_float_mixed(double value) -> std::string {

@@ -1,0 +1,5 @@
+let labels = Table { name = ["café", "日本語", "plain"] };
+labels[update {
+    characters = length(name),
+    bytes = byte_length(name)
+}][select { name, characters, bytes }][order name];

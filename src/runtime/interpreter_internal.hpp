@@ -829,11 +829,12 @@ struct AggregateExec {
 // by scalar_kernel_fn (expr.cpp). None for the vast majority of scalars.
 enum class ScalarKernel : std::uint8_t {
     None,
-    FillNull,     // fill_null
-    FloatClean,   // null_if_nan / null_if_not_finite (kernel branches on callee)
-    Coalesce,     // coalesce
-    Like,         // like (compiles the pattern once, then scans the column)
-    NumericCast,  // Int64/Int32/Int / Float64/Float32 (kernel branches on callee)
+    FillNull,      // fill_null
+    FloatClean,    // null_if_nan / null_if_not_finite (kernel branches on callee)
+    Coalesce,      // coalesce
+    Like,          // like (compiles the pattern once, then scans the column)
+    StringLength,  // length / byte_length
+    NumericCast,   // Int64/Int32/Int / Float64/Float32 (kernel branches on callee)
 };
 [[nodiscard]] auto scalar_kernel_fn(ScalarKernel kernel) -> ColumnEvalFn;
 

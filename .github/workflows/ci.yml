@@ -229,7 +229,7 @@ jobs:
       - name: Configure (also emits compile_commands.json)
         # Ninja + CMAKE_EXPORT_COMPILE_COMMANDS (set in CMakeLists) writes
         # compile_commands.json at configure time, and FetchContent populates
-        # the header-only deps (fmt/spdlog/robin_hood) here too — so no build
+        # the header-only deps (robin_hood/pdqsort) here too — so no build
         # is needed before clang-tidy. We only tidy our own src/*.cpp, which
         # don't depend on any build-time-generated headers.
         run: |

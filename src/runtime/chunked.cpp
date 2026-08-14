@@ -4872,6 +4872,10 @@ class ChunkedAggregateOperator final : public Operator {
 
    private:
     auto process_chunk(const Chunk& chunk) -> std::optional<std::string> {
+        // Counted here, once per chunk, because the partition gate below asks
+        // how much input this OPERATOR has — a question the per-call row count
+        // stopped answering the moment sources began arriving in pieces.
+        rows_offered_ += chunk.rows();
         std::vector<const ColumnEntry*> group_entries;
         group_entries.reserve(group_by_->size());
         for (const auto& key : *group_by_) {
@@ -5106,7 +5110,9 @@ class ChunkedAggregateOperator final : public Operator {
                 key_at, rows, gids, str_partitions_, [&](std::size_t n) { str_order_.resize(n); },
                 [&](const std::string& key, std::uint32_t gid, std::size_t) {
                     str_order_[gid] = key;
-                })) {
+                },
+                kDefaultPartitionMinRows,
+                [&](std::uint32_t gid) -> std::string_view { return str_order_[gid]; })) {
             accumulate_gids(gids, agg_entries, rows);
             return std::nullopt;
         }
@@ -5191,7 +5197,8 @@ class ChunkedAggregateOperator final : public Operator {
 
         if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
                 key_at, rows, gids, int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
-                [&](std::int64_t key, std::uint32_t gid, std::size_t) { int_order_[gid] = key; })) {
+                [&](std::int64_t key, std::uint32_t gid, std::size_t) { int_order_[gid] = key; },
+                kDefaultPartitionMinRows, [&](std::uint32_t gid) { return int_order_[gid]; })) {
             accumulate_gids(gids, agg_entries, rows);
             return std::nullopt;
         }
@@ -5331,6 +5338,12 @@ class ChunkedAggregateOperator final : public Operator {
                         // From the row, not by unpacking: `pair_order_` holds the
                         // reader's own values, and the pack truncates to 32 bits.
                         pair_order_[gid] = {key_a_at(row), key_b_at(row)};
+                    },
+                    kDefaultPartitionMinRows,
+                    [&](std::uint32_t gid) {
+                        // The pack is a pure function of the pair, so a group's
+                        // key is recoverable even though the pack is lossy.
+                        return pack_u64(pair_order_[gid].first, pair_order_[gid].second);
                     })) {
                 accumulate_gids(gids, agg_entries, rows);
                 return std::nullopt;
@@ -5387,6 +5400,10 @@ class ChunkedAggregateOperator final : public Operator {
                 [&](const PairIntKey& key, std::uint32_t gid, std::size_t) {
                     pair_order_[gid] = {static_cast<std::int64_t>(key.first),
                                         static_cast<std::int64_t>(key.second)};
+                },
+                kDefaultPartitionMinRows,
+                [&](std::uint32_t gid) {
+                    return pack(pair_order_[gid].first, pair_order_[gid].second);
                 })) {
             accumulate_gids(gids, agg_entries, rows);
             return std::nullopt;
@@ -5609,12 +5626,19 @@ class ChunkedAggregateOperator final : public Operator {
     /// in row order, so each group's values accumulate in exactly the order the
     /// serial path would use. The output is byte-identical, not merely
     /// equivalent — including the float sums.
+    /// Passed as `key_of_group` by a caller that cannot reconstruct a
+    /// partition key from a group id, which is what decides whether this path
+    /// may start part-way through a stream. Only the packed path is in that
+    /// position: its key is built from a ROW and is not invertible.
+    struct NoGroupKeys {};
+
     template <typename Key, typename Hash, typename Eq = std::equal_to<Key>, typename KeyAt,
-              typename ResizeKeys, typename StoreKey>
+              typename ResizeKeys, typename StoreKey, typename KeyOfGroup = NoGroupKeys>
     auto try_discover_partitioned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
                                   std::vector<KeyPartition<Key, Hash, Eq>>& partitions,
                                   const ResizeKeys& resize_keys, const StoreKey& store_key,
-                                  std::size_t min_rows = kDefaultPartitionMinRows) -> bool {
+                                  std::size_t min_rows = kDefaultPartitionMinRows,
+                                  const KeyOfGroup& key_of_group = {}) -> bool {
         // Below `min_rows` the partition and scatter passes cost more than the
         // serial probe they replace. High cardinality is not checkable up front
         // — it is what discovery is about to find out — so row count is the only
@@ -5632,9 +5656,32 @@ class ChunkedAggregateOperator final : public Operator {
         // populates — so a small trailing chunk falling back would not find the
         // existing groups and would allocate second ids for them. The row gate
         // therefore only guards the first use.
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
-            (rows < min_rows && !partitioned_active_)) {
+        //
+        // The gate counts every row this operator has been OFFERED, not the
+        // rows in this call. They were the same number while a source produced
+        // one chunk; once it produces six, a per-call gate sees a sixth of the
+        // input and declines on a query that plainly qualifies. PDS-H q20 is
+        // exactly that: 909k rows over 543k groups, which activated this path
+        // as one chunk and lost it entirely as six, taking the aggregate from
+        // 50ms to 79ms and the query +23%. The threshold itself is unchanged —
+        // lowering it is a measured dead end, because the break-even is set by
+        // group CARDINALITY and a low-cardinality run of this size loses.
+        constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
             return false;
+        }
+        if (!partitioned_active_) {
+            if (std::max(rows_offered_, rows) < min_rows) {
+                return false;
+            }
+            // Starting part-way through means groups already exist, and they
+            // live in the serial index this path neither reads nor writes.
+            // They have to be moved across (below) or they would be issued
+            // second ids; a caller that cannot hand back their keys cannot
+            // start late at all.
+            if (n_groups_ > 0 && !can_seed) {
+                return false;
+            }
         }
         auto& pool = process_worker_pool();
         const std::size_t budget =
@@ -5650,6 +5697,31 @@ class ChunkedAggregateOperator final : public Operator {
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
+        }
+
+        // Adopt the groups the serial path already discovered, so this path can
+        // start on any chunk rather than only the first. Each keeps its
+        // existing global id, and `stored` is set past them all: the ordering
+        // merge below only visits entries added by the current chunk, so their
+        // `first_rows` are never read and the ids handed out here continue
+        // after them — which is the same invariant that lets one partitioned
+        // chunk follow another.
+        if constexpr (can_seed) {
+            if (!partitioned_active_ && n_groups_ > 0) {
+                Hash hasher;
+                for (std::uint32_t gid = 0; gid < static_cast<std::uint32_t>(n_groups_); ++gid) {
+                    auto key = key_of_group(gid);
+                    auto& partition = partitions[static_cast<std::size_t>(hasher(key) & part_mask)];
+                    partition.index.emplace(Key(key),
+                                            static_cast<std::uint32_t>(partition.gids.size()));
+                    partition.gids.push_back(gid);
+                    partition.first_rows.push_back(0);
+                    partition.keys.emplace_back(key);
+                }
+                for (auto& partition : partitions) {
+                    partition.stored = partition.gids.size();
+                }
+            }
         }
 
         // Pass 1: partition of every row, and a per-range histogram. Ranges are
@@ -7340,6 +7412,11 @@ class ChunkedAggregateOperator final : public Operator {
     /// Set once `try_discover_partitioned` has run; see the gate there for why
     /// a later chunk may then never fall back to the serial loop.
     bool partitioned_active_ = false;
+    /// Input rows this operator has been offered across every chunk, which is
+    /// what the partition gate measures. Distinct from `rows_seen_`, which
+    /// counts only rows the partitioned path itself consumed and exists to give
+    /// group first-rows a global base.
+    std::size_t rows_offered_ = 0;
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
     /// The two paths are mutually exclusive, so sharing that map is safe.

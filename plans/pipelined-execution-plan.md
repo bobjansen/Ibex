@@ -189,9 +189,60 @@ Per-query, the 8-core split is wide (q12 −29%, q08 −9%; q01 +69%, q20 +42%,
 q19 +36%). q21 is the one query that loses single-threaded too (+13.6%) and is
 the place to start if Phase 2 lands and something still regresses.
 
-### Phase 2 — concurrent chunks
+### Phase 2 — concurrent chunks — **first slice landed**
 
 The actual win. Multiple chunks in flight through the operator chain.
+
+**What landed: concurrent units inside the scan.** The scan decodes a WINDOW of
+units on worker threads instead of one after another, and the window after the
+one being served is already decoding. Ordering is untouched — workers claim
+units from a shared cursor and write only their own slot; chunks are served in
+unit order with `sequence` / `row_offset` assigned on the calling thread.
+
+Decoding a unit on a worker is safe because `LazyTable::acquire_reader` hands
+each concurrent acquisition its own reader product (that is what the reader pool
+was built for), `project_where_unit` never writes `cache_`, and every inner
+parallel path checks `on_worker_pool_thread()` and runs serial inside a task.
+The middle one is now load-bearing rather than merely tidy: routing any part of
+the unit path back through `project()`, which does cache, turns it into a race.
+
+PDS-H SF-1, 8 cores, interleaved, geomean against the materialized path:
+
+| | geomean |
+|---|---|
+| Phase 1 (units, serial) | 1.084 |
+| Phase 2 (units, concurrent) | **0.934** |
+
+Streaming is now **6.6% faster** than materializing, where Phase 1 was 8.4%
+slower. q06 −27%, q12 −39%, q15 −20%, q04 −18%, q14 −18%, q19 −17%, q01 −18%.
+
+**Two fixes mattered more than the concurrency itself**, and both were found by
+following the profile rather than by reasoning about the design:
+
+* *Per-row dictionary interning.* The chunk-to-chunk categorical remap interned
+  **per row** instead of per dictionary entry. On q01 that was 114ms of a 160ms
+  scan — the entire regression — and it was invisible from the query: TPC-H's
+  `l_returnflag`/`l_linestatus` are plain `string` in the Arrow schema and only
+  become Categorical because the writer dictionary-encoded them. Interning each
+  dictionary entry once and gathering codes took q01 from +90% to −18%.
+* *A concat that only existed because chunks did.* The semi/anti join's swapped
+  path called `MaterializeOperator` on its left, which was free when the left
+  was one chunk and a full copy once it was six. It buffers the chunks as a list
+  now — it needs the left twice, but never glued. q21's semi join went 113ms ->
+  87ms, and the query from +40% to +10%.
+
+The second is the shape to expect more of: **operators that were written against
+a one-chunk world hide a concat.** They are correct either way, so only a
+profile finds them.
+
+Still open, in order of size: **q20 +25%** and **q21 +10%** (both semi/anti join
+shapes, and q21's remaining cost is no longer in any profiled statement — worth
+checking binding/plan time before assuming it is execution), and **q22 +10%**.
+The scan itself is now faster than materializing on every query measured.
+
+The rest of this phase — a scheduler that runs the whole operator chain
+concurrently rather than just the scan — is unstarted, and the table below is
+still the design.
 
 Requires deciding, per operator, which of three it is:
 

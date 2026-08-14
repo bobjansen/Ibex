@@ -116,7 +116,7 @@ class Parser {
                     return std::nullopt;
                 }
                 params.push_back(std::move(*param));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
         }
         if (!validate_param_defaults(params)) {
             return std::nullopt;
@@ -173,7 +173,7 @@ class Parser {
                     return std::nullopt;
                 }
                 params.push_back(std::move(*param));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
         }
         if (!validate_param_defaults(params)) {
             return std::nullopt;
@@ -260,7 +260,7 @@ class Parser {
                     return false;
                 }
                 effects.push_back(std::move(*spec));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after effects")) {
             return false;
@@ -407,7 +407,7 @@ class Parser {
                     return std::nullopt;
                 }
                 names.push_back(std::move(*n));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
             if (!consume(TokenKind::RParen, "expected ')' after tuple binding names")) {
                 return std::nullopt;
             }
@@ -1050,7 +1050,7 @@ class Parser {
                         right = std::move(*mapped);
                     }
                     keys.push_back(JoinKey{.left = std::move(left), .right = std::move(right)});
-                } while (match(TokenKind::Comma));
+                } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
             }
             if (!consume(TokenKind::RBrace, "expected '}' after join key list")) {
                 return std::nullopt;
@@ -1199,7 +1199,7 @@ class Parser {
                             }
                             args.push_back(std::move(arg));
                         }
-                    } while (match(TokenKind::Comma));
+                    } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
                 }
                 if (!consume(TokenKind::RParen, "expected ')' after argument list")) {
                     return nullptr;
@@ -1317,7 +1317,7 @@ class Parser {
                     return nullptr;
                 }
                 elements.push_back(std::move(elem));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBracket));
         }
         if (!consume(TokenKind::RBracket, "expected ']' after array literal")) {
             return nullptr;
@@ -1351,7 +1351,7 @@ class Parser {
                 }
                 columns.push_back(
                     TableColumnDef{.name = std::move(*col_name), .expr = std::move(col_expr)});
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after Table constructor")) {
             return nullptr;
@@ -1446,7 +1446,7 @@ class Parser {
                             return nullptr;
                         }
                         sink_args.push_back(std::move(arg));
-                    } while (match(TokenKind::Comma));
+                    } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
                 }
                 if (!consume(TokenKind::RParen, "expected ')' after sink argument list")) {
                     return nullptr;
@@ -1493,7 +1493,7 @@ class Parser {
                     return std::nullopt;
                 }
                 clauses.push_back(std::move(*clause));
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBracket));
         }
         return clauses;
     }
@@ -1861,7 +1861,7 @@ class Parser {
                         return std::nullopt;
                     }
                     keys.push_back(std::move(*key));
-                } while (match(TokenKind::Comma));
+                } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
             }
             if (!consume(TokenKind::RBrace, "expected '}' after order list")) {
                 return std::nullopt;
@@ -1915,7 +1915,7 @@ class Parser {
             order_keys.push_back(std::move(*key));
         }
 
-        while (match(TokenKind::Comma)) {
+        while (match(TokenKind::Comma) && !check(TokenKind::RParen)) {
             seen_named = true;
             if (peek().kind != TokenKind::Identifier || peek_next().kind != TokenKind::Eq) {
                 return fail_expr(peek(), "rank(): expected named argument after ','");
@@ -1976,7 +1976,7 @@ class Parser {
                     expr = std::move(value);
                 }
                 fields.push_back(Field{.name = std::move(*name), .expr = std::move(expr)});
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after field list")) {
             return std::nullopt;
@@ -2112,7 +2112,7 @@ class Parser {
                             return std::nullopt;
                         }
                         names.push_back(std::move(*n));
-                    } while (match(TokenKind::Comma));
+                    } while (match(TokenKind::Comma) && !check(TokenKind::RParen));
                     if (!consume(TokenKind::RParen, "expected ')' after tuple column names")) {
                         return std::nullopt;
                     }
@@ -2140,7 +2140,7 @@ class Parser {
                     }
                     fields.push_back(Field{.name = std::move(*name), .expr = std::move(expr)});
                 }
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after field list")) {
             return std::nullopt;
@@ -2242,7 +2242,7 @@ class Parser {
                     return std::nullopt;
                 }
                 fields.push_back(SchemaField{.name = std::move(*name), .type = *scalar});
-            } while (match(TokenKind::Comma));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         if (!consume(TokenKind::RBrace, "expected '}' after schema type")) {
             return std::nullopt;

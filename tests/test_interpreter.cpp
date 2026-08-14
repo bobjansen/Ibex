@@ -3462,6 +3462,34 @@ TEST_CASE("resample count/sum/mean (fast path, numeric reducers)") {
     CHECK(m[2] == 50.0);
 }
 
+TEST_CASE("resample supports compound aggregate expressions") {
+    constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
+    runtime::Table table;
+    table.add_column("ts",
+                     Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(30LL * 1'000'000'000LL),
+                                       ts_from_nanos(min_ns)});
+    table.add_column("symbol", Column<std::string>{"MSFT", "MSFT", "MSFT"});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0});
+    table.add_column("volume", Column<std::int64_t>{2, 1, 3});
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("tf", table);
+    auto ir = require_ir(
+        "tf[resample 1m, select { avg_price = sum(price * volume) / sum(volume), "
+        "volume = sum(volume) }, by symbol];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& vwap = std::get<Column<double>>(*result->find("avg_price"));
+    const auto& volume = std::get<Column<std::int64_t>>(*result->find("volume"));
+    CHECK(vwap[0] == Catch::Approx(40.0 / 3.0));
+    CHECK(vwap[1] == Catch::Approx(30.0));
+    CHECK(volume[0] == 3);
+    CHECK(volume[1] == 3);
+    CHECK(result->find("_agg0") == nullptr);
+}
+
 TEST_CASE("resample with by - one bucket per (bucket, symbol)") {
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
     runtime::Table table;

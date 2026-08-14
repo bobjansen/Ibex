@@ -41,6 +41,8 @@ namespace {
 struct LoweredAggList {
     std::vector<ir::AggSpec> aggs;
     std::vector<ir::FieldSpec> preagg_updates;
+    std::vector<ir::FieldSpec> postagg_updates;
+    std::vector<std::string> final_columns;
 };
 
 struct CompileTimeValue {
@@ -2264,6 +2266,30 @@ class Lowerer {
                                                    std::move(lowered.aggs));
             resample_node->add_child(std::move(node));
             node = std::move(resample_node);
+            if (!lowered.postagg_updates.empty()) {
+                auto postagg = builder_.update(std::move(lowered.postagg_updates));
+                postagg->add_child(std::move(node));
+                node = std::move(postagg);
+
+                // An empty reference is the internal Project marker for the
+                // runtime time-index column.  Resample's bucket column name is
+                // known only at execution time, so it cannot be named here.
+                std::vector<ir::ColumnRef> columns;
+                columns.reserve(1 + (state.by ? state.by->keys.size() : 0) +
+                                lowered.final_columns.size());
+                columns.push_back(ir::ColumnRef{.name = ""});
+                if (state.by) {
+                    for (const auto& key : state.by->keys) {
+                        columns.push_back(ir::ColumnRef{.name = key.name});
+                    }
+                }
+                for (const auto& name : lowered.final_columns) {
+                    columns.push_back(ir::ColumnRef{.name = name});
+                }
+                auto project = builder_.project(std::move(columns));
+                project->add_child(std::move(node));
+                node = std::move(project);
+            }
 
             // Deferred from the pre-window slot above: `order` on a resample
             // sorts the emitted bars (e.g. group them by symbol), not the input.
@@ -4297,16 +4323,70 @@ class Lowerer {
             return alias;
         };
 
+        std::function<std::expected<ir::Expr, LowerError>(const Expr&)> lower_agg_expr;
+        lower_agg_expr = [&](const Expr& expr) -> std::expected<ir::Expr, LowerError> {
+            if (std::holds_alternative<LiteralExpr>(expr.node)) {
+                return lower_expr_to_ir(expr);
+            }
+            if (const auto* group = std::get_if<GroupExpr>(&expr.node)) {
+                return lower_agg_expr(*group->expr);
+            }
+            if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+                auto left = lower_agg_expr(*binary->left);
+                if (!left)
+                    return std::unexpected(left.error());
+                auto right = lower_agg_expr(*binary->right);
+                if (!right)
+                    return std::unexpected(right.error());
+                auto op = to_arithmetic_op(binary->op);
+                if (!op)
+                    return std::unexpected(LowerError{
+                        .message = "unsupported binary operator in resample expression"});
+                return ir::Expr{.node =
+                                    ir::BinaryExpr{.op = *op,
+                                                   .left = ir::make_expr_ptr(std::move(*left)),
+                                                   .right = ir::make_expr_ptr(std::move(*right))}};
+            }
+            const auto* call = std::get_if<CallExpr>(&expr.node);
+            if (call == nullptr || !parse_agg_func(call->callee).has_value()) {
+                return std::unexpected(
+                    LowerError{.message = "resample select: aggregate expressions may contain only "
+                                          "aggregate calls, arithmetic, and literals"});
+            }
+            const auto func = *parse_agg_func(call->callee);
+            const std::string alias = make_temp();
+            if (call->callee == "count" && call->args.empty()) {
+                lowered.aggs.push_back(
+                    ir::AggSpec{.func = func, .column = {.name = ""}, .alias = alias});
+            } else {
+                if (call->args.size() != 1) {
+                    return std::unexpected(
+                        LowerError{.message = "aggregate functions take one argument"});
+                }
+                auto column = lower_agg_arg(*call->args[0]);
+                if (!column)
+                    return std::unexpected(column.error());
+                lowered.aggs.push_back(ir::AggSpec{
+                    .func = func, .column = {.name = std::move(*column)}, .alias = alias});
+            }
+            return ir::Expr{.node = ir::ColumnRef{.name = alias}};
+        };
+
         for (const auto& field : select.fields) {
             if (field.expr == nullptr) {
                 return std::unexpected(
                     LowerError{.message = "resample select: bare column reference not supported — "
                                           "use an aggregate function"});
             }
+            lowered.final_columns.push_back(field.name);
             const auto* call = std::get_if<CallExpr>(&field.expr->node);
             if (call == nullptr) {
-                return std::unexpected(LowerError{
-                    .message = "resample select: only aggregate function calls are supported"});
+                auto expr = lower_agg_expr(*field.expr);
+                if (!expr)
+                    return std::unexpected(expr.error());
+                lowered.postagg_updates.push_back(
+                    ir::FieldSpec{.alias = field.name, .expr = std::move(*expr)});
+                continue;
             }
             auto func = parse_agg_func(call->callee);
             if (!func.has_value()) {

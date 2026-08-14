@@ -260,6 +260,9 @@ auto project_schema(const std::vector<ColumnRef>& columns, const SchemaInfo& inp
     std::vector<SchemaField> out;
     out.reserve(columns.size());
     for (const auto& ref : columns) {
+        if (ref.name.empty()) {
+            continue;  // internal Project marker: retain the runtime time index
+        }
         // A projection moves a column, so every proof about its values -- type
         // and nullability alike -- moves with it.
         if (const auto* field = input.find(ref.name)) {
@@ -271,8 +274,9 @@ auto project_schema(const std::vector<ColumnRef>& columns, const SchemaInfo& inp
     // Keep the time index only if the projection retains that column.
     std::optional<std::string> time_index;
     if (input.time_index().has_value()) {
-        const bool kept = std::ranges::any_of(
-            columns, [&](const ColumnRef& ref) { return ref.name == *input.time_index(); });
+        const bool kept = std::ranges::any_of(columns, [&](const ColumnRef& ref) {
+            return ref.name.empty() || ref.name == *input.time_index();
+        });
         if (kept) {
             time_index = input.time_index();
         }
@@ -1346,6 +1350,9 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
     switch (node.kind()) {
         case NodeKind::Project:
             for (const auto& ref : static_cast<const ProjectNode&>(node).columns()) {
+                if (ref.name.empty()) {
+                    continue;  // internal runtime-time-index projection marker
+                }
                 if (input.find(ref.name) == nullptr) {
                     return missing_column("select", ref.name);
                 }

@@ -2904,6 +2904,9 @@ column and compose inside arithmetic and scalar calls like any other value:
 the enclosing `window` clause. Its column argument may itself be a row-local
 expression, such as `sum(price * volume) / sum(volume)` for a rolling VWAP.
 
+The same aggregate arithmetic is valid in `resample`: it is evaluated once per
+bucket, so `sum(price * volume) / sum(volume)` produces a bucketed VWAP.
+
 **Positional shift (no `window` required):**
 
 | Function           | Description                              |

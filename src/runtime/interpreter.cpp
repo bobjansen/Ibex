@@ -143,6 +143,13 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     -> std::expected<Table, std::string> {
     Table output;
     for (const auto& col : columns) {
+        if (col.name.empty()) {
+            if (const auto& time_index = input.time_index();
+                time_index.has_value() && !output.index.contains(*time_index)) {
+                output.add_column_from(*time_index, *input.find_entry(*time_index));
+            }
+            continue;
+        }
         const auto* entry = input.find_entry(col.name);
         if (entry == nullptr) {
             return std::unexpected("select column not found: " + col.name +

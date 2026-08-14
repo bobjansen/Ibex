@@ -211,10 +211,10 @@ PDS-H SF-1, 8 cores, interleaved, geomean against the materialized path:
 | | geomean |
 |---|---|
 | Phase 1 (units, serial) | 1.084 |
-| Phase 2 (units, concurrent) | **0.934** |
+| Phase 2 (units, concurrent) | **0.922** |
 
-Streaming is now **6.6% faster** than materializing, where Phase 1 was 8.4%
-slower. q06 −27%, q12 −39%, q15 −20%, q04 −18%, q14 −18%, q19 −17%, q01 −18%.
+Streaming is now **7.8% faster** than materializing, where Phase 1 was 8.4%
+slower. q12 −44%, q06 −31%, q04 −23%, q19 −21%, q14 −19%, q01 −17%, q15 −16%.
 
 **Two fixes mattered more than the concurrency itself**, and both were found by
 following the profile rather than by reasoning about the design:
@@ -235,10 +235,30 @@ The second is the shape to expect more of: **operators that were written against
 a one-chunk world hide a concat.** They are correct either way, so only a
 profile finds them.
 
-Still open, in order of size: **q20 +25%** and **q21 +10%** (both semi/anti join
-shapes, and q21's remaining cost is no longer in any profiled statement — worth
-checking binding/plan time before assuming it is execution), and **q22 +10%**.
-The scan itself is now faster than materializing on every query measured.
+**q21, run down.** The residual was in a profiled statement after all — an
+earlier single-sample reading said otherwise and was wrong. Statement 1 (+16%)
+carried the whole of it, and inside that statement the cost was not any operator
+but the **sink**: `MaterializeOperator` spent 33ms appending where the
+single-chunk path spent 0, because one chunk is *moved* into the result table
+and six must be concatenated. Appending was a `push_back` per row even for a
+flat numeric column; `append_column_values` now bulk-copies, which took
+statement 1 from +16.4% to +8.9%. What is left is the memmove itself —
+`li_F` is 2.9M rows of four POD columns, so ~58MB of copying that the
+single-chunk path never does.
+
+That cost is inherent while a `let` binding is one contiguous `Table`: streaming
+a large intermediate into a binding must glue it back together. It is the same
+lesson as `plans/runtime-multithreading-plan.md`'s "the MERGE CONCAT is the real
+island cost", and it says the wins track *output* size — which is exactly the
+observed split, since every query that gains reduces its rows sharply (q06,
+q12) and every one that loses binds a large intermediate.
+
+Still open: **q20 +23%**, which is a different cause — its high-cardinality
+group-by on `(l_partkey, l_suppkey)` costs 40ms -> 68ms when fed six chunks
+rather than one, with no concat involved. That is the chunked aggregate's own
+merge, and it connects to the existing high-cardinality group-by gap. **q21
++9%** and **q22 +7%** are the concat above. The scan itself is now faster than
+materializing on every query measured.
 
 The rest of this phase — a scheduler that runs the whole operator chain
 concurrently rather than just the scan — is unstarted, and the table below is

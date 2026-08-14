@@ -1,0 +1,21 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// Streamed scan over a Categorical column whose dictionary differs per row
+// group (pipelined-execution plan, Phase 1). The file is the one
+// parquet_categorical_check.ibex writes: row group 0 is [alpha, beta] and row
+// group 1 is [gamma, beta], so "gamma" occupies the code "alpha" holds in the
+// other group.
+//
+// Under IBEX_STREAM_SCAN each row group arrives as its own chunk, carrying its
+// own local codes. The scan operator remaps them onto one dictionary shared by
+// all of its chunks; without that remap the counts below come out wrong while
+// the row count stays right — alpha 624288 / gamma 0 instead of the split
+// this asserts.
+//
+// It is a separate file from the writer because only a batch-eligible script
+// reaches the streaming path, and a script with a write_parquet side effect is
+// not one. Nothing in PDS-H is dictionary-encoded, so this is the only
+// coverage that remap has.
+let back = read_parquet("tests/data/parquet_categorical_check_out.parquet");
+
+back[select { n = count() }, by { cat }, order { cat }];

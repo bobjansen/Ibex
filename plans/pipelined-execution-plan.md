@@ -111,7 +111,7 @@ batch units rather than as one table.
 
 Deliberately ordered so each is separately measurable and the risky one is last.
 
-### Phase 0 — make multi-chunk real, and prove it correct
+### Phase 0 — make multi-chunk real, and prove it correct — **DONE (`f9db6a0`)**
 
 No performance goal. Get more than one chunk flowing and find out what breaks.
 
@@ -126,7 +126,7 @@ No performance goal. Get more than one chunk flowing and find out what breaks.
 Exit criterion: every query is byte-identical at every grain. Expect real bugs
 here — this machinery has never executed.
 
-### Phase 1 — a streaming scan that keeps its pushdowns
+### Phase 1 — a streaming scan that keeps its pushdowns — **DONE, off by default**
 
 - Give `LazyTable` a way to yield its planned decode in units (row group, or
   Arrow batch) instead of one table, with projection, conjuncts, dynamic key
@@ -140,6 +140,54 @@ Trap: `LazyTable::cache_` is not thread-safe and the deferred-probe path
 explicitly declines when a key column is already cached. Streaming must not
 quietly disable the fused scans — check by diffing plan shapes (profiler
 `op="..."` counts), which is how a silent decline was caught on 2026-08-14.
+
+**What landed.** `SourceUnit` is a source-global row range a reader can decode
+alone; `LazySourceReader::decode_units()` reports them (Parquet: one per row
+group) and `decode` / `key_filter_scan` / `string_filter_scan` all take one.
+`LazyTable::project_where_unit` is `project_where` restricted to a unit, with
+every pushdown applied to that unit rather than declined — the fused scans
+included, because both already plan over the whole file and answer in
+source-global indices, so restricting them is a filter on their group list.
+`DeferredScanSourceOperator` drives it. `IBEX_STREAM_SCAN=1` turns it on; the
+default path is untouched.
+
+Two things had to be got right and are worth remembering. Selections stay
+source-global at every boundary, which is what lets the unit path reuse the
+whole-source filtering code instead of growing a second index space. And a unit
+decode never touches `cache_`: a unit holds a *fragment* of a column, and a
+fragment in the cache is indistinguishable from a whole one to every later
+reader — including the fused scans, which decline when their key column is
+cached.
+
+**The bar was not met, and the way it was missed is the useful result.**
+PDS-H SF-1, interleaved, min-of-5, answers identical and plan shapes identical
+(no pushdown silently declined):
+
+| | geomean vs materialized |
+|---|---|
+| 1 core | **0.943** |
+| 8 cores, `taskset -c 0-7` | **1.084** |
+
+Streaming is **5.7% faster on one core and 8.4% slower on eight**. Since the
+same binary does the same work in both, the regression is not extra work — it
+is *lost parallelism*, and the single-core number says the phase delivered
+exactly the cache-locality win it promised. q01's decode confirms it directly:
+pool work drops 234ms → 125ms while wall rises 123ms → 208ms, and occupancy
+falls 0.44 → 0.14.
+
+The cause is the diagnosis above, one level down. A unit is ~1M rows, which is
+plenty to parallelize (`parallel_min_rows` is 65536, so no gate is being
+missed) — but six units run one after another with a serial phase between each,
+so the pool sees six short bursts instead of one long one and nothing overlaps
+them. Materialize-then-fan-out, at unit granularity.
+
+**This is Phase 2's case, made quantitatively.** Concurrent units are not a
+refinement of Phase 1; they are the thing that turns the 0.943 into the
+8-core number. Until then the switch stays off.
+
+Per-query, the 8-core split is wide (q12 −29%, q08 −9%; q01 +69%, q20 +42%,
+q19 +36%). q21 is the one query that loses single-threaded too (+13.6%) and is
+the place to start if Phase 2 lands and something still regresses.
 
 ### Phase 2 — concurrent chunks
 

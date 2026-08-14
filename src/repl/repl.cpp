@@ -4889,6 +4889,30 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             if (lazy == nullptr) {
                 continue;
             }
+            // Phase 1 of plans/pipelined-execution-plan.md: hand the source to
+            // the plan still undecoded, so its scan operator can emit it a unit
+            // at a time instead of the whole file arriving as one chunk. The
+            // pushdowns are the same ones the eager call below applies — they
+            // travel in the registration rather than being spent here.
+            //
+            // A null `filter` marks this as a streaming registration rather
+            // than a deferred *probe* scan; the two must stay distinguishable
+            // because a probe's decode is the join's to schedule. Probes are
+            // registered above and skipped by the `contains` guard, so the two
+            // sets never overlap.
+            if (runtime::stream_scans_enabled() && lazy->scan_units().size() > 1) {
+                deferred_scans.emplace(
+                    name, runtime::DeferredScan{
+                              .lazy = resolve_lazy_ptr(name),
+                              .conjuncts = applied_filters.contains(name) ? predicates.at(name)
+                                                                          : std::vector<ir::Expr>{},
+                              .demand = needed.names,
+                              .demand_all = needed.all,
+                              .key_column = {},
+                              .filter = nullptr,
+                          });
+                continue;
+            }
             std::expected<runtime::Table, std::string> table;
             if (applied_filters.contains(name)) {
                 std::set<std::string> names = needed.names;

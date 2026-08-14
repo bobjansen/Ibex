@@ -194,21 +194,20 @@ static auto bounds_worth_applying(const DeferredScan& scan) -> bool {
     return kept_span / source_span <= 0.8;
 }
 
-auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext& exec)
-    -> std::expected<Table, std::string> {
-    std::vector<ir::Expr> conjuncts = scan.conjuncts;
-    const DynamicScanFilter* dynamic = nullptr;
+auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan {
+    DeferredScanPlan plan;
+    plan.conjuncts = scan.conjuncts;
     if (scan.filter != nullptr && scan.filter->ready) {
         if (scan.filter->has_membership()) {
-            dynamic = scan.filter.get();
+            plan.dynamic = scan.filter.get();
         }
         // Bound conjuncts only when there is no membership filter (the Bloom
         // was built from exactly these keys, so bounds add nothing to it) and
         // they provably prune.
-        if (dynamic == nullptr && scan.filter->min.has_value() && scan.filter->max.has_value() &&
-            bounds_worth_applying(scan)) {
+        if (plan.dynamic == nullptr && scan.filter->min.has_value() &&
+            scan.filter->max.has_value() && bounds_worth_applying(scan)) {
             const auto bound = [&](ir::CompareOp op, std::int64_t value) {
-                conjuncts.push_back(ir::Expr{ir::CompareExpr{
+                plan.conjuncts.push_back(ir::Expr{ir::CompareExpr{
                     .op = op,
                     .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = scan.key_column}}),
                     .right = ir::make_expr_ptr(ir::Expr{ir::Literal{.value = value}}),
@@ -218,18 +217,41 @@ auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext&
             bound(ir::CompareOp::Le, *scan.filter->max);
         }
     }
-    if (conjuncts.empty() && dynamic == nullptr) {
+    plan.names = scan.demand;
+    if (scan.demand_all) {
+        for (const auto& field : scan.lazy->schema().columns) {
+            plan.names.insert(field.name);
+        }
+    }
+    return plan;
+}
+
+auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    const auto plan = plan_deferred_scan(scan);
+    if (plan.conjuncts.empty() && plan.dynamic == nullptr) {
         return scan.demand_all ? scan.lazy->materialize(exec)
                                : scan.lazy->project(scan.demand, exec);
     }
-    std::set<std::string> names = scan.demand;
-    if (scan.demand_all) {
-        for (const auto& field : scan.lazy->schema().columns) {
-            names.insert(field.name);
-        }
-    }
-    return scan.lazy->project_where(names, conjuncts, exec, nullptr, dynamic,
-                                    dynamic != nullptr ? &scan.key_column : nullptr);
+    return scan.lazy->project_where(plan.names, plan.conjuncts, exec, nullptr, plan.dynamic,
+                                    plan.dynamic != nullptr ? &scan.key_column : nullptr);
+}
+
+auto stream_scans_enabled() -> bool {
+    const char* value = std::getenv("IBEX_STREAM_SCAN");
+    return value != nullptr && *value != '\0' && *value != '0';
+}
+
+auto deferred_scan_units(const DeferredScan& scan) -> std::vector<SourceUnit> {
+    return scan.lazy == nullptr ? std::vector<SourceUnit>{} : scan.lazy->scan_units();
+}
+
+auto materialize_deferred_scan_unit(const DeferredScan& scan, const DeferredScanPlan& plan,
+                                    const SourceUnit& unit, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    return scan.lazy->project_where_unit(plan.names, plan.conjuncts, unit, exec, nullptr,
+                                         plan.dynamic,
+                                         plan.dynamic != nullptr ? &scan.key_column : nullptr);
 }
 
 auto deferred_scan_key_selection(const DeferredScan& scan, const ExecutionContext& exec)

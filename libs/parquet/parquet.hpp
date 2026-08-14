@@ -2459,8 +2459,25 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
           rows_(rows),
           path_(std::move(path)) {}
 
+    /// One unit per row group: the row group is the file's own decode
+    /// boundary, so a unit is exactly what the decoder can already read
+    /// without touching anything else, and no unit ever straddles a
+    /// dictionary.
+    auto decode_units() -> std::vector<ibex::runtime::SourceUnit> override {
+        const auto& metadata = *reader_->parquet_reader()->metadata();
+        std::vector<ibex::runtime::SourceUnit> units;
+        units.reserve(static_cast<std::size_t>(metadata.num_row_groups()));
+        std::size_t start = 0;
+        for (int group = 0; group < metadata.num_row_groups(); ++group) {
+            const auto rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+            units.push_back(ibex::runtime::SourceUnit{.start = start, .rows = rows});
+            start += rows;
+        }
+        return units;
+    }
+
     auto decode(const std::vector<std::string>& names, const ibex::runtime::Selection* selection,
-                const ibex::runtime::ExecutionContext& exec)
+                const ibex::runtime::SourceUnit* unit, const ibex::runtime::ExecutionContext& exec)
         -> std::expected<ibex::runtime::Table, std::string> override {
         std::vector<int> column_indices;
         column_indices.reserve(names.size());
@@ -2473,14 +2490,17 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         }
 
         try {
+            const auto& metadata = *reader_->parquet_reader()->metadata();
+            const auto groups =
+                unit == nullptr ? all_decode_groups(metadata) : unit_decode_groups(metadata, *unit);
             // Row groups multiply the units: a single-column decode still has
             // one task per row group to hand out (see direct_decode_table).
-            const auto units = column_indices.size() *
-                               static_cast<std::size_t>(std::max(
-                                   1, reader_->parquet_reader()->metadata()->num_row_groups()));
-            auto readers = parallel_readers(units, exec);
+            // A unit IS one row group, so there the column count is all of it.
+            const auto tasks = column_indices.size() *
+                               static_cast<std::size_t>(std::max(1, groups.end - groups.begin));
+            auto readers = parallel_readers(tasks, exec);
             return direct_decode_table(std::span{readers}, *schema_, column_indices, selection,
-                                       rows_);
+                                       rows_, groups);
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: failed to read columns from " + path_ + " (" +
                                    e.what() + ")");
@@ -2488,6 +2508,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     }
 
     auto key_filter_scan(const std::string& key, const ibex::runtime::DynamicScanFilter& filter,
+                         const ibex::runtime::SourceUnit* unit,
                          const ibex::runtime::ExecutionContext& exec)
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(key);
@@ -2517,15 +2538,17 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                       ->physical_type();
             const auto& metadata = *reader_->parquet_reader()->metadata();
             if (physical == parquet::Type::INT64) {
-                const auto groups =
-                    filtered_key_scan_groups<parquet::Int64Type>(metadata, leaf_index, filter);
+                const auto groups = restrict_to_unit(
+                    filtered_key_scan_groups<parquet::Int64Type>(metadata, leaf_index, filter),
+                    unit);
                 auto readers = parallel_readers(groups.size(), exec);
                 return filtered_key_selection<parquet::Int64Type>(std::span{readers}, leaf_index,
                                                                   filter, groups);
             }
             if (physical == parquet::Type::INT32) {
-                const auto groups =
-                    filtered_key_scan_groups<parquet::Int32Type>(metadata, leaf_index, filter);
+                const auto groups = restrict_to_unit(
+                    filtered_key_scan_groups<parquet::Int32Type>(metadata, leaf_index, filter),
+                    unit);
                 auto readers = parallel_readers(groups.size(), exec);
                 return filtered_key_selection<parquet::Int32Type>(std::span{readers}, leaf_index,
                                                                   filter, groups);
@@ -2539,6 +2562,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
 
     auto string_filter_scan(const std::string& column,
                             const ibex::runtime::StringScanFilter& filter,
+                            const ibex::runtime::SourceUnit* unit,
                             const ibex::runtime::ExecutionContext& exec)
         -> std::expected<std::optional<ibex::runtime::Selection>, std::string> override {
         auto it = indices_->find(column);
@@ -2563,7 +2587,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                 parquet::Type::BYTE_ARRAY) {
                 return std::optional<ibex::runtime::Selection>{};
             }
-            const auto groups = whole_file_scan_groups(metadata);
+            const auto groups = restrict_to_unit(whole_file_scan_groups(metadata), unit);
             auto readers = parallel_readers(groups.size(), exec);
             return filtered_string_selection(std::span{readers}, leaf_index, filter, groups);
         } catch (const std::exception& e) {
@@ -2573,6 +2597,41 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     }
 
    private:
+    /// The row-group range covering exactly `unit`. `decode_units` builds units
+    /// from row-group boundaries, so this always lands on one; a unit that did
+    /// not is a caller mixing units from a different source, which is a bug
+    /// rather than something to round.
+    static auto unit_decode_groups(const parquet::FileMetaData& metadata,
+                                   const ibex::runtime::SourceUnit& unit) -> DirectDecodeGroups {
+        std::size_t start = 0;
+        for (int group = 0; group < metadata.num_row_groups(); ++group) {
+            const auto rows = static_cast<std::size_t>(metadata.RowGroup(group)->num_rows());
+            if (start == unit.start && rows == unit.rows) {
+                return DirectDecodeGroups{
+                    .begin = group, .end = group + 1, .source_start = start, .rows = rows};
+            }
+            start += rows;
+        }
+        throw std::runtime_error("read_parquet: decode unit does not match a row group");
+    }
+
+    /// The scan groups lying inside `unit`. Both fused scans plan over the
+    /// whole file and index their answers file-globally, so restricting them
+    /// to a unit is a filter on the group list and nothing else — which is why
+    /// streaming keeps the fused scans instead of declining them.
+    static auto restrict_to_unit(std::vector<KeyScanGroup> groups,
+                                 const ibex::runtime::SourceUnit* unit)
+        -> std::vector<KeyScanGroup> {
+        if (unit == nullptr) {
+            return groups;
+        }
+        const std::size_t end = unit->start + unit->rows;
+        std::erase_if(groups, [&](const KeyScanGroup& group) {
+            return group.base < unit->start || group.base >= end;
+        });
+        return groups;
+    }
+
     /// Readers to spread `units` independent pieces of decode work over: this
     /// product's own reader first, then as many extra ones as the thread budget
     /// justifies. A unit is a column for a whole-table decode and a row group

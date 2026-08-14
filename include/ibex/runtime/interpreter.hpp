@@ -455,6 +455,20 @@ struct DeferredScan {
     std::shared_ptr<DynamicScanFilter> filter;
 };
 
+/// A range of source rows a reader can decode without touching the rest.
+///
+/// This is the streaming unit: a Parquet row group or a run of them, an Arrow
+/// batch, whatever decomposition the source has natively. `start` is a
+/// **source-global** row index and every `Selection` stays in source-global
+/// indices too, so a selection means the same thing whether it is handed to a
+/// whole-source decode or restricted to one unit. That is what lets the
+/// per-unit path reuse the whole-source pushdown machinery unchanged instead of
+/// growing a second, unit-local index space.
+struct SourceUnit {
+    std::size_t start = 0;
+    std::size_t rows = 0;
+};
+
 /// Keyed by scan (instance) name as it appears in the plan.
 using DeferredScanRegistry = std::map<std::string, DeferredScan>;
 
@@ -619,6 +633,47 @@ void configure_parallel_from_env(ExecutionContext& exec);
 /// filter slot carries (if `ready`). The single decode path for deferred
 /// sources — both the chunked join and the interpret fallback use it.
 [[nodiscard]] auto materialize_deferred_scan(const DeferredScan& scan, const ExecutionContext& exec)
+    -> std::expected<Table, std::string>;
+
+/// What a deferred scan decided to apply, worked out once from the filter
+/// slot's published state.
+///
+/// `materialize_deferred_scan` does this and the decode in one call, which is
+/// all a whole-table consumer needs. A streaming consumer decodes many times
+/// and must not re-decide in between: the filter slot is shared mutable state,
+/// so re-reading it per unit could apply a bound to unit 3 that units 0-2 never
+/// saw, and the concatenation would be missing rows no predicate excluded.
+struct DeferredScanPlan {
+    std::set<std::string> names;      ///< columns to decode, already expanded for demand_all
+    std::vector<ir::Expr> conjuncts;  ///< static predicates plus any synthesized bounds
+    /// Non-null when a membership filter applies, in which case the key is
+    /// `scan.key_column`. Borrowed from the scan's filter slot.
+    const DynamicScanFilter* dynamic = nullptr;
+};
+
+[[nodiscard]] auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan;
+
+/// Whether a lazy source should be streamed through its scan operator rather
+/// than decoded whole before the plan runs.
+///
+/// Off by default while Phase 1 of `plans/pipelined-execution-plan.md` is
+/// measured; `IBEX_STREAM_SCAN=1` turns it on. Read fresh each call so a test
+/// can flip it, and consulted in exactly two places — the driver that decides
+/// whether to defer a source, and the scan operator builder — which must agree,
+/// hence one function rather than two `getenv`s.
+[[nodiscard]] auto stream_scans_enabled() -> bool;
+
+/// The scan's streaming decomposition, or empty when its source has none (a
+/// non-lazy source, or a reader with no unit decode). Decodes nothing.
+[[nodiscard]] auto deferred_scan_units(const DeferredScan& scan) -> std::vector<SourceUnit>;
+
+/// One unit of a deferred scan, under a plan already fixed by
+/// `plan_deferred_scan`. Concatenating every unit in order reproduces
+/// `materialize_deferred_scan`.
+[[nodiscard]] auto materialize_deferred_scan_unit(const DeferredScan& scan,
+                                                  const DeferredScanPlan& plan,
+                                                  const SourceUnit& unit,
+                                                  const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
 
 /// Opaque model result produced by the `model { ... }` clause.

@@ -4727,9 +4727,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         runtime::TableRegistry tables = base_tables;
         LazyTableRegistry lazy_sources;
         ir::SourceStats source_stats;
-        // Threaded like any other decode: proving a key is a full column scan.
-        const runtime::ExecutionContext proof_exec = command_exec();
-        const std::set<std::string> join_key_columns = ir::plan_join_key_columns(*rewritten);
         ir::SourceSchemas& schemas = source_stats.schemas;
         ir::SourceRowCounts& row_counts = source_stats.rows;
         // Materialized shared bindings participate in schema-aware rewrites
@@ -4758,15 +4755,31 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             // every base source reached the cost model with no unique key at
             // all. Proving it here is what puts a real bound under join
             // ordering rather than an estimate.
-            ir::SchemaInfo schema = table_schema_info(lazy.value()->schema());
-            for (auto& column : prove_unique_columns(*lazy.value(), join_key_columns, proof_exec)) {
-                schema.add_unique_key(ir::UniqueKey{std::move(column)});
-            }
-            schemas.insert_or_assign(source.source_name, std::move(schema));
+            schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
             row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
             source_stats.distinct.insert_or_assign(source.source_name,
                                                    derive_column_distinct(*lazy.value()));
             lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
+        }
+
+        // Uniqueness is the one thing the planner cannot infer about a base
+        // table from its own construction, and without it the `|PK join FK| <=
+        // |FK|` bound in `estimate_cardinality` never applies to a scan. It runs
+        // as a second pass because resolving a join key back to the source
+        // column it came from needs every source's schema already in place.
+        {
+            const runtime::ExecutionContext proof_exec = command_exec();
+            for (const auto& [source_name, columns] :
+                 ir::plan_join_key_origins(*rewritten, schemas)) {
+                const auto lazy = lazy_sources.find(source_name);
+                const auto schema = schemas.find(source_name);
+                if (lazy == lazy_sources.end() || schema == schemas.end()) {
+                    continue;
+                }
+                for (auto& column : prove_unique_columns(*lazy->second, columns, proof_exec)) {
+                    schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
+                }
+            }
         }
 
         // Prove what the ascriptions assert before anything is decoded: the

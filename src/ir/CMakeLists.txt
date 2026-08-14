@@ -17,6 +17,7 @@ add_library(ibex_ir STATIC
     optimizer.cpp
     pending_order.cpp
     required_columns.cpp
+    column_origins.cpp
     scan_predicates.cpp
     schema.cpp
 )

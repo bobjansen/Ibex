@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/format.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/rng.hpp>
 
 #include <CLI/CLI.hpp>
-#include <ibex/format.hpp>
 
 // When jemalloc is linked, prevent large allocations from being returned to the OS
 // between benchmark iterations.  By default jemalloc decays dirty pages after 10 s,
@@ -1096,8 +1096,8 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
 auto verify_join_row_count(const ibex::runtime::Table& result, std::size_t expected_rows,
                            std::string_view label) -> std::optional<std::string> {
     if (result.rows() != expected_rows) {
-        return ibex::formatting::format("{} row-count mismatch: expected {}, got {}", label, expected_rows,
-                           result.rows());
+        return ibex::formatting::format("{} row-count mismatch: expected {}, got {}", label,
+                                        expected_rows, result.rows());
     }
     return std::nullopt;
 }
@@ -1705,24 +1705,27 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                 try {
                     fresh.emplace(name, read_csv(path));
                 } catch (const std::exception& e) {
-                    ibex::formatting::print("error: read_csv({}) failed for {}: {}\n", path, query.name,
-                               e.what());
+                    ibex::formatting::print("error: read_csv({}) failed for {}: {}\n", path,
+                                            query.name, e.what());
                     return 1;
                 }
             }
             auto parsed = ibex::parser::parse(normalized);
             if (!parsed) {
-                ibex::formatting::print("error: parse failed for {}: {}\n", query.name, parsed.error().format());
+                ibex::formatting::print("error: parse failed for {}: {}\n", query.name,
+                                        parsed.error().format());
                 return 1;
             }
             auto lowered = ibex::parser::lower(*parsed);
             if (!lowered) {
-                ibex::formatting::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
+                ibex::formatting::print("error: lower failed for {}: {}\n", query.name,
+                                        lowered.error().message);
                 return 1;
             }
             auto result = ibex::runtime::interpret(*lowered.value(), fresh, &scalars);
             if (!result) {
-                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                        result.error());
                 return 1;
             }
             last_rows = result->rows();
@@ -1757,20 +1760,23 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     if (!include_parse) {
         auto parsed = ibex::parser::parse(normalized);
         if (!parsed) {
-            ibex::formatting::print("error: parse failed for {}: {}\n", query.name, parsed.error().format());
+            ibex::formatting::print("error: parse failed for {}: {}\n", query.name,
+                                    parsed.error().format());
             return 1;
         }
 
         auto lowered = ibex::parser::lower(*parsed);
         if (!lowered) {
-            ibex::formatting::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
+            ibex::formatting::print("error: lower failed for {}: {}\n", query.name,
+                                    lowered.error().message);
             return 1;
         }
 
         for (std::size_t i = 0; i < warmup_iters; ++i) {
             auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
             if (!result) {
-                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                        result.error());
                 return 1;
             }
         }
@@ -1783,7 +1789,8 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
             auto t1 = std::chrono::steady_clock::now();
             if (!result) {
-                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+                ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                        result.error());
                 return 1;
             }
             last_rows = result->rows();
@@ -1801,17 +1808,20 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
     auto run_once = [&](std::size_t& last_rows) -> int {
         auto parsed = ibex::parser::parse(normalized);
         if (!parsed) {
-            ibex::formatting::print("error: parse failed for {}: {}\n", query.name, parsed.error().format());
+            ibex::formatting::print("error: parse failed for {}: {}\n", query.name,
+                                    parsed.error().format());
             return 1;
         }
         auto lowered = ibex::parser::lower(*parsed);
         if (!lowered) {
-            ibex::formatting::print("error: lower failed for {}: {}\n", query.name, lowered.error().message);
+            ibex::formatting::print("error: lower failed for {}: {}\n", query.name,
+                                    lowered.error().message);
             return 1;
         }
         auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
         if (!result) {
-            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name, result.error());
+            ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
+                                    result.error());
             return 1;
         }
         last_rows = result->rows();
@@ -2007,8 +2017,8 @@ int main(int argc, char** argv) {
                     print_table_types("prices_ts", tables.find("prices_ts")->second);
                 }
             } catch (const std::exception& e) {
-                ibex::formatting::print("warning: failed to read prices_ts CSV ({}): {}\n", prices_ts_path,
-                           e.what());
+                ibex::formatting::print("warning: failed to read prices_ts CSV ({}): {}\n",
+                                        prices_ts_path, e.what());
             }
         }
 
@@ -2072,7 +2082,8 @@ int main(int argc, char** argv) {
                 bool this_include_parse = (qi >= 7) ? true : saved_include_parse;
                 if (verify && queries[qi].name.rfind("parse_", 0) != 0) {
                     if (auto err = verify_benchmark(queries[qi], tables, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", queries[qi].name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n",
+                                                queries[qi].name, *err);
                         return 1;
                     }
                 }
@@ -2092,7 +2103,7 @@ int main(int argc, char** argv) {
         // column. No grouping — exercises the simple scan-and-accumulate path.
         if (status == 0 && run_suite("cumulative")) {
             ibex::formatting::print("\n-- Cumulative function benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> cumulative_queries = {
                 {"cumsum_price", "prices[update { cs = cumsum(price) }]"},
                 {"cumprod_price", "prices[update { cp = cumprod(price) }]"},
@@ -2119,7 +2130,7 @@ int main(int argc, char** argv) {
         //   sort_symbol_price_desc— (String asc, Double desc) mixed multi-key radix
         if (status == 0 && run_suite("sort")) {
             ibex::formatting::print("\n-- Full-sort benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> sort_queries = {
                 {"sort_price", "prices[order price]"},
                 {"sort_price_desc", "prices[order { price desc }]"},
@@ -2130,7 +2141,8 @@ int main(int argc, char** argv) {
             for (const auto& query : sort_queries) {
                 if (verify) {
                     if (auto err = verify_benchmark(query, tables, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name,
+                                                *err);
                         return 1;
                     }
                 }
@@ -2150,7 +2162,7 @@ int main(int argc, char** argv) {
         // each group*: dense rank, lag(1), and a running sum reset per symbol.
         if (status == 0 && run_suite("window")) {
             ibex::formatting::print("\n-- Grouped window benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> window_queries = {
                 {"rank_by_symbol",
                  "prices[update { rk = rank(price, method = dense, ascending = false) }, by "
@@ -2161,7 +2173,8 @@ int main(int argc, char** argv) {
             for (const auto& query : window_queries) {
                 if (verify) {
                     if (auto err = verify_benchmark(query, tables, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name,
+                                                *err);
                         return 1;
                     }
                 }
@@ -2181,7 +2194,7 @@ int main(int argc, char** argv) {
         // per group rather than the streaming sum/min/max of mean_by_symbol.
         if (status == 0 && run_suite("groupagg")) {
             ibex::formatting::print("\n-- Group aggregate benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> groupagg_queries = {
                 {"median_by_symbol", "prices[select { med = median(price) }, by symbol]"},
                 {"quantile_by_symbol", "prices[select { p90 = quantile(price, 0.9) }, by symbol]"},
@@ -2190,7 +2203,8 @@ int main(int argc, char** argv) {
             for (const auto& query : groupagg_queries) {
                 if (verify) {
                     if (auto err = verify_benchmark(query, tables, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name,
+                                                *err);
                         return 1;
                     }
                 }
@@ -2215,7 +2229,7 @@ int main(int argc, char** argv) {
         //                         → clip → re-aggregate
         if (status == 0 && run_suite("pipeline")) {
             ibex::formatting::print("\n-- Pipeline benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> pipeline_queries = {
                 {"filter_group_sort",
                  "prices[filter price > 500.0][select { avg = mean(price) }, by symbol]"
@@ -2251,7 +2265,8 @@ int main(int argc, char** argv) {
             for (const auto& query : pipeline_queries) {
                 if (verify) {
                     if (auto err = verify_benchmark(query, tables, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n", query.name,
+                                                *err);
                         return 1;
                     }
                 }
@@ -2278,7 +2293,7 @@ int main(int argc, char** argv) {
         // (e.g. aggregate over it) so every engine has to materialise it.
         if (status == 0 && run_suite("transform")) {
             ibex::formatting::print("\n-- Transform benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> transform_queries = {
                 {"pmin_clip", "prices[update { clipped = pmin(price, 500.0) }]"},
                 {"where_update_clip", "prices[where price > 900.0 update { price = 900.0 }]"},
@@ -2307,7 +2322,7 @@ int main(int argc, char** argv) {
         // math kernels, comparable to update_price_x2's arithmetic fast path.
         if (status == 0 && run_suite("scalar")) {
             ibex::formatting::print("\n-- Scalar builtin benchmarks ({} prices rows) --\n",
-                       tables.at("prices").rows());
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> scalar_queries = {
                 {"abs_price", "prices[update { v = abs(price) }]"},
                 {"sqrt_price", "prices[update { v = sqrt(price) }]"},
@@ -2335,7 +2350,8 @@ int main(int argc, char** argv) {
         // Vectorized RNG benchmarks: rand_uniform and rand_normal appended as a
         // new column. Measures the column-at-a-time PRNG throughput.
         if (status == 0 && run_suite("rng")) {
-            ibex::formatting::print("\n-- RNG benchmarks ({} prices rows) --\n", tables.at("prices").rows());
+            ibex::formatting::print("\n-- RNG benchmarks ({} prices rows) --\n",
+                                    tables.at("prices").rows());
             std::vector<BenchQuery> rng_queries = {
                 {"rand_uniform", "prices[update { r = rand_uniform(0.0, 1.0) }]"},
                 {"rand_normal", "prices[update { n = rand_normal(0.0, 1.0) }]"},
@@ -2407,7 +2423,7 @@ int main(int argc, char** argv) {
             null_reg.emplace("lookup", std::move(lookup_table));
 
             ibex::formatting::print("\n-- Null benchmarks ({} prices rows, {} lookup rows) --\n",
-                       null_reg.at("prices").rows(), null_reg.at("lookup").rows());
+                                    null_reg.at("prices").rows(), null_reg.at("lookup").rows());
 
             // Join benchmarks on the same lookup workload.
             // - left: exercises null bitmap tracking on right-side columns.
@@ -2441,8 +2457,8 @@ int main(int argc, char** argv) {
                 cross_reg.emplace("lookup_small",
                                   slice_table(null_reg.at("lookup"), kCrossRightRows));
                 ibex::formatting::print("-- Cross join benchmark subset ({} x {} rows) --\n",
-                           cross_reg.at("prices_small").rows(),
-                           cross_reg.at("lookup_small").rows());
+                                        cross_reg.at("prices_small").rows(),
+                                        cross_reg.at("lookup_small").rows());
 
                 // Both slices come from tables that share `symbol`, and a cross
                 // join has no keys to fold it into one output column, so the
@@ -2453,7 +2469,8 @@ int main(int argc, char** argv) {
                     R"(prices_small cross join lookup_small suffix { "", "_lookup" })"};
                 if (verify) {
                     if (auto err = verify_benchmark(cross_query, cross_reg, verify_rows)) {
-                        ibex::formatting::print("error: verify failed for {}: {}\n", cross_query.name, *err);
+                        ibex::formatting::print("error: verify failed for {}: {}\n",
+                                                cross_query.name, *err);
                         return 1;
                     }
                 }
@@ -2481,8 +2498,9 @@ int main(int argc, char** argv) {
                 ibex::runtime::TableRegistry join_reg;
                 join_reg.emplace("prices", tables.at("prices"));
                 join_reg.emplace("lookup", std::move(lookup_table));
-                ibex::formatting::print("\n-- Inner join benchmark ({} prices x {} lookup rows) --\n",
-                           join_reg.at("prices").rows(), join_reg.at("lookup").rows());
+                ibex::formatting::print(
+                    "\n-- Inner join benchmark ({} prices x {} lookup rows) --\n",
+                    join_reg.at("prices").rows(), join_reg.at("lookup").rows());
                 BenchQuery q{"inner_join_symbol", "prices join lookup on symbol"};
                 if (verify) {
                     if (auto err = verify_benchmark(q, join_reg, verify_rows)) {
@@ -2501,14 +2519,16 @@ int main(int argc, char** argv) {
                     events_table = read_csv(csv_events_path);
                     users_table = read_csv(csv_users_path);
                 } catch (const std::exception& e) {
-                    ibex::formatting::print("error: failed to read events/users CSV: {}\n", e.what());
+                    ibex::formatting::print("error: failed to read events/users CSV: {}\n",
+                                            e.what());
                     return 1;
                 }
                 ibex::runtime::TableRegistry join_reg;
                 join_reg.emplace("events", std::move(events_table));
                 join_reg.emplace("users", std::move(users_table));
-                ibex::formatting::print("\n-- Inner join benchmark ({} events x {} users rows) --\n",
-                           join_reg.at("events").rows(), join_reg.at("users").rows());
+                ibex::formatting::print(
+                    "\n-- Inner join benchmark ({} events x {} users rows) --\n",
+                    join_reg.at("events").rows(), join_reg.at("users").rows());
                 BenchQuery q{"inner_join_user", "events join users on user_id"};
                 if (verify) {
                     if (auto err = verify_benchmark(q, join_reg, verify_rows)) {
@@ -3070,7 +3090,7 @@ int main(int argc, char** argv) {
         ibex::runtime::TableRegistry trades_tables;
         trades_tables.emplace("trades", std::move(trades_table));
         ibex::formatting::print("\n-- Statistics benchmarks ({} trades rows) --\n",
-                   trades_tables.at("trades").rows());
+                                trades_tables.at("trades").rows());
         BenchQuery q{"corr_price_vol", "trades[corr]"};
         ScanPaths sp;
         if (include_read) {
@@ -3234,7 +3254,7 @@ int main(int argc, char** argv) {
                 ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars);
             if (!long_result) {
                 ibex::formatting::print("error: failed to build long table for dcast: {}\n",
-                           long_result.error());
+                                        long_result.error());
                 return 1;
             }
             ibex::runtime::Table long_table = std::move(*long_result);
@@ -3255,7 +3275,8 @@ int main(int argc, char** argv) {
                 const auto* day_entry = long_table.find_entry("day");
                 const auto* value_entry = long_table.find_entry("value");
                 if (sym_entry == nullptr || day_entry == nullptr || value_entry == nullptr) {
-                    ibex::formatting::print("error: long table is missing expected columns for typed dcast\n");
+                    ibex::formatting::print(
+                        "error: long table is missing expected columns for typed dcast\n");
                     return 1;
                 }
 
@@ -3375,7 +3396,8 @@ int main(int argc, char** argv) {
         if (a_entry == nullptr || b_entry == nullptr || c_entry == nullptr || d_entry == nullptr ||
             !a_entry->validity.has_value() || !b_entry->validity.has_value() ||
             !c_entry->validity.has_value() || !d_entry->validity.has_value()) {
-            ibex::formatting::print("error: merge_validity suite requires nullable columns a,b,c,d\n");
+            ibex::formatting::print(
+                "error: merge_validity suite requires nullable columns a,b,c,d\n");
             return 1;
         }
         const auto* a_valid = &*a_entry->validity;
@@ -3384,7 +3406,7 @@ int main(int argc, char** argv) {
         const auto* d_valid = &*d_entry->validity;
 
         ibex::formatting::print("\n-- merge_validity function micro benchmarks ({} rows) --\n",
-                   merge_validity_rows);
+                                merge_validity_rows);
         status = run_bitmap_kernel_benchmark(
             "merge_validity_fn_pair", merge_validity_rows, warmup_iters, iters, [&]() {
                 return ibex::runtime::merge_validity_bitmaps(a_valid, b_valid, merge_validity_rows);
@@ -3424,7 +3446,7 @@ int main(int argc, char** argv) {
         }
 
         ibex::formatting::print("\n-- merge_validity expression micro benchmarks ({} rows) --\n",
-                   merge_validity_rows);
+                                merge_validity_rows);
         std::vector<BenchQuery> merge_queries = {
             {"merge_validity_pair", "merge_data[update { out = a + b }]"},
             {"merge_validity_chain8",
@@ -3468,7 +3490,8 @@ int main(int argc, char** argv) {
             print_table_types("tf_data", tf_tables.find("tf_data")->second);
         }
 
-        ibex::formatting::print("\n-- TimeFrame benchmarks ({} rows, 1s spacing) --\n", timeframe_rows);
+        ibex::formatting::print("\n-- TimeFrame benchmarks ({} rows, 1s spacing) --\n",
+                                timeframe_rows);
 
         // Queries listed from cheapest to most expensive.
         // as_timeframe:       sort + time_index assignment — O(n log n)

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/format.hpp>
 #include <ibex/parser/ast.hpp>
 #include <ibex/parser/effects.hpp>
 #include <ibex/parser/lexer.hpp>
 #include <ibex/parser/parser.hpp>
-#include <ibex/format.hpp>
 
 #include <cctype>
 #include <charconv>
@@ -35,8 +35,8 @@ class Parser {
         Program program;
         while (!is_at_end()) {
             if (peek().kind == TokenKind::Error) {
-                return std::unexpected(
-                    make_error(peek(), ibex::formatting::format("invalid token {}", format_token(peek()))));
+                return std::unexpected(make_error(
+                    peek(), ibex::formatting::format("invalid token {}", format_token(peek()))));
             }
             auto stmt = parse_statement();
             if (!stmt.has_value()) {
@@ -469,8 +469,9 @@ class Parser {
             return std::nullopt;
         }
         if (!check(TokenKind::Semicolon)) {
-            error_ = make_error(
-                peek(), ibex::formatting::format("unexpected token {} after expression", format_token(peek())));
+            error_ =
+                make_error(peek(), ibex::formatting::format("unexpected token {} after expression",
+                                                            format_token(peek())));
             return std::nullopt;
         }
         if (!consume(TokenKind::Semicolon, "expected ';' after expression")) {
@@ -1097,12 +1098,13 @@ class Parser {
             const std::string_view word = is_left ? "left" : "right";
             advance();  // 'left' / 'right'
             advance();  // '('
-            auto column =
-                consume_column_identifier(ibex::formatting::format("expected a column name in {}(...)", word));
+            auto column = consume_column_identifier(
+                ibex::formatting::format("expected a column name in {}(...)", word));
             if (!column.has_value()) {
                 return nullptr;
             }
-            if (!consume(TokenKind::RParen, ibex::formatting::format("expected ')' after {}(column)", word))) {
+            if (!consume(TokenKind::RParen,
+                         ibex::formatting::format("expected ')' after {}(column)", word))) {
                 return nullptr;
             }
             auto arg = std::make_unique<Expr>();

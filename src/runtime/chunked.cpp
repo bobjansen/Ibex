@@ -7627,11 +7627,11 @@ auto process_island_stats() -> ParallelIslandStats* {
                 return;
             }
             ibex::formatting::print(stderr,
-                       "island stats: parallel={} serial={} morsels={} range_heads={} "
-                       "two_phase={} parallel_fields={}\n",
-                       stats.parallel_islands.load(), stats.serial_islands.load(),
-                       stats.morsels.load(), stats.range_heads.load(),
-                       stats.two_phase_filters.load(), stats.parallel_fields.load());
+                                    "island stats: parallel={} serial={} morsels={} range_heads={} "
+                                    "two_phase={} parallel_fields={}\n",
+                                    stats.parallel_islands.load(), stats.serial_islands.load(),
+                                    stats.morsels.load(), stats.range_heads.load(),
+                                    stats.two_phase_filters.load(), stats.parallel_fields.load());
         }
     };
     static const Reporter reporter;

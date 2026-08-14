@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <map>
 #include <memory>
@@ -55,13 +56,19 @@ struct DeferrableProbeScan {
 
 /// Scan (instance) name -> eligibility info. `sources` is the set of lazy
 /// scan names the caller can actually defer; anything else is ignored.
-/// Every column name used as a join key anywhere in `root`, both sides.
+/// For each source, its own names for the columns joined on anywhere in `root`.
 ///
 /// Uniqueness of a base column is only worth proving where a pass can consume
 /// it, and the consumer is `estimate_cardinality`'s `|PK join FK| <= |FK|`
 /// bound, which reads join keys. Proving it costs a full column decode, so this
 /// is what keeps that cost proportional to the plan rather than to the file.
-[[nodiscard]] auto plan_join_key_columns(const Node& root) -> std::set<std::string>;
+///
+/// Resolved through `column_origins`, not by matching names. A join key names a
+/// column of the JOIN'S INPUT, which may be several renames removed from the
+/// source column it came from -- `select { c_nationkey = n_nationkey }` is the
+/// PDS-H idiom and defeats a name comparison outright.
+[[nodiscard]] auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
+    -> robin_hood::unordered_map<std::string, std::set<std::string>>;
 
 [[nodiscard]] auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
     -> std::map<std::string, DeferrableProbeScan>;

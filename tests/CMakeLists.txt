@@ -25,6 +25,7 @@ set(IBEX_TEST_SOURCES
     test_ir_node.cpp
     test_ir_optimizer.cpp
     test_ir_pending_order.cpp
+    test_ir_column_origins.cpp
     test_ir_required_columns.cpp
     test_ir_schema.cpp
     test_kafka_common.cpp

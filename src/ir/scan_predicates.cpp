@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/scan_predicates.hpp>
 
@@ -397,14 +398,25 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
 
 }  // namespace
 
-auto plan_join_key_columns(const Node& root) -> std::set<std::string> {
-    std::set<std::string> out;
-    const auto walk = [&out](const Node& node, const auto& self) -> void {
-        if (node.kind() == NodeKind::Join) {
+auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
+    -> robin_hood::unordered_map<std::string, std::set<std::string>> {
+    robin_hood::unordered_map<std::string, std::set<std::string>> out;
+    const auto walk = [&](const Node& node, const auto& self) -> void {
+        if (node.kind() == NodeKind::Join && node.children().size() >= 2) {
             const auto& join = static_cast<const JoinNode&>(node);
-            for (const auto& key : join.keys()) {
-                out.insert(key.left);
-                out.insert(key.right);
+            // Each side's keys name columns of THAT side's output, so each is
+            // resolved against that side's origins.
+            for (std::size_t side = 0; side < 2; ++side) {
+                if (node.children()[side] == nullptr) {
+                    continue;
+                }
+                const ColumnOriginMap origins = column_origins(*node.children()[side], sources);
+                for (const auto& key : join.keys()) {
+                    const auto& name = side == 0 ? key.left : key.right;
+                    if (const auto it = origins.find(name); it != origins.end()) {
+                        out[it->second.source].insert(it->second.column);
+                    }
+                }
             }
         }
         for (const auto& child : node.children()) {

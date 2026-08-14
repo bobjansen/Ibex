@@ -1659,7 +1659,8 @@ inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
 auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
-                    RowRange rows) -> std::expected<ColResult, std::string> {
+                    RowRange rows, std::optional<ir::Duration> window, bool window_aligned)
+    -> std::expected<ColResult, std::string> {
     const std::size_t n = rows.count;
     return std::visit(
         [&](const auto& node) -> std::expected<ColResult, std::string> {
@@ -1713,10 +1714,11 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     node.value);
                 return ColResult{std::move(cv)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                auto lhs = eval_value_vec(*node.left, table, scalars, rows);
+                auto lhs = eval_value_vec(*node.left, table, scalars, rows, window, window_aligned);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs = eval_value_vec(*node.right, table, scalars, rows);
+                auto rhs =
+                    eval_value_vec(*node.right, table, scalars, rows, window, window_aligned);
                 if (!rhs)
                     return std::unexpected(rhs.error());
                 auto result = arith_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
@@ -1736,15 +1738,52 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     // arithmetic (e.g. `px - rolling_mean(px, 20)` or
                     // `t + rand_normal(0, 1)`), using the same kernels as a
                     // bare field. Externs are not threaded into this evaluator
-                    // (same as scalar calls below); no enclosing `window`
-                    // clause reaches here, so rolling_* needs a per-call
-                    // window argument.
-                    const ColumnEvalCtx ctx{
-                        .scalars = scalars, .externs = nullptr, .window = std::nullopt};
+                    // (same as scalar calls below), but an enclosing `window`
+                    // clause must reach nested rolling calls too.
+                    const ColumnEvalCtx ctx{.scalars = scalars,
+                                            .externs = nullptr,
+                                            .window = window,
+                                            .window_aligned = window_aligned};
                     // Not row-local: evaluated over the whole table and sliced,
                     // never over the range alone (see slice_computed).
                     const std::size_t kernel_rows = table.rows();
-                    auto col = column_eval_of(*fn)(node, table, kernel_rows, ctx);
+                    const ir::CallExpr* kernel_call = &node;
+                    const Table* kernel_input = &table;
+                    ir::CallExpr rewritten_call;
+                    Table materialized_input;
+                    if (ir::is_rolling_func(node.callee) && !node.args.empty() &&
+                        ir::as_column_ref(*node.args.front()) == nullptr) {
+                        // Rolling kernels use a single source column. Materialize a
+                        // row-local argument such as `price * volume` so windowed
+                        // aggregate expressions can compose without a separate
+                        // user-visible update step.
+                        auto arg =
+                            eval_value_vec(*node.args.front(), table, scalars,
+                                           RowRange::whole(kernel_rows), window, window_aligned);
+                        if (!arg) {
+                            return std::unexpected(arg.error());
+                        }
+                        ColumnValue argument = std::holds_alternative<ColumnValue>(arg->data)
+                                                   ? std::move(std::get<ColumnValue>(arg->data))
+                                                   : *std::get<const ColumnValue*>(arg->data);
+                        materialized_input = table;
+                        std::string name = "__ibex_rolling_arg__";
+                        while (materialized_input.find(name) != nullptr) {
+                            name += '_';
+                        }
+                        if (const auto* validity = arg->get_validity()) {
+                            materialized_input.add_column(name, std::move(argument), *validity);
+                        } else {
+                            materialized_input.add_column(name, std::move(argument));
+                        }
+                        rewritten_call = node;
+                        ir::Expr ref;
+                        ref.node = ir::ColumnRef{.name = name};
+                        rewritten_call.args.front() = ir::make_expr_ptr(std::move(ref));
+                        kernel_call = &rewritten_call;
+                        kernel_input = &materialized_input;
+                    }
+                    auto col = column_eval_of(*fn)(*kernel_call, *kernel_input, kernel_rows, ctx);
                     if (!col) {
                         return std::unexpected(col.error());
                     }

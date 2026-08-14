@@ -321,6 +321,64 @@ and **reverted as a measured dead end**: +52% peak RSS on a 25-row-group scan
 operator that eats chunks faster than they decode. There is no consumer work to
 overlap with until the rest of the pipeline runs concurrently.
 
+### What the sweep says about the rest of the phase — read this first
+
+Repeating the thread sweep was this plan's own gate ("the number that must move
+is the implied parallel fraction, not the wall time"). Run at SF-2 on the same
+harness, materialized vs streamed:
+
+| | 1c | 2c | 4c | 8c | speedup | implied parallel fraction |
+|---|---|---|---|---|---|---|
+| materialized | 4990 ms | 4153 | 3568 | 3236 | 1.54× | 34% |
+| streamed | 4456 ms | 3967 | 3365 | 3033 | 1.47× | **22%** |
+
+Streaming is faster at every core count (−11% at 1c, −6% at 8c) and the
+parallel fraction went **DOWN**. It did not make more of the program parallel;
+it made the serial part cheaper. **The premise at the top of this document —
+that pipelining is what raises the parallel fraction — is not what Phase 2's
+first slice delivered**, and nothing about the rest of the phase should be
+justified by it without new evidence.
+
+(Caveat: this harness times whole processes, so startup and plugin load are
+counted as serial and deflate the fraction against the `run_bench.sh` numbers
+in the table at the top. The materialized-vs-streamed comparison is same-harness
+and sound; the absolute 34%/22% are not comparable to the 44% above.)
+
+### Where the serial time actually is
+
+Calling-thread ms summed over real operator nodes across the suite, 8 cores,
+with the worker help each drew (`pool_work / self`):
+
+| operator | self ms | pool ms | worker help |
+|---|---|---|---|
+| scan | 479 | 2257 | 4.7× |
+| aggregate | 473 | 813 | 1.7× |
+| **join inner** | **422** | 92 | **0.2×** |
+| **join semi** | **326** | 0 | **none** |
+| **join anti** | **33** | 0 | **none** |
+| update | 57 | 104 | 1.8× |
+| distinct | 40 | 160 | 4.0× |
+
+**Joins are 42% of calling-thread operator time and draw essentially no worker
+help at all**; semi and anti draw literally none. The scan, which this phase
+spent its effort on, is now the best-parallelized operator in the engine. The
+same ranking holds with streaming off (joins 54% there), so it is a property of
+the join operators, not of streaming.
+
+So the next step is **not** the general scheduler below. It is the joins, in
+this order:
+
+1. **Semi/anti join** — 359ms, zero worker help, and the simplest shape: build
+   a key set, then filter. The filter pass is row-local over a hash set, and
+   under streaming its left input already arrives as chunks.
+2. **Inner join** — 422ms at 0.2×. `plans/runtime-multithreading-plan.md` notes
+   a parallel probe was built and shelved (`git stash` "parallel inner-join
+   probe") as unmeasurable, with `assemble_output` named as the other half.
+   It was unmeasurable because the scan dominated then; it does not now.
+
+The scheduler remains the design for running the whole chain concurrently, but
+it is a large change and this measurement does not argue for it yet.
+
 The rest of this phase — a scheduler that runs the whole operator chain
 concurrently rather than just the scan — is unstarted, and the table below is
 still the design.

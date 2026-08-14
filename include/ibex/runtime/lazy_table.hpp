@@ -68,16 +68,32 @@ class LazySourceReader {
    public:
     virtual ~LazySourceReader() = default;
 
+    /// The source's streaming decomposition, in ascending row order and
+    /// covering every row exactly once. Empty — the default — means the source
+    /// has no decomposition and must be decoded whole; `LazyTable` then never
+    /// passes a non-null `unit` to any of the methods below, so a reader that
+    /// does not override this may ignore that parameter entirely.
+    [[nodiscard]] virtual auto decode_units() -> std::vector<SourceUnit> { return {}; }
+
     /// `exec` carries the query's parallel settings. A decoder is free to use
     /// them (the Parquet one decodes columns across workers) or ignore them,
     /// but it must not consult the environment for the answer: the execution
     /// context is the single authority on whether a query runs parallel.
+    ///
+    /// `unit` restricts the decode to one range from `decode_units()`; null
+    /// means the whole source. The result holds only that unit's rows, and
+    /// `selection` — still source-global — is intersected with the unit rather
+    /// than reinterpreted relative to it.
     [[nodiscard]] virtual auto decode(const std::vector<std::string>& names,
-                                      const Selection* selection, const ExecutionContext& exec)
+                                      const Selection* selection, const SourceUnit* unit,
+                                      const ExecutionContext& exec)
         -> std::expected<Table, std::string> = 0;
 
+    /// Passing rows for `filter`, in source-global indices; `unit` restricts
+    /// the scan the same way it restricts `decode`.
     [[nodiscard]] virtual auto key_filter_scan(const std::string& /*key*/,
                                                const DynamicScanFilter& /*filter*/,
+                                               const SourceUnit* /*unit*/,
                                                const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
@@ -95,6 +111,7 @@ class LazySourceReader {
     /// needed whatever fraction of rows survives.
     [[nodiscard]] virtual auto string_filter_scan(const std::string& /*column*/,
                                                   const StringScanFilter& /*filter*/,
+                                                  const SourceUnit* /*unit*/,
                                                   const ExecutionContext& /*exec*/)
         -> std::expected<std::optional<Selection>, std::string> {
         return std::optional<Selection>{};
@@ -202,6 +219,35 @@ class LazyTable {
                                      const std::string* dynamic_key = nullptr)
         -> std::expected<Table, std::string>;
 
+    /// The source's streaming decomposition, or empty when it has none.
+    ///
+    /// A source with units can be scanned a piece at a time through
+    /// `project_where_unit` instead of materialized whole by `project_where`.
+    /// Consulting this decodes nothing: it is read from metadata the binding
+    /// already holds.
+    [[nodiscard]] auto scan_units() -> std::vector<SourceUnit>;
+
+    /// `project_where` restricted to one unit from `scan_units()`.
+    ///
+    /// Every pushdown the whole-source call applies is applied here too, to
+    /// that unit alone: projection, static conjuncts, the dynamic key
+    /// membership filter, and both fused scans. Concatenating the units in
+    /// order reproduces `project_where`'s table exactly — that equality is the
+    /// contract, and `tests/test_lazy_table.cpp` asserts it directly rather
+    /// than trusting the two code paths to stay in step.
+    ///
+    /// Unlike `project_where` this never reads or writes `cache_` for the
+    /// columns it decodes: a unit holds a fragment of a column, and a fragment
+    /// must never be able to masquerade as a whole one. A column another query
+    /// already cached whole is sliced rather than re-read.
+    [[nodiscard]] auto project_where_unit(const std::set<std::string>& names,
+                                          const std::vector<ir::Expr>& conjuncts,
+                                          const SourceUnit& unit, const ExecutionContext& exec,
+                                          const ScalarRegistry* scalars = nullptr,
+                                          const DynamicScanFilter* dynamic = nullptr,
+                                          const std::string* dynamic_key = nullptr)
+        -> std::expected<Table, std::string>;
+
     /// Materialize `names` through an explicit ascending row selection —
     /// late materialization for a caller (the deferred-probe join) that
     /// already knows exactly which rows survive. Bypasses `cache_` like
@@ -260,17 +306,28 @@ class LazyTable {
         const robin_hood::unordered_set<std::string>& referenced, const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto decode_columns(const std::vector<std::string>& names,
-                                      const Selection* selection, const ExecutionContext& exec)
+                                      const Selection* selection, const SourceUnit* unit,
+                                      const ExecutionContext& exec)
         -> std::expected<Table, std::string>;
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
-                                       const ExecutionContext& exec)
+                                       const SourceUnit* unit, const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// The predicate columns for one unit, never cached and never read from
+    /// the cache except to slice a column that is already there whole.
+    [[nodiscard]] auto decode_unit_predicate_columns(
+        const robin_hood::unordered_set<std::string>& referenced, const SourceUnit& unit,
+        const ExecutionContext& exec) -> std::expected<Table, std::string>;
+    /// Every demanded column of `unit`, with no filtering — the unit-scoped
+    /// counterpart of `project` for a scan that has nothing to filter by.
+    [[nodiscard]] auto project_unit(const std::set<std::string>& names, const SourceUnit& unit,
+                                    const ExecutionContext& exec)
+        -> std::expected<Table, std::string>;
     /// Run every conjunct that `fusable_string_conjuncts` claimed through the
     /// source's fused scan, intersecting their selections. nullopt = at least
     /// one had no fused answer, so the caller must evaluate them all the
     /// ordinary way (a partial answer would silently drop the rest).
     [[nodiscard]] auto scan_string_filters(const std::vector<FusedStringConjunct>& fused,
-                                           const ExecutionContext& exec)
+                                           const SourceUnit* unit, const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
     [[nodiscard]] auto acquire_reader() -> std::expected<LazySourceReaderPtr, std::string>;
     void release_reader(LazySourceReaderPtr reader);

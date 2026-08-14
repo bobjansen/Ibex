@@ -50,7 +50,8 @@ LazyTable::LazyTable(Table schema, std::size_t rows, LazySourceReaderFactory rea
       stats_(std::move(stats)) {}
 
 auto LazyTable::decode_columns(const std::vector<std::string>& names, const Selection* selection,
-                               const ExecutionContext& exec) -> std::expected<Table, std::string> {
+                               const SourceUnit* unit, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
     auto* profile_entry =
         exec.execution_profile == nullptr
             ? nullptr
@@ -62,17 +63,32 @@ auto LazyTable::decode_columns(const std::vector<std::string>& names, const Sele
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->decode(names, selection, exec);
+        auto result = (*reader)->decode(names, selection, unit, exec);
         if (result) {
             release_reader(std::move(*reader));
         }
         return result;
     }
+    // Only a factory-backed source can report units, so a decode function
+    // source is never asked for one.
     return decode_(names, selection);
 }
 
+auto LazyTable::scan_units() -> std::vector<SourceUnit> {
+    if (!reader_factory_) {
+        return {};
+    }
+    auto reader = acquire_reader();
+    if (!reader) {
+        return {};  // the failure resurfaces at the first real decode
+    }
+    auto units = (*reader)->decode_units();
+    release_reader(std::move(*reader));
+    return units;
+}
+
 auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
-                                const ExecutionContext& exec)
+                                const SourceUnit* unit, const ExecutionContext& exec)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -83,7 +99,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
         if (!reader) {
             return std::unexpected(reader.error());
         }
-        auto result = (*reader)->key_filter_scan(key, filter, exec);
+        auto result = (*reader)->key_filter_scan(key, filter, unit, exec);
         if (result) {
             release_reader(std::move(*reader));
         }
@@ -139,7 +155,7 @@ auto LazyTable::project_uncached(const std::set<std::string>& names, const Execu
     }
     Table out;
     if (!missing.empty()) {
-        auto decoded = decode_columns(missing, nullptr, exec);
+        auto decoded = decode_columns(missing, nullptr, nullptr, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -171,7 +187,7 @@ auto LazyTable::project(const std::set<std::string>& names, const ExecutionConte
     }
 
     if (!missing.empty()) {
-        auto decoded = decode_columns(missing, nullptr, exec);
+        auto decoded = decode_columns(missing, nullptr, nullptr, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -385,7 +401,7 @@ auto LazyTable::fusable_string_conjuncts(const std::vector<ir::Expr>& conjuncts,
 }
 
 auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fused,
-                                    const ExecutionContext& exec)
+                                    const SourceUnit* unit, const ExecutionContext& exec)
     -> std::expected<std::optional<Selection>, std::string> {
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
@@ -398,7 +414,7 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
     }
     std::optional<Selection> selected;
     for (const auto& conjunct : fused) {
-        auto part = (*reader)->string_filter_scan(conjunct.column, conjunct.filter, exec);
+        auto part = (*reader)->string_filter_scan(conjunct.column, conjunct.filter, unit, exec);
         if (!part) {
             return std::unexpected(part.error());
         }
@@ -439,7 +455,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     // in-memory filter pass below is cheaper than re-reading pages.
     if (membership && conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(*dynamic_key)) {
-        auto scan = scan_key_filter(*dynamic_key, *dynamic, exec);
+        auto scan = scan_key_filter(*dynamic_key, *dynamic, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }
@@ -453,7 +469,8 @@ auto LazyTable::project_where(const std::set<std::string>& names,
                 }
             }
             if (!wanted.empty()) {
-                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, exec);
+                auto decoded =
+                    decode_columns(wanted, all_rows ? nullptr : &selected, nullptr, exec);
                 if (!decoded) {
                     return std::unexpected(decoded.error());
                 }
@@ -487,7 +504,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     std::vector<ir::Expr> unfused;
     std::optional<Selection> fused_selection;
     if (fusable_string_conjuncts(conjuncts, names, fused, unfused)) {
-        auto scan = scan_string_filters(fused, exec);
+        auto scan = scan_string_filters(fused, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }
@@ -554,7 +571,296 @@ auto LazyTable::project_where(const std::set<std::string>& names,
 
     Table decoded_remaining;
     if (!remaining.empty()) {
-        auto decoded = decode_columns(remaining, all_rows ? nullptr : &*selected, exec);
+        auto decoded = decode_columns(remaining, all_rows ? nullptr : &*selected, nullptr, exec);
+        if (!decoded) {
+            return std::unexpected(decoded.error());
+        }
+        decoded_remaining = std::move(*decoded);
+        for (const auto& name : remaining) {
+            if (decoded_remaining.find_entry(name) == nullptr) {
+                return std::unexpected("lazy source did not produce requested column '" + name +
+                                       "'");
+            }
+        }
+        if (decoded_remaining.rows() != selected->size()) {
+            return std::unexpected(
+                "lazy source produced selected columns with the wrong row count");
+        }
+    }
+
+    robin_hood::unordered_map<std::string, ColumnEntry> selected_columns;
+    selected_columns.reserve(names.size());
+    for (const auto& entry : predicates.columns) {
+        if (!names.contains(entry.name)) {
+            continue;
+        }
+        ColumnEntry gathered;
+        gathered.name = entry.name;
+        if (all_rows) {
+            gathered.column = entry.column;
+            gathered.validity = entry.validity;
+        } else {
+            gathered.column = std::make_shared<ColumnValue>(
+                gather_column(*entry.column, selected->data(), selected->size(), &exec));
+            if (entry.validity.has_value()) {
+                ValidityBitmap validity(selected->size(), true);
+                for (std::size_t row = 0; row < selected->size(); ++row) {
+                    validity.set(row, (*entry.validity)[(*selected)[row]]);
+                }
+                gathered.validity = std::move(validity);
+            }
+        }
+        selected_columns.insert_or_assign(gathered.name, std::move(gathered));
+    }
+    for (auto& entry : decoded_remaining.columns) {
+        auto name = entry.name;
+        selected_columns.insert_or_assign(std::move(name), std::move(entry));
+    }
+
+    Table out;
+    for (const auto& field : schema_.columns) {
+        if (!names.contains(field.name)) {
+            continue;
+        }
+        auto it = selected_columns.find(field.name);
+        if (it == selected_columns.end()) {
+            return std::unexpected("lazy source did not produce requested column '" + field.name +
+                                   "'");
+        }
+        out.add_column_shared(it->second.name, it->second.column, it->second.validity);
+    }
+    out.logical_rows = selected->size();
+    return out;
+}
+
+auto LazyTable::project_unit(const std::set<std::string>& names, const SourceUnit& unit,
+                             const ExecutionContext& exec) -> std::expected<Table, std::string> {
+    std::vector<std::string> missing;
+    for (const auto& field : schema_.columns) {
+        if (names.contains(field.name) && !cache_.contains(field.name)) {
+            missing.push_back(field.name);
+        }
+    }
+
+    Table decoded;
+    if (!missing.empty()) {
+        auto res = decode_columns(missing, nullptr, &unit, exec);
+        if (!res) {
+            return std::unexpected(res.error());
+        }
+        decoded = std::move(*res);
+        if (decoded.rows() != unit.rows) {
+            return std::unexpected("lazy source produced a unit with the wrong row count");
+        }
+    }
+
+    // A column another query already decoded whole is sliced rather than
+    // re-read: the pages are gone from the equation, and the copy is exactly
+    // this unit's rows.
+    std::vector<std::size_t> unit_rows;
+    const auto slice_of = [&](const ColumnEntry& entry) -> ColumnEntry {
+        if (unit_rows.empty() && unit.rows != 0) {
+            unit_rows.resize(unit.rows);
+            for (std::size_t row = 0; row < unit.rows; ++row) {
+                unit_rows[row] = unit.start + row;
+            }
+        }
+        ColumnEntry sliced;
+        sliced.name = entry.name;
+        sliced.column = std::make_shared<ColumnValue>(
+            gather_column(*entry.column, unit_rows.data(), unit_rows.size(), &exec));
+        if (entry.validity.has_value()) {
+            ValidityBitmap bits(unit.rows, true);
+            for (std::size_t row = 0; row < unit.rows; ++row) {
+                bits.set(row, (*entry.validity)[unit.start + row]);
+            }
+            sliced.validity = std::move(bits);
+        }
+        return sliced;
+    };
+
+    Table out;
+    for (const auto& field : schema_.columns) {
+        if (!names.contains(field.name)) {
+            continue;
+        }
+        if (const auto cached = cache_.find(field.name); cached != cache_.end()) {
+            auto sliced = slice_of(cached->second);
+            out.add_column_shared(sliced.name, std::move(sliced.column),
+                                  std::move(sliced.validity));
+            continue;
+        }
+        const auto* entry = decoded.find_entry(field.name);
+        if (entry == nullptr) {
+            return std::unexpected("lazy source did not produce requested column '" + field.name +
+                                   "'");
+        }
+        out.add_column_from(entry->name, *entry);
+    }
+    out.logical_rows = unit.rows;
+    return out;
+}
+
+auto LazyTable::decode_unit_predicate_columns(
+    const robin_hood::unordered_set<std::string>& referenced, const SourceUnit& unit,
+    const ExecutionContext& exec) -> std::expected<Table, std::string> {
+    // Deliberately NOT `decode_whole_columns`. That one caches what it decodes,
+    // which is correct for a whole-file predicate column and wrong here: this
+    // holds one unit's rows, and a fragment sitting in `cache_` would be
+    // indistinguishable from a whole column to every later reader of it.
+    std::set<std::string> names;
+    for (const auto& name : referenced) {
+        names.insert(name);
+    }
+    return project_unit(names, unit, exec);
+}
+
+auto LazyTable::project_where_unit(const std::set<std::string>& names,
+                                   const std::vector<ir::Expr>& conjuncts, const SourceUnit& unit,
+                                   const ExecutionContext& exec, const ScalarRegistry* scalars,
+                                   const DynamicScanFilter* dynamic, const std::string* dynamic_key)
+    -> std::expected<Table, std::string> {
+    const bool membership =
+        dynamic != nullptr && dynamic_key != nullptr && dynamic->has_membership();
+    if (conjuncts.empty() && !membership) {
+        return project_unit(names, unit, exec);
+    }
+
+    // Everything below mirrors `project_where` step for step, with two
+    // differences and no third: decodes carry `&unit`, and the selections the
+    // source hands back (which are source-global) are rebased to unit-local
+    // indices so the in-memory filtering and gathering code is untouched.
+    const auto to_local = [&](Selection& selection) {
+        if (unit.start == 0) {
+            return;
+        }
+        for (auto& row : selection) {
+            row -= unit.start;
+        }
+    };
+
+    // Fused path: the source evaluates the key filter inside its own decoder,
+    // for this unit's row groups only.
+    if (membership && conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
+        !cache_.contains(*dynamic_key)) {
+        auto scan = scan_key_filter(*dynamic_key, *dynamic, &unit, exec);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        if (scan->has_value()) {
+            const Selection selected = std::move(**scan);  // source-global
+            const bool all_rows = selected.size() == unit.rows;
+            std::vector<std::string> wanted;
+            for (const auto& field : schema_.columns) {
+                if (names.contains(field.name)) {
+                    wanted.push_back(field.name);
+                }
+            }
+            if (!wanted.empty()) {
+                auto decoded = decode_columns(wanted, all_rows ? nullptr : &selected, &unit, exec);
+                if (!decoded) {
+                    return std::unexpected(decoded.error());
+                }
+                if (decoded->rows() != selected.size()) {
+                    return std::unexpected(
+                        "lazy source produced selected columns with the wrong row count");
+                }
+                Table out;
+                for (const auto& name : wanted) {
+                    const auto* entry = decoded->find_entry(name);
+                    if (entry == nullptr) {
+                        return std::unexpected("lazy source did not produce requested column '" +
+                                               name + "'");
+                    }
+                    out.add_column_from(entry->name, *entry);
+                }
+                out.logical_rows = selected.size();
+                return out;
+            }
+        }
+    }
+
+    std::vector<FusedStringConjunct> fused;
+    std::vector<ir::Expr> unfused;
+    std::optional<Selection> fused_selection;
+    if (fusable_string_conjuncts(conjuncts, names, fused, unfused)) {
+        auto scan = scan_string_filters(fused, &unit, exec);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        fused_selection = std::move(*scan);
+        if (fused_selection.has_value()) {
+            to_local(*fused_selection);
+        }
+    }
+    const std::vector<ir::Expr>& applied = fused_selection.has_value() ? unfused : conjuncts;
+
+    robin_hood::unordered_set<std::string> referenced;
+    for (const auto& conjunct : applied) {
+        ir::collect_expr_column_refs(conjunct, referenced);
+    }
+    if (membership) {
+        referenced.insert(*dynamic_key);
+    }
+
+    auto predicates_res = decode_unit_predicate_columns(referenced, unit, exec);
+    if (!predicates_res) {
+        return std::unexpected(predicates_res.error());
+    }
+    Table const& predicates = *predicates_res;
+
+    const auto key =
+        membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
+
+    std::optional<Selection> selected;
+    if (!applied.empty()) {
+        auto from_conjuncts = filter_selection(predicates, applied, exec, scalars);
+        if (!from_conjuncts) {
+            return std::unexpected(from_conjuncts.error());
+        }
+        selected = std::move(*from_conjuncts);
+        if (key.has_value()) {
+            apply_membership_filter(*key, *dynamic, *selected);
+        }
+    } else if (membership && key.has_value()) {
+        selected = membership_selection(*key, *dynamic, unit.rows);
+    }
+
+    if (fused_selection.has_value()) {
+        if (!selected.has_value()) {
+            selected = std::move(*fused_selection);
+        } else {
+            Selection both;
+            both.reserve(std::min(selected->size(), fused_selection->size()));
+            std::ranges::set_intersection(*selected, *fused_selection, std::back_inserter(both));
+            selected = std::move(both);
+        }
+    }
+    if (!selected.has_value()) {
+        return project_unit(names, unit, exec);  // nothing left to filter by
+    }
+    const bool all_rows = selected->size() == unit.rows;
+
+    std::vector<std::string> remaining;
+    for (const auto& field : schema_.columns) {
+        if (names.contains(field.name) && !referenced.contains(field.name)) {
+            remaining.push_back(field.name);
+        }
+    }
+
+    Table decoded_remaining;
+    if (!remaining.empty()) {
+        // The source indexes rows file-globally, so hand it the selection
+        // rebased back out of unit-local space.
+        Selection global;
+        if (!all_rows && unit.start != 0) {
+            global.reserve(selected->size());
+            for (const auto row : *selected) {
+                global.push_back(row + unit.start);
+            }
+        }
+        const Selection* pass = all_rows ? nullptr : (unit.start == 0 ? &*selected : &global);
+        auto decoded = decode_columns(remaining, pass, &unit, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -630,7 +936,7 @@ auto LazyTable::decode_whole_columns(const robin_hood::unordered_set<std::string
         }
     }
     if (!missing.empty()) {
-        auto decoded = decode_columns(missing, nullptr, exec);
+        auto decoded = decode_columns(missing, nullptr, nullptr, exec);
         if (!decoded) {
             return std::unexpected(decoded.error());
         }
@@ -675,7 +981,7 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
     }
     Table decoded;
     if (!missing.empty()) {
-        auto res = decode_columns(missing, all_rows ? nullptr : &selected, exec);
+        auto res = decode_columns(missing, all_rows ? nullptr : &selected, nullptr, exec);
         if (!res) {
             return std::unexpected(res.error());
         }
@@ -733,7 +1039,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     // values are decoded at all.
     if (conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
         !cache_.contains(key_name)) {
-        auto scan = scan_key_filter(key_name, dynamic, exec);
+        auto scan = scan_key_filter(key_name, dynamic, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }

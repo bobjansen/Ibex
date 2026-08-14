@@ -85,7 +85,7 @@ class TrackingReader final : public runtime::LazySourceReader {
         : state_(std::move(state)), product_(product) {}
 
     auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
-                const runtime::ExecutionContext& /*exec*/)
+                const runtime::SourceUnit* /*unit*/, const runtime::ExecutionContext& /*exec*/)
         -> std::expected<runtime::Table, std::string> override {
         state_->decode_products.push_back(product_);
         const runtime::Selection all{0, 1, 2};
@@ -166,22 +166,51 @@ struct TextSourceState {
     std::vector<std::string> scan_calls;
     /// When false the reader declines the fused scan, exercising the fallback.
     bool fused = true;
+    /// When false the reader reports no decomposition, so `scan_units` is
+    /// empty and nothing streams.
+    bool units = true;
 };
 
 constexpr std::array<std::string_view, 6> kText{"alpha",    "bad apple", "cherry",
                                                 "very bad", "date",      "elder"};
 
+/// Units this source decomposes into: three ranges of two rows. Deliberately
+/// uneven with nothing else in the file — a unit boundary that lines up with a
+/// filter boundary would hide a rebasing bug.
+constexpr std::array<runtime::SourceUnit, 3> kUnits{runtime::SourceUnit{.start = 0, .rows = 2},
+                                                    runtime::SourceUnit{.start = 2, .rows = 2},
+                                                    runtime::SourceUnit{.start = 4, .rows = 2}};
+
 class TextReader final : public runtime::LazySourceReader {
    public:
     explicit TextReader(std::shared_ptr<TextSourceState> state) : state_(std::move(state)) {}
 
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        return state_->units ? std::vector<runtime::SourceUnit>{kUnits.begin(), kUnits.end()}
+                             : std::vector<runtime::SourceUnit>{};
+    }
+
     auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
-                const runtime::ExecutionContext& /*exec*/)
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
         -> std::expected<runtime::Table, std::string> override {
         state_->decode_calls.push_back(names);
-        runtime::Selection all(kText.size());
-        std::iota(all.begin(), all.end(), std::size_t{0});
-        const auto& rows = selection == nullptr ? all : *selection;
+        // A unit restricts which source rows this decode covers; the selection
+        // stays source-global and is intersected with it, never rebased.
+        const std::size_t begin = unit == nullptr ? 0 : unit->start;
+        const std::size_t end = unit == nullptr ? kText.size() : unit->start + unit->rows;
+        runtime::Selection all;
+        for (std::size_t row = begin; row < end; ++row) {
+            all.push_back(row);
+        }
+        runtime::Selection within;
+        if (selection != nullptr) {
+            for (const auto row : *selection) {
+                if (row >= begin && row < end) {
+                    within.push_back(row);
+                }
+            }
+        }
+        const auto& rows = selection == nullptr ? all : within;
         runtime::Table out;
         for (const auto& name : names) {
             if (name == "s") {
@@ -205,14 +234,17 @@ class TextReader final : public runtime::LazySourceReader {
     }
 
     auto string_filter_scan(const std::string& column, const runtime::StringScanFilter& filter,
+                            const runtime::SourceUnit* unit,
                             const runtime::ExecutionContext& /*exec*/)
         -> std::expected<std::optional<runtime::Selection>, std::string> override {
         state_->scan_calls.push_back(column);
         if (!state_->fused) {
             return std::optional<runtime::Selection>{};
         }
+        const std::size_t begin = unit == nullptr ? 0 : unit->start;
+        const std::size_t end = unit == nullptr ? kText.size() : unit->start + unit->rows;
         runtime::Selection selected;
-        for (std::size_t row = 0; row < kText.size(); ++row) {
+        for (std::size_t row = begin; row < end; ++row) {
             if (filter.passes(kText[row])) {
                 selected.push_back(row);
             }
@@ -1115,4 +1147,158 @@ TEST_CASE("LazyTable: an unnegated like fuses too", "[runtime][lazy_table][strin
     REQUIRE(table);
     CHECK(int_column(*table, "n") == std::vector<std::int64_t>{1, 3});
     CHECK(state->scan_calls == std::vector<std::string>{"s"});
+}
+
+// --- Streaming a scan in units -------------------------------------------
+//
+// Phase 1 of plans/pipelined-execution-plan.md. The whole point of the design
+// is that a unit-at-a-time scan applies the same pushdowns as the whole-source
+// one, so the tests that matter are equality tests against `project_where`
+// rather than tests of the streaming path in isolation: two code paths that are
+// supposed to agree will not stay in step unless something checks.
+
+namespace {
+
+/// `project_where` run unit by unit and glued back together — what a streaming
+/// scan operator does with `project_where_unit`.
+struct Streamed {
+    std::vector<std::int64_t> n;
+    std::vector<std::string> s;
+    std::size_t units = 0;
+};
+
+auto stream_units(runtime::LazyTable& lazy, const std::set<std::string>& names,
+                  const std::vector<ir::Expr>& conjuncts) -> Streamed {
+    Streamed out;
+    for (const auto& unit : lazy.scan_units()) {
+        auto part = lazy.project_where_unit(names, conjuncts, unit, kExec);
+        REQUIRE(part.has_value());
+        ++out.units;
+        if (const auto* entry = part->find_entry("n"); entry != nullptr) {
+            const auto* column = std::get_if<Column<std::int64_t>>(&*entry->column);
+            REQUIRE(column != nullptr);
+            out.n.insert(out.n.end(), column->begin(), column->end());
+        }
+        if (const auto* entry = part->find_entry("s"); entry != nullptr) {
+            const auto* column = std::get_if<Column<std::string>>(&*entry->column);
+            REQUIRE(column != nullptr);
+            for (std::size_t row = 0; row < column->size(); ++row) {
+                out.s.emplace_back((*column)[row]);
+            }
+        }
+    }
+    return out;
+}
+
+auto string_column(const runtime::Table& table, const std::string& name)
+    -> std::vector<std::string> {
+    const auto* entry = table.find_entry(name);
+    REQUIRE(entry != nullptr);
+    const auto* column = std::get_if<Column<std::string>>(&*entry->column);
+    REQUIRE(column != nullptr);
+    std::vector<std::string> out;
+    out.reserve(column->size());
+    for (std::size_t row = 0; row < column->size(); ++row) {
+        out.emplace_back((*column)[row]);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("LazyTable: units concatenate to the whole-source projection",
+          "[runtime][lazy_table][stream]") {
+    auto whole_state = std::make_shared<TextSourceState>();
+    auto whole_lazy = make_text_lazy(whole_state);
+    auto stream_state = std::make_shared<TextSourceState>();
+    auto stream_lazy = make_text_lazy(stream_state);
+
+    SECTION("no predicate at all") {
+        auto whole = whole_lazy.project_where({"n", "s"}, {}, kExec);
+        REQUIRE(whole);
+        const auto streamed = stream_units(stream_lazy, {"n", "s"}, {});
+        CHECK(streamed.units == 3);
+        CHECK(streamed.n == int_column(*whole, "n"));
+        CHECK(streamed.s == string_column(*whole, "s"));
+    }
+
+    SECTION("a conjunct the source cannot fuse") {
+        // `n > 1` is evaluated in memory over the decoded column, so this is
+        // the path where the selection is computed per unit and has to be
+        // rebased before it indexes that unit's rows.
+        std::vector<ir::Expr> conjuncts;
+        conjuncts.push_back(greater_than("n", 1));
+        auto whole = whole_lazy.project_where({"n", "s"}, conjuncts, kExec);
+        REQUIRE(whole);
+        const auto streamed = stream_units(stream_lazy, {"n", "s"}, conjuncts);
+        CHECK(streamed.n == int_column(*whole, "n"));
+        CHECK(streamed.n == std::vector<std::int64_t>{2, 3, 4, 5});
+        CHECK(streamed.s == string_column(*whole, "s"));
+    }
+
+    SECTION("a fused string scan, restricted to each unit") {
+        // The fused scan answers in source-global indices for the whole file;
+        // restricted to a unit it must answer for that unit alone, or the rows
+        // it names will not exist in the unit's decoded columns.
+        std::vector<ir::Expr> conjuncts;
+        conjuncts.push_back(like_call("s", "%bad%"));
+        auto whole = whole_lazy.project_where({"n"}, conjuncts, kExec);
+        REQUIRE(whole);
+        const auto streamed = stream_units(stream_lazy, {"n"}, conjuncts);
+        CHECK(streamed.n == int_column(*whole, "n"));
+        CHECK(streamed.n == std::vector<std::int64_t>{1, 3});
+        // Asked once per unit, and the text column was never materialized.
+        CHECK(stream_state->scan_calls == std::vector<std::string>{"s", "s", "s"});
+        for (const auto& call : stream_state->decode_calls) {
+            CHECK(std::ranges::find(call, "s") == call.end());
+        }
+    }
+
+    SECTION("a fused scan the source declines") {
+        stream_state->fused = false;
+        whole_state->fused = false;
+        std::vector<ir::Expr> conjuncts;
+        conjuncts.push_back(not_like("s", "%bad%"));
+        auto whole = whole_lazy.project_where({"n"}, conjuncts, kExec);
+        REQUIRE(whole);
+        const auto streamed = stream_units(stream_lazy, {"n"}, conjuncts);
+        CHECK(streamed.n == int_column(*whole, "n"));
+    }
+}
+
+TEST_CASE("LazyTable: a unit decode never enters the whole-column cache",
+          "[runtime][lazy_table][stream]") {
+    // A unit holds a fragment of a column. If one reached `cache_`, every later
+    // reader would treat those few rows as the whole column — and the fused
+    // scans, which decline when their key column is already cached, would
+    // decline on the strength of a fragment.
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    std::vector<ir::Expr> conjuncts;
+    conjuncts.push_back(greater_than("n", 1));
+    const auto streamed = stream_units(lazy, {"n", "s"}, conjuncts);
+    CHECK(streamed.n.size() == 4);
+
+    // A whole-source call afterwards still sees every row, and still fuses.
+    state->scan_calls.clear();
+    std::vector<ir::Expr> fusable;
+    fusable.push_back(like_call("s", "%bad%"));
+    auto whole = lazy.project_where({"n"}, fusable, kExec);
+    REQUIRE(whole);
+    CHECK(int_column(*whole, "n") == std::vector<std::int64_t>{1, 3});
+    CHECK(state->scan_calls == std::vector<std::string>{"s"});
+}
+
+TEST_CASE("LazyTable: a source with no decomposition reports no units",
+          "[runtime][lazy_table][stream]") {
+    // The decline path. `scan_units` empty is how a caller learns to keep
+    // materializing whole, and it must not be an error or an empty scan.
+    auto state = std::make_shared<TextSourceState>();
+    state->units = false;
+    auto lazy = make_text_lazy(state);
+    CHECK(lazy.scan_units().empty());
+    auto whole = lazy.project_where({"n", "s"}, {}, kExec);
+    REQUIRE(whole);
+    CHECK(int_column(*whole, "n").size() == kText.size());
 }

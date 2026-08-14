@@ -3586,7 +3586,10 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& name = static_cast<const ir::ScanNode&>(*cur).source_name();
     const auto* scan = exec.deferred_scan(name);
-    if (scan == nullptr) {
+    // A probe scan is one with a filter slot to publish build-side bounds
+    // into. The registry also holds streaming registrations (Phase 1), which
+    // have no slot and are not this join's to decode.
+    if (scan == nullptr || scan->filter == nullptr) {
         return {};
     }
     // Recover the stored key iterator to expose the registry's own name string.
@@ -9360,6 +9363,102 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
 }
 
+/// Streams a deferred lazy scan one source unit at a time instead of decoding
+/// the whole source and handing it over as a single chunk.
+///
+/// This is Phase 1 of `plans/pipelined-execution-plan.md`. The decode it
+/// performs is the same decode `materialize_deferred_scan` performs, with the
+/// same pushdowns — projection, static conjuncts, the dynamic key membership
+/// filter, and both fused scans, all restricted to the unit rather than
+/// declined (see `LazyTable::project_where_unit`). What changes is only that
+/// the rows arrive in pieces, which is the precondition for anything above the
+/// scan ever running concurrently with it.
+///
+/// The plan is fixed once, at construction, for the reason `DeferredScanPlan`
+/// documents: re-reading the shared filter slot per unit could apply to unit 3
+/// a bound that units 0-2 never saw.
+class DeferredScanSourceOperator final : public Operator {
+   public:
+    DeferredScanSourceOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
+                               const ExecutionContext& exec)
+        : scan_(&scan), plan_(plan_deferred_scan(scan)), units_(std::move(units)), exec_(&exec) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (next_unit_ < units_.size()) {
+            const auto& unit = units_[next_unit_++];
+            auto table = materialize_deferred_scan_unit(*scan_, plan_, unit, *exec_);
+            if (!table.has_value()) {
+                return std::unexpected(std::move(table.error()));
+            }
+            normalize_time_index(*table);
+            // A unit whose every row the scan's predicates rejected carries
+            // nothing. Skipping it is not just an optimization: an empty chunk
+            // with columns is a shape some operators would rather not meet, and
+            // dropping it changes no result. A column-less chunk is a different
+            // thing — it carries a row count for `count()` — and is kept.
+            if (!table->columns.empty() && table->rows() == 0) {
+                continue;
+            }
+            unify_categorical_dictionaries(*table);
+
+            Chunk chunk;
+            const std::size_t rows = table->rows();
+            chunk.set_properties(table->properties());
+            chunk.columns = std::move(table->columns);
+            if (chunk.columns.empty()) {
+                chunk.logical_rows = table->logical_rows;
+            }
+            chunk.sequence = sequence_++;
+            chunk.row_offset = emitted_rows_;
+            emitted_rows_ += rows;
+            return std::optional<Chunk>{std::move(chunk)};
+        }
+        return std::optional<Chunk>{};
+    }
+
+   private:
+    /// Remap every Categorical column onto a dictionary shared by all this
+    /// source's chunks.
+    ///
+    /// Parquet writes one dictionary PER ROW GROUP, and a unit is one row
+    /// group, so without this each chunk's codes would mean something different
+    /// from the last one's — and the operators that compare dictionary identity
+    /// to take a fast path (grouping, joins, the packed key encoder) would be
+    /// comparing codes across dictionaries that disagree. The whole-file decode
+    /// never had this problem because it merged the groups' dictionaries
+    /// itself. `ChunkedParquetSourceOperator` solves it the same way.
+    void unify_categorical_dictionaries(Table& table) {
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            auto* local = std::get_if<Column<Categorical>>(table.columns[i].column.get());
+            if (local == nullptr) {
+                continue;
+            }
+            if (cat_states_.size() <= i) {
+                cat_states_.resize(table.columns.size());
+            }
+            auto& state = cat_states_[i];
+            if (!state.has_value()) {
+                state.emplace();
+            }
+            Column<Categorical> remapped{state->dictionary_ptr(), state->index_ptr(), {}};
+            remapped.reserve(local->size());
+            for (std::size_t row = 0; row < local->size(); ++row) {
+                remapped.push_back((*local)[row]);
+            }
+            table.columns[i].column = std::make_shared<ColumnValue>(std::move(remapped));
+        }
+    }
+
+    const DeferredScan* scan_;
+    DeferredScanPlan plan_;
+    std::vector<SourceUnit> units_;
+    const ExecutionContext* exec_;
+    std::vector<std::optional<Column<Categorical>>> cat_states_;
+    std::size_t next_unit_ = 0;
+    std::size_t emitted_rows_ = 0;
+    std::uint64_t sequence_ = 0;
+};
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -9390,6 +9489,31 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         const auto island = analyze_parallel_island(node);
         if (island.eligible()) {
             return build_parallel_island(island, registry, scalars, externs, exec, model_out);
+        }
+    }
+
+    // A deferred lazy scan can be streamed instead of materialized. Everything
+    // else — a registered table, a source with no unit decomposition — falls
+    // through to the whole-table path at the bottom of this function, so
+    // declining here costs nothing but the whole-table behaviour.
+    if (node.kind() == ir::NodeKind::Scan && stream_scans_enabled()) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        if (!registry.contains(scan.source_name())) {
+            // A null filter slot is what distinguishes a scan registered for
+            // streaming from a deferred *probe* scan. A probe's decode belongs
+            // to the join above it, which publishes build-side key bounds into
+            // that slot first; streaming it here would decode it before those
+            // bounds exist. See `deferred_probe_scan_of`, which draws the same
+            // line from the other side.
+            if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                deferred != nullptr && deferred->filter == nullptr) {
+                auto units = deferred_scan_units(*deferred);
+                if (units.size() > 1) {
+                    return std::make_unique<DeferredScanSourceOperator>(*deferred, std::move(units),
+                                                                        exec);
+                }
+            }
         }
     }
 

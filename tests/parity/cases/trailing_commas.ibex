@@ -1,0 +1,11 @@
+let prices = Table {
+    symbol = ["A", "B",],
+    price = [10, 20,],
+};
+
+prices[
+    update { doubled = price * 2, },
+][
+    select { symbol, doubled, },
+    order { symbol asc, },
+];

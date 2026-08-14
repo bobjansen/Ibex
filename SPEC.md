@@ -871,7 +871,7 @@ expr            = primary
 
 (* Collision renaming — Section 5.6. Both suffixes are always named; an empty
    string leaves that side alone, and two empty strings are rejected. *)
-join_suffix     = "suffix" "{" STRING "," STRING "}" ;
+join_suffix     = "suffix" "{" STRING "," STRING [ "," ] "}" ;
 
 (* Null key matching — Section 5.6. Governs equijoin keys, so it is available
    only on the `on join_keys` forms; on a cross join or a pure predicate join
@@ -1017,7 +1017,7 @@ field_item      = field
 field           = col_name "=" expr
                 | col_name ;
 
-tuple_field     = "(" col_name { "," col_name } ")" "=" expr ;
+tuple_field     = "(" col_name { "," col_name } [ "," ] ")" "=" expr ;
 
 col_name        = IDENT | QUOTED_IDENT ;
 
@@ -1072,6 +1072,10 @@ binary_op       = "+" | "-" | "*" | "/" | "%"
 literal         = INT_LIT | FLOAT_LIT | STRING_LIT
                 | BOOL_LIT | DURATION_LIT ;
 ```
+
+Every comma-separated list delimited by `()`, `[]`, or `{}` permits one
+optional trailing comma. This is useful for multi-line source and never
+changes the parse meaning.
 
 ### 4.1 Disambiguation Rules
 

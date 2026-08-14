@@ -66,6 +66,22 @@ const JoinExpr& require_join(const Expr& expr) {
 
 }  // namespace
 
+TEST_CASE("Parse trailing commas in delimited lists") {
+    const char* source = R"(
+extern fn scan(path: String,) -> DataFrame<{ symbol: String, price: Float64, }>
+    effects { io_read, } from "scan.hpp";
+fn identity(value: Int,) -> Int { value; }
+let (symbol, price,) = columns(symbol, price,);
+let values = [1, 2,];
+let table = Table { symbol = ["A",], price = [1.0,], };
+table[select { symbol, price, }, order { symbol asc, },];
+)";
+
+    auto result = parse(source);
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 6);
+}
+
 TEST_CASE("Parse extern declaration with schema types") {
     const char* source =
         "extern fn read_csv(path: String, schema: DataFrame<{ id: Int64, name: String }>)"

@@ -2900,10 +2900,9 @@ transpiler does not yet emit per-call windows.
 **Composition.** Rolling, shift, cumulative, and fill functions produce a
 column and compose inside arithmetic and scalar calls like any other value:
 `price - rolling_mean(price, 20)`, `(close - lag(close, 1)) / lag(close, 1)`,
-`cumsum(qty) * px`. Their own column argument must still be a bare column —
-materialize a computed input with a preceding `update` block. A rolling call
-nested inside a larger expression needs a per-call window; the enclosing
-`window` clause applies only to top-level rolling fields.
+`cumsum(qty) * px`. A rolling call nested inside a larger expression inherits
+the enclosing `window` clause. Its column argument may itself be a row-local
+expression, such as `sum(price * volume) / sum(volume)` for a rolling VWAP.
 
 **Positional shift (no `window` required):**
 

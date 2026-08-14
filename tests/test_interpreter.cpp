@@ -2949,6 +2949,29 @@ TEST_CASE("rolling_sum with 2ns window") {
     REQUIRE((*s)[2] == 50);  // rows 1+2
 }
 
+TEST_CASE("windowed aggregate expressions support rolling VWAP") {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});
+    table.add_column("symbol", Column<std::string>{"MSFT", "MSFT", "MSFT"});
+    table.add_column("price", Column<double>{10.0, 20.0, 30.0});
+    table.add_column("volume", Column<std::int64_t>{2, 1, 3});
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+
+    runtime::TableRegistry registry;
+    registry.emplace("data", table);
+
+    auto ir = require_ir(
+        "data[select { vwap = sum(price * volume) / sum(volume) }, by symbol, window 2ns];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* vwap = std::get_if<Column<double>>(result->find("vwap"));
+    REQUIRE(vwap != nullptr);
+    CHECK((*vwap)[0] == Catch::Approx(10.0));
+    CHECK((*vwap)[1] == Catch::Approx(40.0 / 3.0));
+    CHECK((*vwap)[2] == Catch::Approx(27.5));
+}
+
 TEST_CASE("rolling_mean with 2ns window") {
     runtime::Table table;
     table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2)});

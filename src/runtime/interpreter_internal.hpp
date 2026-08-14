@@ -1153,7 +1153,9 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
                                         const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const Table& table,
-                                  const ScalarRegistry* scalars, RowRange rows)
+                                  const ScalarRegistry* scalars, RowRange rows,
+                                  std::optional<ir::Duration> window = std::nullopt,
+                                  bool window_aligned = false)
     -> std::expected<ColResult, std::string>;
 /// Element-wise arithmetic. `lhs_off`/`rhs_off` are the operands' `ColResult::offset`
 /// — the output is always dense, so only the inputs carry one.

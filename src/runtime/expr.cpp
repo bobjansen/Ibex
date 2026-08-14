@@ -2112,7 +2112,7 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
     // nested whole-column calls cannot be built per row. Evaluate them
     // through the vectorized, validity-aware path.
     if (field_uses_vectorized_eval(expr)) {
-        auto res = eval_value_vec(expr, input, ctx.scalars, range);
+        auto res = eval_value_vec(expr, input, ctx.scalars, range, ctx.window, ctx.window_aligned);
         if (!res) {
             return std::unexpected(res.error());
         }

@@ -201,6 +201,51 @@ inline void materialize_append_validity(std::optional<ValidityBitmap>& dst_valid
     }
 }
 
+/// Append every value of `src_value` onto `dst_value`. Both must already hold
+/// the same variant alternative; callers check that and report a schema
+/// mismatch, which is a better error than this could give.
+///
+/// This is the merge concat that every multi-chunk path bottoms out in, and it
+/// is not a small cost. Appending a `push_back` per row is what it used to do,
+/// which for a flat numeric column is a bounds check and a size update per
+/// element instead of one `memmove`: on PDS-H q21, gluing a 2.9M-row
+/// intermediate back together row by row cost 33ms — the whole of that query's
+/// regression once its source began arriving in six chunks rather than one.
+/// With one chunk there is no concat at all, so nothing paid for this until
+/// streaming existed.
+///
+/// Growth is left to the underlying vector, which grows geometrically.
+/// Reserving exactly `size + chunk` before each append is the trap in the other
+/// direction: it makes the concat quadratic in the chunk count, invisible at
+/// one chunk and dominant at a few hundred.
+inline void append_column_values(ColumnValue& dst_value, const ColumnValue& src_value) {
+    std::visit(
+        [&](auto& dst) {
+            using Col = std::decay_t<decltype(dst)>;
+            const auto& src = std::get<Col>(src_value);
+            if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                // Codes are copied as-is rather than re-interned, which is only
+                // sound because the chunks share one dictionary — the contract
+                // every caller of this already relies on (see
+                // `MaterializeOperator`, and the scan's own dictionary unifier).
+                const auto& codes = src.codes();
+                dst.append_codes(codes.begin(), codes.end());
+            } else if constexpr (std::is_same_v<Col, Column<std::string>> ||
+                                 std::is_same_v<Col, Column<bool>>) {
+                // Neither is a flat array of values, so neither can be copied in
+                // one go: a string's destination offset depends on every
+                // preceding row's length, and a bool packs many rows per word.
+                dst.reserve(dst.size() + src.size());
+                for (std::size_t r = 0; r < src.size(); ++r) {
+                    dst.push_back(src[r]);
+                }
+            } else {
+                (void)dst.insert(dst.end(), src.begin(), src.end());
+            }
+        },
+        dst_value);
+}
+
 class MaterializeOperator {
    public:
     explicit MaterializeOperator(OperatorPtr child) : child_(std::move(child)) {}
@@ -293,24 +338,10 @@ class MaterializeOperator {
                 if (grow) {
                     reserved[i] = std::max(needed, reserved[i] * 2);
                 }
-                std::visit(
-                    [&](auto& dst) {
-                        using Col = std::decay_t<decltype(dst)>;
-                        auto& src = std::get<Col>(*chunk.columns[i].column);
-                        if (grow) {
-                            dst.reserve(reserved[i]);
-                        }
-                        if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_code(src.code_at(r));
-                            }
-                        } else {
-                            for (std::size_t r = 0; r < src.size(); ++r) {
-                                dst.push_back(src[r]);
-                            }
-                        }
-                    },
-                    dst_col);
+                if (grow) {
+                    std::visit([&](auto& dst) { dst.reserve(reserved[i]); }, dst_col);
+                }
+                append_column_values(dst_col, *chunk.columns[i].column);
                 materialize_append_validity(result.columns[i].validity, prev_rows,
                                             chunk.columns[i].validity, src_rows);
             }

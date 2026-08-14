@@ -232,9 +232,11 @@ if [[ "$SKIP_REPL" == false ]]; then
     rm -f "$dec_st" "$dec_mt"
 
     echo "▸ whole-script (parquet plugin, streamed scan across row-group dictionaries)"
-    # IBEX_STREAM_SCAN makes a lazy source arrive one ROW GROUP at a time
-    # instead of as one table (pipelined-execution plan, Phase 1). Streaming
-    # changes when rows arrive, never which, so the two runs must agree.
+    # Streaming makes a lazy source arrive one ROW GROUP at a time instead of as
+    # one table (pipelined-execution plan, Phases 1-2). It is the DEFAULT, so
+    # the comparison run is the one that opts out with IBEX_STREAM_SCAN=0 —
+    # getting that backwards would compare streaming against streaming and pass
+    # without testing anything.
     #
     # The Categorical column is the interesting case. Parquet writes one
     # dictionary per row group and the writer above builds these two to
@@ -252,11 +254,20 @@ if [[ "$SKIP_REPL" == false ]]; then
         "$IBEX_ROOT/tests/data/parquet_categorical_check.ibex" >/dev/null 2>&1
     str_off="$(mktemp)"
     str_on="$(mktemp)"
-    "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+    IBEX_STREAM_SCAN=0 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_stream_categorical_check.ibex" >"$str_off" 2>&1
     IBEX_STREAM_SCAN=1 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_stream_categorical_check.ibex" >"$str_on" 2>&1
+    # A third run, streaming but NOT parallel. A serial scan decodes one unit
+    # per window and never submits to the pool, which is a different control
+    # path through the window loop and not a cosmetic difference: it is where
+    # every unit after the first was once dropped, silently and with the row
+    # count simply coming out short.
+    str_serial="$(mktemp)"
+    IBEX_STREAM_SCAN=1 IBEX_PARALLEL=0 IBEX_THREADS=1 "$BUILD_DIR/tools/ibex_eval" \
+        --plugin-path "$BUILD_DIR/tools" \
+        "$IBEX_ROOT/tests/data/parquet_stream_categorical_check.ibex" >"$str_serial" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_categorical_check_out.parquet"
     # chunks=2 is the part that keeps this honest: without it a silently
     # declined stream would pass the comparison by being the same code path.
@@ -266,15 +277,18 @@ if [[ "$SKIP_REPL" == false ]]; then
         || ! rg -n '"beta"\s+\| 624288' "$str_on" >/dev/null \
         || ! rg -n '"gamma" \| 100000' "$str_on" >/dev/null \
         || ! diff -q <(rg -v "^(profile |operator profile:)" "$str_off") \
-                     <(rg -v "^(profile |operator profile:)" "$str_on") >/dev/null; then
+                     <(rg -v "^(profile |operator profile:)" "$str_on") >/dev/null \
+        || ! diff -q "$str_off" "$str_serial" >/dev/null; then
         echo "--- materialized ---" >&2
         cat "$str_off" >&2
         echo "--- streamed ---" >&2
         cat "$str_on" >&2
-        rm -f "$str_off" "$str_on"
+        echo "--- streamed, serial ---" >&2
+        cat "$str_serial" >&2
+        rm -f "$str_off" "$str_on" "$str_serial"
         exit 1
     fi
-    rm -f "$str_off" "$str_on"
+    rm -f "$str_off" "$str_on" "$str_serial"
 
     echo "▸ whole-script (parquet plugin, fused key scan across row groups)"
     # Run through ibex_eval, not the REPL: the fused key scan only exists on the

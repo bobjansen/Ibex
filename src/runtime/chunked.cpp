@@ -9507,19 +9507,31 @@ class DeferredScanSourceOperator final : public Operator {
                 }
                 return std::optional<Chunk>{std::move(*chunk)};
             }
-            // Out of decoded units. Wait for whatever is in flight, then put
-            // the window after it in flight before serving this one, so the
-            // consumer's work overlaps the next decode.
-            if (!batch_.has_value()) {
+            // Out of decoded units: put the next window in flight and wait for
+            // it.
+            //
+            // Dispatching the window AFTER this one here too, so the consumer's
+            // work would overlap the next decode, is a MEASURED DEAD END. It
+            // doubles how much of the source is decoded at once — peak RSS on a
+            // 25-row-group scan went 161MB -> 244MB — and returns nothing,
+            // because the consumer is a blocking operator that eats chunks
+            // faster than they decode, so there is no consumer work to overlap
+            // with. Real overlap needs a pipeline that keeps running while the
+            // scan decodes, which is the rest of Phase 2, not a deeper queue.
+            //
+            // `inflight_pending_`, not `batch_`: a one-unit window decodes on
+            // this thread and never submits, so a `batch_`-based test reports
+            // "nothing in flight" and drops a window that has already been
+            // decoded. That silently lost every unit after the first whenever
+            // the query was not parallel, and every trailing single-unit window
+            // when it was.
+            if (!inflight_pending_) {
                 if (dispatched_ >= units_.size()) {
                     return std::optional<Chunk>{};
                 }
                 dispatch();
             }
             harvest();
-            if (dispatched_ < units_.size()) {
-                dispatch();
-            }
         }
     }
 
@@ -9547,6 +9559,7 @@ class DeferredScanSourceOperator final : public Operator {
         dispatched_ += window_count_;
         inflight_.clear();
         inflight_.resize(window_count_);
+        inflight_pending_ = true;
         if (window_count_ == 1) {
             // Nothing to overlap and no reason to pay for a pool round trip.
             inflight_[0] = decode_unit(0);
@@ -9584,6 +9597,7 @@ class DeferredScanSourceOperator final : public Operator {
         }
         ready_ = std::move(inflight_);
         inflight_.clear();
+        inflight_pending_ = false;
         served_ = 0;
     }
 
@@ -9688,6 +9702,9 @@ class DeferredScanSourceOperator final : public Operator {
     /// this, so it must not be resized while `batch_` is live.
     std::vector<std::expected<Table, std::string>> inflight_;
     std::optional<WorkerPool::Batch> batch_;
+    /// Whether `inflight_` holds a dispatched window awaiting harvest. Not
+    /// derivable from `batch_`: a one-unit window is decoded inline.
+    bool inflight_pending_ = false;
     std::atomic<std::size_t> cursor_{0};
     std::size_t window_begin_ = 0;
     std::size_t window_count_ = 0;

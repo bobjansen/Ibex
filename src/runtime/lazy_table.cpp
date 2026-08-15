@@ -1026,6 +1026,86 @@ auto LazyTable::project_rows(const std::set<std::string>& names, const Selection
     return out;
 }
 
+/// The columns `conjuncts` read from this source, when every one of them can be
+/// staged through a selection cheaply -- nullopt when any cannot, and the
+/// caller must not take the staged path at all.
+///
+/// The test is the column's WIDTH, not its selectivity. Reading a variable-width
+/// column through a sparse selection is not proportionally cheaper: the reader
+/// still walks the pages the selection skips through, and a dictionary-encoded
+/// string still builds its dictionary per row group. So a staged read of one
+/// costs about what the whole-file read costs, and the membership scan that
+/// bought the selection goes unrepaid. q10 (`l_returnflag == "R"`) is exactly
+/// that shape and measured +9.7% before this declined it.
+///
+/// Checked BEFORE the fused key scan runs, never after: deciding late would
+/// mean paying for the scan and then falling back to the path that does not use
+/// its answer.
+auto LazyTable::stageable_conjunct_columns(const std::vector<ir::Expr>& conjuncts) const
+    -> std::optional<std::set<std::string>> {
+    robin_hood::unordered_set<std::string> named;
+    for (const auto& conjunct : conjuncts) {
+        ir::collect_expr_column_refs(conjunct, named);
+    }
+    std::set<std::string> names;
+    for (const auto& field : schema_.columns) {
+        if (!named.contains(field.name)) {
+            continue;
+        }
+        if (std::holds_alternative<Column<std::string>>(*field.column) ||
+            std::holds_alternative<Column<Categorical>>(*field.column)) {
+            return std::nullopt;
+        }
+        names.insert(field.name);
+    }
+    if (names.empty()) {
+        return std::nullopt;
+    }
+    return names;
+}
+
+/// AND `conjuncts` into a selection the fused key scan already produced,
+/// decoding their columns THROUGH it rather than whole-file.
+///
+/// Late materialization applied to the predicate columns themselves: the
+/// selection handed in came from a scan that abandons itself when it stops
+/// rejecting, so it is already small, and reading a predicate column for those
+/// rows beats reading it for the whole file to throw most of it away.
+///
+/// `filter_selection` answers in the staged table's own row numbers, so the
+/// survivors are mapped back through `selected`. Both are ascending and the map
+/// is monotone, so the result is ascending too -- which every consumer of a
+/// Selection requires.
+///
+/// nullopt = the conjuncts reference no column of this source, which this shape
+/// cannot stage; the caller keeps its whole-column path.
+auto LazyTable::narrow_selection(Selection selected, const std::vector<ir::Expr>& conjuncts,
+                                 const ExecutionContext& exec, const ScalarRegistry* scalars)
+    -> std::expected<std::optional<Selection>, std::string> {
+    const auto names = stageable_conjunct_columns(conjuncts);
+    if (!names.has_value()) {
+        return std::optional<Selection>{};
+    }
+    if (selected.empty()) {
+        return std::optional{std::move(selected)};
+    }
+
+    auto stage = project_rows(*names, selected, exec);
+    if (!stage) {
+        return std::unexpected(stage.error());
+    }
+    auto local = filter_selection(*stage, conjuncts, exec, scalars);
+    if (!local) {
+        return std::unexpected(local.error());
+    }
+    Selection out;
+    out.reserve(local->size());
+    for (const std::size_t row : *local) {
+        out.push_back(selected[row]);
+    }
+    return std::optional{std::move(out)};
+}
+
 auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
                                    const ExecutionContext& exec, const ScalarRegistry* scalars,
                                    const DynamicScanFilter& dynamic, const std::string& key_name)
@@ -1034,30 +1114,58 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         return std::optional<JoinKeySelection>{};
     }
 
-    // Fused path, same conditions as project_where: the source computes the
-    // selection during the key column's decode, then only the surviving key
-    // values are decoded at all.
-    if (conjuncts.empty() && (key_filter_scan_ != nullptr || reader_factory_) &&
-        !cache_.contains(key_name)) {
+    // Fused path: the source evaluates the key filter inside its own decoder,
+    // one row group per worker, and the key column is never materialized
+    // whole-file. Only the surviving key values are decoded at all.
+    //
+    // Static conjuncts do NOT disqualify this. They used to -- the condition
+    // read `conjuncts.empty()`, copied from `project_where`, where a conjunct
+    // really does need a different shape -- and the cost of that copy was paid
+    // by exactly the queries whose probe scan is most selective. q03
+    // (`l_shipdate > ...`) and q10 (`l_returnflag == "R"`) fell to the path
+    // below, which decodes the whole 12M-row key column AND the whole predicate
+    // column and then walks all 12M rows twice, serially, to reject most of
+    // them. Here the fused scan answers membership first and the conjuncts are
+    // evaluated through its selection, so every later step is sized by what
+    // survived rather than by the file.
+    if ((key_filter_scan_ != nullptr || reader_factory_) && !cache_.contains(key_name) &&
+        (conjuncts.empty() || stageable_conjunct_columns(conjuncts).has_value())) {
         auto scan = scan_key_filter(key_name, dynamic, nullptr, exec);
         if (!scan) {
             return std::unexpected(scan.error());
         }
-        if (!scan->has_value()) {
-            return std::optional<JoinKeySelection>{};  // no fused answer
+        if (scan->has_value()) {
+            Selection selected = std::move(**scan);
+            bool narrowed = true;
+            if (!conjuncts.empty()) {
+                auto rest = narrow_selection(std::move(selected), conjuncts, exec, scalars);
+                if (!rest) {
+                    return std::unexpected(rest.error());
+                }
+                if (rest->has_value()) {
+                    selected = std::move(**rest);
+                } else {
+                    narrowed = false;  // conjuncts not evaluable here
+                }
+            }
+            if (narrowed) {
+                JoinKeySelection out;
+                out.selected = std::move(selected);
+                auto keys = project_rows({key_name}, out.selected, exec);
+                if (!keys) {
+                    return std::unexpected(keys.error());
+                }
+                auto* entry = keys->find_entry(key_name);
+                if (entry == nullptr ||
+                    !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
+                    return std::optional<JoinKeySelection>{};
+                }
+                out.keys = std::move(*entry);
+                return std::optional{std::move(out)};
+            }
         }
-        JoinKeySelection out;
-        out.selected = std::move(**scan);
-        auto keys = project_rows({key_name}, out.selected, exec);
-        if (!keys) {
-            return std::unexpected(keys.error());
-        }
-        auto* entry = keys->find_entry(key_name);
-        if (entry == nullptr || !std::holds_alternative<Column<std::int64_t>>(*entry->column)) {
-            return std::optional<JoinKeySelection>{};
-        }
-        out.keys = std::move(*entry);
-        return std::optional{std::move(out)};
+        // No fused answer (unsupported key type, or the filter stopped
+        // rejecting and the scan abandoned): the whole-column path stands.
     }
 
     robin_hood::unordered_set<std::string> referenced;

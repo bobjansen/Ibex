@@ -159,6 +159,7 @@ filter select update  distinct order head tail by window
 rename resample melt  dcast  cov  corr  transpose
 join   left   right   outer   asof   on
 cross  semi   anti    suffix
+case   else    NULL
 import Stream
 asc    desc    as
 true   false
@@ -349,6 +350,33 @@ calendar-adjacent row checks.
 Postfix operators bind tighter than all prefix and infix operators.
 Join expressions (`A join B on key`, etc.) have **lower precedence** than all
 binary operators and associate **left**.
+
+### 2.6 Case Expressions
+
+`case` chooses the value from the first matching arm. A searched case uses a
+boolean condition for each arm:
+
+```
+case {
+    price < 0  => "loss",
+    price == 0 => "flat",
+    else       => "gain",
+}
+```
+
+With an expression after `case`, each arm is an equality test against that
+selector. The two forms are therefore equivalent:
+
+```
+case side { "BUY" => 1, "SELL" => -1, else => NULL }
+case { side == "BUY" => 1, side == "SELL" => -1, else => NULL }
+```
+
+`else` is required. Arms are evaluated in order and evaluation stops after the
+first true condition; a null condition does not match. `NULL` is a typed null
+value and may be used for a value arm when another arm establishes the result
+type. All non-`NULL` value arms must have the same type, apart from the usual
+`Int`/`Float` widening.
 
 ---
 
@@ -895,6 +923,7 @@ join_take       = "take" ( "first" | "last" | "any" ) ;
 
 primary         = IDENT [ "(" [ arg_list ] ")" ]
                 | "Table" "{" [ table_col_def { "," table_col_def } [ "," ] ] "}"
+                | case_expr
                 | "^" IDENT                      (* scope escape *)
                 | outer_capture
                 | join_side_ref
@@ -922,6 +951,10 @@ join_side_ref   = ( "left" | "right" ) "(" IDENT ")" ;
 table_col_def   = IDENT "=" expr ;
 
 array_lit       = "[" [ expr { "," expr } [ "," ] ] "]" ;
+
+case_expr       = "case" [ expr ] "{" [ case_match { "," case_match } "," ]
+                  "else" "=>" expr [ "," ] "}" ;
+case_match      = expr "=>" expr ;
 
 arg_list        = arg { "," arg } [ "," ] ;
 

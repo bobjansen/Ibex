@@ -157,6 +157,31 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
         return ColumnType::Int64;
     }
     if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        if (call->callee == "__case") {
+            std::optional<ColumnType> result;
+            for (std::size_t i = 1; i < call->args.size(); i += 2) {
+                const auto* null_arm = std::get_if<CallExpr>(&call->args[i]->node);
+                if (null_arm != nullptr && null_arm->callee == "__null") {
+                    continue;
+                }
+                const auto type = expr_type(*call->args[i], input);
+                if (!type.has_value()) {
+                    return std::nullopt;
+                }
+                if (!result.has_value()) {
+                    result = *type;
+                } else if (is_numeric(*result) && is_numeric(*type)) {
+                    result = is_float(*result) || is_float(*type) ? ColumnType::Float64
+                                                                  : ColumnType::Int64;
+                } else if (*result != *type) {
+                    return std::nullopt;
+                }
+            }
+            return result;
+        }
+        if (call->callee == "__null") {
+            return std::nullopt;
+        }
         if (auto target = cast_target(call->callee)) {
             return target;
         }

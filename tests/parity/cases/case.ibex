@@ -1,0 +1,13 @@
+let trades = Table {
+    side = ["BUY", "SELL", "HOLD"],
+    price = [-1, 0, 2],
+};
+
+trades[update {
+    direction = case side { "BUY" => 1, "SELL" => -1, else => NULL },
+    label = case {
+        price < 0  => "loss",
+        price == 0 => "flat",
+        else       => "gain",
+    },
+}][select { side, direction, label }];

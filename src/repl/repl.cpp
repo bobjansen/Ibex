@@ -4821,18 +4821,34 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
-        // After the reorder, so it sees the join shape that will actually run,
-        // and after the uniqueness proofs above, which are its whole premise.
-        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
         // A source scanned twice in the plan (nation on both join sides, a
         // self-joined fact table) gets one instance name per scan, so each
-        // scan keeps its own pushed selection and column demand.
+        // scan keeps its own pushed selection and column demand. This must
+        // run before FD reduction: ColumnOrigin identifies a base column by
+        // scan-instance name, and until scans are split, both sides of a
+        // self-join share one name -- a unique key proved on one instance
+        // would otherwise be taken to determine the OTHER instance's columns
+        // too, dropping a group key that is not actually redundant.
         std::set<std::string> lazy_names;
         for (const auto& [name, lazy] : lazy_sources) {
             lazy_names.insert(name);
         }
         auto split = ir::split_scan_instances(std::move(rewritten), lazy_names);
         rewritten = std::move(split.plan);
+        // FD reduction needs each split instance's schema under its instance
+        // name too, or a self-join's second occurrence would look like an
+        // unknown source and just fail to prove anything about it.
+        ir::SourceSchemas schemas_with_instances = schemas;
+        for (const auto& [instance, source] : split.instances) {
+            if (const auto it = schemas.find(source); it != schemas.end()) {
+                schemas_with_instances.insert_or_assign(instance, it->second);
+            }
+        }
+        // After the reorder and split, so it sees the join shape and scan
+        // identities that will actually run, and after the uniqueness proofs
+        // above, which are its whole premise.
+        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten),
+                                                                 schemas_with_instances);
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
             auto it = lazy_sources.find(name);
             if (it == lazy_sources.end()) {

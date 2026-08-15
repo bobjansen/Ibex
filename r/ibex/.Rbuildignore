@@ -3,3 +3,5 @@
 ^src/symbols\\.rds$
 ^src/ibex-src$
 ^src/ibex-build$
+^.*\.Rproj$
+^\.Rproj\.user$

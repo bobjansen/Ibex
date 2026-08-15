@@ -50,26 +50,27 @@ struct TableRangeMorsel {
 /// dictionary rebuild happens and the codes stay valid.
 [[nodiscard]] inline auto gather_range(const ColumnValue& src, std::size_t begin, std::size_t end)
     -> ColumnValue {
-    return std::visit(
-        [&](const auto& col) -> ColumnValue {
-            using Col = std::decay_t<decltype(col)>;
-            if constexpr (std::is_same_v<Col, Column<Categorical>>) {
-                Column<Categorical> out(col.dictionary_ptr(), col.index_ptr());
-                out.reserve(end - begin);
-                for (std::size_t r = begin; r < end; ++r) {
-                    out.push_code(col.code_at(r));
-                }
-                return out;
-            } else {
-                Col out;
-                out.reserve(end - begin);
-                for (std::size_t r = begin; r < end; ++r) {
-                    out.push_back(col[r]);
-                }
-                return out;
-            }
-        },
-        src);
+    return with_meta_of(std::visit(
+                            [&](const auto& col) -> ColumnValue {
+                                using Col = std::decay_t<decltype(col)>;
+                                if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                                    Column<Categorical> out(col.dictionary_ptr(), col.index_ptr());
+                                    out.reserve(end - begin);
+                                    for (std::size_t r = begin; r < end; ++r) {
+                                        out.push_code(col.code_at(r));
+                                    }
+                                    return out;
+                                } else {
+                                    Col out;
+                                    out.reserve(end - begin);
+                                    for (std::size_t r = begin; r < end; ++r) {
+                                        out.push_back(col[r]);
+                                    }
+                                    return out;
+                                }
+                            },
+                            src),
+                        src);
 }
 
 /// Gather rows `[begin, end)` of an optional validity bitmap. A `nullopt`

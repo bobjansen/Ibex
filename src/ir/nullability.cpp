@@ -65,6 +65,18 @@ auto expr_nullability(const Expr& expr, const SchemaInfo& input) -> Nullability 
         return all_present(input, bin->left, bin->right);
     }
     if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        if (call->callee == "__null") {
+            return Nullability::Maybe;
+        }
+        if (call->callee == "__case") {
+            // Any nullable value arm (including explicit NULL) may be selected.
+            for (std::size_t i = 1; i < call->args.size(); i += 2) {
+                if (expr_nullability(*call->args[i], input) == Nullability::Maybe) {
+                    return Nullability::Maybe;
+                }
+            }
+            return Nullability::Never;
+        }
         // The registry is the authority on what a built-in does to nulls; this
         // pass only turns its answer into a lattice value. `nullopt` is an
         // unknown callee or a non-row-local one -- no claim either way.

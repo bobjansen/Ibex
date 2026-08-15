@@ -327,6 +327,23 @@ result &lt;- collect(query)</code></pre>
     </p>
   </section>
 
+  <section class="section">
+    <p class="section-label">Conditional values</p>
+    <h2>First-match <code>case</code></h2>
+    <p class="section-sub">
+      Use <code>case</code> in any expression position. Conditions are considered
+      in order; the selector form is shorthand for equality checks, and
+      <code>else</code> is required.
+    </p>
+    <div class="tour-code">
+<pre><code><span class="kw">let</span> direction = <span class="kw">case</span> side {
+    "BUY"  =&gt; 1,
+    "SELL" =&gt; -1,
+    <span class="kw">else</span>   =&gt; <span class="kw">NULL</span>
+};</code></pre>
+    </div>
+  </section>
+
   <!-- Install -->
   <section class="section" id="install">
     <p class="section-label">Install &amp; run</p>

@@ -266,6 +266,18 @@ auto clone_expr(const Expr& expr) -> ExprPtr {
             auto out = std::make_unique<Expr>();
             if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
                 out->node = node;
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                CaseExpr case_expr{
+                    .selector = nullptr, .arms = {}, .else_value = clone_expr(*node.else_value)};
+                if (node.selector != nullptr) {
+                    case_expr.selector = clone_expr(*node.selector);
+                }
+                case_expr.arms.reserve(node.arms.size());
+                for (const auto& arm : node.arms) {
+                    case_expr.arms.push_back(CaseArm{.condition = clone_expr(*arm.condition),
+                                                     .value = clone_expr(*arm.value)});
+                }
+                out->node = std::move(case_expr);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 CallExpr call{.callee = node.callee, .args = {}, .named_args = {}};
                 call.args.reserve(node.args.size());
@@ -441,6 +453,13 @@ void count_table_refs(const Expr& expr, bool table_position, TableRefCounts& cou
                 }
             } else if constexpr (std::is_same_v<T, LiteralExpr>) {
                 // Reads nothing.
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                count_table_refs(node.selector, false, counts);
+                for (const auto& arm : node.arms) {
+                    count_table_refs(arm.condition, false, counts);
+                    count_table_refs(arm.value, false, counts);
+                }
+                count_table_refs(node.else_value, false, counts);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 for (const auto& arg : node.args) {
                     count_table_refs(arg, false, counts);
@@ -573,6 +592,11 @@ auto contains_call(const Expr& expr, std::string_view callee) -> bool {
                 return std::ranges::any_of(node.args, in) ||
                        std::ranges::any_of(node.named_args,
                                            [&](const NamedArg& a) { return in(a.value); });
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                return in(node.selector) || in(node.else_value) ||
+                       std::ranges::any_of(node.arms, [&](const CaseArm& arm) {
+                           return in(arm.condition) || in(arm.value);
+                       });
             } else if constexpr (std::is_same_v<T, RankExpr>) {
                 return std::ranges::any_of(node.named_args,
                                            [&](const NamedArg& a) { return in(a.value); });
@@ -703,6 +727,20 @@ auto substitute_params(const Expr& expr,
                 out->node = node;
             } else if constexpr (std::is_same_v<T, LiteralExpr>) {
                 out->node = node;
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                CaseExpr case_expr{.selector = nullptr, .arms = {}, .else_value = nullptr};
+                if (node.selector != nullptr) {
+                    case_expr.selector = substitute_params(*node.selector, subs);
+                }
+                case_expr.arms.reserve(node.arms.size());
+                for (const auto& arm : node.arms) {
+                    case_expr.arms.push_back(CaseArm{
+                        .condition = substitute_params(*arm.condition, subs),
+                        .value = substitute_params(*arm.value, subs),
+                    });
+                }
+                case_expr.else_value = substitute_params(*node.else_value, subs);
+                out->node = std::move(case_expr);
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 CallExpr call{.callee = node.callee, .args = {}, .named_args = {}};
                 call.args.reserve(node.args.size());
@@ -1093,6 +1131,36 @@ auto substitute_map_expr(const Expr& expr,
             if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
                 auto out = std::make_unique<Expr>();
                 out->node = node;
+                return out;
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                CaseExpr case_expr{.selector = nullptr, .arms = {}, .else_value = nullptr};
+                if (node.selector != nullptr) {
+                    auto selector = substitute_map_expr(*node.selector, env);
+                    if (!selector.has_value()) {
+                        return selector;
+                    }
+                    case_expr.selector = std::move(*selector);
+                }
+                case_expr.arms.reserve(node.arms.size());
+                for (const auto& arm : node.arms) {
+                    auto condition = substitute_map_expr(*arm.condition, env);
+                    if (!condition.has_value()) {
+                        return condition;
+                    }
+                    auto value = substitute_map_expr(*arm.value, env);
+                    if (!value.has_value()) {
+                        return value;
+                    }
+                    case_expr.arms.push_back(
+                        CaseArm{.condition = std::move(*condition), .value = std::move(*value)});
+                }
+                auto fallback = substitute_map_expr(*node.else_value, env);
+                if (!fallback.has_value()) {
+                    return fallback;
+                }
+                case_expr.else_value = std::move(*fallback);
+                auto out = std::make_unique<Expr>();
+                out->node = std::move(case_expr);
                 return out;
             } else if constexpr (std::is_same_v<T, CallExpr>) {
                 if (node.callee == "get" && node.args.size() == 1 && node.named_args.empty()) {
@@ -3320,6 +3388,40 @@ class Lowerer {
                 return ir::Expr{.node = ir::Literal{.value = *ts_value}};
             }
             return std::unexpected(LowerError{.message = "unsupported literal in expression"});
+        }
+        if (const auto* case_expr = std::get_if<CaseExpr>(&expr.node)) {
+            ir::CallExpr lowered;
+            lowered.callee = "__case";
+            lowered.args.reserve(case_expr->arms.size() * 2 + 1);
+            for (const auto& arm : case_expr->arms) {
+                auto condition = lower_expr_to_ir(*arm.condition);
+                if (!condition.has_value()) {
+                    return std::unexpected(condition.error());
+                }
+                if (case_expr->selector != nullptr) {
+                    auto selector = lower_expr_to_ir(*case_expr->selector);
+                    if (!selector.has_value()) {
+                        return std::unexpected(selector.error());
+                    }
+                    condition =
+                        ir::Expr{.node = ir::CompareExpr{
+                                     .op = ir::CompareOp::Eq,
+                                     .left = ir::make_expr_ptr(std::move(selector.value())),
+                                     .right = ir::make_expr_ptr(std::move(condition.value()))}};
+                }
+                auto value = lower_expr_to_ir(*arm.value);
+                if (!value.has_value()) {
+                    return std::unexpected(value.error());
+                }
+                lowered.args.push_back(ir::make_expr_ptr(std::move(condition.value())));
+                lowered.args.push_back(ir::make_expr_ptr(std::move(value.value())));
+            }
+            auto fallback = lower_expr_to_ir(*case_expr->else_value);
+            if (!fallback.has_value()) {
+                return std::unexpected(fallback.error());
+            }
+            lowered.args.push_back(ir::make_expr_ptr(std::move(fallback.value())));
+            return ir::Expr{.node = std::move(lowered)};
         }
         if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
             // Both correlation forms are consumed by `lower_filter` before any

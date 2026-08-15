@@ -5111,8 +5111,14 @@ class ChunkedAggregateOperator final : public Operator {
             scratch_offset_.assign(n_aggs_, 0);
             scratch_stride_ = 0;
             for (std::size_t i = 0; i < n_aggs_; ++i) {
-                if (plan_[i].func == ir::AggFunc::Skew || plan_[i].func == ir::AggFunc::Kurtosis) {
-                    plan_[i].scratch_doubles = 2;
+                // Scratch layout is [m2, m3, m4]. Stddev needs only the
+                // first; the higher moments imply it, since their recurrence
+                // reads m2 on every update.
+                if (plan_[i].func == ir::AggFunc::Stddev) {
+                    plan_[i].scratch_doubles = 1;
+                } else if (plan_[i].func == ir::AggFunc::Skew ||
+                           plan_[i].func == ir::AggFunc::Kurtosis) {
+                    plan_[i].scratch_doubles = 3;
                 }
                 scratch_offset_[i] = static_cast<std::uint32_t>(scratch_stride_);
                 scratch_stride_ += plan_[i].scratch_doubles;
@@ -6484,7 +6490,8 @@ class ChunkedAggregateOperator final : public Operator {
         constexpr std::size_t kMaxMorsels = 64;
         constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
         constexpr std::size_t kMergeToScanRatio = 4;
-        const std::size_t per_morsel_bytes = n_groups_ * n_aggs_ * sizeof(AggSlotCore);
+        const std::size_t per_morsel_bytes =
+            n_groups_ * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
         if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
             return false;
         }
@@ -6495,8 +6502,10 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         const std::size_t stride = n_groups_ * n_aggs_;
+        const std::size_t scratch_span = n_groups_ * scratch_stride_;
         const std::size_t grain = (rows + morsels - 1) / morsels;
         std::vector<AggSlotCore> partials(morsels * stride);
+        std::vector<double> partial_scratch(morsels * scratch_span, 0.0);
 
         auto& pool = process_worker_pool();
         const std::size_t threads =
@@ -6513,17 +6522,22 @@ class ChunkedAggregateOperator final : public Operator {
                 if (begin >= end) {
                     continue;
                 }
-                accumulate_columns_into(gids, agg_entries, begin, end, &partials[m * stride]);
+                accumulate_columns_into(gids, agg_entries, begin, end, &partials[m * stride],
+                                        partial_scratch.data() + (m * scratch_span));
             }
         });
         batch.wait();
 
         for (std::size_t m = 0; m < morsels; ++m) {
             const AggSlotCore* src = &partials[m * stride];
+            const double* src_scratch = partial_scratch.data() + (m * scratch_span);
             for (std::size_t g = 0; g < n_groups_; ++g) {
                 AggSlotCore* dst = &flat_slots_[g * n_aggs_];
                 for (std::size_t a = 0; a < n_aggs_; ++a) {
-                    agg_combine(dst[a], src[(g * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+                    const std::size_t off = (g * scratch_stride_) + scratch_offset_[a];
+                    agg_combine(dst[a], src[(g * n_aggs_) + a], plan_[a].func, plan_[a].kind,
+                                scratch_stride_ == 0 ? nullptr : scratch_.data() + off,
+                                scratch_stride_ == 0 ? nullptr : src_scratch + off);
                 }
             }
         }
@@ -6538,7 +6552,8 @@ class ChunkedAggregateOperator final : public Operator {
     void accumulate_gids(const std::uint32_t* gids,
                          const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) {
         if (!try_accumulate_parallel(gids, agg_entries, rows)) {
-            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data());
+            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(),
+                                    scratch_.data());
         }
     }
 
@@ -6553,7 +6568,8 @@ class ChunkedAggregateOperator final : public Operator {
     template <typename GidT>
     void accumulate_columns_into(const GidT* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
-                                 std::size_t begin, std::size_t end, AggSlotCore* base) {
+                                 std::size_t begin, std::size_t end, AggSlotCore* base,
+                                 double* scratch_base) {
         AggSlotCore* fs = base;
         const std::size_t rows = end;
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
@@ -6561,6 +6577,14 @@ class ChunkedAggregateOperator final : public Operator {
             // implicit narrowing conversion at each of the ~19 call sites.
             const auto slot_for = [&](GidT g) -> AggSlotCore& {
                 return fs[(static_cast<std::size_t>(g) * n_aggs_) + agg_i];
+            };
+            // Moment accumulators, laid out beside `base` and indexed the same
+            // way. A worker-private slot array needs a worker-private scratch
+            // to match, or two morsels would accumulate one group's variance
+            // into the same doubles.
+            const auto scratch_at = [&](GidT g) -> double* {
+                return scratch_base + (static_cast<std::size_t>(g) * scratch_stride_) +
+                       scratch_offset_[agg_i];
             };
 
             if (plan_[agg_i].func == ir::AggFunc::Count) {
@@ -6621,7 +6645,8 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            agg_update_stddev(slot_for(gids[row]), data[row]);
+                            agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
+                                              data[row]);
                         }
                         break;
                     case ir::AggFunc::Skew:
@@ -6629,8 +6654,9 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            double* scr = scratch_for(static_cast<std::size_t>(gids[row]), agg_i);
-                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], data[row]);
+                            double* scr = scratch_at(gids[row]);
+                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
+                                               data[row]);
                         }
                         break;
                     case ir::AggFunc::First:
@@ -6702,7 +6728,8 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            agg_update_stddev(slot_for(gids[row]), static_cast<double>(data[row]));
+                            agg_update_stddev(slot_for(gids[row]), scratch_at(gids[row])[0],
+                                              static_cast<double>(data[row]));
                         }
                         break;
                     case ir::AggFunc::Skew:
@@ -6710,8 +6737,8 @@ class ChunkedAggregateOperator final : public Operator {
                         for (std::size_t row = begin; row < rows; ++row) {
                             if (has_nulls && !(*validity)[row])
                                 continue;
-                            double* scr = scratch_for(static_cast<std::size_t>(gids[row]), agg_i);
-                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1],
+                            double* scr = scratch_at(gids[row]);
+                            agg_update_moments(slot_for(gids[row]), scr[0], scr[1], scr[2],
                                                static_cast<double>(data[row]));
                         }
                         break;
@@ -6823,7 +6850,8 @@ class ChunkedAggregateOperator final : public Operator {
         constexpr std::size_t kMinRowsPerMorsel = 65536;
         constexpr std::size_t kMaxMorsels = 64;
         constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
-        const std::size_t per_morsel_bytes = dict_size * n_aggs_ * sizeof(AggSlotCore);
+        const std::size_t per_morsel_bytes =
+            dict_size * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
         if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
             return false;  // one worker's state alone blows the budget
         }
@@ -6847,6 +6875,7 @@ class ChunkedAggregateOperator final : public Operator {
         const auto* codes = cat.codes_data();
         const std::size_t grain = (rows + morsels - 1) / morsels;
         std::vector<AggSlotCore> partials(morsels * dict_size * n_aggs_);
+        std::vector<double> cat_partial_scratch(morsels * dict_size * scratch_stride_, 0.0);
         // Per morsel, the codes it saw in first-occurrence order.
         std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
 
@@ -6875,8 +6904,9 @@ class ChunkedAggregateOperator final : public Operator {
                         order.push_back(code);
                     }
                 }
-                accumulate_columns_into(codes, agg_entries, begin, end,
-                                        &partials[m * dict_size * n_aggs_]);
+                accumulate_columns_into(
+                    codes, agg_entries, begin, end, &partials[m * dict_size * n_aggs_],
+                    cat_partial_scratch.data() + (m * dict_size * scratch_stride_));
             }
         });
         batch.wait();
@@ -6886,6 +6916,8 @@ class ChunkedAggregateOperator final : public Operator {
         }
         for (std::size_t m = 0; m < morsels; ++m) {
             const AggSlotCore* src = &partials[m * dict_size * n_aggs_];
+            const double* src_scratch =
+                cat_partial_scratch.data() + (m * dict_size * scratch_stride_);
             for (const auto code : seen[m]) {
                 const auto idx = static_cast<std::size_t>(code);
                 std::uint32_t gid = cat_dense_gid_[idx];
@@ -6896,7 +6928,11 @@ class ChunkedAggregateOperator final : public Operator {
                 }
                 AggSlotCore* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
                 for (std::size_t a = 0; a < n_aggs_; ++a) {
-                    agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+                    agg_combine(dst[a], src[(idx * n_aggs_) + a], plan_[a].func, plan_[a].kind,
+                                scratch_stride_ == 0 ? nullptr : scratch_for(gid, a),
+                                scratch_stride_ == 0
+                                    ? nullptr
+                                    : src_scratch + (idx * scratch_stride_) + scratch_offset_[a]);
                 }
             }
         }
@@ -6906,8 +6942,11 @@ class ChunkedAggregateOperator final : public Operator {
         return true;
     }
 
-    void accumulate_ungrouped_range(const std::vector<const ColumnEntry*>& agg_entries,
-                                    std::size_t begin, std::size_t end, AggSlotCore* slots) {
+    /// `scratch_base` is this caller's moment region for the single group —
+    /// `scratch_` serially, a worker-private slice per morsel in parallel.
+    void accumulate_ungrouped_range_impl(const std::vector<const ColumnEntry*>& agg_entries,
+                                         std::size_t begin, std::size_t end, AggSlotCore* slots,
+                                         double* scratch_base) {
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
             AggSlotCore& slot = slots[agg_i];
             const auto func = plan_[agg_i].func;
@@ -6971,15 +7010,15 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Stddev:
                         each([&](std::size_t r) {
-                            agg_update_stddev(slot, data[r]);
+                            agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]], data[r]);
                             slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         each([&](std::size_t r) {
-                            double* scr = scratch_for(0, agg_i);
-                            agg_update_moments(slot, scr[0], scr[1], data[r]);
+                            double* scr = scratch_base + scratch_offset_[agg_i];
+                            agg_update_moments(slot, scr[0], scr[1], scr[2], data[r]);
                             slot.has_value = true;
                         });
                         break;
@@ -7032,15 +7071,17 @@ class ChunkedAggregateOperator final : public Operator {
                         break;
                     case ir::AggFunc::Stddev:
                         each([&](std::size_t r) {
-                            agg_update_stddev(slot, static_cast<double>(data[r]));
+                            agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]],
+                                              static_cast<double>(data[r]));
                             slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Skew:
                     case ir::AggFunc::Kurtosis:
                         each([&](std::size_t r) {
-                            double* scr = scratch_for(0, agg_i);
-                            agg_update_moments(slot, scr[0], scr[1], static_cast<double>(data[r]));
+                            double* scr = scratch_base + scratch_offset_[agg_i];
+                            agg_update_moments(slot, scr[0], scr[1], scr[2],
+                                               static_cast<double>(data[r]));
                             slot.has_value = true;
                         });
                         break;
@@ -7109,7 +7150,7 @@ class ChunkedAggregateOperator final : public Operator {
 
         const std::size_t morsels = ungrouped_morsels(rows);
         if (morsels < 2) {
-            accumulate_ungrouped_range(agg_entries, 0, rows, dst);
+            accumulate_ungrouped_range_impl(agg_entries, 0, rows, dst, scratch_.data());
             return std::nullopt;
         }
 
@@ -7119,6 +7160,7 @@ class ChunkedAggregateOperator final : public Operator {
         // reproducible run to run.
         const std::size_t grain = (rows + morsels - 1) / morsels;
         std::vector<AggSlotCore> partials(morsels * n_aggs_);
+        std::vector<double> ung_scratch(morsels * scratch_stride_, 0.0);
 
         auto& pool = process_worker_pool();
         const std::size_t threads =
@@ -7133,7 +7175,9 @@ class ChunkedAggregateOperator final : public Operator {
                 const std::size_t begin = m * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 if (begin < end) {
-                    accumulate_ungrouped_range(agg_entries, begin, end, &partials[(m * n_aggs_)]);
+                    accumulate_ungrouped_range_impl(agg_entries, begin, end,
+                                                    &partials[(m * n_aggs_)],
+                                                    ung_scratch.data() + (m * scratch_stride_));
                 }
             }
         });
@@ -7144,7 +7188,11 @@ class ChunkedAggregateOperator final : public Operator {
         }
         for (std::size_t m = 0; m < morsels; ++m) {
             for (std::size_t a = 0; a < n_aggs_; ++a) {
-                agg_combine(dst[a], partials[(m * n_aggs_) + a], plan_[a].func, plan_[a].kind);
+                agg_combine(dst[a], partials[(m * n_aggs_) + a], plan_[a].func, plan_[a].kind,
+                            scratch_stride_ == 0 ? nullptr : scratch_for(0, a),
+                            scratch_stride_ == 0
+                                ? nullptr
+                                : ung_scratch.data() + (m * scratch_stride_) + scratch_offset_[a]);
             }
         }
         return std::nullopt;
@@ -7349,13 +7397,15 @@ class ChunkedAggregateOperator final : public Operator {
                         }
                         break;
                     case ir::AggFunc::Stddev:
-                        append_scalar(column, agg_finalize_stddev(slot));
+                        append_scalar(column, agg_finalize_stddev(slot, scratch_for(g, i)[0]));
                         break;
                     case ir::AggFunc::Skew:
-                        append_scalar(column, agg_finalize_skew(slot, scratch_for(g, i)[0]));
+                        append_scalar(column, agg_finalize_skew(slot, scratch_for(g, i)[0],
+                                                                scratch_for(g, i)[1]));
                         break;
                     case ir::AggFunc::Kurtosis:
-                        append_scalar(column, agg_finalize_kurtosis(slot, scratch_for(g, i)[1]));
+                        append_scalar(column, agg_finalize_kurtosis(slot, scratch_for(g, i)[0],
+                                                                    scratch_for(g, i)[2]));
                         break;
                     case ir::AggFunc::First:
                         if (plan_[i].kind == ExprType::Double) {
@@ -7824,7 +7874,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 first.ordering()->begin() + static_cast<std::ptrdiff_t>(group_by_->size()));
         }
         cur_slots_.assign(n_aggs_, AggSlotCore{});
-        cur_scratch_.assign(n_aggs_ * 2, 0.0);
+        cur_scratch_.assign(n_aggs_ * kMomentScratch, 0.0);
         reset_output();
         return std::nullopt;
     }
@@ -8017,12 +8067,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
             const bool has_nulls = entry.validity.has_value();
             if (plan_[i].kind == ExprType::Double) {
                 const double* data = std::get<Column<double>>(*entry.column).data();
-                accumulate_typed(slot, &cur_scratch_[i * 2], plan_[i].func, data, entry, has_nulls,
-                                 start, end);
+                accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
+                                 entry, has_nulls, start, end);
             } else {
                 const std::int64_t* data = std::get<Column<std::int64_t>>(*entry.column).data();
-                accumulate_typed(slot, &cur_scratch_[i * 2], plan_[i].func, data, entry, has_nulls,
-                                 start, end);
+                accumulate_typed(slot, &cur_scratch_[i * kMomentScratch], plan_[i].func, data,
+                                 entry, has_nulls, start, end);
             }
         }
     }
@@ -8097,7 +8147,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    agg_update_stddev(slot, static_cast<double>(data[row]));
+                    agg_update_stddev(slot, scratch[0], static_cast<double>(data[row]));
                 }
                 break;
             case ir::AggFunc::Skew:
@@ -8106,7 +8156,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     if (!valid(row)) {
                         continue;
                     }
-                    agg_update_moments(slot, scratch[0], scratch[1],
+                    agg_update_moments(slot, scratch[0], scratch[1], scratch[2],
                                        static_cast<double>(data[row]));
                 }
                 break;
@@ -8163,15 +8213,18 @@ class ChunkedSortedAggregateOperator final : public Operator {
                                                                   static_cast<double>(slot.count)});
                     break;
                 case ir::AggFunc::Stddev:
-                    append_scalar(column, ScalarValue{agg_finalize_stddev(slot)});
+                    append_scalar(column, ScalarValue{agg_finalize_stddev(
+                                              slot, cur_scratch_[i * kMomentScratch])});
                     break;
                 case ir::AggFunc::Skew:
-                    append_scalar(column,
-                                  ScalarValue{agg_finalize_skew(slot, cur_scratch_[i * 2])});
+                    append_scalar(column, ScalarValue{agg_finalize_skew(
+                                              slot, cur_scratch_[i * kMomentScratch],
+                                              cur_scratch_[(i * kMomentScratch) + 1])});
                     break;
                 case ir::AggFunc::Kurtosis:
                     append_scalar(column, ScalarValue{agg_finalize_kurtosis(
-                                              slot, cur_scratch_[(i * 2) + 1])});
+                                              slot, cur_scratch_[i * kMomentScratch],
+                                              cur_scratch_[(i * kMomentScratch) + 2])});
                     break;
                 default:  // Sum / Min / Max
                     if (plan_[i].kind == ExprType::Double) {
@@ -8236,6 +8289,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
     /// Scratch for the group currently being streamed — 2 doubles per
     /// aggregate that declared any (see SlotPlan::scratch_doubles). This
     /// operator holds one group at a time, so it needs one group's worth.
+    /// [m2, m3, m4] per aggregate. Every moment aggregate needs m2 -- the
+    /// higher ones read it on each update -- so the stride is uniform rather
+    /// than per-function; this operator keeps one group's worth, not millions.
+    static constexpr std::size_t kMomentScratch = 3;
     std::vector<double> cur_scratch_;
     std::vector<ScalarValue> open_key_;
 

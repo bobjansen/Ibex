@@ -350,6 +350,45 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
     return seed;
 }
 
+/// Hash a `Key` exactly as `hash_key_row` hashes the equivalent row.
+///
+/// For seeding a `KeyRowIndex` with values that never sat in a live column —
+/// a fast-path group migrated to the generic index after a later chunk's
+/// nulls made the fast-path state unrepresentable. `KeyHash` (above) is NOT
+/// interchangeable with this: it always mixes in one extra term for
+/// `null_mask`, which `hash_key_row` never does, so `KeyHash` on a Key and
+/// `hash_key_row` on the row it describes disagree even when both key values
+/// are non-null — and if a migrated group's hash does not match what a later
+/// chunk's row-based probe computes for the same value, the probe misses the
+/// slot the group actually occupies and silently duplicates it. `Date` and
+/// `Timestamp` hash identically to `hash_key_row`'s own `int32_t`/`int64_t`
+/// cases (see the `std::hash` specializations in `time.hpp`), so visiting the
+/// `ScalarValue` by its held type reproduces `hash_key_row` exactly.
+inline auto hash_key_value(const Key& key) -> std::uint64_t {
+    std::uint64_t seed = 0;
+    const auto mix = [&seed](std::uint64_t value) {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    };
+    for (std::size_t i = 0; i < key.values.size(); ++i) {
+        if (key.is_null(i)) {
+            mix(0xd1b54a32d192ed03ULL + i);
+            continue;
+        }
+        const auto h = std::visit(
+            [](const auto& v) -> std::size_t {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, std::string>) {
+                    return std::hash<std::string_view>{}(std::string_view{v});
+                } else {
+                    return std::hash<T>{}(v);
+                }
+            },
+            key.values[i]);
+        mix(static_cast<std::uint64_t>(h));
+    }
+    return seed;
+}
+
 /// Does the group's stored key describe this row? Mirrors KeyEq: null matches
 /// only null, and a double compares with `==`, so NaN keys stay distinct and
 /// -0.0 still finds the 0.0 group — exactly as a boxed Key comparison did.

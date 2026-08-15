@@ -5227,6 +5227,20 @@ class ChunkedAggregateOperator final : public Operator {
         if (group_entries.empty()) {
             return process_rows_ungrouped(agg_entries, rows);
         }
+        // A fast-path index records only raw values/codes. It therefore cannot
+        // distinguish a later null from that value's zero/code representation.
+        // Parquet commonly omits an all-valid row group's bitmap, so this is a
+        // real streaming transition rather than a schema change visible in the
+        // first chunk. The existing fast-path groups cannot be migrated into
+        // the generic KeyRowIndex without rebuilding their boxed keys, so fail
+        // explicitly instead of silently merging a null with a real key.
+        if ((cat_fast_path_ || str_fast_path_ || int_fast_path_ || pair_int_fast_path_ ||
+             packed_fast_path_) &&
+            std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
+                return entry->validity.has_value();
+            })) {
+            return "ChunkedAggregateOperator: group-by key column gained nulls across chunks";
+        }
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
         }
@@ -5243,11 +5257,7 @@ class ChunkedAggregateOperator final : public Operator {
             auto plan = encoder_.build_packed_key(group_entries);
             if (!plan.has_value()) {
                 // The shape was packable when the first chunk fixed the path,
-                // so this means a key column gained nulls mid-stream. Falling
-                // back is not available — the groups discovered so far live in
-                // the packed index, which the generic path cannot see — and
-                // this operator already reports a mid-stream schema change as
-                // an error rather than guessing.
+                // so this is an unsupported mid-stream key-layout transition.
                 return "ChunkedAggregateOperator: group-by key column gained nulls across chunks";
             }
             if (plan->width <= sizeof(std::uint64_t)) {

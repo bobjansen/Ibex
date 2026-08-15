@@ -7348,42 +7348,60 @@ class ChunkedAggregateOperator final : public Operator {
         };
 
         const AggSlotCore* fs = flat_slots_.data();
-        for (std::size_t out_row = 0; out_row < n_groups_; ++out_row) {
-            const std::size_t g = out_row;
+
+        // Emission is column-major, one output column per task: every column is
+        // a separate buffer written by exactly one worker, so no two tasks touch
+        // the same bytes and the emitted order is the group order regardless of
+        // which worker got which column.
+        const auto emit_key_column = [&](std::size_t ci) {
+            ColumnValue& col = out.mutable_column(ci);
             if (cat_fast_path_) {
-                const bool single_key = group_by_->size() == 1;
-                if (single_key) {
-                    auto& cat_col = std::get<Column<Categorical>>(out.mutable_column(0));
-                    cat_col.push_code(cat_order_[g]);
+                auto& cat_col = std::get<Column<Categorical>>(col);
+                const std::size_t n_keys = group_by_->size();
+                if (n_keys == 1) {
+                    for (std::size_t g = 0; g < n_groups_; ++g) {
+                        cat_col.push_code(cat_order_[g]);
+                    }
                 } else {
-                    const std::size_t n_keys = group_by_->size();
-                    for (std::size_t ci = 0; ci < n_keys; ++ci) {
-                        auto& cat_col = std::get<Column<Categorical>>(out.mutable_column(ci));
+                    for (std::size_t g = 0; g < n_groups_; ++g) {
                         cat_col.push_code(multi_cat_codes_flat_[(g * n_keys) + ci]);
                     }
                 }
             } else if (str_fast_path_) {
-                auto& str_col = std::get<Column<std::string>>(out.mutable_column(0));
-                str_col.push_back(str_order_[g]);
+                auto& str_col = std::get<Column<std::string>>(col);
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    str_col.push_back(str_order_[g]);
+                }
             } else if (int_fast_path_) {
-                push_int_key(out.mutable_column(0), int_key_kind_, int_order_[g]);
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    push_int_key(col, int_key_kind_, int_order_[g]);
+                }
             } else if (pair_int_fast_path_) {
-                push_int_key(out.mutable_column(0), int_key_kind_, pair_order_[g].first);
-                push_int_key(out.mutable_column(1), int_key_kind_b_, pair_order_[g].second);
+                const IntKeyKind kind = ci == 0 ? int_key_kind_ : int_key_kind_b_;
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    push_int_key(col, kind, ci == 0 ? pair_order_[g].first : pair_order_[g].second);
+                }
             } else {
-                const Key& key = group_order_[g];
-                for (std::size_t ci = 0; ci < key.values.size(); ++ci) {
-                    append_scalar(out.mutable_column(ci), key.values[ci]);
+                for (std::size_t g = 0; g < n_groups_; ++g) {
+                    const Key& key = group_order_[g];
+                    if (ci >= key.values.size()) {
+                        continue;
+                    }
+                    append_scalar(col, key.values[ci]);
                     if (any_null_keys != 0 && ci < kMaxKeyColumns &&
                         (key.null_mask & (std::uint64_t{1} << ci)) != 0) {
-                        key_validity[ci].set(out_row, false);
+                        key_validity[ci].set(g, false);
                     }
                 }
             }
-            for (std::size_t i = 0; i < aggregations_->size(); ++i) {
-                auto& column = out.mutable_column(group_by_->size() + i);
+        };
+
+        const auto emit_agg_column = [&](std::size_t i) {
+            ColumnValue& column = out.mutable_column(group_by_->size() + i);
+            const bool tracks_validity = track_validity[i] != 0U;
+            for (std::size_t g = 0; g < n_groups_; ++g) {
                 const AggSlotCore& slot = fs[(g * n_aggs_) + i];
-                if (track_validity[i] != 0U) {
+                if (tracks_validity) {
                     agg_validity[i].push_back(chunked_agg_valid(plan_[i].func, slot));
                 }
                 switch (plan_[i].func) {
@@ -7417,14 +7435,6 @@ class ChunkedAggregateOperator final : public Operator {
                                                                     scratch_for(g, i)[2]));
                         break;
                     case ir::AggFunc::First:
-                        if (plan_[i].kind == ExprType::Double) {
-                            append_scalar(column, slot.double_value);
-                        } else if (plan_[i].kind == ExprType::Int) {
-                            append_scalar(column, slot.int_value);
-                        } else {
-                            append_scalar(column, text_store_[(g * n_aggs_) + i]);
-                        }
-                        break;
                     case ir::AggFunc::Last:
                         if (plan_[i].kind == ExprType::Double) {
                             append_scalar(column, slot.double_value);
@@ -7437,6 +7447,44 @@ class ChunkedAggregateOperator final : public Operator {
                     default:
                         break;
                 }
+            }
+        };
+
+        const std::size_t n_out_columns = out.columns.size();
+        const auto emit_column = [&](std::size_t c) {
+            if (c < group_by_->size()) {
+                emit_key_column(c);
+            } else {
+                emit_agg_column(c - group_by_->size());
+            }
+        };
+
+        // A one-task budget would pay the pool round trip for work the calling
+        // thread is about to do anyway, so it stays serial.
+        auto& pool = process_worker_pool();
+        const std::size_t threads =
+            std::min(n_out_columns, (exec_ != nullptr && exec_->parallel_threads != 0)
+                                        ? exec_->parallel_threads
+                                        : pool.size());
+        if (exec_ != nullptr && exec_->parallel && !on_worker_pool_thread() && threads > 1 &&
+            n_groups_ >= exec_->parallel_min_rows) {
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(threads, [&](std::size_t) {
+                while (true) {
+                    const std::size_t c = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (c >= n_out_columns) {
+                        return;
+                    }
+                    emit_column(c);
+                }
+            });
+            batch.wait();
+            if (exec_->parallel_stats != nullptr) {
+                exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            for (std::size_t c = 0; c < n_out_columns; ++c) {
+                emit_column(c);
             }
         }
 

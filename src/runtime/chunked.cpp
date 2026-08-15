@@ -2454,6 +2454,30 @@ struct PackedKeyEncoder {
         }
     }
 
+    /// The exact inverse of `splice`/the single-word shift in `pack_row`:
+    /// recover the `width_bits`-wide cell that was spliced in at bit offset
+    /// `shift`. Only ever needed to decode an ALREADY-PACKED key back into its
+    /// per-column values (fast-path migration); packing itself never reads a
+    /// cell back out, so this has no hot-path cost.
+    template <typename Packed>
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    [[nodiscard]] static auto extract_cell(const Packed& key, unsigned shift, unsigned width_bits)
+        -> std::uint64_t {
+        const std::uint64_t mask =
+            width_bits >= 64U ? ~std::uint64_t{0} : ((std::uint64_t{1} << width_bits) - 1);
+        if constexpr (std::is_same_v<Packed, std::uint64_t>) {
+            return (key >> shift) & mask;
+        } else {
+            const unsigned word = shift / 64U;
+            const unsigned off = shift % 64U;
+            std::uint64_t value = key.w[word] >> off;
+            if (off != 0 && word + 1 < key.w.size()) {
+                value |= key.w[word + 1] << (64U - off);
+            }
+            return value & mask;
+        }
+    }
+
     /// One fixed-width integral key column, resolved to its raw storage and the
     /// bit offset it occupies in the packed key.
     struct PackCol {
@@ -2470,6 +2494,22 @@ struct PackedKeyEncoder {
         std::vector<PackCol> cols;
         unsigned width = 0;  ///< total packed width in bytes
     };
+
+    /// Bit width of one packed cell, matching the byte counts
+    /// `build_packed_layout` accumulates per `PackCol::Kind`.
+    [[nodiscard]] static auto width_bits_of(PackCol::Kind kind) -> unsigned {
+        switch (kind) {
+            case PackCol::Kind::Int64:
+            case PackCol::Kind::Ts:
+                return 64U;
+            case PackCol::Kind::Date:
+            case PackCol::Kind::Cat:
+                return 32U;
+            case PackCol::Kind::Bool:
+                return 8U;
+        }
+        return 0U;
+    }
 
     /// Per-key-column interning state for Categorical columns.
     ///
@@ -2497,6 +2537,24 @@ struct PackedKeyEncoder {
     /// code comparable across chunks.
     auto build_packed_key(const std::vector<const ColumnEntry*>& entries)
         -> std::optional<PackedPlan> {
+        for (const auto* entry : entries) {
+            if (entry->validity.has_value()) {
+                return std::nullopt;
+            }
+        }
+        return build_packed_layout(entries);
+    }
+
+    /// Same as `build_packed_key`, minus the "no column may carry nulls" check.
+    ///
+    /// Used to recover a stable fast path's (kind, shift) layout when a LATER
+    /// chunk's nulls are exactly what disqualifies `build_packed_key` -- the
+    /// layout itself does not depend on nullability, only on each column's
+    /// type and position, which stay fixed for the life of the query once the
+    /// packed path has been selected. The migration path calls this to learn
+    /// how to decode the packed keys a prior, null-free chunk already built.
+    auto build_packed_layout(const std::vector<const ColumnEntry*>& entries)
+        -> std::optional<PackedPlan> {
         // Size the interning state ONCE, before any of it is pointed at.
         //
         // `intern_categorical` hands back `remap.data()`, and `PackCol` holds
@@ -2519,9 +2577,6 @@ struct PackedKeyEncoder {
         unsigned bytes = 0;
         for (std::size_t k = 0; k < entries.size(); ++k) {
             const auto& entry = *entries[k];
-            if (entry.validity.has_value()) {
-                return std::nullopt;
-            }
             PackCol col;
             col.shift = bytes * 8;
             const ColumnValue& column = *entry.column;
@@ -2714,11 +2769,20 @@ class ChunkedDistinctOperator final : public Operator {
             // against each other. A later Parquet row group may be the first
             // one to carry a bitmap, so do not switch stores and re-emit every
             // non-null key the fast path already accepted.
+            //
+            // A single-column typed store (int64/double/bool/Date/Timestamp/
+            // string) migrates: it is a plain seen-set with no order to
+            // preserve, so its values seed the generic index directly. The
+            // packed multi-key stores and the categorical store still fail
+            // explicitly -- see `migrate_single_column_dedup_to_generic`.
             if (fast_dedup_seen_ && std::ranges::any_of(t.columns, [](const ColumnEntry& entry) {
                     return entry.validity.has_value();
                 })) {
-                return std::unexpected(
-                    "ChunkedDistinctOperator: key column gained nulls across chunks");
+                if (t.columns.size() != 1 ||
+                    !migrate_single_column_dedup_to_generic(*t.columns.front().column)) {
+                    return std::unexpected(
+                        "ChunkedDistinctOperator: key column gained nulls across chunks");
+                }
             }
             generic_dedup_seen_ = true;
 
@@ -3170,6 +3234,84 @@ class ChunkedDistinctOperator final : public Operator {
             return gather_distinct_categorical_rows(std::move(t), *col);
         }
         return std::nullopt;
+    }
+
+    /// One column's raw value hashed exactly as `hash_key_row` hashes a
+    /// non-null single-column row -- what every hash `key_index_` stores must
+    /// use, or a later chunk's probe would miss a migrated group's slot.
+    static auto mix_one(std::uint64_t value) -> std::uint64_t {
+        return value + 0x9e3779b97f4a7c15ULL;
+    }
+
+    /// Seed `group_order_`/`key_index_` with every value a single-column typed
+    /// store (`seen_i64_`, `seen_strings_`, ...) already accepted, so a later
+    /// chunk's generic probe treats them as already-emitted instead of
+    /// re-emitting them. Distinct has no group order to preserve -- unlike the
+    /// aggregate operator's gid-indexed slots, nothing downstream is keyed by
+    /// the position a value lands at here -- so the values can be seeded in
+    /// whatever order the typed set iterates them.
+    template <typename Container, typename ToScalar, typename ToHash>
+    void seed_generic_dedup_from(const Container& seen, const ToScalar& to_scalar,
+                                 const ToHash& to_hash) {
+        group_order_.reserve(group_order_.size() + seen.size());
+        key_index_.hashes.reserve(key_index_.hashes.size() + seen.size());
+        for (const auto& v : seen) {
+            Key key;
+            key.values.push_back(to_scalar(v));
+            group_order_.push_back(std::move(key));
+            key_index_.hashes.push_back(to_hash(v));
+        }
+        std::size_t capacity = 1024;
+        while (capacity * 7 < key_index_.hashes.size() * 10) {
+            capacity *= 2;
+        }
+        key_index_.rehash(capacity);
+    }
+
+    /// Migrate whichever single-column typed store `process_single_column`
+    /// used into the generic validity-aware index, so the transition to a
+    /// nullable chunk keeps every row already emitted instead of erroring or
+    /// re-emitting them. Categorical is excluded: `seen_cat_flags_` is keyed
+    /// by dictionary-relative code, not a portable value, so (like the packed
+    /// multi-key stores) it is left to the explicit-failure path.
+    auto migrate_single_column_dedup_to_generic(const ColumnValue& column) -> bool {
+        if (std::holds_alternative<Column<std::int64_t>>(column)) {
+            seed_generic_dedup_from(
+                seen_i64_, [](std::int64_t v) -> ScalarValue { return v; },
+                [](std::int64_t v) { return mix_one(std::hash<std::int64_t>{}(v)); });
+            return true;
+        }
+        if (std::holds_alternative<Column<double>>(column)) {
+            seed_generic_dedup_from(
+                seen_f64_, [](double v) -> ScalarValue { return v; },
+                [](double v) { return mix_one(std::hash<double>{}(v)); });
+            return true;
+        }
+        if (std::holds_alternative<Column<bool>>(column)) {
+            seed_generic_dedup_from(
+                seen_bool_, [](bool v) -> ScalarValue { return v; },
+                [](bool v) { return mix_one(std::hash<bool>{}(v)); });
+            return true;
+        }
+        if (std::holds_alternative<Column<Date>>(column)) {
+            seed_generic_dedup_from(
+                seen_date_, [](Date v) -> ScalarValue { return v; },
+                [](Date v) { return mix_one(std::hash<Date>{}(v)); });
+            return true;
+        }
+        if (std::holds_alternative<Column<Timestamp>>(column)) {
+            seed_generic_dedup_from(
+                seen_timestamp_, [](Timestamp v) -> ScalarValue { return v; },
+                [](Timestamp v) { return mix_one(std::hash<Timestamp>{}(v)); });
+            return true;
+        }
+        if (std::holds_alternative<Column<std::string>>(column)) {
+            seed_generic_dedup_from(
+                seen_strings_, [](std::string_view v) -> ScalarValue { return std::string(v); },
+                [](std::string_view v) { return mix_one(std::hash<std::string_view>{}(v)); });
+            return true;
+        }
+        return false;
     }
 
     OperatorPtr child_;
@@ -5254,15 +5396,33 @@ class ChunkedAggregateOperator final : public Operator {
         // distinguish a later null from that value's zero/code representation.
         // Parquet commonly omits an all-valid row group's bitmap, so this is a
         // real streaming transition rather than a schema change visible in the
-        // first chunk. The existing fast-path groups cannot be migrated into
-        // the generic KeyRowIndex without rebuilding their boxed keys, so fail
-        // explicitly instead of silently merging a null with a real key.
+        // first chunk.
+        //
+        // Every fast path stores its groups' raw values in a form the generic
+        // `KeyRowIndex` can be reseeded from -- `int_order_`/`str_order_`
+        // directly, `cat_order_`/`multi_cat_codes_flat_` via the dictionary
+        // `group_templates_` still holds, `pair_order_` via both, and the
+        // packed path's `group_order_` is already boxed `Key`s (see
+        // `migrate_packed_fast_path_to_generic`). Migrating only rebuilds the
+        // key->gid lookup; the accumulated `flat_slots_`/`scratch_` those gids
+        // already own are untouched, and this chunk then runs the generic path
+        // below like any other.
         if ((cat_fast_path_ || str_fast_path_ || int_fast_path_ || pair_int_fast_path_ ||
              packed_fast_path_) &&
             std::ranges::any_of(group_entries, [](const ColumnEntry* entry) {
                 return entry->validity.has_value();
             })) {
-            return "ChunkedAggregateOperator: group-by key column gained nulls across chunks";
+            if (cat_fast_path_) {
+                migrate_cat_fast_path_to_generic(group_entries.size());
+            } else if (int_fast_path_) {
+                migrate_int_fast_path_to_generic();
+            } else if (str_fast_path_) {
+                migrate_str_fast_path_to_generic();
+            } else if (pair_int_fast_path_) {
+                migrate_pair_int_fast_path_to_generic();
+            } else if (packed_fast_path_) {
+                migrate_packed_fast_path_to_generic();
+            }
         }
         if (cat_fast_path_) {
             return process_rows_cat(group_entries, agg_entries, rows);
@@ -6116,6 +6276,158 @@ class ChunkedAggregateOperator final : public Operator {
         ++n_groups_;
         size_group_arrays();
         return gid;
+    }
+
+    /// Seed `group_order_`/`key_index_` (the generic path's state) with `n`
+    /// groups a fast path already discovered, in the same first-seen order
+    /// the fast path used -- so gid `i` here matches the gid `flat_slots_`/
+    /// `scratch_` already hold data for at index `i`. `key_at` builds the
+    /// full `Key` (every fast path here stores raw values only, never a
+    /// null, so every migrated `Key` has an empty null mask).
+    ///
+    /// Hashing goes through `hash_key_value`, which is defined to agree with
+    /// `hash_key_row` on every value both can express -- the invariant this
+    /// whole migration rests on: a later chunk's row-based probe and a
+    /// migrated group's stored hash must land the same value in the same
+    /// slot. `KeyRowIndex::rehash` reproduces the exact open-address
+    /// placement `find_or_insert` would have made one row at a time, so a
+    /// batch reseed and an incremental build agree on where every group ends
+    /// up.
+    template <typename KeyAt>
+    void seed_generic_index_from_keys(std::size_t n, const KeyAt& key_at) {
+        group_order_.reserve(group_order_.size() + n);
+        key_index_.hashes.reserve(key_index_.hashes.size() + n);
+        for (std::size_t i = 0; i < n; ++i) {
+            Key key = key_at(i);
+            key_index_.hashes.push_back(hash_key_value(key));
+            group_order_.push_back(std::move(key));
+        }
+        std::size_t capacity = 1024;
+        while (capacity * 7 < key_index_.hashes.size() * 10) {
+            capacity *= 2;
+        }
+        key_index_.rehash(capacity);
+    }
+
+    /// A single `int_key_kind_`-typed raw value, as a `ScalarValue` matching
+    /// what `push_key_value` would have built for the equivalent column.
+    static auto scalar_of_int_key(IntKeyKind kind, std::int64_t raw) -> ScalarValue {
+        switch (kind) {
+            case IntKeyKind::Date:
+                return Date{.days = static_cast<std::int32_t>(raw)};
+            case IntKeyKind::Ts:
+                return Timestamp{.nanos = raw};
+            case IntKeyKind::Int64:
+            case IntKeyKind::Cat:
+                break;
+        }
+        return raw;
+    }
+
+    /// Fold the single-int fast path's raw values (int64 / Date / Timestamp,
+    /// as `process_rows_int` stores them) into the generic grouping path when
+    /// a later chunk brings a validity bitmap the fast path cannot express.
+    /// The accumulated slots stay put -- only the key->gid lookup is rebuilt.
+    void migrate_int_fast_path_to_generic() {
+        seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
+            Key key;
+            key.values.push_back(scalar_of_int_key(int_key_kind_, int_order_[i]));
+            return key;
+        });
+        int_fast_path_ = false;
+    }
+
+    /// Same migration as `migrate_int_fast_path_to_generic`, for the
+    /// single-string fast path's `str_order_`.
+    void migrate_str_fast_path_to_generic() {
+        seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
+            Key key;
+            key.values.push_back(str_order_[i]);
+            return key;
+        });
+        str_fast_path_ = false;
+    }
+
+    /// Fold the categorical fast path -- single-key (`cat_order_`, code ==
+    /// dictionary index) or multi-key (`multi_cat_codes_flat_`, `n_keys`
+    /// codes per group) -- into the generic grouping path. A code only means
+    /// something against ITS column's dictionary, which `group_templates_`
+    /// still holds (the empty `make_empty_like` template built at
+    /// `initialized_` time shares the dictionary every chunk's column uses),
+    /// so decoding a migrated group's code to the same string `push_key_value`
+    /// would have read off the live column is just a dictionary lookup.
+    void migrate_cat_fast_path_to_generic(std::size_t n_keys) {
+        const auto decode = [&](std::size_t c, Column<Categorical>::code_type code) {
+            return std::get<Column<Categorical>>(group_templates_[c])
+                .dictionary()[static_cast<std::size_t>(code)];
+        };
+        if (n_keys == 1) {
+            seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
+                Key key;
+                key.values.push_back(std::string(decode(0, cat_order_[i])));
+                return key;
+            });
+        } else {
+            seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
+                Key key;
+                key.values.reserve(n_keys);
+                for (std::size_t c = 0; c < n_keys; ++c) {
+                    key.values.push_back(
+                        std::string(decode(c, multi_cat_codes_flat_[(i * n_keys) + c])));
+                }
+                return key;
+            });
+        }
+        cat_fast_path_ = false;
+    }
+
+    /// Fold the paired-int fast path's raw values (`pair_order_`, one
+    /// `int64`/`Date`/`Timestamp`/categorical-code pair per group) into the
+    /// generic grouping path. `int_key_kind_`/`int_key_kind_b_` name each
+    /// column's type; a `Cat` column's code decodes through the matching
+    /// `group_templates_` entry exactly as the single/multi categorical
+    /// migration does.
+    void migrate_pair_int_fast_path_to_generic() {
+        const auto scalar_at = [&](IntKeyKind kind, std::size_t col_index,
+                                   std::int64_t raw) -> ScalarValue {
+            if (kind == IntKeyKind::Cat) {
+                const auto& dict =
+                    std::get<Column<Categorical>>(group_templates_[col_index]).dictionary();
+                return std::string(dict[static_cast<std::size_t>(raw)]);
+            }
+            return scalar_of_int_key(kind, raw);
+        };
+        seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
+            Key key;
+            key.values.reserve(2);
+            key.values.push_back(scalar_at(int_key_kind_, 0, pair_order_[i].first));
+            key.values.push_back(scalar_at(int_key_kind_b_, 1, pair_order_[i].second));
+            return key;
+        });
+        pair_int_fast_path_ = false;
+    }
+
+    /// Fold the packed (3+ key) fast path into the generic grouping path.
+    ///
+    /// Unlike every other fast path here, this one needs no decode at all:
+    /// `process_rows_packed` already builds a full boxed `Key` per group into
+    /// `group_order_` from the ROW (see its comment -- the packed word is
+    /// used only for the FAST lookup, never as the group's stored identity),
+    /// so `group_order_` is already exactly what the generic path expects.
+    /// Only `key_index_`, which hashes packed words rather than `Key`s, needs
+    /// rebuilding from what is already there.
+    void migrate_packed_fast_path_to_generic() {
+        key_index_.hashes.clear();
+        key_index_.hashes.reserve(group_order_.size());
+        for (const auto& key : group_order_) {
+            key_index_.hashes.push_back(hash_key_value(key));
+        }
+        std::size_t capacity = 1024;
+        while (capacity * 7 < key_index_.hashes.size() * 10) {
+            capacity *= 2;
+        }
+        key_index_.rehash(capacity);
+        packed_fast_path_ = false;
     }
 
     // ── Multi-key categorical index, keyed on the code tuple ──────────────────

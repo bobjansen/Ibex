@@ -46,6 +46,12 @@ const CallExpr& require_call(const Expr& expr) {
     return *node;
 }
 
+const CaseExpr& require_case(const Expr& expr) {
+    const auto* node = std::get_if<CaseExpr>(&expr.node);
+    REQUIRE(node != nullptr);
+    return *node;
+}
+
 const RankExpr& require_rank(const Expr& expr) {
     const auto* node = std::get_if<RankExpr>(&expr.node);
     REQUIRE(node != nullptr);
@@ -94,6 +100,28 @@ lhs join rhs on id suffix { "_left", "_right", };
 )");
 
     REQUIRE(result.has_value());
+}
+
+TEST_CASE("Parse searched and selector case expressions") {
+    const auto result = parse(R"(
+let direction = case side { "BUY" => 1, "SELL" => -1, else => NULL };
+let label = case { price < 0 => "loss", price == 0 => "flat", else => "gain", };
+)");
+
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 2);
+
+    const auto& direction = std::get<LetStmt>(result->statements[0]);
+    const auto& selector_case = require_case(require_expr(direction.value));
+    REQUIRE(selector_case.selector != nullptr);
+    REQUIRE(selector_case.arms.size() == 2);
+    REQUIRE(selector_case.else_value != nullptr);
+
+    const auto& label = std::get<LetStmt>(result->statements[1]);
+    const auto& searched_case = require_case(require_expr(label.value));
+    REQUIRE(searched_case.selector == nullptr);
+    REQUIRE(searched_case.arms.size() == 2);
+    REQUIRE(searched_case.else_value != nullptr);
 }
 
 TEST_CASE("Parse extern declaration with schema types") {

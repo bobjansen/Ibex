@@ -98,6 +98,19 @@ struct LiteralExpr {
     std::variant<std::int64_t, double, bool, std::string, DurationLiteral, Date, Timestamp> value;
 };
 
+struct CaseArm {
+    ExprPtr condition;
+    ExprPtr value;
+};
+
+/// First-match value selection. When `selector` is present, each arm condition
+/// is compared to it for equality (`case side { "BUY" => 1, ... }`).
+struct CaseExpr {
+    ExprPtr selector;
+    std::vector<CaseArm> arms;
+    ExprPtr else_value;
+};
+
 enum class UnaryOp : std::uint8_t {
     Negate,
     Not,
@@ -426,8 +439,9 @@ struct AscribeExpr {
 };
 
 struct Expr {
-    std::variant<IdentifierExpr, LiteralExpr, CallExpr, RankExpr, UnaryExpr, BinaryExpr, GroupExpr,
-                 BlockExpr, JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr, AscribeExpr>
+    std::variant<IdentifierExpr, LiteralExpr, CaseExpr, CallExpr, RankExpr, UnaryExpr, BinaryExpr,
+                 GroupExpr, BlockExpr, JoinExpr, StreamExpr, ArrayLiteralExpr, TableExpr,
+                 AscribeExpr>
         node;
 };
 

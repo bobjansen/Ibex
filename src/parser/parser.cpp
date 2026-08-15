@@ -1070,6 +1070,65 @@ class Parser {
         return keys;
     }
     auto parse_primary() -> ExprPtr {
+        if (match(TokenKind::KeywordCase)) {
+            ExprPtr selector;
+            if (!check(TokenKind::LBrace)) {
+                selector = parse_expression();
+                if (!selector) {
+                    return nullptr;
+                }
+            }
+            if (!consume(TokenKind::LBrace, "expected '{' after case expression")) {
+                return nullptr;
+            }
+            std::vector<CaseArm> arms;
+            ExprPtr else_value;
+            while (!check(TokenKind::RBrace)) {
+                if (match(TokenKind::KeywordElse)) {
+                    if (!consume(TokenKind::FatArrow, "expected '=>' after else in case")) {
+                        return nullptr;
+                    }
+                    else_value = parse_expression();
+                    if (!else_value) {
+                        return nullptr;
+                    }
+                    match(TokenKind::Comma);
+                    break;
+                }
+                auto condition = parse_expression();
+                if (!condition) {
+                    return nullptr;
+                }
+                if (!consume(TokenKind::FatArrow, "expected '=>' after case condition")) {
+                    return nullptr;
+                }
+                auto value = parse_expression();
+                if (!value) {
+                    return nullptr;
+                }
+                arms.push_back(
+                    CaseArm{.condition = std::move(condition), .value = std::move(value)});
+                if (!consume(TokenKind::Comma, "expected ',' between case arms")) {
+                    return nullptr;
+                }
+            }
+            if (!else_value) {
+                return fail_expr(peek(), "case requires a final else arm");
+            }
+            if (!consume(TokenKind::RBrace, "expected '}' after case arms")) {
+                return nullptr;
+            }
+            auto expr = std::make_unique<Expr>();
+            expr->node = CaseExpr{.selector = std::move(selector),
+                                  .arms = std::move(arms),
+                                  .else_value = std::move(else_value)};
+            return expr;
+        }
+        if (match(TokenKind::KeywordNull)) {
+            auto expr = std::make_unique<Expr>();
+            expr->node = CallExpr{.callee = "__null", .args = {}, .named_args = {}};
+            return expr;
+        }
         // `^name` — the scope-escape primary (SPEC.md Section 6.2). It is a
         // prefix on a bare identifier, not a unary operator: `^42`, `^(expr)`
         // and `^f(x)` are parse errors.

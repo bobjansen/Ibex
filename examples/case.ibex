@@ -1,0 +1,15 @@
+// First-match conditional values, including selector shorthand and NULL.
+
+let trades = Table {
+    side = ["BUY", "SELL", "HOLD"],
+    price = [12.5, -3.0, 0.0],
+};
+
+trades[update {
+    direction = case side { "BUY" => 1, "SELL" => -1, else => NULL },
+    label = case {
+        price < 0  => "loss",
+        price == 0 => "flat",
+        else       => "gain",
+    },
+}];

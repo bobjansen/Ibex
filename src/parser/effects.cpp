@@ -266,6 +266,15 @@ class EffectAnalyzer {
                     for (const auto& named : node.named_args) {
                         collect_expr_effects(*named.value, direct, deps);
                     }
+                } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                    if (node.selector != nullptr) {
+                        collect_expr_effects(*node.selector, direct, deps);
+                    }
+                    for (const auto& arm : node.arms) {
+                        collect_expr_effects(*arm.condition, direct, deps);
+                        collect_expr_effects(*arm.value, direct, deps);
+                    }
+                    collect_expr_effects(*node.else_value, direct, deps);
                 } else if constexpr (std::is_same_v<T, RankExpr>) {
                     for (const auto& named : node.named_args) {
                         collect_expr_effects(*named.value, direct, deps);

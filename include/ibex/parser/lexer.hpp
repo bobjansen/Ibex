@@ -67,6 +67,8 @@ enum class TokenKind : std::uint8_t {
     KeywordAsc,
     KeywordDesc,
     KeywordAs,
+    KeywordCase,
+    KeywordElse,
 
     // Type keywords
     KeywordInt,

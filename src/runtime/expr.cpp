@@ -1814,6 +1814,50 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         return ExprType::Bool;
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "__null") {
+            if (!call->args.empty()) {
+                return std::unexpected("NULL takes no arguments");
+            }
+            return std::unexpected("NULL needs a typed case arm");
+        }
+        if (call->callee == "__case") {
+            if (call->args.empty() || call->args.size() % 2 == 0) {
+                return std::unexpected("case: expected condition/value arm pairs followed by else");
+            }
+            for (std::size_t i = 0; i + 1 < call->args.size(); i += 2) {
+                auto condition = infer_expr_type(*call->args[i], input, scalars, externs);
+                if (!condition) {
+                    return condition;
+                }
+                if (*condition != ExprType::Bool) {
+                    return std::unexpected("case: each condition must have type Bool");
+                }
+            }
+            std::optional<ExprType> result;
+            for (std::size_t i = 1; i < call->args.size(); i += 2) {
+                const auto* null_arm = std::get_if<ir::CallExpr>(&call->args[i]->node);
+                if (null_arm != nullptr && null_arm->callee == "__null") {
+                    continue;
+                }
+                auto type = infer_expr_type(*call->args[i], input, scalars, externs);
+                if (!type) {
+                    return type;
+                }
+                if (!result.has_value()) {
+                    result = *type;
+                } else if (*result == ExprType::Int && *type == ExprType::Double) {
+                    result = ExprType::Double;
+                } else if (!(*result == ExprType::Double && *type == ExprType::Int) &&
+                           *result != *type) {
+                    return std::unexpected(
+                        "case: all value arms must have the same type (or Int/Float)");
+                }
+            }
+            if (!result.has_value()) {
+                return std::unexpected("case: at least one arm must provide a non-NULL value");
+            }
+            return *result;
+        }
         // Pure row-wise scalar builtins: single source of truth (see
         // builtins()). Both this pass and eval_expr dispatch here.
         if (auto it = builtins().find(call->callee); it != builtins().end()) {
@@ -1997,6 +2041,33 @@ auto eval_expr(const ir::Expr& expr, const Table& input, std::size_t row,
         }
     }
     if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if (call->callee == "__null") {
+            if (!call->args.empty()) {
+                return std::unexpected("NULL takes no arguments");
+            }
+            return ExprValue{Null{}};
+        }
+        if (call->callee == "__case") {
+            if (call->args.empty() || call->args.size() % 2 == 0) {
+                return std::unexpected("case: expected condition/value arm pairs followed by else");
+            }
+            for (std::size_t i = 0; i + 1 < call->args.size(); i += 2) {
+                auto condition = eval_expr(*call->args[i], input, row, scalars, externs);
+                if (!condition) {
+                    return condition;
+                }
+                // CASE follows SQL's three-valued rule: a null condition does
+                // not match and the next arm is considered.
+                if (const auto* matched = std::get_if<bool>(&condition.value())) {
+                    if (*matched) {
+                        return eval_expr(*call->args[i + 1], input, row, scalars, externs);
+                    }
+                } else if (!std::holds_alternative<Null>(condition.value())) {
+                    return std::unexpected("case: each condition must evaluate to Bool");
+                }
+            }
+            return eval_expr(*call->args.back(), input, row, scalars, externs);
+        }
         // Pure row-wise scalar builtins: single source of truth (see
         // builtins()). Both this pass and infer_expr_type dispatch here.
         // Non-Scalar builtins hold no ScalarExec — they fall through to the

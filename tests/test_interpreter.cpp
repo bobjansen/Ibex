@@ -151,6 +151,43 @@ TEST_CASE("Interpret filter + select") {
     REQUIRE((*price_ints)[1] == 30);
 }
 
+TEST_CASE("Interpret selector case expressions with NULL fallback", "[interpreter][case]") {
+    runtime::Table table;
+    table.add_column("side", Column<std::string>{"BUY", "SELL", "HOLD"});
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir(
+        "trades[update { direction = case side { \"BUY\" => 1, \"SELL\" => -1, else => NULL } }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* direction = std::get_if<Column<std::int64_t>>(result->find("direction"));
+    REQUIRE(direction != nullptr);
+    CHECK((*direction)[0] == 1);
+    CHECK((*direction)[1] == -1);
+    CHECK(runtime::is_null(*result->find_entry("direction"), 2));
+}
+
+TEST_CASE("Interpret searched case expressions in first-match order", "[interpreter][case]") {
+    runtime::Table table;
+    table.add_column("price", Column<std::int64_t>{-1, 0, 4});
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir(
+        "trades[update { label = case { price < 0 => \"loss\", price == 0 => \"flat\", else => "
+        "\"gain\" } }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* label = std::get_if<Column<std::string>>(result->find("label"));
+    REQUIRE(label != nullptr);
+    CHECK((*label)[0] == "loss");
+    CHECK((*label)[1] == "flat");
+    CHECK((*label)[2] == "gain");
+}
+
 TEST_CASE("Interpret Program executes preamble extern calls before main node") {
     ir::Builder builder;
 

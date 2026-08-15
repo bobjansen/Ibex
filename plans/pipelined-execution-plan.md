@@ -191,7 +191,7 @@ Per-query, the 8-core split is wide (q12 −29%, q08 −9%; q01 +69%, q20 +42%,
 q19 +36%). q21 is the one query that loses single-threaded too (+13.6%) and is
 the place to start if Phase 2 lands and something still regresses.
 
-### Phase 2 — concurrent chunks — **first slice landed**
+### Phase 2 — concurrent chunks — **scan slice + the join slice landed**
 
 The actual win. Multiple chunks in flight through the operator chain.
 
@@ -347,34 +347,91 @@ and sound; the absolute 34%/22% are not comparable to the 44% above.)
 ### Where the serial time actually is
 
 Calling-thread ms summed over real operator nodes across the suite, 8 cores,
-with the worker help each drew (`pool_work / self`):
+with the worker help each drew (`pool_work / self`). The first column is the
+reading that opened this section; the second is the same measurement after the
+joins were worked on.
 
-| operator | self ms | pool ms | worker help |
-|---|---|---|---|
-| scan | 479 | 2257 | 4.7× |
-| aggregate | 473 | 813 | 1.7× |
-| **join inner** | **422** | 92 | **0.2×** |
-| **join semi** | **326** | 0 | **none** |
-| **join anti** | **33** | 0 | **none** |
-| update | 57 | 104 | 1.8× |
-| distinct | 40 | 160 | 4.0× |
+| operator | self ms (before) | self ms (now) | pool ms (now) | worker help |
+|---|---|---|---|---|
+| scan | 479 | 631 | 2902 | 4.6× |
+| aggregate | 473 | 552 | 945 | 1.7× |
+| **join inner** | **422** | **435** | 80 | **0.2×** |
+| join semi | 326 | **183** | 285 | 1.6× |
+| join anti | 33 | 36 | 14 | 0.4× |
+| update | 57 | 70 | 145 | 2.1× |
+| distinct | 40 | 48 | 191 | 3.9× |
 
-**Joins are 42% of calling-thread operator time and draw essentially no worker
-help at all**; semi and anti draw literally none. The scan, which this phase
-spent its effort on, is now the best-parallelized operator in the engine. The
-same ranking holds with streaming off (joins 54% there), so it is a property of
-the join operators, not of streaming.
+**Joins were 42% of calling-thread operator time and drew essentially no worker
+help.** That reading was right, and it is what the rest of this phase should be
+steered by. The scan, which this phase spent its effort on, is now the
+best-parallelized operator in the engine.
 
-So the next step is **not** the general scheduler below. It is the joins, in
-this order:
+**How to read `self ms` — settled by reading the profiler, after getting it
+wrong twice.** `ExecutionProfileScope` pushes a frame per scope and adds its
+whole elapsed time to its parent's `child_ns`, which the parent subtracts. That
+applies to `ProfilePhase::Source` exactly as it does to a nested operator, so
+**a source stage's time is EXCLUDED from the enclosing operator's self, not
+added to it**. A mid-session claim that `join inner`'s 422ms was mostly its
+deferred probe's decode was wrong on that mechanism; the empirical check is q03,
+whose source stages cost 147ms of calling-thread time while its two `join inner`
+rows report 10.6ms and 7.6ms between them.
 
-1. **Semi/anti join** — 359ms, zero worker help, and the simplest shape: build
-   a key set, then filter. The filter pass is row-local over a hash set, and
-   under streaming its left input already arrives as chunks.
-2. **Inner join** — 422ms at 0.2×. `plans/runtime-multithreading-plan.md` notes
-   a parallel probe was built and shelved (`git stash` "parallel inner-join
-   probe") as unmeasurable, with `assemble_output` named as the other half.
-   It was unmeasurable because the scan dominated then; it does not now.
+The practical consequence is the opposite of what that wrong reading implied:
+the joins' self ms is real join work, and the ranking above stands.
+
+1. **Semi/anti join** — **DONE.** Its `filter_chunk` was 266ms across the suite
+   with the pool idle, split 4:1 predicate to gather. Only the predicate was
+   threaded: each one probes a set that stops changing before the first left
+   chunk arrives, so ranges need no coordination and each builds its own index
+   list. The gather is deliberately left serial — threading a gather here is the
+   same memory-bound dead end already recorded over `ChunkedDistinctOperator`.
+   q21 −29%, suite −4.6%; the row above went 326 self / 0 pool to 183 / 285.
+2. **Inner join** — still 435ms at 0.2×, but **it is not one lever**. Timed
+   directly, the operator's own work splits into `probe_chunk` 91ms,
+   `assemble_output` 48ms, `build_index` 42ms, `emit_swapped` 7ms, and a
+   remainder that is phase A's IN-MEMORY passes (`filter_selection`,
+   `apply_membership_filter`, the two-phase hit loop) — those are not source
+   stages, so they land in the join's self.
+
+   So the shelved `git stash` "parallel inner-join probe" addresses
+   `probe_chunk` + `assemble_output` ≈ **139ms**, or 3-4% of suite wall if
+   perfectly parallelized. Worth doing, but it is not what makes the join row
+   large, and it should not be sold as such.
+
+   Also measured: the full two-phase branch's `left_copy` — a deep copy of the
+   build table — **never runs in PDS-H**. `build.rows() > sel.selected.size()`
+   sends every query down the `RightMaterialized` branch instead. Do not spend
+   effort there without a query that reaches it.
+
+### What came out of following that ranking
+
+Two changes landed that the ranking did not predict, both found by timing phase
+A of the deferred probe rather than the operator that owns it:
+
+* **Phase A now fuses membership past a static filter.** Its fused key scan
+  required `conjuncts.empty()`, a condition copied from `project_where`, so a
+  probe scan carrying a filter decoded the whole key column AND the predicate
+  column and then walked every row twice, serially. Membership now runs inside
+  the decoder and the conjuncts are evaluated through its selection. q03 −37%,
+  q07 −24% at 8 cores. Gated on fixed-width conjunct columns: a sparse read of a
+  variable-width column is not proportionally cheaper (q10 +9.3% when it was
+  not gated).
+* **The key scan's abandon rule is asked 16× sooner.** It needs 262k rows to
+  fire but was only asked at ~1M-row group boundaries, so a doomed scan decoded
+  a whole group — and in parallel every other in-flight group finished
+  alongside it. Group 0 now asks it per 64k batch, which is sound because group
+  0's rows ARE the file-order prefix. That removed the q05/q10 regressions the
+  fusion change introduced, and those regressions had SCALED WITH CORE COUNT
+  because the overshoot was bounded by one worker wave.
+
+Cumulative for both, PDS-H SF-2, interleaved, min of 6: suite −3.3% at 1 core,
+−3.4% at 4, −4.0% at 8, with q03 −37% and q07 −24% at 8.
+
+**Still open where phase A is concerned:** membership-first wins only when
+membership is more selective than the conjuncts, and nothing at this layer
+estimates that. q10 probes `orders` against an unfiltered customer table and its
+scan still abandons — now cheaply. The estimate would come from the footer-stats
+cost model behind `join_reorder`.
 
 The scheduler remains the design for running the whole chain concurrently, but
 it is a large change and this measurement does not argue for it yet.

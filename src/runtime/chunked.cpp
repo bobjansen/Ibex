@@ -2968,6 +2968,23 @@ class ChunkedDistinctOperator final : public Operator {
             // which it must not be, or a partition's rows would go unvisited.
             packed_part_count_ = count;
             state.parts.resize(count);
+            // Anything an earlier chunk deduped serially lives in `state.seen`,
+            // which no worker will ever probe, so it has to move into the
+            // partitions before the first parallel chunk runs. Without this a
+            // value already emitted is inserted afresh and emitted a SECOND
+            // time: the row gate is per chunk, so a chunk under it falls back
+            // to serial while leaving `packed_part_count_` at 0, and the next
+            // chunk over the gate is then the first parallel use, against empty
+            // partitions. A 5000-row chunk ahead of a 40000-row one is enough,
+            // which any filter with uneven selectivity produces.
+            //
+            // Same hasher and mask the worker uses below, or a seeded key would
+            // land in a partition nobody probes for it.
+            Hash seed_hasher;
+            for (const Packed& key : state.seen) {
+                state.parts[seed_hasher(key) & (count - 1)].insert(key);
+            }
+            state.seen.clear();
         }
         const std::size_t part_count = packed_part_count_;
         const std::size_t workers = part_count;

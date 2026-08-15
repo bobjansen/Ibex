@@ -203,3 +203,52 @@ TEST_CASE("chunked source preserves validity that appears only in a later chunk"
         }
     }
 }
+
+TEST_CASE("chunked distinct dedups across a serial-then-parallel transition",
+          "[runtime][chunked][distinct]") {
+    // Distinct's packed path keeps two dedup stores that cannot see each other:
+    // `seen` for the serial branch, one set per partition for the parallel one.
+    // Its row gate is evaluated per chunk until the parallel path first runs,
+    // so a chunk UNDER the gate dedups into `seen` and leaves the operator
+    // still unactivated -- and the next chunk over the gate is then the first
+    // parallel use, against empty partitions. Every value the serial chunk
+    // already emitted is inserted afresh and emitted a second time.
+    //
+    // The shape is a small chunk ahead of a large one, which any filter with
+    // uneven selectivity produces: here 5000 rows survive chunk 0 (under the
+    // 32768 gate) and 40000 survive chunk 1 (over it). Deliberately NOT a
+    // uniform grain -- equal chunks are all on one side of the gate and the
+    // transition never happens.
+    constexpr std::size_t kRows = 120000;
+    constexpr std::size_t kFirstChunk = 40000;
+    Column<std::int64_t> a;
+    Column<std::int64_t> b;
+    Column<std::int64_t> keep;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        a.push_back(static_cast<std::int64_t>(i % 100));
+        b.push_back(7);  // a second column, so the key packs rather than taking
+                         // the single-column path, which has no parallel branch
+        keep.push_back(i < kFirstChunk ? (i % 8 == 0 ? 1 : 0) : 1);
+    }
+    runtime::Table table;
+    table.add_column("a", std::move(a));
+    table.add_column("b", std::move(b));
+    table.add_column("keep", std::move(keep));
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+    const std::string query = "t[filter keep == 1][distinct { a, b }];";
+
+    const auto whole = run(query, registry);
+    REQUIRE(whole.rows() == 100);  // a is i % 100, b constant
+
+    const ChunkGrainGuard guard{"40000"};
+    const auto chunked = run(query, registry);
+    // Against the unfixed operator this is 125: the 25 values chunk 0 emitted
+    // serially come back a second time from the first parallel chunk.
+    REQUIRE(chunked.rows() == whole.rows());
+    auto mismatch = runtime::compare_tables(whole, chunked);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}

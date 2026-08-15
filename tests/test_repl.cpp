@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <ranges>
 #include <set>
 #include <string>
@@ -771,6 +772,55 @@ result;
     // see a reader's schema at all (it runs inside lower_script, before
     // canonicalize fuses the Filter it needs to move).
     REQUIRE(source_instances == 3);
+}
+
+TEST_CASE("REPL footer estimates handle the full signed integer range", "[repl][batch]") {
+    // The footer's min/max are legitimate signed values. Their mathematical
+    // inclusive span is 2^64, which does not fit in uint64_t; the planner must
+    // saturate the estimate and decline its small-span proof rather than first
+    // overflowing a signed subtraction while deriving source statistics.
+    ibex::runtime::ExternRegistry registry;
+    registry.register_lazy_table(
+        "read_extreme",
+        [](const ibex::runtime::ExternArgs&)
+            -> std::expected<ibex::runtime::LazyTablePtr, std::string> {
+            ibex::runtime::Table schema;
+            schema.add_column("k", ibex::Column<std::int64_t>{});
+            ibex::runtime::SourceColumnStats stats;
+            stats.emplace("k", ibex::runtime::ColumnStats{
+                                   .min = std::numeric_limits<std::int64_t>::min(),
+                                   .max = std::numeric_limits<std::int64_t>::max(),
+                                   .null_count = 0,
+                               });
+            return std::make_shared<ibex::runtime::LazyTable>(
+                std::move(schema), 2,
+                [](const std::vector<std::string>& names, const ibex::runtime::Selection* selection)
+                    -> std::expected<ibex::runtime::Table, std::string> {
+                    const std::vector<std::int64_t> values{
+                        std::numeric_limits<std::int64_t>::min(),
+                        std::numeric_limits<std::int64_t>::max(),
+                    };
+                    const ibex::runtime::Selection all{0, 1};
+                    const auto& rows = selection == nullptr ? all : *selection;
+                    ibex::runtime::Table table;
+                    if (std::ranges::find(names, "k") != names.end()) {
+                        std::vector<std::int64_t> selected;
+                        selected.reserve(rows.size());
+                        for (const auto row : rows) {
+                            selected.push_back(values[row]);
+                        }
+                        table.add_column("k", ibex::Column<std::int64_t>{std::move(selected)});
+                    }
+                    table.logical_rows = rows.size();
+                    return table;
+                },
+                std::move(stats));
+        });
+
+    REQUIRE(
+        ibex::repl::execute_script("extern fn read_extreme() -> DataFrame from \"x.hpp\"; "
+                                   "read_extreme()[select { n = count() }, by { k }];",
+                                   registry));
 }
 
 namespace {

@@ -1405,6 +1405,28 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
 /// answer is impossible, because what enters the schema is the verdict of an
 /// exhaustive check and never a statistic — the footer only decides whether the
 /// check is worth running.
+///
+/// The full signed range contains 2^64 values, one more than a uint64_t can
+/// represent. Saturating it to uint64_t's maximum is sufficient here: every
+/// caller compares the span to a much smaller resource cap before allocating.
+[[nodiscard]] auto inclusive_int64_span(std::int64_t min, std::int64_t max) -> std::uint64_t {
+    if (max < min) {
+        return 0;
+    }
+    // Conversion to unsigned is defined modulo 2^64, so this computes the
+    // distance without evaluating the potentially overflowing signed `max - min`.
+    const std::uint64_t distance =
+        static_cast<std::uint64_t>(max) - static_cast<std::uint64_t>(min);
+    return distance == std::numeric_limits<std::uint64_t>::max() ? distance : distance + 1;
+}
+
+/// `value - base`, expressed without signed-overflow UB. Callers first verify
+/// that the result is inside an inclusive span, so values outside the range are
+/// rejected rather than used as bitset indices.
+[[nodiscard]] auto int64_offset(std::int64_t value, std::int64_t base) -> std::uint64_t {
+    return static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(base);
+}
+
 auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>& wanted,
                           const runtime::ExecutionContext& exec) -> std::vector<std::string> {
     /// Cap on the bitset, in values. A candidate wider than this is left
@@ -1441,7 +1463,7 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
         if (stats.null_count.value_or(1) != 0) {
             continue;
         }
-        const auto span = static_cast<std::uint64_t>(*stats.max - *stats.min) + 1;
+        const auto span = inclusive_int64_span(*stats.min, *stats.max);
         if (span < rows || span > kMaxSpanValues) {
             continue;
         }
@@ -1462,7 +1484,7 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
         bool unique = true;
         const auto* data = values->data();
         for (std::size_t i = 0; i < rows; ++i) {
-            const auto offset = static_cast<std::uint64_t>(data[i] - base);
+            const auto offset = int64_offset(data[i], base);
             if (offset >= span) {
                 unique = false;  // outside the footer's own range: trust nothing
                 break;
@@ -1492,11 +1514,11 @@ auto derive_column_distinct(const runtime::LazyTable& lazy) -> ir::ColumnDistinc
         if (!stats.min.has_value() || !stats.max.has_value()) {
             continue;  // no integer range -> no estimate for this column
         }
-        // max >= min by construction, so the span is positive; guard the
-        // arithmetic against a pathological footer all the same.
-        const auto span =
-            *stats.max >= *stats.min ? static_cast<std::size_t>(*stats.max - *stats.min) + 1 : rows;
-        out.emplace(name, std::min(rows, span));
+        const auto span = inclusive_int64_span(*stats.min, *stats.max);
+        // The minimum fits in size_t because `rows` does. Convert only after
+        // bounding the footer's uint64_t estimate by that row count.
+        const auto bounded = std::min(static_cast<std::uint64_t>(rows), span);
+        out.emplace(name, static_cast<std::size_t>(bounded));
     }
     return out;
 }

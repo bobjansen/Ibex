@@ -3175,8 +3175,8 @@ class ChunkedDistinctOperator final : public Operator {
 class ChunkedSemiAntiJoinOperator final : public Operator {
    public:
     ChunkedSemiAntiJoinOperator(OperatorPtr left, Table right, ir::JoinKind kind,
-                                const std::vector<ir::JoinKey>* keys)
-        : left_(std::move(left)), right_(std::move(right)), kind_(kind), keys_(keys) {}
+                                const std::vector<ir::JoinKey>* keys, const ExecutionContext* exec)
+        : left_(std::move(left)), right_(std::move(right)), kind_(kind), keys_(keys), exec_(exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -3408,16 +3408,83 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         return "ChunkedSemiAntiJoinOperator: unsupported key type";
     }
 
+    // Below this the fan-out costs more than the probes it splits: a probe runs
+    // at ~10ns/row, so a 1<<16 chunk is a ~0.6ms pass, and there is nothing
+    // there for eight threads to divide. The queries this split exists for are
+    // two orders of magnitude past the gate either way -- q21 probes 21.5M rows
+    // -- so it is set where a mistake is cheap rather than where it is tight.
+    static constexpr std::size_t kMinParallelPredicateRows = 1U << 18U;
+
+    /// The surviving row indices, ascending, evaluated across the worker pool.
+    ///
+    /// Every predicate this operator builds probes ONE key cell against a set
+    /// that stopped changing before the first left chunk arrived: it reads the
+    /// key column, the set, and a validity bitmap, and writes nothing. So the
+    /// rows split with no coordination at all, and each range can build its own
+    /// index list -- one memcpy per range to concatenate, rather than a second
+    /// full pass over a keep-flag array.
+    ///
+    /// Ranges are contiguous and appended in order, so the result stays
+    /// ascending, which both `gather_rows` and every consumer of the chunk
+    /// require.
+    template <typename Pred>
+    auto select_rows(std::size_t rows, Pred pred) -> std::vector<std::size_t> {
+        auto& pool = process_worker_pool();
+        const std::size_t budget = (exec_ != nullptr && exec_->parallel_threads != 0)
+                                       ? exec_->parallel_threads
+                                       : pool.size();
+        const std::size_t workers = std::min(budget, pool.size());
+        // `submit` CLAMPS its worker count to the pool size, so a range count
+        // above it would leave those ranges unvisited and silently drop rows.
+        const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows));
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || ranges < 2 ||
+            rows < kMinParallelPredicateRows) {
+            std::vector<std::size_t> idx;
+            idx.reserve(rows);
+            for (std::size_t row = 0; row < rows; ++row) {
+                if (pred(row)) {
+                    idx.push_back(row);
+                }
+            }
+            return idx;
+        }
+
+        const std::size_t grain = (rows + ranges - 1) / ranges;
+        std::vector<std::vector<std::size_t>> parts(ranges);
+        {
+            auto batch = pool.submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                if (begin >= end) {
+                    return;
+                }
+                auto& out = parts[r];
+                out.reserve(end - begin);
+                for (std::size_t row = begin; row < end; ++row) {
+                    if (pred(row)) {
+                        out.push_back(row);
+                    }
+                }
+            });
+            batch.wait();
+        }
+
+        std::size_t total = 0;
+        for (const auto& part : parts) {
+            total += part.size();
+        }
+        std::vector<std::size_t> idx;
+        idx.reserve(total);
+        for (const auto& part : parts) {
+            idx.insert(idx.end(), part.begin(), part.end());
+        }
+        return idx;
+    }
+
     template <typename Pred>
     auto filter_rows(Table t, Pred pred) -> std::optional<Table> {
         const std::size_t rows = t.rows();
-        std::vector<std::size_t> idx;
-        idx.reserve(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (pred(row)) {
-                idx.push_back(row);
-            }
-        }
+        const std::vector<std::size_t> idx = select_rows(rows, pred);
         if (idx.empty()) {
             return std::nullopt;
         }
@@ -3543,6 +3610,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::vector<Table> left_buffered_;
     std::size_t swapped_next_ = 0;
     ExprType right_kind_ = ExprType::Int;
+    const ExecutionContext* exec_ = nullptr;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
     robin_hood::unordered_flat_set<double> right_f64_;
@@ -10112,8 +10180,9 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }
-            return std::make_unique<ChunkedSemiAntiJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), join.kind(), &join.keys());
+            return std::make_unique<ChunkedSemiAntiJoinOperator>(std::move(left_op.value()),
+                                                                 std::move(right.value()),
+                                                                 join.kind(), &join.keys(), &exec);
         }
         // `nulls equal` goes to the materialized join, which implements the
         // policy. These streaming operators hash and probe on their own and

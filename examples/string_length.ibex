@@ -1,0 +1,7 @@
+// Unicode-aware character counts and UTF-8 byte counts.
+let labels = Table { name = ["café", "日本語", "plain"] };
+
+labels[update {
+    characters = length(name),
+    bytes = byte_length(name)
+}];

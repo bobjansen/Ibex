@@ -8,6 +8,43 @@ knitr_state$sessions <- new.env(parent = emptyenv())
     if (is.null(lhs)) rhs else lhs
 }
 
+# These are deliberately only expression markers.  They are recognised while
+# dplyr captures a lazy ibex_tbl expression and are never evaluated in R.
+ibex_window_marker <- function(...) {
+    rlang::abort("Window functions are available only inside mutate() or summarise() on ibex_tbl.")
+}
+
+#' @export
+rolling_sum <- ibex_window_marker
+#' @export
+rolling_mean <- ibex_window_marker
+#' @export
+rolling_min <- ibex_window_marker
+#' @export
+rolling_max <- ibex_window_marker
+#' @export
+rolling_count <- ibex_window_marker
+#' @export
+rolling_median <- ibex_window_marker
+#' @export
+rolling_std <- ibex_window_marker
+#' @export
+rolling_ewma <- ibex_window_marker
+#' @export
+rolling_quantile <- ibex_window_marker
+#' @export
+rolling_skew <- ibex_window_marker
+#' @export
+rolling_kurtosis <- ibex_window_marker
+#' @export
+rolling_first <- ibex_window_marker
+#' @export
+rolling_last <- ibex_window_marker
+#' @export
+window_start <- ibex_window_marker
+#' @export
+window_end <- ibex_window_marker
+
 default_plugin_paths <- function() {
     split_env_paths <- function(value) {
         if (!nzchar(value)) {

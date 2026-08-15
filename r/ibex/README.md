@@ -27,6 +27,26 @@ returns a tibble. Unsupported calls follow the constructor's explicit
 an ordinary local tibble and never silently re-enters Ibex. See
 `inst/dplyr-compatibility.md` for the exact native surface and semantic notes.
 
+Time-series plans stay lazy too. Promote a timestamp (or Date / integer-nanosecond)
+column with `as_timeframe()`, use `window()` immediately before `mutate()` or
+`summarise()`, and use `resample()` for fixed, epoch-aligned bars:
+
+```r
+bars <- ibex_tbl(ticks, fallback = "error") |>
+  as_timeframe(timestamp) |>
+  resample("1m", open = dplyr::first(price), close = dplyr::last(price), .by = symbol)
+
+rolling <- ibex_tbl(ticks, fallback = "error") |>
+  as_timeframe(timestamp) |>
+  window("5m") |>
+  dplyr::mutate(mean_5m = rolling_mean(price))
+```
+
+The rolling helpers are `rolling_sum`, `rolling_mean`, `rolling_min`,
+`rolling_max`, `rolling_count`, `rolling_median`, `rolling_std`, `rolling_ewma`,
+`rolling_quantile`, `rolling_skew`, `rolling_kurtosis`, `rolling_first`, and
+`rolling_last`; `window_start()` and `window_end()` expose the nominal bounds.
+
 Current shape:
 - `eval_ibex()` evaluates an inline Ibex query.
 - `eval_file()` evaluates a `.ibex` file.

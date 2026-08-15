@@ -312,6 +312,15 @@ class LazyTable {
     [[nodiscard]] auto scan_key_filter(const std::string& key, const DynamicScanFilter& filter,
                                        const SourceUnit* unit, const ExecutionContext& exec)
         -> std::expected<std::optional<Selection>, std::string>;
+    /// The conjunct columns eligible for staging through a selection; nullopt
+    /// when any of them is variable-width and the staged path must be declined.
+    [[nodiscard]] auto stageable_conjunct_columns(const std::vector<ir::Expr>& conjuncts) const
+        -> std::optional<std::set<std::string>>;
+    /// AND static conjuncts into an existing selection, decoding their columns
+    /// through it. nullopt = the conjuncts name no column to stage.
+    [[nodiscard]] auto narrow_selection(Selection selected, const std::vector<ir::Expr>& conjuncts,
+                                        const ExecutionContext& exec, const ScalarRegistry* scalars)
+        -> std::expected<std::optional<Selection>, std::string>;
     /// The predicate columns for one unit, never cached and never read from
     /// the cache except to slice a column that is already there whole.
     [[nodiscard]] auto decode_unit_predicate_columns(

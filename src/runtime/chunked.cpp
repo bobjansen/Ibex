@@ -2669,7 +2669,9 @@ class ChunkedDistinctOperator final : public Operator {
             // "null", so a null would dedupe against a genuine 0 / "". A
             // null-bearing column falls through to the Key path below, which
             // carries the null bits.
-            if (t.columns.size() == 1 && !t.columns.front().validity.has_value()) {
+            if (!generic_dedup_seen_ && t.columns.size() == 1 &&
+                !t.columns.front().validity.has_value()) {
+                fast_dedup_seen_ = true;
                 auto out = process_single_column(std::move(t));
                 if (!out.has_value()) {
                     continue;
@@ -2689,20 +2691,36 @@ class ChunkedDistinctOperator final : public Operator {
             for (const auto& entry : t.columns) {
                 key_entries_.push_back(&entry);
             }
-            if (auto plan = encoder_.build_packed_key(key_entries_); plan.has_value()) {
-                std::optional<Table> out;
-                if (plan->width <= sizeof(std::uint64_t)) {
-                    out = process_packed(std::move(t), plan->cols, packed64_);
-                } else if (plan->width <= sizeof(PackedKeyEncoder::Packed128)) {
-                    out = process_packed(std::move(t), plan->cols, packed128_);
-                } else {
-                    out = process_packed(std::move(t), plan->cols, packed256_);
+            if (!generic_dedup_seen_) {
+                if (auto plan = encoder_.build_packed_key(key_entries_); plan.has_value()) {
+                    fast_dedup_seen_ = true;
+                    std::optional<Table> out;
+                    if (plan->width <= sizeof(std::uint64_t)) {
+                        out = process_packed(std::move(t), plan->cols, packed64_);
+                    } else if (plan->width <= sizeof(PackedKeyEncoder::Packed128)) {
+                        out = process_packed(std::move(t), plan->cols, packed128_);
+                    } else {
+                        out = process_packed(std::move(t), plan->cols, packed256_);
+                    }
+                    if (!out.has_value()) {
+                        continue;
+                    }
+                    return std::optional<Chunk>{table_to_chunk(std::move(*out))};
                 }
-                if (!out.has_value()) {
-                    continue;
-                }
-                return std::optional<Chunk>{table_to_chunk(std::move(*out))};
             }
+
+            // The typed and packed stores contain raw values only, whereas the
+            // generic Key index includes validity. They cannot deduplicate
+            // against each other. A later Parquet row group may be the first
+            // one to carry a bitmap, so do not switch stores and re-emit every
+            // non-null key the fast path already accepted.
+            if (fast_dedup_seen_ && std::ranges::any_of(t.columns, [](const ColumnEntry& entry) {
+                    return entry.validity.has_value();
+                })) {
+                return std::unexpected(
+                    "ChunkedDistinctOperator: key column gained nulls across chunks");
+            }
+            generic_dedup_seen_ = true;
 
             const std::size_t rows = t.rows();
 
@@ -3177,6 +3195,11 @@ class ChunkedDistinctOperator final : public Operator {
     /// `t.columns` as pointers, rebuilt per chunk for the encoder. A member so
     /// the reserve is paid once rather than per chunk.
     std::vector<const ColumnEntry*> key_entries_;
+    /// A validity-aware Key index and the typed/packed stores have incompatible
+    /// identities. Once either kind has recorded a row, later chunks must not
+    /// silently move to the other.
+    bool fast_dedup_seen_ = false;
+    bool generic_dedup_seen_ = false;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
     robin_hood::unordered_flat_set<double> seen_f64_;

@@ -940,6 +940,7 @@ class Parser {
             return std::nullopt;
         }
         std::string right = unescape_string(previous().lexeme);
+        match(TokenKind::Comma);
         if (!consume(TokenKind::RBrace, "expected '}' after the suffix pair")) {
             return std::nullopt;
         }
@@ -2025,6 +2026,7 @@ class Parser {
             if (!val.has_value()) {
                 return std::nullopt;
             }
+            match(TokenKind::Comma);
             if (!consume(TokenKind::RParen, "expected ')' after map binding")) {
                 return std::nullopt;
             }

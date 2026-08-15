@@ -23,6 +23,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -250,5 +251,88 @@ TEST_CASE("chunked distinct dedups across a serial-then-parallel transition",
     auto mismatch = runtime::compare_tables(whole, chunked);
     if (mismatch.has_value()) {
         FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",
+          "[runtime][chunked][aggregate]") {
+    // The Welford/Pébay accumulators live in a per-group SCRATCH region, not in
+    // AggSlotCore, so the parallel accumulate -- which works by giving each
+    // morsel a private slot array and merging -- needs a private scratch to
+    // match. Without one, two morsels accumulate the same group's variance into
+    // the same doubles and the answer is silently wrong.
+    //
+    // Every other test of these aggregates is a handful of rows, which cannot
+    // reach that path: it needs >= 65536 rows per morsel and >= 2 morsels. This
+    // one is sized to cross it, with few enough groups that the merge-to-scan
+    // gate lets it through.
+    constexpr std::size_t kRows = 400000;
+    constexpr std::int64_t kGroups = 4;
+    Column<std::int64_t> key;
+    Column<double> value;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        key.push_back(static_cast<std::int64_t>(i) % kGroups);
+        // Spread and asymmetric, so skew and kurtosis are not trivially zero.
+        const auto x = static_cast<double>(i % 1000);
+        value.push_back((x * x) / 100.0);
+    }
+    runtime::Table table;
+    table.add_column("k", std::move(key));
+    table.add_column("v", std::move(value));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    // TWO queries on purpose. `agg_is_combinable` excludes skew and kurtosis, so
+    // a query containing either declines the parallel accumulate for ALL of its
+    // aggregates -- putting them together would test the serial path twice and
+    // pass against a broken parallel one. Only the first query below reaches the
+    // private-scratch merge; the second covers the wider scratch stride.
+    const std::string parallel_query = "t[select { s = std(v), n = count(v) }, by { k }];";
+    const std::string serial_query = "t[select { sk = skew(v), ku = kurtosis(v) }, by { k }];";
+
+    const auto run_with = [&](const std::string& query, bool parallel) {
+        auto program = parser::parse(query);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    const auto serial = run_with(parallel_query, false);
+    const auto parallel = run_with(parallel_query, true);
+    REQUIRE(serial.rows() == static_cast<std::size_t>(kGroups));
+    REQUIRE(parallel.rows() == serial.rows());
+
+    // Not bit-equality: a parallel reduction sums in a different order, and the
+    // operator's own contract only promises the same answer to within the last
+    // ulps (run-to-run stable, which is the property that matters).
+    for (const char* name : {"s"}) {
+        const auto* a = std::get_if<Column<double>>(serial.find(name));
+        const auto* b = std::get_if<Column<double>>(parallel.find(name));
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            INFO("column " << name << " row " << i);
+            REQUIRE((*a)[i] != 0.0);  // a zero here would pass vacuously
+            REQUIRE(std::abs((*a)[i] - (*b)[i]) <= 1e-9 * std::abs((*a)[i]));
+        }
+    }
+
+    // Skew and kurtosis stay serial, but they use the same scratch region at a
+    // wider stride, so a mis-sized or mis-offset layout shows up here.
+    const auto moments = run_with(serial_query, true);
+    REQUIRE(moments.rows() == static_cast<std::size_t>(kGroups));
+    for (const char* name : {"sk", "ku"}) {
+        const auto* col = std::get_if<Column<double>>(moments.find(name));
+        REQUIRE(col != nullptr);
+        for (std::size_t i = 0; i < col->size(); ++i) {
+            INFO("column " << name << " row " << i);
+            REQUIRE(std::isfinite((*col)[i]));
+            REQUIRE((*col)[i] != 0.0);
+        }
     }
 }

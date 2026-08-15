@@ -508,6 +508,11 @@ inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
 /// discriminant check plus a string move instead of a memcpy, and every slot
 /// costs a constructor and a destructor. Measured on 100k slots: 1.59ms to
 /// build and tear down with a ScalarValue, 0.33ms without.
+/// The moment accumulators (Σ(x-mean)^k) are deliberately NOT here. Only three
+/// of thirteen aggregates need any of them, so they live in the caller's
+/// per-group scratch region rather than taxing every slot of every group: this
+/// struct is allocated once per GROUP, and a group-by can carry millions.
+/// `double_value` still doubles as the running mean while they accumulate.
 struct AggSlotCore {
     ir::AggFunc func = ir::AggFunc::Sum;
     ExprType kind = ExprType::Int;
@@ -521,14 +526,6 @@ struct AggSlotCore {
         std::int64_t int_value = 0;
         double double_value;
     };
-    double m2 = 0.0;  ///< Welford M2 accumulator: Σ(x-mean)². `double_value`
-                      ///< doubles as the running mean for the moment aggs.
-                      ///< The HIGHER moments (Σ(x-mean)³ and ⁴, for skew and
-                      ///< kurtosis) are deliberately NOT here: only two of
-                      ///< ten aggregates need them, so they live in the
-                      ///< caller's per-group scratch region rather than
-                      ///< taxing every slot of every group. See SlotPlan's
-                      ///< `scratch_doubles`.
 };
 
 /// AggSlotCore plus the boxed value First/Last needs for a non-numeric column
@@ -538,12 +535,24 @@ struct AggSlotCore {
 /// that stays EMPTY — and therefore free — for an all-numeric query.
 struct AggSlot : AggSlotCore {
     ScalarValue text_value;
+    /// Welford M2, inline here because the materializing aggregate keeps one
+    /// slot per group in ordinary containers and has no scratch region to put
+    /// it in. The chunked operator, which allocates slots by the million, keeps
+    /// it in scratch instead — that asymmetry is the whole point of the split.
+    double m2 = 0.0;
 };
 
 // The whole point of the split — lock it in so a future field cannot quietly
 // put a constructor back on the per-group hot path.
 static_assert(std::is_trivially_destructible_v<AggSlotCore>);
 static_assert(std::is_trivially_copyable_v<AggSlotCore>);
+// One slot per GROUP, and a group-by can carry millions, so its size is a
+// deliberate number rather than whatever the fields happen to add up to. The
+// three flags pack into the padding ahead of `count`; a fourth 8-byte member
+// would cost 33% more memory traffic across allocation, growth and every
+// accumulate pass. If one is genuinely needed, put it in the caller's per-group
+// scratch — that is what moved Σ(x-mean)^k out of here.
+static_assert(sizeof(AggSlotCore) == 24);
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
 // We need AggSlotCore to be a POD
@@ -554,16 +563,16 @@ static_assert(std::is_trivially_copyable_v<AggSlotCore>);
 // aggregate computes to within floating-point rounding — and for stddev the
 // M2 update is bit-identical (Pébay's term1 reduces to the simple Welford
 // step), so `stddev` results agree exactly across paths.
-inline void agg_update_stddev(AggSlotCore& slot, double x) {
+inline void agg_update_stddev(AggSlotCore& slot, double& m2, double x) {
     slot.count += 1;
     const double delta = x - slot.double_value;
     slot.double_value += delta / static_cast<double>(slot.count);
-    slot.m2 += delta * (x - slot.double_value);
+    m2 += delta * (x - slot.double_value);
 }
 
 // Full m2/m3/m4 update for skewness/kurtosis (Pébay single-value recurrence).
 // Updates m4 and m3 before m2 because they read the pre-update accumulators.
-inline void agg_update_moments(AggSlotCore& slot, double& m3, double& m4, double x) {
+inline void agg_update_moments(AggSlotCore& slot, double& m2, double& m3, double& m4, double x) {
     const auto n1 = static_cast<double>(slot.count);
     slot.count += 1;
     const auto n = static_cast<double>(slot.count);
@@ -572,33 +581,33 @@ inline void agg_update_moments(AggSlotCore& slot, double& m3, double& m4, double
     const double delta_n2 = delta_n * delta_n;
     const double term1 = delta * delta_n * n1;
     slot.double_value += delta_n;
-    m4 += (term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0)) + (6.0 * delta_n2 * slot.m2) -
+    m4 += (term1 * delta_n2 * ((n * n) - (3.0 * n) + 3.0)) + (6.0 * delta_n2 * m2) -
           (4.0 * delta_n * m3);
-    m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * slot.m2);
-    slot.m2 += term1;
+    m3 += (term1 * delta_n * (n - 2.0)) - (3.0 * delta_n * m2);
+    m2 += term1;
 }
 
-inline auto agg_finalize_stddev(const AggSlotCore& slot) -> double {
-    return slot.count < 2 ? 0.0 : std::sqrt(slot.m2 / static_cast<double>(slot.count - 1));
+inline auto agg_finalize_stddev(const AggSlotCore& slot, double m2) -> double {
+    return slot.count < 2 ? 0.0 : std::sqrt(m2 / static_cast<double>(slot.count - 1));
 }
 
-inline auto agg_finalize_skew(const AggSlotCore& slot, double m3) -> double {
-    if (slot.count < 3 || slot.m2 == 0.0) {
+inline auto agg_finalize_skew(const AggSlotCore& slot, double m2, double m3) -> double {
+    if (slot.count < 3 || m2 == 0.0) {
         return 0.0;
     }
     const auto n = static_cast<double>(slot.count);
     // Fisher–Pearson sample skewness (matches pandas/scipy default).
-    return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (m3 / std::pow(slot.m2, 1.5));
+    return (n * std::sqrt(n - 1.0) / (n - 2.0)) * (m3 / std::pow(m2, 1.5));
 }
 
-inline auto agg_finalize_kurtosis(const AggSlotCore& slot, double m4) -> double {
-    if (slot.count < 4 || slot.m2 == 0.0) {
+inline auto agg_finalize_kurtosis(const AggSlotCore& slot, double m2, double m4) -> double {
+    if (slot.count < 4 || m2 == 0.0) {
         return 0.0;
     }
     const auto n = static_cast<double>(slot.count);
     // Unbiased Fisher excess kurtosis (matches pandas/scipy default).
     return (n - 1.0) / ((n - 2.0) * (n - 3.0)) *
-           (((n + 1.0) * n * m4 / (slot.m2 * slot.m2)) - (3.0 * (n - 1.0)));
+           (((n + 1.0) * n * m4 / (m2 * m2)) - (3.0 * (n - 1.0)));
 }
 
 /// Can this aggregate be computed as independent partials and merged?
@@ -649,7 +658,12 @@ inline void copy_active_value(AggSlotCore& dst, const AggSlotCore& src, ExprType
 /// accumulation, so sums and stddev may differ from the serial path in the
 /// last ulps. That is inherent to any parallel float reduction; it is stable
 /// run-to-run, which is the property that matters.
-inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc func, ExprType kind) {
+/// `dst_m2` / `src_m2` are the pair's Welford accumulators, which live outside
+/// the slot. Only the Stddev case reads them, so every other aggregate may pass
+/// null — but a caller that has them should just pass them, since a wrong null
+/// here is a silently zero variance rather than a crash.
+inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc func, ExprType kind,
+                        double* dst_m2 = nullptr, const double* src_m2 = nullptr) {
     switch (func) {
         case ir::AggFunc::Count:
             dst.count += src.count;
@@ -702,7 +716,9 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             if (dst.count == 0) {
                 dst.count = src.count;
                 dst.double_value = src.double_value;
-                dst.m2 = src.m2;
+                if (dst_m2 != nullptr && src_m2 != nullptr) {
+                    *dst_m2 = *src_m2;
+                }
                 dst.has_value = dst.has_value || src.has_value;
                 return;
             }
@@ -711,7 +727,9 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             const double n = na + nb;
             const double delta = src.double_value - dst.double_value;
             dst.double_value += delta * (nb / n);
-            dst.m2 += src.m2 + (delta * delta * (na * nb / n));
+            if (dst_m2 != nullptr && src_m2 != nullptr) {
+                *dst_m2 += *src_m2 + (delta * delta * (na * nb / n));
+            }
             dst.count += src.count;
             dst.has_value = dst.has_value || src.has_value;
             return;

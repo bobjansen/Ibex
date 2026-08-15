@@ -37,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
@@ -4916,6 +4917,88 @@ class ChunkedInnerJoinOperator final : public Operator {
 /// the Categorical dictionary pointer when applicable) and reused when
 /// building output; the chunked csv source shares dictionaries across
 /// chunks, matching MaterializeOperator's existing assumption.
+/// A growable array of trivially-copyable slots that grows through `realloc`.
+///
+/// `std::vector` cannot use `realloc`: it must allocate, copy, and free, and on
+/// this array that copy IS the cost. A group-by discovers its groups a chunk at
+/// a time, so the slot array is resized once per chunk and never shrinks; by
+/// the last chunk the copies dominate. Measured on q18 (3M groups over 6
+/// chunks): `size_group_arrays` cost 79ms, and pre-reserving the final size --
+/// which a real query cannot do, since the group count is what it is about to
+/// find out -- removed 49ms of it. That removed cost is all copying.
+///
+/// At these sizes the block is served by `mmap`, and `realloc` extends it with
+/// `mremap`: page-table work, no bytes moved. The elements it must still touch
+/// are only the NEW ones, which is the irreducible part.
+///
+/// Deliberately minimal: no shrink, no insert, no iterators. It is a slot array
+/// indexed by group id, and every use it has is `resize` / `data` / `[]`.
+template <typename T>
+class SlotArray {
+   public:
+    static_assert(std::is_trivially_copyable_v<T>);
+    static_assert(std::is_trivially_destructible_v<T>);
+
+    SlotArray() = default;
+    SlotArray(const SlotArray&) = delete;
+    auto operator=(const SlotArray&) -> SlotArray& = delete;
+    SlotArray(SlotArray&& other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+    auto operator=(SlotArray&& other) noexcept -> SlotArray& {
+        if (this != &other) {
+            std::free(data_);
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+    ~SlotArray() { std::free(data_); }
+
+    [[nodiscard]] auto size() const noexcept -> std::size_t { return size_; }
+    [[nodiscard]] auto data() noexcept -> T* { return data_; }
+    [[nodiscard]] auto data() const noexcept -> const T* { return data_; }
+    auto operator[](std::size_t i) noexcept -> T& { return data_[i]; }
+    auto operator[](std::size_t i) const noexcept -> const T& { return data_[i]; }
+
+    /// Grow to `n`, value-initializing the new tail. Never shrinks the
+    /// allocation: a group-by only ever adds groups.
+    void resize(std::size_t n) {
+        if (n <= size_) {
+            size_ = n;
+            return;
+        }
+        if (n > capacity_) {
+            // Geometric, so a per-chunk resize does not call realloc once per
+            // chunk on a stream of many small chunks.
+            const std::size_t want = std::max(n, capacity_ + (capacity_ / 2));
+            auto* grown = static_cast<T*>(std::realloc(data_, want * sizeof(T)));
+            if (grown == nullptr) {
+                throw std::bad_alloc();
+            }
+            data_ = grown;
+            capacity_ = want;
+        }
+        const T prototype{};
+        for (std::size_t i = size_; i < n; ++i) {
+            std::memcpy(data_ + i, &prototype, sizeof(T));
+        }
+        size_ = n;
+    }
+
+   private:
+    T* data_ = nullptr;
+    std::size_t size_ = 0;
+    std::size_t capacity_ = 0;
+};
+
 class ChunkedAggregateOperator final : public Operator {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -7411,7 +7494,7 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<ScalarValue> text_store_;
 
     // Flat accumulator storage: n_groups_ × n_aggs_ contiguous AggSlotCores.
-    std::vector<AggSlotCore> flat_slots_;
+    SlotArray<AggSlotCore> flat_slots_;
 
     // Reusable per-chunk gids buffer to avoid repeated heap allocations.
     std::vector<std::uint32_t> gids_buf_;

@@ -9,3 +9,7 @@ prices[
     select { symbol, doubled, },
     order { symbol asc, },
 ];
+
+let lhs = Table { id = [1], value = [10], };
+let rhs = Table { id = [1], value = [20], };
+lhs join rhs on id suffix { "_left", "_right", };

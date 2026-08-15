@@ -75,11 +75,25 @@ let (symbol, price,) = columns(symbol, price,);
 let values = [1, 2,];
 let table = Table { symbol = ["A",], price = [1.0,], };
 table[select { symbol, price, }, order { symbol asc, },];
+let column_names = ["a", "b",];
+let mapped = Table { a = [1], b = [2] }[select {
+    map (i, name,) in column_names => `copy_${name}` = get(name),
+}];
 )";
 
     auto result = parse(source);
     REQUIRE(result.has_value());
-    REQUIRE(result->statements.size() == 6);
+    REQUIRE(result->statements.size() == 8);
+}
+
+TEST_CASE("Parse a trailing comma in join suffixes") {
+    const auto result = parse(R"(
+let lhs = Table { id = [1], value = [10], };
+let rhs = Table { id = [1], value = [20], };
+lhs join rhs on id suffix { "_left", "_right", };
+)");
+
+    REQUIRE(result.has_value());
 }
 
 TEST_CASE("Parse extern declaration with schema types") {

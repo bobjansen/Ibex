@@ -20,6 +20,10 @@ using SourceColumn = std::pair<std::string, std::string>;
 struct JoinEdge {
     SourceColumn left;
     SourceColumn right;
+    /// An inner join preserves the dependency in both directions when the far
+    /// key is unique. A left join does not: unmatched left rows all carry the
+    /// same null right key while their left-side values may differ.
+    bool bidirectional = false;
 };
 
 auto as_key(const ColumnOrigin& origin) -> SourceColumn {
@@ -32,9 +36,10 @@ auto as_key(const ColumnOrigin& origin) -> SourceColumn {
 /// Only Inner and Left joins contribute. On either, a left row maps to at most
 /// one right row when the right key is unique, so the left key determines the
 /// right table's columns — an unmatched left row takes nulls, which is still a
-/// function of the key. Right and Outer are excluded: an unmatched RIGHT row
-/// carries a null left key, so two such rows share a key value while differing
-/// in the right table's columns, and the dependency is broken.
+/// function of the key. The reverse direction is valid only for Inner: a Left
+/// join can produce several unmatched rows with the same null right key and
+/// different left-side values. Right and Outer are excluded for the symmetric
+/// reason.
 void collect_join_edges(const Node& node, const SourceSchemas& sources,
                         std::vector<JoinEdge>& out) {
     if (node.kind() == NodeKind::Join && node.children().size() >= 2 &&
@@ -48,7 +53,8 @@ void collect_join_edges(const Node& node, const SourceSchemas& sources,
                 const auto right_it = right.find(key.right);
                 if (left_it != left.end() && right_it != right.end()) {
                     out.push_back(JoinEdge{.left = as_key(left_it->second),
-                                           .right = as_key(right_it->second)});
+                                           .right = as_key(right_it->second),
+                                           .bidirectional = join.kind() == JoinKind::Inner});
                 }
             }
         }
@@ -122,7 +128,7 @@ auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>&
             if (right_unique && closed.contains(edge.left)) {
                 add_all_of(edge.right.first);
             }
-            if (left_unique && closed.contains(edge.right)) {
+            if (edge.bidirectional && left_unique && closed.contains(edge.right)) {
                 add_all_of(edge.left.first);
             }
         }

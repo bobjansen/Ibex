@@ -162,6 +162,50 @@ TEST_CASE("group key reduction declines across a right join") {
     CHECK(static_cast<const ir::AggregateNode&>(*plan).group_by().size() == 2);
 }
 
+TEST_CASE("group key reduction does not carry a dependency backwards across a left join") {
+    // Although c_custkey is unique, n_nationkey does not determine customer
+    // columns after a left join: every unmatched customer has the same null
+    // n_nationkey while its c_name may differ. Dropping c_name would merge all
+    // those unmatched groups.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+    sources.emplace("nation", source({"n_nationkey", "n_name"}, "n_nationkey"));
+
+    std::vector<ir::JoinKey> keys{
+        ir::JoinKey{std::string{"c_custkey"}, std::string{"n_nationkey"}}};
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{3}, ir::JoinKind::Left, std::move(keys));
+    join->add_child(scan("customer"));
+    join->add_child(scan("nation"));
+
+    auto plan = aggregate({"n_nationkey", "c_name"}, std::move(join));
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    REQUIRE(plan->kind() == ir::NodeKind::Aggregate);
+    CHECK(static_cast<const ir::AggregateNode&>(*plan).group_by().size() == 2);
+}
+
+TEST_CASE("group key reduction carries a dependency forwards across a left join") {
+    // The sound direction remains useful: one left key identifies at most one
+    // unique right row, with unmatched keys consistently producing nulls.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_nationkey", "v"}));
+    sources.emplace("nation", source({"n_nationkey", "n_name"}, "n_nationkey"));
+
+    std::vector<ir::JoinKey> keys{
+        ir::JoinKey{std::string{"c_nationkey"}, std::string{"n_nationkey"}}};
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{3}, ir::JoinKind::Left, std::move(keys));
+    join->add_child(scan("customer"));
+    join->add_child(scan("nation"));
+
+    auto plan = aggregate({"c_nationkey", "n_name"}, std::move(join));
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    CHECK(agg->group_by().front().name == "c_nationkey");
+}
+
 TEST_CASE("group key reduction declines when a key has no traceable origin") {
     ir::SourceSchemas sources;
     sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));

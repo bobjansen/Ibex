@@ -336,3 +336,67 @@ TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",
         }
     }
 }
+
+TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",
+          "[runtime][chunked][aggregate]") {
+    // `build_output_chunk` emits COLUMN-MAJOR, one output column per pool task.
+    // Every column is a separate buffer, so the tasks cannot race -- but a
+    // column that reads the wrong index (its own `ci` against another column's
+    // source array) produces a plausible-looking chunk with the values of a
+    // neighbour. Only a run with enough groups to cross the gate can see it:
+    // the emit stays serial below `parallel_min_rows` groups, and every other
+    // aggregate test has a handful of groups.
+    constexpr std::size_t kRows = 300000;
+    constexpr std::int64_t kGroups = 100000;
+    Column<std::int64_t> k1;
+    Column<std::int64_t> k2;
+    Column<std::int64_t> v;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        const auto g = static_cast<std::int64_t>(i) % kGroups;
+        // Two DIFFERENT key columns: a column that emitted the other key's
+        // values would still look well-formed.
+        k1.push_back(g);
+        k2.push_back(-g - 1);
+        v.push_back(g * 3);
+    }
+    runtime::Table table;
+    table.add_column("k1", std::move(k1));
+    table.add_column("k2", std::move(k2));
+    table.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    const std::string query =
+        "t[select { n = count(v), s = sum(v), lo = min(v), hi = max(v) }, by { k1, k2 }];";
+
+    const auto run_with = [&](bool parallel) {
+        auto program = parser::parse(query);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    const auto serial = run_with(false);
+    const auto parallel = run_with(true);
+    REQUIRE(serial.rows() == static_cast<std::size_t>(kGroups));
+    REQUIRE(parallel.rows() == serial.rows());
+
+    // Integer aggregates, so this is exact equality -- and row-for-row, because
+    // the emit order is the group order whichever worker gets the column.
+    for (const char* name : {"k1", "k2", "n", "s", "lo", "hi"}) {
+        const auto* a = std::get_if<Column<std::int64_t>>(serial.find(name));
+        const auto* b = std::get_if<Column<std::int64_t>>(parallel.find(name));
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        REQUIRE(a->size() == static_cast<std::size_t>(kGroups));
+        for (std::size_t i = 0; i < a->size(); ++i) {
+            INFO("column " << name << " row " << i);
+            REQUIRE((*a)[i] == (*b)[i]);
+        }
+    }
+}

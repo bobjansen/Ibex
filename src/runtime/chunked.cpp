@@ -5326,7 +5326,8 @@ class ChunkedAggregateOperator final : public Operator {
                     int_fast_path_ = true;
                     int_key_kind_ = *kind;
                 }
-            } else if (group_entries.size() == 2 && !group_entries[0]->validity.has_value() &&
+            } else if (!cat_fast_path_ && group_entries.size() == 2 &&
+                       !group_entries[0]->validity.has_value() &&
                        !group_entries[1]->validity.has_value()) {
                 // A Categorical joins the pair path as its code. `cat_fast_path_`
                 // already owns the all-Categorical case and is dispatched first,

@@ -1128,6 +1128,34 @@ TEST_CASE("Interpret group-by on Categorical and Date rebuilds when a later chun
     CHECK((*sum)[3] == 20);
 }
 
+TEST_CASE("Interpret grouped aggregate rejects a null key introduced by a later chunk") {
+    // Parquet omits the bitmap for an all-valid row group. The first chunk
+    // therefore selects the integer fast path; the null in chunk two still
+    // stores a raw zero, which used to be grouped with the genuine zero from
+    // chunk one. Fast-path state has no boxed keys with which to migrate into
+    // the generic nullable index, so it must reject the transition rather than
+    // return that corrupted aggregate.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_key", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("k", {0, 1}));
+        auto later = make_int_chunk("k", {0, 1});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_key() -> DataFrame from \"x.hpp\"; "
+        "late_null_key()[select { n = count() }, by { k }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() ==
+          "ChunkedAggregateOperator: group-by key column gained nulls across chunks");
+}
+
 // Dates far enough apart that the cell product blows the dense budget must fall
 // back to the hash path and still group correctly.
 TEST_CASE("Interpret group-by on Categorical and Date falls back when the key domain is huge") {

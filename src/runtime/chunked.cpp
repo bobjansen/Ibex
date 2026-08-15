@@ -6000,6 +6000,15 @@ class ChunkedAggregateOperator final : public Operator {
         // this is a P-way merge. Groups carried over from earlier chunks keep
         // their ids: a group first seen in a later chunk necessarily has a later
         // first row, so appending after them preserves the global order.
+        //
+        // Rescanning every partition per group is O(groups x partitions), and
+        // replacing it with the textbook heap (replace-top, one sift per group,
+        // O(groups log partitions)) is a MEASURED DEAD END: q18's merge went
+        // 25.6ms -> 27.1ms and q20's 7.9ms -> 13.1ms, suite +0.15% over 12
+        // interleaved rounds. P is `part_count`, a power of two capped by the
+        // worker count -- 8 here. Eight predictable compares over an array that
+        // never leaves L1 beat three sift levels of data-dependent branching and
+        // struct moves. A heap would need dozens of runs before it paid.
         const std::size_t base = n_groups_;
         {
             std::vector<std::size_t> cursors(part_count);

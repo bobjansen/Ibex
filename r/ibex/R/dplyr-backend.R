@@ -105,12 +105,15 @@ ibex_assert_live <- function(x) {
 
 new_ibex_tbl <- function(session, source, schema, generation, steps = list(), groups = character(),
                          ordering = NULL, captured_scalars = list(), fallback_policy = "warn",
-                         display_name = NULL, source_frame = NULL) {
+                         display_name = NULL, source_frame = NULL, time_index = NULL,
+                         pending_window = NULL) {
     structure(
         list(
             session = session,
             source = source,
             source_frame = source_frame,
+            time_index = time_index,
+            pending_window = pending_window,
             schema = schema,
             steps = steps,
             groups = groups,
@@ -232,7 +235,8 @@ ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
         # Held only while the plan can still use it; `ibex_append_step()` drops
         # it at the first step that makes reuse impossible. See
         # `ibex_reusable_source_columns()`.
-        source_frame = if (inherits(x, "data.frame")) x else NULL
+        source_frame = if (inherits(x, "data.frame")) x else NULL,
+        time_index = if (length(info$time_index)) info$time_index[[1]] else NULL
     )
 }
 
@@ -327,8 +331,16 @@ ibex_render_fields <- function(fields) {
     }, character(1)), collapse = ", ")
 }
 
+ibex_render_window <- function(window) {
+    paste0("window ", window$duration, if (isTRUE(window$aligned)) " aligned" else "")
+}
+
 ibex_render_plan <- function(x, redact = FALSE) {
     ibex_assert_live(x)
+    if (!is.null(x$pending_window)) {
+        rlang::abort("window() must be followed by mutate() or summarise() before execution.",
+                     class = "ibex_unsupported")
+    }
     code <- x$source
     for (step in x$steps) {
         code <- switch(
@@ -339,12 +351,21 @@ ibex_render_plan <- function(x, redact = FALSE) {
                 paste0(ibex_quote_identifier(mapping$new), " = ", ibex_quote_identifier(mapping$old))
             }, character(1)), collapse = ", "), " }]"),
             update = paste0(
-                code, "[update { ", ibex_render_fields(step$fields), " }",
+                code, "[", if (!is.null(step$window)) paste0(ibex_render_window(step$window), ", ") else "",
+                "update { ", ibex_render_fields(step$fields), " }",
                 if (length(step$groups)) paste0(", by { ", paste(vapply(step$groups, ibex_quote_identifier, character(1)), collapse = ", "), " }") else "",
                 "]"
             ),
             aggregate = paste0(
-                code, "[select { ", ibex_render_fields(step$fields), " }",
+                code, "[", if (!is.null(step$window)) paste0(ibex_render_window(step$window), ", ") else "",
+                "select { ", ibex_render_fields(step$fields), " }",
+                if (length(step$groups)) paste0(", by { ", paste(vapply(step$groups, ibex_quote_identifier, character(1)), collapse = ", "), " }") else "",
+                "]"
+            ),
+            timeframe = paste0("as_timeframe(", code, ", ", ibex_quote_string(step$index), ")"),
+            resample = paste0(
+                code, "[resample ", step$duration, if (isTRUE(step$aligned)) " aligned" else "",
+                ", select { ", ibex_render_fields(step$fields), " }",
                 if (length(step$groups)) paste0(", by { ", paste(vapply(step$groups, ibex_quote_identifier, character(1)), collapse = ", "), " }") else "",
                 "]"
             ),
@@ -556,6 +577,7 @@ compute.ibex_tbl <- function(x, name = NULL, temporary = TRUE, ...) {
         generation = info$generation,
         groups = x$groups,
         ordering = x$ordering,
+        time_index = if (length(info$time_index)) info$time_index[[1]] else NULL,
         fallback_policy = x$fallback_policy,
         display_name = name %||% binding
     )
@@ -644,9 +666,15 @@ ibex_call_identity <- function(head, env) {
         dense_rank = dplyr::dense_rank, row_number = dplyr::row_number,
         cume_dist = dplyr::cume_dist, as.Date = base::as.Date
     )
+    rolling <- c("rolling_sum", "rolling_mean", "rolling_min", "rolling_max",
+                 "rolling_count", "rolling_median", "rolling_std", "rolling_ewma",
+                 "rolling_quantile", "rolling_skew", "rolling_kurtosis", "rolling_first",
+                 "rolling_last", "window_start", "window_end")
+    for (rolling_name in rolling) known[[rolling_name]] <- get(rolling_name, envir = asNamespace("ibex"))
     if (!name %in% names(known)) return(NULL)
     resolved <- tryCatch(rlang::eval_bare(head, env), error = function(e) NULL)
     if (!identical(resolved, known[[name]])) return(NULL)
+    if (name %in% rolling) return(paste0("ibex::", name))
     paste0(if (name %in% c("coalesce", "between", "first", "last", "n")) "dplyr" else "base", "::", name)
 }
 
@@ -733,6 +761,36 @@ ibex_translate_expr <- function(expr, quo_env, x, context, state, inside_aggrega
         if (length(args)) ibex_unsupported("`n()` takes no arguments.", expr)
         return(ibex_expr_result("count()", "Int64", FALSE, TRUE))
     }
+    if (startsWith(identity, "ibex::")) {
+        fn <- sub(".*::", "", identity)
+        if (fn %in% c("rolling_count", "window_start", "window_end")) {
+            if (length(args) || any(nzchar(arg_names))) ibex_unsupported(paste0("`", fn, "()` takes no arguments."), expr)
+        } else if (fn %in% c("rolling_ewma", "rolling_quantile")) {
+            if (length(args) != 2L || any(nzchar(arg_names))) ibex_unsupported(paste0("`", fn, "()` requires a column and a numeric parameter."), expr)
+        } else if (!length(args) %in% c(1L, 2L) || any(nzchar(arg_names))) {
+            ibex_unsupported(paste0("`", fn, "()` requires a column and an optional count window."), expr)
+        }
+        translated <- lapply(args, function(arg) ibex_translate_expr(arg, quo_env, x, context, state, inside_aggregate))
+        # Ibex deliberately requires the rolling count, EWMA alpha, and
+        # quantile probability to be source literals. Keep those literals in
+        # the emitted Ibex rather than turning them into scalar bindings.
+        literal_pos <- if (fn %in% c("rolling_ewma", "rolling_quantile")) 2L else if (length(args) == 2L) 2L else NULL
+        if (!is.null(literal_pos)) {
+            literal <- args[[literal_pos]]
+            if (!is.atomic(literal) || length(literal) != 1L || !is.numeric(literal) || is.na(literal) || !is.finite(literal)) {
+                ibex_unsupported(paste0("`", fn, "()` requires a finite numeric literal for its final argument."), expr)
+            }
+            translated[[literal_pos]] <- ibex_expr_result(
+                format(literal, scientific = FALSE, trim = TRUE),
+                if (is.integer(literal)) "Int64" else "Float64", FALSE
+            )
+        }
+        codes <- vapply(translated, `[[`, character(1), "code")
+        nullable <- any(vapply(translated, `[[`, logical(1), "nullable"))
+        refs <- unlist(lapply(translated, `[[`, "refs"), use.names = FALSE)
+        type <- if (fn %in% c("rolling_mean", "rolling_median", "rolling_std", "rolling_ewma", "rolling_quantile", "rolling_skew", "rolling_kurtosis")) "Float64" else if (fn == "rolling_count") "Int64" else if (fn %in% c("window_start", "window_end")) "Timestamp" else if (length(translated)) translated[[1]]$type else "Unknown"
+        return(ibex_expr_result(paste0(fn, "(", paste(codes, collapse = ", "), ")"), type, nullable, FALSE, refs))
+    }
     if (identity %in% c("dplyr::min_rank", "dplyr::dense_rank", "dplyr::row_number", "dplyr::cume_dist")) {
         if (length(args) != 1L || any(nzchar(arg_names))) {
             ibex_unsupported("Native rank helpers require exactly one column.", expr)
@@ -816,6 +874,73 @@ ibex_state <- function(x) {
     state
 }
 
+ibex_duration <- function(duration, call = rlang::caller_env()) {
+    if (!is.character(duration) || length(duration) != 1L || is.na(duration) ||
+        !grepl("^[1-9][0-9]*(ns|us|ms|s|m|h|d|w)$", duration)) {
+        rlang::abort("`duration` must be one Ibex duration such as \"5m\" or \"250ms\".", call = call)
+    }
+    duration
+}
+
+ibex_require_timeframe <- function(x, verb) {
+    if (is.null(x$time_index)) {
+        ibex_unsupported(paste0(verb, "() requires as_timeframe() first."))
+    }
+}
+
+#' Mark an Ibex lazy table as time-indexed
+#'
+#' @param .data An [ibex_tbl()].
+#' @param index A Timestamp, Date, or integer-nanosecond column.
+#' @export
+as_timeframe <- function(.data, index) UseMethod("as_timeframe")
+
+#' @export
+as_timeframe.ibex_tbl <- function(.data, index) {
+    ibex_assert_live(.data)
+    index_quo <- rlang::enquo(index)
+    positions <- tidyselect::eval_select(index_quo, data = ibex_schema_proxy(.data))
+    if (length(positions) != 1L || !identical(names(positions), .data$schema$names[unname(positions)])) {
+        rlang::abort("`index` must select exactly one existing column.")
+    }
+    name <- .data$schema$names[[unname(positions)[[1]]]]
+    type <- .data$schema$types[[match(name, .data$schema$names)]]
+    if (!type %in% c("Timestamp", "Date", "Int64")) {
+        rlang::abort("The TimeFrame index must be a Timestamp, Date, or Int64 column.")
+    }
+    if (.data$schema$nullable[[match(name, .data$schema$names)]]) {
+        rlang::abort("The TimeFrame index must not contain missing values.")
+    }
+    schema <- .data$schema
+    out <- ibex_append_step(
+        .data, list(kind = "timeframe", index = name), schema = schema,
+        ordering = data.frame(name = name, descending = FALSE)
+    )
+    out$time_index <- name
+    out
+}
+
+#' Set the time window used by the next mutate or summarise
+#'
+#' @param x A TimeFrame created with [as_timeframe()].
+#' @param duration An Ibex duration string such as `"5m"`.
+#' @param aligned Reset windows on epoch-aligned duration boundaries.
+#' @export
+window <- function(x, ...) UseMethod("window")
+
+#' @export
+window.ibex_tbl <- function(x, duration, aligned = FALSE, ...) {
+    ibex_assert_live(x)
+    if (length(list(...))) rlang::abort("window() has no arguments beyond `duration` and `aligned`.")
+    ibex_require_timeframe(x, "window")
+    if (!is.null(x$pending_window)) rlang::abort("A window is already pending; follow it with mutate() or summarise().")
+    if (!is.logical(aligned) || length(aligned) != 1L || is.na(aligned)) rlang::abort("`aligned` must be TRUE or FALSE.")
+    x$pending_window <- list(duration = ibex_duration(duration), aligned = aligned)
+    x
+}
+
+ibex_take_window <- function(x) x$pending_window
+
 ibex_select_positions <- function(x, quos, strict = TRUE) {
     tidyselect::eval_select(rlang::expr(c(!!!quos)), data = ibex_schema_proxy(x), strict = strict)
 }
@@ -874,8 +999,13 @@ select.ibex_tbl <- function(.data, ...) {
     } else {
         NULL
     }
-    ibex_append_step(.data, list(kind = "project", fields = fields), schema = schema,
-                     groups = groups, ordering = ordering)
+    out <- ibex_append_step(.data, list(kind = "project", fields = fields), schema = schema,
+                            groups = groups, ordering = ordering)
+    if (!is.null(.data$time_index)) {
+        index_output <- output_name(.data$time_index)
+        out$time_index <- if (.data$time_index %in% inputs) index_output else NULL
+    }
+    out
 }
 
 rename.ibex_tbl <- function(.data, ...) {
@@ -896,7 +1026,9 @@ rename.ibex_tbl <- function(.data, ...) {
     groups <- rename_one(.data$groups)
     ordering <- .data$ordering
     if (!is.null(ordering)) ordering$name <- rename_one(ordering$name)
-    ibex_append_step(.data, list(kind = "rename", mappings = mappings), schema, groups, ordering)
+    out <- ibex_append_step(.data, list(kind = "rename", mappings = mappings), schema, groups, ordering)
+    if (!is.null(.data$time_index)) out$time_index <- rename_one(.data$time_index)[[1]]
+    out
 }
 
 relocate.ibex_tbl <- function(.data, ..., .before = NULL, .after = NULL) {
@@ -982,8 +1114,9 @@ ibex_mutate_impl <- function(.data, dots, keep = "all", before = NULL, after = N
             }
             ordering <- out$ordering
             if (!is.null(ordering) && name %in% ordering$name) ordering <- NULL
-            out <- ibex_append_step(out, list(kind = "update", fields = list(list(name = name, code = translated$code)), groups = step_groups), schema, ordering = ordering, scalars = state$scalars)
+            out <- ibex_append_step(out, list(kind = "update", fields = list(list(name = name, code = translated$code)), groups = step_groups, window = ibex_take_window(out)), schema, ordering = ordering, scalars = state$scalars)
         }
+        out$pending_window <- NULL
         # Grouping supplied per-call does not outlive the call.
         if (!is.null(by)) out$groups <- character()
         out
@@ -1082,8 +1215,67 @@ summarise.ibex_tbl <- function(.data, ..., .by = NULL, .groups = NULL) {
             rows = NA_real_
         )
         groups <- switch(groups_mode, drop = character(), drop_last = head(keys, -1L), keep = keys)
-        ibex_append_step(.data, list(kind = "aggregate", fields = fields, groups = keys), schema, groups, NULL, state$scalars)
+        out <- ibex_append_step(.data, list(kind = "aggregate", fields = fields, groups = keys,
+                                             window = ibex_take_window(.data)), schema, groups, NULL, state$scalars)
+        out$pending_window <- NULL
+        out
     }, replay)
+}
+
+#' Aggregate a TimeFrame into fixed time bars
+#'
+#' @param .data A TimeFrame created with [as_timeframe()].
+#' @param duration An Ibex duration string such as `"1m"`.
+#' @param ... Named aggregate expressions, for example `close = last(price)`.
+#' @param .by Optional grouping columns for separate bars per group.
+#' @param aligned Accepted for symmetry with [window()]; resample buckets are
+#'   always epoch-aligned.
+#' @export
+resample <- function(.data, ...) UseMethod("resample")
+
+#' @export
+resample.ibex_tbl <- function(.data, duration, ..., .by = NULL, aligned = FALSE) {
+    dots <- rlang::enquos(...)
+    by <- rlang::enquo(.by)
+    ibex_with_fallback(.data, "resample", function() {
+        ibex_require_timeframe(.data, "resample")
+        if (!is.logical(aligned) || length(aligned) != 1L || is.na(aligned)) rlang::abort("`aligned` must be TRUE or FALSE.")
+        keys <- ibex_resolve_by(.data, by) %||% .data$groups
+        state <- ibex_state(.data)
+        translated <- Map(function(quo, name) {
+            if (!nzchar(name)) ibex_unsupported("Every resample expression must be named.", rlang::quo_get_expr(quo))
+            value <- ibex_translate_quosure(quo, .data, "aggregate", state)
+            if (!value$aggregate) ibex_unsupported("resample() expressions must contain an aggregate.", rlang::quo_get_expr(quo))
+            if (!all(value$refs %in% keys)) ibex_unsupported("resample() references non-group columns outside aggregate calls.", rlang::quo_get_expr(quo))
+            list(name = name, code = value$code, type = value$type)
+        }, dots, names(dots))
+        index_pos <- match(.data$time_index, .data$schema$names)
+        group_pos <- match(keys, .data$schema$names)
+        # The runtime always retains the index as the bar label, even when it
+        # was not named in select; include it in the frontend schema too.
+        output_keys <- setdiff(keys, .data$time_index)
+        output_key_pos <- match(output_keys, .data$schema$names)
+        fields <- c(
+            lapply(output_keys, function(name) list(name = name, code = ibex_quote_identifier(name))),
+            translated
+        )
+        schema <- list(
+            names = c(.data$time_index, output_keys, names(dots)),
+            types = c(.data$schema$types[[index_pos]], .data$schema$types[output_key_pos], vapply(translated, `[[`, character(1), "type")),
+            categorical = c(.data$schema$categorical[[index_pos]], .data$schema$categorical[output_key_pos], rep(FALSE, length(translated))),
+            timezone = c(.data$schema$timezone[[index_pos]], .data$schema$timezone[output_key_pos], rep(NA_character_, length(translated))),
+            rows = NA_real_
+        )
+        out <- ibex_append_step(.data, list(kind = "resample", duration = ibex_duration(duration),
+                                             aligned = aligned, fields = fields, groups = keys), schema,
+                                groups = character(),
+                                ordering = data.frame(name = .data$time_index, descending = FALSE),
+                                scalars = state$scalars)
+        out$pending_window <- NULL
+        out
+    }, function(local) {
+        ibex_unsupported("resample() cannot be replayed with local dplyr; use fallback = \"error\".")
+    })
 }
 
 arrange.ibex_tbl <- function(.data, ..., .by_group = FALSE) {

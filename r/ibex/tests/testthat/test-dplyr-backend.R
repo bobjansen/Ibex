@@ -26,6 +26,44 @@ test_that("ibex_tbl identity is lazy, repeatable, and schema-aware", {
     expect_length(attr(schema, "grouped_by"), 0L)
 })
 
+test_that("TimeFrame windows render lazily and execute rolling expressions", {
+    ticks <- tibble::tibble(
+        ts = as.POSIXct(c(0, 60, 120), origin = "1970-01-01", tz = "UTC"),
+        price = c(10, 20, 30)
+    )
+    query <- ibex_tbl(ticks, fallback = "error") |>
+        as_timeframe(ts) |>
+        window("2m") |>
+        dplyr::mutate(avg = rolling_mean(price), n = rolling_count())
+
+    expect_s3_class(query, "ibex_tbl")
+    rendered <- ibex_render_plan(query)
+    expect_match(rendered, "as_timeframe\\(")
+    expect_match(rendered, "window 2m, update")
+    result <- dplyr::collect(query)
+    expect_equal(result$avg, c(10, 15, 25))
+    expect_equal(result$n, c(1, 2, 2))
+})
+
+test_that("resample creates lazy time bars, optionally partitioned", {
+    ticks <- tibble::tibble(
+        ts = as.POSIXct(c(0, 30, 60, 90), origin = "1970-01-01", tz = "UTC"),
+        symbol = c("A", "A", "B", "B"),
+        price = c(10, 20, 30, 40)
+    )
+    query <- ibex_tbl(ticks, fallback = "error") |>
+        as_timeframe(ts) |>
+        resample("1m", close = dplyr::last(price), n = dplyr::n(), .by = symbol)
+
+    expect_s3_class(query, "ibex_tbl")
+    expect_match(ibex_render_plan(query), "resample 1m, select")
+    result <- dplyr::collect(query)
+    expect_equal(result$symbol, c("A", "B"))
+    expect_equal(result$close, c(20, 40))
+    expect_equal(result$n, c(2, 2))
+    expect_equal(as.numeric(result$ts), c(0, 60))
+})
+
 test_that("R factors bind as categorical columns", {
     input <- tibble::tibble(
         symbol = factor(c("A", NA, "B", "A"), levels = c("B", "A")),

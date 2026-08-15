@@ -611,6 +611,61 @@ TEST_CASE("join: semi join preserves left row order when left side is smaller", 
     CHECK(col_i64(out, "lval") == std::vector<std::int64_t>{20, 10, 21});
 }
 
+// The streaming semi/anti operator evaluates its predicate across the worker
+// pool once a chunk is large enough, and stitches the per-range index lists back
+// together. Every smaller case above stays under that gate, so this is the only
+// one that reaches the threaded path -- and what it is really checking is that
+// the stitched result is still the left's own row ORDER, not just its row count.
+TEST_CASE("join: semi and anti keep left order across a threaded predicate", "[join]") {
+    constexpr std::int64_t kRows = 300000;  // over the operator's fan-out gate
+    Column<std::int64_t> ids;
+    Column<std::int64_t> lvals;
+    ids.reserve(kRows);
+    lvals.reserve(kRows);
+    for (std::int64_t i = 0; i < kRows; ++i) {
+        // Descending, so a result in ascending key order would be visibly wrong
+        // rather than accidentally right.
+        ids.push_back(kRows - 1 - i);
+        lvals.push_back((kRows - 1 - i) * 10);
+    }
+    Column<std::int64_t> rids;
+    for (std::int64_t i = 0; i < kRows; i += 3) {
+        rids.push_back(i);
+    }
+
+    runtime::Table lhs;
+    lhs.add_column("id", std::move(ids));
+    lhs.add_column("lval", std::move(lvals));
+    runtime::Table rhs;
+    rhs.add_column("id", std::move(rids));
+
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    std::vector<std::int64_t> want_semi;
+    std::vector<std::int64_t> want_anti;
+    for (std::int64_t i = 0; i < kRows; ++i) {
+        const std::int64_t id = kRows - 1 - i;
+        (id % 3 == 0 ? want_semi : want_anti).push_back(id);
+    }
+
+    auto semi = interpret_expr("lhs semi join rhs on id;", tables);
+    CHECK(col_i64(semi, "id") == want_semi);
+    CHECK(semi.rows() == want_semi.size());
+
+    auto anti = interpret_expr("lhs anti join rhs on id;", tables);
+    CHECK(col_i64(anti, "id") == want_anti);
+    CHECK(anti.rows() == want_anti.size());
+
+    // The payload column must be carried through the same stitching as the key.
+    const auto lval = col_i64(semi, "lval");
+    REQUIRE(lval.size() == want_semi.size());
+    for (std::size_t i = 0; i < lval.size(); ++i) {
+        REQUIRE(lval[i] == want_semi[i] * 10);
+    }
+}
+
 TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});

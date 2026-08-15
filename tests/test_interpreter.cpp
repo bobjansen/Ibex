@@ -1070,6 +1070,53 @@ auto make_cat_date_chunk(const std::shared_ptr<std::vector<std::string>>& dictio
     return chunk;
 }
 
+/// A chunk with one Categorical column, sharing `dictionary` with any other
+/// chunk built from the same pointer -- required for a code to mean the same
+/// thing across chunks.
+auto make_cat_chunk(const std::string& name,
+                    const std::shared_ptr<std::vector<std::string>>& dictionary,
+                    std::vector<Column<Categorical>::code_type> codes) -> runtime::Chunk {
+    runtime::Chunk chunk;
+    runtime::ColumnEntry entry;
+    entry.name = name;
+    entry.column = std::make_shared<runtime::ColumnValue>(
+        Column<Categorical>{dictionary, std::make_shared<Column<Categorical>::index_map>()});
+    auto& col = std::get<Column<Categorical>>(*entry.column);
+    for (auto code : codes) {
+        col.push_code(code);
+    }
+    chunk.columns.push_back(std::move(entry));
+    return chunk;
+}
+
+/// Append a second Categorical column `name` (own dictionary) onto `chunk`.
+void add_cat_column(runtime::Chunk& chunk, const std::string& name,
+                    const std::shared_ptr<std::vector<std::string>>& dictionary,
+                    std::vector<Column<Categorical>::code_type> codes) {
+    runtime::ColumnEntry entry;
+    entry.name = name;
+    entry.column = std::make_shared<runtime::ColumnValue>(
+        Column<Categorical>{dictionary, std::make_shared<Column<Categorical>::index_map>()});
+    auto& col = std::get<Column<Categorical>>(*entry.column);
+    for (auto code : codes) {
+        col.push_code(code);
+    }
+    chunk.columns.push_back(std::move(entry));
+}
+
+/// Append a second int64 column `name` onto `chunk`.
+void add_int_column(runtime::Chunk& chunk, const std::string& name,
+                    std::vector<std::int64_t> values) {
+    runtime::ColumnEntry entry;
+    entry.name = name;
+    entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+    auto& col = std::get<Column<std::int64_t>>(*entry.column);
+    for (auto v : values) {
+        col.push_back(v);
+    }
+    chunk.columns.push_back(std::move(entry));
+}
+
 }  // namespace
 
 // A Categorical key and a Date key both fit in 32 bits, so the pair groups
@@ -1165,13 +1212,14 @@ TEST_CASE("Interpret group-by on Categorical and Date rebuilds when a later chun
     CHECK((*sum)[3] == 20);
 }
 
-TEST_CASE("Interpret grouped aggregate rejects a null key introduced by a later chunk") {
+TEST_CASE("Interpret grouped aggregate migrates a null key introduced by a later chunk") {
     // Parquet omits the bitmap for an all-valid row group. The first chunk
-    // therefore selects the integer fast path; the null in chunk two still
-    // stores a raw zero, which used to be grouped with the genuine zero from
-    // chunk one. Fast-path state has no boxed keys with which to migrate into
-    // the generic nullable index, so it must reject the transition rather than
-    // return that corrupted aggregate.
+    // therefore selects the integer fast path; a null arriving in chunk two
+    // cannot be expressed in that fast-path state (it stores raw values only),
+    // so it must be migrated into the generic nullable index rather than
+    // either erroring out or silently merging the null into the genuine `0`
+    // group. The two `k=0`/`k=1` groups the fast path already accumulated
+    // carry over unchanged -- only the key->gid lookup is rebuilt.
     runtime::TableRegistry registry;
     runtime::ExternRegistry externs;
     externs.register_chunked_table("late_null_key", [&](const runtime::ExternArgs&) {
@@ -1188,9 +1236,207 @@ TEST_CASE("Interpret grouped aggregate rejects a null key introduced by a later 
         "extern fn late_null_key() -> DataFrame from \"x.hpp\"; "
         "late_null_key()[select { n = count() }, by { k }];");
     auto result = runtime::interpret(*ir, registry, nullptr, &externs);
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error() ==
-          "ChunkedAggregateOperator: group-by key column gained nulls across chunks");
+    REQUIRE(result.has_value());
+
+    const auto* k = std::get_if<Column<std::int64_t>>(result->find("k"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(k != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(k->size() == 3);
+
+    // First-seen order: k=0 (chunk 1), k=1 (chunk 1, then +1 from chunk 2's
+    // valid row), then the null key chunk 2 introduces.
+    CHECK((*k)[0] == 0);
+    CHECK((*n)[0] == 1);
+    CHECK((*k)[1] == 1);
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("k"), 2));
+    CHECK((*n)[2] == 1);
+}
+
+TEST_CASE(
+    "Interpret single-key categorical aggregate migrates a null key introduced by a later chunk") {
+    // Chunk one selects the single-Categorical dense-array fast path
+    // (`cat_order_`/`cat_dense_gid_`, code == dictionary index). A code only
+    // means something against its own dictionary, so migration must decode
+    // through the dictionary the fast path already shares -- not the code
+    // itself -- when it seeds the generic index.
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"AAA", "BBB"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_cat_key", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_cat_chunk("k", dict, {0, 1}));
+        auto later = make_cat_chunk("k", dict, {0, 1});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_cat_key() -> DataFrame from \"x.hpp\"; "
+        "late_null_cat_key()[select { n = count() }, by { k }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* k = std::get_if<Column<Categorical>>(result->find("k"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(k != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(k->size() == 3);
+    CHECK((*k)[0] == "AAA");
+    CHECK((*n)[0] == 1);
+    CHECK((*k)[1] == "BBB");
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("k"), 2));
+    CHECK((*n)[2] == 1);
+}
+
+TEST_CASE(
+    "Interpret multi-key categorical aggregate migrates a null key introduced by a later chunk") {
+    // Two Categorical keys select the multi-key cell-encoded fast path
+    // (`multi_cat_codes_flat_`). Migration decodes EACH column through its own
+    // `group_templates_` entry -- mixing them up would silently swap which
+    // dictionary a code resolves against.
+    auto dict = std::make_shared<std::vector<std::string>>(std::vector<std::string>{"AAA", "BBB"});
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_cat_pair", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_cat_chunk("a", dict, {0, 1});
+        add_cat_column(first, "b", dict, {0, 1});
+        chunks.push_back(std::move(first));
+        auto later = make_cat_chunk("a", dict, {0, 1});
+        add_cat_column(later, "b", dict, {0, 1});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_cat_pair() -> DataFrame from \"x.hpp\"; "
+        "late_null_cat_pair()[select { n = count() }, by { a, b }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* a = std::get_if<Column<Categorical>>(result->find("a"));
+    const auto* b = std::get_if<Column<Categorical>>(result->find("b"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(n != nullptr);
+    for (std::size_t i = 0; i < a->size(); ++i) {
+        INFO("row " << i
+                    << ": a=" << (runtime::is_null(*result->find_entry("a"), i) ? "NULL" : (*a)[i])
+                    << " b=" << (runtime::is_null(*result->find_entry("b"), i) ? "NULL" : (*b)[i])
+                    << " n=" << (*n)[i]);
+        CHECK(true);
+    }
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == "AAA");
+    CHECK((*b)[0] == "AAA");
+    CHECK((*n)[0] == 1);
+    CHECK((*a)[1] == "BBB");
+    CHECK((*b)[1] == "BBB");
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+    CHECK((*b)[2] == "AAA");
+    CHECK((*n)[2] == 1);
+}
+
+TEST_CASE("Interpret paired-int aggregate migrates a null key introduced by a later chunk") {
+    // Two int64 keys select the paired-int fast path (`pair_order_`). Row 1 of
+    // chunk two repeats an existing group; row 0 introduces a null on `a`.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_pair", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_int_chunk("a", {10, 20});
+        add_int_column(first, "b", {1, 2});
+        chunks.push_back(std::move(first));
+        auto later = make_int_chunk("a", {10, 20});
+        add_int_column(later, "b", {1, 2});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_pair() -> DataFrame from \"x.hpp\"; "
+        "late_null_pair()[select { n = count() }, by { a, b }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* b = std::get_if<Column<std::int64_t>>(result->find("b"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == 10);
+    CHECK((*b)[0] == 1);
+    CHECK((*n)[0] == 1);
+    CHECK((*a)[1] == 20);
+    CHECK((*b)[1] == 2);
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+    CHECK((*b)[2] == 1);
+    CHECK((*n)[2] == 1);
+}
+
+TEST_CASE("Interpret packed-key aggregate migrates a null key introduced by a later chunk") {
+    // Three int64 keys select the packed fast path (`PackedGroups`). Its
+    // `group_order_` is already a boxed `Key` per group (built from the row,
+    // like the generic path), so migration should need no decode at all --
+    // only `key_index_`'s packed-word lookup gets rebuilt.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_packed", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_int_chunk("a", {1, 2});
+        add_int_column(first, "b", {10, 20});
+        add_int_column(first, "c", {100, 200});
+        chunks.push_back(std::move(first));
+        auto later = make_int_chunk("a", {1, 2});
+        add_int_column(later, "b", {10, 20});
+        add_int_column(later, "c", {100, 200});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_packed() -> DataFrame from \"x.hpp\"; "
+        "late_null_packed()[select { n = count() }, by { a, b, c }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    const auto* b = std::get_if<Column<std::int64_t>>(result->find("b"));
+    const auto* c = std::get_if<Column<std::int64_t>>(result->find("c"));
+    const auto* n = std::get_if<Column<std::int64_t>>(result->find("n"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(c != nullptr);
+    REQUIRE(n != nullptr);
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == 1);
+    CHECK((*b)[0] == 10);
+    CHECK((*c)[0] == 100);
+    CHECK((*n)[0] == 1);
+    CHECK((*a)[1] == 2);
+    CHECK((*b)[1] == 20);
+    CHECK((*c)[1] == 200);
+    CHECK((*n)[1] == 2);
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+    CHECK((*b)[2] == 10);
+    CHECK((*c)[2] == 100);
+    CHECK((*n)[2] == 1);
 }
 
 // Dates far enough apart that the cell product blows the dense budget must fall
@@ -1454,45 +1700,72 @@ TEST_CASE("Interpret distinct over chunked extern source keeps first occurrence 
     REQUIRE((*score)[4] == 5);
 }
 
-TEST_CASE("Interpret distinct rejects a null key introduced by a later chunk") {
-    // The first row group has no bitmap, so distinct records its values in a
-    // typed (one key) or packed (two keys) store. The next row group introduces
-    // a null with raw value 0. Switching to the generic validity-aware Key
-    // index used to forget the earlier store and emit the repeated non-null row
-    // again; reject that unrepresentable store transition instead.
-    for (const bool multi_key : {false, true}) {
-        INFO("keys " << (multi_key ? 2 : 1));
-        runtime::TableRegistry registry;
-        runtime::ExternRegistry externs;
-        externs.register_chunked_table("late_null_distinct", [&](const runtime::ExternArgs&) {
-            const auto add_second_key = [](runtime::Chunk& chunk) {
-                runtime::ColumnEntry entry;
-                entry.name = "b";
-                entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{7, 7});
-                chunk.columns.push_back(std::move(entry));
-            };
-            std::vector<runtime::Chunk> chunks;
-            auto first = make_int_chunk("a", {0, 1});
-            auto later = make_int_chunk("a", {0, 1});
-            later.columns[0].validity = runtime::ValidityBitmap{false, true};
-            if (multi_key) {
-                add_second_key(first);
-                add_second_key(later);
-            }
-            chunks.push_back(std::move(first));
-            chunks.push_back(std::move(later));
-            return std::expected<runtime::OperatorPtr, std::string>{
-                std::make_unique<VectorSource>(std::move(chunks))};
-        });
+TEST_CASE("Interpret single-key distinct migrates a null key introduced by a later chunk") {
+    // The first row group has no bitmap, so distinct records `a`'s values in
+    // the typed int64 store. The next row group introduces a null. That store
+    // is a plain seen-set with no order to preserve, so it migrates into the
+    // generic validity-aware Key index instead of forgetting what it already
+    // emitted (which would re-emit `a=1`) or rejecting the query outright.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_distinct", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_int_chunk("a", {0, 1}));
+        auto later = make_int_chunk("a", {0, 1});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
 
-        const auto keys = multi_key ? "a, b" : "a";
-        const std::string query = "extern fn late_null_distinct() -> DataFrame from \"x.hpp\"; " +
-                                  std::string{"late_null_distinct()[distinct { "} + keys + " }];";
-        auto ir = require_ir(query.c_str());
-        auto result = runtime::interpret(*ir, registry, nullptr, &externs);
-        REQUIRE_FALSE(result.has_value());
-        CHECK(result.error() == "ChunkedDistinctOperator: key column gained nulls across chunks");
-    }
+    auto ir = require_ir(
+        "extern fn late_null_distinct() -> DataFrame from \"x.hpp\"; "
+        "late_null_distinct()[distinct { a }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+
+    const auto* a = std::get_if<Column<std::int64_t>>(result->find("a"));
+    REQUIRE(a != nullptr);
+    REQUIRE(a->size() == 3);
+    CHECK((*a)[0] == 0);
+    CHECK((*a)[1] == 1);
+    // Row 2 of chunk 2 (a=1, valid) is a repeat of a group already emitted;
+    // row 1 of chunk 2 (a=null) is genuinely new.
+    CHECK(runtime::is_null(*result->find_entry("a"), 2));
+}
+
+TEST_CASE("Interpret multi-key distinct rejects a null key introduced by a later chunk") {
+    // Two keys pack into the flat PackedDedup store, which -- unlike the
+    // single-column typed stores -- has no portable per-value representation
+    // to seed the generic index from, so the transition still fails
+    // explicitly rather than forgetting the earlier store's rows.
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("late_null_distinct_multi", [&](const runtime::ExternArgs&) {
+        const auto add_second_key = [](runtime::Chunk& chunk) {
+            runtime::ColumnEntry entry;
+            entry.name = "b";
+            entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{7, 7});
+            chunk.columns.push_back(std::move(entry));
+        };
+        std::vector<runtime::Chunk> chunks;
+        auto first = make_int_chunk("a", {0, 1});
+        auto later = make_int_chunk("a", {0, 1});
+        later.columns[0].validity = runtime::ValidityBitmap{false, true};
+        add_second_key(first);
+        add_second_key(later);
+        chunks.push_back(std::move(first));
+        chunks.push_back(std::move(later));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn late_null_distinct_multi() -> DataFrame from \"x.hpp\"; "
+        "late_null_distinct_multi()[distinct { a, b }];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == "ChunkedDistinctOperator: key column gained nulls across chunks");
 }
 
 TEST_CASE("Interpret global tail preserves current order of last rows") {

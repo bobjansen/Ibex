@@ -1454,6 +1454,47 @@ TEST_CASE("Interpret distinct over chunked extern source keeps first occurrence 
     REQUIRE((*score)[4] == 5);
 }
 
+TEST_CASE("Interpret distinct rejects a null key introduced by a later chunk") {
+    // The first row group has no bitmap, so distinct records its values in a
+    // typed (one key) or packed (two keys) store. The next row group introduces
+    // a null with raw value 0. Switching to the generic validity-aware Key
+    // index used to forget the earlier store and emit the repeated non-null row
+    // again; reject that unrepresentable store transition instead.
+    for (const bool multi_key : {false, true}) {
+        INFO("keys " << (multi_key ? 2 : 1));
+        runtime::TableRegistry registry;
+        runtime::ExternRegistry externs;
+        externs.register_chunked_table("late_null_distinct", [&](const runtime::ExternArgs&) {
+            const auto add_second_key = [](runtime::Chunk& chunk) {
+                runtime::ColumnEntry entry;
+                entry.name = "b";
+                entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{7, 7});
+                chunk.columns.push_back(std::move(entry));
+            };
+            std::vector<runtime::Chunk> chunks;
+            auto first = make_int_chunk("a", {0, 1});
+            auto later = make_int_chunk("a", {0, 1});
+            later.columns[0].validity = runtime::ValidityBitmap{false, true};
+            if (multi_key) {
+                add_second_key(first);
+                add_second_key(later);
+            }
+            chunks.push_back(std::move(first));
+            chunks.push_back(std::move(later));
+            return std::expected<runtime::OperatorPtr, std::string>{
+                std::make_unique<VectorSource>(std::move(chunks))};
+        });
+
+        const auto keys = multi_key ? "a, b" : "a";
+        const std::string query = "extern fn late_null_distinct() -> DataFrame from \"x.hpp\"; " +
+                                  std::string{"late_null_distinct()[distinct { "} + keys + " }];";
+        auto ir = require_ir(query.c_str());
+        auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == "ChunkedDistinctOperator: key column gained nulls across chunks");
+    }
+}
+
 TEST_CASE("Interpret global tail preserves current order of last rows") {
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{10, 20, 30, 40});

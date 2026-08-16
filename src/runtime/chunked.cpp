@@ -4174,58 +4174,111 @@ class ChunkedInnerJoinOperator final : public Operator {
         const ValidityBitmap* key_validity =
             sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
         const std::size_t n = keys_col->size();
-        struct Hit {
-            std::size_t pos;   // index into the candidate selection
-            std::size_t head;  // first build row in the chain
+
+        // Same scan/replay shape as `probe_swapped`, with a twist: `ri` here
+        // indexes HITS (the survivor list), not probe rows, so each part
+        // needs two prefix offsets — its first hit index and its first output
+        // pair — before the replays can write disjoint slices. One part when
+        // the gate declines, so the serial path is the same code.
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<SwappedHit>& hits,
+                              std::size_t& total) {
+            for (std::size_t i = begin; i < end; ++i) {
+                if (key_validity != nullptr && !(*key_validity)[i]) {
+                    continue;
+                }
+                const auto it = i64_heads_.find(key_data[i]);
+                if (it == i64_heads_.end()) {
+                    continue;
+                }
+                hits.push_back(SwappedHit{.rrow = i, .head = it->second});
+                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                    ++total;
+                }
+            }
         };
-        std::vector<Hit> hits;
-        hits.reserve(n);
+        const std::size_t workers = probe_parallel_workers(n);
+        if (workers == 0) {
+            swapped_parts_.resize(1);
+            swapped_parts_[0].hits.clear();
+            swapped_parts_[0].total = 0;
+            scan(0, n, swapped_parts_[0].hits, swapped_parts_[0].total);
+        } else {
+            auto& pool = process_worker_pool();
+            const std::size_t grain = (n + workers - 1) / workers;
+            swapped_parts_.resize(workers);
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                auto& part = swapped_parts_[w];
+                part.hits.clear();
+                part.total = 0;
+                const std::size_t begin = w * grain;
+                const std::size_t end = std::min(n, begin + grain);
+                if (begin < end) {
+                    scan(begin, end, part.hits, part.total);
+                }
+            });
+            batch.wait();
+        }
+        const std::size_t n_parts = swapped_parts_.size();
+        std::vector<std::size_t> hit_offsets(n_parts);
+        part_offsets_.resize(n_parts);
+        std::size_t n_hits = 0;
         std::size_t total = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            if (key_validity != nullptr && !(*key_validity)[i]) {
-                continue;
-            }
-            const auto it = i64_heads_.find(key_data[i]);
-            if (it == i64_heads_.end()) {
-                continue;
-            }
-            hits.push_back(Hit{.pos = i, .head = it->second});
-            for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
-                ++total;
-            }
+        for (std::size_t w = 0; w < n_parts; ++w) {
+            hit_offsets[w] = n_hits;
+            part_offsets_[w] = total;
+            n_hits += swapped_parts_[w].hits.size();
+            total += swapped_parts_[w].total;
         }
 
-        Selection survivors;
-        survivors.reserve(hits.size());
-        for (const Hit& hit : hits) {
-            survivors.push_back(sel.selected[hit.pos]);
-        }
-
+        Selection survivors(n_hits);
         std::vector<std::size_t> li(total, 0);
         std::vector<std::size_t> ri(total, 0);
-        std::size_t pos = 0;
-        for (std::size_t h = 0; h < hits.size(); ++h) {
-            for (std::size_t cur = hits[h].head; cur != kNil; cur = chain_next_[cur]) {
-                li[pos] = cur;
-                ri[pos] = h;
-                ++pos;
+        Column<std::int64_t> gathered_keys;
+        const bool gather_keys = n_hits != n;
+        if (gather_keys) {
+            gathered_keys.resize_for_overwrite(n_hits);
+        }
+        // Detach once here, not per element inside the replay: the mutable
+        // `operator[]` pays a CoW check every call, and on a worker the
+        // detach itself would race.
+        std::int64_t* gathered_out = gather_keys ? gathered_keys.data() : nullptr;
+        const auto replay = [&](std::size_t w) {
+            const auto& part = swapped_parts_[w];
+            std::size_t h = hit_offsets[w];
+            std::size_t pos = part_offsets_[w];
+            for (const SwappedHit& hit : part.hits) {
+                survivors[h] = sel.selected[hit.rrow];
+                if (gathered_out != nullptr) {
+                    gathered_out[h] = key_data[hit.rrow];
+                }
+                for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
+                    li[pos] = cur;
+                    ri[pos] = h;
+                    ++pos;
+                }
+                ++h;
+            }
+        };
+        if (workers == 0) {
+            replay(0);
+        } else {
+            auto batch = process_worker_pool().submit(n_parts, replay);
+            batch.wait();
+            if (deferred_exec_->parallel_stats != nullptr) {
+                deferred_exec_->parallel_stats->parallel_probes.fetch_add(
+                    1, std::memory_order_relaxed);
             }
         }
-        const bool ri_identity = total == hits.size();
+        const bool ri_identity = total == n_hits;
 
         // Survivors' key values, gathered in memory from phase A's keys.
         ColumnEntry key_entry;
         key_entry.name = sel.keys.name;
-        if (hits.size() == n) {
+        if (!gather_keys) {
             key_entry.column = sel.keys.column;
             key_entry.validity = sel.keys.validity;
         } else {
-            Column<std::int64_t> gathered;
-            gathered.reserve(hits.size());
-            for (const Hit& hit : hits) {
-                gathered.push_back(key_data[hit.pos]);
-            }
-            key_entry.column = std::make_shared<ColumnValue>(std::move(gathered));
+            key_entry.column = std::make_shared<ColumnValue>(std::move(gathered_keys));
             // Null keys never match, so every survivor's key is valid.
         }
 
@@ -4559,24 +4612,33 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// Order is exactly the serial order — ranges are contiguous and visited in
     /// order, and each range appends in row order — so the output is
     /// byte-identical however the workers interleave.
-    template <typename Body>
-    auto probe_ranges_parallel(std::size_t n, std::vector<std::size_t>& li,
-                               std::vector<std::size_t>& ri, const Body& body) -> bool {
-        // Below this the fan-out and the concatenation cost more than the
-        // probes they spread. A probe is a hash lookup plus a chain walk, so
-        // the per-row work is real, but so is submitting a batch.
+    /// The shared admission gate for every parallel probe axis: how many
+    /// workers a probe over `n` rows may fan out to, or 0 to decline and run
+    /// the caller's serial loop. Below `kMinProbeRows` the fan-out and the
+    /// concatenation cost more than the probes they spread — a probe is a hash
+    /// lookup plus a chain walk, so the per-row work is real, but so is
+    /// submitting a batch.
+    [[nodiscard]] auto probe_parallel_workers(std::size_t n) const -> std::size_t {
         constexpr std::size_t kMinProbeRows = 1U << 14U;
         if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || n < kMinProbeRows ||
             !parallel_join_probe_enabled()) {
-            return false;
+            return 0;
         }
         auto& pool = process_worker_pool();
         const std::size_t budget =
             exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
         const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
-        if (workers < 2) {
+        return workers < 2 ? 0 : workers;
+    }
+
+    template <typename Body>
+    auto probe_ranges_parallel(std::size_t n, std::vector<std::size_t>& li,
+                               std::vector<std::size_t>& ri, const Body& body) -> bool {
+        const std::size_t workers = probe_parallel_workers(n);
+        if (workers == 0) {
             return false;
         }
+        auto& pool = process_worker_pool();
         const std::size_t grain = (n + workers - 1) / workers;
         probe_parts_.resize(workers);
         {
@@ -4634,6 +4696,99 @@ class ChunkedInnerJoinOperator final : public Operator {
             exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
+    }
+
+    /// One matching probe row in swapped mode: the right row and the head of
+    /// the left chain it hit. Phase 2 replays these instead of re-probing.
+    struct SwappedHit {
+        std::size_t rrow;
+        std::size_t head;  ///< first left row in the chain for this key
+    };
+    /// One worker's slice of a swapped-mode phase 1. A member for the same
+    /// reason as `ProbePart`: capacity survives across chunks.
+    struct SwappedPart {
+        std::vector<SwappedHit> hits;
+        std::size_t total = 0;  ///< output rows this part's chains expand to
+    };
+
+    /// Swapped-mode probe: phase 1 walks right rows `head_of` resolves against
+    /// the left index, phase 2 expands the recorded chains into (li, ri).
+    /// The parallel path fans phase 1 out over contiguous right-row ranges and
+    /// phase 2 out over the per-range hit lists — each part's output slice
+    /// starts at the prefix sum of the parts before it, so workers write
+    /// disjoint slices and the result is byte-identical to the serial replay
+    /// (parts are visited in range order, ranges in row order).
+    template <typename HeadOf>
+    void probe_swapped(std::size_t n_right, const HeadOf& head_of, std::vector<std::size_t>& li,
+                       std::vector<std::size_t>& ri) {
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<SwappedHit>& hits,
+                              std::size_t& total) {
+            for (std::size_t r = begin; r < end; ++r) {
+                if (probe_is_null(r)) {
+                    continue;
+                }
+                const std::size_t head = head_of(r);
+                if (head == kNil) {
+                    continue;
+                }
+                hits.push_back(SwappedHit{.rrow = r, .head = head});
+                for (std::size_t cur = head; cur != kNil; cur = chain_next_[cur]) {
+                    ++total;
+                }
+            }
+        };
+        const auto replay = [&](const std::vector<SwappedHit>& hits, std::size_t pos) {
+            for (const SwappedHit& hit : hits) {
+                for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
+                    li[pos] = cur;
+                    ri[pos] = hit.rrow;
+                    ++pos;
+                }
+            }
+        };
+
+        const std::size_t workers = probe_parallel_workers(n_right);
+        if (workers == 0) {
+            std::vector<SwappedHit> hits;
+            std::size_t total = 0;
+            scan(0, n_right, hits, total);
+            li.assign(total, 0);
+            ri.assign(total, 0);
+            replay(hits, 0);
+            return;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t grain = (n_right + workers - 1) / workers;
+        swapped_parts_.resize(workers);
+        {
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                auto& part = swapped_parts_[w];
+                part.hits.clear();
+                part.total = 0;
+                const std::size_t begin = w * grain;
+                const std::size_t end = std::min(n_right, begin + grain);
+                if (begin < end) {
+                    scan(begin, end, part.hits, part.total);
+                }
+            });
+            batch.wait();
+        }
+        part_offsets_.resize(workers);
+        std::size_t total = 0;
+        for (std::size_t w = 0; w < workers; ++w) {
+            part_offsets_[w] = total;
+            total += swapped_parts_[w].total;
+        }
+        li.assign(total, 0);
+        ri.assign(total, 0);
+        {
+            auto batch = pool.submit(
+                workers, [&](std::size_t w) { replay(swapped_parts_[w].hits, part_offsets_[w]); });
+            batch.wait();
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Stream mode: walk the probe side (a left chunk), for each row look
@@ -4902,8 +5057,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         const Table& left_table = *left_table_;
         const std::size_t n_right = right_.rows();
 
-        std::size_t total = 0;
-
         // In swapped mode the index is on the left, so the right table is the
         // probe side. Its null-keyed rows match nothing (see build_index).
         const auto* right_entry = right_.find_entry(keys_->front().right);
@@ -4911,45 +5064,26 @@ class ChunkedInnerJoinOperator final : public Operator {
                               ? &*right_entry->validity
                               : nullptr;
 
-        struct Hit {
-            std::size_t rrow;
-            std::size_t head;  // first left row in the chain for this key
-        };
-        std::vector<Hit> hits;
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
 
+        // Every key kind reduces to "resolve right row r to a left chain head
+        // or kNil"; the map branches wrap the hash lookup, the categorical
+        // fast path hands the pre-resolved head straight through. One shape
+        // means `probe_swapped` is the single scan/replay implementation for
+        // both the serial and the parallel path.
         auto do_phase1 = [&](auto&& key_at, const auto& heads) {
-            for (std::size_t r = 0; r < n_right; ++r) {
-                if (probe_is_null(r)) {
-                    continue;
-                }
-                auto it = heads.find(key_at(r));
-                if (it == heads.end()) {
-                    continue;
-                }
-                hits.push_back(Hit{r, it->second});
-                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
-                    ++total;
-                }
-            }
+            probe_swapped(
+                n_right,
+                [&](std::size_t r) {
+                    auto it = heads.find(key_at(r));
+                    return it == heads.end() ? kNil : it->second;
+                },
+                li, ri);
         };
-
         // Same shape with the chain head already resolved — see
         // `resolve_categorical_heads`.
-        auto do_phase1_resolved = [&](auto&& head_at) {
-            for (std::size_t r = 0; r < n_right; ++r) {
-                if (probe_is_null(r)) {
-                    continue;
-                }
-                const std::size_t head = head_at(r);
-                if (head == kNil) {
-                    continue;
-                }
-                hits.push_back(Hit{.rrow = r, .head = head});
-                for (std::size_t cur = head; cur != kNil; cur = chain_next_[cur]) {
-                    ++total;
-                }
-            }
-        };
+        auto do_phase1_resolved = [&](auto&& head_at) { probe_swapped(n_right, head_at, li, ri); };
 
         if (key_kind_ == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
@@ -5003,24 +5137,12 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
         }
 
-        // Phase 2: replay the recorded hits in the same order Phase 1 visited
-        // them — right-scan (probe) order. Row order is outside the join
-        // contract (SPEC.md §5.6), so there's no correctness reason to
-        // reassemble by left row instead; doing so was actively harmful,
-        // permuting the output away from the probe side's natural scan
-        // order and hurting cache locality on any downstream join that
-        // probes this join's output.
-        std::vector<std::size_t> li(total, 0);
-        std::vector<std::size_t> ri(total, 0);
-        std::size_t pos = 0;
-        for (const Hit& hit : hits) {
-            for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
-                li[pos] = cur;
-                ri[pos] = hit.rrow;
-                ++pos;
-            }
-        }
-
+        // Output order is the order phase 1 visited the hits — right-scan
+        // (probe) order. Row order is outside the join contract (SPEC.md
+        // §5.6), so there's no correctness reason to reassemble by left row
+        // instead; doing so was actively harmful, permuting the output away
+        // from the probe side's natural scan order and hurting cache locality
+        // on any downstream join that probes this join's output.
         Table left_copy;
         left_copy.columns.reserve(left_table.columns.size());
         for (const auto& c : left_table.columns) {
@@ -5187,6 +5309,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         std::vector<std::size_t> ri;
     };
     std::vector<ProbePart> probe_parts_;
+    std::vector<SwappedPart> swapped_parts_;
     std::vector<std::size_t> part_offsets_;
     std::vector<std::size_t> right_emit_idx_;
     std::vector<std::string> right_emit_names_;

@@ -279,13 +279,73 @@ auto membership_pass_rate(const KeyColumn& key, const DynamicScanFilter& filter,
     return static_cast<double>(passed) / static_cast<double>(sampled);
 }
 
+/// How many ranges a membership pass over `n` candidates may fan out to (1 =
+/// run serial). The filter is a read-only Bloom/IN-list probe per row, so
+/// ranges share nothing; each builds its own kept list and the lists are
+/// concatenated in range order, which is exactly the serial order. Gated the
+/// same way as `for_row_ranges` — that helper itself wants a pre-sized
+/// output, which a filtered selection cannot supply.
+auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size_t {
+    constexpr std::size_t kMaxRanges = 64;
+    if (!exec.parallel || n < exec.parallel_min_rows || on_worker_pool_thread() ||
+        !parallel_join_probe_enabled()) {
+        return 1;
+    }
+    const std::size_t min_rows = std::max<std::size_t>(exec.parallel_min_rows, 1);
+    auto& pool = process_worker_pool();
+    const std::size_t budget = exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+    return std::min({std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges), budget, pool.size()});
+}
+
+/// Fan the row-keep predicate out over `ranges` contiguous ranges of
+/// `[0, n)`, appending each range's surviving `row_at(i)` values, then stitch
+/// the per-range lists back in order.
+template <typename RowAt>
+auto keep_rows_parallel(std::size_t n, std::size_t ranges, const KeyColumn& key,
+                        const DynamicScanFilter& filter, const RowAt& row_at)
+    -> std::vector<std::size_t> {
+    std::vector<std::vector<std::size_t>> parts(ranges);
+    const std::size_t grain = (n + ranges - 1) / ranges;
+    auto batch = process_worker_pool().submit(ranges, [&](std::size_t r) {
+        const std::size_t begin = r * grain;
+        const std::size_t end = std::min(n, begin + grain);
+        if (begin >= end) {
+            return;
+        }
+        auto& part = parts[r];
+        part.reserve(end - begin);
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::size_t row = row_at(i);
+            if (key_passes(key, filter, row)) {
+                part.push_back(row);
+            }
+        }
+    });
+    batch.wait();
+    std::size_t total = 0;
+    for (const auto& part : parts) {
+        total += part.size();
+    }
+    std::vector<std::size_t> kept;
+    kept.reserve(total);
+    for (const auto& part : parts) {
+        kept.insert(kept.end(), part.begin(), part.end());
+    }
+    return kept;
+}
+
 /// AND the membership filter into an existing selection, in place. Skipped
 /// (selection untouched) when the sample says it barely rejects.
 void apply_membership_filter(const KeyColumn& key, const DynamicScanFilter& filter,
-                             std::vector<std::size_t>& selected) {
+                             std::vector<std::size_t>& selected, const ExecutionContext& exec) {
     if (membership_pass_rate(key, filter, selected.size(), [&](std::size_t i) {
             return selected[i];
         }) > kMembershipPassRateCutoff) {
+        return;
+    }
+    if (const std::size_t ranges = membership_ranges(exec, selected.size()); ranges >= 2) {
+        selected = keep_rows_parallel(selected.size(), ranges, key, filter,
+                                      [&](std::size_t i) { return selected[i]; });
         return;
     }
     auto end = std::remove_if(selected.begin(), selected.end(),
@@ -296,12 +356,15 @@ void apply_membership_filter(const KeyColumn& key, const DynamicScanFilter& filt
 /// Build a selection straight from the membership filter (no static
 /// conjuncts). nullopt = the filter barely rejects; caller should decode
 /// densely instead.
-auto membership_selection(const KeyColumn& key, const DynamicScanFilter& filter, std::size_t rows)
-    -> std::optional<std::vector<std::size_t>> {
+auto membership_selection(const KeyColumn& key, const DynamicScanFilter& filter, std::size_t rows,
+                          const ExecutionContext& exec) -> std::optional<std::vector<std::size_t>> {
     const auto sampled_rate =
         membership_pass_rate(key, filter, rows, [](std::size_t i) { return i; });
     if (sampled_rate > kMembershipPassRateCutoff) {
         return std::nullopt;
+    }
+    if (const std::size_t ranges = membership_ranges(exec, rows); ranges >= 2) {
+        return keep_rows_parallel(rows, ranges, key, filter, [](std::size_t i) { return i; });
     }
     // One filter pass, not count-then-fill: a Bloom probe per key is the
     // expensive part here, and the sampled rate gives a good enough reserve
@@ -537,13 +600,13 @@ auto LazyTable::project_where(const std::set<std::string>& names,
         }
         selected = std::move(*from_conjuncts);
         if (key.has_value()) {
-            apply_membership_filter(*key, *dynamic, *selected);
+            apply_membership_filter(*key, *dynamic, *selected, exec);
         }
     } else if (membership && key.has_value()) {
         // nullopt here is the escape hatch (the filter barely rejects) or a
         // key that is missing/non-int64; either way membership contributes
         // nothing and `selected` stays empty.
-        selected = membership_selection(*key, *dynamic, rows_);
+        selected = membership_selection(*key, *dynamic, rows_, exec);
     }
 
     if (fused_selection.has_value()) {
@@ -820,10 +883,10 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
         }
         selected = std::move(*from_conjuncts);
         if (key.has_value()) {
-            apply_membership_filter(*key, *dynamic, *selected);
+            apply_membership_filter(*key, *dynamic, *selected, exec);
         }
     } else if (membership && key.has_value()) {
-        selected = membership_selection(*key, *dynamic, unit.rows);
+        selected = membership_selection(*key, *dynamic, unit.rows, exec);
     }
 
     if (fused_selection.has_value()) {
@@ -1191,10 +1254,10 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
         if (!selected) {
             return std::unexpected(selected.error());
         }
-        apply_membership_filter(*key, dynamic, *selected);
+        apply_membership_filter(*key, dynamic, *selected, exec);
         out.selected = std::move(*selected);
     } else {
-        auto from_membership = membership_selection(*key, dynamic, rows_);
+        auto from_membership = membership_selection(*key, dynamic, rows_, exec);
         if (!from_membership.has_value()) {
             return std::optional<JoinKeySelection>{};  // escape hatch
         }

@@ -13225,6 +13225,82 @@ TEST_CASE("Inner join probe fans out across workers and matches the serial probe
     }
 }
 
+TEST_CASE("Swapped-mode join probe fans out across workers and matches the serial probe",
+          "[runtime][parallel][join]") {
+    // The mirror of the stream-mode test: the LEFT side is the small one, so
+    // the join indexes it and the large right side becomes the probe —
+    // `emit_swapped`. Right must be past kStreamRightThreshold (65536) for the
+    // join to swap at all, and past the probe gate (1<<14) to fan out.
+    constexpr std::size_t kRightRows = 70000;
+    runtime::Table small_left;
+    {
+        // Two build rows per key so phase 2 replays a chain, not a single hit;
+        // keys 100..127 probe as misses.
+        std::vector<std::int64_t> keys;
+        std::vector<std::int64_t> tags;
+        keys.reserve(200);
+        tags.reserve(200);
+        for (std::int64_t key = 0; key < 100; ++key) {
+            keys.push_back(key);
+            tags.push_back(key * 10);
+            keys.push_back(key);
+            tags.push_back((key * 10) + 1);
+        }
+        small_left.add_column("k", Column<std::int64_t>{std::move(keys)});
+        small_left.add_column("tag", Column<std::int64_t>{std::move(tags)});
+    }
+    runtime::Table big_right;
+    {
+        std::vector<std::int64_t> keys;
+        std::vector<std::int64_t> vals;
+        keys.reserve(kRightRows);
+        vals.reserve(kRightRows);
+        for (std::size_t row = 0; row < kRightRows; ++row) {
+            keys.push_back(static_cast<std::int64_t>(row % 128));
+            vals.push_back(static_cast<std::int64_t>(row));
+        }
+        big_right.add_column("k", Column<std::int64_t>{std::move(keys)});
+        big_right.add_column("v", Column<std::int64_t>{std::move(vals)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("small_l", std::move(small_left));
+    registry.emplace("big_r", std::move(big_right));
+    auto ir = require_ir("small_l join big_r on k;");
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats& stats) {
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+
+    runtime::ParallelIslandStats serial_stats;
+    auto serial = run(false, serial_stats);
+    CHECK(serial_stats.parallel_probes.load() == 0);
+
+    runtime::ParallelIslandStats parallel_stats;
+    auto parallel = run(true, parallel_stats);
+    CHECK(parallel_stats.parallel_probes.load() >= 1);
+
+    // 100 matching keys x 2 chain rows x (20000/128) right rows each.
+    for (const char* name : {"k", "tag", "v"}) {
+        const auto* expect = std::get_if<Column<std::int64_t>>(serial.find(name));
+        const auto* got = std::get_if<Column<std::int64_t>>(parallel.find(name));
+        REQUIRE(expect != nullptr);
+        REQUIRE(got != nullptr);
+        REQUIRE(got->size() == expect->size());
+        REQUIRE(got->size() > 0);
+        std::size_t mismatches = 0;
+        for (std::size_t row = 0; row < expect->size(); ++row) {
+            mismatches += static_cast<std::size_t>((*got)[row] != (*expect)[row]);
+        }
+        CHECK(mismatches == 0);
+    }
+}
+
 // Ordering by a Categorical column ranks its DICTIONARY and maps each row's
 // code through that ranking, rather than flattening to one string_view per row
 // and re-deriving the distinct values by hashing all of them. These cases pin

@@ -139,7 +139,54 @@ no 1-core regression.
 
 ### W2 — Aggregate serial residue (~552 ms attacked; expect 150–250 ms)
 
-Three known, separate causes:
+**Status 2026-08-16: probed and largely re-scoped.** The three causes below were
+written from the operator table, which reports *self time* — and self time on an
+operator that blocks on `batch.wait()` counts the wait. Phase timers inside the
+worst case (q18's `sum(l_quantity) by l_orderkey`: 12M rows, 3M groups, the
+single largest aggregate self-time in the suite at 213 ms) say the residue is
+not where the table implies:
+
+| phase | ms | serial? |
+|---|---:|---|
+| pass-3 partition probe (`try_discover_partitioned`) | 80 | no — 8 workers |
+| slot-array fill (`size_group_arrays`) | 44 | **yes** |
+| first-occurrence ordered merge | 26 | **yes** |
+| key-array growth (`resize_keys`) | 12 | **yes** |
+| accumulate (`accumulate_gids`) | 10 | yes, but tiny |
+
+So: the accumulate — the thing `try_accumulate_parallel` declines on and the
+thing cause 2 is about — is 5% of the operator, not the lever. The gid probe,
+the largest single phase, is *already* threaded. What is left serial is
+**memory-shaped work: growing and zeroing per-group arrays** (56 of the 172 ms).
+
+Landed from this: `SlotArray` grows uninitialized and the tail fill is one
+`memset`, fanned out across workers. Honest result — **cold** (`ibex q.ibex`,
+what a script does) q18 −4.3%; **warm** (the PDS-H harness reuses one process,
+so the allocator returns already-faulted pages) the suite geomean does not move,
+two interleaved runs at 0.9975 and 1.0014. The cost was first-touch page faults,
+and page faults only exist the first time.
+
+**Measured dead end — gid-sharded accumulate.** Reusing the discovery scatter
+(`scatter_rows_` + partition bounds) to accumulate by *group* instead of by
+*row* needs no private slot arrays at all, sidesteps the 32 MB partial-state
+budget that makes cause 2 decline, and is byte-identical to serial (rows stay
+ascending within a partition, so float sums associate the same way and
+First/Last pick the same row). It is still a loss: each worker's rows are spread
+through the whole chunk, so all 8 stream the entire gid and value columns —
+8× the read traffic. q18's accumulate went 10 ms → 17 ms. Do not redo it
+without a shape where accumulate is actually dominant.
+
+**What to do instead**, in order of measured size:
+- The ordered merge (26 ms) and the array growth (56 ms) are the serial half.
+  Growth is `realloc`/`mremap` already; the remaining cost is the kernel's, so
+  the lever is fewer/larger faults (huge pages via an aligned `mmap` +
+  `MADV_HUGEPAGE` backing for `SlotArray`) rather than more threads.
+- Re-derive cause 3 (parallel gid) against 80 ms of *already-parallel* probe,
+  not against a serial pass — the premise it was written under is gone.
+- Cause 2's fat-slot diet is **already done**: the chunked operator stores
+  `AggSlotCore` (24 B, static_asserted) with boxed values in a side array.
+
+The original three, kept for the parts still standing:
 
 1. **First-chunk serial discovery under streaming.** The cumulative-rows gate
    fix seeds late-activated partitions, but chunk 0 is still discovered
@@ -225,9 +272,14 @@ lazily constructed or amortized process-wide.
 ## 4. Sequencing
 
 ```
-W1 join (probe+assemble, phase A)   ──┐  independent of scheduler; start now
-W2 aggregate (defer-first-chunk,      ├─ interleave; each lands separately
-   fat slot, cardinality gate)      ──┘  with its own sweep
+W1 join (probe+assemble, phase A)   ── DONE (294230c, e06e1d7): SF-2 geomean 0.943
+W2 aggregate                        ── probed; the residue is array growth, not
+                                       accumulate. Slot fill landed (cold-only).
+                                       Remaining levers are small; see W2 above.
+W1b multi-key join probes           ── NEXT, and now the largest item measured:
+                                       join inner is 574 ms self at 0.42x help,
+                                       and q09/q05/q11 spend it in the SERIAL
+                                       join_table_impl that W1 never touched
 W3.1 progress-aware admission       ── next scheduler slice; fixes 2-core cliff
 W3.2 q18/q22 rundown                ── decides W4's priority
 W4 chunked let bindings             ── design note first; largest structural risk
@@ -235,6 +287,15 @@ W3.3+ aggregate-output stages,
       general scheduler, island retirement
 W2.3 parallel gid                   ── only if still dominant after the above
 ```
+
+Suite operator table re-measured 2026-08-16 (SF-2, 8 pinned cores,
+`IBEX_PROFILE_OPERATORS`, one process per query so the decode numbers are cold):
+`join inner` 574 ms self / 0.42× help is now the largest unparallelized
+operator, ahead of `aggregate` (446 ms / 2.03×) and `join semi` (232 ms /
+0.21×). W1 threaded `ChunkedInnerJoinOperator`'s single-key probe; q09 (169 ms),
+q05 (90 ms) and q11 (60 ms) are two-key joins that run in `join_table_impl`
+instead and never reach it. That is the measurement W1's "deliberately not done"
+note asked for, and it says to go there next.
 
 Rough payoff bookkeeping against the ~450 ms target (SF-2, 8c): W1 ≈ 250–300,
 W2 ≈ 150–250, W3.1/W3.2 ≈ 100–200 (removing the named regressions alone), W4
@@ -258,6 +319,15 @@ predicted win survives measurement.
   2-core totals (the cliff).
 - Interleaved A/B with a layout control for anything narrower than the suite;
   ±10% box drift means never compare absolute totals across sessions.
+- **Allocation-shaped changes must also be measured cold.** The harness runs 22
+  queries in one warm process, so the allocator hands back already-faulted pages
+  and first-touch cost is invisible to it — W2's slot fill is −4.3% on a cold
+  `ibex q18.ibex` and exactly 0 on the suite. Both numbers are real; report
+  both, and never quote only the flattering one.
+- **`self_ms` is not serial time.** An operator that fans out and joins spends
+  its wait inside `next()`, and the profile counts it. Any workstream sized off
+  the operator table must confirm with phase timers before committing, which is
+  what re-scoped W2.
 - Determinism: partition on row/data properties only, never thread count;
   first-occurrence order tests must use keys whose occurrence order differs
   from sorted order.
@@ -265,7 +335,9 @@ predicted win survives measurement.
 ## 6. Measured dead ends — do not revisit without new evidence
 
 Collected here so no workstream re-runs them: probe-operator Bloom;
-column-axis join gather; the two-phase join `left_copy` branch; lookahead
+column-axis join gather; gid-sharded aggregate accumulate over the discovery
+scatter (8× read amplification, q18 10 ms → 17 ms — see W2);
+the two-phase join `left_copy` branch; lookahead
 decode window (+52% RSS, zero wall); static one-producer admission gate;
 lowering the int-partition row gate; footer-bytes small-query gate; naive
 morsel islands around 1:1 operators; AVX2 filter left-pack; more island

@@ -153,7 +153,7 @@ auto chunked_agg_valid(ir::AggFunc func, const AggSlotCore& slot) -> bool {
         case ir::AggFunc::Max:
         case ir::AggFunc::First:
         case ir::AggFunc::Last:
-            return slot.has_value;
+            return slot.present();
         case ir::AggFunc::Stddev:
             return slot.count >= 2;
         case ir::AggFunc::Skew:
@@ -7331,7 +7331,7 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.double_value += data[row];
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Mean:
@@ -7341,7 +7341,6 @@ class ChunkedAggregateOperator final : public Operator {
                             auto& slot = slot_for(gids[row]);
                             slot.double_value += data[row];
                             slot.count++;
-                            slot.has_value = true;
                         }
                         break;
                     case ir::AggFunc::Min:
@@ -7350,8 +7349,8 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             const double v = data[row];
-                            slot.double_value = slot.has_value ? std::min(slot.double_value, v) : v;
-                            slot.has_value = true;
+                            slot.double_value = slot.present() ? std::min(slot.double_value, v) : v;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Max:
@@ -7360,8 +7359,8 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             const double v = data[row];
-                            slot.double_value = slot.has_value ? std::max(slot.double_value, v) : v;
-                            slot.has_value = true;
+                            slot.double_value = slot.present() ? std::max(slot.double_value, v) : v;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Stddev:
@@ -7387,9 +7386,9 @@ class ChunkedAggregateOperator final : public Operator {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            if (!slot.has_value) {
+                            if (!slot.present()) {
                                 slot.double_value = data[row];
-                                slot.has_value = true;
+                                slot.mark_present();
                             }
                         }
                         break;
@@ -7399,7 +7398,7 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.double_value = data[row];
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                         break;
                     default:
@@ -7414,7 +7413,7 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.int_value += data[row];
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Mean:
@@ -7424,7 +7423,6 @@ class ChunkedAggregateOperator final : public Operator {
                             auto& slot = slot_for(gids[row]);
                             slot.double_value += static_cast<double>(data[row]);
                             slot.count++;
-                            slot.has_value = true;
                         }
                         break;
                     case ir::AggFunc::Min:
@@ -7433,8 +7431,8 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             std::int64_t v = data[row];
-                            slot.int_value = slot.has_value ? std::min(slot.int_value, v) : v;
-                            slot.has_value = true;
+                            slot.int_value = slot.present() ? std::min(slot.int_value, v) : v;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Max:
@@ -7443,8 +7441,8 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             std::int64_t v = data[row];
-                            slot.int_value = slot.has_value ? std::max(slot.int_value, v) : v;
-                            slot.has_value = true;
+                            slot.int_value = slot.present() ? std::max(slot.int_value, v) : v;
+                            slot.mark_present();
                         }
                         break;
                     case ir::AggFunc::Stddev:
@@ -7470,9 +7468,9 @@ class ChunkedAggregateOperator final : public Operator {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            if (!slot.has_value) {
+                            if (!slot.present()) {
                                 slot.int_value = data[row];
-                                slot.has_value = true;
+                                slot.mark_present();
                             }
                         }
                         break;
@@ -7482,7 +7480,7 @@ class ChunkedAggregateOperator final : public Operator {
                                 continue;
                             auto& slot = slot_for(gids[row]);
                             slot.int_value = data[row];
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                         break;
                     default:
@@ -7507,10 +7505,10 @@ class ChunkedAggregateOperator final : public Operator {
                         if (has_nulls && !(*validity)[row])
                             continue;
                         auto& slot = slot_for(gids[row]);
-                        if (!slot.has_value) {
+                        if (!slot.present()) {
                             text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i) =
                                 value_at(row);
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                     }
                 } else {
@@ -7520,7 +7518,7 @@ class ChunkedAggregateOperator final : public Operator {
                         auto& slot = slot_for(gids[row]);
                         text_at((static_cast<std::size_t>(gids[row]) * n_aggs_) + agg_i) =
                             value_at(row);
-                        slot.has_value = true;
+                        slot.mark_present();
                     }
                 }
             }
@@ -7707,34 +7705,32 @@ class ChunkedAggregateOperator final : public Operator {
                         // column is NULL, not 0.
                         each([&](std::size_t r) {
                             slot.double_value += data[r];
-                            slot.has_value = true;
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Mean:
                         each([&](std::size_t r) {
                             slot.double_value += data[r];
                             slot.count++;
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Min:
                         each([&](std::size_t r) {
                             slot.double_value =
-                                slot.has_value ? std::min(slot.double_value, data[r]) : data[r];
-                            slot.has_value = true;
+                                slot.present() ? std::min(slot.double_value, data[r]) : data[r];
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Max:
                         each([&](std::size_t r) {
                             slot.double_value =
-                                slot.has_value ? std::max(slot.double_value, data[r]) : data[r];
-                            slot.has_value = true;
+                                slot.present() ? std::max(slot.double_value, data[r]) : data[r];
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Stddev:
                         each([&](std::size_t r) {
                             agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]], data[r]);
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Skew:
@@ -7742,21 +7738,20 @@ class ChunkedAggregateOperator final : public Operator {
                         each([&](std::size_t r) {
                             double* scr = scratch_base + scratch_offset_[agg_i];
                             agg_update_moments(slot, scr[0], scr[1], scr[2], data[r]);
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::First:
                         each([&](std::size_t r) {
-                            if (!slot.has_value) {
+                            if (!slot.present()) {
                                 slot.double_value = data[r];
-                                slot.has_value = true;
+                                slot.mark_present();
                             }
                         });
                         break;
                     case ir::AggFunc::Last:
                         each([&](std::size_t r) {
                             slot.double_value = data[r];
-                            slot.has_value = true;
+                            slot.mark_present();
                         });
                         break;
                     default:
@@ -7768,35 +7763,33 @@ class ChunkedAggregateOperator final : public Operator {
                     case ir::AggFunc::Sum:
                         each([&](std::size_t r) {
                             slot.int_value += data[r];
-                            slot.has_value = true;
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Mean:
                         each([&](std::size_t r) {
                             slot.double_value += static_cast<double>(data[r]);
                             slot.count++;
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Min:
                         each([&](std::size_t r) {
                             slot.int_value =
-                                slot.has_value ? std::min(slot.int_value, data[r]) : data[r];
-                            slot.has_value = true;
+                                slot.present() ? std::min(slot.int_value, data[r]) : data[r];
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Max:
                         each([&](std::size_t r) {
                             slot.int_value =
-                                slot.has_value ? std::max(slot.int_value, data[r]) : data[r];
-                            slot.has_value = true;
+                                slot.present() ? std::max(slot.int_value, data[r]) : data[r];
+                            slot.mark_present();
                         });
                         break;
                     case ir::AggFunc::Stddev:
                         each([&](std::size_t r) {
                             agg_update_stddev(slot, scratch_base[scratch_offset_[agg_i]],
                                               static_cast<double>(data[r]));
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::Skew:
@@ -7805,21 +7798,20 @@ class ChunkedAggregateOperator final : public Operator {
                             double* scr = scratch_base + scratch_offset_[agg_i];
                             agg_update_moments(slot, scr[0], scr[1], scr[2],
                                                static_cast<double>(data[r]));
-                            slot.has_value = true;
                         });
                         break;
                     case ir::AggFunc::First:
                         each([&](std::size_t r) {
-                            if (!slot.has_value) {
+                            if (!slot.present()) {
                                 slot.int_value = data[r];
-                                slot.has_value = true;
+                                slot.mark_present();
                             }
                         });
                         break;
                     case ir::AggFunc::Last:
                         each([&](std::size_t r) {
                             slot.int_value = data[r];
-                            slot.has_value = true;
+                            slot.mark_present();
                         });
                         break;
                     default:
@@ -7837,15 +7829,15 @@ class ChunkedAggregateOperator final : public Operator {
                 };
                 if (func == ir::AggFunc::First) {
                     each([&](std::size_t r) {
-                        if (!slot.has_value) {
+                        if (!slot.present()) {
                             text_at(agg_i) = value_at(r);
-                            slot.has_value = true;
+                            slot.mark_present();
                         }
                     });
                 } else {
                     each([&](std::size_t r) {
                         text_at(agg_i) = value_at(r);
-                        slot.has_value = true;
+                        slot.mark_present();
                     });
                 }
             }
@@ -8870,7 +8862,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     } else {
                         slot.int_value += data[row];
                     }
-                    slot.has_value = true;
+                    slot.mark_present();
                 }
                 break;
             case ir::AggFunc::Mean:
@@ -8880,7 +8872,6 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     }
                     slot.double_value += static_cast<double>(data[row]);
                     slot.count++;
-                    slot.has_value = true;
                 }
                 break;
             case ir::AggFunc::Min:
@@ -8890,12 +8881,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     }
                     if constexpr (std::is_same_v<T, double>) {
                         slot.double_value =
-                            slot.has_value ? std::min(slot.double_value, data[row]) : data[row];
+                            slot.present() ? std::min(slot.double_value, data[row]) : data[row];
                     } else {
                         slot.int_value =
-                            slot.has_value ? std::min(slot.int_value, data[row]) : data[row];
+                            slot.present() ? std::min(slot.int_value, data[row]) : data[row];
                     }
-                    slot.has_value = true;
+                    slot.mark_present();
                 }
                 break;
             case ir::AggFunc::Max:
@@ -8905,12 +8896,12 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     }
                     if constexpr (std::is_same_v<T, double>) {
                         slot.double_value =
-                            slot.has_value ? std::max(slot.double_value, data[row]) : data[row];
+                            slot.present() ? std::max(slot.double_value, data[row]) : data[row];
                     } else {
                         slot.int_value =
-                            slot.has_value ? std::max(slot.int_value, data[row]) : data[row];
+                            slot.present() ? std::max(slot.int_value, data[row]) : data[row];
                     }
-                    slot.has_value = true;
+                    slot.mark_present();
                 }
                 break;
             case ir::AggFunc::Stddev:
@@ -8933,7 +8924,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 break;
             case ir::AggFunc::First:
                 for (std::size_t row = start; row < end; ++row) {
-                    if (!valid(row) || slot.has_value) {
+                    if (!valid(row) || slot.present()) {
                         continue;
                     }
                     if constexpr (std::is_same_v<T, double>) {
@@ -8941,7 +8932,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     } else {
                         slot.int_value = data[row];
                     }
-                    slot.has_value = true;
+                    slot.mark_present();
                 }
                 break;
             case ir::AggFunc::Last:
@@ -8954,7 +8945,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                     } else {
                         slot.int_value = data[row];
                     }
-                    slot.has_value = true;
+                    slot.mark_present();
                 }
                 break;
             default:

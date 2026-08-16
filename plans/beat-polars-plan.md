@@ -73,6 +73,31 @@ they would run ≈2707 ms rather than 3164 ms (**−457 ms**), and 4 cores ≈20
 rather than 2278 ms (**−188 ms**). That is the largest single number left on the
 board, and it is W3.1's.
 
+**Confirmed by experiment, and the mechanism is now certain.** Pin to the same
+two physical cores and vary only the thread BUDGET:
+
+| pinned cores | thread budget | total | speedup vs 1c | implied p |
+|---|---|---:|---:|---:|
+| 1 | 1 | 3778 ms | 1.000× | — |
+| 2 | 2 | 3149 ms | 1.200× | 33.3% |
+| 2 | 3 | 2816 ms | 1.342× | 50.9% |
+| 2 | **4** | **2715 ms** | **1.392×** | **56.3%** |
+| 2 | 8 | 2744 ms | 1.377× | 54.8% |
+
+No extra hardware — 23 points of parallel fraction appear purely from raising
+the budget, and **434 ms of the predicted 457 ms is recovered by that alone**.
+So the 2-core deficit is not the scheduler running slowly and not a hardware
+limit: at a budget of 2 the program simply stops *offering* the work. The
+budget-8-on-2-cores row also shows the other edge — oversubscription starts
+costing again, so the fix is not "always oversubscribe" but "never let the
+effective budget collapse toward 1".
+
+This makes W3.1 concrete: **decouple the admission budget (how many parallel
+units to create) from the hardware thread count**, and make sure whatever
+reserves a producer thread cannot take the remaining budget below 2. Do that
+before rewriting admission policy on progress signals — a one-line floor may
+capture most of the 457 ms, and the sweep above is the falsifying test.
+
 **1-core no-regression gate, verified for this session's three commits**
 (`a0dd4c1`, `315504e`, `68af53e` vs `d1ca618`): geomean **0.9965**, no query
 worse than +2%. The single-core lead is intact.

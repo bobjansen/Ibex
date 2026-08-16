@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
@@ -102,8 +103,33 @@ TEST_CASE("WorkerPool batch destruction waits for its bodies", "[runtime][worker
     CHECK(finished.load());
 }
 
-TEST_CASE("default_thread_count is at least one", "[runtime][worker_pool]") {
-    CHECK(runtime::default_thread_count() >= 1);
+TEST_CASE("decode_thread_count separates the decode pool from the compute budget",
+          "[runtime][worker_pool]") {
+    // The two budgets are different numbers on purpose: decode is
+    // memory-latency bound and pays for threads past the core count, compute is
+    // not and does not. Measured pinned at 2 cores, the suite went 3247ms ->
+    // 2832ms with a doubled pool; at 8 cores the same doubling LOST 9%. So the
+    // policy has to bend at both ends, and this pins that shape.
+    const std::size_t cores = runtime::compute_thread_count();
+    const std::size_t decode = runtime::decode_thread_count();
+
+    // Never fewer decode threads than cores -- that would starve the scan
+    // pipeline, which is the one consumer sized against the pool.
+    CHECK(decode >= cores);
+    // And never unbounded: past the memory system's saturation point the extra
+    // threads are contention, which is why this is a clamp and not a multiplier.
+    CHECK(decode <= std::max<std::size_t>(cores, 2 * cores));
+
+    if (cores == 1) {
+        // One core has nothing to overlap, and a second pool thread would flip
+        // the `pool.size() < 2` guards on -- buying pipeline machinery for a
+        // workload that cannot use it. Measured a 3.5% loss.
+        CHECK(decode == 1);
+    }
+}
+
+TEST_CASE("compute_thread_count is at least one", "[runtime][worker_pool]") {
+    CHECK(runtime::compute_thread_count() >= 1);
     CHECK(runtime::process_worker_pool().size() >= 1);
 }
 

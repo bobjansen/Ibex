@@ -498,6 +498,14 @@ struct ParallelIslandStats {
     std::atomic<std::uint64_t> parallel_islands{0};  ///< islands run on worker threads
     std::atomic<std::uint64_t> serial_islands{0};    ///< islands below the grain threshold
     std::atomic<std::uint64_t> morsels{0};           ///< morsels those islands partitioned into
+    /// Streamed scan pipelines, with or without fused row-local maps, that have
+    /// no whole-table boundary between the source and the next breaker.
+    std::atomic<std::uint64_t> pipelined_scans{0};
+    /// Bounded producer/consumer stages inserted after a streamable breaker.
+    /// A stage owns one pull chain and publishes its ordered output while its
+    /// parent is already processing earlier chunks. This makes scheduler
+    /// activation observable separately from source-level scan pipelining.
+    std::atomic<std::uint64_t> pipelined_stages{0};
     /// Islands whose head operator was absorbed into a range-evaluating source
     /// instead of being run above a gathered morsel. Observability for the
     /// zero-copy path: it is a silent optimization, so without a counter a

@@ -1,7 +1,11 @@
 # Pipelined Execution — scoping
 
-Status: **scoping only, nothing implemented.** Written 2026-08-14 from the
-thread sweep below. Read `plans/runtime-multithreading-plan.md` and
+Status: **partially implemented.** Multi-chunk correctness, streamed scans,
+concurrent scan-unit decoding, the first source-to-map pipeline, and a bounded
+join-probe handoff have landed. The general scheduler across arbitrary pipeline
+breakers remains open.
+Written 2026-08-14 from the thread sweep below; status updated 2026-08-16.
+Read `plans/runtime-multithreading-plan.md` and
 `plans/chunked-execution-plan.md` first; this proposes the thing both of them
 stop short of, and it supersedes neither.
 
@@ -183,23 +187,33 @@ missed) — but six units run one after another with a serial phase between each
 so the pool sees six short bursts instead of one long one and nothing overlaps
 them. Materialize-then-fan-out, at unit granularity.
 
-**This is Phase 2's case, made quantitatively.** Concurrent units are not a
-refinement of Phase 1; they are the thing that turns the 0.943 into the
-8-core number. Until then the switch stays off.
+**This was Phase 2's case, made quantitatively.** Concurrent scan units are
+not a refinement of Phase 1; they turn the 0.943 into a better 8-core number.
+They do *not*, by themselves, turn the operator chain into a pipeline. The
+remaining scheduler work is what must move the parallel fraction.
 
 Per-query, the 8-core split is wide (q12 −29%, q08 −9%; q01 +69%, q20 +42%,
 q19 +36%). q21 is the one query that loses single-threaded too (+13.6%) and is
 the place to start if Phase 2 lands and something still regresses.
 
-### Phase 2 — concurrent chunks — **scan slice + the join slice landed**
+### Phase 2 — concurrent chunks — **scan slice and join slices landed; scheduler open**
 
-The actual win. Multiple chunks in flight through the operator chain.
+The desired end state is multiple chunks in flight through the operator chain.
+What has landed so far is narrower: multiple scan units decode concurrently,
+then their window is harvested and consumed in order. This is useful
+intra-source parallelism, but it is not pipeline concurrency.
 
 **What landed: concurrent units inside the scan.** The scan decodes a WINDOW of
-units on worker threads instead of one after another, and the window after the
-one being served is already decoding. Ordering is untouched — workers claim
-units from a shared cursor and write only their own slot; chunks are served in
-unit order with `sequence` / `row_offset` assigned on the calling thread.
+units on worker threads instead of one after another. Ordering is untouched —
+workers claim units from a shared cursor and write only their own slot; after
+the caller harvests the completed window, chunks are served in unit order with
+`sequence` / `row_offset` assigned on the calling thread.
+
+This distinction is load-bearing: the source waits for the entire window before
+it returns its first chunk, and it cannot start the next window until the
+current one has been consumed. Decode can use the pool, but downstream joins,
+aggregates, and row-local operators do not overlap with it. Treat any result
+from this slice as scan parallelism, not evidence of end-to-end scaling.
 
 Decoding a unit on a worker is safe because `LazyTable::acquire_reader` hands
 each concurrent acquisition its own reader product (that is what the reader pool
@@ -433,12 +447,119 @@ estimates that. q10 probes `orders` against an unfiltered customer table and its
 scan still abandons — now cheaply. The estimate would come from the footer-stats
 cost model behind `join_reorder`.
 
-The scheduler remains the design for running the whole chain concurrently, but
-it is a large change and this measurement does not argue for it yet.
+The scheduler remains the design for running the whole chain concurrently. The
+original thread sweep does argue for it: the current scan slice makes the
+single-core path faster but leaves Ibex at 1.66x on eight cores, versus Polars'
+3.44x. The next phase must be judged by whether it raises the implied parallel
+fraction and reaches at least Polars parity at the fixed core budget, not by a
+small operator-local win.
 
-The rest of this phase — a scheduler that runs the whole operator chain
-concurrently rather than just the scan — is unstarted, and the table below is
-still the design.
+**What landed: the first source pipeline.** A decomposable lazy scan now
+publishes units through a bounded ordered ring as soon as they complete; it no
+longer waits for a whole decode window. A downstream breaker therefore consumes
+earlier chunks while later units are still decoding. When a maximal row-local
+chain starts directly at the scan, `build_operator` builds one private chain per
+worker and the same task immediately runs its decoded unit through those maps
+before publishing it. There is no whole table or whole-window wait at either
+boundary. Empty-schema carriers, categorical dictionary unification, sequence
+order, cancellation, and backpressure are preserved at the ordered publication
+point.
+
+One pool thread is reserved for downstream parallel work when a long source can
+fill the ring and park every producer. Without that reservation a blocking
+operator can submit a batch while every pool thread is on the backpressure
+condition: the caller waits for the batch, the scan workers wait for the caller
+to drain, and neither can move. A source of at most `3 * workers` units cannot
+reach that state — the ring holds `2 * workers` and the workers have already
+claimed at most one unit each — so those common short Parquet scans retain the
+full decode budget. A one-thread pool keeps the old serial-window source.
+
+This is deliberately the first scheduler slice, not the completed scheduler.
+It covers source → optional row-local maps → breaker, including the direct
+scan-to-aggregate shape and the map chain that previously hit
+`build_parallel_island`'s materialize-before-fan-out boundary.
+
+**What landed next: a bounded join-probe handoff.** `PipelinedStageOperator`
+keeps the pull `Operator::next()` API on both sides of a breaker while a
+dedicated producer thread drives the join below it and publishes at most two
+ordered chunks. Its caller can consequently aggregate or map one probe output
+while the join pulls and probes the next. It is intentionally not a
+`WorkerPool` task: a streamed scan already owns tasks from that fixed pool, and
+using the same pool for a long-lived stage recreates the producer/backpressure
+deadlock that the scan worker reservation avoids. Cancellation wakes both queue
+waits before joining; producer errors cross the queue exactly once.
+
+The builder stages only streamable inner/semi/anti joins whose *left/probe*
+subtree contains a multi-unit deferred scan. One-chunk table joins have no
+overlap to expose and stay on the original pull path; terminal aggregates also
+stay on the caller because a hash aggregate emits only after its input ends.
+`ParallelIslandStats::pipelined_stages` and the deferred four-unit join test
+make both the gate and ordering observable.
+
+This is the breaker-output mechanism Phase 2 needed, but it is not yet a
+general scheduler: aggregate outputs, other semi-blocking probe paths, shared
+stage admission, and retirement of the materialized-island executor remain
+open. The stage is also not a scaling win yet. A same-binary release screening
+run at SF-1 (five timed iterations, not interleaved) measured 4 cores
+1208→1255 ms (+3.9%, query geomean 1.042) and 8 cores 1070→1075 ms (+0.5%,
+geomean 1.018). Treat that as a negative result, not a benchmark claim: the
+general scheduler needs progress-aware admission and a repeated interleaved
+sweep before this stage can satisfy Phase 2's performance gate.
+
+PDS-H SF-1, pinned cores, whole-script mode, release builds at `8f1e349`
+versus this slice (warmup 1-2, 5-7 timed iterations):
+
+| cores | baseline total | pipeline total | total delta | query geomean |
+|---|---:|---:|---:|---:|
+| 1 | 1976 ms | 1913 ms | -3.2% | 0.963 |
+| 2 | 1583 ms | 1542 ms | -2.5% | 0.963 |
+| 4 | 1355 ms | 1292 ms | -4.6% | 0.935 |
+| 8 | 1141 ms | 1092 ms | -4.3% | 0.964 |
+
+The implied parallel fraction moves only about one percentage point (48% to
+49% from the 1/8 totals), so this is a useful source-overlap win, not yet the
+curve-changing scheduler the phase is aiming for. q01 is consistently about
+14% faster at eight cores; q22 is the consistent outlier at +12-19%. The
+phase's original no-regression bar was explicitly loosened for this slice on
+2026-08-16, so q22 remains follow-up work rather than a reason to keep the
+pipeline disabled.
+
+SF-4 makes both the scaling benefit and a low-core scheduling defect clearer.
+The table below is the mean of two order-balanced sweeps of the same baseline
+and worktree, with one warmup and five timed iterations per query in each
+sweep. Higher scale factors are timing-only because the official qualification
+answers in this repository apply only to SF-1.
+
+| cores | baseline total | pipeline total | total delta | query geomean |
+|---|---:|---:|---:|---:|
+| 1 | 8305 ms | 8419 ms | +1.4% | 1.000 |
+| 2 | 6309 ms | 6742 ms | +6.9% | 1.077 |
+| 4 | 5274 ms | 5242 ms | -0.6% | 0.951 |
+| 8 | 4533 ms | 4366 ms | -3.7% | 0.953 |
+
+The one-core geomean is neutral, as expected because the scan pipeline is
+disabled for a one-thread pool; its total is dominated by noisy long-tail
+queries and is a control rather than evidence of pipeline overhead. At four
+and eight cores the broad query geomean improves about 4.7-4.9%, and the 1/8
+totals move the implied parallel fraction from about 52% to 55%. q18 remains
+the large counterexample (+24% at four cores, +13% at eight); q20 is +10% at
+four cores and q17 is +12% at eight.
+
+Two cores expose a separate policy cliff. Long sources reserve one of the two
+pool threads to avoid producer/breaker deadlock, leaving a single decode
+producer while still paying the pipeline handoff cost. The suite is +6.9%,
+with q06 +47%, q04 +24%, and q12 +24%. The next scheduler slice must replace
+that static reservation with progress-aware admission/backpressure (or decline
+the pipeline when it cannot retain useful producer parallelism). The relaxed
+no-regression bar permits keeping this first slice enabled, but the two-core
+crossover and q18 are now named follow-up gates rather than noise to average
+away.
+
+The rest of this phase must retain the same bounded-queue contract: a source
+may publish completed units as they become ready, row-local stages may consume
+and publish morsels independently, and a blocking stage supplies backpressure
+before the next pipeline. A whole-window `wait()` at the source boundary is
+expressly not sufficient.
 
 Requires deciding, per operator, which of three it is:
 
@@ -472,8 +593,10 @@ scheduler and the materialize-before-fan-out invariant can go. Not before.
 - **Suite**: `ctest` (1574) plus `scripts/ibex-e2e.sh` at each phase.
 - **Performance**: `run_bench.sh` archives + `compare_runs.py`, which reports a
   reference engine's drift so a box-condition change cannot be read as a result.
-  Repeat the 1/2/4/8 sweep at each phase; the number that must move is the
-  **implied parallel fraction**, not the wall time.
+  Repeat the 1/2/4/8 sweep at each phase. The scheduler's acceptance gate is
+  **at least Ibex/Polars multi-core parity at the same pinned core budget**;
+  the leading diagnostic is the **implied parallel fraction**, not a
+  single-core or operator-local wall-time change.
 - **Interleaved A/B with a control query** for anything narrower, per the
   methodology that caught three false positives on 2026-08-14.
 
@@ -488,7 +611,7 @@ scheduler and the materialize-before-fan-out invariant can go. Not before.
   has run out of road. `plans/runtime-multithreading-plan.md` Phase 4 remains
   open for specific gaps, but it is not the answer to the curve above.
 
-## Open questions to settle before Phase 2
+## Open questions to settle before the scheduler slice
 
 1. Where does the scheduler live — inside `build_operator`'s seam (the
    `execution-plan-seam-plan.md` Option B position), or above it?

@@ -12818,6 +12818,92 @@ TEST_CASE("interpret rejects nested execution while a query lease is held", "[ru
 
 namespace {
 
+struct PipelineReaderState {
+    std::atomic<int> active{0};
+    std::atomic<int> max_active{0};
+    std::atomic<int> products{0};
+};
+
+class PipelineReader final : public runtime::LazySourceReader {
+   public:
+    explicit PipelineReader(std::shared_ptr<PipelineReaderState> state)
+        : state_(std::move(state)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        return {{.start = 0, .rows = 1000},
+                {.start = 1000, .rows = 1000},
+                {.start = 2000, .rows = 1000},
+                {.start = 3000, .rows = 1000}};
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
+        -> std::expected<runtime::Table, std::string> override {
+        if (unit == nullptr) {
+            return std::unexpected("pipeline reader expected a source unit");
+        }
+        const int active = state_->active.fetch_add(1) + 1;
+        int observed = state_->max_active.load();
+        while (active > observed && !state_->max_active.compare_exchange_weak(observed, active)) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+        std::vector<std::size_t> rows;
+        if (selection == nullptr) {
+            rows.reserve(unit->rows);
+            for (std::size_t row = unit->start; row < unit->start + unit->rows; ++row) {
+                rows.push_back(row);
+            }
+        } else {
+            for (const std::size_t row : *selection) {
+                if (row >= unit->start && row < unit->start + unit->rows) {
+                    rows.push_back(row);
+                }
+            }
+        }
+
+        runtime::Table out;
+        for (const auto& name : names) {
+            if (name != "x") {
+                state_->active.fetch_sub(1);
+                return std::unexpected("pipeline reader received an unknown column");
+            }
+            std::vector<std::int64_t> values;
+            values.reserve(rows.size());
+            for (const std::size_t row : rows) {
+                values.push_back(static_cast<std::int64_t>(row));
+            }
+            out.add_column("x", Column<std::int64_t>{std::move(values)});
+        }
+        out.logical_rows = rows.size();
+        state_->active.fetch_sub(1);
+        return out;
+    }
+
+   private:
+    std::shared_ptr<PipelineReaderState> state_;
+};
+
+auto make_pipeline_deferred(const std::shared_ptr<PipelineReaderState>& state)
+    -> runtime::DeferredScanRegistry {
+    runtime::Table schema;
+    schema.add_column("x", Column<std::int64_t>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), 4000,
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            state->products.fetch_add(1);
+            return runtime::LazySourceReaderPtr{std::make_unique<PipelineReader>(state)};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace("df", runtime::DeferredScan{.lazy = std::move(lazy),
+                                                 .conjuncts = {},
+                                                 .demand = {"x"},
+                                                 .demand_all = false,
+                                                 .key_column = {},
+                                                 .filter = nullptr});
+    return deferred;
+}
+
 // Run `program` over a two-column int table `t(k, v)` and return the result's
 // order-sensitive metadata for the table-properties rule tests below.
 auto metadata_of(const char* program) -> runtime::Table {
@@ -12952,6 +13038,116 @@ TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
     REQUIRE(x->size() == kRows - 2001);
     CHECK((*x)[0] == 1);
     CHECK((*x)[x->size() - 1] == static_cast<std::int64_t>(kRows) - 2001);
+}
+
+TEST_CASE("Scan pipeline decodes source units through row-local maps without materializing",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[filter x > 500];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(stats.pipelined_scans.load() == 1);
+    CHECK(stats.morsels.load() == 4);
+    CHECK(state->max_active.load() >= 2);
+    CHECK(state->products.load() >= 2);
+
+    const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+    REQUIRE(x != nullptr);
+    REQUIRE(x->size() == 3499);
+    CHECK((*x)[0] == 501);
+    CHECK((*x)[x->size() - 1] == 3999);
+}
+
+TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[filter x > 5000];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.pipelined_scans.load() == 1);
+    CHECK(out->rows() == 0);
+    REQUIRE(out->columns.size() == 1);
+    CHECK(out->columns[0].name == "x");
+    const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+    REQUIRE(x != nullptr);
+    CHECK(x->empty());
+}
+
+TEST_CASE("Scan pipeline feeds a blocking aggregate without a materialized scan boundary",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[select { total = sum(x) }];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.parallel_islands.load() == 0);
+    CHECK(stats.pipelined_scans.load() == 1);
+    CHECK(stats.pipelined_stages.load() == 0);
+    CHECK(stats.morsels.load() == 4);
+    const auto* total = std::get_if<Column<std::int64_t>>(out->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == 1);
+    CHECK((*total)[0] == 7'998'000);
+}
+
+TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    runtime::Table right;
+    right.add_column("x", Column<std::int64_t>{2, 1002, 2002, 3002, 5000});
+    right.add_column("w", Column<std::int64_t>{200, 400, 500, 600, 700});
+    runtime::TableRegistry registry;
+    registry.emplace("r", std::move(right));
+    auto ir = require_ir("df join r on x;");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.pipelined_stages.load() == 1);
+    const auto* w = std::get_if<Column<std::int64_t>>(out->find("w"));
+    REQUIRE(w != nullptr);
+    REQUIRE(w->size() == 4);
+    CHECK((*w)[0] == 200);
+    CHECK((*w)[1] == 400);
+    CHECK((*w)[2] == 500);
+    CHECK((*w)[3] == 600);
 }
 
 // Ordering by a Categorical column ranks its DICTIONARY and maps each row's

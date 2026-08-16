@@ -1435,6 +1435,10 @@ extern "C" SEXP ibex_c_shutdown_runtime() {
     return R_NilValue;
 }
 
+extern "C" void ibex_shutdown_runtime_for_unload() {
+    ibex::runtime::shutdown_process_worker_pool();
+}
+
 extern "C" SEXP ibex_c_reset_session(SEXP session_sexp) {
     auto session = session_from_sexp(session_sexp);
     if (!session.has_value()) {

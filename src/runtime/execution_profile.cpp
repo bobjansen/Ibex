@@ -24,6 +24,7 @@ struct ExecutionProfileEntry {
     std::atomic<std::uint64_t> next_self_ns{0};
     std::atomic<std::uint64_t> pool_next_ns{0};
     std::atomic<std::uint64_t> source_self_ns{0};
+    std::atomic<std::uint64_t> pool_source_ns{0};
     std::atomic<std::uint64_t> span_ns{0};
     std::atomic<std::uint64_t> pool_work_ns{0};
     std::atomic<std::uint64_t> calls{0};
@@ -248,7 +249,7 @@ ExecutionProfileState::~ExecutionProfileState() {
         ibex::formatting::print(
             stderr,
             "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
-            "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} "
+            "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
             "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
             "chunks={} rows={} pool_calls={} pool_tasks={}\n",
             row->node_id, row->label,
@@ -257,6 +258,7 @@ ExecutionProfileState::~ExecutionProfileState() {
             static_cast<double>(row->source_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->span_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->pool_next_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->pool_source_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->pool_work_ns.load(std::memory_order_relaxed)) / 1.0e6,
             row_occupancy, row->calls.load(std::memory_order_relaxed),
             row->chunks.load(std::memory_order_relaxed), row->rows.load(std::memory_order_relaxed),
@@ -281,6 +283,16 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     std::uint64_t serial_self_ns = 0;
     std::uint64_t pool_total_ns = 0;
     for (const auto& row : rows) {
+        // `pool_next_ns`/`pool_source_ns` are excluded from `self` on purpose,
+        // not by omission: `source_self_ns`/`next_self_ns` already exclude
+        // time this scope spent running ON a pool thread (see
+        // `ExecutionProfileScope`'s destructor), so `self` here is exactly the
+        // work that ran on the calling thread. `pool_work_ns` is a different,
+        // coarser signal — how much worker time a `WorkerPool::submit` this
+        // operator issued consumed — and is what answers "did this operator's
+        // self-time get backed by help". Folding the two together would count
+        // the same parallelism from both axes for an operator that both ran a
+        // scope on a pool thread AND submitted its own batch.
         const std::uint64_t self = row.build_self_ns + row.next_self_ns + row.source_self_ns;
         self_total_ns += self;
         pool_total_ns += row.pool_work_ns;
@@ -331,6 +343,7 @@ auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnap
             .source_self_ns = row->source_self_ns.load(std::memory_order_relaxed),
             .span_ns = row->span_ns.load(std::memory_order_relaxed),
             .pool_next_ns = row->pool_next_ns.load(std::memory_order_relaxed),
+            .pool_source_ns = row->pool_source_ns.load(std::memory_order_relaxed),
             .pool_work_ns = row->pool_work_ns.load(std::memory_order_relaxed),
             .calls = row->calls.load(std::memory_order_relaxed),
             .chunks = row->chunks.load(std::memory_order_relaxed),
@@ -365,7 +378,29 @@ ExecutionProfileScope::~ExecutionProfileScope() {
     if (phase_ == ProfilePhase::Build) {
         entry_->build_self_ns.fetch_add(self, std::memory_order_relaxed);
     } else if (phase_ == ProfilePhase::Source) {
-        entry_->source_self_ns.fetch_add(self, std::memory_order_relaxed);
+        // `LazyTable::decode_columns`/`scan_key_filter` run this scope from
+        // whichever thread claims a `SourceUnit` — a `PipelinedScanOperator`
+        // worker as often as the calling thread — so `source_self_ns` must
+        // make the same on/off-pool split `next_self_ns` does below, or every
+        // decode a scan pipeline fans out reads as 100% serial regardless of
+        // how many threads actually ran it.
+        //
+        // This was not a theoretical gap: traced live on PDS-H q19, `source
+        // decode selected` reported self_ms=137 / pool_work_ms=4 while a
+        // per-call thread-id trace showed the SAME decode spread across 8
+        // distinct pool threads. `pool_source_ns` is diagnostic-only, the same
+        // as `pool_next_ns` — excluded from `summarize_execution_profile`'s
+        // self/serial totals on purpose, because `WorkerPool::submit`'s own
+        // `pool_work_ns` attribution is a separate, coarser mechanism (one
+        // snapshot per `submit()` call) that already answers "how much of this
+        // operator's declared work went to a worker"; folding a per-call source
+        // signal into the same total would double-book the same parallelism
+        // two different ways.
+        if (on_worker_pool_thread()) {
+            entry_->pool_source_ns.fetch_add(self, std::memory_order_relaxed);
+        } else {
+            entry_->source_self_ns.fetch_add(self, std::memory_order_relaxed);
+        }
     } else {
         if (on_worker_pool_thread()) {
             entry_->pool_next_ns.fetch_add(self, std::memory_order_relaxed);

@@ -255,8 +255,20 @@ struct ProcessWorkerPool {
 };
 
 auto process_worker_pool_state() -> ProcessWorkerPool& {
-    static ProcessWorkerPool state;
-    return state;
+    // Deliberately never destroy this registry at CRT/process teardown.
+    //
+    // On Windows, RStudio's R-session shutdown reaches C++ static destruction
+    // after its worker-thread bookkeeping has started to disappear. Destroying
+    // a pool then attempts to join those threads and can leave rsession.exe
+    // stuck in WaitForSingleObject. The operating system owns process teardown
+    // and reclaims this tiny registry and any still-live workers atomically.
+    //
+    // This is not a leak on an ordinary DLL unload: R_unload_ibex() calls
+    // shutdown_process_worker_pool() first, which joins and releases `pool`.
+    // The heap registry itself must outlive the DLL's static destruction so
+    // that process exit does not perform a second, unsafe teardown.
+    static auto* state = new ProcessWorkerPool();  // NOLINT(cppcoreguidelines-owning-memory)
+    return *state;
 }
 
 }  // namespace

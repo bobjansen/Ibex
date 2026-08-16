@@ -1148,19 +1148,19 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                     .min_args = 1,
                     .max_args = 1,
                     .scalar_kernel = ScalarKernel::StringLength,
-                    .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
+                    .infer = [](std::string_view function_name, const std::vector<ExprType>& a) -> IT {
                         if (a[0] != ExprType::String) {
-                            return std::unexpected(std::string(name) + ": argument must be String");
+                            return std::unexpected(std::string(function_name) + ": argument must be String");
                         }
                         return ExprType::Int;
                     },
-                    .exec = ScalarExec{.eval = [](std::string_view name,
+                    .exec = ScalarExec{.eval = [](std::string_view function_name,
                                                   const std::vector<ExprValue>& a) -> IV {
                         const auto* value = std::get_if<std::string>(a.data());
                         if (value == nullptr) {
-                            return std::unexpected(std::string(name) + ": argument must be String");
+                            return std::unexpected(std::string(function_name) + ": argument must be String");
                         }
-                        if (name == "byte_length") {
+                        if (function_name == "byte_length") {
                             return ExprValue{static_cast<std::int64_t>(value->size())};
                         }
                         return ExprValue{utf8_codepoint_count(*value)};

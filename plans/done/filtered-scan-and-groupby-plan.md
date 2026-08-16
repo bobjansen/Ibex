@@ -5,6 +5,10 @@ Date: 2026-07-14
 Baseline: PDS-H SF-1, single-threaded, warm page cache, `build-release/` at
 `ed21794` (join rework + NumericCast kernel committed)
 
+Archived as a completed investigation. Its `select_bounds` result shipped; the
+remaining recommendations predate the later decode-fusion and parallel
+group-discovery work and are historical evidence, not an active queue.
+
 ## Standings after the join work
 
 Full-suite run (user's `run_bench.sh`, 2026-07-14 16:24):
@@ -78,7 +82,7 @@ selection, the worse the ratio (q10's 25% → 1.60× vs q03's 54% → 1.20×):
 per-value overhead and Skip-gap churn grow relative to bytes delivered.
 
 This is the already-diagnosed conclusion of
-`plans/parquet-filtering-scan-observations.md`: rearranging Skip/ReadBatch
+`plans/done/parquet-filtering-scan-observations.md`: rearranging Skip/ReadBatch
 above Apache's public API was measured neutral-or-slower; the next step must
 run **inside the encoding decoder** (dense-decode the block, gather survivors)
 — "direct per-row-group decode + selection-aware late materialization are ONE
@@ -145,7 +149,7 @@ Costs, in order:
 2. ~~`select_bounds` reserve~~ — **DONE** (3e8a46d), q03 scan 47.1 → 43.3ms.
 3. The in-decoder filtered decode (finding 1) — the big one, and now the only
    remaining lever on the scan side; plan it against
-   `plans/parquet-filtering-scan-observations.md`'s rejected-experiments list
+   `plans/done/parquet-filtering-scan-observations.md`'s rejected-experiments list
    so nothing is re-run. **Re-profile first**: findings here predate the join
    rework, null-free fast paths, and the reserve fix.
 4. Group-key arena (finding 2.2) — now the leading q10 aggregate item, since

@@ -1,4 +1,4 @@
-# Pipelined Execution — scoping
+# Pipelined Execution
 
 Status: **partially implemented.** Multi-chunk correctness, streamed scans,
 concurrent scan-unit decoding, the first source-to-map pipeline, and a bounded

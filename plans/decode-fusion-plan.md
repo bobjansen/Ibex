@@ -1,6 +1,6 @@
 # Fusing whole-script optimization with decoding
 
-Status: Stages 1–3 IMPLEMENTED 2026-07-16 (uncommitted); Stage 4 not started.
+Status: Stages 1–3 implemented; Stage 4 not started.
 See "Implementation notes" at the bottom for what landed and what the
 whole-script benchmark mode now measures.
 Goal: no field is decoded (or materialized) unless it participates in the
@@ -125,7 +125,7 @@ Arrow/AWS-SDK dlopen noise per run.)
 ### Stage 4 — READ THIS BEFORE WRITING ANY DECODER CODE
 
 **Stage 4 as originally drafted below is largely already-rejected work.** The
-2026-07-16 re-profile plus `plans/parquet-filtering-scan-observations.md`
+2026-07-16 re-profile plus `plans/done/parquet-filtering-scan-observations.md`
 change the picture:
 
 - Points (2) and (3) of the draft — dense-decode the block, evaluate the
@@ -167,7 +167,7 @@ discarding the bitmap entirely when the column proves null-free.
 
 **Recommended next single-thread work is NOT here.** The observations doc's own
 conclusion after decomposing q13 stands: decode is no longer the dominant term;
-the join and group-by are. See `plans/filtered-scan-and-groupby-plan.md`
+the join and group-by are. See `plans/done/filtered-scan-and-groupby-plan.md`
 finding 2.2 (per-group Key boxing / malloc churn, ~12% of q10's aggregate) —
 and note its finding 2.1 (faster string hash) is now **refuted and reverted**.
 
@@ -177,9 +177,9 @@ Today the seam is `ColumnDecodeFn(names, selection)`
 (`include/ibex/runtime/lazy_table.hpp:23`): `project_where` fully decodes
 predicate columns, computes a selection in the runtime, then decodes the
 rest per-value through Arrow `ReadBatch`/`Skip` glue — measured at ~44% of
-q03's scan statement (see `plans/filtered-scan-and-groupby-plan.md`,
+q03's scan statement (see `plans/done/filtered-scan-and-groupby-plan.md`,
 finding 1; per-row-group experiments in
-`plans/parquet-filtering-scan-observations.md`).
+`plans/done/parquet-filtering-scan-observations.md`).
 
 Extend the seam to a request struct — demanded columns **plus the pushed
 conjuncts** — so the parquet plugin can, per row group:

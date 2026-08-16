@@ -173,7 +173,7 @@ than promote that disconnected segmenter onto the hot path, `build_operator()`
 authoritative and gains one eligibility pass it consults at each `Passthrough`
 chain to choose a parallel-island operator or the existing serial chain. This
 decision fork, and the prerequisite work of establishing that single seam before
-any parallel code lands, is [execution-plan-seam-plan.md](execution-plan-seam-plan.md);
+any parallel code lands, is [execution-plan-seam-plan.md](done/execution-plan-seam-plan.md);
 Option B is the chosen branch.
 
 Logical planning and optimization remain responsible for plan shape, predicate
@@ -1303,6 +1303,18 @@ scalar, pipeline, and PDS-H workloads. A zero-copy result that regresses
 ordinary Ibex execution is not an acceptable migration.
 
 ## Phase 3b — Parallel Sources and I/O
+
+**Status update (2026-08-16): first source slice landed.** `LazyTable` now
+streams Parquet row groups in bounded, ordered units; units decode concurrently
+with independent reader products; a direct source or maximal row-local map chain
+can publish completed units to its downstream breaker without waiting for a
+decode window. The first bounded join-probe output handoff also landed. The
+implementation preserves pushdown, cancellation, backpressure, and categorical
+dictionary unification. See `plans/pipelined-execution-plan.md` for its SF-1
+and SF-4 measurements, including the explicitly unresolved two-core admission
+problem. This is not the general source scheduler or full Phase 3b acceptance:
+CSV, TSAN coverage, generalized source partitioning, and progress-aware
+admission remain open.
 
 Build bounded source concurrency on the Phase 3a ownership and backend
 contracts:

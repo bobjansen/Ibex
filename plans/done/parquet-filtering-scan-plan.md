@@ -1,5 +1,9 @@
 # Filtering Parquet scan: direct decode + late materialization
 
+Status: **complete and archived.** The implementation and its measured boundary
+are retained here; later decoder work is tracked by decode fusion and parallel
+source execution.
+
 Implemented in `588d8e5` and `400315c`. Detailed profiles, Polars comparison,
 rejected decoder prototypes, and follow-up directions are recorded in
 [`parquet-filtering-scan-observations.md`](parquet-filtering-scan-observations.md).

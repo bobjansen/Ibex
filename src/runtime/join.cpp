@@ -9,6 +9,7 @@
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstdlib>
@@ -464,8 +465,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                      const ScalarRegistry* scalars, PredicateMaskEvaluator mask_evaluator,
                      const ir::JoinSuffixPolicy& suffix,
                      const std::vector<ir::OrderKey>& pending_order, ir::NullMatch null_match,
-                     const ir::JoinExpect& expect, ir::MatchSelection take)
-    -> std::expected<Table, std::string> {
+                     const ir::JoinExpect& expect, ir::MatchSelection take,
+                     const ExecutionContext* exec) -> std::expected<Table, std::string> {
     if (predicate == nullptr && kind != ir::JoinKind::Cross && keys.empty()) {
         return std::unexpected("join requires at least one key");
     }
@@ -1114,6 +1115,86 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         return join_failure(output);
     }
 
+    // ── Parallel probe-scan fan-out ──────────────────────────────────────
+    // The probe scan is the largest serial block left in this function: on
+    // PDS-H (SF-2, 8 cores) it is 120ms of q13's left join, 33ms of q05, 21ms
+    // of q09 and 18ms of q20 — the joins that never reach
+    // `ChunkedInnerJoinOperator`, which is where W1's parallel probe lives.
+    // Those are exactly the shapes the chunked operator excludes: a LEFT join
+    // (q13) and multi-key joins (q05/q09/q20).
+    //
+    // Same contract as `probe_ranges_parallel` there, for the same reason:
+    // ranges are contiguous and their parts concatenate in range order, and
+    // each range appends in row order, so the result is byte-identical to the
+    // serial loop however the workers interleave. The build index is complete
+    // and read-only by now — `RowKeyIndex::find` is const and the fast paths
+    // probe a `robin_hood` map they no longer write — so no locking is needed.
+    const auto probe_workers = [&](std::size_t n) -> std::size_t {
+        // Below this the fan-out and the concatenation cost more than the
+        // probes they spread; the same threshold the chunked probe uses.
+        constexpr std::size_t kMinProbeRows = 1U << 14U;
+        if (exec == nullptr || !exec->parallel || on_worker_pool_thread() || n < kMinProbeRows ||
+            !parallel_join_probe_enabled()) {
+            return 0;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t budget =
+            exec->parallel_threads != 0 ? exec->parallel_threads : pool.size();
+        const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
+        return workers < 2 ? 0 : workers;
+    };
+
+    // Run `body(begin, end, out_li, out_ri)` over contiguous ranges of [0, n)
+    // and append the parts to `li`/`ri` in range order. Returns false when the
+    // shape does not qualify and the caller should run `body(0, n, li, ri)`.
+    //
+    // Per-worker output rather than count-then-fill: counting first would probe
+    // the hash table twice per row, and a second cache-missing lookup per probe
+    // row costs more than the one concatenating memcpy it would save.
+    const auto scan_ranges_parallel = [&](std::size_t n, std::vector<std::size_t>& li,
+                                          std::vector<std::size_t>& ri, const auto& body) -> bool {
+        const std::size_t workers = probe_workers(n);
+        if (workers == 0) {
+            return false;
+        }
+        struct Part {
+            std::vector<std::size_t> li;
+            std::vector<std::size_t> ri;
+        };
+        std::vector<Part> parts(workers);
+        auto& pool = process_worker_pool();
+        const std::size_t grain = (n + workers - 1) / workers;
+        {
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                const std::size_t begin = w * grain;
+                const std::size_t end = std::min(n, begin + grain);
+                if (begin >= end) {
+                    return;
+                }
+                // One match per row is the common case; a fan-out join grows
+                // past it, which is what a vector is for.
+                parts[w].li.reserve(end - begin);
+                parts[w].ri.reserve(end - begin);
+                body(begin, end, parts[w].li, parts[w].ri);
+            });
+            batch.wait();
+        }
+        std::size_t total = 0;
+        for (const auto& part : parts) {
+            total += part.li.size();
+        }
+        li.reserve(li.size() + total);
+        ri.reserve(ri.size() + total);
+        for (auto& part : parts) {
+            li.insert(li.end(), part.li.begin(), part.li.end());
+            ri.insert(ri.end(), part.ri.begin(), part.ri.end());
+        }
+        if (exec->parallel_stats != nullptr) {
+            exec->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    };
+
     // ── Helper: build index arrays from a right-row → left-matches lookup ─
     // Used by the small-left/large-right paths. Probes the index ONCE per
     // right row, in scan order, and emits matches immediately in that same
@@ -1167,21 +1248,37 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_matched_flags.assign(n_right, 0U);
         }
 
-        for (std::size_t r = 0; r < n_right; ++r) {
-            const std::span<const std::size_t> matches = left_matches_for_right_row(r);
-            if (matches.empty()) {
-                continue;
-            }
-            for (const std::size_t l : matches) {
-                li.push_back(l);
-                ri.push_back(r);
-                if (preserve_left_rows) {
-                    left_matched_flags[l] = 1U;
+        // One body for both paths, so the parallel and serial results cannot
+        // drift: the parallel one runs it per range, the serial one once.
+        //
+        // `left_matched_flags` is the only cross-range write — a left row can
+        // be matched from any right row — so it goes through `atomic_ref`. The
+        // store is relaxed and always the same value, which on every target
+        // here is the plain byte store the serial path already did; it is
+        // present to make the race well defined, not to order anything.
+        // `right_matched_flags[r]` needs none of that: `r` is the range's own.
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t r = begin; r < end; ++r) {
+                const std::span<const std::size_t> matches = left_matches_for_right_row(r);
+                if (matches.empty()) {
+                    continue;
+                }
+                for (const std::size_t l : matches) {
+                    out_l.push_back(l);
+                    out_r.push_back(r);
+                    if (preserve_left_rows) {
+                        std::atomic_ref<std::uint8_t>(left_matched_flags[l])
+                            .store(1U, std::memory_order_relaxed);
+                    }
+                }
+                if (preserve_right_rows) {
+                    right_matched_flags[r] = 1U;
                 }
             }
-            if (preserve_right_rows) {
-                right_matched_flags[r] = 1U;
-            }
+        };
+        if (!scan_ranges_parallel(n_right, li, ri, scan)) {
+            scan(0, n_right, li, ri);
         }
 
         if (preserve_left_rows) {
@@ -1225,37 +1322,47 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             right_matched_flags.assign(n_right, 0U);
         }
 
-        for (std::size_t l = 0; l < n_left; ++l) {
-            const std::span<const std::size_t> matches = right_matches_for_left_row(l);
-            const bool has_match = !matches.empty();
-            if (semi_join) {
-                if (has_match) {
-                    li.push_back(l);
-                    ri.push_back(kNull);
+        // As in the right scan: one body, run per range in parallel or once
+        // serially. Here the cross-range write is `right_matched_flags` —
+        // a right row can be matched from any left row.
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                const std::span<const std::size_t> matches = right_matches_for_left_row(l);
+                const bool has_match = !matches.empty();
+                if (semi_join) {
+                    if (has_match) {
+                        out_l.push_back(l);
+                        out_r.push_back(kNull);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (anti_join) {
+                if (anti_join) {
+                    if (!has_match) {
+                        out_l.push_back(l);
+                        out_r.push_back(kNull);
+                    }
+                    continue;
+                }
                 if (!has_match) {
-                    li.push_back(l);
-                    ri.push_back(kNull);
+                    if (preserve_left_rows) {
+                        out_l.push_back(l);
+                        out_r.push_back(kNull);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (!has_match) {
-                if (preserve_left_rows) {
-                    li.push_back(l);
-                    ri.push_back(kNull);
-                }
-                continue;
-            }
-            for (const std::size_t r : matches) {
-                li.push_back(l);
-                ri.push_back(r);
-                if (preserve_right_rows) {
-                    right_matched_flags[r] = 1U;
+                for (const std::size_t r : matches) {
+                    out_l.push_back(l);
+                    out_r.push_back(r);
+                    if (preserve_right_rows) {
+                        std::atomic_ref<std::uint8_t>(right_matched_flags[r])
+                            .store(1U, std::memory_order_relaxed);
+                    }
                 }
             }
+        };
+        if (!scan_ranges_parallel(n_left, li, ri, scan)) {
+            scan(0, n_left, li, ri);
         }
 
         if (preserve_right_rows) {

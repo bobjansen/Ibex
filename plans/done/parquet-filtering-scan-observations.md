@@ -9,7 +9,7 @@ Primary commits:
 
 This note records the implementation results, profiles, Polars comparison,
 failed experiments, and remaining optimization boundary after executing
-`plans/parquet-filtering-scan-plan.md`. It is intentionally more detailed than
+`plans/done/parquet-filtering-scan-plan.md`. It is intentionally more detailed than
 the commit messages so that the rejected paths do not have to be rediscovered.
 
 ## Executive summary

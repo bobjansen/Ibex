@@ -9,7 +9,7 @@ metadata:
 # Proposal: `exists` subquery terms
 
 Status: **proposed**, not built. Follows the shipped correlated scalar subquery
-(`plans/correlated-subquery-q02-plan.md`, SPEC 5.7), whose capture machinery
+(`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7), whose capture machinery
 this reuses wholesale.
 
 ## Start here: `exists` buys no new queries by itself

@@ -9,7 +9,7 @@ metadata:
 # Proposal: `in` / `not in` subquery terms
 
 Status: **proposed**, not built. Reuses the capture/decorrelation machinery of
-the shipped scalar subquery (`plans/correlated-subquery-q02-plan.md`, SPEC 5.7)
+the shipped scalar subquery (`plans/done/correlated-subquery-q02-plan.md`, SPEC 5.7)
 and is a close sibling of the `exists` proposal (`plans/exists-subquery-plan.md`).
 
 ## `in` is not a scalar, and there are two of them

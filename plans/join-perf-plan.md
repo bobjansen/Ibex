@@ -9,7 +9,7 @@ Baseline: PDS-H/TPC-H SF-1, single-threaded, warm page cache, `build-release/`
 
 As of today Ibex is at **geomean parity with polars-st** across the 8 implemented
 PDS-H queries (polars-st 1.1x by geomean; Ibex *wins* q01 and q19). Scan/decode
-work is finished: `plans/parquet-filtering-scan-observations.md` records that
+work is finished: `plans/done/parquet-filtering-scan-observations.md` records that
 dense string decode is now at Apache's floor (55ms microbenchmark vs Polars'
 57ms), and that the three remaining scan ideas — a native encoding decoder, a
 decode arena, and mmap — were each measured and **rejected**. Do not re-run them.

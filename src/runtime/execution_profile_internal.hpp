@@ -26,6 +26,7 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t source_self_ns = 0;
     std::uint64_t span_ns = 0;
     std::uint64_t pool_next_ns = 0;
+    std::uint64_t pool_source_ns = 0;
     std::uint64_t pool_work_ns = 0;
     std::uint64_t calls = 0;
     std::uint64_t chunks = 0;

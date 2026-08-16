@@ -247,11 +247,39 @@ auto default_thread_count() -> std::size_t {
     return hardware == 0 ? 1 : static_cast<std::size_t>(hardware);
 }
 
+namespace {
+
+struct ProcessWorkerPool {
+    std::mutex mutex;
+    std::unique_ptr<WorkerPool> pool;
+};
+
+auto process_worker_pool_state() -> ProcessWorkerPool& {
+    static ProcessWorkerPool state;
+    return state;
+}
+
+}  // namespace
+
 auto process_worker_pool() -> WorkerPool& {
-    // Function-local static: constructed on first use (thread-safe since C++11)
-    // and joined during normal process teardown.
-    static WorkerPool pool(default_thread_count());
-    return pool;
+    auto& state = process_worker_pool_state();
+    const std::lock_guard lock(state.mutex);
+    if (state.pool == nullptr) {
+        state.pool = std::make_unique<WorkerPool>(default_thread_count());
+    }
+    return *state.pool;
+}
+
+void shutdown_process_worker_pool() {
+    auto& state = process_worker_pool_state();
+    std::unique_ptr<WorkerPool> pool;
+    {
+        const std::lock_guard lock(state.mutex);
+        pool = std::move(state.pool);
+    }
+    // Destroy outside the singleton mutex: joining a worker can take arbitrary
+    // time, and no code needs to hold the registry lock while doing so.
+    pool.reset();
 }
 
 auto parallel_enabled_from_env() -> std::optional<bool> {

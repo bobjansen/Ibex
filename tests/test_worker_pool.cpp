@@ -107,6 +107,23 @@ TEST_CASE("default_thread_count is at least one", "[runtime][worker_pool]") {
     CHECK(runtime::process_worker_pool().size() >= 1);
 }
 
+TEST_CASE("process worker pool can be shut down and recreated", "[runtime][worker_pool]") {
+    std::atomic<std::size_t> ran{0};
+    {
+        auto batch = runtime::process_worker_pool().submit(
+            1, [&](std::size_t) { ran.fetch_add(1, std::memory_order_relaxed); });
+        batch.wait();
+    }
+    runtime::shutdown_process_worker_pool();
+
+    {
+        auto batch = runtime::process_worker_pool().submit(
+            1, [&](std::size_t) { ran.fetch_add(1, std::memory_order_relaxed); });
+        batch.wait();
+    }
+    CHECK(ran.load() == 2);
+}
+
 TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
           "[runtime][worker_pool]") {
     // The guard against nested parallelism. Anything reachable from inside a

@@ -1,0 +1,7 @@
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// Every row is rejected. A streamed lazy scan must still emit one empty schema
+// carrier: callers distinguish an empty `cat` column from a table with none.
+let back = read_parquet("tests/data/parquet_categorical_check_out.parquet");
+
+back[filter cat == "not-present"][select { cat }];

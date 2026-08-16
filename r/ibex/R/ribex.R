@@ -4,6 +4,13 @@
 knitr_state <- new.env(parent = emptyenv())
 knitr_state$sessions <- new.env(parent = emptyenv())
 
+.onUnload <- function(libpath) {
+    # The runtime owns a process-wide C++ worker pool.  R namespace unloads
+    # remove the shared library while the R process continues, so join those
+    # workers before that can happen.
+    .Call(ibex_c_shutdown_runtime)
+}
+
 `%||%` <- function(lhs, rhs) {
     if (is.null(lhs)) rhs else lhs
 }

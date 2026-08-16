@@ -11,6 +11,7 @@
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <cmath>
 #include <cstdint>
@@ -1424,6 +1425,14 @@ extern "C" SEXP ibex_c_create_session(SEXP plugin_paths_sexp) {
     Rf_classgets(ext, cls);
     UNPROTECT(2);
     return ext;
+}
+
+extern "C" SEXP ibex_c_shutdown_runtime() {
+    // R can unload a namespace while its host process remains alive (notably
+    // during RStudio restart/reload flows).  The pool executes functions from
+    // this DLL, so it must be joined before R removes the DLL mapping.
+    ibex::runtime::shutdown_process_worker_pool();
+    return R_NilValue;
 }
 
 extern "C" SEXP ibex_c_reset_session(SEXP session_sexp) {

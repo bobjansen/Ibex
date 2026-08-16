@@ -15,6 +15,7 @@ SEXP ibex_c_session_eval_file(SEXP session_sexp, SEXP path_sexp, SEXP tables_sex
                                SEXP scalars_sexp);
 SEXP ibex_c_session_table_info(SEXP session_sexp, SEXP name_sexp);
 SEXP ibex_c_session_infer_schema(SEXP session_sexp, SEXP query_sexp, SEXP lexical_names_sexp);
+SEXP ibex_c_shutdown_runtime(void);
 
 static const R_CallMethodDef call_methods[] = {
     {"ibex_c_arrow_buffer_addresses", (DL_FUNC)&ibex_c_arrow_buffer_addresses, 1},
@@ -26,6 +27,7 @@ static const R_CallMethodDef call_methods[] = {
     {"ibex_c_session_eval_ibex", (DL_FUNC)&ibex_c_session_eval_ibex, 4},
     {"ibex_c_session_infer_schema", (DL_FUNC)&ibex_c_session_infer_schema, 3},
     {"ibex_c_session_table_info", (DL_FUNC)&ibex_c_session_table_info, 2},
+    {"ibex_c_shutdown_runtime", (DL_FUNC)&ibex_c_shutdown_runtime, 0},
     {NULL, NULL, 0},
 };
 

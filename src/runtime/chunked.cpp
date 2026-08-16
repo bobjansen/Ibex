@@ -45,6 +45,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -8946,12 +8947,15 @@ auto process_island_stats() -> ParallelIslandStats* {
             if (!enabled) {
                 return;
             }
-            ibex::formatting::print(stderr,
-                                    "island stats: parallel={} serial={} morsels={} range_heads={} "
-                                    "two_phase={} parallel_fields={}\n",
-                                    stats.parallel_islands.load(), stats.serial_islands.load(),
-                                    stats.morsels.load(), stats.range_heads.load(),
-                                    stats.two_phase_filters.load(), stats.parallel_fields.load());
+            ibex::formatting::print(
+                stderr,
+                "island stats: parallel={} serial={} morsels={} "
+                "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
+                "parallel_fields={}\n",
+                stats.parallel_islands.load(), stats.serial_islands.load(), stats.morsels.load(),
+                stats.pipelined_scans.load(), stats.pipelined_stages.load(),
+                stats.range_heads.load(), stats.two_phase_filters.load(),
+                stats.parallel_fields.load());
         }
     };
     static const Reporter reporter;
@@ -10384,6 +10388,578 @@ class DeferredScanSourceOperator final : public Operator {
     std::size_t window_ = 1;
 };
 
+// A one-chunk source owned by one scan-pipeline worker. The worker replaces
+// the pending chunk for every source unit it claims, then pulls the private
+// row-local chain exactly once. Keeping the chain private is what makes its
+// mutable per-operator state safe without locks.
+class ScanPipelineSource final : public Operator {
+   public:
+    void set(Chunk chunk) { pending_ = std::move(chunk); }
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!pending_.has_value()) {
+            return std::optional<Chunk>{};
+        }
+        auto chunk = std::move(*pending_);
+        pending_.reset();
+        return std::optional<Chunk>{std::move(chunk)};
+    }
+
+   private:
+    std::optional<Chunk> pending_;
+};
+
+struct ScanPipelineWorker {
+    ScanPipelineSource* source = nullptr;
+    OperatorPtr chain;
+};
+
+[[nodiscard]] auto build_scan_pipeline_worker(const std::vector<const ir::Node*>& operators,
+                                              const ScalarRegistry* scalars,
+                                              const ExternRegistry* externs,
+                                              const ExecutionContext& exec)
+    -> std::expected<ScanPipelineWorker, std::string> {
+    auto source = std::make_unique<ScanPipelineSource>();
+    ScanPipelineWorker worker{.source = source.get(), .chain = std::move(source)};
+    for (const ir::Node* op_node : operators) {
+        auto next = build_row_local_map_operator(*op_node, std::move(worker.chain), scalars,
+                                                 externs, exec, true);
+        if (!next.has_value()) {
+            return std::unexpected("scan pipeline: " + next.error());
+        }
+        worker.chain = std::move(next.value());
+    }
+    return worker;
+}
+
+/// A bounded source-to-map pipeline.
+///
+/// Each worker claims one source unit, decodes it with all globally planned
+/// pushdowns intact, immediately runs the row-local operator chain, and
+/// publishes the result into a bounded ordered ring. The caller drains that
+/// ring into the next blocking operator. Thus decode of unit N+1, row-local
+/// work on unit N, and consumption of an earlier unit can all be live at once;
+/// there is no materialized table or whole-window wait between those stages.
+class PipelinedScanOperator final : public Operator {
+   public:
+    PipelinedScanOperator(const DeferredScan& scan, std::vector<SourceUnit> units,
+                          std::vector<ScanPipelineWorker> workers, const ExecutionContext& exec,
+                          WorkerPool& pool)
+        : scan_(&scan),
+          plan_(plan_deferred_scan(scan)),
+          units_(std::move(units)),
+          workers_(std::move(workers)),
+          exec_(&exec),
+          pool_(&pool),
+          window_(std::max<std::size_t>(workers_.size() * 2, 2)),
+          ring_(window_) {}
+
+    ~PipelinedScanOperator() override { cancel_and_join(); }
+
+    PipelinedScanOperator(const PipelinedScanOperator&) = delete;
+    auto operator=(const PipelinedScanOperator&) -> PipelinedScanOperator& = delete;
+    PipelinedScanOperator(PipelinedScanOperator&&) = delete;
+    auto operator=(PipelinedScanOperator&&) -> PipelinedScanOperator& = delete;
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (finished_) {
+            return std::optional<Chunk>{};
+        }
+        start();
+
+        while (next_sequence_ < units_.size()) {
+            std::expected<Chunk, std::string> produced = std::unexpected("missing pipeline unit");
+            {
+                std::unique_lock lock(mutex_);
+                const std::size_t slot = next_sequence_ % window_;
+                ready_.wait(lock, [&] {
+                    return ring_[slot].has_value() || cancelled_ || worker_failure_.has_value();
+                });
+                if (worker_failure_.has_value()) {
+                    auto message = std::move(*worker_failure_);
+                    lock.unlock();
+                    return fail(std::move(message));
+                }
+                if (!ring_[slot].has_value()) {
+                    lock.unlock();
+                    return fail(interrupt_requested() ? interrupt_message()
+                                                      : "scan pipeline: missing output unit");
+                }
+                produced = std::move(**ring_[slot]);
+                ring_[slot].reset();
+                ++next_sequence_;
+                ++released_;
+            }
+            space_.notify_all();
+
+            if (!produced.has_value()) {
+                return fail(std::move(produced.error()));
+            }
+            Chunk chunk = std::move(*produced);
+            if (!chunk.columns.empty() && chunk.rows() == 0) {
+                if (!empty_schema_carrier_.has_value()) {
+                    empty_schema_carrier_ = std::move(chunk);
+                }
+                continue;
+            }
+
+            empty_schema_carrier_.reset();
+            normalize_categorical_dictionaries(chunk);
+            restamp(chunk);
+            return std::optional<Chunk>{std::move(chunk)};
+        }
+
+        finish_workers();
+        finished_ = true;
+        if (empty_schema_carrier_.has_value()) {
+            auto carrier = std::move(*empty_schema_carrier_);
+            empty_schema_carrier_.reset();
+            normalize_categorical_dictionaries(carrier);
+            restamp(carrier);
+            return std::optional<Chunk>{std::move(carrier)};
+        }
+        return std::optional<Chunk>{};
+    }
+
+   private:
+    void start() {
+        if (started_) {
+            return;
+        }
+        started_ = true;
+        batch_ = pool_->submit(workers_.size(), [this](std::size_t id) { run_worker(id); });
+    }
+
+    void run_worker(std::size_t worker_id) noexcept {
+        try {
+            auto& worker = workers_[worker_id];
+            while (true) {
+                const std::size_t sequence = cursor_.fetch_add(1, std::memory_order_relaxed);
+                if (sequence >= units_.size()) {
+                    return;
+                }
+                {
+                    std::unique_lock lock(mutex_);
+                    space_.wait(lock, [&] { return cancelled_ || sequence < released_ + window_; });
+                    if (cancelled_) {
+                        return;
+                    }
+                }
+                if (interrupt_requested()) {
+                    cancel();
+                    return;
+                }
+
+                auto result = run_unit(worker, sequence);
+                {
+                    const std::scoped_lock lock(mutex_);
+                    ring_[sequence % window_] = std::move(result);
+                }
+                ready_.notify_one();
+            }
+        } catch (const std::exception& error) {
+            record_worker_failure("scan pipeline: worker exception: " + std::string(error.what()));
+        } catch (...) {
+            record_worker_failure("scan pipeline: worker threw a non-standard exception");
+        }
+    }
+
+    [[nodiscard]] auto run_unit(ScanPipelineWorker& worker, std::size_t sequence)
+        -> std::expected<Chunk, std::string> {
+        auto decoded = materialize_deferred_scan_unit(*scan_, plan_, units_[sequence], *exec_);
+        if (!decoded.has_value()) {
+            return std::unexpected(std::move(decoded.error()));
+        }
+        normalize_time_index(*decoded);
+        worker.source->set(table_to_chunk(
+            std::move(*decoded),
+            ChunkIdentity{.sequence = sequence, .row_offset = units_[sequence].start}));
+        auto produced = worker.chain->next();
+        if (!produced.has_value()) {
+            return std::unexpected(std::move(produced.error()));
+        }
+        if (!produced->has_value()) {
+            return std::unexpected("scan pipeline: row-local chain dropped a source unit");
+        }
+        Chunk chunk = std::move(**produced);
+        if (chunk.sequence != sequence) {
+            return std::unexpected("scan pipeline: row-local chain reordered a source unit");
+        }
+        return chunk;
+    }
+
+    void restamp(Chunk& chunk) noexcept {
+        chunk.sequence = emitted_sequence_++;
+        chunk.row_offset = emitted_rows_;
+        emitted_rows_ += chunk.rows();
+    }
+
+    // Parquet dictionaries are local to row groups. Ordered publication is the
+    // one serial point where chunks are remapped onto one shared dictionary,
+    // preserving the existing streamed-source contract for downstream keys.
+    void normalize_categorical_dictionaries(Chunk& chunk) {
+        using code_type = Column<Categorical>::code_type;
+        if (cat_states_.size() < chunk.columns.size()) {
+            cat_states_.resize(chunk.columns.size());
+        }
+        for (std::size_t i = 0; i < chunk.columns.size(); ++i) {
+            auto* local = std::get_if<Column<Categorical>>(chunk.columns[i].column.get());
+            if (local == nullptr) {
+                continue;
+            }
+            auto& state = cat_states_[i];
+            if (!state.has_value()) {
+                state.emplace();
+            }
+            if (state->dictionary_ptr() == local->dictionary_ptr()) {
+                continue;
+            }
+            const auto& dictionary = local->dictionary();
+            state->clear();
+            for (const auto& value : dictionary) {
+                state->push_back(value);
+            }
+            std::vector<code_type> remap(dictionary.size());
+            for (std::size_t entry = 0; entry < dictionary.size(); ++entry) {
+                remap[entry] = state->code_at(entry);
+            }
+            state->clear();
+            const auto& local_codes = local->codes();
+            std::vector<code_type> codes(local_codes.size());
+            for (std::size_t row = 0; row < local_codes.size(); ++row) {
+                codes[row] = remap[static_cast<std::size_t>(local_codes[row])];
+            }
+            chunk.columns[i].column = std::make_shared<ColumnValue>(
+                Column<Categorical>{state->dictionary_ptr(), state->index_ptr(), std::move(codes)});
+        }
+    }
+
+    void record_worker_failure(std::string message) noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (!worker_failure_.has_value()) {
+                worker_failure_ = std::move(message);
+            }
+            cancelled_ = true;
+        }
+        ready_.notify_all();
+        space_.notify_all();
+    }
+
+    void cancel() noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            cancelled_ = true;
+        }
+        ready_.notify_all();
+        space_.notify_all();
+    }
+
+    void finish_workers() {
+        if (batch_.has_value()) {
+            batch_->wait();
+            batch_.reset();
+        }
+        if (validated_) {
+            return;
+        }
+        validated_ = true;
+        for (auto& worker : workers_) {
+            auto trailing = worker.chain->next();
+            if (!trailing.has_value()) {
+                throw std::runtime_error(std::move(trailing.error()));
+            }
+            if (trailing->has_value()) {
+                throw std::runtime_error("scan pipeline: unexpected trailing output");
+            }
+        }
+    }
+
+    void cancel_and_join() noexcept {
+        cancel();
+        try {
+            finish_workers();
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+    }
+
+    [[nodiscard]] auto fail(std::string message)
+        -> std::expected<std::optional<Chunk>, std::string> {
+        finished_ = true;
+        cancel_and_join();
+        return std::unexpected(std::move(message));
+    }
+
+    const DeferredScan* scan_;
+    DeferredScanPlan plan_;
+    std::vector<SourceUnit> units_;
+    std::vector<ScanPipelineWorker> workers_;
+    const ExecutionContext* exec_;
+    WorkerPool* pool_;
+    std::size_t window_ = 2;
+    std::vector<std::optional<std::expected<Chunk, std::string>>> ring_;
+    std::vector<std::optional<Column<Categorical>>> cat_states_;
+    std::optional<Chunk> empty_schema_carrier_;
+    std::optional<WorkerPool::Batch> batch_;
+    std::atomic<std::size_t> cursor_{0};
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::condition_variable space_;
+    std::optional<std::string> worker_failure_;
+    std::size_t released_ = 0;
+    std::size_t next_sequence_ = 0;
+    std::size_t emitted_rows_ = 0;
+    std::uint64_t emitted_sequence_ = 0;
+    bool started_ = false;
+    bool cancelled_ = false;
+    bool finished_ = false;
+    bool validated_ = false;
+};
+
+/// A bounded asynchronous boundary between two pipeline segments.
+///
+/// The existing executor is pull-based, which is ideal for operator-local
+/// state but normally means a parent cannot start its work until its child has
+/// returned from `next()`. This stage retains that contract at both ends while
+/// driving its child on a dedicated scheduler thread and holding at most two
+/// ordered chunks between them. A breaker below the stage may therefore build
+/// or probe the next chunk while a row-local parent (or the next breaker) is
+/// working on the preceding one.
+///
+/// This deliberately does not borrow a WorkerPool thread. A streamed scan
+/// already owns pool tasks, and putting the stage on that same fixed pool
+/// reintroduces the saturated-pool deadlock that the scan producer's worker
+/// reservation avoids. The query lease limits this to one query, while the
+/// builder only inserts stages at breaker boundaries, so this is bounded by
+/// plan depth rather than morsel count.
+class PipelinedStageOperator final : public Operator {
+   public:
+    explicit PipelinedStageOperator(OperatorPtr child) : child_(std::move(child)) {}
+
+    ~PipelinedStageOperator() override { cancel_and_join(); }
+
+    PipelinedStageOperator(const PipelinedStageOperator&) = delete;
+    auto operator=(const PipelinedStageOperator&) -> PipelinedStageOperator& = delete;
+    PipelinedStageOperator(PipelinedStageOperator&&) = delete;
+    auto operator=(PipelinedStageOperator&&) -> PipelinedStageOperator& = delete;
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        start();
+        std::expected<std::optional<Chunk>, std::string> result = std::optional<Chunk>{};
+        {
+            std::unique_lock lock(mutex_);
+            ready_.wait(lock, [this] {
+                return !ready_chunks_.empty() || producer_done_ || failure_.has_value();
+            });
+            if (failure_.has_value()) {
+                result = std::unexpected(std::move(*failure_));
+                failure_.reset();
+            } else if (!ready_chunks_.empty()) {
+                result = std::optional<Chunk>{std::move(ready_chunks_.front())};
+                ready_chunks_.pop_front();
+            } else {
+                done_ = true;
+            }
+        }
+        space_.notify_one();
+        if (!result.has_value()) {
+            cancel_and_join();
+            return result;
+        }
+        if (done_) {
+            join();
+        }
+        return result;
+    }
+
+   private:
+    static constexpr std::size_t kCapacity = 2;
+
+    void start() {
+        if (started_) {
+            return;
+        }
+        started_ = true;
+        producer_ = std::thread([this] { produce(); });
+    }
+
+    void produce() noexcept {
+        try {
+            while (true) {
+                {
+                    std::unique_lock lock(mutex_);
+                    space_.wait(lock,
+                                [this] { return cancelled_ || ready_chunks_.size() < kCapacity; });
+                    if (cancelled_) {
+                        return;
+                    }
+                }
+
+                auto next = child_->next();
+                if (!next.has_value()) {
+                    fail(std::move(next.error()));
+                    return;
+                }
+                if (!next->has_value()) {
+                    {
+                        const std::scoped_lock lock(mutex_);
+                        producer_done_ = true;
+                    }
+                    ready_.notify_all();
+                    return;
+                }
+
+                {
+                    const std::scoped_lock lock(mutex_);
+                    if (cancelled_) {
+                        return;
+                    }
+                    // There is one producer. The capacity check immediately
+                    // before `child_->next()` therefore reserves this slot:
+                    // only the consumer can change the queue size meanwhile.
+                    ready_chunks_.push_back(std::move(**next));
+                }
+                ready_.notify_one();
+            }
+        } catch (const std::exception& error) {
+            fail("pipeline stage: producer exception: " + std::string(error.what()));
+        } catch (...) {
+            fail("pipeline stage: producer threw a non-standard exception");
+        }
+    }
+
+    void fail(std::string message) noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (!failure_.has_value()) {
+                failure_ = std::move(message);
+            }
+            producer_done_ = true;
+        }
+        ready_.notify_all();
+    }
+
+    void join() noexcept {
+        if (producer_.joinable()) {
+            producer_.join();
+        }
+    }
+
+    void cancel_and_join() noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            cancelled_ = true;
+        }
+        ready_.notify_all();
+        space_.notify_all();
+        join();
+    }
+
+    OperatorPtr child_;
+    std::thread producer_;
+    std::deque<Chunk> ready_chunks_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::condition_variable space_;
+    std::optional<std::string> failure_;
+    bool started_ = false;
+    bool producer_done_ = false;
+    bool cancelled_ = false;
+    bool done_ = false;
+};
+
+[[nodiscard]] auto make_pipelined_stage(OperatorPtr child, const ExecutionContext& exec)
+    -> OperatorPtr {
+    if (!exec.parallel || on_worker_pool_thread() || process_worker_pool().size() < 2) {
+        return child;
+    }
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->pipelined_stages.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::make_unique<PipelinedStageOperator>(std::move(child));
+}
+
+[[nodiscard]] auto make_pipelined_stage_if(OperatorPtr child, bool eligible,
+                                           const ExecutionContext& exec) -> OperatorPtr {
+    return eligible ? make_pipelined_stage(std::move(child), exec) : std::move(child);
+}
+
+[[nodiscard]] auto scan_pipeline_worker_count(const ExecutionContext& exec, std::size_t unit_count)
+    -> std::size_t {
+    auto& pool = process_worker_pool();
+    if (pool.size() < 2) {
+        // With one pool thread there is no worker to reserve for a downstream
+        // operator batch. Running the producer there can deadlock as soon as a
+        // breaker submits work and waits, so keep the serial window source.
+        return 0;
+    }
+    const std::size_t budget = exec.parallel_threads == 0 ? pool.size() : exec.parallel_threads;
+    std::size_t workers = std::min({budget, pool.size(), unit_count});
+    // A spare thread is only necessary when every pool thread could remain
+    // parked behind ring backpressure. The ring holds 2W results and workers
+    // have already claimed at most another W units, so a source of at most 3W
+    // units necessarily lets one worker exit after the first chunk is released.
+    // Smaller sources (the common Parquet shape) keep the full decode budget;
+    // longer sources reserve one thread for downstream batches.
+    if (workers == pool.size() && unit_count > workers * 3) {
+        --workers;
+    }
+    return workers;
+}
+
+[[nodiscard]] auto build_pipelined_scan(const std::vector<const ir::Node*>& operators,
+                                        bool count_as_island, const DeferredScan& scan,
+                                        std::vector<SourceUnit> units,
+                                        const ScalarRegistry* scalars,
+                                        const ExternRegistry* externs, const ExecutionContext& exec)
+    -> std::expected<OperatorPtr, std::string> {
+    const std::size_t worker_count = scan_pipeline_worker_count(exec, units.size());
+    if (worker_count == 0) {
+        return std::unexpected("scan pipeline requires a worker");
+    }
+    std::vector<ScanPipelineWorker> workers;
+    workers.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+        auto worker = build_scan_pipeline_worker(operators, scalars, externs, exec);
+        if (!worker.has_value()) {
+            return std::unexpected(std::move(worker.error()));
+        }
+        workers.push_back(std::move(*worker));
+    }
+    if (exec.parallel_stats != nullptr) {
+        if (count_as_island) {
+            exec.parallel_stats->parallel_islands.fetch_add(1, std::memory_order_relaxed);
+        }
+        exec.parallel_stats->morsels.fetch_add(units.size(), std::memory_order_relaxed);
+        exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::make_unique<PipelinedScanOperator>(scan, std::move(units), std::move(workers), exec,
+                                                   process_worker_pool());
+}
+
+/// A breaker only earns a scheduler thread when its probe input can actually
+/// publish more than one source unit. Registered tables and one-unit readers
+/// return a single chunk, so staging them merely moves the same serial call to
+/// another thread. Keep this structural test at build time: it avoids putting
+/// a speculative thread on the hot path and makes the queue capacity an
+/// overlap buffer rather than an accidental materialization boundary.
+[[nodiscard]] auto has_multi_unit_deferred_scan(const ir::Node& node, const TableRegistry& registry,
+                                                const ExecutionContext& exec) -> bool {
+    if (node.kind() == ir::NodeKind::Scan) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        if (registry.contains(scan.source_name())) {
+            return false;
+        }
+        const auto* deferred = exec.deferred_scan(scan.source_name());
+        return deferred != nullptr && deferred->filter == nullptr &&
+               deferred_scan_units(*deferred).size() > 1;
+    }
+    return std::ranges::any_of(node.children(), [&](const ir::NodePtr& child) {
+        return has_multi_unit_deferred_scan(*child, registry, exec);
+    });
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -10413,6 +10989,27 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     if (exec.parallel) {
         const auto island = analyze_parallel_island(node);
         if (island.eligible()) {
+            // A row-local chain rooted directly at a decomposable lazy scan is
+            // one physical pipeline: decode and maps run in the same worker
+            // task, and the ordered ring feeds the next breaker. This is the
+            // production replacement for the old materialize-before-fan-out
+            // island boundary. Probe scans keep their join-owned dynamic
+            // filter timing and therefore do not enter here.
+            if (stream_scans_enabled() && island.input->kind() == ir::NodeKind::Scan) {
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+                const auto& scan = static_cast<const ir::ScanNode&>(*island.input);
+                if (!registry.contains(scan.source_name())) {
+                    if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                        deferred != nullptr && deferred->filter == nullptr) {
+                        auto units = deferred_scan_units(*deferred);
+                        if (units.size() > 1 &&
+                            scan_pipeline_worker_count(exec, units.size()) >= 2) {
+                            return build_pipelined_scan(island.operators, true, *deferred,
+                                                        std::move(units), scalars, externs, exec);
+                        }
+                    }
+                }
+            }
             return build_parallel_island(island, registry, scalars, externs, exec, model_out);
         }
     }
@@ -10435,6 +11032,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 deferred != nullptr && deferred->filter == nullptr) {
                 auto units = deferred_scan_units(*deferred);
                 if (units.size() > 1) {
+                    if (exec.parallel && scan_pipeline_worker_count(exec, units.size()) > 0) {
+                        return build_pipelined_scan({}, false, *deferred, std::move(units), scalars,
+                                                    externs, exec);
+                    }
                     return std::make_unique<DeferredScanSourceOperator>(*deferred, std::move(units),
                                                                         exec);
                 }
@@ -10638,6 +11239,11 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // chunks arrive sorted on the group keys, and otherwise replays the
             // first chunk into a hash ChunkedAggregateOperator — so it is safe
             // to route the whole streamable subset here.
+            // Aggregates are often the terminal breaker and hash aggregation
+            // emits only after consuming all input. Scheduling one in its own
+            // stage in that shape buys no overlap and only creates a thread.
+            // A join below it is staged instead: its probe stream can fill the
+            // aggregate while it keeps pulling the next probe chunk.
             return std::make_unique<ChunkedSortedAggregateOperator>(
                 std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec);
         }
@@ -10767,6 +11373,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             join.null_match() == ir::NullMatch::Never && !join.expect().asserts_anything() &&
             join.take() == ir::MatchSelection::All;
         if (streamable_semi_anti) {
+            const bool stage_probe =
+                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
@@ -10781,9 +11389,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }
-            return std::make_unique<ChunkedSemiAntiJoinOperator>(std::move(left_op.value()),
-                                                                 std::move(right.value()),
-                                                                 join.kind(), &join.keys(), &exec);
+            return make_pipelined_stage_if(std::make_unique<ChunkedSemiAntiJoinOperator>(
+                                               std::move(left_op.value()), std::move(right.value()),
+                                               join.kind(), &join.keys(), &exec),
+                                           stage_probe, exec);
         }
         // `nulls equal` goes to the materialized join, which implements the
         // policy. These streaming operators hash and probe on their own and
@@ -10796,6 +11405,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             join.keys().size() == 1 && join.null_match() == ir::NullMatch::Never &&
             !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
         if (streamable_inner) {
+            const bool stage_probe =
+                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
@@ -10806,10 +11417,12 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // interprets the right subtree itself (resolve_deferred_probe).
             if (const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
                 probe.scan != nullptr) {
-                return std::make_unique<ChunkedInnerJoinOperator>(
-                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
-                    &join.pending_order());
+                return make_pipelined_stage_if(
+                    std::make_unique<ChunkedInnerJoinOperator>(
+                        std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
+                        externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
+                        &join.pending_order()),
+                    stage_probe, exec);
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
@@ -10820,9 +11433,11 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }
-            return std::make_unique<ChunkedInnerJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
-                join.suffix(), &join.pending_order());
+            return make_pipelined_stage_if(
+                std::make_unique<ChunkedInnerJoinOperator>(
+                    std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
+                    join.suffix(), &join.pending_order()),
+                stage_probe, exec);
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(

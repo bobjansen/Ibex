@@ -1142,30 +1142,32 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                   });
 
         for (const std::string_view name : {"length", "byte_length"}) {
-            m.emplace(
-                name,
-                BuiltinFn{
-                    .min_args = 1,
-                    .max_args = 1,
-                    .scalar_kernel = ScalarKernel::StringLength,
-                    .infer = [](std::string_view function_name, const std::vector<ExprType>& a) -> IT {
-                        if (a[0] != ExprType::String) {
-                            return std::unexpected(std::string(function_name) + ": argument must be String");
-                        }
-                        return ExprType::Int;
-                    },
-                    .exec = ScalarExec{.eval = [](std::string_view function_name,
-                                                  const std::vector<ExprValue>& a) -> IV {
-                        const auto* value = std::get_if<std::string>(a.data());
-                        if (value == nullptr) {
-                            return std::unexpected(std::string(function_name) + ": argument must be String");
-                        }
-                        if (function_name == "byte_length") {
-                            return ExprValue{static_cast<std::int64_t>(value->size())};
-                        }
-                        return ExprValue{utf8_codepoint_count(*value)};
-                    }},
-                });
+            m.emplace(name,
+                      BuiltinFn{
+                          .min_args = 1,
+                          .max_args = 1,
+                          .scalar_kernel = ScalarKernel::StringLength,
+                          .infer = [](std::string_view function_name,
+                                      const std::vector<ExprType>& a) -> IT {
+                              if (a[0] != ExprType::String) {
+                                  return std::unexpected(std::string(function_name) +
+                                                         ": argument must be String");
+                              }
+                              return ExprType::Int;
+                          },
+                          .exec = ScalarExec{.eval = [](std::string_view function_name,
+                                                        const std::vector<ExprValue>& a) -> IV {
+                              const auto* value = std::get_if<std::string>(a.data());
+                              if (value == nullptr) {
+                                  return std::unexpected(std::string(function_name) +
+                                                         ": argument must be String");
+                              }
+                              if (function_name == "byte_length") {
+                                  return ExprValue{static_cast<std::int64_t>(value->size())};
+                              }
+                              return ExprValue{utf8_codepoint_count(*value)};
+                          }},
+                      });
         }
 
         // pmin / pmax: 2+ comparable args of one type (Int/Float widen to Float).

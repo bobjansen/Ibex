@@ -88,6 +88,15 @@ class WorkerPool {
 /// code and would otherwise each get their own pool (the RTLD_LOCAL trap).
 [[nodiscard]] auto process_worker_pool() -> WorkerPool&;
 
+/// Stop and join the process-wide worker pool, if it has been created.
+///
+/// Hosts which unload the Ibex shared library before their process exits (R's
+/// namespace unload path is one example) must call this while code in the
+/// library is still mapped.  Joining here ensures no worker can resume into
+/// unloaded code.  A later call to process_worker_pool() creates a fresh pool,
+/// which also makes this safe for an unload/reload development cycle.
+void shutdown_process_worker_pool();
+
 /// True when the calling thread belongs to a WorkerPool.
 ///
 /// The guard against nested parallelism. Anything that may run inside a pool

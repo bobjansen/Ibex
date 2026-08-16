@@ -1054,7 +1054,7 @@ if [[ "${IBEX_R_ONLY_MODE:-0}" == "1" ]]; then
     # Hold every framework to the same budget. `taskset` bounds the process, and
     # the two variables stop Ibex's worker pool and data.table's OpenMP pool
     # from each sizing themselves from nproc and oversubscribing the pinned set.
-    export IBEX_THREADS="$R_ONLY_CORES"
+    export IBEX_CORES="$R_ONLY_CORES"
     export OMP_NUM_THREADS="$R_ONLY_CORES"
 
     mkdir -p "$R_ONLY_OUT"

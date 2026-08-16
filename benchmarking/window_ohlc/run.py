@@ -524,7 +524,7 @@ def main() -> None:
     ap.add_argument("--threads", default="auto",
                     help="thread budget applied to EVERY engine -- a fairness "
                          "invariant, not a tuning knob. An integer pins all four "
-                         "(POLARS_MAX_THREADS, IBEX_THREADS, DuckDB PRAGMA, "
+                         "(POLARS_MAX_THREADS, IBEX_CORES, DuckDB PRAGMA, "
                          "ClickHouse max_threads). '1' additionally sets "
                          "IBEX_PARALLEL=0. 'auto' = each engine's own default, "
                          "which is NOT comparable across engines.")
@@ -545,13 +545,13 @@ def main() -> None:
         # as a comparison.
         n = int(args.threads)
         os.environ["POLARS_MAX_THREADS"] = str(n)
-        os.environ["IBEX_THREADS"] = str(n)
+        os.environ["IBEX_CORES"] = str(n)
         duck_threads = n
         label = f"{n}t"
         print(f"# thread budget: {n} for every engine", file=sys.stderr)
     elif args.threads == "1":
         os.environ["POLARS_MAX_THREADS"] = "1"
-        os.environ["IBEX_THREADS"] = "1"
+        os.environ["IBEX_CORES"] = "1"
         # Ibex runs parallel islands by DEFAULT now, so pinning the other two
         # without pinning it would quietly hand Ibex threads its competitors
         # were denied -- and the headline "single-threaded, Ibex wins at every

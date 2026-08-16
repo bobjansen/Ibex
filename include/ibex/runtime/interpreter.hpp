@@ -574,8 +574,11 @@ struct ExecutionContext {
     /// value is an explicit override and is used as given.
     std::size_t parallel_grain = 0;
 
-    /// Island thread budget, or 0 to use the process pool's size
-    /// (`IBEX_THREADS`). Clamped to the pool size and to the morsel count.
+    /// Compute thread budget. `configure_parallel_from_env` pins this to
+    /// `compute_thread_count()` (`IBEX_CORES`); 0 falls back to the pool size,
+    /// which is now sized for DECODE and therefore larger, so compute paths
+    /// must not rely on that fallback. Clamped to the pool size and the morsel
+    /// count.
     std::size_t parallel_threads = 0;
 
     /// The plan's grain-size serial threshold: an island input smaller than
@@ -619,8 +622,8 @@ struct ExecutionContext {
 /// deliberately small grain is honored). Unset variables leave `exec`
 /// untouched, so this never overrides a budget the caller chose.
 ///
-/// `IBEX_THREADS` is deliberately *not* applied here: it sizes the process
-/// worker pool, which a zero `parallel_threads` defers to anyway.
+/// `IBEX_CORES` IS applied here, to `parallel_threads`: it is the compute
+/// budget, and the process pool it used to defer to is now sized for decode.
 ///
 /// This is how a benchmark run turns the executor on: parallel islands stay off
 /// by default until Phase 1's acceptance measurements say otherwise.

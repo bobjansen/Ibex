@@ -210,10 +210,10 @@ if [[ "$SKIP_REPL" == false ]]; then
     echo "▸ whole-script (parquet plugin, fixed-width decode split across row groups)"
     dec_st="$(mktemp)"
     dec_mt="$(mktemp)"
-    IBEX_THREADS=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_row_group_decode_check.ibex" >"$dec_st" 2>&1
-    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_row_group_decode_check.ibex" >"$dec_mt" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_row_group_decode_out.parquet"
@@ -265,7 +265,7 @@ if [[ "$SKIP_REPL" == false ]]; then
     # every unit after the first was once dropped, silently and with the row
     # count simply coming out short.
     str_serial="$(mktemp)"
-    IBEX_STREAM_SCAN=1 IBEX_PARALLEL=0 IBEX_THREADS=1 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_STREAM_SCAN=1 IBEX_PARALLEL=0 IBEX_CORES=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_stream_categorical_check.ibex" >"$str_serial" 2>&1
     # An all-rejected streamed scan must still preserve its empty output
@@ -316,10 +316,10 @@ if [[ "$SKIP_REPL" == false ]]; then
     # key/payload totals but not the row count.
     scan_st="$(mktemp)"
     scan_mt="$(mktemp)"
-    IBEX_THREADS=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=1 IBEX_PARALLEL=0 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_key_scan_check.ibex" \
         >"$scan_st" 2>&1
-    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_key_scan_check.ibex" \
         >"$scan_mt" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_key_scan_facts.parquet" \
@@ -350,10 +350,10 @@ if [[ "$SKIP_REPL" == false ]]; then
     # optimization ran at all.
     str_st="$(mktemp)"
     str_mt="$(mktemp)"
-    IBEX_THREADS=1 IBEX_PARALLEL=0 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=1 IBEX_PARALLEL=0 IBEX_PROFILE_OPERATORS=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_string_filter_check.ibex" \
         >"$str_st" 2>&1
-    IBEX_THREADS=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
+    IBEX_CORES=8 IBEX_PARALLEL=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" "$IBEX_ROOT/tests/data/parquet_string_filter_check.ibex" \
         >"$str_mt" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_string_filter.parquet"

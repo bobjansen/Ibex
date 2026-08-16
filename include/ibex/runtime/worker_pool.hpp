@@ -79,7 +79,7 @@ class WorkerPool {
     std::size_t threads_;
 };
 
-/// The lazily constructed process-wide pool. Sized by `default_thread_count()`
+/// The lazily constructed process-wide pool. Sized by `decode_thread_count()`
 /// on first use and reused for every query, so no query pays thread-creation
 /// cost.
 ///
@@ -105,14 +105,34 @@ void shutdown_process_worker_pool();
 /// from a worker deadlocks (and aborts loudly rather than hanging).
 [[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
 
-/// Thread budget for the compute-bound row-local island, from `IBEX_THREADS`.
-/// Unset or `auto` means `std::thread::hardware_concurrency()`; an explicit
-/// count is used as given; anything unparseable or zero falls back to 1.
+/// Thread budget for compute, from `IBEX_CORES`. Unset or `auto` means
+/// `std::thread::hardware_concurrency()`; an explicit count is used as given;
+/// anything unparseable or zero falls back to 1.
 ///
-/// The plan treats pool size as a per-workload tunable rather than a hardwired
-/// core count — an I/O- or decode-heavy stage may want more threads than cores.
-/// This is the compute budget only.
-[[nodiscard]] auto default_thread_count() -> std::size_t;
+/// This is the COMPUTE budget, and deliberately not the pool size — decode
+/// wants more threads than cores and compute measurably does not, so the two
+/// are separate numbers. `configure_parallel_from_env` pins
+/// `ExecutionContext::parallel_threads` to this, which is what every compute
+/// gate sizes itself from; `decode_thread_count()` sizes the pool.
+///
+/// Named `IBEX_CORES` rather than `IBEX_THREADS` because that is what it now
+/// means. The old name said "threads" while setting a core count and a pool
+/// size at once, which is exactly the conflation this split exists to undo.
+[[nodiscard]] auto compute_thread_count() -> std::size_t;
+
+/// Size of the process worker pool, chosen for DECODE rather than compute.
+///
+/// Two knobs, both for experiments rather than for users:
+///   * `IBEX_DECODE_THREADS` — absolute pool size, bypassing the policy.
+///   * `IBEX_DECODE_SATURATION` — the point past which extra decode threads
+///     stop paying (default 8). It is a property of the box's memory system,
+///     so sweep it on a new machine rather than trusting the default.
+/// Decode is memory-latency bound and wants more threads than cores up to the
+/// point the memory system saturates; compute does not, and clamps to
+/// `ExecutionContext::parallel_threads` instead. `IBEX_DECODE_THREADS` overrides
+/// with an absolute count (for A/B, and for boxes whose saturation point
+/// differs). See the definition for the measurements behind the policy.
+[[nodiscard]] auto decode_thread_count() -> std::size_t;
 
 /// Whether `IBEX_PARALLEL` asks the interpreter to enable parallel islands.
 /// `nullopt` when `IBEX_PARALLEL` is unset or unrecognized, so the caller keeps

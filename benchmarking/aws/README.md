@@ -143,7 +143,7 @@ scaling axes: **symbol count** at a fixed row count (`--symbols`, default
 count (`--rows`, default `5000000 20000000 50000000` at `--sweep-symbols 3`).
 
 Every engine is pinned to the same cores with `taskset` and given the same
-thread budget (`IBEX_THREADS`, `POLARS_MAX_THREADS`, DuckDB `PRAGMA threads`),
+thread budget (`IBEX_CORES`, `POLARS_MAX_THREADS`, DuckDB `PRAGMA threads`),
 so a row reads as "this engine on N cores" rather than "this engine on
 whatever pool it chose for itself" — which is the whole reason to run it on a
 clean box rather than a laptop. `--cores "8 16 32"` repeats both sweeps at each
@@ -178,7 +178,7 @@ memory bandwidth, sustained clocks and NUMA. Holding the box fixed makes the
 answer a property of the engines.
 
 Every engine gets the same budget at each point (`run_scale_suite.sh --threads`
-sets `IBEX_THREADS`, `POLARS_MAX_THREADS`, `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`,
+sets `IBEX_CORES`, `POLARS_MAX_THREADS`, `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`,
 `R_DATATABLE_NUM_THREADS` and the SQL harnesses' `--threads`), and each pass is
 pinned to cores `0..T-1`. Linux numbers one thread per physical core first, so
 the low half of the sweep is physical cores and the SMT knee stays visible
@@ -212,7 +212,7 @@ warmup (`--iters`, `--warmup`).
 **Eight cores, deliberately** (`--cores`, default 8). The three frameworks
 scale differently with thread count, so an unpinned box turns a query
 comparison into a thread-count comparison. `taskset` bounds the process and
-`IBEX_THREADS`/`OMP_NUM_THREADS` stop Ibex's worker pool and data.table's
+`IBEX_CORES`/`OMP_NUM_THREADS` stop Ibex's worker pool and data.table's
 OpenMP pool from each sizing themselves from `nproc` and oversubscribing the
 pinned set.
 

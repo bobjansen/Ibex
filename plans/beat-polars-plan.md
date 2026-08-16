@@ -92,11 +92,7 @@ budget-8-on-2-cores row also shows the other edge — oversubscription starts
 costing again, so the fix is not "always oversubscribe" but "never let the
 effective budget collapse toward 1".
 
-This makes W3.1 concrete: **decouple the admission budget (how many parallel
-units to create) from the hardware thread count**, and make sure whatever
-reserves a producer thread cannot take the remaining budget below 2. Do that
-before rewriting admission policy on progress signals — a one-line floor may
-capture most of the 457 ms, and the sweep above is the falsifying test.
+**W3.1 DONE**, though not in the shape this plan predicted — see below.
 
 **1-core no-regression gate, verified for this session's three commits**
 (`a0dd4c1`, `315504e`, `68af53e` vs `d1ca618`): geomean **0.9965**, no query
@@ -292,6 +288,66 @@ Also here: grouped median/quantile per-row Key grouping
 but the same machinery).
 
 Exit: aggregate worker help ≥ 2.5×; q13/q20/q10 flat or better at 1 core.
+
+### W3.1 — Decode gets its own thread budget (DONE)
+
+The plan guessed the 2-core deficit was the scheduler reserving a producer
+thread, and §1a guessed it was the nine `workers < 2 → decline` gates. **Both
+guesses were wrong.** The gates do not decline at 2 cores — they get
+`workers = 2` and pass — and a first attempt at cutting finer probe units with a
+work-stealing cursor measured 0.9972 at 8 cores, a wash, and was reverted.
+
+Splitting the 2-core gain per query found it instead: it is concentrated in
+scan-dominated queries (q06 −34% — the plan's own scan canary — q19 −30%,
+q12 −28%, q14 −24%, q15 −20%) while compute-heavy ones LOSE (q01 +4.6%,
+q17 +3.2%). That is memory-stall hiding in Parquet decode.
+`scan_pipeline_worker_count` clamped decode to `pool.size()`, so a 2-thread pool
+starved it.
+
+The fix is to stop expressing two different budgets with one number. The pool is
+now sized for DECODE — `min(2·cores, max(cores, saturation))` — while
+`configure_parallel_from_env` pins `parallel_threads` to the core count, so every
+compute gate still sizes itself to hardware. A flat multiplier is wrong at both
+ends and the policy has to bend:
+
+| cores | 1× | 2× | 3× |
+|---|---:|---:|---:|
+| 1 | **3787** | 3919 | 3947 |
+| 2 | 3247 | **2832** | 2868 |
+| 4 | 2320 | **2165** | 2189 |
+| 8 | **1809** | 1971 | 1959 |
+
+At one core there is nothing to overlap and a second thread only flips the
+`pool.size() < 2` guards on; at eight the memory system is saturated and the
+extra threads are contention.
+
+**Result** (interleaved, SF-2, stamped scale factor, sequential with nothing else
+on the box):
+
+| cores | new | old | ratio | implied p before → after |
+|---|---:|---:|---:|---|
+| 1 | 3802 ms | 3786 ms | 1.004 | — |
+| 2 | 2818 ms | 3165 ms | **0.890** | 32.8% → **51.7%** |
+| 4 | 2170 ms | 2250 ms | **0.964** | 54.1% → **57.2%** |
+| 8 | 1894 ms | 1891 ms | 1.002 | 57.2% → **57.3%** |
+
+The core-count ramp — the thing that broke the Amdahl premise — is largely gone.
+The 1-core hard gate and the 8-core headline configuration are both untouched by
+design. Predicted −12%/−7%/neutral/neutral in advance; got −11.0%/−3.6%/+0.4%/
++0.2%, so 4 cores came in at about half the predicted gain.
+
+`IBEX_THREADS` is renamed to `IBEX_CORES` (compute budget), joined by
+`IBEX_DECODE_THREADS` (absolute pool size) and `IBEX_DECODE_SATURATION` (default
+8). The old name conflated a core count with a pool size in one number, which is
+precisely why "more decode, same compute" was inexpressible. Setting the old
+name now warns rather than silently falling back to `hardware_concurrency()` —
+that silent fallback destroyed a measurement here.
+
+**The saturation constant is a property of this box's memory system, not of the
+code.** Four points on one machine is the first row of the table a heuristic
+would come from, not the heuristic. Sweep `IBEX_DECODE_SATURATION` on the AWS
+4-physical-core box before publishing any number
+([[project_bench_two_tier_framework]]).
 
 ### W3 — The scheduler, second slice (raises the fraction rather than shrinking the serial term)
 

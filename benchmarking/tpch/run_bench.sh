@@ -79,7 +79,7 @@ fi
 PIN=()
 if [[ -n "$CORES" ]]; then
     PIN=(taskset -c "0-$((CORES - 1))")
-    export IBEX_THREADS="$CORES"
+    export IBEX_CORES="$CORES"
     export POLARS_MAX_THREADS="$CORES"
     echo "=== pinned to ${CORES} cores (of $(nproc)) ==="
 fi
@@ -155,12 +155,12 @@ echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
 SUFFIX="_sf${SCALE}"
 
 echo "=== ibex (multi-threaded, ${CORES:-$(nproc)} cores) ==="
-IBEX_THREADS="${CORES:-auto}" IBEX_PARALLEL=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
+IBEX_CORES="${CORES:-auto}" IBEX_PARALLEL=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
     --warmup "$WARMUP" --iters "$ITERS" \
     --out "$RESULTS/ibex${SUFFIX}.tsv"
 
 echo "=== ibex-st (single-threaded) ==="
-IBEX_THREADS=1 IBEX_PARALLEL=0 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
+IBEX_CORES=1 IBEX_PARALLEL=0 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
     --warmup "$WARMUP" --iters "$ITERS" \
     --out "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 sed 's/^ibex\t/ibex-st\t/' "$RESULTS/ibex_st${SUFFIX}.tsv.tmp" > "$RESULTS/ibex_st${SUFFIX}.tsv"

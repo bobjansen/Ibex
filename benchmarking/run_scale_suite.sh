@@ -214,7 +214,7 @@ fi
 # whole sweep, and because an engine we forget to thread through would quietly
 # fall back to nproc — the failure mode that makes a scaling curve a lie.
 #
-#   IBEX_THREADS           ibex          (src/runtime/worker_pool.cpp)
+#   IBEX_CORES           ibex          (src/runtime/worker_pool.cpp)
 #   POLARS_MAX_THREADS     polars
 #   RAYON_NUM_THREADS      datafusion's rayon pool, under its target-partitions
 #   OMP_NUM_THREADS        data.table / OpenMP-backed R and BLAS paths
@@ -230,7 +230,7 @@ if [[ -n "$THREADS" ]]; then
         echo "error: --threads must be a positive integer, got '$THREADS'" >&2
         exit 1
     fi
-    export IBEX_THREADS="$THREADS"
+    export IBEX_CORES="$THREADS"
     export POLARS_MAX_THREADS="$THREADS"
     export RAYON_NUM_THREADS="$THREADS"
     export OMP_NUM_THREADS="$THREADS"

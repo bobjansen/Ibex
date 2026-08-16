@@ -41,6 +41,19 @@ constexpr std::size_t kNull = SIZE_MAX;
 // Sentinel group id: "this row's key is not in the index".
 constexpr std::uint32_t kNoGroup = UINT32_MAX;
 
+/// Mark a join row as matched while multiple probe ranges may reach it.
+inline void set_matched_flag(std::uint8_t& flag) noexcept {
+#ifdef __cpp_lib_atomic_ref
+    std::atomic_ref<std::uint8_t>(flag).store(1U, std::memory_order_relaxed);
+#else
+    // Apple's libc++ (macOS clang-werror leg) doesn't ship std::atomic_ref yet.
+    // A byte atomic is lock-free on the supported targets, so this view gives
+    // the same relaxed store without needing atomic_ref.
+    static_assert(std::atomic<std::uint8_t>::is_always_lock_free);
+    reinterpret_cast<std::atomic<std::uint8_t>*>(&flag)->store(1U, std::memory_order_relaxed);
+#endif
+}
+
 /// CSR view over the build side: matches(gid) is the ascending list of build
 /// rows whose key belongs to group gid.
 ///
@@ -1252,7 +1265,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // drift: the parallel one runs it per range, the serial one once.
         //
         // `left_matched_flags` is the only cross-range write — a left row can
-        // be matched from any right row — so it goes through `atomic_ref`. The
+        // be matched from any right row — so it goes through an atomic store. The
         // store is relaxed and always the same value, which on every target
         // here is the plain byte store the serial path already did; it is
         // present to make the race well defined, not to order anything.
@@ -1268,8 +1281,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     out_l.push_back(l);
                     out_r.push_back(r);
                     if (preserve_left_rows) {
-                        std::atomic_ref<std::uint8_t>(left_matched_flags[l])
-                            .store(1U, std::memory_order_relaxed);
+                        set_matched_flag(left_matched_flags[l]);
                     }
                 }
                 if (preserve_right_rows) {
@@ -1355,8 +1367,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     out_l.push_back(l);
                     out_r.push_back(r);
                     if (preserve_right_rows) {
-                        std::atomic_ref<std::uint8_t>(right_matched_flags[r])
-                            .store(1U, std::memory_order_relaxed);
+                        set_matched_flag(right_matched_flags[r]);
                     }
                 }
             }

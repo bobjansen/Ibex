@@ -35,6 +35,48 @@ So the goal is: **raise the implied parallel fraction from ~44% to ~60–65%**,
 while not giving back the single-core lead (the 1-core geomean is a hard
 no-regression gate — it is the asset the whole strategy leans on).
 
+### 1a. Where the fraction actually is (measured 2026-08-16, post-W1/W1b/W2)
+
+Interleaved sweep on one binary at `68af53e`, SF-2, pinned, min-of-3. Absolute
+totals are **not** comparable to the table above — different session, and box
+drift is ±10% — but the speedup column is within-session and therefore is:
+
+| cores | total | speedup vs own 1c | implied parallel fraction |
+|---|---:|---:|---:|
+| 1 | 3944 ms | 1.000× | — |
+| 2 | 3164 ms | 1.247× | **39.6%** |
+| 3 | 2674 ms | 1.475× | **48.3%** |
+| 4 | 2278 ms | 1.732× | **56.4%** |
+| 8 | 1820 ms | 2.214× | **62.7%** |
+
+Two findings, and the second is the important one.
+
+**At 8 cores the target band is reached.** 62.7% is inside the 60–65% goal, and
+the 2.214× speedup clears the 2.10× this plan set for "beat by 10%". That does
+not by itself say we beat Polars — that claim needs Polars re-measured in the
+same session, which has not been done and must be before anything is published.
+
+**The Amdahl premise no longer holds, and its failure IS the 2-core cliff.**
+§1 says "Amdahl fit holds at every core count"; it does not any more. A real
+Amdahl program yields the same `p` at every `n`. Ours climbs monotonically —
+39.6 → 48.3 → 56.4 → 62.7 — which is the signature of parallel work being
+*declined* at low core counts rather than executed slowly. There are nine
+`workers < 2 → decline` gates across `chunked.cpp`/`join.cpp`; with anything
+reserving a producer thread, a 2-core run leaves a budget of 1 and every one of
+them falls back to its serial loop. Less of the program is *eligible* at 2 cores
+than at 8. (Parallel still beats serial at every core count — 2c parallel/serial
+is 0.847 — so nothing is actively backfiring; the work is simply not being
+offered.)
+
+The prize, sized against the 8-core fraction: if 2 cores were as eligible as 8
+they would run ≈2707 ms rather than 3164 ms (**−457 ms**), and 4 cores ≈2090 ms
+rather than 2278 ms (**−188 ms**). That is the largest single number left on the
+board, and it is W3.1's.
+
+**1-core no-regression gate, verified for this session's three commits**
+(`a0dd4c1`, `315504e`, `68af53e` vs `d1ca618`): geomean **0.9965**, no query
+worse than +2%. The single-core lead is intact.
+
 The same thing in absolute terms, which is how the workstreams are ranked: at
 8 cores the total is ≈ serial + parallel/8 ≈ 2116 + 208 ms. **The fight is over
 ~2.1 s of calling-thread (serial) time.** Beating Polars by 10% means removing
@@ -237,6 +279,17 @@ win (~4%), not the curve-changer. The named work, in order:
    gate was measured worse and withdrawn — the admission signal must be
    *progress* (is the ring draining? is the consumer blocked?), not
    configuration.
+
+   **Sharpened by the §1a sweep, and now the top item on the board.** The
+   deficit is not a dip at one core count, it is a monotonic ramp in how much
+   work is *eligible*: 39.6% of the program parallelises at 2 cores against
+   62.7% at 8. Before touching the scheduler's admission policy, audit the nine
+   `workers < 2 → decline` gates — a budget of 1 makes each of them fall back
+   to a serial loop wholesale, so at low core counts they, not the scheduler,
+   may be most of the ramp. Cheap experiment first: force the budget to
+   `max(2, …)` at 2 cores and re-run the sweep. If the ramp flattens, the fix
+   is the gates; if it does not, it is the reservation. Worth ≈457 ms at 2
+   cores and ≈188 ms at 4.
 2. **Run down q18/q22/q17/q20 pipeline regressions** — the loosened
    no-regression bar is explicitly temporary. q22 and q18 look sink-concat
    shaped (large bound intermediates → W4); confirm with the profiler before

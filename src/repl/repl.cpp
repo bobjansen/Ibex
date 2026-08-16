@@ -1428,7 +1428,9 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
 }
 
 auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>& wanted,
-                          const runtime::ExecutionContext& exec) -> std::vector<std::string> {
+                          const runtime::ExecutionContext& exec,
+                          const std::string* deferred_probe_key = nullptr)
+    -> std::vector<std::string> {
     /// Cap on the bitset, in values. A candidate wider than this is left
     /// unproven rather than allocating without bound for a plan-time fact.
     constexpr std::uint64_t kMaxSpanValues = 1ULL << 28U;  // 32 MiB of bits
@@ -1467,7 +1469,15 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
         if (span < rows || span > kMaxSpanValues) {
             continue;
         }
-        auto decoded = lazy.project_uncached({name}, exec);
+        // The proof is a full-column decode, so retain it for the actual scan
+        // whenever that is safe.  A deferred probe is the exception: caching
+        // its key disables the fused dynamic-key scan that is the reason the
+        // probe was deferred, and is worse than reading this small key twice.
+        // Every other source, including a streamed one, can slice this cached
+        // column and avoids immediately decoding the same join key again.
+        auto decoded = deferred_probe_key != nullptr && *deferred_probe_key == name
+                           ? lazy.project_uncached({name}, exec)
+                           : lazy.project({name}, exec);
         if (!decoded.has_value()) {
             continue;  // the executor will report its own error
         }
@@ -4792,6 +4802,15 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // column it came from needs every source's schema already in place.
         {
             const runtime::ExecutionContext proof_exec = command_exec();
+            std::set<std::string> lazy_names;
+            for (const auto& [name, lazy] : lazy_sources) {
+                lazy_names.insert(name);
+            }
+            // Only an actual deferred-probe key must stay uncached; all other
+            // proof reads are reusable execution work.  This analysis is
+            // conservative with respect to the current (pre-reorder) plan:
+            // a later plan that declines a probe simply keeps a useful cache.
+            const auto deferred_probes = ir::deferrable_probe_scans(*rewritten, lazy_names);
             for (const auto& [source_name, columns] :
                  ir::plan_join_key_origins(*rewritten, schemas)) {
                 const auto lazy = lazy_sources.find(source_name);
@@ -4799,7 +4818,11 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                 if (lazy == lazy_sources.end() || schema == schemas.end()) {
                     continue;
                 }
-                for (auto& column : prove_unique_columns(*lazy->second, columns, proof_exec)) {
+                const auto probe = deferred_probes.find(source_name);
+                const std::string* probe_key =
+                    probe == deferred_probes.end() ? nullptr : &probe->second.key_column;
+                for (auto& column :
+                     prove_unique_columns(*lazy->second, columns, proof_exec, probe_key)) {
                     schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
                 }
             }

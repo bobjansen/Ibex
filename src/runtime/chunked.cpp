@@ -10155,6 +10155,20 @@ class DeferredScanSourceOperator final : public Operator {
             // when it was.
             if (!inflight_pending_) {
                 if (dispatched_ >= units_.size()) {
+                    // A stream must still carry its schema when every unit was
+                    // empty after scan pushdown.  Without this carrier,
+                    // MaterializeOperator sees end-of-stream as its first
+                    // result and returns a column-less Table, unlike the
+                    // equivalent eager scan (and unlike a filter above an
+                    // ordinary table source).  Keep the first empty unit out
+                    // of the normal pipeline -- several streaming operators
+                    // intentionally do not consume empty chunks -- and emit it
+                    // only when it is the sole result.
+                    if (empty_schema_carrier_.has_value()) {
+                        auto carrier = std::move(*empty_schema_carrier_);
+                        empty_schema_carrier_.reset();
+                        return std::optional<Chunk>{emit_schema_carrier(std::move(carrier))};
+                    }
                     return std::optional<Chunk>{};
                 }
                 dispatch();
@@ -10239,8 +10253,13 @@ class DeferredScanSourceOperator final : public Operator {
     /// count for `count()` — and is kept.
     auto emit(Table table) -> std::optional<Chunk> {
         if (!table.columns.empty() && table.rows() == 0) {
+            if (!empty_schema_carrier_.has_value()) {
+                empty_schema_carrier_ = std::move(table);
+            }
             return std::nullopt;
         }
+        // A non-empty result makes a deferred carrier unnecessary.
+        empty_schema_carrier_.reset();
         unify_categorical_dictionaries(table);
         Chunk chunk;
         const std::size_t rows = table.rows();
@@ -10252,6 +10271,24 @@ class DeferredScanSourceOperator final : public Operator {
         chunk.sequence = sequence_++;
         chunk.row_offset = emitted_rows_;
         emitted_rows_ += rows;
+        return chunk;
+    }
+
+    /// Materialize the one schema carrier retained when scan pushdown rejected
+    /// every row.  It follows the ordinary source identity convention: first
+    /// chunk, at row zero.  Dictionary unification remains necessary because a
+    /// zero-row categorical still carries dictionary identity as part of its
+    /// schema.
+    auto emit_schema_carrier(Table table) -> Chunk {
+        unify_categorical_dictionaries(table);
+        Chunk chunk;
+        chunk.set_properties(table.properties());
+        chunk.columns = std::move(table.columns);
+        if (chunk.columns.empty()) {
+            chunk.logical_rows = table.logical_rows;
+        }
+        chunk.sequence = sequence_++;
+        chunk.row_offset = emitted_rows_;
         return chunk;
     }
 
@@ -10326,6 +10363,10 @@ class DeferredScanSourceOperator final : public Operator {
     /// them have been.
     std::vector<std::expected<Table, std::string>> ready_;
     std::size_t served_ = 0;
+    /// First empty, column-bearing unit.  It becomes a schema carrier only if
+    /// every unit was empty; otherwise empty units stay invisible to the
+    /// streaming operators above this source.
+    std::optional<Table> empty_schema_carrier_;
     /// The window currently being decoded. Workers write disjoint slots of
     /// this, so it must not be resized while `batch_` is live.
     std::vector<std::expected<Table, std::string>> inflight_;

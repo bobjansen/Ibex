@@ -268,6 +268,15 @@ if [[ "$SKIP_REPL" == false ]]; then
     IBEX_STREAM_SCAN=1 IBEX_PARALLEL=0 IBEX_THREADS=1 "$BUILD_DIR/tools/ibex_eval" \
         --plugin-path "$BUILD_DIR/tools" \
         "$IBEX_ROOT/tests/data/parquet_stream_categorical_check.ibex" >"$str_serial" 2>&1
+    # An all-rejected streamed scan must still preserve its empty output
+    # schema. Otherwise the source emits no chunks and MaterializeOperator
+    # returns a column-less Table, unlike the eager path.
+    empty_off="$(mktemp)"
+    empty_on="$(mktemp)"
+    IBEX_STREAM_SCAN=0 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+        "$IBEX_ROOT/tests/data/parquet_stream_empty_check.ibex" >"$empty_off" 2>&1
+    IBEX_STREAM_SCAN=1 "$BUILD_DIR/tools/ibex_eval" --plugin-path "$BUILD_DIR/tools" \
+        "$IBEX_ROOT/tests/data/parquet_stream_empty_check.ibex" >"$empty_on" 2>&1
     rm -f "$IBEX_ROOT/tests/data/parquet_categorical_check_out.parquet"
     # chunks=2 is the part that keeps this honest: without it a silently
     # declined stream would pass the comparison by being the same code path.
@@ -278,17 +287,23 @@ if [[ "$SKIP_REPL" == false ]]; then
         || ! rg -n '"gamma" \| 100000' "$str_on" >/dev/null \
         || ! diff -q <(rg -v "^(profile |operator profile:)" "$str_off") \
                      <(rg -v "^(profile |operator profile:)" "$str_on") >/dev/null \
-        || ! diff -q "$str_off" "$str_serial" >/dev/null; then
+        || ! diff -q "$str_off" "$str_serial" >/dev/null \
+        || rg -n "error:" "$empty_on" >/dev/null \
+        || ! diff -q "$empty_off" "$empty_on" >/dev/null; then
         echo "--- materialized ---" >&2
         cat "$str_off" >&2
         echo "--- streamed ---" >&2
         cat "$str_on" >&2
         echo "--- streamed, serial ---" >&2
         cat "$str_serial" >&2
-        rm -f "$str_off" "$str_on" "$str_serial"
+        echo "--- empty materialized ---" >&2
+        cat "$empty_off" >&2
+        echo "--- empty streamed ---" >&2
+        cat "$empty_on" >&2
+        rm -f "$str_off" "$str_on" "$str_serial" "$empty_off" "$empty_on"
         exit 1
     fi
-    rm -f "$str_off" "$str_on" "$str_serial"
+    rm -f "$str_off" "$str_on" "$str_serial" "$empty_off" "$empty_on"
 
     echo "▸ whole-script (parquet plugin, fused key scan across row groups)"
     # Run through ibex_eval, not the REPL: the fused key scan only exists on the

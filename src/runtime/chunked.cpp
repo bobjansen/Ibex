@@ -4537,6 +4537,105 @@ class ChunkedInnerJoinOperator final : public Operator {
         return {};
     }
 
+    /// Run `body(begin, end, li, ri)` over the probe rows across workers,
+    /// concatenating each range's output in range order. Returns false when the
+    /// parallel path declines and the caller should run its serial loop.
+    ///
+    /// **This is the join's only parallel axis, and it is the whole of it.**
+    /// The build side is a shared read-only hash index — `heads`, `chain_next_`
+    /// — so probing it concurrently needs no locking at all, and the build
+    /// itself is not worth threading: it is 1.5% of q10 against the probe and
+    /// output assembly's ~15%.
+    ///
+    /// **Per-worker output rather than count-then-fill.** The obvious shape is
+    /// to count matches per range, prefix-sum, then have each worker write its
+    /// slice — but that probes the hash table TWICE per row, and a redundant
+    /// cache-missing lookup per probe row is exactly the cost `emit_swapped`
+    /// was restructured to avoid (q03 probes 3.2M lineitems to emit ~30K rows).
+    /// Each worker appends to its own vectors instead and they are concatenated
+    /// afterwards: one memcpy of two size_t arrays, against one hash probe per
+    /// row saved.
+    ///
+    /// Order is exactly the serial order — ranges are contiguous and visited in
+    /// order, and each range appends in row order — so the output is
+    /// byte-identical however the workers interleave.
+    template <typename Body>
+    auto probe_ranges_parallel(std::size_t n, std::vector<std::size_t>& li,
+                               std::vector<std::size_t>& ri, const Body& body) -> bool {
+        // Below this the fan-out and the concatenation cost more than the
+        // probes they spread. A probe is a hash lookup plus a chain walk, so
+        // the per-row work is real, but so is submitting a batch.
+        constexpr std::size_t kMinProbeRows = 1U << 14U;
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || n < kMinProbeRows ||
+            !parallel_join_probe_enabled()) {
+            return false;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t budget =
+            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
+        if (workers < 2) {
+            return false;
+        }
+        const std::size_t grain = (n + workers - 1) / workers;
+        probe_parts_.resize(workers);
+        {
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                auto& part = probe_parts_[w];
+                part.li.clear();
+                part.ri.clear();
+                const std::size_t begin = w * grain;
+                const std::size_t end = std::min(n, begin + grain);
+                if (begin >= end) {
+                    return;
+                }
+                // Reserve for the common case of roughly one match per row;
+                // a fan-out join grows past it, which is what a vector is for.
+                part.li.reserve(end - begin);
+                part.ri.reserve(end - begin);
+                body(begin, end, part.li, part.ri);
+            });
+            batch.wait();
+        }
+        std::size_t total = 0;
+        for (const auto& part : probe_parts_) {
+            total += part.li.size();
+        }
+        li.resize(total);
+        ri.resize(total);
+        // The concat is the price the fan-out pays that the serial probe does
+        // not, and on a high-match join it is the whole regression: every row
+        // matching means `total == n`, i.e. two full index arrays copied
+        // again. Each part's destination slice is disjoint and known, so the
+        // copies go back to the workers; below the threshold the batch costs
+        // more than the memcpy it spreads.
+        constexpr std::size_t kMinParallelConcatRows = 1U << 16U;
+        const auto copy_part = [&](std::size_t w, std::size_t at) {
+            const auto& part = probe_parts_[w];
+            std::ranges::copy(part.li, li.begin() + static_cast<std::ptrdiff_t>(at));
+            std::ranges::copy(part.ri, ri.begin() + static_cast<std::ptrdiff_t>(at));
+        };
+        part_offsets_.resize(workers);
+        std::size_t at = 0;
+        for (std::size_t w = 0; w < workers; ++w) {
+            part_offsets_[w] = at;
+            at += probe_parts_[w].li.size();
+        }
+        if (total >= kMinParallelConcatRows) {
+            auto batch =
+                pool.submit(workers, [&](std::size_t w) { copy_part(w, part_offsets_[w]); });
+            batch.wait();
+        } else {
+            for (std::size_t w = 0; w < workers; ++w) {
+                copy_part(w, part_offsets_[w]);
+            }
+        }
+        if (exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_probes.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
     // Stream mode: walk the probe side (a left chunk), for each row look
     // up the right-keyed chain and append (li, ri) in probe-scan order.
     // Returns true if every probe row matched exactly once (li == 0..n-1).
@@ -4545,6 +4644,30 @@ class ChunkedInnerJoinOperator final : public Operator {
     template <typename Map, typename GetKey>
     auto probe_scalar(const Map& heads, std::size_t n, GetKey get, std::vector<std::size_t>& li,
                       std::vector<std::size_t>& ri) -> bool {
+        // One body for both paths, so the parallel and serial results cannot
+        // drift: the parallel one runs it per range, the serial one once.
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                if (probe_is_null(l)) {
+                    continue;
+                }
+                auto it = heads.find(get(l));
+                if (it == heads.end()) {
+                    continue;
+                }
+                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                    out_l.push_back(l);
+                    out_r.push_back(cur);
+                }
+            }
+        };
+        if (probe_ranges_parallel(n, li, ri, scan)) {
+            // `li_identity` means li == 0..n-1, which for a unique build side
+            // is exactly "every row matched" — the same test the serial path
+            // makes, just recovered from the totals.
+            return build_unique_ && li.size() == n;
+        }
         if (build_unique_) {
             li.resize(n);
             ri.resize(n);
@@ -4591,6 +4714,21 @@ class ChunkedInnerJoinOperator final : public Operator {
     template <typename GetHead>
     auto probe_resolved(std::size_t n, GetHead head_of, std::vector<std::size_t>& li,
                         std::vector<std::size_t>& ri) -> bool {
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                if (probe_is_null(l)) {
+                    continue;
+                }
+                for (std::size_t cur = head_of(l); cur != kNil; cur = chain_next_[cur]) {
+                    out_l.push_back(l);
+                    out_r.push_back(cur);
+                }
+            }
+        };
+        if (probe_ranges_parallel(n, li, ri, scan)) {
+            return build_unique_ && li.size() == n;
+        }
         if (build_unique_) {
             li.resize(n);
             ri.resize(n);
@@ -5042,6 +5180,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads_;
     robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
         string_heads_;
+    /// One worker's slice of a parallel probe. Members so the vectors keep
+    /// their capacity across chunks instead of reallocating per probe.
+    struct ProbePart {
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+    };
+    std::vector<ProbePart> probe_parts_;
+    std::vector<std::size_t> part_offsets_;
     std::vector<std::size_t> right_emit_idx_;
     std::vector<std::string> right_emit_names_;
     std::vector<std::string> left_emit_names_;
@@ -8951,11 +9097,11 @@ auto process_island_stats() -> ParallelIslandStats* {
                 stderr,
                 "island stats: parallel={} serial={} morsels={} "
                 "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
-                "parallel_fields={}\n",
+                "parallel_fields={} parallel_probes={}\n",
                 stats.parallel_islands.load(), stats.serial_islands.load(), stats.morsels.load(),
                 stats.pipelined_scans.load(), stats.pipelined_stages.load(),
                 stats.range_heads.load(), stats.two_phase_filters.load(),
-                stats.parallel_fields.load());
+                stats.parallel_fields.load(), stats.parallel_probes.load());
         }
     };
     static const Reporter reporter;

@@ -253,6 +253,21 @@ auto stream_scans_enabled() -> bool {
     return true;
 }
 
+auto parallel_join_probe_enabled() -> bool {
+    // On by default, and answers both ways for the same reason as
+    // `IBEX_STREAM_SCAN`: the off position is what a bug hunt or an A/B
+    // against the serial probe actually needs.
+    const char* raw = std::getenv("IBEX_JOIN_PROBE");  // NOLINT(concurrency-mt-unsafe)
+    if (raw == nullptr) {
+        return true;
+    }
+    const std::string_view value{raw};
+    if (value == "0" || value == "off" || value == "false" || value == "no") {
+        return false;
+    }
+    return true;
+}
+
 auto deferred_scan_units(const DeferredScan& scan) -> std::vector<SourceUnit> {
     return scan.lazy == nullptr ? std::vector<SourceUnit>{} : scan.lazy->scan_units();
 }

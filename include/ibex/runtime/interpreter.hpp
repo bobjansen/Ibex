@@ -531,6 +531,12 @@ struct ParallelIslandStats {
     /// field, an extern call added to a query — would cost the parallelism with
     /// every test still green.
     std::atomic<std::uint64_t> parallel_group_windows{0};
+    /// Inner-join probe scans fanned out across worker ranges instead of run
+    /// as one serial walk. Same reason as the counters above: the concatenated
+    /// range outputs are byte-identical to the serial probe, so without this a
+    /// gate that quietly stopped matching (a smaller probe chunk, a budget
+    /// change) would cost the parallelism with every test still green.
+    std::atomic<std::uint64_t> parallel_probes{0};
 };
 
 struct ExecutionContext {
@@ -675,6 +681,11 @@ struct DeferredScanPlan {
 /// operator builder — which must agree, hence one function rather than two
 /// `getenv`s.
 [[nodiscard]] auto stream_scans_enabled() -> bool;
+
+/// Whether an inner-join probe may fan its scan out across worker ranges
+/// (`IBEX_JOIN_PROBE`, on by default). Off is for A/B measurement and bug
+/// isolation; the output is byte-identical either way.
+[[nodiscard]] auto parallel_join_probe_enabled() -> bool;
 
 /// The scan's streaming decomposition, or empty when its source has none (a
 /// non-lazy source, or a reader with no unit decode). Decodes nothing.

@@ -11812,7 +11812,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             [&](Table left, Table right) {
                 return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
                                        compute_mask, join.suffix(), join.pending_order(),
-                                       join.null_match(), join.expect(), join.take());
+                                       join.null_match(), join.expect(), join.take(), &exec);
             });
     }
 

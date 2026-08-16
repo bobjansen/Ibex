@@ -276,10 +276,7 @@ W1 join (probe+assemble, phase A)   ── DONE (294230c, e06e1d7): SF-2 geomean
 W2 aggregate                        ── probed; the residue is array growth, not
                                        accumulate. Slot fill landed (cold-only).
                                        Remaining levers are small; see W2 above.
-W1b multi-key join probes           ── NEXT, and now the largest item measured:
-                                       join inner is 574 ms self at 0.42x help,
-                                       and q09/q05/q11 spend it in the SERIAL
-                                       join_table_impl that W1 never touched
+W1b join_table_impl probe scan      ── DONE (below): geomean 0.973 / 0.981
 W3.1 progress-aware admission       ── next scheduler slice; fixes 2-core cliff
 W3.2 q18/q22 rundown                ── decides W4's priority
 W4 chunked let bindings             ── design note first; largest structural risk
@@ -288,14 +285,52 @@ W3.3+ aggregate-output stages,
 W2.3 parallel gid                   ── only if still dominant after the above
 ```
 
+### W1b — `join_table_impl`'s probe scan (DONE)
+
 Suite operator table re-measured 2026-08-16 (SF-2, 8 pinned cores,
-`IBEX_PROFILE_OPERATORS`, one process per query so the decode numbers are cold):
-`join inner` 574 ms self / 0.42× help is now the largest unparallelized
-operator, ahead of `aggregate` (446 ms / 2.03×) and `join semi` (232 ms /
-0.21×). W1 threaded `ChunkedInnerJoinOperator`'s single-key probe; q09 (169 ms),
-q05 (90 ms) and q11 (60 ms) are two-key joins that run in `join_table_impl`
-instead and never reach it. That is the measurement W1's "deliberately not done"
-note asked for, and it says to go there next.
+`IBEX_PROFILE_OPERATORS`, one process per query): `join inner` reads as 574 ms
+self / 0.42× help, the largest unparallelized operator. **Most of that is not
+join work.** Timing inside the operator, q09's 169 ms splits as ~76 ms of
+deferred-probe phase A (a fused decode charged to the join), ~23 ms of actual
+probe and assemble, and ~62 ms in `join_table_impl`. Same caution as W2: the
+table over-attributes.
+
+Timing `join_table_impl` itself across the suite gives the real target — and
+it is not "multi-key", which is how W1's follow-up note framed it:
+
+| query | keys | total ms | probe scan | materialize |
+|---|---|---:|---:|---:|
+| q13 | 1, but a **LEFT** join | 139 | **120** | 20 |
+| q09 | 2 | 62 | 21 | 20 |
+| q05 | 2 | 35 | 33 | 2 |
+| q20 | 2 | 18 | 18 | 0.2 |
+
+`ChunkedInnerJoinOperator` handles inner joins with one key; everything else
+falls to `join_table_impl`, whose probe scan was wholly serial. The single
+biggest item is q13's LEFT join, not a multi-key one. Both
+`build_indices_from_left_scan` and `build_indices_from_right_scan` are shared by
+every path in that function, so threading those two covers left/right/outer and
+multi-key at once.
+
+Landed: contiguous ranges into per-worker `(li, ri)` parts concatenated in range
+order — byte-identical to serial, the same contract as W1's `probe_ranges_parallel`
+— under the existing `IBEX_JOIN_PROBE` gate, with a `parallel_probes` counter and
+a both-direction test covering the two-key and left-join shapes. The one
+cross-range write in each direction (`left_matched_flags` / `right_matched_flags`)
+goes through `std::atomic_ref` with a relaxed store. Every lookup closure was
+checked read-only first (`RowKeyIndex::find` is const; the fast paths probe a
+finished `robin_hood` map through const references).
+
+**Isolated A/B** (same binary pair, interleaved ABBA×3, 8 pinned cores, SF-2):
+geomean **0.9725** and **0.9810** on two runs. q13 −19%, q05 −20%, q20 −10%,
+q09 −6%, q16 −4%, q03 −3%. q22 is +8–11% and reproduces, but it is **not this
+change**: q22 never calls the fan-out (its join is a 1-row cross join, 0.71 ms
+of `join_table_impl` total), and the regression is still there with
+`IBEX_JOIN_PROBE=0` on the same binary — it is code layout in a hot TU, the
+per-query noise floor [[project_cow_detach_hot_loop]] documents.
+
+Still serial after this: `materialize` (~42 ms suite-wide, the gather), and the
+semi/anti branch of the right scan.
 
 Rough payoff bookkeeping against the ~450 ms target (SF-2, 8c): W1 ≈ 250–300,
 W2 ≈ 150–250, W3.1/W3.2 ≈ 100–200 (removing the named regressions alone), W4

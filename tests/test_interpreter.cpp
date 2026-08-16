@@ -13225,6 +13225,112 @@ TEST_CASE("Inner join probe fans out across workers and matches the serial probe
     }
 }
 
+TEST_CASE("join_table_impl probe scan fans out and matches the serial scan",
+          "[runtime][parallel][join]") {
+    // The joins ChunkedInnerJoinOperator never sees: a LEFT join (it handles
+    // inner only) and a two-key join (it declines above one key). Both land in
+    // join_table_impl, whose probe scan is the block this fans out — measured
+    // as 120ms of PDS-H q13 and 33ms of q05 before it was threaded.
+    //
+    // Both sides carry unmatched rows on purpose. A left join's unmatched left
+    // rows are appended AFTER the scan from `left_matched_flags`, which is the
+    // one array a worker writes outside its own range, so a broken fan-out
+    // shows up here as wrong row counts rather than wrong values.
+    constexpr std::size_t kLeftRows = 40000;
+    runtime::Table left_side;
+    {
+        std::vector<std::int64_t> ka;
+        std::vector<std::int64_t> kb;
+        std::vector<std::int64_t> vals;
+        ka.reserve(kLeftRows);
+        kb.reserve(kLeftRows);
+        vals.reserve(kLeftRows);
+        for (std::size_t row = 0; row < kLeftRows; ++row) {
+            // 150 distinct (a, b) pairs, of which only 100 exist on the right,
+            // so a third of the left rows go unmatched.
+            ka.push_back(static_cast<std::int64_t>(row % 150));
+            kb.push_back(static_cast<std::int64_t>((row % 150) * 2));
+            vals.push_back(static_cast<std::int64_t>(row));
+        }
+        left_side.add_column("a", Column<std::int64_t>{std::move(ka)});
+        left_side.add_column("b", Column<std::int64_t>{std::move(kb)});
+        left_side.add_column("v", Column<std::int64_t>{std::move(vals)});
+    }
+    runtime::Table right_side;
+    {
+        // Two rows per key so the probe walks a chain rather than taking the
+        // unique-build shortcut.
+        std::vector<std::int64_t> ka;
+        std::vector<std::int64_t> kb;
+        std::vector<std::int64_t> tags;
+        for (std::int64_t key = 0; key < 100; ++key) {
+            for (std::int64_t dup = 0; dup < 2; ++dup) {
+                ka.push_back(key);
+                kb.push_back(key * 2);
+                tags.push_back((key * 10) + dup);
+            }
+        }
+        right_side.add_column("a", Column<std::int64_t>{std::move(ka)});
+        right_side.add_column("b", Column<std::int64_t>{std::move(kb)});
+        right_side.add_column("tag", Column<std::int64_t>{std::move(tags)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("big_l", std::move(left_side));
+    registry.emplace("small_r", std::move(right_side));
+
+    const auto run = [&](const std::string& src, bool parallel,
+                         runtime::ParallelIslandStats& stats) {
+        auto ir = require_ir(src.c_str());
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+
+    const auto check_same = [&](const std::string& src, const std::vector<const char*>& columns) {
+        runtime::ParallelIslandStats serial_stats;
+        auto serial = run(src, false, serial_stats);
+        // Both directions, as in the stream-mode test: a silently narrowed
+        // gate would leave the value comparison green while costing the
+        // parallelism, so the serial run must not count and the parallel must.
+        CHECK(serial_stats.parallel_probes.load() == 0);
+
+        runtime::ParallelIslandStats parallel_stats;
+        auto parallel = run(src, true, parallel_stats);
+        CHECK(parallel_stats.parallel_probes.load() >= 1);
+
+        for (const char* name : columns) {
+            const auto* expect = std::get_if<Column<std::int64_t>>(serial.find(name));
+            const auto* got = std::get_if<Column<std::int64_t>>(parallel.find(name));
+            REQUIRE(expect != nullptr);
+            REQUIRE(got != nullptr);
+            REQUIRE(got->size() == expect->size());
+            std::size_t mismatches = 0;
+            for (std::size_t row = 0; row < expect->size(); ++row) {
+                const bool expect_null = serial.find_entry(name)->validity.has_value() &&
+                                         !(*serial.find_entry(name)->validity)[row];
+                const bool got_null = parallel.find_entry(name)->validity.has_value() &&
+                                      !(*parallel.find_entry(name)->validity)[row];
+                mismatches += static_cast<std::size_t>(expect_null != got_null);
+                if (!expect_null) {
+                    mismatches += static_cast<std::size_t>((*got)[row] != (*expect)[row]);
+                }
+            }
+            CHECK(mismatches == 0);
+        }
+    };
+
+    SECTION("two-key inner join") {
+        check_same("big_l join small_r on { a, b };", {"a", "b", "v", "tag"});
+    }
+    SECTION("left join keeps unmatched left rows") {
+        check_same("big_l left join small_r on { a, b };", {"a", "b", "v", "tag"});
+    }
+}
+
 TEST_CASE("Swapped-mode join probe fans out across workers and matches the serial probe",
           "[runtime][parallel][join]") {
     // The mirror of the stream-mode test: the LEFT side is the small one, so

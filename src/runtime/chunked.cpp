@@ -11032,7 +11032,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 deferred != nullptr && deferred->filter == nullptr) {
                 auto units = deferred_scan_units(*deferred);
                 if (units.size() > 1) {
-                    if (exec.parallel && scan_pipeline_worker_count(exec, units.size()) > 0) {
+                    // A single producer only adds a queue handoff; it cannot
+                    // overlap decode with useful downstream parallel work.
+                    // Keep the established serial window in that case.
+                    if (exec.parallel && scan_pipeline_worker_count(exec, units.size()) >= 2) {
                         return build_pipelined_scan({}, false, *deferred, std::move(units), scalars,
                                                     externs, exec);
                     }

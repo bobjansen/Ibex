@@ -183,8 +183,18 @@ without a shape where accumulate is actually dominant.
   `MADV_HUGEPAGE` backing for `SlotArray`) rather than more threads.
 - Re-derive cause 3 (parallel gid) against 80 ms of *already-parallel* probe,
   not against a serial pass — the premise it was written under is gone.
-- Cause 2's fat-slot diet is **already done**: the chunked operator stores
-  `AggSlotCore` (24 B, static_asserted) with boxed values in a side array.
+- Cause 2's fat-slot diet is **done, and finished past the target**:
+  `AggSlotCore` is now **16 B** (static_asserted), the size the multithreading
+  plan called the big remaining win. It got there by deleting state that was not
+  information: `func`/`kind` were a per-GROUP copy of something that varies per
+  AGGREGATE (every reader already passed `plan_[agg_i]` in), and `has_value` is
+  `count != 0` — which `agg_combine`'s Stddev arm had already been relying on.
+  Wall time is a wash warm (three interleaved runs: 0.987, 1.010, 0.997) and
+  slightly positive cold (q20 −4%, q16 −5%); **the measurable win is memory** —
+  q18 peak RSS 593 MB → 535 MB (−9.9%), q20 −5%. It also cuts
+  `per_morsel_bytes` by a third, which is the gate deciding whether a group-by
+  can afford replicated partial state at all, so it widens the path cause 2 is
+  about rather than speeding up the one query measured.
 
 The original three, kept for the parts still standing:
 

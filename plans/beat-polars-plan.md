@@ -76,18 +76,35 @@ W1/W2 can proceed in parallel with W3.
 
 ### W1 — Parallel inner join (~435 ms attacked; expect 250–300 ms)
 
-**Status 2026-08-16: step 1 landed.** The stashed probe was unshelved, plus a
-parallel range-concat for the probe's output indices (the serial concat was
-measurably the tax on high-match probes: SF-2 geomean went 0.987 → 0.972 when
-the concat moved onto the workers, gated at 64k output rows). Interleaved
-ABBA×2 min-of-4, 8 pinned cores, `IBEX_JOIN_PROBE` on/off on the same binary:
-**SF-1 geomean 0.979, SF-2 geomean 0.972**; q11 −31–37%, q07 −5–9%, q09
-−6.6%, q03/q19 −4–5%. No reproducible regression (q13/q22 blips did not
-survive the rerun). All 22 answers OK; `parallel_probes` counter + both-way
-test in test_interpreter.cpp; `IBEX_JOIN_PROBE=0` opts out.
-**Not covered yet:** `emit_swapped` phase 1 (the swapped-mode probe walk is
-still serial), multi-key probes (`keys_->size() > 1` routes elsewhere), and
-step 2's phase-A passes (`apply_membership_filter`, the two-phase hit loop).
+**Status 2026-08-16: DONE** (commits `294230c` + `e06e1d7`), in two slices,
+all under one `IBEX_JOIN_PROBE` gate (`probe_parallel_workers`, on by
+default) with a `parallel_probes` counter and both-direction tests:
+
+1. *Stream-mode probe* (the unshelved stash): `probe_ranges_parallel` fans
+   the probe over contiguous ranges into per-worker (li, ri) parts,
+   concatenated in range order — byte-identical. The part concat itself runs
+   on workers above 64k output rows; the serial concat was most of the tax on
+   high-match probes (SF-2 geomean 0.987 → 0.972 from that alone).
+2. *Swapped mode + phase A*: `emit_swapped`'s two phases unified into one
+   `probe_swapped` scan/replay (per-worker hit parts, replay into disjoint
+   slices at prefix-summed offsets); `try_two_phase_probe`'s candidate-key
+   loop uses the same parts with two prefix offsets (first hit, first pair)
+   so survivors, the key gather, and pair expansion all write disjointly;
+   `apply_membership_filter`/`membership_selection` split the Bloom probing
+   into per-range kept lists.
+
+**Cumulative W1 A/B** (interleaved ABBA×2 min-of-4, 8 pinned cores, on/off
+same binary): **SF-1 geomean 0.950, SF-2 geomean 0.943** — a ~5.7% suite
+win. q11 −41%, q05 −17%, q09 −12%, q07 −12%, q10 −11%, q16 −10%, q03 −6%.
+Small-query upticks (q02/q13/q22 +4%) did not reproduce across runs. All 22
+answers OK serial and parallel; full suite green.
+
+**Deliberately not done:** multi-key probes (`keys_->size() > 1` never
+reaches `ChunkedInnerJoinOperator` — q02/q05/q09's two-key joins run in
+`join_table_impl`, a separate serial probe; measure before threading),
+partitioned parallel build (step 3 — build_index was 42 ms suite-wide, still
+believed not worth it), and the phase-A selectivity estimate (step 4, waits
+on the footer-stats cost model).
 
 The one large operator drawing no pool help. Its self-time is *not one lever*
 (measured split: `probe_chunk` 91, `assemble_output` 48, `build_index` 42,

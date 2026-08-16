@@ -22,6 +22,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -5403,12 +5404,28 @@ class SlotArray {
     auto operator[](std::size_t i) noexcept -> T& { return data_[i]; }
     auto operator[](std::size_t i) const noexcept -> const T& { return data_[i]; }
 
-    /// Grow to `n`, value-initializing the new tail. Never shrinks the
-    /// allocation: a group-by only ever adds groups.
-    void resize(std::size_t n) {
+    /// Grow to `n` WITHOUT initializing the new tail, which is returned for the
+    /// caller to fill. Never shrinks the allocation: a group-by only ever adds
+    /// groups.
+    ///
+    /// Split out of `resize` because on a large array the fill is the expensive
+    /// half and it is not serial by nature. `mremap` hands back pages the kernel
+    /// has yet to materialize, so writing them is 72MB of first-touch page
+    /// faults on q18's 3M slots — 44ms in a cold process, several times what the
+    /// bytes alone cost, and page faults are what scales with threads. A caller
+    /// holding a worker pool fans this out; one without it calls `resize` and
+    /// pays the serial fill.
+    ///
+    /// How much this is worth depends on whether the pages are fresh, so read
+    /// the two numbers separately. Cold (`ibex query.ibex`, the path a script
+    /// takes) the fan-out takes q18's fill 44ms -> 34ms and the whole query
+    /// -4.3%. Warm — the PDS-H harness, which reuses one process, so the
+    /// allocator hands back pages already faulted — the fill is plain bandwidth
+    /// and the suite geomean does not move.
+    [[nodiscard]] auto grow_uninitialized(std::size_t n) -> std::span<T> {
         if (n <= size_) {
             size_ = n;
-            return;
+            return {};
         }
         if (n > capacity_) {
             // Geometric, so a per-chunk resize does not call realloc once per
@@ -5421,12 +5438,45 @@ class SlotArray {
             data_ = grown;
             capacity_ = want;
         }
-        const T prototype{};
-        for (std::size_t i = size_; i < n; ++i) {
-            std::memcpy(data_ + i, &prototype, sizeof(T));
-        }
+        const std::size_t old = size_;
         size_ = n;
+        return {data_ + old, n - old};
     }
+
+    /// Value-initialize `tail`, a range `grow_uninitialized` just handed back.
+    ///
+    /// One `memset` when `T`'s value-initialized form is all-zero bytes, which
+    /// every slot type here is (`AggSlotCore`'s two enums both start at 0). The
+    /// per-element copy this replaces cost q18's fill 12ms of its 55: three
+    /// million 24-byte `memcpy`s the compiler will not fuse, because it cannot
+    /// see that the prototype is zeros.
+    ///
+    /// Padding is why the test is a run-time `memcmp` rather than a
+    /// `static_assert`: value-initialization zeroes `T`'s padding too, so the
+    /// comparison is well defined here, but no constant expression can state
+    /// that for a type with padding. The loop keeps the class honest for a
+    /// future slot type whose default is not all zeros.
+    static void fill_default(std::span<T> tail) noexcept {
+        if (tail.empty()) {
+            return;
+        }
+        const T prototype{};
+        alignas(T) std::array<unsigned char, sizeof(T)> zero{};
+        // NOLINTNEXTLINE(cert-exp42-c,bugprone-suspicious-memory-comparison) -- padding note above.
+        if (std::memcmp(&prototype, zero.data(), sizeof(T)) == 0) {
+            // Through `void*`: `T` has default member initializers, so it is not
+            // trivially default-constructible and -Wclass-memaccess objects to
+            // memset-ing it directly. The memcmp above is what licenses this.
+            std::memset(static_cast<void*>(tail.data()), 0, tail.size() * sizeof(T));
+            return;
+        }
+        for (auto& slot : tail) {
+            std::memcpy(&slot, &prototype, sizeof(T));
+        }
+    }
+
+    /// Grow to `n`, value-initializing the new tail on the calling thread.
+    void resize(std::size_t n) { fill_default(grow_uninitialized(n)); }
 
    private:
     T* data_ = nullptr;
@@ -6536,10 +6586,57 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
     void size_group_arrays() {
-        flat_slots_.resize(n_groups_ * n_aggs_);
+        auto tail = flat_slots_.grow_uninitialized(n_groups_ * n_aggs_);
+        if (!fill_slots_parallel(tail)) {
+            SlotArray<AggSlotCore>::fill_default(tail);
+        }
         if (scratch_stride_ != 0) {
             scratch_.resize(n_groups_ * scratch_stride_, 0.0);
         }
+    }
+
+    /// Zero a freshly grown slot tail across workers. Returns false when the
+    /// tail is too small to be worth a batch — which is every call from
+    /// `alloc_group`, where the tail is one slot — and the caller fills it
+    /// serially.
+    ///
+    /// Worth threading at all only because the cost is page faults rather than
+    /// bytes: the kernel materializes a page per fault, and eight threads
+    /// faulting disjoint pages fault in parallel. Eight threads buy about 1.3x,
+    /// not 8x — the fault path serializes on the kernel's own locks — so this is
+    /// a small win, not a lever. Sizing it against the rest of q18's aggregate
+    /// (3M groups): 80ms parallel discovery probe, 44ms this fill, 26ms serial
+    /// first-occurrence merge, 12ms key-array growth, 10ms accumulate. It is the
+    /// largest SERIAL block, which is why it is threaded first, and it is still
+    /// only a sixth of the operator.
+    auto fill_slots_parallel(std::span<AggSlotCore> tail) -> bool {
+        // Sized so the batch (a submit plus a join) stays small against the
+        // work. Below a few megabytes the serial memset is already
+        // bandwidth-bound and has no faults left to hide.
+        constexpr std::size_t kMinTailBytes = 4UL << 20;
+        if (tail.size() * sizeof(AggSlotCore) < kMinTailBytes) {
+            return false;
+        }
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
+            return false;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t threads = std::min(
+            std::size_t{16}, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        if (threads < 2) {
+            return false;
+        }
+        const std::size_t grain = (tail.size() + threads - 1) / threads;
+        auto batch = pool.submit(threads, [&](std::size_t t) {
+            const std::size_t begin = t * grain;
+            if (begin >= tail.size()) {
+                return;
+            }
+            const std::size_t end = std::min(tail.size(), begin + grain);
+            SlotArray<AggSlotCore>::fill_default(tail.subspan(begin, end - begin));
+        });
+        batch.wait();
+        return true;
     }
 
     auto alloc_group() -> std::uint32_t {
@@ -7190,6 +7287,7 @@ class ChunkedAggregateOperator final : public Operator {
     /// `flat_slots_` for the serial path, a worker-private array for the
     /// parallel one — and `GidT` covers both assigned gids (uint32_t) and raw
     /// Categorical codes (int32_t), which are already dense indices.
+    ///
     template <typename GidT>
     void accumulate_columns_into(const GidT* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,

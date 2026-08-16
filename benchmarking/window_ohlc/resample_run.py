@@ -223,7 +223,7 @@ def main() -> None:
     # must be set before any engine module loads or the query runs.
     THREADS = args.threads
     os.environ["POLARS_MAX_THREADS"] = str(THREADS)
-    os.environ["IBEX_THREADS"] = str(THREADS)
+    os.environ["IBEX_CORES"] = str(THREADS)
     print(f"# thread budget: {THREADS} for every engine", file=sys.stderr)
 
     if args.verify:

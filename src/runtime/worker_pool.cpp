@@ -7,6 +7,7 @@
 #include <charconv>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -232,8 +233,27 @@ void WorkerPool::Batch::wait() {
     }
 }
 
-auto default_thread_count() -> std::size_t {
-    const auto raw = env_value("IBEX_THREADS");
+auto compute_thread_count() -> std::size_t {
+    // `IBEX_THREADS` was this knob's name until the compute budget and the pool
+    // size were split apart. Left unhandled the rename fails SILENTLY and in the
+    // worst possible direction: the old name is ignored, the fallback is
+    // `hardware_concurrency()`, and a run meant to be pinned to one core quietly
+    // spawns twenty-four threads. That cost a measurement here before the
+    // warning existed, and a benchmark script is exactly the kind of caller that
+    // would never notice. Warn once rather than aliasing, so stale callers get
+    // fixed instead of silently kept working.
+    static const bool warned = [] {
+        if (!env_value("IBEX_THREADS").empty() && env_value("IBEX_CORES").empty()) {
+            std::fputs(
+                "ibex: IBEX_THREADS is no longer read; it was split into "
+                "IBEX_CORES (compute budget) and IBEX_DECODE_THREADS (pool size). "
+                "Ignoring it and using the detected core count.\n",
+                stderr);
+        }
+        return true;
+    }();
+    (void)warned;
+    const auto raw = env_value("IBEX_CORES");
     if (!raw.empty() && raw != "auto") {
         std::size_t parsed = 0;
         const auto* end = raw.data() + raw.size();
@@ -245,6 +265,61 @@ auto default_thread_count() -> std::size_t {
     }
     const unsigned hardware = std::thread::hardware_concurrency();
     return hardware == 0 ? 1 : static_cast<std::size_t>(hardware);
+}
+
+/// Positive integer from `name`, or `fallback` when unset/unparseable/zero.
+/// Every pool-sizing knob goes through this so they all answer the same way.
+auto env_size(const char* name, std::size_t fallback) -> std::size_t {
+    const auto raw = env_value(name);
+    if (raw.empty()) {
+        return fallback;
+    }
+    std::size_t parsed = 0;
+    const auto* end = raw.data() + raw.size();
+    const auto result = std::from_chars(raw.data(), end, parsed);
+    return (result.ec == std::errc{} && result.ptr == end && parsed > 0) ? parsed : fallback;
+}
+
+auto decode_thread_count() -> std::size_t {
+    // How many threads the process pool gets. Sized for DECODE, which is
+    // memory-latency bound: below saturation, extra decode threads fill stalls
+    // a core-sized budget leaves empty. Compute is not latency bound and does
+    // not want them, so compute paths clamp to `ExecutionContext::
+    // parallel_threads` (pinned to the core count in
+    // `configure_parallel_from_env`) and only the scan pipeline draws on the
+    // whole pool.
+    //
+    // The policy is "oversubscribe until the memory system saturates, then
+    // stop", because a flat multiplier is measurably wrong at both ends. Suite
+    // totals, pinned, varying only the pool size:
+    //
+    //     cores   1x      2x      3x
+    //       1   3787    3919    3947     <- oversubscribing LOSES
+    //       2   3247    2832    2868     <- 2x wins by 12.8%
+    //       4   2320    2165    2189     <- 2x wins by 6.7%
+    //       8   1809    1971    1959     <- oversubscribing LOSES by 9%
+    //
+    // At one core there is nothing to overlap with and a second thread only
+    // flips the `pool.size() < 2` guards on, buying pipeline machinery for a
+    // workload that cannot use it. At eight the memory system is already
+    // saturated and the extra threads are pure contention. In between, decode
+    // stalls dominate and doubling pays.
+    //
+    // The saturation point is where THIS box stops improving, so it is a
+    // property of the memory system rather than of the code, and it is
+    // `IBEX_DECODE_SATURATION` precisely so it can be swept on a new machine
+    // instead of guessed. Four points on one box is not a heuristic; it is the
+    // first row of the table one would be derived from. Re-derive before
+    // trusting any of this on the AWS 4-physical-core box (benchmarking/aws).
+    const std::size_t saturation = env_size("IBEX_DECODE_SATURATION", 8);
+    const std::size_t cores = compute_thread_count();
+    if (const std::size_t forced = env_size("IBEX_DECODE_THREADS", 0); forced != 0) {
+        return forced;  // absolute override, for A/B and for other boxes
+    }
+    if (cores < 2) {
+        return cores;
+    }
+    return std::min(cores * 2, std::max(cores, saturation));
 }
 
 namespace {
@@ -277,7 +352,7 @@ auto process_worker_pool() -> WorkerPool& {
     auto& state = process_worker_pool_state();
     const std::lock_guard lock(state.mutex);
     if (state.pool == nullptr) {
-        state.pool = std::make_unique<WorkerPool>(default_thread_count());
+        state.pool = std::make_unique<WorkerPool>(decode_thread_count());
     }
     return *state.pool;
 }

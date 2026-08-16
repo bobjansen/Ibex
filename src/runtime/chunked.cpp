@@ -9324,6 +9324,16 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     if (const auto want = parallel_enabled_from_env(); want.has_value()) {
         exec.parallel = *want;
     }
+    // Pin the COMPUTE budget to the core count. Every compute gate sizes itself
+    // from `parallel_threads`, falling back to the pool size when it is 0 — and
+    // the pool is now sized for decode, which wants more threads than cores
+    // (`decode_oversubscribe`). Without this, growing the pool would
+    // oversubscribe the compute paths too, and those measurably do not want it
+    // (q01 +4.6%, q17 +3.2%). With a multiplier of 1 this is the same number the
+    // fallback produced, so the default configuration is unchanged.
+    if (exec.parallel_threads == 0) {
+        exec.parallel_threads = compute_thread_count();
+    }
     if (exec.parallel_stats == nullptr) {
         exec.parallel_stats = process_island_stats();
     }
@@ -9333,7 +9343,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         // asking for a profile never constructs a pool a serial query would
         // otherwise never have built.
         const std::size_t budget =
-            exec.parallel_threads != 0 ? exec.parallel_threads : default_thread_count();
+            exec.parallel_threads != 0 ? exec.parallel_threads : compute_thread_count();
         exec.execution_profile = std::make_shared<ExecutionProfileState>(budget);
     }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
@@ -9343,10 +9353,9 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         // threshold would silently override the knob it was asked to honor.
         exec.parallel_min_rows = std::min(exec.parallel_min_rows, grain);
     }
-    // `parallel_threads` is deliberately left alone. `IBEX_THREADS` already
-    // sizes the process pool, and a zero budget means "use the pool", so the
-    // environment reaches the island either way — while a caller that set its
-    // own budget before calling this keeps it.
+    // `parallel_threads` is set at the top of this function, not here: it is
+    // the COMPUTE budget and must track the core count, because the pool it
+    // used to default to is now sized for decode instead.
 }
 
 // One construction point for every row-local map operator that can live in a
@@ -11251,7 +11260,12 @@ class PipelinedStageOperator final : public Operator {
         // breaker submits work and waits, so keep the serial window source.
         return 0;
     }
-    const std::size_t budget = exec.parallel_threads == 0 ? pool.size() : exec.parallel_threads;
+    // The decode pipeline is the one consumer sized against the POOL rather
+    // than the compute budget: it is what the extra threads were added for.
+    // An explicit `parallel_threads` from a caller (tests, tuning) still caps
+    // it, but the default-configured value no longer does, because
+    // `configure_parallel_from_env` now sets that to the core count.
+    const std::size_t budget = pool.size();
     std::size_t workers = std::min({budget, pool.size(), unit_count});
     // A spare thread is only necessary when every pool thread could remain
     // parked behind ring backpressure. The ring holds 2W results and workers

@@ -11251,8 +11251,7 @@ class PipelinedStageOperator final : public Operator {
     return eligible ? make_pipelined_stage(std::move(child), exec) : std::move(child);
 }
 
-[[nodiscard]] auto scan_pipeline_worker_count(const ExecutionContext& exec, std::size_t unit_count)
-    -> std::size_t {
+[[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t {
     auto& pool = process_worker_pool();
     if (pool.size() < 2) {
         // With one pool thread there is no worker to reserve for a downstream
@@ -11262,9 +11261,8 @@ class PipelinedStageOperator final : public Operator {
     }
     // The decode pipeline is the one consumer sized against the POOL rather
     // than the compute budget: it is what the extra threads were added for.
-    // An explicit `parallel_threads` from a caller (tests, tuning) still caps
-    // it, but the default-configured value no longer does, because
-    // `configure_parallel_from_env` now sets that to the core count.
+    // `ExecutionContext::parallel_threads` deliberately does not cap it;
+    // configure_parallel_from_env uses that field for compute only.
     const std::size_t budget = pool.size();
     std::size_t workers = std::min({budget, pool.size(), unit_count});
     // A spare thread is only necessary when every pool thread could remain
@@ -11285,7 +11283,7 @@ class PipelinedStageOperator final : public Operator {
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string> {
-    const std::size_t worker_count = scan_pipeline_worker_count(exec, units.size());
+    const std::size_t worker_count = scan_pipeline_worker_count(units.size());
     if (worker_count == 0) {
         return std::unexpected("scan pipeline requires a worker");
     }
@@ -11374,8 +11372,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                     if (const auto* deferred = exec.deferred_scan(scan.source_name());
                         deferred != nullptr && deferred->filter == nullptr) {
                         auto units = deferred_scan_units(*deferred);
-                        if (units.size() > 1 &&
-                            scan_pipeline_worker_count(exec, units.size()) >= 2) {
+                        if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
                             return build_pipelined_scan(island.operators, true, *deferred,
                                                         std::move(units), scalars, externs, exec);
                         }
@@ -11404,7 +11401,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 deferred != nullptr && deferred->filter == nullptr) {
                 auto units = deferred_scan_units(*deferred);
                 if (units.size() > 1) {
-                    if (exec.parallel && scan_pipeline_worker_count(exec, units.size()) > 0) {
+                    if (exec.parallel && scan_pipeline_worker_count(units.size()) > 0) {
                         return build_pipelined_scan({}, false, *deferred, std::move(units), scalars,
                                                     externs, exec);
                     }

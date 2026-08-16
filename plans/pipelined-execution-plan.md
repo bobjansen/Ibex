@@ -472,7 +472,10 @@ condition: the caller waits for the batch, the scan workers wait for the caller
 to drain, and neither can move. A source of at most `3 * workers` units cannot
 reach that state — the ring holds `2 * workers` and the workers have already
 claimed at most one unit each — so those common short Parquet scans retain the
-full decode budget. A one-thread pool keeps the old serial-window source.
+full decode budget. The admission gate also keeps the old serial-window source
+when the execution budget exposes fewer than two decode workers: one producer
+only adds a bounded-queue handoff and cannot overlap decode with useful
+downstream work.
 
 This is deliberately the first scheduler slice, not the completed scheduler.
 It covers source → optional row-local maps → breaker, including the direct
@@ -545,15 +548,15 @@ totals move the implied parallel fraction from about 52% to 55%. q18 remains
 the large counterexample (+24% at four cores, +13% at eight); q20 is +10% at
 four cores and q17 is +12% at eight.
 
-Two cores expose a separate policy cliff. Long sources reserve one of the two
+Two cores exposed a separate policy cliff. Long sources reserve one of the two
 pool threads to avoid producer/breaker deadlock, leaving a single decode
-producer while still paying the pipeline handoff cost. The suite is +6.9%,
-with q06 +47%, q04 +24%, and q12 +24%. The next scheduler slice must replace
-that static reservation with progress-aware admission/backpressure (or decline
-the pipeline when it cannot retain useful producer parallelism). The relaxed
-no-regression bar permits keeping this first slice enabled, but the two-core
-crossover and q18 are now named follow-up gates rather than noise to average
-away.
+producer while still paying the pipeline handoff cost. The admission gate now
+declines that one-producer configuration and returns to the established serial
+window; the corresponding regression must be remeasured before this becomes a
+new performance claim. Progress-aware admission/backpressure remains the next
+general scheduler step. The relaxed no-regression bar permits keeping this
+first slice enabled, but q18 and the two-core crossover remain named follow-up
+gates rather than noise to average away.
 
 The rest of this phase must retain the same bounded-queue contract: a source
 may publish completed units as they become ready, row-local stages may consume

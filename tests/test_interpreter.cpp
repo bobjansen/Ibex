@@ -13121,6 +13121,28 @@ TEST_CASE("Scan pipeline feeds a blocking aggregate without a materialized scan 
     CHECK((*total)[0] == 7'998'000);
 }
 
+TEST_CASE("Scan pipeline declines a one-worker decode budget", "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[select { total = sum(x) }];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 1;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.pipelined_scans.load() == 0);
+    CHECK(stats.morsels.load() == 0);
+    const auto* total = std::get_if<Column<std::int64_t>>(out->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == 1);
+    CHECK((*total)[0] == 7'998'000);
+}
+
 TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
           "[runtime][parallel][pipeline]") {
     auto state = std::make_shared<PipelineReaderState>();

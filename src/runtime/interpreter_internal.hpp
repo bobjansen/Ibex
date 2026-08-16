@@ -552,27 +552,67 @@ inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
 /// per-group scratch region rather than taxing every slot of every group: this
 /// struct is allocated once per GROUP, and a group-by can carry millions.
 /// `double_value` still doubles as the running mean while they accumulate.
+/// Two words, and every bit of both is live. What used to be here and is not
+/// any more, because none of it was information THIS slot carried:
+///
+/// - `func` and `kind` were a copy, per GROUP, of something that varies only
+///   per AGGREGATE. Every reader already had `plan_[agg_i]` in hand and passed
+///   it in — `agg_combine` takes both as parameters and never read the slot's.
+///   On a 3M-group aggregate that was 6MB of the same two bytes.
+/// - `has_value` is `count != 0`. The Stddev arm of `agg_combine` had already
+///   worked that out and tested `count == 0` for presence; the other arms kept
+///   a separate flag saying the same thing. Aggregates that do not otherwise
+///   count now store 1 rather than setting a bool — the same single store, to a
+///   field that was there anyway.
+///
+/// Dropping them takes the slot from 24 bytes to 16, which is a third off
+/// everything the array costs: `mremap` growth, the first-touch fill (44ms of
+/// q18 alone), every accumulate pass, and the `per_morsel_bytes` budget that
+/// decides whether a group-by can afford replicated partial state at all. 16 is
+/// also the size at which n_aggs slots start sharing cache lines — four to a
+/// line instead of two and a bit.
 struct AggSlotCore {
-    ir::AggFunc func = ir::AggFunc::Sum;
-    ExprType kind = ExprType::Int;
-    bool has_value = false;
+    /// Rows accumulated into this slot, and the presence flag. Aggregates that
+    /// need a real count (Count, Mean, the moments) increment it; the rest set
+    /// it to 1 on their first value. Read presence through `present()` rather
+    /// than comparing here, so the two meanings stay legible.
     std::int64_t count = 0;
     /// A slot belongs to one aggregate and one column type, so the integer and
     /// double accumulators are never both live — they share storage. Anything
-    /// that writes one and reads the other is a bug; `kind` says which is
-    /// active, and agg_combine() switches on it for exactly this reason.
+    /// that writes one and reads the other is a bug; the aggregate's `kind` in
+    /// `plan_` says which is active, and agg_combine() takes it as a parameter
+    /// for exactly this reason.
     union {
         std::int64_t int_value = 0;
         double double_value;
     };
+
+    /// Has any non-null row reached this slot? See `count`.
+    [[nodiscard]] auto present() const noexcept -> bool { return count != 0; }
+    /// Mark presence for an aggregate that keeps no running count. A plain
+    /// store, not an increment: nothing reads the magnitude, and a store has no
+    /// dependency on the old value.
+    void mark_present() noexcept { count = 1; }
 };
 
-/// AggSlotCore plus the boxed value First/Last needs for a non-numeric column
-/// (String, but also Bool/Date/Timestamp). The materializing aggregate path
-/// keeps its slots in several containers and reads this inline; the chunked
-/// operator stores `AggSlotCore` and keeps the boxed values in a side array
-/// that stays EMPTY — and therefore free — for an all-numeric query.
-struct AggSlot : AggSlotCore {
+/// The materializing aggregate's per-group state (`aggregate.cpp`). Standalone
+/// rather than derived from `AggSlotCore`: that path keeps one slot per group in
+/// ordinary containers, never calls `agg_combine`, and reads `func`/`kind`/
+/// `has_value` inline — so it wants the wide, self-describing slot, while the
+/// chunked operator allocating by the million wants the lean one. Sharing a base
+/// only forced the wide fields onto the path that cannot afford them.
+struct AggSlot {
+    ir::AggFunc func = ir::AggFunc::Sum;
+    ExprType kind = ExprType::Int;
+    bool has_value = false;
+    std::int64_t count = 0;
+    union {
+        std::int64_t int_value = 0;
+        double double_value;
+    };
+    /// The boxed value First/Last needs for a non-numeric column (String, but
+    /// also Bool/Date/Timestamp). The chunked operator keeps these in a side
+    /// array that stays EMPTY — and therefore free — for an all-numeric query.
     ScalarValue text_value;
     /// Welford M2, inline here because the materializing aggregate keeps one
     /// slot per group in ordinary containers and has no scratch region to put
@@ -586,12 +626,12 @@ struct AggSlot : AggSlotCore {
 static_assert(std::is_trivially_destructible_v<AggSlotCore>);
 static_assert(std::is_trivially_copyable_v<AggSlotCore>);
 // One slot per GROUP, and a group-by can carry millions, so its size is a
-// deliberate number rather than whatever the fields happen to add up to. The
-// three flags pack into the padding ahead of `count`; a fourth 8-byte member
-// would cost 33% more memory traffic across allocation, growth and every
+// deliberate number rather than whatever the fields happen to add up to. Two
+// 8-byte words with no padding and nothing redundant left in either; a third
+// would cost 50% more memory traffic across allocation, growth and every
 // accumulate pass. If one is genuinely needed, put it in the caller's per-group
 // scratch — that is what moved Σ(x-mean)^k out of here.
-static_assert(sizeof(AggSlotCore) == 24);
+static_assert(sizeof(AggSlotCore) == 16);
 
 // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
 // We need AggSlotCore to be a POD
@@ -713,28 +753,27 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             } else {
                 dst.double_value += src.double_value;
             }
-            dst.has_value = dst.has_value || src.has_value;
+            dst.count += src.count;
             return;
         case ir::AggFunc::Mean:
             dst.double_value += src.double_value;
             dst.count += src.count;
-            dst.has_value = dst.has_value || src.has_value;
             return;
         case ir::AggFunc::Min:
         case ir::AggFunc::Max:
-            if (!src.has_value) {
+            if (!src.present()) {
                 return;
             }
             // int_value and double_value SHARE storage, so only the member
             // `kind` names may be touched — copying both would reinterpret one
             // as the other.
-            if (!dst.has_value) {
+            if (!dst.present()) {
                 if (kind == ExprType::Int) {
                     dst.int_value = src.int_value;
                 } else {
                     dst.double_value = src.double_value;
                 }
-                dst.has_value = true;
+                dst.mark_present();
                 return;
             }
             if (kind == ExprType::Int) {
@@ -758,7 +797,6 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
                 if (dst_m2 != nullptr && src_m2 != nullptr) {
                     *dst_m2 = *src_m2;
                 }
-                dst.has_value = dst.has_value || src.has_value;
                 return;
             }
             const auto na = static_cast<double>(dst.count);
@@ -770,21 +808,20 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
                 *dst_m2 += *src_m2 + (delta * delta * (na * nb / n));
             }
             dst.count += src.count;
-            dst.has_value = dst.has_value || src.has_value;
             return;
         }
         case ir::AggFunc::First:
             // Leftmost wins: `dst` is the earlier range.
-            if (!dst.has_value && src.has_value) {
+            if (!dst.present() && src.present()) {
                 copy_active_value(dst, src, kind);
-                dst.has_value = true;
+                dst.mark_present();
             }
             return;
         case ir::AggFunc::Last:
             // Rightmost wins: `src` is the later range.
-            if (src.has_value) {
+            if (src.present()) {
                 copy_active_value(dst, src, kind);
-                dst.has_value = true;
+                dst.mark_present();
             }
             return;
         default:

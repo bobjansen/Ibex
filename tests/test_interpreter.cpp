@@ -13150,6 +13150,81 @@ TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
     CHECK((*w)[3] == 600);
 }
 
+TEST_CASE("Inner join probe fans out across workers and matches the serial probe",
+          "[runtime][parallel][join]") {
+    // Above the parallel probe's 1<<14 row gate so the fan-out actually
+    // qualifies; the counter assertion below is what proves it did.
+    constexpr std::size_t kRows = 20000;
+    runtime::Table probe_side;
+    {
+        std::vector<std::int64_t> keys;
+        std::vector<std::int64_t> vals;
+        keys.reserve(kRows);
+        vals.reserve(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            keys.push_back(static_cast<std::int64_t>(row % 128));
+            vals.push_back(static_cast<std::int64_t>(row));
+        }
+        probe_side.add_column("k", Column<std::int64_t>{std::move(keys)});
+        probe_side.add_column("v", Column<std::int64_t>{std::move(vals)});
+    }
+    runtime::Table build_side;
+    {
+        // Two build rows per key so the probe walks a chain rather than the
+        // unique-build fast path; keys 100..127 probe as misses.
+        std::vector<std::int64_t> keys;
+        std::vector<std::int64_t> tags;
+        keys.reserve(200);
+        tags.reserve(200);
+        for (std::int64_t key = 0; key < 100; ++key) {
+            keys.push_back(key);
+            tags.push_back(key * 10);
+            keys.push_back(key);
+            tags.push_back((key * 10) + 1);
+        }
+        build_side.add_column("k", Column<std::int64_t>{std::move(keys)});
+        build_side.add_column("tag", Column<std::int64_t>{std::move(tags)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("probe_t", std::move(probe_side));
+    registry.emplace("build_t", std::move(build_side));
+    auto ir = require_ir("probe_t join build_t on k;");
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats& stats) {
+        runtime::ExecutionContext exec{.execution_profile = nullptr};
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return std::move(*out);
+    };
+
+    runtime::ParallelIslandStats serial_stats;
+    auto serial = run(false, serial_stats);
+    CHECK(serial_stats.parallel_probes.load() == 0);
+
+    runtime::ParallelIslandStats parallel_stats;
+    auto parallel = run(true, parallel_stats);
+    // Both directions, per the range_heads pattern: the serial run must not
+    // count, and the parallel run must — otherwise a silently narrowed gate
+    // would leave the value comparison green while costing the parallelism.
+    CHECK(parallel_stats.parallel_probes.load() >= 1);
+
+    for (const char* name : {"k", "v", "tag"}) {
+        const auto* expect = std::get_if<Column<std::int64_t>>(serial.find(name));
+        const auto* got = std::get_if<Column<std::int64_t>>(parallel.find(name));
+        REQUIRE(expect != nullptr);
+        REQUIRE(got != nullptr);
+        REQUIRE(got->size() == expect->size());
+        std::size_t mismatches = 0;
+        for (std::size_t row = 0; row < expect->size(); ++row) {
+            mismatches += static_cast<std::size_t>((*got)[row] != (*expect)[row]);
+        }
+        CHECK(mismatches == 0);
+    }
+}
+
 // Ordering by a Categorical column ranks its DICTIONARY and maps each row's
 // code through that ranking, rather than flattening to one string_view per row
 // and re-deriving the distinct values by hashing all of them. These cases pin

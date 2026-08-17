@@ -33,6 +33,8 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t rows = 0;
     std::uint64_t pool_thread_calls = 0;
     std::uint64_t pool_tasks = 0;
+    std::uint64_t barriers = 0;
+    std::uint64_t barrier_wait_ns = 0;
 };
 
 /// Share of the machine an operator kept busy while it ran: 0 means it was
@@ -52,7 +54,26 @@ struct ExecutionProfileSnapshotRow {
 /// wider machine, rather than inferring it backwards from an observed speedup.
 struct ExecutionProfileSummary {
     double self_ms = 0.0;
+    /// Main-thread time that was NOT parked at a barrier.
+    ///
+    /// This used to be "self time of operators that were handed no worker at
+    /// all", a per-operator binary. That understated the residue in exactly the
+    /// interesting case: an operator that fans out contributed ZERO, even
+    /// though its self time still contains the serial phases between its
+    /// barriers (a prefix sum, a first-occurrence merge, slot growth) and the
+    /// time parked in `wait()`. Now every operator contributes
+    /// `self - barrier_wait`, so a partly-parallel operator's serial residue is
+    /// visible instead of rounded away.
     double serial_self_ms = 0.0;
+    /// Main-thread time parked inside `Batch::wait()`, across every operator.
+    ///
+    /// The scheduler question in one number. Serial residue that is mostly THIS
+    /// is reclaimable by a `join` that participates in the work queue instead
+    /// of blocking; residue that is mostly `serial_self_ms` is not, and wants
+    /// algorithmic work instead. Nothing could tell the two apart before.
+    double barrier_wait_ms = 0.0;
+    /// Fork-join round trips the query issued.
+    std::uint64_t barriers = 0;
     /// `serial_self_ms / self_ms`.
     double serial_fraction = 0.0;
     /// Amdahl's limit at unbounded cores, `1 / serial_fraction`. Zero when
@@ -121,6 +142,19 @@ class ExecutionProfileScope {
 [[nodiscard]] auto current_execution_profile_entry() noexcept -> ExecutionProfileEntry*;
 void record_execution_profile_worker(ExecutionProfileEntry* entry,
                                      std::chrono::nanoseconds elapsed) noexcept;
+
+/// Count one fork-join round trip against the operator that issued it.
+void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept;
+
+/// Add wall time the submitting thread spent parked in `Batch::wait()`.
+///
+/// Separate from `record_execution_profile_worker`, and the distinction is the
+/// whole point of measuring it: worker time is work that happened, barrier wait
+/// is a thread doing nothing while it happens. The summary subtracts this from
+/// self time, so the reported serial fraction stops counting a barrier park as
+/// serial compute.
+void record_execution_profile_barrier_wait(ExecutionProfileEntry* entry,
+                                           std::chrono::nanoseconds elapsed) noexcept;
 
 [[nodiscard]] auto execution_profile_requested() noexcept -> bool;
 

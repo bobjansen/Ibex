@@ -217,6 +217,15 @@ TEST_CASE("a pool worker's ring park is not charged to the caller", "[runtime][p
     REQUIRE(row != rows.end());
     CHECK(row->ring_wait_ns == 0);
     CHECK(row->pool_tasks == 2);
+    // It is subtracted from the worker time instead: a worker that parked was
+    // not working, and counting the park made `occupancy` overstate the machine.
+    CHECK(row->pool_idle_ns > 0);
+    CHECK(row->pool_work_ns < row->pool_idle_ns);
+
+    const auto summary = runtime::summarize_execution_profile(rows, /*wall_ms=*/4.0,
+                                                              /*workers=*/2);
+    CHECK(summary.pool_idle_ms > 0.0);
+    CHECK(summary.pool_work_ms < summary.pool_idle_ms);
 }
 
 TEST_CASE("a stage thread's work is not charged to the caller", "[runtime][profile]") {

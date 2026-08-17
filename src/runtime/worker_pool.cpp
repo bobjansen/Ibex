@@ -53,6 +53,11 @@ void run_task(Task const& task) {
     const auto profile_start = state.profile_entry == nullptr
                                    ? std::chrono::steady_clock::time_point{}
                                    : std::chrono::steady_clock::now();
+    // Drop any park this thread accumulated before the body began, so a
+    // previous task's leftover cannot be charged to this one.
+    if (state.profile_entry != nullptr) {
+        (void)take_pool_park_ns();
+    }
     std::exception_ptr caught;
     try {
         state.body(task.worker_id);
@@ -66,9 +71,16 @@ void run_task(Task const& task) {
     // window — narrow, and only when profiling is on — in which this thread
     // writes into freed memory.
     if (state.profile_entry != nullptr) {
-        record_execution_profile_worker(state.profile_entry,
-                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                            std::chrono::steady_clock::now() - profile_start));
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - profile_start);
+        // A worker that parked on ring backpressure was not working. Counting
+        // that park as worker time made a blocked worker read as a busy one and
+        // made `occupancy` overstate how much of the machine was in use.
+        // Clamped: the two are sampled by the same clock but the subtraction
+        // must not underflow on an unsigned duration.
+        const auto parked = std::min(take_pool_park_ns(), elapsed);
+        record_execution_profile_worker(state.profile_entry, elapsed - parked);
+        record_execution_profile_pool_idle(state.profile_entry, parked);
     }
     {
         const std::lock_guard lock(state.mutex);

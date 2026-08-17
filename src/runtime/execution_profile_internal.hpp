@@ -37,6 +37,7 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t barrier_wait_ns = 0;
     std::uint64_t stage_self_ns = 0;
     std::uint64_t ring_wait_ns = 0;
+    std::uint64_t pool_idle_ns = 0;
 };
 
 /// Share of the machine an operator kept busy while it ran: 0 means it was
@@ -93,7 +94,14 @@ struct ExecutionProfileSummary {
     /// Amdahl's limit at unbounded cores, `1 / serial_fraction`. Zero when
     /// nothing serial was measured, meaning "no ceiling observed".
     double amdahl_ceiling = 0.0;
+    /// Worker time spent WORKING. Excludes time a worker sat parked on ring
+    /// backpressure, which `run_task` subtracts before recording — otherwise a
+    /// blocked worker reads as a busy one and `occupancy` overstates the machine.
     double pool_work_ms = 0.0;
+    /// Worker time spent parked on ring backpressure, i.e. produced-ahead.
+    /// Large values mean the CONSUMER is the bottleneck, the mirror image of
+    /// what a large `ring_wait_ms` says about the producer.
+    double pool_idle_ms = 0.0;
     /// Time that ran on a stage thread (a `PipelinedStageOperator` producer).
     /// Excluded from `self_ms`, and reported so the exclusion is visible: this
     /// number used to be silently folded into `serial_self_ms`, which is what
@@ -165,6 +173,10 @@ void record_execution_profile_worker(ExecutionProfileEntry* entry,
 /// Count one fork-join round trip against the operator that issued it.
 void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept;
 
+/// Record worker time that was a backpressure park rather than work.
+void record_execution_profile_pool_idle(ExecutionProfileEntry* entry,
+                                        std::chrono::nanoseconds elapsed) noexcept;
+
 /// Add wall time the submitting thread spent parked in `Batch::wait()`.
 ///
 /// Separate from `record_execution_profile_worker`, and the distinction is the
@@ -174,6 +186,15 @@ void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept;
 /// serial compute.
 void record_execution_profile_barrier_wait(ExecutionProfileEntry* entry,
                                            std::chrono::nanoseconds elapsed) noexcept;
+
+/// Accumulate a pool worker's park, to be drained by `run_task` and subtracted
+/// from the worker time it records. Thread-local: one task runs per pool thread
+/// at a time, so the accumulator needs no key.
+void add_pool_park_ns(std::chrono::nanoseconds elapsed) noexcept;
+
+/// Read and reset this thread's accumulated park. Called by `run_task` either
+/// side of a worker body.
+[[nodiscard]] auto take_pool_park_ns() noexcept -> std::chrono::nanoseconds;
 
 /// Times a park on a pipeline ring and charges it to the operator whose `next()`
 /// is blocking.
@@ -193,6 +214,7 @@ class RingWaitScope {
 
    private:
     ExecutionProfileEntry* entry_ = nullptr;
+    bool pool_ = false;
     std::chrono::steady_clock::time_point start_;
 };
 

@@ -9814,6 +9814,10 @@ class ParallelIslandOperator final : public Operator {
                 std::unique_lock lock(mutex_);
                 // Backpressure: this morsel's ring slot is only free once the
                 // consumer has released the morsel `window_` ahead of it.
+                // Produced-ahead is idle, not work: `run_task` subtracts this
+                // from the worker time it records, or a blocked worker reads as
+                // a busy one and `occupancy` overstates the machine.
+                const RingWaitScope ring_wait;
                 space_.wait(lock, [&] {
                     return cancelled_ || sequence < released_ + window_ ||
                            (has_error_ && error_sequence_ < sequence);
@@ -10956,6 +10960,7 @@ class PipelinedScanOperator final : public Operator {
                 }
                 {
                     std::unique_lock lock(mutex_);
+                    const RingWaitScope ring_wait;  // produced-ahead: idle, not work
                     space_.wait(lock, [&] { return cancelled_ || sequence < released_ + window_; });
                     if (cancelled_) {
                         return;

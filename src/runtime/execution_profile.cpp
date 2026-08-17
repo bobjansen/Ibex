@@ -43,6 +43,10 @@ struct ExecutionProfileEntry {
     /// reclaim. It is a subset of the enclosing scope's self time, which is why
     /// the summary subtracts it rather than adding it.
     std::atomic<std::uint64_t> barrier_wait_ns{0};
+    /// Time that ran on a STAGE thread — `PipelinedStageOperator`'s producer.
+    /// Diagnostic only, and excluded from the self/serial totals for the same
+    /// reason `pool_next_ns` is: it did not run on the calling thread.
+    std::atomic<std::uint64_t> stage_self_ns{0};
 };
 
 struct ExecutionProfileState::Impl {
@@ -249,10 +253,13 @@ ExecutionProfileState::~ExecutionProfileState() {
                             "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
                             "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
                             "barriers={} barrier_wait_ms={:.3f} "
-                            "pool_work_ms={:.3f} occupancy={:.3f}\n",
+                            "pool_work_ms={:.3f} occupancy={:.3f} "
+                            "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f}\n",
                             total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
                             summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
-                            summary.barrier_wait_ms, summary.pool_work_ms, summary.occupancy);
+                            summary.barrier_wait_ms, summary.pool_work_ms, summary.occupancy,
+                            process_worker_pool().size(), stage_thread_peak(),
+                            summary.stage_self_ms);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
@@ -263,7 +270,8 @@ ExecutionProfileState::~ExecutionProfileState() {
             "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
             "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
             "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
-            "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f}\n",
+            "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f} "
+            "stage_self_ms={:.3f}\n",
             row->node_id, row->label,
             static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
@@ -277,7 +285,8 @@ ExecutionProfileState::~ExecutionProfileState() {
             row->pool_thread_calls.load(std::memory_order_relaxed),
             row->pool_tasks.load(std::memory_order_relaxed),
             row->barriers.load(std::memory_order_relaxed),
-            static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6);
+            static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->stage_self_ns.load(std::memory_order_relaxed)) / 1.0e6);
     }
 }
 
@@ -298,6 +307,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     std::uint64_t pool_total_ns = 0;
     std::uint64_t barrier_wait_total_ns = 0;
     std::uint64_t barrier_total = 0;
+    std::uint64_t stage_total_ns = 0;
     for (const auto& row : rows) {
         // `pool_next_ns`/`pool_source_ns` are excluded from `self` on purpose,
         // not by omission: `source_self_ns`/`next_self_ns` already exclude
@@ -320,6 +330,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
         const std::uint64_t parked = std::min(row.barrier_wait_ns, self);
         barrier_wait_total_ns += parked;
         barrier_total += row.barriers;
+        stage_total_ns += row.stage_self_ns;
         serial_self_ns += self - parked;
     }
     ExecutionProfileSummary summary;
@@ -328,6 +339,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     summary.pool_work_ms = static_cast<double>(pool_total_ns) / 1.0e6;
     summary.barrier_wait_ms = static_cast<double>(barrier_wait_total_ns) / 1.0e6;
     summary.barriers = barrier_total;
+    summary.stage_self_ms = static_cast<double>(stage_total_ns) / 1.0e6;
     summary.serial_fraction = self_total_ns == 0 ? 0.0
                                                  : static_cast<double>(serial_self_ns) /
                                                        static_cast<double>(self_total_ns);
@@ -376,6 +388,7 @@ auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnap
             .pool_tasks = row->pool_tasks.load(std::memory_order_relaxed),
             .barriers = row->barriers.load(std::memory_order_relaxed),
             .barrier_wait_ns = row->barrier_wait_ns.load(std::memory_order_relaxed),
+            .stage_self_ns = row->stage_self_ns.load(std::memory_order_relaxed),
         });
     }
     return out;
@@ -424,12 +437,23 @@ ExecutionProfileScope::~ExecutionProfileScope() {
         // two different ways.
         if (on_worker_pool_thread()) {
             entry_->pool_source_ns.fetch_add(self, std::memory_order_relaxed);
+        } else if (on_stage_thread()) {
+            entry_->stage_self_ns.fetch_add(self, std::memory_order_relaxed);
         } else {
             entry_->source_self_ns.fetch_add(self, std::memory_order_relaxed);
         }
     } else {
         if (on_worker_pool_thread()) {
             entry_->pool_next_ns.fetch_add(self, std::memory_order_relaxed);
+        } else if (on_stage_thread()) {
+            // A stage thread is neither a pool worker nor the calling thread. It
+            // runs CONCURRENTLY with the calling thread, so charging it to
+            // `next_self_ns` made `self_ms` exceed `wall_ms` on every query that
+            // stages a breaker, and inflated the serial fraction the scheduler
+            // decision is read from. `span_ns` is skipped for the same reason it
+            // is skipped on a pool thread: the span belongs to the consumer's
+            // pull, not to a producer running beside it.
+            entry_->stage_self_ns.fetch_add(self, std::memory_order_relaxed);
         } else {
             entry_->next_self_ns.fetch_add(self, std::memory_order_relaxed);
             entry_->span_ns.fetch_add(elapsed, std::memory_order_relaxed);

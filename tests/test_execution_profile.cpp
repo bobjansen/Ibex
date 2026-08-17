@@ -163,6 +163,41 @@ TEST_CASE("profile summary tolerates an empty profile and a zero budget", "[runt
     CHECK(runtime::profile_row_occupancy({}, 0) == 0.0);
 }
 
+TEST_CASE("a stage thread's work is not charged to the caller", "[runtime][profile]") {
+    // The bug this closes: `PipelinedStageOperator`'s producer is not a pool
+    // thread, so `on_worker_pool_thread()` is false there and its scopes landed
+    // in `next_self_ns` — main-thread self time — while running CONCURRENTLY
+    // with the real main thread. That made `self_ms` exceed `wall_ms` on every
+    // query that stages a breaker, and inflated the serial fraction that the
+    // scheduler decision is read from by >=77ms across PDS-H SF-1.
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/4,
+                                                                    /*report=*/false);
+    auto* stage_entry = profile->stage("staged");
+
+    std::thread producer([&] {
+        const runtime::StageThreadScope stage_thread;
+        const runtime::ExecutionProfileScope scope(stage_entry, runtime::ProfilePhase::Next);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    });
+    producer.join();
+
+    const auto rows = profile->snapshot();
+    const auto row = std::ranges::find_if(rows, [](const auto& e) { return e.label == "staged"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->stage_self_ns > 0);
+    CHECK(row->next_self_ns == 0);  // not the caller's
+    CHECK(row->pool_next_ns == 0);  // and not a worker's either
+    // The span belongs to the consumer's pull, not to a producer beside it.
+    CHECK(row->span_ns == 0);
+
+    // And it stays out of the self/serial totals.
+    const auto summary = runtime::summarize_execution_profile(rows, /*wall_ms=*/5.0,
+                                                              /*workers=*/4);
+    CHECK(summary.self_ms == 0.0);
+    CHECK(summary.serial_self_ms == 0.0);
+    CHECK(summary.stage_self_ms > 0.0);
+}
+
 TEST_CASE("submitting a batch records a barrier and its wait", "[runtime][profile]") {
     // End-to-end through the real pool, because the summary tests above feed
     // `summarize_execution_profile` hand-built rows and so cannot see the

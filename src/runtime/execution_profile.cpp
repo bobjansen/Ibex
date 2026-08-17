@@ -49,6 +49,7 @@ struct ExecutionProfileEntry {
     std::atomic<std::uint64_t> stage_self_ns{0};
     /// Calling-thread time parked on a pipeline ring. See `RingWaitScope`.
     std::atomic<std::uint64_t> ring_wait_ns{0};
+    std::atomic<std::uint64_t> pool_idle_ns{0};
 };
 
 struct ExecutionProfileState::Impl {
@@ -65,6 +66,9 @@ struct ExecutionProfileState::Impl {
 namespace {
 
 thread_local ExecutionProfileScope::Frame* current_frame = nullptr;
+
+// A pool worker's accumulated backpressure park, drained by `run_task`.
+thread_local std::uint64_t t_pool_park_ns = 0;
 
 [[nodiscard]] auto ns_since(std::chrono::steady_clock::time_point start) -> std::uint64_t {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -255,13 +259,13 @@ ExecutionProfileState::~ExecutionProfileState() {
                             "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
                             "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
                             "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
-                            "pool_work_ms={:.3f} occupancy={:.3f} "
+                            "pool_work_ms={:.3f} pool_idle_ms={:.3f} occupancy={:.3f} "
                             "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f}\n",
                             total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
                             summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
                             summary.barrier_wait_ms, summary.ring_wait_ms, summary.pool_work_ms,
-                            summary.occupancy, process_worker_pool().size(), stage_thread_peak(),
-                            summary.stage_self_ms);
+                            summary.pool_idle_ms, summary.occupancy, process_worker_pool().size(),
+                            stage_thread_peak(), summary.stage_self_ms);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
@@ -273,7 +277,7 @@ ExecutionProfileState::~ExecutionProfileState() {
             "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
             "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
             "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f} "
-            "stage_self_ms={:.3f} ring_wait_ms={:.3f}\n",
+            "stage_self_ms={:.3f} ring_wait_ms={:.3f} pool_idle_ms={:.3f}\n",
             row->node_id, row->label,
             static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
@@ -289,7 +293,8 @@ ExecutionProfileState::~ExecutionProfileState() {
             row->barriers.load(std::memory_order_relaxed),
             static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->stage_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
-            static_cast<double>(row->ring_wait_ns.load(std::memory_order_relaxed)) / 1.0e6);
+            static_cast<double>(row->ring_wait_ns.load(std::memory_order_relaxed)) / 1.0e6,
+            static_cast<double>(row->pool_idle_ns.load(std::memory_order_relaxed)) / 1.0e6);
     }
 }
 
@@ -312,6 +317,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     std::uint64_t barrier_total = 0;
     std::uint64_t stage_total_ns = 0;
     std::uint64_t ring_wait_total_ns = 0;
+    std::uint64_t pool_idle_total_ns = 0;
     for (const auto& row : rows) {
         // `pool_next_ns`/`pool_source_ns` are excluded from `self` on purpose,
         // not by omission: `source_self_ns`/`next_self_ns` already exclude
@@ -327,6 +333,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
         const std::uint64_t self = row.build_self_ns + row.next_self_ns + row.source_self_ns;
         self_total_ns += self;
         pool_total_ns += row.pool_work_ns;
+        pool_idle_total_ns += row.pool_idle_ns;
         // Barrier wait is a subset of self time — the submitting thread is
         // inside this scope while it is parked — so it is subtracted, never
         // added. Clamped because the two are sampled by different clocks and a
@@ -352,6 +359,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     summary.barriers = barrier_total;
     summary.stage_self_ms = static_cast<double>(stage_total_ns) / 1.0e6;
     summary.ring_wait_ms = static_cast<double>(ring_wait_total_ns) / 1.0e6;
+    summary.pool_idle_ms = static_cast<double>(pool_idle_total_ns) / 1.0e6;
     summary.serial_fraction = self_total_ns == 0 ? 0.0
                                                  : static_cast<double>(serial_self_ns) /
                                                        static_cast<double>(self_total_ns);
@@ -402,6 +410,7 @@ auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnap
             .barrier_wait_ns = row->barrier_wait_ns.load(std::memory_order_relaxed),
             .stage_self_ns = row->stage_self_ns.load(std::memory_order_relaxed),
             .ring_wait_ns = row->ring_wait_ns.load(std::memory_order_relaxed),
+            .pool_idle_ns = row->pool_idle_ns.load(std::memory_order_relaxed),
         });
     }
     return out;
@@ -506,6 +515,15 @@ void record_execution_profile_worker(ExecutionProfileEntry* entry,
     entry->pool_tasks.fetch_add(1, std::memory_order_relaxed);
 }
 
+void record_execution_profile_pool_idle(ExecutionProfileEntry* entry,
+                                        std::chrono::nanoseconds elapsed) noexcept {
+    if (entry == nullptr || elapsed.count() <= 0) {
+        return;
+    }
+    entry->pool_idle_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                  std::memory_order_relaxed);
+}
+
 void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept {
     if (entry == nullptr) {
         return;
@@ -514,24 +532,39 @@ void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept {
 }
 
 RingWaitScope::RingWaitScope() noexcept
-    // Only the calling thread's parks belong here. A pool worker parking on ring
-    // backpressure is idle too, but it inflates `pool_work_ns` rather than self
-    // time, and is accounted separately.
-    : entry_(on_worker_pool_thread() || on_stage_thread() ? nullptr
-                                                          : current_execution_profile_entry()),
-      start_(entry_ == nullptr ? std::chrono::steady_clock::time_point{}
-                               : std::chrono::steady_clock::now()) {}
+    : entry_(on_stage_thread() ? nullptr : current_execution_profile_entry()),
+      pool_(on_worker_pool_thread()),
+      start_((entry_ == nullptr && !pool_) ? std::chrono::steady_clock::time_point{}
+                                           : std::chrono::steady_clock::now()) {}
 
 RingWaitScope::~RingWaitScope() {
-    if (entry_ == nullptr) {
+    if (entry_ == nullptr && !pool_) {
         return;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start_);
-    if (elapsed.count() > 0) {
-        entry_->ring_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
-                                       std::memory_order_relaxed);
+    if (elapsed.count() <= 0) {
+        return;
     }
+    if (pool_) {
+        // A worker's park is subtracted from the worker time `run_task` records,
+        // not from any self time — it was never in one.
+        add_pool_park_ns(elapsed);
+        return;
+    }
+    entry_->ring_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                   std::memory_order_relaxed);
+}
+
+void add_pool_park_ns(std::chrono::nanoseconds elapsed) noexcept {
+    if (elapsed.count() > 0) {
+        t_pool_park_ns += static_cast<std::uint64_t>(elapsed.count());
+    }
+}
+
+auto take_pool_park_ns() noexcept -> std::chrono::nanoseconds {
+    return std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(
+        std::exchange(t_pool_park_ns, std::uint64_t{0})));
 }
 
 void record_execution_profile_barrier_wait(ExecutionProfileEntry* entry,

@@ -18,6 +18,12 @@ complete enough to move under `plans/done/`.
 | [multiway-join-chain-perf-plan.md](multiway-join-chain-perf-plan.md) | Investigation complete | Probe-order-preserving joins landed (82c391f): q05 -7%, q18 -4.2%, q09 -3.9%, q07 -3.4%. All three follow-ups resolved 2026-07-18: q05 stage profile (residual = lineitem decode 67ms + raw hash-probe throughput 59ms, NOT inter-stage materialization); q11's `german_supply` confirmed materialized once (shared-binding gate, lower.cpp:1347); DuckDB EXPLAIN ANALYZE shows its 2.7x q05 win is dynamic filter pushdown (`l_orderkey IN BF` in the lineitem scan → 3.3% of rows emitted). Probe-side Bloom tried + reverted (−3.4% isolated, wash end-to-end). Successor: [dynamic-filter-pushdown-plan.md](done/dynamic-filter-pushdown-plan.md) |
 | [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Phases 1–3a, the first Phase 3b source slice, and Phase 4 items 1–2 landed; item 3 retired, item 4 part-done | Lazy scans now have bounded concurrent decode and ordered source→breaker overlap (see pipelined execution); general pipeline scheduling remains open. **Item 3 (hash join) is RETIRED**: the gap was Categorical probe keys hashed as text. Next: profile the string/int/generic group-by and `distinct` paths before adding parallelism; re-measure at target scale because fixed-core per-core wins do not preserve the headline as data grows. |
 
+## Reference — descriptive, not a work item
+
+| Document | What it is |
+|---|---|
+| [parallelism-overview.md](parallelism-overview.md) | How multi-core execution works today, in the vocabulary of the parallel-database literature: the `WorkerPool` substrate and its two thread budgets, the three parallelism layers (pipeline / parallel-map island / intra-operator), the determinism contract, and the full config surface. Part 2 is a numbered list of the places the implementation diverges from itself — type-dependent gather rules, whole-table vs chunked operator coverage, eleven private row thresholds beside the two `ExecutionContext` knobs — with a suggested order of attack. Start here before adding a new fan-out |
+
 ## Proposed — no implementation yet
 
 | Plan | Notes |

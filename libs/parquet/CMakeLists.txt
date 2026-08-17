@@ -324,7 +324,11 @@ else()
     message(FATAL_ERROR "Arrow shared targets not found (arrow_shared/parquet_shared).")
 endif()
 
-target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet)
+# ibex_parquet is a static library. Its PRIVATE link dependencies do not
+# propagate to the shared plugin, so the final DLL must also link curl for the
+# HTTPS reader (notably required by MinGW, which otherwise leaves
+# __imp_curl_* unresolved).
+target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet CURL::libcurl)
 
 set(_ibex_parquet_stub "${_ibex_parquet_output_dir}/parquet.ibex")
 add_custom_command(

@@ -9,6 +9,7 @@
 // terminating the process, and a Batch never outlives its bodies.
 
 #include <ibex/runtime/env.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,6 +26,36 @@
 #include <string>
 
 using namespace ibex;
+
+namespace {
+
+/// Save one `IBEX_*` variable and restore it on scope exit, so a test may set it
+/// freely without leaking the setting into whatever Catch2 runs next.
+class EnvGuard {
+   public:
+    explicit EnvGuard(const char* name) : name_(name) {
+        if (const char* v = std::getenv(name); v != nullptr) {  // NOLINT(concurrency-mt-unsafe)
+            saved_ = v;
+        }
+    }
+    ~EnvGuard() {
+        if (saved_.has_value()) {
+            runtime::set_env(name_, *saved_);
+        } else {
+            runtime::unset_env(name_);
+        }
+    }
+    EnvGuard(const EnvGuard&) = delete;
+    auto operator=(const EnvGuard&) -> EnvGuard& = delete;
+    EnvGuard(EnvGuard&&) = delete;
+    auto operator=(EnvGuard&&) -> EnvGuard& = delete;
+
+   private:
+    const char* name_;
+    std::optional<std::string> saved_;
+};
+
+}  // namespace
 
 TEST_CASE("WorkerPool runs each worker body exactly once", "[runtime][worker_pool]") {
     runtime::WorkerPool pool(4);
@@ -188,25 +219,7 @@ TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
 // "1", which is the only value the old one understood.
 TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
           "[runtime][parallel][worker_pool]") {
-    struct EnvGuard {
-        std::optional<std::string> saved;
-        EnvGuard() {
-            if (const char* v = std::getenv("IBEX_PARALLEL"); v != nullptr) {
-                saved = v;
-            }
-        }
-        ~EnvGuard() {
-            if (saved.has_value()) {
-                runtime::set_env("IBEX_PARALLEL", *saved);
-            } else {
-                runtime::unset_env("IBEX_PARALLEL");
-            }
-        }
-        EnvGuard(const EnvGuard&) = delete;
-        auto operator=(const EnvGuard&) -> EnvGuard& = delete;
-        EnvGuard(EnvGuard&&) = delete;
-        auto operator=(EnvGuard&&) -> EnvGuard& = delete;
-    } const guard;
+    const EnvGuard guard("IBEX_PARALLEL");
 
     SECTION("unset leaves the caller's choice alone") {
         runtime::unset_env("IBEX_PARALLEL");
@@ -234,5 +247,100 @@ TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
     SECTION("an unrecognized value leaves the choice alone rather than guessing") {
         runtime::set_env("IBEX_PARALLEL", "maybe");
         CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
+    }
+}
+
+// The other two execution switches parse exactly like `IBEX_PARALLEL`.
+//
+// They share one `env_flag` parser precisely so the accepted spellings cannot
+// drift apart -- `IBEX_PARALLEL=off` working while `IBEX_JOIN_PROBE=off` is
+// silently ignored is the failure this pins down, and it is invisible in any
+// test that only ever writes "0".
+TEST_CASE("execution switches share one on/off spelling", "[runtime][parallel][worker_pool]") {
+    const auto check_flag = [](const char* name, auto read) {
+        const EnvGuard guard(name);
+        CAPTURE(name);
+
+        runtime::unset_env(name);
+        CHECK_FALSE(read().has_value());  // unset leaves the caller's choice alone
+
+        for (const char* value : {"1", "on", "true", "yes"}) {
+            runtime::set_env(name, value);
+            CAPTURE(value);
+            REQUIRE(read().has_value());
+            CHECK(read().value());
+        }
+        for (const char* value : {"0", "off", "false", "no"}) {
+            runtime::set_env(name, value);
+            CAPTURE(value);
+            REQUIRE(read().has_value());
+            CHECK_FALSE(read().value());
+        }
+
+        // Unrecognized: leave the choice alone rather than guessing a direction.
+        runtime::set_env(name, "maybe");
+        CHECK_FALSE(read().has_value());
+    };
+
+    check_flag("IBEX_STREAM_SCAN", runtime::stream_scans_from_env);
+    check_flag("IBEX_JOIN_PROBE", runtime::parallel_join_probe_from_env);
+    check_flag("IBEX_PARALLEL", runtime::parallel_enabled_from_env);
+}
+
+// The I8 contract: the environment reaches these settings through
+// `configure_parallel_from_env` and the `ExecutionContext`, and nowhere else.
+//
+// Both switches used to be a `getenv` at each of their three use sites. Six
+// reads of two variables is six authorities, each free to disagree with the
+// context the rest of the engine obeys -- and a caller that built its own
+// context had no way to say "ignore the environment" for them, which is the
+// spelling `interpret()`'s no-context overload exists to contrast with.
+TEST_CASE("stream-scan and join-probe switches reach the ExecutionContext",
+          "[runtime][parallel][worker_pool]") {
+    const EnvGuard stream_guard("IBEX_STREAM_SCAN");
+    const EnvGuard probe_guard("IBEX_JOIN_PROBE");
+
+    SECTION("both default to on") {
+        const runtime::ExecutionContext exec;
+        CHECK(exec.stream_scans);
+        CHECK(exec.parallel_join_probe);
+    }
+
+    SECTION("the environment turns each one off independently") {
+        runtime::set_env("IBEX_STREAM_SCAN", "0");
+        runtime::unset_env("IBEX_JOIN_PROBE");
+        runtime::ExecutionContext exec;
+        runtime::configure_parallel_from_env(exec);
+        CHECK_FALSE(exec.stream_scans);
+        CHECK(exec.parallel_join_probe);
+
+        runtime::unset_env("IBEX_STREAM_SCAN");
+        runtime::set_env("IBEX_JOIN_PROBE", "off");
+        runtime::ExecutionContext other;
+        runtime::configure_parallel_from_env(other);
+        CHECK(other.stream_scans);
+        CHECK_FALSE(other.parallel_join_probe);
+    }
+
+    SECTION("an unset variable leaves a caller's explicit choice alone") {
+        runtime::unset_env("IBEX_STREAM_SCAN");
+        runtime::unset_env("IBEX_JOIN_PROBE");
+        runtime::ExecutionContext exec;
+        exec.stream_scans = false;
+        exec.parallel_join_probe = false;
+        runtime::configure_parallel_from_env(exec);
+        CHECK_FALSE(exec.stream_scans);
+        CHECK_FALSE(exec.parallel_join_probe);
+    }
+
+    SECTION("the environment overrides a caller's choice when it is set") {
+        runtime::set_env("IBEX_STREAM_SCAN", "yes");
+        runtime::set_env("IBEX_JOIN_PROBE", "yes");
+        runtime::ExecutionContext exec;
+        exec.stream_scans = false;
+        exec.parallel_join_probe = false;
+        runtime::configure_parallel_from_env(exec);
+        CHECK(exec.stream_scans);
+        CHECK(exec.parallel_join_probe);
     }
 }

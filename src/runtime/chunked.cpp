@@ -4621,8 +4621,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// submitting a batch.
     [[nodiscard]] auto probe_parallel_workers(std::size_t n) const -> std::size_t {
         constexpr std::size_t kMinProbeRows = 1U << 14U;
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || n < kMinProbeRows ||
-            !parallel_join_probe_enabled()) {
+        if (exec_ == nullptr || !exec_->parallel || !exec_->parallel_join_probe ||
+            on_worker_pool_thread() || n < kMinProbeRows) {
             return 0;
         }
         auto& pool = process_worker_pool();
@@ -9324,6 +9324,19 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     if (const auto want = parallel_enabled_from_env(); want.has_value()) {
         exec.parallel = *want;
     }
+    // The other two execution switches, applied the same way and for the same
+    // reason: one authority per setting. Both were `getenv` at their use sites
+    // until the seams that share them started to outnumber the settings —
+    // `stream_scans` is read at three build seams that must agree, and
+    // `parallel_join_probe` at three probe gates. An unset variable leaves the
+    // caller's choice alone, so a context built by hand still means "ignore the
+    // environment".
+    if (const auto want = stream_scans_from_env(); want.has_value()) {
+        exec.stream_scans = *want;
+    }
+    if (const auto want = parallel_join_probe_from_env(); want.has_value()) {
+        exec.parallel_join_probe = *want;
+    }
     // Pin the COMPUTE budget to the core count. Every compute gate sizes itself
     // from `parallel_threads`, falling back to the pool size when it is 0 — and
     // the pool is now sized for decode, which wants more threads than cores
@@ -11365,7 +11378,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // production replacement for the old materialize-before-fan-out
             // island boundary. Probe scans keep their join-owned dynamic
             // filter timing and therefore do not enter here.
-            if (stream_scans_enabled() && island.input->kind() == ir::NodeKind::Scan) {
+            if (exec.stream_scans && island.input->kind() == ir::NodeKind::Scan) {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
                 const auto& scan = static_cast<const ir::ScanNode&>(*island.input);
                 if (!registry.contains(scan.source_name())) {
@@ -11387,7 +11400,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // else — a registered table, a source with no unit decomposition — falls
     // through to the whole-table path at the bottom of this function, so
     // declining here costs nothing but the whole-table behaviour.
-    if (node.kind() == ir::NodeKind::Scan && stream_scans_enabled()) {
+    if (node.kind() == ir::NodeKind::Scan && exec.stream_scans) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& scan = static_cast<const ir::ScanNode&>(node);
         if (!registry.contains(scan.source_name())) {

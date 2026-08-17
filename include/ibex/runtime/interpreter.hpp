@@ -605,6 +605,32 @@ struct ExecutionContext {
     /// Optional island counters, or null to record nothing. Not owned.
     ParallelIslandStats* parallel_stats = nullptr;
 
+    /// Whether a lazy source is streamed through its scan operator rather than
+    /// decoded whole before the plan runs.
+    ///
+    /// **On by default** (`plans/pipelined-execution-plan.md`, Phases 1-2):
+    /// streaming measures 7.8% faster than materializing on PDS-H at 8 cores
+    /// and 5.7% faster on one, and it bounds how much of a source is decoded at
+    /// once. `IBEX_STREAM_SCAN=0` (or `off`/`false`/`no`) turns it off, which is
+    /// the escape hatch for a bug in it or an A/B against it.
+    ///
+    /// Three places consult it — the driver that decides whether to defer a
+    /// source, and the two scan-operator build seams — and they must agree.
+    /// That is why it is a field rather than a `getenv` at each site: three
+    /// reads of the environment are three authorities free to disagree with
+    /// each other and with the context, and a caller-built context is the one
+    /// spelling for "ignore the environment" (see the `interpret()` overload
+    /// without an `ExecutionContext`).
+    bool stream_scans = true;
+
+    /// Whether an inner-join probe may fan its scan out across worker ranges.
+    ///
+    /// `IBEX_JOIN_PROBE=0` turns it off for A/B measurement and bug isolation;
+    /// the output is byte-identical either way. A field for the same reason as
+    /// `stream_scans`: three probe gates consult it (the whole-table join, the
+    /// chunked join, and the lazy-table keep-rows scan) and must agree.
+    bool parallel_join_probe = true;
+
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.
     [[nodiscard]] auto deferred_scan(const std::string& name) const -> const DeferredScan* {
@@ -669,26 +695,6 @@ struct DeferredScanPlan {
 };
 
 [[nodiscard]] auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan;
-
-/// Whether a lazy source should be streamed through its scan operator rather
-/// than decoded whole before the plan runs.
-///
-/// **On by default** (`plans/pipelined-execution-plan.md`, Phases 1-2):
-/// streaming measures 7.8% faster than materializing on PDS-H at 8 cores and
-/// 5.7% faster on one, and it bounds how much of a source is decoded at once.
-/// `IBEX_STREAM_SCAN=0` (or `off`/`false`/`no`) turns it off, which is the
-/// escape hatch for a bug in it or an A/B against it.
-///
-/// Read fresh each call so a test can flip it, and consulted in exactly two
-/// places — the driver that decides whether to defer a source, and the scan
-/// operator builder — which must agree, hence one function rather than two
-/// `getenv`s.
-[[nodiscard]] auto stream_scans_enabled() -> bool;
-
-/// Whether an inner-join probe may fan its scan out across worker ranges
-/// (`IBEX_JOIN_PROBE`, on by default). Off is for A/B measurement and bug
-/// isolation; the output is byte-identical either way.
-[[nodiscard]] auto parallel_join_probe_enabled() -> bool;
 
 /// The scan's streaming decomposition, or empty when its source has none (a
 /// non-lazy source, or a reader with no unit decode). Decodes nothing.

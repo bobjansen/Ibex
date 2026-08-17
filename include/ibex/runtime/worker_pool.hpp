@@ -145,6 +145,22 @@ void shutdown_process_worker_pool();
 /// `0`/`off`/`false`/`no`.
 [[nodiscard]] auto parallel_enabled_from_env() -> std::optional<bool>;
 
+/// Whether `IBEX_STREAM_SCAN` asks for lazy sources to be streamed through
+/// their scan operator rather than decoded whole. Same three-state contract and
+/// same spellings as `parallel_enabled_from_env`.
+///
+/// `configure_parallel_from_env` applies this to `ExecutionContext::
+/// stream_scans`, which is the only thing the scan seams read. Nothing else may
+/// call `getenv` for it: the three seams that consult the setting have to
+/// agree, and a second reader is a second authority free to disagree.
+[[nodiscard]] auto stream_scans_from_env() -> std::optional<bool>;
+
+/// Whether `IBEX_JOIN_PROBE` asks for join probes to fan out across worker
+/// ranges. Same three-state contract and same spellings as
+/// `parallel_enabled_from_env`; applied to
+/// `ExecutionContext::parallel_join_probe`.
+[[nodiscard]] auto parallel_join_probe_from_env() -> std::optional<bool>;
+
 /// Rows per SOURCE chunk from `IBEX_CHUNK_ROWS`, or 0 when unset/invalid.
 ///
 /// Zero means "one chunk", which is what production does today. A non-zero

@@ -163,6 +163,62 @@ TEST_CASE("profile summary tolerates an empty profile and a zero budget", "[runt
     CHECK(runtime::profile_row_occupancy({}, 0) == 0.0);
 }
 
+TEST_CASE("a ring park is idle, not serial work", "[runtime][profile]") {
+    // The second misreport the barrier counters exposed. `barrier_wait_ns` only
+    // covers parks inside `Batch::wait()`. A consumer pulling from a pipelined
+    // scan's ordered ring blocks on a plain condvar, so that idle landed in
+    // `next_self_ns` and was reported as the query's SERIAL residue. On PDS-H
+    // q04 that read as "100% serial" for a query whose scan is fully parallel.
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/4,
+                                                                    /*report=*/false);
+    auto* entry = profile->stage("ring");
+    {
+        const runtime::ExecutionProfileScope scope(entry, runtime::ProfilePhase::Next);
+        const runtime::RingWaitScope ring_wait;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto rows = profile->snapshot();
+    const auto row = std::ranges::find_if(rows, [](const auto& e) { return e.label == "ring"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->ring_wait_ns > 0);
+    CHECK(row->barrier_wait_ns == 0);  // a different kind of park, counted apart
+    CHECK(row->ring_wait_ns <= row->next_self_ns);
+
+    const auto summary = runtime::summarize_execution_profile(rows, /*wall_ms=*/5.0,
+                                                              /*workers=*/4);
+    CHECK(summary.ring_wait_ms > 0.0);
+    // Idle is subtracted from serial, so a scope that only waited reports
+    // essentially no serial work. Not exactly zero: the scope's own entry and
+    // exit sit outside the wait, which is sub-microsecond but real, so this
+    // asserts the split rather than an exact zero a wall clock cannot promise.
+    CHECK(summary.serial_self_ms < 1.0);
+    CHECK(summary.ring_wait_ms > 10.0 * summary.serial_self_ms);
+}
+
+TEST_CASE("a pool worker's ring park is not charged to the caller", "[runtime][profile]") {
+    // A worker parking on ring backpressure is idle too, but it inflates
+    // `pool_work_ns`, not self time. Attributing it to the operator's
+    // `ring_wait_ns` would subtract it from a serial figure it was never in.
+    runtime::WorkerPool pool{2};
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/2,
+                                                                    /*report=*/false);
+    auto* entry = profile->stage("worker_ring");
+    {
+        const runtime::ExecutionProfileScope scope(entry, runtime::ProfilePhase::Next);
+        auto batch = pool.submit(2, [](std::size_t) {
+            const runtime::RingWaitScope ring_wait;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        });
+        batch.wait();
+    }
+    const auto rows = profile->snapshot();
+    const auto row =
+        std::ranges::find_if(rows, [](const auto& e) { return e.label == "worker_ring"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->ring_wait_ns == 0);
+    CHECK(row->pool_tasks == 2);
+}
+
 TEST_CASE("a stage thread's work is not charged to the caller", "[runtime][profile]") {
     // The bug this closes: `PipelinedStageOperator`'s producer is not a pool
     // thread, so `on_worker_pool_thread()` is false there and its scopes landed

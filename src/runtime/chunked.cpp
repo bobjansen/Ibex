@@ -9704,10 +9704,14 @@ class ParallelIslandOperator final : public Operator {
         {
             std::unique_lock lock(mutex_);
             const auto slot = static_cast<std::size_t>(next_sequence_ % window_);
-            ready_.wait(lock, [&] {
-                return ring_ready_[slot] || cancelled_ || active_workers_ == 0 ||
-                       (has_error_ && error_sequence_ <= next_sequence_);
-            });
+            {
+                // Idle, not serial work: the merger is waiting on its workers.
+                const RingWaitScope ring_wait;
+                ready_.wait(lock, [&] {
+                    return ring_ready_[slot] || cancelled_ || active_workers_ == 0 ||
+                           (has_error_ && error_sequence_ <= next_sequence_);
+                });
+            }
             if (ring_ready_[slot]) {
                 chunk = std::move(ring_[slot]);
                 ring_[slot].reset();
@@ -10878,9 +10882,15 @@ class PipelinedScanOperator final : public Operator {
             {
                 std::unique_lock lock(mutex_);
                 const std::size_t slot = next_sequence_ % window_;
-                ready_.wait(lock, [&] {
-                    return ring_[slot].has_value() || cancelled_ || worker_failure_.has_value();
-                });
+                {
+                    // Idle, not serial work: the consumer is waiting on its
+                    // decode workers. Counting this as self time reported a
+                    // streaming scan's wait as the query's serial residue.
+                    const RingWaitScope ring_wait;
+                    ready_.wait(lock, [&] {
+                        return ring_[slot].has_value() || cancelled_ || worker_failure_.has_value();
+                    });
+                }
                 if (worker_failure_.has_value()) {
                     auto message = std::move(*worker_failure_);
                     lock.unlock();
@@ -11154,9 +11164,13 @@ class PipelinedStageOperator final : public Operator {
         std::expected<std::optional<Chunk>, std::string> result = std::optional<Chunk>{};
         {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock, [this] {
-                return !ready_chunks_.empty() || producer_done_ || failure_.has_value();
-            });
+            {
+                // Idle, not serial work: waiting on the stage's producer thread.
+                const RingWaitScope ring_wait;
+                ready_.wait(lock, [this] {
+                    return !ready_chunks_.empty() || producer_done_ || failure_.has_value();
+                });
+            }
             if (failure_.has_value()) {
                 result = std::unexpected(std::move(*failure_));
                 failure_.reset();

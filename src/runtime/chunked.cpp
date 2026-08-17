@@ -11224,7 +11224,8 @@ class PipelinedScanOperator final : public Operator {
 /// plan depth rather than morsel count.
 class PipelinedStageOperator final : public Operator {
    public:
-    explicit PipelinedStageOperator(OperatorPtr child) : child_(std::move(child)) {}
+    PipelinedStageOperator(OperatorPtr child, ExecutionProfileEntry* entry)
+        : child_(std::move(child)), entry_(entry) {}
 
     ~PipelinedStageOperator() override { cancel_and_join(); }
 
@@ -11297,7 +11298,12 @@ class PipelinedStageOperator final : public Operator {
                     }
                 }
 
-                auto next = child_->next();
+                auto next = [&] {
+                    // Scoped per pull, mirroring ProfiledOperator, so the
+                    // backpressure wait above stays outside it.
+                    const ExecutionProfileScope scope(entry_, ProfilePhase::Next);
+                    return child_->next();
+                }();
                 if (!next.has_value()) {
                     fail(std::move(next.error()));
                     return;
@@ -11358,6 +11364,12 @@ class PipelinedStageOperator final : public Operator {
     }
 
     OperatorPtr child_;
+    // The operator this stage was built for. `profile_operator` wraps the
+    // STAGE, not the child, so the producer thread runs unwrapped code and had
+    // no profile frame at all: anything it submitted to the pool was attributed
+    // to no operator, and a fully parallel scan read as zero pool work. The
+    // producer pushes a scope for this entry so its work has an owner.
+    ExecutionProfileEntry* entry_ = nullptr;
     std::thread producer_;
     std::deque<Chunk> ready_chunks_;
     std::mutex mutex_;
@@ -11370,20 +11382,21 @@ class PipelinedStageOperator final : public Operator {
     bool done_ = false;
 };
 
-[[nodiscard]] auto make_pipelined_stage(OperatorPtr child, const ExecutionContext& exec)
-    -> OperatorPtr {
+[[nodiscard]] auto make_pipelined_stage(OperatorPtr child, const ExecutionContext& exec,
+                                        ExecutionProfileEntry* entry) -> OperatorPtr {
     if (!exec.parallel || on_worker_pool_thread() || process_worker_pool().size() < 2) {
         return child;
     }
     if (exec.parallel_stats != nullptr) {
         exec.parallel_stats->pipelined_stages.fetch_add(1, std::memory_order_relaxed);
     }
-    return std::make_unique<PipelinedStageOperator>(std::move(child));
+    return std::make_unique<PipelinedStageOperator>(std::move(child), entry);
 }
 
 [[nodiscard]] auto make_pipelined_stage_if(OperatorPtr child, bool eligible,
-                                           const ExecutionContext& exec) -> OperatorPtr {
-    return eligible ? make_pipelined_stage(std::move(child), exec) : std::move(child);
+                                           const ExecutionContext& exec,
+                                           ExecutionProfileEntry* entry) -> OperatorPtr {
+    return eligible ? make_pipelined_stage(std::move(child), exec, entry) : std::move(child);
 }
 
 [[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t {
@@ -11896,7 +11909,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             return make_pipelined_stage_if(std::make_unique<ChunkedSemiAntiJoinOperator>(
                                                std::move(left_op.value()), std::move(right.value()),
                                                join.kind(), &join.keys(), &exec),
-                                           stage_probe, exec);
+                                           stage_probe, exec,
+                                           execution_profile_entry(exec.execution_profile, node));
         }
         // `nulls equal` goes to the materialized join, which implements the
         // policy. These streaming operators hash and probe on their own and
@@ -11926,7 +11940,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                         std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
                         externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
                         &join.pending_order()),
-                    stage_probe, exec);
+                    stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
             }
             auto right_op =
                 build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
@@ -11941,7 +11955,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 std::make_unique<ChunkedInnerJoinOperator>(
                     std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
                     join.suffix(), &join.pending_order()),
-                stage_probe, exec);
+                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
         }
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(

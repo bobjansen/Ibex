@@ -677,59 +677,91 @@ test methodology survives, and it captures the cost exactly where it is free.
 
 ---
 
-## Measured: where the serial residue actually is
+## Measured: where the main thread's time actually goes
 
 PDS-H SF-1, `IBEX_CORES=8`, `build-release`, quiet box, two runs per query with
-only the second parsed. Totals in ms, from the counters added under item 4.
+only the second parsed.
 
-| | ms |
-|---|---|
-| wall | 1258.6 |
-| main-thread self | 1216.2 |
-| — of which genuinely serial | **805.0** |
-| — of which parked at a barrier | **411.2** (33.8%) |
-| stage-thread work (excluded from self) | 112.0 |
-| pool worker work | 2990.4 |
-| barriers issued | 249 |
+**This table was wrong twice before it was right.** Both errors inflated
+"serial", and both were misattributed idle: stage-thread work (79ms, fixed by
+`stage_self_ns`) and ring parks (374ms, fixed by `RingWaitScope`). The first
+version of this section reported 805ms serial and concluded that the residue was
+mostly serial algorithms. It is not.
 
-**Total thread-time 4318.6ms against 1258.6ms wall = 3.43x achieved on 8 cores.**
-With 805ms genuinely serial the Amdahl ceiling is 5.36x, i.e. wall could reach
-~805ms — a 36% reduction — if everything except the serial work parallelized
-perfectly.
+| | ms | share of self |
+|---|---|---|
+| wall | 1286.6 | |
+| main-thread self | 1236.8 | |
+| — genuinely serial work | **443.5** | 35.9% |
+| — parked at a barrier | **419.6** | 33.9% |
+| — parked on a pipeline ring | **373.6** | 30.2% |
+| stage-thread work (excluded from self) | 116.1 | |
+| pool worker work | 3042.0 | |
+| barriers issued | 249 | |
 
-**What a work-participating `join` buys is NOT the 33.8%.** It turns W workers
-into W+1 for the batch the caller submitted, so at W=8 each batch shortens by
-about 1/9 and the recoverable slice of 411.2ms is ~46ms — **3.6% of wall**. There
-is no other ready work for the parked caller to pick up, because a fork-join plan
-is sequential by construction. This is the specific fix for the specific thing
-that was measured, and it is small.
+**64% of the main thread's non-worker time is idle, not serial.** Occupancy is
+`3042.0 / (1286.6 x 8)` = **29.6%**: the machine is largely not working.
 
-The gap between 3.43x achieved and 5.36x ceiling is where the scheduler's *other*
-claimed benefits live — work stealing against load imbalance, the
-`on_worker_pool_thread() -> serial` nesting cliff, concurrent breakers. **None of
-them is measured by these counters**: `barrier_wait_ms` is *caller* idle, not
-*worker* idle. So the scheduler's addressable range is somewhere between 3.6% and
-36%, and narrowing it needs worker-side idle instrumentation — time a pool thread
-spends with no task while a batch is in flight. That is the same size of change
-as item 4 and should come before committing to item 6.
+### Idle is not automatically reclaimable
 
-**Independent of scheduling**, the serial column is concentrated and attackable
-without any new primitive:
+The three kinds want different things, and conflating them is what produced two
+wrong conclusions in a row:
 
-| query | wall | serial | share |
-|---|---|---|---|
-| q13 | 132.0 | 106.9 | 81% |
-| q21 | 128.5 | 78.5 | 61% |
-| q18 | 119.2 | 75.6 | 63% |
-| q20 | 79.9 | 61.1 | 76% |
-| q04 | 62.0 | 61.9 | 100% |
+* **Barrier park (419.6ms)** — the caller waiting on a batch it submitted. A
+  work-participating `join` makes it a W+1th worker, shortening each batch by
+  ~1/9 at W=8, so the recoverable slice is **~47ms, 3.6% of wall**. The park is
+  large; the recovery is bounded by the work still having to be done.
+* **Ring park (373.6ms)** — the consumer waiting on a producer it does not
+  control. This mostly means **the producer side is the bottleneck**, and is often
+  correct rather than wasteful: q06 is 98.7% idle because a scan-filter-sum
+  query's main thread genuinely has nothing to do. A scheduler only reclaims it
+  where there is other ready work, and a sequential plan often has none.
+* **Serial work (443.5ms)** — the only part that needs algorithmic attention, and
+  now half what it appeared to be.
 
-Those five are 384ms of the 805ms. At the other extreme q08, q17, q03 and q07 are
-71-79% barrier park, so they are the ones a scheduler would actually help.
+### The open question this leaves
 
-**Methodology notes.** The post-commit perf hook runs a background check on
-`build-release`; a run overlapping it read 30% high on wall and pushed park% from
-33.8% to 36.5%. Check the box is quiet first — contention inflates barrier waits
-specifically, which biases exactly the ratio being measured. The scan script is
-in the session scratchpad, not the repo; it is ~90 lines of subprocess plus regex
-over the `operator profile:` lines and is cheap to rewrite.
+Occupancy at 29.6% says the workers are idle too, and **these counters cannot see
+that**: `barrier_wait`/`ring_wait` are *caller* idle. Worse, `pool_work_ns` is
+itself still contaminated — the three producer-side `space_.wait` sites mean a
+pool worker parked on backpressure is counted as working. So the next measurement
+is worker-side idle, and it should precede any scheduler commitment.
+
+### q04, the query that exposed both errors
+
+Reported as 100% serial. It is not, and Polars gets 1.94x on it where Ibex gets
+1.55x (SF-1 recorded suite: polars 39.9ms / polars-st 77.5ms, ibex 53.5ms /
+ibex-st 82.8ms — note Ibex is also 6.8% slower single-threaded here, one of the
+few PDS-H queries where it is).
+
+Warm per-node profile:
+
+| node | build_self | next_self | ring_wait | pool_work |
+|---|---|---|---|---|
+| `join semi keys=1` | 16.7 | 28.4 | 28.3 | **0.0** |
+| `scan __ibex_source_1` | 0.0 | 20.3 | 20.2 | 113.3 |
+
+So q04 is decode-bound — 125ms of parallel decode, with the main thread parked on
+the ring — plus **one genuinely serial block: the semi-join's build, 16.7ms of a
+63.9ms wall (26%), with zero pool work and zero barriers.**
+
+That block is `init_int_swapped` (`chunked.cpp:3476`), a serial loop over
+3,793,296 right-side keys probing a 57,218-entry map:
+
+    for (std::size_t i = 0; i < rcol.size(); ++i) {
+        if (rnull(i)) continue;
+        if (auto it = seen.find(rcol[i]); it != seen.end()) it->second = char{1};
+    }
+
+Two gates decline, for different reasons. The left-side parallel predicate path
+(`select_rows`) needs `kMinParallelPredicateRows` = 262144 and q04's left is
+57,218 rows — a correct decline. The right-side intersection pass has **no
+parallel path at all**; it was never written. The documented position that "the
+build side is never threaded, 1.5% of q10 against the probe's 15%" was measured
+on q10, where the build is small; after the build-side swap that made q04 -39%,
+q04's build IS the query.
+
+It parallelizes cleanly and deterministically: the pass only ever sets a flag,
+never inserts, so `seen` is immutable throughout. Store a dense index instead of
+a flag, give each worker a `vector<char>` over 57k slots (~57KB), and OR them —
+byte-identical, no atomics. Sizing: 16.7ms of 63.9ms wall.

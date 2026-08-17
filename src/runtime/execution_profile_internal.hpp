@@ -35,6 +35,7 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t pool_tasks = 0;
     std::uint64_t barriers = 0;
     std::uint64_t barrier_wait_ns = 0;
+    std::uint64_t stage_self_ns = 0;
 };
 
 /// Share of the machine an operator kept busy while it ran: 0 means it was
@@ -80,6 +81,11 @@ struct ExecutionProfileSummary {
     /// nothing serial was measured, meaning "no ceiling observed".
     double amdahl_ceiling = 0.0;
     double pool_work_ms = 0.0;
+    /// Time that ran on a stage thread (a `PipelinedStageOperator` producer).
+    /// Excluded from `self_ms`, and reported so the exclusion is visible: this
+    /// number used to be silently folded into `serial_self_ms`, which is what
+    /// made `self_ms` exceed `wall_ms` on a query that stages a breaker.
+    double stage_self_ms = 0.0;
     /// Whole-query occupancy: `pool_work_ms / (wall_ms * workers)`.
     double occupancy = 0.0;
 };

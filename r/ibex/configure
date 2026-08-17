@@ -64,7 +64,11 @@ if [ "${IBEX_R_BUILD_PARQUET:-ON}" = "ON" ]; then
     -DIBEX_ROOT="${IBEX_ROOT}" \
     -DIBEX_BUILD_DIR="${IBEX_BUILD_DIR}" \
     -DIBEX_PARQUET_LOCAL_ONLY=ON
-  cmake --build "${IBEX_PARQUET_BUILD_DIR}" --target ibex_parquet_plugin --parallel
+  # Arrow compiles many large translation units. Keep the default modest to
+  # avoid oversubscribing CI and interactive builds; callers with more memory
+  # can raise IBEX_R_PARALLEL.
+  cmake --build "${IBEX_PARQUET_BUILD_DIR}" --target ibex_parquet_plugin \
+    --parallel "${IBEX_R_PARALLEL:-2}"
   rm -rf "${IBEX_PLUGIN_STAGE}"
   mkdir -p "${IBEX_PLUGIN_STAGE}"
   cp -R "${IBEX_ROOT}/libraries/." "${IBEX_PLUGIN_STAGE}/"

@@ -200,3 +200,7 @@ custom plugin-backed queries, make sure the plugin path is discoverable:
 
 Set `IBEX_R_BUILD_PARQUET=OFF` only when installing from source in a constrained
 environment that does not need `ibex_read_parquet()`.
+
+On Windows, compilation defaults to a short directory under `LOCALAPPDATA` to
+avoid the Windows path-length limit in Arrow's AWS dependencies. Set
+`IBEX_R_BUILD_ROOT` to override that location.

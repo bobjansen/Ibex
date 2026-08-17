@@ -9,9 +9,23 @@ if [ -z "${IBEX_GITHUB_REF:-}" ]; then
   IBEX_GITHUB_REF=${IBEX_GITHUB_REF:-main}
 fi
 IBEX_SOURCE_URL=${IBEX_SOURCE_URL:-"https://github.com/bobjansen/Ibex/archive/${IBEX_GITHUB_REF}.tar.gz"}
-IBEX_ROOT=${IBEX_ROOT:-"$(pwd)/src/ibex-src"}
-IBEX_BUILD_DIR=${IBEX_BUILD_DIR:-"$(pwd)/src/ibex-build"}
-IBEX_PARQUET_BUILD_DIR=${IBEX_PARQUET_BUILD_DIR:-"$(pwd)/src/ibex-parquet-build"}
+# R installs into a deeply nested temporary directory. Arrow's AWS sources add
+# enough components below a CMake build directory to exceed MAX_PATH while GCC
+# writes .obj.d files (the failing path is about 270 characters). Keep all
+# compilation paths under LocalAppData by default; the package staging path is
+# still used only for the final, shallow copy of the plugin files.
+if [ -z "${IBEX_R_BUILD_ROOT:-}" ]; then
+  IBEX_R_BUILD_PARENT=${LOCALAPPDATA:-${TEMP:-/tmp}}
+  if command -v cygpath >/dev/null 2>&1; then
+    IBEX_R_BUILD_PARENT=$(cygpath -u "${IBEX_R_BUILD_PARENT}")
+  fi
+  IBEX_R_BUILD_ROOT="${IBEX_R_BUILD_PARENT}/ibex-r"
+fi
+IBEX_R_BUILD_KEY=$(printf '%s' "$(pwd)" | cksum | awk '{print $1}')
+IBEX_R_BUILD_BASE="${IBEX_R_BUILD_ROOT}/${IBEX_R_BUILD_KEY}"
+IBEX_ROOT=${IBEX_ROOT:-"${IBEX_R_BUILD_BASE}/src"}
+IBEX_BUILD_DIR=${IBEX_BUILD_DIR:-"${IBEX_R_BUILD_BASE}/build"}
+IBEX_PARQUET_BUILD_DIR=${IBEX_PARQUET_BUILD_DIR:-"${IBEX_R_BUILD_BASE}/parquet"}
 IBEX_PLUGIN_STAGE="$(pwd)/inst/plugins"
 
 if [ ! -d "${IBEX_ROOT}/include/ibex" ]; then

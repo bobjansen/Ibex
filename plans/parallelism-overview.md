@@ -454,11 +454,36 @@ regression. But it is not a win either, on a 1M-row output that clears the
 65536-row gate and therefore *is* fanning out. The per-column barrier is
 plausibly eating the parallel gather it buys.
 
-*Convergence:* give the join the sort's task shape — collect the output columns
-into one (column x range) task list and submit a single batch. That is a real
-change to `join_table_impl`'s assembly loop, not a threshold tweak, which is why
-it is recorded here rather than done under I1. It is also the same lever as
-[[project_join_parallelism]]'s "assemble_output is the other half".
+**RESOLVED.** `gather_columns_batched` (`runtime_internal.hpp`) now holds the
+sort's task shape as a shared primitive: it builds (column x range) tasks across
+*all* the columns and submits **one** batch, with 64-aligned ranges, and takes a
+`gather_whole(j)` callback for the tasks that cannot be split — a string, or a
+job the caller marked `indivisible`. Those still run concurrently with the other
+columns, which is the point.
+
+It had **two** instances, which is I4 in miniature: `join_table_impl` in
+`join.cpp` *and* `ChunkedInnerJoinOperator`'s own `gather_with_validity` loop in
+`chunked.cpp`. The second is the one the `inner_join_*` benchmarks actually
+exercise, so fixing only the first would have left the measured symptom
+untouched — worth remembering as evidence for how much the duplicate engines
+cost. Both now call the one shared helper rather than growing a copy each.
+
+Two things fell out. `gather_entry` lost its `ExecutionContext` parameter
+entirely: with the fan-out decided once, one level up, every caller passed
+`nullptr`, and a parameter that is always null implies a choice that no longer
+exists. And the chunked join's `has_right_nulls` — computed and then dropped on
+the floor while `gather_column_with_nulls` rescanned inside every column's
+gather — is now the `indivisible` flag, scanned once per side.
+
+Measured (same harness, 9 interleaved repeats, 8 cores): geomean 1.021x, total
+-1.96%, 34/34 `noise`. `inner_join_symbol` went +4.95% -> 0.00% and
+`inner_join_user` +1.84% -> -2.33% against their respective baselines, so the
+per-column barrier was indeed costing what it looked like. Sorts drifted the
+other way this run (+1.8% to +3.7%, having been -0.6% to -2.7% last run), which
+is the ±13% per-query floor doing its thing and not a signal.
+
+This is the same lever as [[project_join_parallelism]]'s "assemble_output is the
+other half"; the build side remains unthreaded on purpose.
 
 ### Not inconsistencies (recorded so they are not "fixed")
 
@@ -496,9 +521,10 @@ touch.
    rules is how a heisenbug gets in. Measured neutral-to-positive (geomean
    1.012x over join/sort/filter/bool, 34/34 verdicts `noise`), and it surfaced
    I15.
-3. **I15** — give the join's output assembly the sort's single-batch
-   (column x range) task shape. Small, self-contained, and the one place I1
-   left parallelism on the table.
+3. ~~**I15** — give the join's output assembly the sort's single-batch
+   (column x range) task shape.~~ **Done**, in both engines, via a shared
+   `gather_columns_batched`. It needed doing twice, which is itself an argument
+   for the next item.
 4. **I4** — decide, per operator, whether the whole-table implementation is
    still needed, and delete or align it. A decision, not cleanup: the scheduler
    is exactly the kind of change one otherwise implements twice.

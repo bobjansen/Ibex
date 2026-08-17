@@ -3419,6 +3419,34 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     // set, ~40% of the query). Past it, materialize the left and swap.
     static constexpr std::size_t kSemiSwapThreshold = 65536;
 
+    /// Workers for the swapped build's intersection scan, or 0 to run it here.
+    ///
+    /// The scan is one hash lookup per right row against a map that stopped
+    /// changing before it started, so it splits with no coordination — the same
+    /// shape as `select_rows` below, and gated on the same row floor for the
+    /// same reason: below it the fan-out costs more than the lookups it spreads.
+    ///
+    /// Capped additionally by a BYTE budget, which `select_rows` needs no
+    /// equivalent of: each worker owns a private byte per left key, so the cost
+    /// scales with the left's cardinality as well as the right's row count. A
+    /// 57k-key left (q04) is 57KB per worker and free; a multi-million-key left
+    /// would not be, and would rather have fewer workers than a large private
+    /// allocation each.
+    [[nodiscard]] auto intersect_worker_count(std::size_t right_rows, std::size_t slots) const
+        -> std::size_t {
+        constexpr std::size_t kSlotBudgetBytes = 8UL << 20;
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || slots == 0 ||
+            right_rows < kMinParallelPredicateRows) {
+            return 0;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t budget =
+            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
+        workers = std::min(workers, std::max<std::size_t>(kSlotBudgetBytes / slots, 1));
+        return workers < 2 ? 0 : workers;
+    }
+
     // Build the right-key set as the INTERSECTION of the two key columns, by
     // probing the large right against a map of the small left keys rather than
     // inserting every right key. `filter_chunk` then works unchanged: a left row
@@ -3466,23 +3494,64 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
         if (!lcols.empty() && left_rows < rcol.size()) {
             // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
-            robin_hood::unordered_flat_map<std::int64_t, char> seen;
+            //
+            // The map stores a DENSE INDEX rather than a matched flag, which is
+            // what lets the 3.8M-row scan below be split. Ranges of the right
+            // column are independent — the scan only ever marks an existing
+            // slot, never inserts — so each worker marks into its own byte
+            // vector over the left keys and they are ORed afterwards. No
+            // atomics, and the answer cannot depend on the split: `right_i64_`
+            // is a set, so only WHICH keys were hit matters, not the order they
+            // were found in.
+            robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> seen;
             seen.reserve(left_rows);
+            std::uint32_t next_slot = 0;
             for (const auto* lcol : lcols) {
                 for (const std::int64_t v : *lcol) {
-                    seen.try_emplace(v, char{0});
+                    if (seen.try_emplace(v, next_slot).second) {
+                        ++next_slot;
+                    }
                 }
             }
-            for (std::size_t i = 0; i < rcol.size(); ++i) {
-                if (rnull(i)) {
-                    continue;  // a null right key puts nothing in the set
+            const std::size_t n_slots = next_slot;
+
+            const auto scan_range = [&](std::size_t lo, std::size_t hi, char* hits) {
+                for (std::size_t i = lo; i < hi; ++i) {
+                    if (rnull(i)) {
+                        continue;  // a null right key puts nothing in the set
+                    }
+                    if (auto it = seen.find(rcol[i]); it != seen.end()) {
+                        hits[it->second] = char{1};
+                    }
                 }
-                if (auto it = seen.find(rcol[i]); it != seen.end()) {
-                    it->second = char{1};
+            };
+
+            std::vector<char> hits(n_slots, char{0});
+            const std::size_t workers = intersect_worker_count(rcol.size(), n_slots);
+            if (workers < 2) {
+                scan_range(0, rcol.size(), hits.data());
+            } else {
+                // One private vector per worker, ORed below. `n_slots` bytes
+                // each, which is why the worker count is capped by a byte
+                // budget rather than by the pool size alone.
+                std::vector<std::vector<char>> parts(workers, std::vector<char>(n_slots, char{0}));
+                const std::size_t grain = (rcol.size() + workers - 1) / workers;
+                auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+                    const std::size_t lo = w * grain;
+                    if (lo < rcol.size()) {
+                        scan_range(lo, std::min(rcol.size(), lo + grain), parts[w].data());
+                    }
+                });
+                batch.wait();
+                for (const auto& part : parts) {
+                    for (std::size_t slot = 0; slot < n_slots; ++slot) {
+                        hits[slot] = static_cast<char>(hits[slot] | part[slot]);
+                    }
                 }
             }
-            for (const auto& [k, matched] : seen) {
-                if (matched != char{0}) {
+
+            for (const auto& [k, slot] : seen) {
+                if (hits[slot] != char{0}) {
                     right_i64_.insert(k);
                 }
             }

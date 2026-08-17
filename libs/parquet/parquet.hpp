@@ -7,6 +7,8 @@
 // Reading:
 //   extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 //   let df = read_parquet("data/myfile.parquet");
+//   // The local-only R package build accepts local paths only.
+//   // The regular plugin additionally supports HTTPS and S3 paths.
 //   let public = read_parquet("https://data.example.com/myfile.parquet");
 //   let remote = read_parquet("s3://bucket/path/myfile.parquet?region=us-east-1");
 //
@@ -16,7 +18,7 @@
 //
 // Compile with: -I$(IBEX_ROOT)/libraries
 
-// curl.h and Arrow both eventually drag in <windows.h> on this platform
+// Arrow (and curl in the remote-capable build) eventually drags in <windows.h> on this platform
 // (via winsock2.h). Without NOMINMAX its min/max macros clobber every
 // std::numeric_limits<T>::max()-style call textually, which is exactly what
 // breaks arrow/util/compression.h's own use of it -- must be defined before
@@ -48,7 +50,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
 #include <curl/curl.h>
+#endif
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -72,6 +76,7 @@
 
 namespace {
 
+#if !defined(IBEX_PARQUET_LOCAL_ONLY)
 inline auto is_s3_uri(std::string_view path) -> bool {
     return path.starts_with("s3://");
 }
@@ -174,10 +179,17 @@ inline auto download_https_to_temp(std::string_view url) -> std::string {
 
     return temp_path;
 }
+#endif
 
 inline auto open_parquet_input(std::string_view path)
     -> std::shared_ptr<arrow::io::RandomAccessFile> {
     std::string path_string{path};
+#if defined(IBEX_PARQUET_LOCAL_ONLY)
+    if (path_string.find("://") != std::string::npos) {
+        throw std::runtime_error("read_parquet: this build supports local files only: '" +
+                                 path_string + "'");
+    }
+#else
     if (is_https_uri(path)) {
         auto temp_path = download_https_to_temp(path);
         auto input_result = arrow::io::ReadableFile::Open(temp_path);
@@ -189,7 +201,6 @@ inline auto open_parquet_input(std::string_view path)
         }
         return input_result.ValueOrDie();
     }
-
     if (is_s3_uri(path)) {
         std::string object_path;
         auto fs_result = arrow::fs::FileSystemFromUri(path_string, &object_path);
@@ -205,6 +216,7 @@ inline auto open_parquet_input(std::string_view path)
         }
         return input_result.ValueOrDie();
     }
+#endif
 
     std::error_code ec;
     const bool exists = std::filesystem::exists(path_string, ec);

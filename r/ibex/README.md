@@ -158,7 +158,7 @@ summary <- session_eval(sess, '
 ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 ```
 
-Parquet files are first-class lazy sources. The bundled plugin is loaded
+Local Parquet files are first-class lazy sources. The bundled plugin is loaded
 automatically, so filters and projections stay in Ibex until collection:
 
 ```r

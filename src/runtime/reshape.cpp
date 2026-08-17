@@ -32,7 +32,10 @@ namespace ibex::runtime {
 
 namespace {
 
-[[noreturn]] void invariant_violation(std::string_view detail) {
+// Named apart from the shared `invariant_violation` that runtime_internal.hpp
+// declares: this one carries a reshape-specific prefix, and an unqualified call
+// to either would otherwise be ambiguous.
+[[noreturn]] void reshape_invariant_violation(std::string_view detail) {
     (void)std::fputs("ibex internal invariant violated (runtime/reshape): ", stderr);
     (void)std::fwrite(detail.data(), sizeof(char), detail.size(), stderr);
     (void)std::fputc('\n', stderr);
@@ -935,7 +938,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<Column<std::string>>(entry.column.get());
                     if (src == nullptr) {
-                        invariant_violation(
+                        reshape_invariant_violation(
                             "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);
@@ -971,7 +974,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<Column<Categorical>>(entry.column.get());
                     if (src == nullptr) {
-                        invariant_violation(
+                        reshape_invariant_violation(
                             "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);
@@ -993,7 +996,7 @@ auto melt_table(const Table& input, const std::vector<std::string>& id_columns,
                     const auto& entry = input.columns[measure_indices[mi]];
                     const auto* src = std::get_if<SrcCol>(entry.column.get());
                     if (src == nullptr) {
-                        invariant_violation(
+                        reshape_invariant_violation(
                             "melt_table: measure column type mismatch after upfront validation");
                     }
                     measures.push_back(src);

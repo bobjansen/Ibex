@@ -32,6 +32,7 @@
 #include <functional>
 #include <optional>
 #include <robin_hood.h>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -43,9 +44,12 @@
 
 namespace ibex::runtime {
 
-// Abort with a diagnostic on a broken internal invariant (defined in
-// interpreter.cpp).
-[[noreturn]] void invariant_violation(std::string_view detail);
+// `invariant_violation` and the gather kernel (`make_gather_column`,
+// `gather_range_into`, `gather_validity_range`) moved down to
+// runtime_internal.hpp, which this includes: `gather_column` lives in that
+// lower layer and had grown a second, divergent copy of the same kernel.
+// `gather_rows` below still lives here, because it alone needs ir::OrderKey and
+// TableProperties.
 
 struct ComputedColumn {
     ColumnValue column;
@@ -1073,121 +1077,6 @@ inline auto scalar_kind_from_value(const ScalarValue& value) -> ExprType {
 
 inline auto scalar_from_literal(const ir::Literal& literal) -> ScalarValue {
     return std::visit([](const auto& v) -> ScalarValue { return v; }, literal.value);
-}
-
-/// Allocate an output column of `rows` rows shaped like `src`, ready to be
-/// filled by `gather_range_into`.
-///
-/// A `Column<std::string>` cannot be sized without first totalling its bytes,
-/// so it comes back empty and is built whole by the gather itself.
-inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> ColumnValue {
-    return with_meta_of(std::visit(
-                            [&](const auto& col) -> ColumnValue {
-                                using ColT = std::decay_t<decltype(col)>;
-                                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                                    // Shares the source dictionary; only the codes are gathered.
-                                    return Column<Categorical>(
-                                        col.dictionary_ptr(), col.index_ptr(),
-                                        std::vector<Column<Categorical>::code_type>(rows));
-                                } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                                    return ColT{};
-                                } else {
-                                    ColT dst;
-                                    dst.resize(rows);
-                                    return dst;
-                                }
-                            },
-                            src),
-                        src);
-}
-
-/// Copy output rows `[lo, hi)` from `src` through `idx` into an already-sized
-/// `dst`.
-///
-/// **Concurrency:** output rows are contiguous, so two ranges write disjoint
-/// memory for every column that stores at least one addressable unit per row.
-/// `Column<bool>` packs 64 rows per word, so a caller splitting one column
-/// across threads must align its range boundaries to 64 — which is cheap here
-/// precisely because the ranges are contiguous, unlike a scattered scatter.
-///
-/// A string column has no partial form: its flat offsets are cumulative, so it
-/// is built whole and `[lo, hi)` must be the entire column.
-template <typename Idx>
-void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, const std::vector<Idx>& idx,
-                       std::size_t lo, std::size_t hi) {
-    std::visit(
-        [&](const auto& src) {
-            using ColT = std::decay_t<decltype(src)>;
-            if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                if (lo != 0 || hi != idx.size()) {
-                    invariant_violation("gather_rows: a string column has no partial-range form");
-                }
-                std::size_t total_chars = 0;
-                const auto* src_off = src.offsets_data();
-                const auto* src_char = src.chars_data();
-                for (std::size_t pos = 0; pos < hi; ++pos) {
-                    auto si = static_cast<std::size_t>(idx[pos]);
-                    total_chars += src_off[si + 1] - src_off[si];
-                }
-                ColT dst;
-                dst.resize_for_gather(hi, total_chars);
-                auto* dst_off = dst.offsets_data();
-                auto* dst_char = dst.chars_data();
-                dst_off[0] = 0;
-                std::uint32_t cur = 0;
-                for (std::size_t pos = 0; pos < hi; ++pos) {
-                    auto si = static_cast<std::size_t>(idx[pos]);
-                    std::uint32_t len = src_off[si + 1] - src_off[si];
-                    std::memcpy(dst_char + cur, src_char + src_off[si], len);
-                    cur += len;
-                    dst_off[pos + 1] = cur;
-                }
-                dst_v = std::move(dst);
-            } else {
-                auto* dst = std::get_if<ColT>(&dst_v);
-                if (dst == nullptr) {
-                    invariant_violation("gather_rows: source/destination column type mismatch");
-                }
-                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    auto* dp = dst->codes_data();
-                    const auto* sp = src.codes_data();
-                    for (std::size_t pos = lo; pos < hi; ++pos) {
-                        dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
-                    }
-                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    for (std::size_t pos = lo; pos < hi; ++pos) {
-                        dst->set(pos, src[static_cast<std::size_t>(idx[pos])]);
-                    }
-                } else {
-                    auto* dp = dst->data();
-                    const auto* sp = src.data();
-                    for (std::size_t pos = lo; pos < hi; ++pos) {
-                        dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
-                    }
-                }
-            }
-        },
-        src_v);
-}
-
-/// Copy output rows `[lo, hi)` of a validity bitmap. Same 64-row alignment rule
-/// as `gather_range_into`.
-template <typename Idx>
-void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
-                           const std::vector<Idx>& idx, std::size_t lo, std::size_t hi) {
-    auto* dst_words = dst.words_data();
-    const auto* src_bytes = src.buffer_data();
-    const std::size_t src_offset = src.buffer_offset();
-    for (std::size_t pos = lo; pos < hi; ++pos) {
-        const std::size_t source_bit = src_offset + static_cast<std::size_t>(idx[pos]);
-        const bool valid = ((src_bytes[source_bit / 8] >> (source_bit % 8)) & 0x01U) != 0U;
-        const auto mask = ValidityBitmap::word_type{1} << (pos % 64);
-        if (valid) {
-            dst_words[pos / 64] |= mask;
-        } else {
-            dst_words[pos / 64] &= ~mask;
-        }
-    }
 }
 
 /// Gather `idx`-selected rows of `input` into a new table (one visit per

@@ -276,9 +276,10 @@ auto find_candidate_time_column(const Table& side) -> std::optional<std::string>
 /// already null in the source. `gather_column_with_nulls` produces only the
 /// first, so a source null came out as the type's zero — the very conflation
 /// the join's key rules go to such lengths to avoid, one step later.
-auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total)
+auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total,
+                  const ExecutionContext* exec)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull);
+    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, exec);
     if (!entry.validity.has_value()) {
         return {std::move(column), std::move(validity)};
     }
@@ -870,7 +871,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         for (const auto& item : right_out) {
             auto [col_out, validity] =
-                gather_entry(*item.entry, right_idx.data(), right_idx.size());
+                gather_entry(*item.entry, right_idx.data(), right_idx.size(), exec);
             output.replace_column(item.out_index, std::move(col_out), std::move(validity));
         }
 
@@ -926,7 +927,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
         if (!has_left_nulls) {
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                auto [col_out, validity] = gather_entry(left.columns[c], left_idx.data(), total);
+                auto [col_out, validity] =
+                    gather_entry(left.columns[c], left_idx.data(), total, exec);
                 output.replace_column(c, std::move(col_out), std::move(validity));
             }
         } else {
@@ -981,7 +983,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     output.replace_column(c, std::move(out_col), std::move(out_validity));
                 } else {
                     auto [col_out, validity] =
-                        gather_entry(left.columns[c], left_idx.data(), total);
+                        gather_entry(left.columns[c], left_idx.data(), total, exec);
                     output.replace_column(c, std::move(col_out), std::move(validity));
                 }
             }
@@ -997,7 +999,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             }
 
             for (const auto& item : right_out) {
-                auto [col_out, validity] = gather_entry(*item.entry, right_idx.data(), total);
+                auto [col_out, validity] = gather_entry(*item.entry, right_idx.data(), total, exec);
                 output.replace_column(item.out_index, std::move(col_out), std::move(validity));
             }
         }

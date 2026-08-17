@@ -5,7 +5,7 @@
 """TimeFrame benchmark: ibex script vs C++ bench harness.
 
 Each operation is benchmarked by running a .ibex script that:
-  1. Calls gen_tf_data(rows) once to produce the synthetic table.
+  1. Calls data_gen's gen_ticks(rows) once to produce the synthetic table.
   2. Repeats the query N times (to reach min_seconds of compute).
   3. The per-operation avg_ms is (total_time - data_gen_overhead) / N.
 
@@ -29,11 +29,11 @@ import time
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 TF_QUERIES: list[tuple[str, str]] = [
-    ("as_timeframe",       'as_timeframe(tf_data, "ts")'),
-    ("tf_lag1",            'as_timeframe(tf_data, "ts")[update { prev = lag(price, 1) }]'),
-    ("tf_rolling_count_1m",'as_timeframe(tf_data, "ts")[window 1m, update { c = rolling_count() }]'),
-    ("tf_rolling_sum_1m",  'as_timeframe(tf_data, "ts")[window 1m, update { s = rolling_sum(price) }]'),
-    ("tf_rolling_mean_5m", 'as_timeframe(tf_data, "ts")[window 5m, update { m = rolling_mean(price) }]'),
+    ("as_timeframe",       'as_timeframe(tf_data, "timestamp")'),
+    ("tf_lag1",            'as_timeframe(tf_data, "timestamp")[update { prev = lag(price, 1) }]'),
+    ("tf_rolling_count_1m",'as_timeframe(tf_data, "timestamp")[window 1m, update { c = rolling_count() }]'),
+    ("tf_rolling_sum_1m",  'as_timeframe(tf_data, "timestamp")[window 1m, update { s = rolling_sum(price) }]'),
+    ("tf_rolling_mean_5m", 'as_timeframe(tf_data, "timestamp")[window 5m, update { m = rolling_mean(price) }]'),
 ]
 
 
@@ -46,18 +46,20 @@ def detect_build_dir() -> pathlib.Path:
 
 def make_script(rows: int, query_expr: str, repeats: int) -> str:
     header = (
-        'extern fn gen_tf_data(n: Int) -> DataFrame from "gen_tf_data.hpp";\n'
-        f'let tf_data = gen_tf_data({rows});\n'
+        'import data_gen;\n'
+        'seed_rng(42);\n'
+        f'let tf_data = gen_ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
     )
     body = "\n".join(f"let r = {query_expr};" for _ in range(repeats))
     return header + body + "\n"
 
 
 def make_baseline_script(rows: int) -> str:
-    """Script that only generates data — used to measure gen_tf_data overhead."""
+    """Script that only generates data — used to measure data_gen overhead."""
     return (
-        'extern fn gen_tf_data(n: Int) -> DataFrame from "gen_tf_data.hpp";\n'
-        f'let tf_data = gen_tf_data({rows});\n'
+        'import data_gen;\n'
+        'seed_rng(42);\n'
+        f'let tf_data = gen_ticks({rows}, "TICK", 100.0, 0.0, 1000.0, 1);\n'
     )
 
 
@@ -131,9 +133,9 @@ def main() -> int:
     build_dir  = args.build_dir or detect_build_dir()
     plugin_dir = build_dir / "tools"
 
-    if not (plugin_dir / "gen_tf_data.so").exists():
-        print("error: gen_tf_data.so not found in build dir", file=sys.stderr)
-        print(f"       Run: cmake --build {build_dir} --target ibex_gen_tf_data_plugin", file=sys.stderr)
+    if not (plugin_dir / "data_gen.so").exists():
+        print("error: data_gen.so not found in build dir", file=sys.stderr)
+        print(f"       Run: cmake --build {build_dir} --target ibex_data_gen_plugin", file=sys.stderr)
         return 1
 
     print(f"build : {build_dir}")
@@ -141,13 +143,13 @@ def main() -> int:
     print(f"warmup: {args.warmup}")
     print()
 
-    # Measure gen_tf_data overhead (startup + data generation, amortised once per script).
+    # Measure data_gen overhead (startup + data generation, amortised once per script).
     baseline_script = make_baseline_script(args.rows)
     for _ in range(args.warmup):
         run_ibex(baseline_script, build_dir, plugin_dir)
     baseline_elapsed, _ = run_ibex(baseline_script, build_dir, plugin_dir)
     baseline_ms = baseline_elapsed * 1000.0
-    print(f"baseline (startup + gen_tf_data): {baseline_ms:.1f} ms  [subtracted from each result]\n")
+    print(f"baseline (startup + data_gen): {baseline_ms:.1f} ms  [subtracted from each result]\n")
 
     print(f"{'benchmark':<24} {'iters':>6} {'avg_ms':>10}")
     print("-" * 44)

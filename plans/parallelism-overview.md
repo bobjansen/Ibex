@@ -450,14 +450,45 @@ a pool just to size a profile.
 
 ### Structural
 
-**I12 — `PipelinedStageOperator` runs on a raw `std::thread`, outside the pool's
-accounting** (medium). `chunked.cpp:11151`. Consequences: (a) the thread is not
-counted against either budget, so peak thread count exceeds
-`decode_thread_count()` by one per staged breaker; (b) `on_worker_pool_thread()`
-is **false** on it, so operators running under it happily submit their own pool
-batches — which is intended (that is what the reserved-thread rule in
-`scan_pipeline_worker_count` accommodates) but means the "outermost wins"
-nesting policy has one silent exception. Nothing states the exception.
+**I12 — The runtime has two species of thread and only one was accounted for**
+— **PARTLY RESOLVED**, and reframed. The original entry called the raw
+`std::thread` in `PipelinedStageOperator` an exception to the nesting policy. It
+is better understood as a *second kind of thread* that the runtime had no
+vocabulary for.
+
+`WorkerPool` runs short, independent, non-blocking bodies to completion and joins
+them. A **stage thread** is the opposite of all three: long-lived, and it parks
+on its consumer's ring backpressure before each child pull. Hosting that on the
+pool would be the actual bug — the producer's child chain (usually a scan
+pipeline, the most parallel thing in the query) would lose every fan-out to the
+`on_worker_pool_thread()` guard, and a fixed pool cannot safely hold occupants
+that block on another thread's progress: N producers parked on backpressure with
+a consumer that needs a pool batch to drain them is a deadlock.
+`scan_pipeline_worker_count`'s reserved thread already reasons about that hazard
+from the other side.
+
+So the raw thread stays. What was wrong is that nothing could tell it apart from
+the calling thread. Now `on_stage_thread()` names it, `StageThreadScope` marks it
+and keeps a live count plus a monotonic peak, and the profile header reports
+`pool_threads` and `stage_threads_peak` — the process runs
+`decode_thread_count()` plus one per staged breaker, and previously nothing
+bounded or reported the sum.
+
+**It had already corrupted a measurement.** `ExecutionProfileScope` split on a
+binary `on_worker_pool_thread()`, so a stage thread fell into the `else` and its
+work was charged to main-thread self time *concurrently with the real main
+thread*. That made `self_ms` exceed `wall_ms` on exactly the queries with
+`pipelined_stages > 0`, and inflated `serial_self_ms` — the number the scheduler
+decision is read from — by 79ms across PDS-H SF-1 (884.0 -> 805.0 once
+`stage_self_ns` was split out). Fixed.
+
+**What remains** is the design question, and it belongs to the scheduler: the two
+species should be explicit in the primitive, not one on the books and one beside
+it. Go hands off the M on a blocking syscall; Tokio keeps a separate
+`spawn_blocking` pool. A scheduler that models only CPU-bound fork-join will get
+retrofitted with another untracked thread, so this is an INPUT to item 6 rather
+than something it absorbs. (`stream_buffered.hpp` also detaches a thread, for the
+kafka/ws sources; left alone, as it is not part of a profiled query plan.)
 
 **I13 — Cancellation reaches islands and scan pipelines, not intra-operator
 fan-outs** (medium). `interrupt_requested()` appears in
@@ -643,3 +674,62 @@ this is a *required-ordering* property propagating DOWN the plan, mirroring the
 `ordering` property that already propagates up through `TableProperties`.
 Strictly better than the language change: no user decision, nothing breaks, the
 test methodology survives, and it captures the cost exactly where it is free.
+
+---
+
+## Measured: where the serial residue actually is
+
+PDS-H SF-1, `IBEX_CORES=8`, `build-release`, quiet box, two runs per query with
+only the second parsed. Totals in ms, from the counters added under item 4.
+
+| | ms |
+|---|---|
+| wall | 1258.6 |
+| main-thread self | 1216.2 |
+| — of which genuinely serial | **805.0** |
+| — of which parked at a barrier | **411.2** (33.8%) |
+| stage-thread work (excluded from self) | 112.0 |
+| pool worker work | 2990.4 |
+| barriers issued | 249 |
+
+**Total thread-time 4318.6ms against 1258.6ms wall = 3.43x achieved on 8 cores.**
+With 805ms genuinely serial the Amdahl ceiling is 5.36x, i.e. wall could reach
+~805ms — a 36% reduction — if everything except the serial work parallelized
+perfectly.
+
+**What a work-participating `join` buys is NOT the 33.8%.** It turns W workers
+into W+1 for the batch the caller submitted, so at W=8 each batch shortens by
+about 1/9 and the recoverable slice of 411.2ms is ~46ms — **3.6% of wall**. There
+is no other ready work for the parked caller to pick up, because a fork-join plan
+is sequential by construction. This is the specific fix for the specific thing
+that was measured, and it is small.
+
+The gap between 3.43x achieved and 5.36x ceiling is where the scheduler's *other*
+claimed benefits live — work stealing against load imbalance, the
+`on_worker_pool_thread() -> serial` nesting cliff, concurrent breakers. **None of
+them is measured by these counters**: `barrier_wait_ms` is *caller* idle, not
+*worker* idle. So the scheduler's addressable range is somewhere between 3.6% and
+36%, and narrowing it needs worker-side idle instrumentation — time a pool thread
+spends with no task while a batch is in flight. That is the same size of change
+as item 4 and should come before committing to item 6.
+
+**Independent of scheduling**, the serial column is concentrated and attackable
+without any new primitive:
+
+| query | wall | serial | share |
+|---|---|---|---|
+| q13 | 132.0 | 106.9 | 81% |
+| q21 | 128.5 | 78.5 | 61% |
+| q18 | 119.2 | 75.6 | 63% |
+| q20 | 79.9 | 61.1 | 76% |
+| q04 | 62.0 | 61.9 | 100% |
+
+Those five are 384ms of the 805ms. At the other extreme q08, q17, q03 and q07 are
+71-79% barrier park, so they are the ones a scheduler would actually help.
+
+**Methodology notes.** The post-commit perf hook runs a background check on
+`build-release`; a run overlapping it read 30% high on wall and pushed park% from
+33.8% to 36.5%. Check the box is quiet first — contention inflates barrier waits
+specifically, which biases exactly the ratio being measured. The scan script is
+in the session scratchpad, not the repo; it is ~90 lines of subprocess plus regex
+over the `operator profile:` lines and is cheap to rewrite.

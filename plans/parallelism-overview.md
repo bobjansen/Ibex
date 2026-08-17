@@ -540,8 +540,9 @@ other half"; the build side remains unthreaded on purpose.
 
 ## Suggested order of attack
 
-Sequenced against the two larger tracks (a real task scheduler, and the decision
-on first-occurrence group ordering). Roughly half of Part 2 — **I6, I9, I10,
+Sequenced against the one larger track, a real task scheduler. (A second track
+— weakening first-occurrence group ordering — was considered and REJECTED; see
+item 6.) Roughly half of Part 2 — **I6, I9, I10,
 I11, I12, I14**, and parts of **I7** and **I13** — encodes the cost of a
 fork–join round trip and a barrier, so a task scheduler where submitting is
 cheap and joining does not park a thread rewrites the physics behind those
@@ -570,16 +571,10 @@ touch.
    at barriers", and the current profiler cannot distinguish that from a residue
    of genuinely serial algorithms (prefix sums, first-occurrence merges, slot
    growth) — `self_ms` counts the wait. Do this before committing to item 6.
-5. **Decide first-occurrence group ordering** and write it into `SPEC.md`. A
-   decision plus a modest implementation, not a project, and it is an input to
-   how the aggregate is designed under any scheduler. It is also the only lever
-   here that DELETES serial work rather than overlapping it: unspecified output
-   order lets a partitioned group-by emit partition-by-partition with no
-   first-occurrence merge, and lets grouped aggregation stream its output. The
-   likely answer is conditional rather than binary — preserve ordering when the
-   input is sorted or group-major (free there, and `TableProperties` can
-   propagate it), unspecified otherwise (where preserving it costs the merge).
-   Note part of the cost is a LANGUAGE commitment, not an engine one.
+5. **Instrument first, then decide how much the scheduler is worth.** Item 4
+   gives a number per operator; run it across the PDS-H suite before committing
+   to item 6. The reclaimable share is the `barrier_wait_ms` column, not the
+   whole serial residue, and on the first sample it was the minority.
 6. **The task scheduler** — per-thread queues, work stealing, and a `join` that
    participates in the queue instead of parking a thread. This is the
    structural lever: it retires the `on_worker_pool_thread() -> serial` cliff,
@@ -596,3 +591,55 @@ touch.
    chunked one covers Median and quantile.
 8. **I2 + I3** — the type exclusions and the missing multi-Categorical
    partitioned discovery, once there is a shared predicate to hang them on.
+9. **Elide the first-occurrence merge when nothing downstream reads the order**
+   — see below. Small, and last, because it is worth less than it looks.
+
+---
+
+## Rejected: weakening first-occurrence group ordering
+
+Considered and turned down on 2026-08-17. Recorded because the argument for it
+is genuinely tempting from inside the engine, and someone will make it again.
+
+**The proposal.** A group-by currently emits groups in first-occurrence order.
+The partitioned discovery path (`try_discover_partitioned`) therefore ends with
+a SERIAL first-occurrence merge that assigns global ids in row order. Declare
+the output order unspecified — at least for the hash case — and that merge
+disappears, the partitioned path can emit partition-by-partition, and grouped
+aggregation can stream its output instead of materializing every group first.
+
+**Why not.** The prize is far smaller than the framing suggests. Measured on
+q18 at 3M groups, which is the worst case because the merge is O(groups) and
+not O(rows) (see `fill_slots_parallel`'s comment):
+
+    80ms  parallel discovery probe
+    44ms  slot fill
+    26ms  serial first-occurrence merge   <- the prize
+    12ms  key-array growth
+    10ms  accumulate
+
+That is ~15% of one operator at extreme cardinality, and proportionally less
+everywhere else. Against it:
+
+* **It spends the determinism contract**, which is the best property this
+  codebase has. Byte-identical serial/parallel output is what makes every
+  threshold in Part 1 a free parameter — movable at any time without a
+  correctness argument. Trading that for 26ms is a bad trade.
+* **It blunts the main verification method.** `diff <(IBEX_PARALLEL=1 ...)
+  <(IBEX_PARALLEL=0 ...)` is how I8, I1/I5 and I15 were each checked. Under
+  unspecified group order that degrades to "sort both, then diff", which still
+  catches a wrong value but no longer catches a row misassociated with its key.
+* **It is a breaking change to user scripts**, and Hyrum's Law applies with
+  force to a default that has held since day one. Ibex is `data.table`-inspired,
+  where `by=` preserves first appearance and `keyby=` sorts, so users arrive
+  expecting exactly this. The repo has already been bitten from the other
+  direction — see the note about `data.table`'s `merge()` sorting the join key.
+
+**What to do instead (item 9).** The win is available with no language change:
+elide the merge at PLAN level when the consumer provably does not read the
+order. A group-by feeding an `order`, a scalar aggregate, or a join has dead
+output ordering, and that instance can emit partition-by-partition. Mechanically
+this is a *required-ordering* property propagating DOWN the plan, mirroring the
+`ordering` property that already propagates up through `TableProperties`.
+Strictly better than the language change: no user decision, nothing breaks, the
+test methodology survives, and it captures the cost exactly where it is free.

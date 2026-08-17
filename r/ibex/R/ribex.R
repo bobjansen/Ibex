@@ -66,6 +66,7 @@ default_plugin_paths <- function() {
         split_env_paths(Sys.getenv("IBEX_LIBRARY_PATH", unset = ""))
     )
     candidates <- c(
+        system.file("plugins", package = "ibex"),
         env_plugin_paths,
         if (nzchar(env_build_dir)) file.path(env_build_dir, "tools") else character(),
         file.path(getwd(), "build-release", "tools"),

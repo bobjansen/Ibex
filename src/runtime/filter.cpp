@@ -3351,7 +3351,8 @@ auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conj
                 if (entry == nullptr) {
                     continue;
                 }
-                auto column = gather_column(*entry->column, selected.data(), selected.size());
+                auto column =
+                    gather_column(*entry->column, selected.data(), selected.size(), &exec);
                 if (entry->validity.has_value()) {
                     ValidityBitmap validity(selected.size(), true);
                     for (std::size_t row = 0; row < selected.size(); ++row) {

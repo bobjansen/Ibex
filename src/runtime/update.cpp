@@ -2271,7 +2271,12 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         Table sub;
         for (const auto* entry_ptr : slice_columns) {
             const auto& entry = *entry_ptr;
-            ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
+            // Serial by decision, not omission: `run_group` is itself one task
+            // of a per-group fan-out, so a nested split would only oversubscribe
+            // (and `for_row_ranges` would refuse it anyway), and a single
+            // group's slice is far below the row floor that makes a split pay.
+            ColumnValue gathered =
+                gather_column(*entry.column, row_idx.data(), row_idx.size(), nullptr);
             // Carry each input column's validity into the per-group slice — else a
             // rolling/lag field over a nullable input column (e.g. a computed
             // log-return whose first per-symbol row is null) would see a slice
@@ -3231,7 +3236,10 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {
         Table sub;
         for (const auto& entry : input.columns) {
-            ColumnValue gathered = gather_column(*entry.column, row_idx.data(), row_idx.size());
+            // Serial for the same reason as `grouped_windowed_update_table`'s
+            // slice gather: one group's rows, under a per-group fan-out.
+            ColumnValue gathered =
+                gather_column(*entry.column, row_idx.data(), row_idx.size(), nullptr);
             // Carry each input column's validity into the per-group slice —
             // else an aggregate over a nullable column accumulates the null
             // cells' undefined payloads instead of skipping them (mirrors

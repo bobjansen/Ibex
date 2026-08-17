@@ -241,20 +241,35 @@ leaving it, not about correctness today.
 ### Column-type divergence
 
 **I1 — Three different answers for "can this column type be gathered in
-parallel?"** (high)
+parallel?"** — **RESOLVED**. Before:
 
 | Path | `bool` | `std::string` | `Categorical` | fixed-width |
 |---|---|---|---|---|
-| `gather_column` (`runtime_internal.hpp:158`) | **serial** (bitmap words are shared between ranges) | **serial** (cumulative offsets) | parallel | parallel |
-| `gather_rows_parallel` (`sort.cpp:284`) | **parallel** — ranges aligned to 64 rows so no word is shared | **one indivisible task** (still parallel *with* other columns) | parallel | parallel |
-| `filter_gather_is_thread_safe` (`filter.cpp:2552`) | **parallel** — via `or_bits_into_word`'s shared-word rule | **parallel** — one offset per row, disjoint byte slabs, after a prefix pass | parallel | parallel |
+| `gather_column` (`runtime_internal.hpp`) | **serial** (bitmap words are shared between ranges) | **serial** (cumulative offsets) | parallel | parallel |
+| `gather_rows_parallel` (`sort.cpp`) | **parallel** — ranges aligned to 64 rows so no word is shared | **one indivisible task** (still parallel *with* other columns) | parallel | parallel |
+| `filter_gather_is_thread_safe` (`filter.cpp`) | **parallel** — via `or_bits_into_word`'s shared-word rule | **parallel** — one offset per row, disjoint byte slabs, after a prefix pass | parallel | parallel |
 
 Three solutions to the same two hazards (bit-packed words, cumulative offsets),
-each with a good local justification, none aware of the others. `sort.cpp`'s
-64-row alignment is strictly better than `gather_column`'s "bool is serial", and
-`TwoPhaseFilter`'s prefix pass is strictly better than both for strings.
-*Convergence:* one `gather_range_into`-style kernel family with the alignment
-rule and an optional prefix pass, used by all three.
+each with a good local justification, none aware of the others.
+
+`gather_column` was a second, divergent implementation of the kernel
+`gather_rows` already had. It is now written in terms of it —
+`make_gather_column` sizes the output, `gather_range_into` fills a range — so
+the per-type rules are stated once, in that kernel, and `bool` gathers in
+parallel everywhere rather than in one of the three places. The alignment rule
+moved into `for_row_ranges`, which now hands out 64-row-aligned boundaries; that
+is what makes a bit-packed destination safe, and `tests/test_gather_kernel.cpp`
+asserts the boundaries directly rather than hoping a race surfaces.
+
+The kernel also moved *down* a layer, from `interpreter_internal.hpp` to
+`runtime_internal.hpp`, because the duplicate lived in the lower one and the
+include direction is upward. `gather_rows` stayed put: it alone needs
+`ir::OrderKey` and `TableProperties`.
+
+`TwoPhaseFilterOperator` remains separate **by design**, and the kernel now says
+so: it writes into a caller-presized output at a prefix-summed offset, which is
+a genuinely different operation and is what lets it split strings this cannot.
+That is one documented exception, not a third answer.
 
 **I2 — String and Categorical columns are silently excluded from three
 different fan-out decisions, for three different reasons** (medium)
@@ -303,11 +318,23 @@ path). *Convergence:* at minimum a table in this document kept current; better,
 delete the duplicated whole-table paths as the chunked ones reach coverage.
 
 **I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
-serially by omission** (medium). `lazy_table.cpp` (5 sites) and the chunked join
-(`chunked.cpp:5173`) pass `exec_`; `filter.cpp:3354` and `update.cpp:2274/3234`
-do not. Nothing in the signature says which is intended, and the serial ones are
-not commented as deliberate. A defaulted `nullptr` parameter is the wrong shape
-for a decision this consequential.
+serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked
+join passed `exec_`; `filter.cpp` and `update.cpp` (2 sites) did not. Nothing in
+the signature said which was intended, and the serial ones carried no comment
+saying they were deliberate. A defaulted `nullptr` is the wrong shape for a
+decision this consequential.
+
+`exec` is now required, so every site states its choice:
+
+* the filter's staged compaction gather now passes the query's context — it had
+  one in scope all along and was serial purely by omission;
+* the two per-group slice gathers in `update.cpp` pass `nullptr` **with a
+  reason**: each is one task of a per-group fan-out, so a nested split would
+  only oversubscribe, and a single group's slice is far below the row floor;
+* `gather_column_with_nulls` and the join's `gather_entry` grew the parameter
+  too, which is what put the join's output-assembly gather on the parallel path.
+  Its sentinel-carrying branch stays serial — it branches per row and writes a
+  validity bit beside each value, which is a different kernel.
 
 ### Gate and threshold divergence
 
@@ -410,6 +437,29 @@ machine. `evaluate_field_maybe_parallel` reuses `island_grain` and is safe only
 because its results are element-wise. Nothing warns the next author that reusing
 `island_grain` inside a reduction would make results machine-dependent.
 
+**I15 — The join's output assembly fans out once per COLUMN; the sort fans out
+once for the whole table** (medium). Found while resolving I1/I5, and measured
+rather than assumed.
+
+`gather_entry` (`join.cpp`) is called in a loop over output columns, so with
+`exec` threaded through it now submits and waits one batch **per column**.
+`gather_rows_parallel` (`sort.cpp`) avoids exactly this: it builds
+(column x range) tasks and submits **one** batch, precisely because a column
+count is a poor divisor and per-column barriers do not amortize.
+
+Measured on the local bench (9 interleaved repeats, 8 cores, base = the commit
+before I1/I5): `inner_join_user` +1.84% and `inner_join_symbol` +4.95%, both
+verdict `noise` and both well inside the ±13% per-query floor — so this is not a
+regression. But it is not a win either, on a 1M-row output that clears the
+65536-row gate and therefore *is* fanning out. The per-column barrier is
+plausibly eating the parallel gather it buys.
+
+*Convergence:* give the join the sort's task shape — collect the output columns
+into one (column x range) task list and submit a single batch. That is a real
+change to `join_table_impl`'s assembly loop, not a threshold tweak, which is why
+it is recorded here rather than done under I1. It is also the same lever as
+[[project_join_parallelism]]'s "assemble_output is the other half".
+
 ### Not inconsistencies (recorded so they are not "fixed")
 
 * Build side of a hash join is never threaded — measured at 1.5% of q10 against
@@ -439,13 +489,18 @@ touch.
    `ExecutionContext`.~~ **Done.** Small, and it restores the "single authority"
    property the decoder already relies on — which is also what gives a scheduler
    A/B a context-level switch to bisect with instead of a `getenv`.
-2. **I1 + I5** — one gather kernel family, `exec` non-optional. Removes the
-   largest single source of type-dependent divergence, is mechanical, and wants
+2. ~~**I1 + I5** — one gather kernel family, `exec` non-optional.~~ **Done.**
+   Removed the largest single source of type-dependent divergence, and wanted
    doing *before* the scheduler: a scheduler multiplies the number of
    concurrently live gather sites, so shipping it on top of three disagreeing
-   rules is how a heisenbug gets in.
-3. **I4** — decide, per operator, whether the whole-table implementation is
+   rules is how a heisenbug gets in. Measured neutral-to-positive (geomean
+   1.012x over join/sort/filter/bool, 34/34 verdicts `noise`), and it surfaced
+   I15.
+3. **I15** — give the join's output assembly the sort's single-batch
+   (column x range) task shape. Small, self-contained, and the one place I1
+   left parallelism on the table.
+4. **I4** — decide, per operator, whether the whole-table implementation is
    still needed, and delete or align it. A decision, not cleanup: the scheduler
    is exactly the kind of change one otherwise implements twice.
-4. **I2 + I3** — the type exclusions and the missing multi-Categorical
+5. **I2 + I3** — the type exclusions and the missing multi-Categorical
    partitioned discovery, once there is a shared predicate to hang them on.

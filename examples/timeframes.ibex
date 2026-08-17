@@ -5,20 +5,21 @@
 //    ./build-release/tools/ibex --plugin-path build-release/tools
 //    :load examples/timeframes.ibex
 //
-//  The gen_tf_data plugin generates N rows of 1-second synthetic tick data:
-//    ts    — Timestamp column, 1-second spacing starting at epoch
-//    price — Float column, sawtooth pattern 100..199
+//  The data_gen plugin generates N rows of reproducible synthetic tick data:
+//    timestamp — Timestamp column with a mean 1-second interval from epoch
+//    price     — Float column (a constant 100.0 in this demo)
 // ─────────────────────────────────────────────────────────────────────────────
 
-extern fn gen_tf_data(n: Int) -> DataFrame from "gen_tf_data.hpp";
+import data_gen;
 
-// Generate 10 minutes of 1-second tick data (600 rows).
-let ticks = gen_tf_data(10000000);
+// Generate synthetic ticks with a mean 1-second interval.
+seed_rng(42);
+let ticks = gen_ticks(10000000, "TICK", 100.0, 0.0, 1000.0, 1);
 
 // ── 1. Sort by timestamp and promote to a time-indexed DataFrame ──────────────
 //   as_timeframe checks that the key column is sorted (O(n)), reorders if not,
 //   and records which column is the time index.
-let tf = as_timeframe(ticks, "ts");
+let tf = as_timeframe(ticks, "timestamp");
 
 // ── 2. Lag: previous tick's price ────────────────────────────────────────────
 //   lag(col, n) shifts a column n rows forward (fills first n rows with null).

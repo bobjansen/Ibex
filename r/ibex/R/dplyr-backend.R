@@ -246,7 +246,7 @@ ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
 #' planned by Ibex and can be pushed into the scan.  No R data frame is created
 #' until [dplyr::collect()] is called.
 #'
-#' @param path A local path, HTTPS URL, or S3 URI to a Parquet file.
+#' @param path A local path to a Parquet file.
 #' @param session A persistent Ibex session. Defaults to the shared session
 #'   returned by [ibex_default_session()].
 #' @param name An optional display name used when printing the lazy table.

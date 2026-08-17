@@ -26,7 +26,14 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
 endif()
 
 include(FetchContent)
-find_package(CURL REQUIRED)
+
+# Embedders can omit remote transports entirely. The R package uses this mode:
+# it needs fast, reliable local-file Parquet support and should not build the
+# AWS SDK or depend on a platform-specific libcurl import library.
+option(IBEX_PARQUET_LOCAL_ONLY "Build Parquet with local files only" OFF)
+if(NOT IBEX_PARQUET_LOCAL_ONLY)
+    find_package(CURL REQUIRED)
+endif()
 
 if(IBEX_PARQUET_STANDALONE)
     if(NOT DEFINED IBEX_ROOT)
@@ -108,12 +115,15 @@ set(ARROW_HDFS OFF CACHE BOOL "" FORCE)
 set(ARROW_ORC OFF CACHE BOOL "" FORCE)
 set(ARROW_GANDIVA OFF CACHE BOOL "" FORCE)
 set(ARROW_SUBSTRAIT OFF CACHE BOOL "" FORCE)
-# S3 filesystem support drags in the entire bundled AWS SDK (aws-lc, aws-c-*),
-# a large from-source compile that needs libssl-dev. Real ibex builds keep it
-# (default ON); the benchmark harness has no use for S3 reads and disables it
-# via -DIBEX_PARQUET_S3=OFF to cut build time.
+# S3 filesystem support drags in the entire bundled AWS SDK (aws-lc, aws-c-*).
+# The normal plugin keeps it configurable; local-only embedding hosts exclude
+# it unconditionally.
 option(IBEX_PARQUET_S3 "Build the Parquet/Arrow stack with S3 filesystem support" ON)
-set(ARROW_S3 ${IBEX_PARQUET_S3} CACHE BOOL "" FORCE)
+if(IBEX_PARQUET_LOCAL_ONLY)
+    set(ARROW_S3 OFF CACHE BOOL "" FORCE)
+else()
+    set(ARROW_S3 ${IBEX_PARQUET_S3} CACHE BOOL "" FORCE)
+endif()
 set(ARROW_S3_MODULE OFF CACHE BOOL "" FORCE)
 # Arrow's SIMD kernels, selected by runtime CPU detection.
 #
@@ -208,6 +218,10 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
     target_compile_options(ibex_parquet PRIVATE -Wno-missing-field-initializers)
 endif()
 
+if(IBEX_PARQUET_LOCAL_ONLY)
+    target_compile_definitions(ibex_parquet PRIVATE IBEX_PARQUET_LOCAL_ONLY=1)
+endif()
+
 set_target_properties(ibex_parquet_plugin PROPERTIES
     OUTPUT_NAME parquet
     PREFIX ""
@@ -261,7 +275,10 @@ else()
 endif()
 
 if(TARGET arrow_shared AND TARGET parquet_shared)
-    target_link_libraries(ibex_parquet PRIVATE arrow_shared parquet_shared CURL::libcurl)
+    target_link_libraries(ibex_parquet PRIVATE arrow_shared parquet_shared)
+    if(NOT IBEX_PARQUET_LOCAL_ONLY)
+        target_link_libraries(ibex_parquet PRIVATE CURL::libcurl)
+    endif()
     set(_ibex_arrow_shared_targets arrow_shared parquet_shared)
     if(TARGET arrow_ipc_shared)
         # On some configs (observed on Windows) arrow_ipc_shared exists as a
@@ -328,7 +345,10 @@ endif()
 # propagate to the shared plugin, so the final DLL must also link curl for the
 # HTTPS reader (notably required by MinGW, which otherwise leaves
 # __imp_curl_* unresolved).
-target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet CURL::libcurl)
+target_link_libraries(ibex_parquet_plugin PRIVATE ibex_parquet)
+if(NOT IBEX_PARQUET_LOCAL_ONLY)
+    target_link_libraries(ibex_parquet_plugin PRIVATE CURL::libcurl)
+endif()
 
 set(_ibex_parquet_stub "${_ibex_parquet_output_dir}/parquet.ibex")
 add_custom_command(

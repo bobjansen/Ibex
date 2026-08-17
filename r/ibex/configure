@@ -63,7 +63,7 @@ if [ "${IBEX_R_BUILD_PARQUET:-ON}" = "ON" ]; then
     -DCMAKE_BUILD_TYPE=Release \
     -DIBEX_ROOT="${IBEX_ROOT}" \
     -DIBEX_BUILD_DIR="${IBEX_BUILD_DIR}" \
-    -DIBEX_PARQUET_S3="${IBEX_PARQUET_S3:-ON}"
+    -DIBEX_PARQUET_LOCAL_ONLY=ON
   cmake --build "${IBEX_PARQUET_BUILD_DIR}" --target ibex_parquet_plugin --parallel
   rm -rf "${IBEX_PLUGIN_STAGE}"
   mkdir -p "${IBEX_PLUGIN_STAGE}"

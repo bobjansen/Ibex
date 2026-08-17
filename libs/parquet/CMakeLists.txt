@@ -92,6 +92,22 @@ set(ARROW_BUILD_UTILITIES OFF CACHE BOOL "" FORCE)
 set(ARROW_FILESYSTEM ON CACHE BOOL "" FORCE)
 set(ARROW_PARQUET ON CACHE BOOL "" FORCE)
 set(ARROW_IPC ON CACHE BOOL "" FORCE)
+# The plugin uses Arrow's core arrays, file systems, IPC, and Parquet reader /
+# writer only.  Pin the unrelated Arrow subsystems off rather than relying on
+# their upstream defaults: a parent project or a reused CMake cache must not
+# turn a small Parquet install into a Compute/Dataset/Flight build.
+set(ARROW_COMPUTE OFF CACHE BOOL "" FORCE)
+set(ARROW_ACERO OFF CACHE BOOL "" FORCE)
+set(ARROW_DATASET OFF CACHE BOOL "" FORCE)
+set(ARROW_CSV OFF CACHE BOOL "" FORCE)
+set(ARROW_JSON OFF CACHE BOOL "" FORCE)
+set(ARROW_FLIGHT OFF CACHE BOOL "" FORCE)
+set(ARROW_FLIGHT_SQL OFF CACHE BOOL "" FORCE)
+set(ARROW_FLIGHT_SQL_ODBC OFF CACHE BOOL "" FORCE)
+set(ARROW_HDFS OFF CACHE BOOL "" FORCE)
+set(ARROW_ORC OFF CACHE BOOL "" FORCE)
+set(ARROW_GANDIVA OFF CACHE BOOL "" FORCE)
+set(ARROW_SUBSTRAIT OFF CACHE BOOL "" FORCE)
 # S3 filesystem support drags in the entire bundled AWS SDK (aws-lc, aws-c-*),
 # a large from-source compile that needs libssl-dev. Real ibex builds keep it
 # (default ON); the benchmark harness has no use for S3 reads and disables it

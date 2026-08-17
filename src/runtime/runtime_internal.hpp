@@ -459,6 +459,133 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
     return gathered;
 }
 
+/// A gathered column and the validity bitmap that came with it.
+using GatheredColumn = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
+
+/// One column in a multi-column gather.
+struct ColumnGatherJob {
+    const ColumnValue* column = nullptr;
+    const ValidityBitmap* validity = nullptr;  ///< null when the source has none
+    const std::size_t* idx = nullptr;          ///< output row -> source row
+    /// Set when the CALLER knows this column cannot be written by range — a
+    /// join index carrying `kNull` sentinels is the case that needs it, because
+    /// the sentinel branch writes a validity bit beside each value and so is a
+    /// different kernel. A string column is detected here and needs no flag.
+    bool indivisible = false;
+};
+
+/// Gather several columns in ONE worker batch, as (column x range) tasks.
+///
+/// This is the shape `gather_rows_parallel` (sort.cpp) uses, made available to
+/// the operators that gather a whole output at once. The alternative — calling
+/// `gather_column` in a loop over columns and letting each call fan out its own
+/// rows — submits and waits a batch PER COLUMN, and measurement says the
+/// barrier eats the parallel gather it buys (the two inner-join benchmarks came
+/// out +1.8% / +5.0% that way: inside the noise floor, so not a regression, but
+/// no win either on an output that clears every gate).
+///
+/// Two kinds of task share the list:
+///   * a (column, range) task, whose ranges are 64-ALIGNED so a bit-packed
+///     destination (`Column<bool>`, a validity bitmap) never has two ranges in
+///     one word;
+///   * a whole-column task, for a string (cumulative offsets have no partial
+///     form) or for a job the caller marked `indivisible`. Those still run
+///     CONCURRENTLY WITH the other columns, which is the point of batching.
+///
+/// `gather_whole(j)` produces job `j`'s column in full. It is used for the
+/// indivisible tasks and for the serial fallback, so a caller with extra
+/// per-column semantics (the join's sentinel handling) keeps them in one place.
+/// It takes the INDEX rather than the job so a caller can reach its own
+/// parallel array of per-column state.
+///
+/// The admission test consults `parallel_min_cells` as well as
+/// `parallel_min_rows`: the cost scales with output WIDTH as much as with rows,
+/// which is the same reason the island and the sort's gather both test it.
+template <typename GatherWhole>
+[[nodiscard]] auto gather_columns_batched(std::span<const ColumnGatherJob> jobs, std::size_t total,
+                                          const ExecutionContext* exec, GatherWhole&& gather_whole)
+    -> std::vector<GatheredColumn> {
+    std::vector<GatheredColumn> out(jobs.size());
+
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget =
+        (exec != nullptr && exec->parallel_threads != 0) ? exec->parallel_threads : pool_size;
+    const std::size_t threads = std::min(budget, pool_size);
+    const bool worth_it =
+        exec != nullptr && exec->parallel && !on_worker_pool_thread() && threads >= 2 &&
+        !jobs.empty() && total >= exec->parallel_min_rows &&
+        (exec->parallel_min_cells == 0 || total * jobs.size() >= exec->parallel_min_cells);
+
+    if (!worth_it) {
+        // Serial by decision: the fan-out choice is made here, once, so the
+        // per-column body must not make it again.
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            out[j] = gather_whole(j);
+        }
+        return out;
+    }
+
+    struct Task {
+        std::size_t job = 0;
+        std::size_t lo = 0;
+        std::size_t hi = 0;
+        bool indivisible = false;
+    };
+
+    // Enough tasks that one slow column cannot strand the rest, rounded up to
+    // whole 64-row words so no two tasks share a bit-packed word.
+    constexpr std::size_t kAlign = 64;
+    std::size_t span = (total + (threads * 4) - 1) / (threads * 4);
+    span = ((span + kAlign - 1) / kAlign) * kAlign;
+    span = std::max(span, kAlign);
+
+    std::vector<Task> tasks;
+    tasks.reserve(jobs.size() * ((total / span) + 1));
+    for (std::size_t j = 0; j < jobs.size(); ++j) {
+        const auto& job = jobs[j];
+        if (job.indivisible || std::holds_alternative<Column<std::string>>(*job.column)) {
+            tasks.push_back({.job = j, .lo = 0, .hi = total, .indivisible = true});
+            continue;
+        }
+        // Allocate before the fan-out: the destinations must not be reshaped
+        // once workers hold references into `out`.
+        out[j].first = make_gather_column(*job.column, total);
+        if (job.validity != nullptr) {
+            out[j].second = ValidityBitmap(total, false);
+        }
+        for (std::size_t lo = 0; lo < total; lo += span) {
+            tasks.push_back(
+                {.job = j, .lo = lo, .hi = std::min(lo + span, total), .indivisible = false});
+        }
+    }
+    if (tasks.empty()) {
+        return out;
+    }
+
+    std::atomic<std::size_t> cursor{0};
+    auto batch = process_worker_pool().submit(std::min(threads, tasks.size()), [&](std::size_t) {
+        while (true) {
+            const std::size_t t = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (t >= tasks.size()) {
+                return;
+            }
+            const auto& task = tasks[t];
+            const auto& job = jobs[task.job];
+            if (task.indivisible) {
+                out[task.job] = gather_whole(task.job);
+                continue;
+            }
+            const std::span<const std::size_t> idx{job.idx, total};
+            gather_range_into(out[task.job].first, *job.column, idx, task.lo, task.hi);
+            if (job.validity != nullptr) {
+                gather_validity_range(*out[task.job].second, *job.validity, idx, task.lo, task.hi);
+            }
+        }
+    });
+    batch.wait();
+    return out;
+}
+
 /// Append a default (zero / empty) value to a type-erased column.
 inline auto append_default(ColumnValue& col) -> void {
     std::visit(

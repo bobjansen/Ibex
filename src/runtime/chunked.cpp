@@ -5167,20 +5167,25 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
 
-        auto gather_with_validity =
-            [&](const ColumnValue& src_col, const std::optional<ValidityBitmap>& src_val,
-                const std::size_t* idx) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-            ColumnValue gathered = gather_column(src_col, idx, total, exec_);
-            std::optional<ValidityBitmap> val;
-            if (src_val.has_value()) {
-                const auto& src_bm = *src_val;
-                ValidityBitmap dst(total, false);
-                for (std::size_t i = 0; i < total; ++i) {
-                    dst.set(i, src_bm[idx[i]]);
+        // Gather a batch of columns in ONE fan-out. Calling `gather_column` per
+        // column instead lets each call fan out its own rows, which submits and
+        // waits a batch PER COLUMN — see `gather_columns_batched` for the
+        // measurement that ruled that out. This is an inner join, so no index
+        // carries a `kNull` sentinel and no job needs `indivisible`.
+        const auto gather_batch =
+            [&](std::span<const ColumnGatherJob> jobs) -> std::vector<GatheredColumn> {
+            return gather_columns_batched(jobs, total, exec_, [&](std::size_t j) -> GatheredColumn {
+                const auto& job = jobs[j];
+                ColumnValue gathered = gather_column(*job.column, job.idx, total, nullptr);
+                std::optional<ValidityBitmap> val;
+                if (job.validity != nullptr) {
+                    ValidityBitmap dst(total, false);
+                    gather_validity_range(dst, *job.validity,
+                                          std::span<const std::size_t>{job.idx, total}, 0, total);
+                    val = std::move(dst);
                 }
-                val = std::move(dst);
-            }
-            return {std::move(gathered), std::move(val)};
+                return {std::move(gathered), std::move(val)};
+            });
         };
 
         // li_identity: every probe row matched exactly once, so left columns
@@ -5234,13 +5239,22 @@ class ChunkedInnerJoinOperator final : public Operator {
                 output.columns.push_back(std::move(lc));
             }
         } else {
+            std::vector<ColumnGatherJob> jobs;
+            jobs.reserve(left_side.columns.size());
+            for (const auto& lc : left_side.columns) {
+                jobs.push_back({.column = lc.column.get(),
+                                .validity = lc.validity.has_value() ? &*lc.validity : nullptr,
+                                .idx = li,
+                                .indivisible = false});
+            }
+            auto gathered = gather_batch(jobs);
             for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
                 const auto& lc = left_side.columns[i];
-                auto [gathered, val] = gather_with_validity(*lc.column, lc.validity, li);
-                if (val.has_value()) {
-                    output.add_column(left_name(i, lc), std::move(gathered), std::move(*val));
+                if (gathered[i].second.has_value()) {
+                    output.add_column(left_name(i, lc), std::move(gathered[i].first),
+                                      std::move(*gathered[i].second));
                 } else {
-                    output.add_column(left_name(i, lc), std::move(gathered));
+                    output.add_column(left_name(i, lc), std::move(gathered[i].first));
                 }
             }
         }
@@ -5250,18 +5264,30 @@ class ChunkedInnerJoinOperator final : public Operator {
         // so probe columns are shared rather than gathered — the same
         // reasoning as li_identity above.
         const bool share_right = ri_identity && total == right_.rows();
-        for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
-            const auto& rc = right_.columns[right_emit_idx_[e]];
-            std::string name = right_emit_names_[e];
-            if (share_right) {
-                output.add_column_from(std::move(name), rc);
-                continue;
+        if (share_right) {
+            for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
+                output.add_column_from(std::string(right_emit_names_[e]),
+                                       right_.columns[right_emit_idx_[e]]);
             }
-            auto [gathered, val] = gather_with_validity(*rc.column, rc.validity, ri);
-            if (val.has_value()) {
-                output.add_column(std::move(name), std::move(gathered), std::move(*val));
-            } else {
-                output.add_column(std::move(name), std::move(gathered));
+        } else {
+            std::vector<ColumnGatherJob> jobs;
+            jobs.reserve(right_emit_idx_.size());
+            for (const auto index : right_emit_idx_) {
+                const auto& rc = right_.columns[index];
+                jobs.push_back({.column = rc.column.get(),
+                                .validity = rc.validity.has_value() ? &*rc.validity : nullptr,
+                                .idx = ri,
+                                .indivisible = false});
+            }
+            auto gathered = gather_batch(jobs);
+            for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
+                std::string name = right_emit_names_[e];
+                if (gathered[e].second.has_value()) {
+                    output.add_column(std::move(name), std::move(gathered[e].first),
+                                      std::move(*gathered[e].second));
+                } else {
+                    output.add_column(std::move(name), std::move(gathered[e].first));
+                }
             }
         }
         if (!carried_ordering.empty()) {

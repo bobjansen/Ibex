@@ -40,6 +40,7 @@ command -v cmake >/dev/null 2>&1 || {
 if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
   echo "configure: building the minimal Ibex runtime" >&2
   cmake -S "${IBEX_ROOT}" -B "${IBEX_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DIBEX_MINIMAL_RUNTIME=ON \
     -DIBEX_BUILD_TESTS=OFF \
     -DIBEX_BUILD_TOOLS=OFF \
@@ -59,6 +60,7 @@ fi
 if [ "${IBEX_R_BUILD_PARQUET:-ON}" = "ON" ]; then
   echo "configure: building bundled Parquet plugin" >&2
   cmake -S "${IBEX_ROOT}/libs/parquet" -B "${IBEX_PARQUET_BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
     -DIBEX_ROOT="${IBEX_ROOT}" \
     -DIBEX_BUILD_DIR="${IBEX_BUILD_DIR}" \
     -DIBEX_PARQUET_S3="${IBEX_PARQUET_S3:-ON}"

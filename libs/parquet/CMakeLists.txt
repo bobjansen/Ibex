@@ -180,6 +180,15 @@ set(CMAKE_PROJECT_aws-cpp-sdk-all_INCLUDE_BEFORE
     "${IBEX_ROOT}/cmake/AwsSdkCppModulePath.cmake")
 set(UNSAFE_TREAT_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(arrow)
+# Boost's locale headers are needed by Arrow's bundled Thrift. On the Rtools
+# POSIX toolchain, FetchContent materializes a top-level `cwctype` entry in
+# that include directory; it shadows MinGW's standard <cwctype> and the latter
+# fails with EINVAL. The real Boost headers live under boost/, so removing only
+# the stray top-level entry is safe and leaves Thrift's Boost.Locale interface
+# intact.
+if(WIN32 AND DEFINED boost_SOURCE_DIR)
+    file(REMOVE "${boost_SOURCE_DIR}/libs/locale/include/cwctype")
+endif()
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS "${_ibex_saved_suppress_dev_warnings}")
 
 # Bundled thrift uses deprecated std::iterator; suppress the warning on its

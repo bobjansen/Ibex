@@ -13,10 +13,12 @@
 #include <cstring>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace ibex::runtime {
 
@@ -116,9 +118,18 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
 /// changing a single byte of its answer.
 /// The row floor is `exec.parallel_min_rows` — the same knob the rest of the
 /// engine gates on, rather than a private constant a test could not reach.
+///
+/// **Range boundaries are aligned to 64 rows.** That is what makes a bit-packed
+/// destination — `Column<bool>`, a validity bitmap — safe to write from several
+/// ranges at once: each 64-row word then belongs to exactly one range. The
+/// alignment is the same rule `gather_range_into` documents and the sort's
+/// (column x range) tasks obey, and it costs only a rounding of the grain. The
+/// alternative this replaced was leaving bit-packed columns serial, which
+/// answered the same question differently in the same engine.
 template <typename Body>
 void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
     constexpr std::size_t kMaxRanges = 64;
+    constexpr std::size_t kAlign = 64;
     std::size_t ranges = 1;
     if (exec != nullptr && exec->parallel && n >= exec->parallel_min_rows &&
         !on_worker_pool_thread()) {
@@ -133,7 +144,10 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
         body(std::size_t{0}, n);
         return;
     }
-    const std::size_t grain = (n + ranges - 1) / ranges;
+    // Round the grain up to a whole number of 64-row words. Rounding UP (rather
+    // than down) keeps the range count at or below `ranges`, so no range is left
+    // unvisited by the fixed-size batch below.
+    const std::size_t grain = (((n + ranges - 1) / ranges) + kAlign - 1) / kAlign * kAlign;
     std::atomic<std::size_t> cursor{0};
     auto batch = process_worker_pool().submit(ranges, [&](std::size_t) {
         while (true) {
@@ -148,77 +162,205 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
     batch.wait();
 }
 
-/// Bulk-gather rows from `src` into a new column using the index array.
-/// One std::visit per column, not per row — much faster for large gathers.
+// Abort with a diagnostic on a broken internal invariant (defined in
+// interpreter.cpp). Declared here rather than in interpreter_internal.hpp
+// because the gather kernel below needs it and this is the lower layer.
+[[noreturn]] void invariant_violation(std::string_view detail);
+
+/// Allocate an output column of `rows` rows shaped like `src`, ready to be
+/// filled by `gather_range_into`.
 ///
-/// `exec` (when non-null and parallel) splits the fixed-width and Categorical
-/// gathers across row ranges. Strings are left serial: their destination
-/// offsets depend on every preceding row's length, so a range cannot know where
-/// to write without a prefix pass first. `bool` is left serial too — a bitmap
-/// packs 64 rows per word, so neighbouring ranges would write the same word.
-[[nodiscard]] inline auto gather_column(const ColumnValue& src, const std::size_t* indices,
-                                        std::size_t n, const ExecutionContext* exec = nullptr)
-    -> ColumnValue {
+/// A `Column<std::string>` cannot be sized without first totalling its bytes,
+/// so it comes back empty and is built whole by the gather itself.
+inline auto make_gather_column(const ColumnValue& src, std::size_t rows) -> ColumnValue {
     return with_meta_of(
         std::visit(
             [&](const auto& col) -> ColumnValue {
                 using ColT = std::decay_t<decltype(col)>;
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    std::vector<Column<Categorical>::code_type> codes(n);
-                    const auto* sp = col.codes_data();
-                    for_row_ranges(exec, n, [&](std::size_t begin, std::size_t end) {
-                        for (std::size_t i = begin; i < end; ++i)
-                            codes[i] = sp[indices[i]];
-                    });
+                    // Shares the source dictionary; only the codes are gathered.
                     return Column<Categorical>(col.dictionary_ptr(), col.index_ptr(),
-                                               std::move(codes));
+                                               std::vector<Column<Categorical>::code_type>(rows));
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                    const auto* src_off = col.offsets_data();
-                    const char* src_char = col.chars_data();
-                    std::size_t total_chars = 0;
-                    for (std::size_t i = 0; i < n; ++i)
-                        total_chars += src_off[indices[i] + 1] - src_off[indices[i]];
+                    return ColT{};
+                } else if constexpr (!std::is_same_v<ColT, Column<bool>> &&
+                                     requires(ColT c) { c.resize_for_overwrite(rows); }) {
+                    // `gather_range_into` writes every slot in
+                    // [0, rows), so value-initializing first is
+                    // a whole extra pass over the output.
+                    // Date/Timestamp carry default member
+                    // initializers and so are not trivially
+                    // default constructible; they keep resize().
+                    //
+                    // Column<bool> is excluded deliberately: its
+                    // last word extends past `rows`, and those
+                    // tail bits are never written by a gather.
+                    // Leaving them indeterminate would make a
+                    // whole-word read of the bitmap depend on
+                    // uninitialized memory.
                     ColT dst;
-                    dst.resize_for_gather(n, total_chars);
-                    auto* dst_off = dst.offsets_data();
-                    char* dst_char = dst.chars_data();
-                    dst_off[0] = 0;
-                    std::uint32_t cur = 0;
-                    for (std::size_t i = 0; i < n; ++i) {
-                        std::uint32_t len = src_off[indices[i] + 1] - src_off[indices[i]];
-                        ::memcpy(dst_char + cur, src_char + src_off[indices[i]], len);
-                        cur += len;
-                        dst_off[i + 1] = cur;
-                    }
-                    return dst;
-                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    ColT dst;
-                    dst.resize(n);
-                    for (std::size_t i = 0; i < n; ++i)
-                        dst.set(i, col[indices[i]]);
+                    dst.resize_for_overwrite(rows);
                     return dst;
                 } else {
                     ColT dst;
-                    // Every slot is written below, so value-initializing first
-                    // is a whole extra pass over the output. Date/Timestamp
-                    // carry default member initializers and so are not
-                    // trivially default constructible; they keep plain resize.
-                    if constexpr (requires { dst.resize_for_overwrite(n); }) {
-                        dst.resize_for_overwrite(n);
-                    } else {
-                        dst.resize(n);
-                    }
-                    auto* dp = dst.data();
-                    const auto* sp = col.data();
-                    for_row_ranges(exec, n, [&](std::size_t begin, std::size_t end) {
-                        for (std::size_t i = begin; i < end; ++i)
-                            dp[i] = sp[indices[i]];
-                    });
+                    dst.resize(rows);
                     return dst;
                 }
             },
             src),
         src);
+}
+
+/// Copy output rows `[lo, hi)` from `src` through `idx` into an already-sized
+/// `dst`.
+///
+/// **This is the one gather kernel.** Every path that rewrites a column through
+/// an index array goes through it — the serial `gather_rows`, the sort's
+/// parallel (column x range) tasks, and `gather_column`'s row ranges — so the
+/// rules below are stated once and cannot be answered three different ways.
+/// (The two-phase filter is the deliberate exception: it writes into a
+/// caller-presized output at a prefix-summed offset, which is a different
+/// operation and is what lets it split strings this cannot. See
+/// `filter_gather_is_thread_safe`.)
+///
+/// **Concurrency:** output rows are contiguous, so two ranges write disjoint
+/// memory for every column that stores at least one addressable unit per row.
+/// `Column<bool>` and validity bitmaps pack 64 rows per word, so a caller
+/// splitting one column across threads must align its range boundaries to 64 —
+/// which is cheap here precisely because the ranges are contiguous, unlike a
+/// scattered scatter. Aligning is strictly better than the obvious alternative
+/// of leaving bit-packed columns serial: it costs a rounding of the grain and
+/// buys the same parallelism every other type gets.
+///
+/// A string column has no partial form: its flat offsets are cumulative, so it
+/// is built whole and `[lo, hi)` must be the entire column. A caller with
+/// several columns to gather still parallelizes across them by treating a
+/// string as one indivisible task.
+///
+/// `idx` is a span so a caller holding a raw pointer and a count can call this
+/// without materializing a vector; `std::vector<Idx>` converts implicitly.
+template <typename Idx>
+void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, std::span<const Idx> idx,
+                       std::size_t lo, std::size_t hi) {
+    std::visit(
+        [&](const auto& src) {
+            using ColT = std::decay_t<decltype(src)>;
+            if constexpr (std::is_same_v<ColT, Column<std::string>>) {
+                if (lo != 0 || hi != idx.size()) {
+                    invariant_violation("gather_rows: a string column has no partial-range form");
+                }
+                std::size_t total_chars = 0;
+                const auto* src_off = src.offsets_data();
+                const auto* src_char = src.chars_data();
+                for (std::size_t pos = 0; pos < hi; ++pos) {
+                    auto si = static_cast<std::size_t>(idx[pos]);
+                    total_chars += src_off[si + 1] - src_off[si];
+                }
+                ColT dst;
+                dst.resize_for_gather(hi, total_chars);
+                auto* dst_off = dst.offsets_data();
+                auto* dst_char = dst.chars_data();
+                dst_off[0] = 0;
+                std::uint32_t cur = 0;
+                for (std::size_t pos = 0; pos < hi; ++pos) {
+                    auto si = static_cast<std::size_t>(idx[pos]);
+                    std::uint32_t len = src_off[si + 1] - src_off[si];
+                    std::memcpy(dst_char + cur, src_char + src_off[si], len);
+                    cur += len;
+                    dst_off[pos + 1] = cur;
+                }
+                dst_v = std::move(dst);
+            } else {
+                auto* dst = std::get_if<ColT>(&dst_v);
+                if (dst == nullptr) {
+                    invariant_violation("gather_rows: source/destination column type mismatch");
+                }
+                if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
+                    auto* dp = dst->codes_data();
+                    const auto* sp = src.codes_data();
+                    for (std::size_t pos = lo; pos < hi; ++pos) {
+                        dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                    }
+                } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
+                    for (std::size_t pos = lo; pos < hi; ++pos) {
+                        dst->set(pos, src[static_cast<std::size_t>(idx[pos])]);
+                    }
+                } else {
+                    auto* dp = dst->data();
+                    const auto* sp = src.data();
+                    for (std::size_t pos = lo; pos < hi; ++pos) {
+                        dp[pos] = sp[static_cast<std::size_t>(idx[pos])];
+                    }
+                }
+            }
+        },
+        src_v);
+}
+
+/// Vector overload. Deduction does not convert `std::vector<Idx>` to
+/// `std::span<const Idx>`, so the common caller gets a forwarder rather than an
+/// explicit template argument at every call site.
+template <typename Idx>
+void gather_range_into(ColumnValue& dst_v, const ColumnValue& src_v, const std::vector<Idx>& idx,
+                       std::size_t lo, std::size_t hi) {
+    gather_range_into<Idx>(dst_v, src_v, std::span<const Idx>{idx}, lo, hi);
+}
+
+/// Copy output rows `[lo, hi)` of a validity bitmap. Same 64-row alignment rule
+/// as `gather_range_into`.
+template <typename Idx>
+void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src, std::span<const Idx> idx,
+                           std::size_t lo, std::size_t hi) {
+    auto* dst_words = dst.words_data();
+    const auto* src_bytes = src.buffer_data();
+    const std::size_t src_offset = src.buffer_offset();
+    for (std::size_t pos = lo; pos < hi; ++pos) {
+        const std::size_t source_bit = src_offset + static_cast<std::size_t>(idx[pos]);
+        const bool valid = ((src_bytes[source_bit / 8] >> (source_bit % 8)) & 0x01U) != 0U;
+        const auto mask = ValidityBitmap::word_type{1} << (pos % 64);
+        if (valid) {
+            dst_words[pos / 64] |= mask;
+        } else {
+            dst_words[pos / 64] &= ~mask;
+        }
+    }
+}
+
+/// Vector overload, for the same deduction reason as `gather_range_into`'s.
+template <typename Idx>
+void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
+                           const std::vector<Idx>& idx, std::size_t lo, std::size_t hi) {
+    gather_validity_range<Idx>(dst, src, std::span<const Idx>{idx}, lo, hi);
+}
+
+/// Bulk-gather rows from `src` into a new column using the index array.
+/// One std::visit per column, not per row — much faster for large gathers.
+///
+/// This is `gather_rows`' single-column form and shares its kernel:
+/// `make_gather_column` sizes the output and `gather_range_into` fills it, so
+/// the per-type concurrency rules are stated once, in that kernel, instead of
+/// being answered differently here. `exec` splits the fill across 64-row-aligned
+/// row ranges, which covers every type but `std::string` — a string's flat
+/// offsets are cumulative, so a range cannot know where to write without a
+/// prefix pass, and it is gathered whole in one call.
+///
+/// `exec` is REQUIRED rather than defaulted. It was optional, and half the call
+/// sites then gathered serially by omission rather than by decision — nothing in
+/// the signature said which was intended. Pass `nullptr` to mean serial, and say
+/// why.
+[[nodiscard]] inline auto gather_column(const ColumnValue& src, const std::size_t* indices,
+                                        std::size_t n, const ExecutionContext* exec)
+    -> ColumnValue {
+    const std::span<const std::size_t> idx{indices, n};
+    ColumnValue out = make_gather_column(src, n);
+    if (std::holds_alternative<Column<std::string>>(src)) {
+        gather_range_into(out, src, idx, 0, n);  // indivisible: whole column or nothing
+        return out;
+    }
+    for_row_ranges(exec, n, [&](std::size_t begin, std::size_t end) {
+        gather_range_into(out, src, idx, begin, end);
+    });
+    return out;
 }
 
 /// Bulk-gather rows from `src`, treating sentinel values (kNull = SIZE_MAX) as null positions
@@ -228,7 +370,7 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 [[nodiscard]] inline auto gather_column_with_nulls(const ColumnValue& src,
                                                    const std::size_t* indices, std::size_t n,
-                                                   std::size_t kNull)
+                                                   std::size_t kNull, const ExecutionContext* exec)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
     // NOLINTEND(bugprone-easily-swappable-parameters)
     auto gathered = std::visit(
@@ -238,7 +380,11 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
             for (std::size_t i = 0; i < n && !has_null; ++i)
                 has_null = (indices[i] == kNull);
             if (!has_null) {
-                return {gather_column(src, indices, n), std::nullopt};
+                // The no-sentinel fast path is a plain gather, so it gets the
+                // shared kernel and the caller's parallelism. The sentinel path
+                // below stays serial: it branches per row and writes a validity
+                // bit alongside each value, which is a different kernel.
+                return {gather_column(src, indices, n, exec), std::nullopt};
             }
             ValidityBitmap bm(n, true);
             if constexpr (std::is_same_v<ColT, Column<Categorical>>) {

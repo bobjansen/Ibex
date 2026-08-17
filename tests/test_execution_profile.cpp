@@ -163,6 +163,41 @@ TEST_CASE("profile summary tolerates an empty profile and a zero budget", "[runt
     CHECK(runtime::profile_row_occupancy({}, 0) == 0.0);
 }
 
+TEST_CASE("work submitted from a stage thread is attributed to an operator", "[runtime][profile]") {
+    // `profile_operator` wraps the STAGE, not the child it produces, so the
+    // producer thread ran unwrapped code with no profile frame at all. Anything
+    // it submitted got `current_execution_profile_entry() == nullptr` and was
+    // attributed to nothing: PDS-H q04's semi-join build fanned out to 8 workers
+    // and reported pool_work_ms=0.000. The fix is a scope on the producer, and
+    // this pins the property that fix depends on.
+    runtime::WorkerPool pool{2};
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/2,
+                                                                    /*report=*/false);
+    auto* entry = profile->stage("staged_submit");
+
+    std::thread producer([&] {
+        const runtime::StageThreadScope stage_thread;
+        // Without this scope there is no frame on this thread, and the submit
+        // below vanishes from the profile.
+        const runtime::ExecutionProfileScope scope(entry, runtime::ProfilePhase::Next);
+        auto batch = pool.submit(
+            2, [](std::size_t) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); });
+        batch.wait();
+    });
+    producer.join();
+
+    const auto rows = profile->snapshot();
+    const auto row =
+        std::ranges::find_if(rows, [](const auto& e) { return e.label == "staged_submit"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->pool_tasks == 2);
+    CHECK(row->pool_work_ns > 0);
+    CHECK(row->barriers == 1);
+    // The producer's own time is still stage time, not the caller's.
+    CHECK(row->stage_self_ns > 0);
+    CHECK(row->next_self_ns == 0);
+}
+
 TEST_CASE("a ring park is idle, not serial work", "[runtime][profile]") {
     // The second misreport the barrier counters exposed. `barrier_wait_ns` only
     // covers parks inside `Batch::wait()`. A consumer pulling from a pipelined

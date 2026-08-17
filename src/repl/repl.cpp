@@ -4985,7 +4985,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             // because a probe's decode is the join's to schedule. Probes are
             // registered above and skipped by the `contains` guard, so the two
             // sets never overlap.
-            if (runtime::stream_scans_enabled() && lazy->scan_units().size() > 1) {
+            if (exec.stream_scans && lazy->scan_units().size() > 1) {
                 deferred_scans.emplace(
                     name, runtime::DeferredScan{
                               .lazy = resolve_lazy_ptr(name),

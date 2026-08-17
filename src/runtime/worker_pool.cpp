@@ -369,8 +369,17 @@ void shutdown_process_worker_pool() {
     pool.reset();
 }
 
-auto parallel_enabled_from_env() -> std::optional<bool> {
-    const auto raw = env_value("IBEX_PARALLEL");
+namespace {
+
+/// The one spelling of an on/off `IBEX_*` switch: `nullopt` when unset or
+/// unrecognized, so the caller keeps whatever it already chose.
+///
+/// Every such switch answers BOTH ways on purpose. All three are on by default,
+/// so a variable that could only turn its feature on would leave no way to turn
+/// it off — which is exactly what someone hitting a bug in it, or A/B-ing it,
+/// needs. Shared so the accepted spellings cannot drift apart between them.
+[[nodiscard]] auto env_flag(const char* name) -> std::optional<bool> {
+    const auto raw = env_value(name);
     if (raw == "1" || raw == "on" || raw == "true" || raw == "yes") {
         return true;
     }
@@ -378,6 +387,20 @@ auto parallel_enabled_from_env() -> std::optional<bool> {
         return false;
     }
     return std::nullopt;
+}
+
+}  // namespace
+
+auto parallel_enabled_from_env() -> std::optional<bool> {
+    return env_flag("IBEX_PARALLEL");
+}
+
+auto stream_scans_from_env() -> std::optional<bool> {
+    return env_flag("IBEX_STREAM_SCAN");
+}
+
+auto parallel_join_probe_from_env() -> std::optional<bool> {
+    return env_flag("IBEX_JOIN_PROBE");
 }
 
 auto source_chunk_rows_from_env() -> std::size_t {

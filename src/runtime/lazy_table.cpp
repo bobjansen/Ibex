@@ -287,8 +287,8 @@ auto membership_pass_rate(const KeyColumn& key, const DynamicScanFilter& filter,
 /// output, which a filtered selection cannot supply.
 auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size_t {
     constexpr std::size_t kMaxRanges = 64;
-    if (!exec.parallel || n < exec.parallel_min_rows || on_worker_pool_thread() ||
-        !parallel_join_probe_enabled()) {
+    if (!exec.parallel || !exec.parallel_join_probe || n < exec.parallel_min_rows ||
+        on_worker_pool_thread()) {
         return 1;
     }
     const std::size_t min_rows = std::max<std::size_t>(exec.parallel_min_rows, 1);

@@ -101,8 +101,8 @@ before binding it. Descriptor-only nanoarrow operations such as creating a
 shallow slice do not mutate the shared buffers.
 
 Install directly from GitHub (the configure step downloads and builds the
-minimal Ibex runtime; this needs CMake 3.26+, a C++23 toolchain with `<format>`,
-`curl`, and `tar):
+minimal Ibex runtime and bundled Parquet plugin; this needs CMake 3.26+, a
+C++23 toolchain with `<format>`, `curl`, and `tar):
 
 ```r
 remotes::install_github("bobjansen/Ibex", subdir = "r/ibex")
@@ -158,6 +158,18 @@ summary <- session_eval(sess, '
 ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 ```
 
+Parquet files are first-class lazy sources. The bundled plugin is loaded
+automatically, so filters and projections stay in Ibex until collection:
+
+```r
+library(dplyr)
+
+ibex_read_parquet("trades.parquet") |>
+  filter(price > 10) |>
+  select(symbol, price) |>
+  collect()
+```
+
 R Markdown engine example:
 
 ```r
@@ -180,7 +192,11 @@ ggplot(summary, aes(Species, avg_sepal)) + geom_col()
 ```
 ````
 
-For plugin-backed queries, make sure the plugin path is discoverable:
+The bundled Parquet plugin is discovered automatically. For development or
+custom plugin-backed queries, make sure the plugin path is discoverable:
 - set `IBEX_BUILD_DIR`
 - or set `IBEX_LIBRARY_PATH`
 - or pass `plugin_paths = c(".../build-release/tools")`
+
+Set `IBEX_R_BUILD_PARQUET=OFF` only when installing from source in a constrained
+environment that does not need `ibex_read_parquet()`.

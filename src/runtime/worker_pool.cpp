@@ -4,6 +4,7 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <condition_variable>
 #include <cstddef>
@@ -120,10 +121,41 @@ namespace {
 // lease).
 thread_local bool t_on_pool_thread = false;
 
+// Same reasoning as `t_on_pool_thread`: a host TU rather than an inline header
+// variable, so a bundled plugin's statically linked copy cannot disagree.
+thread_local bool t_on_stage_thread = false;
+
+std::atomic<std::size_t> g_stage_threads_live{0};
+std::atomic<std::size_t> g_stage_threads_peak{0};
+
 }  // namespace
 
 auto on_worker_pool_thread() noexcept -> bool {
     return t_on_pool_thread;
+}
+
+auto on_stage_thread() noexcept -> bool {
+    return t_on_stage_thread;
+}
+
+StageThreadScope::StageThreadScope() noexcept {
+    t_on_stage_thread = true;
+    const std::size_t live = g_stage_threads_live.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Raise the peak monotonically. A plain `store(max)` would race two threads
+    // starting at once into losing one of the increments.
+    std::size_t peak = g_stage_threads_peak.load(std::memory_order_relaxed);
+    while (peak < live &&
+           !g_stage_threads_peak.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+    }
+}
+
+StageThreadScope::~StageThreadScope() {
+    g_stage_threads_live.fetch_sub(1, std::memory_order_relaxed);
+    t_on_stage_thread = false;
+}
+
+auto stage_thread_peak() noexcept -> std::size_t {
+    return g_stage_threads_peak.load(std::memory_order_relaxed);
 }
 
 WorkerPool::WorkerPool(std::size_t threads)

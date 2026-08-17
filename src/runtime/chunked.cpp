@@ -11186,7 +11186,15 @@ class PipelinedStageOperator final : public Operator {
             return;
         }
         started_ = true;
-        producer_ = std::thread([this] { produce(); });
+        producer_ = std::thread([this] {
+            // Declare what kind of thread this is. It is deliberately NOT a pool
+            // worker — it is long-lived and parks on the consumer's ring
+            // backpressure, which a fixed-size pool cannot host — but it must
+            // still be countable, and the profiler must not charge its work to
+            // the calling thread's self time.
+            const StageThreadScope stage_thread;
+            produce();
+        });
     }
 
     void produce() noexcept {

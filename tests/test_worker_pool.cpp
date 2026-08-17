@@ -24,6 +24,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace ibex;
 
@@ -208,6 +209,72 @@ TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
 
     // And it is not left set on the calling thread afterwards.
     CHECK_FALSE(runtime::on_worker_pool_thread());
+}
+
+// The runtime has two species of thread, and only one used to be countable.
+//
+// A stage thread (`PipelinedStageOperator`'s producer) is long-lived and parks on
+// its consumer's backpressure, which a fixed-size pool cannot host. So the raw
+// std::thread is correct — but before it was tagged, nothing could tell it from
+// the calling thread, and the profiler charged its work to main-thread self time.
+TEST_CASE("a stage thread is distinguishable from a pool worker and the caller",
+          "[runtime][worker_pool][parallel]") {
+    CHECK_FALSE(runtime::on_stage_thread());
+    CHECK_FALSE(runtime::on_worker_pool_thread());
+
+    SECTION("the flag is set for the scope and cleared after") {
+        {
+            const runtime::StageThreadScope stage;
+            CHECK(runtime::on_stage_thread());
+            // The two kinds are mutually exclusive: a stage thread is not a
+            // worker, so it does NOT take the nested-parallelism serial path.
+            // That is deliberate — its child chain must keep its fan-outs.
+            CHECK_FALSE(runtime::on_worker_pool_thread());
+        }
+        CHECK_FALSE(runtime::on_stage_thread());
+    }
+
+    SECTION("the flag is per thread, not global") {
+        std::atomic<bool> seen_on_other{true};
+        {
+            const runtime::StageThreadScope stage;
+            std::thread other([&] { seen_on_other = runtime::on_stage_thread(); });
+            other.join();
+        }
+        CHECK_FALSE(seen_on_other.load());
+    }
+
+    SECTION("the peak counts concurrent stage threads") {
+        std::atomic<int> ready{0};
+        std::atomic<bool> release{false};
+        const auto body = [&] {
+            const runtime::StageThreadScope stage;
+            ++ready;
+            while (!release.load()) {
+                std::this_thread::yield();
+            }
+        };
+        std::thread a(body);
+        std::thread b(body);
+        std::thread c(body);
+        while (ready.load() < 3) {
+            std::this_thread::yield();
+        }
+        // All three are live simultaneously, so the peak must have advanced by
+        // at least three — a `store(live)` instead of a monotonic raise would
+        // lose increments under this race.
+        const std::size_t peak = runtime::stage_thread_peak();
+        release = true;
+        a.join();
+        b.join();
+        c.join();
+        // Three were live at once, so the high-water mark is at least three.
+        // Not `before + 3`: the peak tracks CONCURRENT threads, not a running
+        // total, so an earlier test's scope does not add to it.
+        CHECK(peak >= 3);
+        // And it is a high-water mark: it does not fall when they exit.
+        CHECK(runtime::stage_thread_peak() >= peak);
+    }
 }
 
 // `IBEX_PARALLEL` has to answer both ways.

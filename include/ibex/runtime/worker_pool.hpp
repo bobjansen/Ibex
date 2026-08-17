@@ -105,6 +105,51 @@ void shutdown_process_worker_pool();
 /// from a worker deadlocks (and aborts loudly rather than hanging).
 [[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
 
+/// True on a runtime-owned thread that is NOT a pool worker.
+///
+/// The runtime has two species of thread and they are scheduled by different
+/// rules. `WorkerPool` runs short, independent, non-blocking bodies to
+/// completion and joins them; a **stage thread** is long-lived and blocks on
+/// another thread's progress — `PipelinedStageOperator`'s producer parks on ring
+/// backpressure until its consumer drains. A fixed-size pool cannot safely host
+/// the second kind: N producers parked on backpressure, with a consumer that
+/// needs a pool batch to drain them, is a deadlock, and the producer's child
+/// chain would lose every fan-out to the `on_worker_pool_thread()` guard.
+///
+/// So the raw thread is correct, and this flag is what stops it from being
+/// UNACCOUNTED. Before it existed the profiler credited a stage thread's work to
+/// the calling thread's self time, concurrently with the real calling thread —
+/// which made `self_ms` exceed `wall_ms` on exactly the queries that stage, and
+/// inflated the measured serial fraction by at least 77ms across PDS-H SF-1.
+///
+/// A proper task scheduler names this distinction explicitly (Go hands off the M
+/// on a blocking syscall; Tokio has a separate `spawn_blocking` pool). Until
+/// then this is the minimum: the two kinds are distinguishable and countable.
+[[nodiscard]] auto on_stage_thread() noexcept -> bool;
+
+/// Marks the calling thread as a stage thread for the scope's lifetime, and
+/// maintains the live/peak counts reported by `stage_thread_peak()`.
+///
+/// Construct it as the first statement of the thread body, so everything the
+/// thread calls sees the flag.
+class StageThreadScope {
+   public:
+    StageThreadScope() noexcept;
+    ~StageThreadScope();
+    StageThreadScope(const StageThreadScope&) = delete;
+    auto operator=(const StageThreadScope&) -> StageThreadScope& = delete;
+    StageThreadScope(StageThreadScope&&) = delete;
+    auto operator=(StageThreadScope&&) -> StageThreadScope& = delete;
+};
+
+/// Most stage threads alive at once since process start.
+///
+/// Reported alongside the pool size because the process runs
+/// `decode_thread_count()` pool threads PLUS one per staged breaker, and nothing
+/// bounded — or even reported — the sum. Peak rather than live, because by the
+/// time a query's profile prints, its stage threads have exited.
+[[nodiscard]] auto stage_thread_peak() noexcept -> std::size_t;
+
 /// Thread budget for compute, from `IBEX_CORES`. Unset or `auto` means
 /// `std::thread::hardware_concurrency()`; an explicit count is used as given;
 /// anything unparseable or zero falls back to 1.

@@ -36,6 +36,7 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t barriers = 0;
     std::uint64_t barrier_wait_ns = 0;
     std::uint64_t stage_self_ns = 0;
+    std::uint64_t ring_wait_ns = 0;
 };
 
 /// Share of the machine an operator kept busy while it ran: 0 means it was
@@ -75,6 +76,18 @@ struct ExecutionProfileSummary {
     double barrier_wait_ms = 0.0;
     /// Fork-join round trips the query issued.
     std::uint64_t barriers = 0;
+    /// Main-thread time parked on a pipeline RING, waiting for a producer.
+    ///
+    /// Distinct from `barrier_wait_ms` because the fix is different. A barrier
+    /// park is the caller waiting on a batch it submitted itself, which a
+    /// work-participating `join` reclaims. A ring park is the consumer waiting
+    /// on a producer it does not control — a pipeline dependency, which only a
+    /// scheduler that can give the blocked consumer other work reclaims.
+    ///
+    /// Both are idle, so both are subtracted from `serial_self_ms`. Counting a
+    /// ring park as serial work was a real misreport: it inflated the measured
+    /// serial residue on every query with a streaming scan.
+    double ring_wait_ms = 0.0;
     /// `serial_self_ms / self_ms`.
     double serial_fraction = 0.0;
     /// Amdahl's limit at unbounded cores, `1 / serial_fraction`. Zero when
@@ -161,6 +174,27 @@ void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept;
 /// serial compute.
 void record_execution_profile_barrier_wait(ExecutionProfileEntry* entry,
                                            std::chrono::nanoseconds elapsed) noexcept;
+
+/// Times a park on a pipeline ring and charges it to the operator whose `next()`
+/// is blocking.
+///
+/// Construct around the condvar wait only — not around the surrounding work — so
+/// what is measured is exactly the idle. Attributes nothing when it is not the
+/// calling thread that parked: a pool worker parking on ring backpressure
+/// inflates `pool_work_ns` instead, which is accounted separately.
+class RingWaitScope {
+   public:
+    RingWaitScope() noexcept;
+    ~RingWaitScope();
+    RingWaitScope(const RingWaitScope&) = delete;
+    auto operator=(const RingWaitScope&) -> RingWaitScope& = delete;
+    RingWaitScope(RingWaitScope&&) = delete;
+    auto operator=(RingWaitScope&&) -> RingWaitScope& = delete;
+
+   private:
+    ExecutionProfileEntry* entry_ = nullptr;
+    std::chrono::steady_clock::time_point start_;
+};
 
 [[nodiscard]] auto execution_profile_requested() noexcept -> bool;
 

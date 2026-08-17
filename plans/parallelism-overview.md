@@ -690,17 +690,41 @@ mostly serial algorithms. It is not.
 
 | | ms | share of self |
 |---|---|---|
-| wall | 1286.6 | |
-| main-thread self | 1236.8 | |
-| — genuinely serial work | **443.5** | 35.9% |
-| — parked at a barrier | **419.6** | 33.9% |
-| — parked on a pipeline ring | **373.6** | 30.2% |
-| stage-thread work (excluded from self) | 116.1 | |
-| pool worker work | 3042.0 | |
+| wall | 1286.9 | |
+| main-thread self | 1243.7 | |
+| — genuinely serial work | **442.8** | 35.6% |
+| — parked at a barrier | **414.7** | 33.3% |
+| — parked on a pipeline ring | **386.2** | 31.1% |
+| pool worker work | 3053.2 | |
+| pool worker backpressure park | **0.0** | |
 | barriers issued | 249 | |
 
-**64% of the main thread's non-worker time is idle, not serial.** Occupancy is
-`3042.0 / (1286.6 x 8)` = **29.6%**: the machine is largely not working.
+**64% of the main thread's non-worker time is idle, not serial.**
+
+**And the machine is 70% empty.** Pool capacity is `8 x 1286.9` = 10295 thread-ms;
+3053 is used. Occupancy is **29.7%**, and that figure is now trustworthy —
+`pool_idle_ms` measures 0.0 on all 22 queries, so no worker ever parked on
+backpressure and `pool_work_ms` was never inflated. Total real work
+(3053 + 443) / 1286.9 wall = **2.72x achieved on 8 cores**.
+
+The 70% is pool threads sitting in the pool's own `work.wait()` with **nothing
+queued**. That is a different thing from a parked worker, and none of these
+counters see it.
+
+### What the zero tells us
+
+`pool_idle_ms == 0.0` everywhere is the useful negative result: workers never run
+a full window ahead of their consumer, so the bottleneck direction is
+unambiguous — **consumers wait on producers, never the reverse.** The large
+`ring_wait_ms` said the same thing; this confirms it from the other side.
+
+Which reframes the whole scheduler question. **The problem is not that threads
+block badly; it is that there is not enough queued work to fill them.** A
+scheduler redistributes parallelism, it does not manufacture it. So the lever is
+*more and finer parallel work* — parallelizing serial blocks like q04's
+semi-join, finer grain, more operators running concurrently — rather than better
+scheduling of the work that already exists. That is an argument for demoting the
+scheduler relative to the concrete serial blocks.
 
 ### Idle is not automatically reclaimable
 
@@ -721,11 +745,17 @@ wrong conclusions in a row:
 
 ### The open question this leaves
 
-Occupancy at 29.6% says the workers are idle too, and **these counters cannot see
-that**: `barrier_wait`/`ring_wait` are *caller* idle. Worse, `pool_work_ns` is
-itself still contaminated — the three producer-side `space_.wait` sites mean a
-pool worker parked on backpressure is counted as working. So the next measurement
-is worker-side idle, and it should precede any scheduler commitment.
+Not the accounting any more — all four kinds of park are measured, and the
+producer-side fix turned out to change nothing. What is unmeasured is **pool
+threads with no task queued at all**, which is 70% of the machine. Instrumenting
+that means timing the pool's own `work.wait()` and attributing it to the query
+rather than to an operator, since an empty pool belongs to no operator.
+
+That number would say whether the 70% is unavoidable (the plan genuinely has no
+parallel work available at that moment) or addressable (work exists but is not
+being queued). Until it is measured, "the scheduler is worth X" remains
+unanswerable — but the 2.72x against a 8x machine, with zero worker
+backpressure, already points at supply of work rather than its scheduling.
 
 ### q04, the query that exposed both errors
 

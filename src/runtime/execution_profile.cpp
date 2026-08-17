@@ -32,6 +32,17 @@ struct ExecutionProfileEntry {
     std::atomic<std::uint64_t> rows{0};
     std::atomic<std::uint64_t> pool_thread_calls{0};
     std::atomic<std::uint64_t> pool_tasks{0};
+    /// Fork-join round trips this operator issued: one per `WorkerPool::submit`,
+    /// since every batch is waited on before its captures die.
+    std::atomic<std::uint64_t> barriers{0};
+    /// Wall time the SUBMITTING thread spent parked inside `Batch::wait()`.
+    ///
+    /// This is neither serial work nor parallel work — it is the barrier tax,
+    /// and it is the number that says whether a scheduler whose `join`
+    /// participates in the queue (instead of blocking a thread) has anything to
+    /// reclaim. It is a subset of the enclosing scope's self time, which is why
+    /// the summary subtracts it rather than adding it.
+    std::atomic<std::uint64_t> barrier_wait_ns{0};
 };
 
 struct ExecutionProfileState::Impl {
@@ -237,10 +248,11 @@ ExecutionProfileState::~ExecutionProfileState() {
     ibex::formatting::print(stderr,
                             "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
                             "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
+                            "barriers={} barrier_wait_ms={:.3f} "
                             "pool_work_ms={:.3f} occupancy={:.3f}\n",
                             total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
-                            summary.serial_fraction, summary.amdahl_ceiling, summary.pool_work_ms,
-                            summary.occupancy);
+                            summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
+                            summary.barrier_wait_ms, summary.pool_work_ms, summary.occupancy);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
@@ -251,7 +263,7 @@ ExecutionProfileState::~ExecutionProfileState() {
             "profile node={} op=\"{}\" build_self_ms={:.3f} next_self_ms={:.3f} "
             "source_self_ms={:.3f} span_ms={:.3f} pool_next_ms={:.3f} pool_source_ms={:.3f} "
             "pool_work_ms={:.3f} occupancy={:.3f} calls={} "
-            "chunks={} rows={} pool_calls={} pool_tasks={}\n",
+            "chunks={} rows={} pool_calls={} pool_tasks={} barriers={} barrier_wait_ms={:.3f}\n",
             row->node_id, row->label,
             static_cast<double>(row->build_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
             static_cast<double>(row->next_self_ns.load(std::memory_order_relaxed)) / 1.0e6,
@@ -263,7 +275,9 @@ ExecutionProfileState::~ExecutionProfileState() {
             row_occupancy, row->calls.load(std::memory_order_relaxed),
             row->chunks.load(std::memory_order_relaxed), row->rows.load(std::memory_order_relaxed),
             row->pool_thread_calls.load(std::memory_order_relaxed),
-            row->pool_tasks.load(std::memory_order_relaxed));
+            row->pool_tasks.load(std::memory_order_relaxed),
+            row->barriers.load(std::memory_order_relaxed),
+            static_cast<double>(row->barrier_wait_ns.load(std::memory_order_relaxed)) / 1.0e6);
     }
 }
 
@@ -282,6 +296,8 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     std::uint64_t self_total_ns = 0;
     std::uint64_t serial_self_ns = 0;
     std::uint64_t pool_total_ns = 0;
+    std::uint64_t barrier_wait_total_ns = 0;
+    std::uint64_t barrier_total = 0;
     for (const auto& row : rows) {
         // `pool_next_ns`/`pool_source_ns` are excluded from `self` on purpose,
         // not by omission: `source_self_ns`/`next_self_ns` already exclude
@@ -289,21 +305,29 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
         // `ExecutionProfileScope`'s destructor), so `self` here is exactly the
         // work that ran on the calling thread. `pool_work_ns` is a different,
         // coarser signal — how much worker time a `WorkerPool::submit` this
-        // operator issued consumed — and is what answers "did this operator's
-        // self-time get backed by help". Folding the two together would count
-        // the same parallelism from both axes for an operator that both ran a
-        // scope on a pool thread AND submitted its own batch.
+        // operator issued consumed. Folding the two together would count the
+        // same parallelism from both axes for an operator that both ran a
+        // scope on a pool thread AND submitted its own batch. It no longer
+        // decides the serial split: `barrier_wait_ns` does that, per operator
+        // and continuously, rather than by asking whether help arrived at all.
         const std::uint64_t self = row.build_self_ns + row.next_self_ns + row.source_self_ns;
         self_total_ns += self;
         pool_total_ns += row.pool_work_ns;
-        if (row.pool_work_ns == 0) {
-            serial_self_ns += self;  // this operator was handed no worker at all
-        }
+        // Barrier wait is a subset of self time — the submitting thread is
+        // inside this scope while it is parked — so it is subtracted, never
+        // added. Clamped because the two are sampled by different clocks and a
+        // scope that ends mid-wait could otherwise go negative.
+        const std::uint64_t parked = std::min(row.barrier_wait_ns, self);
+        barrier_wait_total_ns += parked;
+        barrier_total += row.barriers;
+        serial_self_ns += self - parked;
     }
     ExecutionProfileSummary summary;
     summary.self_ms = static_cast<double>(self_total_ns) / 1.0e6;
     summary.serial_self_ms = static_cast<double>(serial_self_ns) / 1.0e6;
     summary.pool_work_ms = static_cast<double>(pool_total_ns) / 1.0e6;
+    summary.barrier_wait_ms = static_cast<double>(barrier_wait_total_ns) / 1.0e6;
+    summary.barriers = barrier_total;
     summary.serial_fraction = self_total_ns == 0 ? 0.0
                                                  : static_cast<double>(serial_self_ns) /
                                                        static_cast<double>(self_total_ns);
@@ -350,6 +374,8 @@ auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnap
             .rows = row->rows.load(std::memory_order_relaxed),
             .pool_thread_calls = row->pool_thread_calls.load(std::memory_order_relaxed),
             .pool_tasks = row->pool_tasks.load(std::memory_order_relaxed),
+            .barriers = row->barriers.load(std::memory_order_relaxed),
+            .barrier_wait_ns = row->barrier_wait_ns.load(std::memory_order_relaxed),
         });
     }
     return out;
@@ -441,6 +467,22 @@ void record_execution_profile_worker(ExecutionProfileEntry* entry,
     entry->pool_work_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
                                   std::memory_order_relaxed);
     entry->pool_tasks.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept {
+    if (entry == nullptr) {
+        return;
+    }
+    entry->barriers.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_execution_profile_barrier_wait(ExecutionProfileEntry* entry,
+                                           std::chrono::nanoseconds elapsed) noexcept {
+    if (entry == nullptr || elapsed.count() <= 0) {
+        return;
+    }
+    entry->barrier_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                     std::memory_order_relaxed);
 }
 
 auto execution_profile_requested() noexcept -> bool {

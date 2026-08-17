@@ -185,6 +185,10 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
+    // One submit is one fork-join round trip: every batch is waited on before
+    // its captures die, so counting here needs no matching hook in `wait()`
+    // (which is idempotent, and which the destructor may call again).
+    record_execution_profile_barrier(state->profile_entry);
     {
         const std::lock_guard lock(impl_->mutex);
         for (std::size_t i = 0; i < count; ++i) {
@@ -195,6 +199,32 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
     return Batch{std::move(state)};
 }
 
+namespace {
+
+/// Block until every worker body of `state` has returned, charging the wall
+/// time to the operator that submitted the batch.
+///
+/// One helper for all three wait sites (`wait()`, the move-assign, the
+/// destructor) so none of them can be the one that forgets to account for
+/// itself — a barrier the profile cannot see is exactly the blind spot this
+/// measurement exists to remove.
+///
+/// The clock is read only when profiling installed an entry, so an unprofiled
+/// run pays one null check per wait rather than two `steady_clock::now()`.
+void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex>& lock) {
+    if (state.profile_entry == nullptr) {
+        state.done.wait(lock, [&state] { return state.remaining == 0; });
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    state.done.wait(lock, [&state] { return state.remaining == 0; });
+    record_execution_profile_barrier_wait(state.profile_entry,
+                                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - start));
+}
+
+}  // namespace
+
 WorkerPool::Batch::Batch(Batch&&) noexcept = default;
 
 auto WorkerPool::Batch::operator=(Batch&& other) noexcept -> Batch& {
@@ -203,7 +233,7 @@ auto WorkerPool::Batch::operator=(Batch&& other) noexcept -> Batch& {
         // the previous owner captured.
         if (state_ != nullptr) {
             std::unique_lock lock(state_->mutex);
-            state_->done.wait(lock, [this] { return state_->remaining == 0; });
+            wait_for_batch(*state_, lock);
         }
         state_ = std::move(other.state_);
     }
@@ -215,7 +245,7 @@ WorkerPool::Batch::~Batch() {
         return;
     }
     std::unique_lock lock(state_->mutex);
-    state_->done.wait(lock, [this] { return state_->remaining == 0; });
+    wait_for_batch(*state_, lock);
 }
 
 void WorkerPool::Batch::wait() {
@@ -225,7 +255,7 @@ void WorkerPool::Batch::wait() {
     std::exception_ptr error;
     {
         std::unique_lock lock(state_->mutex);
-        state_->done.wait(lock, [this] { return state_->remaining == 0; });
+        wait_for_batch(*state_, lock);
         error = std::exchange(state_->error, nullptr);
     }
     if (error != nullptr) {

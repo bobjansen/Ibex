@@ -34,8 +34,8 @@ register_knitr_engines()
 }
 \arguments{
 \item{plugin_paths}{Character vector of directories in which Ibex plugins are
-searched. By default, environment-configured paths and conventional build-tree
-plugin directories are used.}
+searched. By default, bundled package plugins, environment-configured paths,
+and conventional build-tree plugin directories are used.}
 \item{session}{A session created by \code{create_session()}.}
 \item{query}{One Ibex source string.}
 \item{path}{Path to an Ibex source file.}

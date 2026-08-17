@@ -13,6 +13,8 @@ fi
 IBEX_SOURCE_URL=${IBEX_SOURCE_URL:-"https://github.com/bobjansen/Ibex/archive/${IBEX_GITHUB_REF}.tar.gz"}
 IBEX_ROOT=${IBEX_ROOT:-"$(pwd)/src/ibex-src"}
 IBEX_BUILD_DIR=${IBEX_BUILD_DIR:-"$(pwd)/src/ibex-build"}
+IBEX_PARQUET_BUILD_DIR=${IBEX_PARQUET_BUILD_DIR:-"$(pwd)/src/ibex-parquet-build"}
+IBEX_PLUGIN_STAGE="$(pwd)/inst/plugins"
 
 if [ ! -d "${IBEX_ROOT}/include/ibex" ]; then
   command -v curl >/dev/null 2>&1 || {
@@ -48,6 +50,22 @@ if [ ! -f "${IBEX_BUILD_DIR}/src/runtime/libibex_runtime.a" ]; then
     -DIBEX_USE_CCACHE=OFF
   cmake --build "${IBEX_BUILD_DIR}" --target \
     ibex_core ibex_ir ibex_parser ibex_runtime ibex_interop --parallel
+fi
+
+# The bridge is deliberately linked to the small static runtime closure. Build
+# Parquet separately against that same closure, then install the plugin and its
+# Arrow runtime libraries with the R package. Set IBEX_R_BUILD_PARQUET=OFF for
+# constrained source builds that do not need ibex_read_parquet().
+if [ "${IBEX_R_BUILD_PARQUET:-ON}" = "ON" ]; then
+  echo "configure: building bundled Parquet plugin" >&2
+  cmake -S "${IBEX_ROOT}/libs/parquet" -B "${IBEX_PARQUET_BUILD_DIR}" \
+    -DIBEX_ROOT="${IBEX_ROOT}" \
+    -DIBEX_BUILD_DIR="${IBEX_BUILD_DIR}" \
+    -DIBEX_PARQUET_S3="${IBEX_PARQUET_S3:-ON}"
+  cmake --build "${IBEX_PARQUET_BUILD_DIR}" --target ibex_parquet_plugin --parallel
+  rm -rf "${IBEX_PLUGIN_STAGE}"
+  mkdir -p "${IBEX_PLUGIN_STAGE}"
+  cp -R "${IBEX_ROOT}/libraries/." "${IBEX_PLUGIN_STAGE}/"
 fi
 
 IBEX_SYSTEM_LIBS='-pthread -lm'

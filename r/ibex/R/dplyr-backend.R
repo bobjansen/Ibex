@@ -240,6 +240,52 @@ ibex_tbl <- function(x, session = ibex_default_session(), name = NULL,
     )
 }
 
+#' Create a lazy Ibex table from a Parquet file
+#'
+#' The file remains a Parquet-backed Ibex source: filters and projections are
+#' planned by Ibex and can be pushed into the scan.  No R data frame is created
+#' until [dplyr::collect()] is called.
+#'
+#' @param path A local path, HTTPS URL, or S3 URI to a Parquet file.
+#' @param session A persistent Ibex session. Defaults to the shared session
+#'   returned by [ibex_default_session()].
+#' @param name An optional display name used when printing the lazy table.
+#' @param fallback What to do when a dplyr expression cannot be translated:
+#'   warn and collect, error, or collect silently.
+#' @return An immutable lazy `ibex_tbl` backed by the Parquet file.
+#' @export
+ibex_read_parquet <- function(path, session = ibex_default_session(), name = NULL,
+                              fallback = c("warn", "error", "collect")) {
+    if (!is.character(path) || length(path) != 1L || is.na(path) || !nzchar(path)) {
+        rlang::abort("`path` must be one non-empty, non-missing character string.")
+    }
+    fallback <- match.arg(fallback)
+
+    # Declaring the extern is also the activation boundary for the R host: its
+    # session loader finds parquet.so in default_plugin_paths() and registers it
+    # once. Repeating the declaration in a session is harmless.
+    session_eval(session,
+                 'extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";')
+    binding <- ibex_new_binding_name(session, "parquet")
+    session_eval(session, paste0("let ", binding, " = read_parquet(",
+                                 ibex_quote_string(path), ");"))
+    info <- ibex_table_info(session, binding)
+    new_ibex_tbl(
+        session = session,
+        source = binding,
+        schema = ibex_schema_from_info(info),
+        generation = info$generation,
+        ordering = if (length(info$ordering)) {
+            data.frame(name = info$ordering, descending = info$descending)
+        } else {
+            NULL
+        },
+        fallback_policy = fallback,
+        display_name = name %||% path,
+        time_index = if (length(info$time_index)) info$time_index[[1]] else NULL
+    )
+}
+
 names.ibex_tbl <- function(x) x$schema$names
 
 dim.ibex_tbl <- function(x) {

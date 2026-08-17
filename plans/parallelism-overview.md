@@ -299,10 +299,37 @@ gap is not marked anywhere.
 parallelism, and the difference is not written down** (high)
 
 `src/runtime/{filter,aggregate,join,sort,update}.cpp` implement whole-table
-operators; `chunked.cpp` reimplements most of them for the streaming path. The
-chunked ones run in production; the whole-table ones are reached through
-`interpret()` fallbacks, the `ops` layer (codegen), plugins, and the REPL's
-`:load`. Their parallel coverage differs sharply:
+operators; `chunked.cpp` reimplements most of them for the streaming path.
+
+**Correction (verified 2026-08-17):** an earlier draft of this entry said the
+whole-table operators are what the `ops`/codegen layer, plugins and the REPL
+`:load` path reach, so that "the same query can be several times more parallel
+depending on which entry point reached it". That is **wrong**. `interpret()`
+routes unconditionally through `build_operator` -> the chunked operators ->
+`MaterializeOperator`, and `ops.hpp` is a thin `Table -> Table` wrapper over
+`interpret()`. Every entry point gets the chunked engine. The whole-table
+functions are reached only as `interpret_node` fallbacks for node kinds the
+chunked builder declines (complex aggregates such as Median), and as delegation
+targets from inside chunked operators.
+
+That matters for priority: this is a tax on future work and a drift hazard, not
+a user-facing performance gap. Note also that `ops.hpp` already demonstrates the
+fix — a whole-table SIGNATURE over a chunked IMPLEMENTATION.
+
+Three different relationships hide under one name:
+
+* **Delegating** — the chunked operator buffers and calls the whole-table
+  function: `order_table`, `filter_table` (+ `_range`/`_limit`), `update_table`,
+  `join_table_impl`. Not duplication; the whole-table function is the kernel.
+* **Fully reimplemented** — aggregate, distinct, inner join, and the sort's
+  radix fast path. `aggregate_table` appears in `chunked.cpp` only in a comment.
+  This is the real duplication.
+* **Escape hatch** — the chunked aggregate declines Median/quantile and the
+  whole node runs via `interpret_node` -> `aggregate_table`. This is what lets
+  the streaming engine be incomplete, and it is why the aggregate is the LAST
+  operator that can be collapsed, not the first.
+
+Parallel coverage in the reimplemented set differs sharply:
 
 | Operator | whole-table | chunked |
 |---|---|---|
@@ -311,11 +338,23 @@ chunked ones run in production; the whole-table ones are reached through
 | Join | parallel probe (`join.cpp:1167`) | parallel probe + parallel concat + swapped-probe replay |
 | Distinct | serial | packed-key partitioned |
 
-So the same query can be several times more parallel depending on which entry
-point reached it — and a fix applied to one side routinely does not exist on the
-other (memory already records this trap for the fused scan and the REPL `:load`
-path). *Convergence:* at minimum a table in this document kept current; better,
-delete the duplicated whole-table paths as the chunked ones reach coverage.
+A fix applied to one side routinely does not exist on the other. I15 is the
+worked example: it had to be written into both engines, and doing only
+`join.cpp` would have "fixed" a benchmark regression without touching the code
+the benchmark runs.
+
+*Convergence:* keep the whole-table **signature** and delete the second
+**implementation**, per the split `ops.hpp` already uses — `filter_table(t, e)`
+becomes a `TableSource` run through the chunked operator and materialized.
+Sequencing constraint: an operator can only be collapsed once its chunked
+version is COMPLETE, because collapsing removes the decline-and-fall-back path.
+So distinct / inner join / the sort's radix path first, and the aggregate only
+after the chunked one covers Median and quantile.
+
+The duplication tax on the task-scheduler work is avoidable without doing any
+of this first: port the chunked operators to the new primitive and leave the
+whole-table fallbacks on the old one. They are fallbacks, so lagging costs
+correctness nothing and measurable performance almost nothing.
 
 **I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
 serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked
@@ -525,8 +564,35 @@ touch.
    (column x range) task shape.~~ **Done**, in both engines, via a shared
    `gather_columns_batched`. It needed doing twice, which is itself an argument
    for the next item.
-4. **I4** — decide, per operator, whether the whole-table implementation is
-   still needed, and delete or align it. A decision, not cleanup: the scheduler
-   is exactly the kind of change one otherwise implements twice.
-5. **I2 + I3** — the type exclusions and the missing multi-Categorical
+4. **Instrument the barriers.** Barrier count and inter-barrier serial time,
+   with `batch.wait()` excluded from operator self-time. Small, and it re-prices
+   everything after it: the scheduler's whole value proposition is "threads idle
+   at barriers", and the current profiler cannot distinguish that from a residue
+   of genuinely serial algorithms (prefix sums, first-occurrence merges, slot
+   growth) — `self_ms` counts the wait. Do this before committing to item 6.
+5. **Decide first-occurrence group ordering** and write it into `SPEC.md`. A
+   decision plus a modest implementation, not a project, and it is an input to
+   how the aggregate is designed under any scheduler. It is also the only lever
+   here that DELETES serial work rather than overlapping it: unspecified output
+   order lets a partitioned group-by emit partition-by-partition with no
+   first-occurrence merge, and lets grouped aggregation stream its output. The
+   likely answer is conditional rather than binary — preserve ordering when the
+   input is sorted or group-major (free there, and `TableProperties` can
+   propagate it), unspecified otherwise (where preserving it costs the merge).
+   Note part of the cost is a LANGUAGE commitment, not an engine one.
+6. **The task scheduler** — per-thread queues, work stealing, and a `join` that
+   participates in the queue instead of parking a thread. This is the
+   structural lever: it retires the `on_worker_pool_thread() -> serial` cliff,
+   the `PipelinedStageOperator` raw thread, and intra-batch load imbalance at
+   once, and it absorbs the deferred half of Part 2. Land it as a NEW primitive
+   the existing `submit`/`wait` sites port to incrementally — the byte-identity
+   contract is what makes that refactor safe. Port the chunked operators; leave
+   the whole-table fallbacks on the old primitive.
+7. **I4** — collapse the duplicated implementations, keeping the whole-table
+   signatures. After the scheduler, because it turned out to be internal
+   hygiene rather than a user-facing gap, and because its tax on the scheduler
+   is avoidable (item 6). Order within it is set by completeness:
+   distinct / inner join / sort's radix path, then the aggregate once the
+   chunked one covers Median and quantile.
+8. **I2 + I3** — the type exclusions and the missing multi-Categorical
    partitioned discovery, once there is a shared predicate to hang them on.

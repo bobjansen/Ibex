@@ -276,10 +276,14 @@ auto find_candidate_time_column(const Table& side) -> std::optional<std::string>
 /// already null in the source. `gather_column_with_nulls` produces only the
 /// first, so a source null came out as the type's zero — the very conflation
 /// the join's key rules go to such lengths to avoid, one step later.
-auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total,
-                  const ExecutionContext* exec)
+///
+/// Takes no `ExecutionContext`: this is a whole-column body, and whether it runs
+/// on a worker is `gather_entries`' decision, made once for all the columns.
+/// Passing a context here would re-open that decision per column, which is the
+/// per-column fan-out this batching exists to remove.
+auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t total)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, exec);
+    auto [column, validity] = gather_column_with_nulls(*entry.column, idx, total, kNull, nullptr);
     if (!entry.validity.has_value()) {
         return {std::move(column), std::move(validity)};
     }
@@ -291,6 +295,51 @@ auto gather_entry(const ColumnEntry& entry, const std::size_t* idx, std::size_t 
         }
     }
     return {std::move(column), std::move(bitmap)};
+}
+
+/// True when `idx` holds at least one `kNull`, i.e. an output row with no
+/// counterpart on this side.
+auto index_has_sentinel(const std::size_t* idx, std::size_t total) -> bool {
+    for (std::size_t i = 0; i < total; ++i) {
+        if (idx[i] == kNull) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// One output column the join still has to gather.
+struct GatherJob {
+    const ColumnEntry* entry = nullptr;  ///< source column
+    const std::size_t* idx = nullptr;    ///< output row -> source row
+    std::size_t out_index = 0;           ///< destination column in the output table
+    bool has_sentinel = false;           ///< `idx` contains kNull
+};
+
+/// Gather every job in ONE worker batch, delegating the task shape to
+/// `gather_columns_batched`.
+///
+/// The join used to call `gather_entry` in a loop and let each call fan its own
+/// rows out, which submitted and waited a batch per column. See that helper for
+/// the measurement that motivated batching. The join-specific part is only
+/// which columns are indivisible (a side whose index carries `kNull`) and what
+/// a whole-column gather means here (`gather_entry`, which merges the sentinel
+/// nulls with the source's own).
+auto gather_entries(std::span<const GatherJob> jobs, std::size_t total,
+                    const ExecutionContext* exec) -> std::vector<GatheredColumn> {
+    std::vector<ColumnGatherJob> column_jobs;
+    column_jobs.reserve(jobs.size());
+    for (const auto& job : jobs) {
+        column_jobs.push_back({
+            .column = job.entry->column.get(),
+            .validity = job.entry->validity.has_value() ? &*job.entry->validity : nullptr,
+            .idx = job.idx,
+            .indivisible = job.has_sentinel,
+        });
+    }
+    return gather_columns_batched(column_jobs, total, exec, [&](std::size_t j) -> GatheredColumn {
+        return gather_entry(*jobs[j].entry, jobs[j].idx, total);
+    });
 }
 
 auto format_expr_type(ExprType kind) -> std::string {
@@ -864,16 +913,35 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         claim_carried_ordering();
     };
 
+    // Run one batch of gather jobs and land the results on the output. Every
+    // assembly path funnels through here, so they all get the single fan-out
+    // rather than one per column.
+    auto run_gather_jobs = [&](const std::vector<GatherJob>& jobs, std::size_t rows) {
+        if (jobs.empty()) {
+            return;
+        }
+        auto gathered = gather_entries(jobs, rows, exec);
+        for (std::size_t j = 0; j < jobs.size(); ++j) {
+            output.replace_column(jobs[j].out_index, std::move(gathered[j].first),
+                                  std::move(gathered[j].second));
+        }
+    };
+
     auto materialize_left_identity = [&](const std::vector<std::size_t>& right_idx) {
         for (std::size_t c = 0; c < left.columns.size(); ++c) {
             output.replace_column(c, *left.columns[c].column, left.columns[c].validity);
         }
 
+        const bool right_sentinel = index_has_sentinel(right_idx.data(), right_idx.size());
+        std::vector<GatherJob> jobs;
+        jobs.reserve(right_out.size());
         for (const auto& item : right_out) {
-            auto [col_out, validity] =
-                gather_entry(*item.entry, right_idx.data(), right_idx.size(), exec);
-            output.replace_column(item.out_index, std::move(col_out), std::move(validity));
+            jobs.push_back({.entry = item.entry,
+                            .idx = right_idx.data(),
+                            .out_index = item.out_index,
+                            .has_sentinel = right_sentinel});
         }
+        run_gather_jobs(jobs, right_idx.size());
 
         normalize_time_index(output);
         // Every left row, once, in its own order: the strongest form of the
@@ -926,11 +994,15 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         }
 
         if (!has_left_nulls) {
+            std::vector<GatherJob> jobs;
+            jobs.reserve(left.columns.size());
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
-                auto [col_out, validity] =
-                    gather_entry(left.columns[c], left_idx.data(), total, exec);
-                output.replace_column(c, std::move(col_out), std::move(validity));
+                jobs.push_back({.entry = &left.columns[c],
+                                .idx = left_idx.data(),
+                                .out_index = c,
+                                .has_sentinel = false});
             }
+            run_gather_jobs(jobs, total);
         } else {
             // Build a "safe" index: null positions get row 0 (overwritten below).
             std::vector<std::size_t> safe_idx(total);
@@ -946,6 +1018,8 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
 
             // The plan's left columns are its first `left.columns.size()`
             // entries, in input order, so `plan[c]` describes `left.columns[c]`.
+            std::vector<GatherJob> plain_jobs;
+            plain_jobs.reserve(left.columns.size());
             for (std::size_t c = 0; c < left.columns.size(); ++c) {
                 // A folded key is the one output column two inputs feed, so it
                 // is the only one an unmatched right row can fill. The planner
@@ -982,26 +1056,38 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
                     }
                     output.replace_column(c, std::move(out_col), std::move(out_validity));
                 } else {
-                    auto [col_out, validity] =
-                        gather_entry(left.columns[c], left_idx.data(), total, exec);
-                    output.replace_column(c, std::move(col_out), std::move(validity));
+                    // Collected rather than gathered here, so the plain columns
+                    // still share one fan-out. A folded key is built per row
+                    // just above and is not one of them.
+                    plain_jobs.push_back({.entry = &left.columns[c],
+                                          .idx = left_idx.data(),
+                                          .out_index = c,
+                                          .has_sentinel = true});
                 }
             }
+            run_gather_jobs(plain_jobs, total);
         }
 
         // ── Right columns ──
         if (right_out.empty()) {
             // semi/anti — no right columns to emit.
         } else {
-            bool has_right_nulls = false;
-            for (std::size_t i = 0; i < total && !has_right_nulls; ++i) {
-                has_right_nulls = (right_idx[i] == kNull);
-            }
+            // Scanned once for the whole side rather than once per column:
+            // every right column reads the same index array, so the answer
+            // cannot differ between them. (This was already computed here and
+            // then dropped on the floor, while `gather_column_with_nulls`
+            // rescanned inside every column's gather.)
+            const bool has_right_nulls = index_has_sentinel(right_idx.data(), total);
 
+            std::vector<GatherJob> jobs;
+            jobs.reserve(right_out.size());
             for (const auto& item : right_out) {
-                auto [col_out, validity] = gather_entry(*item.entry, right_idx.data(), total, exec);
-                output.replace_column(item.out_index, std::move(col_out), std::move(validity));
+                jobs.push_back({.entry = item.entry,
+                                .idx = right_idx.data(),
+                                .out_index = item.out_index,
+                                .has_sentinel = has_right_nulls});
             }
+            run_gather_jobs(jobs, total);
         }
 
         normalize_time_index(output);

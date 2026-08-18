@@ -26,44 +26,30 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
-    select { l_suppkey = s_suppkey, s_nationkey }
-];
-
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
-    filter l_shipdate >= date"1995-01-01" && l_shipdate <= date"1996-12-31"
-][select { l_suppkey, o_orderkey = l_orderkey, l_extendedprice, l_discount, l_shipdate }];
-
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
-    select { o_orderkey, c_custkey = o_custkey }
-];
-
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
-    select { c_custkey, c_nationkey }
-];
-
-// Two views of nation: the supplier's (supp_nation) and the customer's (cust_nation).
-let supp_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let nations = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
     filter n_name == "FRANCE" || n_name == "GERMANY"
-][
-    select { s_nationkey = n_nationkey, supp_nation = n_name }
 ];
-let cust_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    filter n_name == "FRANCE" || n_name == "GERMANY"
-][
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+
+// Match Polars: customer → customer nation → orders → lineitem → supplier →
+// supplier nation, with both nation and ship-date predicates applied late.
+let joined = (((((customer join nations[
     select { c_nationkey = n_nationkey, cust_nation = n_name }
-];
-
-let joined = (((
-    (customer join cust_nation on c_nationkey)
-        join orders on c_custkey)
-        join lineitem on o_orderkey)
-        join supplier on l_suppkey)
-        join supp_nation on s_nationkey;
+] on { c_nationkey = c_nationkey })
+    join orders on { c_custkey = o_custkey })
+    join lineitem on { o_orderkey = l_orderkey })
+    join supplier on { l_suppkey = s_suppkey })
+    join nations[
+        select { s_nationkey = n_nationkey, supp_nation = n_name }
+    ] on { s_nationkey = s_nationkey });
 
 let result = joined[
-    filter (supp_nation == "FRANCE" && cust_nation == "GERMANY")
-        || (supp_nation == "GERMANY" && cust_nation == "FRANCE")
+    filter ((supp_nation == "FRANCE" && cust_nation == "GERMANY")
+        || (supp_nation == "GERMANY" && cust_nation == "FRANCE"))
+        && l_shipdate >= date"1995-01-01" && l_shipdate <= date"1996-12-31"
 ][
     update { l_year = year(l_shipdate) }
 ][

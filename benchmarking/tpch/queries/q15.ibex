@@ -30,8 +30,10 @@ let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
     select { s_suppkey, s_name, s_address, s_phone }
 ];
 
-let result = (supplier join revenue on s_suppkey)[
-    filter total_revenue == scalar(revenue[select { m = max(total_revenue) }]),
+let max_revenue = revenue[select { max_revenue = max(total_revenue) }];
+
+let result = ((supplier join revenue on s_suppkey) cross join max_revenue)[
+    filter total_revenue == max_revenue,
     select { s_suppkey, s_name, s_address, s_phone, total_revenue }
 ][order { s_suppkey }];
 write_csv(result, "benchmarking/data/tpch/out/q15.csv");

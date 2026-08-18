@@ -23,45 +23,31 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
-    filter p_type == "ECONOMY ANODIZED STEEL"
-][select { l_partkey = p_partkey }];
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let n1 = nation[select { c_nationkey = n_nationkey, n_regionkey }];
+let n2 = nation[select { s_nationkey = n_nationkey, supp_nation = n_name }];
+let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
-    select { l_partkey, l_suppkey, o_orderkey = l_orderkey, l_extendedprice, l_discount }
-];
-
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
-    select { l_suppkey = s_suppkey, s_nationkey }
-];
-// The supplier's nation — names who filled the order (the numerator).
-let supp_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    select { s_nationkey = n_nationkey, supp_nation = n_name }
-];
-
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
-    filter o_orderdate >= date"1995-01-01" && o_orderdate <= date"1996-12-31"
-][select { o_orderkey, c_custkey = o_custkey, o_orderdate }];
-
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
-    select { c_custkey, c_nationkey }
-];
-// The customer's nation — reaches region, which scopes the market.
-let cust_nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    select { c_nationkey = n_nationkey, n_regionkey }
-];
-let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet")[
+// Match Polars: part → lineitem → supplier → orders → customer → n1 → region,
+// then the supplier-nation join and late date/type predicates.
+let regional = ((((((part join lineitem on { p_partkey = l_partkey })
+    join supplier on { l_suppkey = s_suppkey })
+    join orders on { l_orderkey = o_orderkey })
+    join customer on { o_custkey = c_custkey })
+    join n1 on { c_nationkey = c_nationkey })
+    join region on { n_regionkey = r_regionkey })[
     filter r_name == "AMERICA"
-][select { n_regionkey = r_regionkey }];
+];
 
-let joined = (((((
-    (part join lineitem on l_partkey)
-        join supplier on l_suppkey)
-        join supp_nation on s_nationkey)
-        join orders on o_orderkey)
-        join customer on c_custkey)
-        join cust_nation on c_nationkey)
-        join region on n_regionkey;
+let joined = (regional join n2 on { s_nationkey = s_nationkey })[
+    filter o_orderdate >= date"1995-01-01" && o_orderdate <= date"1996-12-31"
+        && p_type == "ECONOMY ANODIZED STEEL"
+];
 
 let result = joined[
     update { o_year = year(o_orderdate) }

@@ -15,25 +15,23 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
-    filter p_brand != "Brand#45" && !like(p_type, "MEDIUM POLISHED%")
-        && (p_size == 49 || p_size == 14 || p_size == 23 || p_size == 45
-            || p_size == 19 || p_size == 3 || p_size == 36 || p_size == 9),
-    select { ps_partkey = p_partkey, p_brand, p_type, p_size }
-];
-
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
 let excluded_suppliers = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
     filter like(s_comment, "%Customer%Complaints%"),
-    select { ps_suppkey = s_suppkey }
+    select { excluded_suppkey = s_suppkey }
 ];
 
-let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet")[
-    select { ps_partkey, ps_suppkey }
-] anti join excluded_suppliers on ps_suppkey;
-
-let unique_part_suppliers = (part join partsupp on ps_partkey)[
-    distinct { p_brand, p_type, p_size, ps_suppkey }
+let parts = (part join partsupp on { p_partkey = ps_partkey })[
+    filter p_brand != "Brand#45" && !like(p_type, "MEDIUM POLISHED%")
+        && (p_size == 49 || p_size == 14 || p_size == 23 || p_size == 45
+            || p_size == 19 || p_size == 3 || p_size == 36 || p_size == 9)
 ];
+
+let unique_part_suppliers = (parts left join excluded_suppliers
+    on { ps_suppkey = excluded_suppkey })[
+    filter is_null(excluded_suppkey)
+][distinct { p_brand, p_type, p_size, ps_suppkey }];
 
 let result = unique_part_suppliers[
     select { supplier_cnt = count() },

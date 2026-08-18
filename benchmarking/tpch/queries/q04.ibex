@@ -38,14 +38,11 @@ let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
 let result = (
-    orders_raw[
-        filter o_orderdate >= date"1993-07-01" && o_orderdate < date"1993-10-01",
-        select { o_orderkey, o_orderpriority }
-    ]
-    semi join
-    lineitem_raw[filter l_commitdate < l_receiptdate][select { o_orderkey = l_orderkey }]
-    on o_orderkey
+    orders_raw
+    semi join lineitem_raw[filter l_commitdate < l_receiptdate]
+        on { o_orderkey = l_orderkey }
 )[
+    filter o_orderdate >= date"1993-07-01" && o_orderdate < date"1993-10-01",
     select { order_count = count() },
     by { o_orderpriority }
 ][

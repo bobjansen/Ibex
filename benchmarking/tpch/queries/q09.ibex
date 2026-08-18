@@ -25,38 +25,27 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let part = part_raw[filter like(p_name, "%green%")][select { l_partkey = p_partkey }];
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
-    select { l_partkey, l_suppkey, l_orderkey, l_quantity, l_extendedprice, l_discount }
+// Match Polars: part → partsupp → supplier → lineitem (composite key) →
+// orders → nation, with the green-part predicate applied after the chain.
+let profit = (((((part join partsupp on { p_partkey = ps_partkey })
+    join supplier on { ps_suppkey = s_suppkey })
+    join lineitem on { p_partkey = l_partkey, ps_suppkey = l_suppkey })
+    join orders on { l_orderkey = o_orderkey })
+    join nation on { s_nationkey = n_nationkey })[
+    filter like(p_name, "%green%")
 ];
-
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
-    select { l_suppkey = s_suppkey, s_nationkey }
-];
-
-let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet")[
-    select { l_partkey = ps_partkey, l_suppkey = ps_suppkey, ps_supplycost }
-];
-
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
-    select { l_orderkey = o_orderkey, o_orderdate }
-];
-
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    select { s_nationkey = n_nationkey, nation = n_name }
-];
-
-let green_lines = part join lineitem on l_partkey;
-let with_supplier = green_lines join supplier on l_suppkey;
-let with_partsupp = with_supplier join partsupp on { l_partkey, l_suppkey };
-let with_orders = with_partsupp join orders on l_orderkey;
-let profit = with_orders join nation on s_nationkey;
 
 let result = profit[
     update {
         o_year = year(o_orderdate),
+        nation = n_name,
         amount = l_extendedprice * (1.0 - l_discount) - ps_supplycost * l_quantity
     }
 ][

@@ -449,6 +449,19 @@ sum/mean/min/max code regardless.
 The escape hatch is therefore design, not debt, and I4 is **complete at 2 of 3**.
 The goal was zero DUPLICATED implementations, not zero whole-table ones.
 
+**Aggregate measurement (2026-08-18).** Per `MEASURING.md`, this was a small
+synthetic profile before any suite run: 1M `Double` rows, `median(v)`, about
+9,800 groups, `IBEX_PROFILE_OPERATORS=1`, and `IBEX_CORES={1,2,4,8}` pinned to
+the matching CPU sets. Two key shapes were required. One key measured
+35.4 / 34.4 / 38.4 / 29.5 ms; two keys measured 52.1 / 56.9 / 47.8 / 44.8 ms.
+Thus eight cores buy only 1.20x and 1.16x respectively, not a scaling result
+worth extrapolating from a suite geomean. An independent `IBEX_PARALLEL=0`
+versus enabled run at eight cores was 49.5 versus 46.9 ms on the two-key case.
+The profile agrees: only 12.7 ms of pool work, one barrier, and roughly 1,100%
+profile occupancy across eight workers. The next aggregate change must target
+the serial group/value-collection path; it should not be a generic scheduler or
+thread-count adjustment.
+
 ### What looking for the third collapse actually found
 
 Chasing "which grouping implementation should survive" turned up a hash

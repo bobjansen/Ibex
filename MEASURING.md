@@ -43,6 +43,134 @@ costs one run.
 Reach for the full suite only to confirm a change you already believe in, or to
 check you did not regress something else.
 
+## 1a. The mechanics: what to run
+
+### Running a query
+
+```bash
+# a .ibex file, one process, fresh each time. This is the measurement binary.
+./build-release/tools/ibex_eval --plugin-path build-release/tools case.ibex
+
+# `ibex` is the REPL and DOES read stdin; `ibex_eval` does not ("file is
+# required"). Bindings need `let`, and the last statement needs a trailing `;`.
+printf 'let t = Table(3);\nt;\n' | ./build-release/tools/ibex
+```
+
+`--plugin-path build-release/tools` is required for anything touching
+parquet/csv/json. `scripts/ibex-run.sh <file.ibex>` does the transpile → compile
+→ run path instead, when you specifically want compiled codegen rather than the
+interpreter.
+
+Generating synthetic input inside the script beats wiring up data files:
+
+```
+seed_rng(12345);
+let t = Table(1000000)[update {
+  a = rand_int(0, 99), b = rand_int(0, 97), v = rand_normal(0.0, 1.0)
+}];
+t[select { m = median(v) }, by {a, b}][select { n = count() }];
+```
+
+Note `by {a, b}` — repeating `by a, by b` is a parse error, and the row-index
+`idx` does not exist; use `rep([...])` or `rand_int` to build key columns.
+
+### Environment variables
+
+These are the whole set (`grep -rhoE '"IBEX_[A-Z0-9_]+"' src/ include/`). The
+ones that matter for measurement:
+
+| Variable | Effect |
+|---|---|
+| `IBEX_CORES` | compute budget. **Pin it** — unset means `hardware_concurrency()`. Cap local cross-engine runs at 8; never 24 (polars thrashes and inflates Ibex ~1.7×) |
+| `IBEX_PROFILE_OPERATORS=1` | per-node + per-statement profile to stderr. The main diagnostic |
+| `IBEX_PARALLEL=0/1` | parallel islands off/on — the byte-identity A/B switch |
+| `IBEX_STREAM_SCAN=0` | opt out of streaming scans |
+| `IBEX_JOIN_PROBE=0` | opt out of the parallel join probe |
+| `IBEX_DECODE_THREADS` | absolute pool size, bypassing policy |
+| `IBEX_DECODE_SATURATION` | where extra decode threads stop paying (default 8; a property of the box, so re-sweep on new hardware) |
+| `IBEX_MORSEL_ROWS`, `IBEX_CHUNK_ROWS` | grain overrides; `IBEX_CHUNK_ROWS` exists to *exercise* cross-chunk paths, not for perf |
+| `IBEX_PARALLEL_STATS=1`, `IBEX_UNIQUE_KEY_STATS=1` | extra diagnostics |
+
+`IBEX_THREADS` is **dead** — it was split into `IBEX_CORES` and
+`IBEX_DECODE_THREADS`. It is read only to print a one-time warning, so a script
+still setting it silently gets `hardware_concurrency()`. All the on/off switches
+accept `1/on/true/yes` and `0/off/false/no`.
+
+### Reading the profile
+
+```bash
+IBEX_PROFILE_OPERATORS=1 IBEX_CORES=8 \
+  ./build-release/tools/ibex_eval --plugin-path build-release/tools case.ibex \
+  2>&1 >/dev/null | grep 'operator profile:'
+```
+
+Per statement you get `wall_ms`, `self_ms`, `serial_self_ms`, `barrier_wait_ms`,
+`ring_wait_ms`, `pool_work_ms`, `pool_idle_ms`, `pool_unqueued_ms`,
+`pool_capacity_ms`, `stage_self_ms`, `stage_park_ms`, `stage_live_ms`,
+`occupancy`. Per node (`profile node=N op="..."`), `build_self_ms` /
+`next_self_ms` / `pool_work_ms` / `pool_tasks` / `barriers`.
+
+Two things to know when reading it:
+
+* **`build_self_ms`, not `next_self_ms`, is where a materializing fallback
+  shows up.** A node whose work happens in `build_operator` (anything routed
+  through `interpret_node`) reports there, and its `occupancy` is meaningless
+  because `span_ns` only covers `next()`.
+* The accounting closes: `pool_work + pool_idle + pool_unqueued ≈
+  pool_capacity` (99.6% over PDS-H) and `stage_self + stage_ring_wait +
+  stage_park ≈ stage_live` (99.9%). If your change makes either stop closing at
+  suite scale, you broke the instrument, not the engine. **Do not check closure
+  on a sub-millisecond statement** — the ledgers are sampled at statement start
+  and end, so on a 0.1ms query the sampling skew is larger than the quantity and
+  `pool_unqueued` routinely exceeds `pool_capacity`.
+
+### Benchmark suites, cheapest first
+
+```bash
+# 1. PDS-H, 22 queries, one warm process — the usual gate
+uv run --project . python benchmarking/tpch/bench_ibex.py --iters 5
+uv run --project . python benchmarking/tpch/check_answers.py    # NO arguments
+
+# 2. A/B two git states, builds both in temp worktrees
+./benchmarking/compare_ibex_git.sh --base HEAD --target WORKTREE \
+    --interleave --repeats 15 --taskset 2
+
+# 3. cross-engine scale suite (slow)
+./benchmarking/run_scale_suite.sh --threads 8
+```
+
+Run `check_answers.py` with **no arguments**. Naming queries filters to ones it
+has a reference answer for, and anything else prints `SKIP (not implemented)`
+and exits 0 — `check_answers.py q01 q06` is two SKIPs and a green exit code,
+having verified nothing. `bench_ibex.py` does take query names (`q01 q06`) and
+runs them for real, so the two are not symmetric.
+
+`compare_ibex_git.sh` defaults to `--base HEAD --target WORKTREE`, so it
+measures uncommitted changes with no arguments. Always pass `--interleave` on
+this box: serial blocks drift. `--replica-control` builds the base twice and
+runs it as a third side, which is how you tell a real regression from layout
+noise.
+
+The competitor harnesses need the project's **uv** environment, not system
+python or conda (those lack polars/pandas and fail in a way that looks like
+"deps not installed"):
+
+```bash
+uv run --project /home/brj/ibex python benchmarking/bench_python.py --csv ... --iters 1
+Rscript benchmarking/bench_r.R --csv ...          # R needs no wrapper
+```
+
+`benchmarking/aws/run-all.sh` and `run-thread-scaling.sh` are the AWS two-tier
+framework. They are **deliberately not run** as a routine step — do not reach
+for them unless the task is explicitly "publish new numbers".
+
+### PDS-H data
+
+`benchmarking/data/tpch/parquet` is a **symlink** the scale scripts flip between
+`parquet_sf1` / `parquet_sf2` / `parquet_sf4`. For an A/B, pin the explicit
+`parquet_sf<N>` path rather than trusting the symlink to still point where it
+did when you started.
+
 ## 2. Vary two dimensions, not one
 
 A one-dimensional sweep will confidently tell you there is no bug.

@@ -183,24 +183,40 @@ Two things it does that you must also do if you write your own:
   should exhaust `pool_capacity`. If it stops closing, a bucket is unmeasured.
   That has happened five times here and always in the same direction.
 
-### Timing A/B by hand
+### Timing A/B over queries
 
-`compare_ibex_git.sh` is the supported path, but when you want a specific
-comparison (one binary against another, custom queries) the pattern is:
+`compare_ibex_git.sh` compares two git STATES via the `ibex_bench` suite.
+`benchmarking/ab_queries.py` compares two BINARIES over `.ibex` query files,
+which is what you want when the thing you care about is a PDS-H query. It
+interleaves the sides, alternates which goes first, takes medians, checks
+byte-identity, and reports a geomean.
 
 ```bash
+# 1. keep the candidate
 cp build-release/tools/ibex_eval /tmp/eval_target
+
+# 2. build the base (git stash, or check specific files out of a ref)
 git stash -q
 CMAKE_BUILD_PARALLEL_LEVEL=6 cmake --build build-release --target ibex_eval
 cp build-release/tools/ibex_eval /tmp/eval_base
 git stash pop -q
+CMAKE_BUILD_PARALLEL_LEVEL=6 cmake --build build-release --target ibex_eval   # NOT optional
+
+# 3. compare
+python3 benchmarking/ab_queries.py --base /tmp/eval_base --target /tmp/eval_target
 ```
 
-Then run `base, target, base, target...` per query and take **medians**, with one
-warm-up of each first. Do not run all of one side then all of the other; this box
-drifts. Remember to rebuild afterwards — after `git stash pop` the binary in
-`build-release/` is still the *base* build, which has produced at least one
-confusing measurement.
+Step 2's final rebuild is the easy one to skip: after `git stash pop` the binary
+in `build-release/` is still the BASE build, so forgetting it means measuring
+the base against itself while believing otherwise.
+
+Exit code is **2** when any output differs, so it can gate. A divergence is a
+correctness result — stop and explain it before reading any timing.
+
+**Run it against itself first if you doubt a result.** `--base X --target X`
+measures the harness's own noise; on this box that is around +1.2% with per-query
+spreads up to 12%, which is why `--noise-pct` defaults to 13 and why a 1–2%
+suite total is a wash rather than a small win.
 
 ### Proving a code path is reached
 

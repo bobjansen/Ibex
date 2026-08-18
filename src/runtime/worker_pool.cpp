@@ -142,65 +142,140 @@ thread_local bool t_on_stage_thread = false;
 std::atomic<std::size_t> g_stage_threads_live{0};
 std::atomic<std::size_t> g_stage_threads_peak{0};
 
-/// One pool thread's record of time spent parked with an empty queue.
-///
-/// Two fields rather than one running total because a total alone cannot answer
-/// the question. A thread parked for a whole query never wakes inside it, so it
-/// never adds to `closed_ns`; only `park_start_ns` reveals that it was idle the
-/// entire time. Both are needed, and `pool_idle_between` combines them.
-struct IdleLedger {
-    std::atomic<std::uint64_t> closed_ns{0};
-    /// Start of the park in progress, or 0 when this thread is running.
-    std::atomic<std::uint64_t> park_start_ns{0};
-};
-
-struct IdleRegistry {
-    std::mutex mutex;
-    // Deque, not vector: `sample_pool_idle` and the owning thread both hold
-    // references into this, and a vector would invalidate them on growth.
-    std::deque<IdleLedger> ledgers;
-};
-
-/// Never destroyed, for the same reason `process_worker_pool_state` is not: a
-/// pool thread may outlive static destruction on a host that unloads the
-/// library, and it writes to its ledger on every park.
-auto idle_registry() -> IdleRegistry& {
-    static auto* registry = new IdleRegistry();  // NOLINT(cppcoreguidelines-owning-memory)
-    return *registry;
-}
-
-/// Ledgers are never reclaimed when a pool is destroyed. A retired thread's
-/// ledger simply stops changing, so it contributes zero to every later window —
-/// correct, and it keeps the sampler free of any lifetime coupling to the pool.
-auto new_idle_ledger() -> IdleLedger& {
-    auto& registry = idle_registry();
-    const std::lock_guard lock(registry.mutex);
-    return registry.ledgers.emplace_back();
-}
-
 [[nodiscard]] auto steady_ns() noexcept -> std::uint64_t {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now().time_since_epoch())
                                           .count());
 }
 
-}  // namespace
+/// One thread's time inside one state, in a form a sampler can window.
+///
+/// Two fields rather than one running total because a total alone cannot answer
+/// the question. A thread parked for a whole query never wakes inside it, so it
+/// never adds to `closed_ns`; only `open_since_ns` reveals that it was idle the
+/// entire time. Both are needed, and `idle_between` combines them.
+struct IntervalLedger {
+    std::atomic<std::uint64_t> closed_ns{0};
+    /// Start of the interval in progress, or 0 when the thread is not in it.
+    std::atomic<std::uint64_t> open_since_ns{0};
+};
 
-auto sample_pool_idle() -> PoolIdleSample {
-    PoolIdleSample sample;
+void interval_open(IntervalLedger& ledger) noexcept {
+    ledger.open_since_ns.store(steady_ns(), std::memory_order_relaxed);
+}
+
+void interval_close(IntervalLedger& ledger) noexcept {
+    const auto started = ledger.open_since_ns.exchange(0, std::memory_order_relaxed);
+    if (started != 0) {
+        ledger.closed_ns.fetch_add(steady_ns() - started, std::memory_order_relaxed);
+    }
+}
+
+/// A stage thread tracks two intervals: how long it has existed, and how long it
+/// has been parked on backpressure. One slot holds both, so the pair cannot
+/// drift out of correspondence the way two separate registries could.
+struct StageLedger {
+    IntervalLedger live;
+    IntervalLedger park;
+};
+
+template <typename Ledger>
+struct LedgerRegistry {
+    std::mutex mutex;
+    // Deque, not vector: the sampler and the owning thread both hold references
+    // into this, and a vector would invalidate them on growth.
+    std::deque<Ledger> ledgers;
+    // Slots whose thread has exited, available for reuse. Pool threads never
+    // retire so their registry never uses this. Stage threads are spawned per
+    // staged breaker per query, and without reuse a long REPL session would
+    // accumulate one slot per breaker ever executed.
+    std::vector<Ledger*> free;
+};
+
+/// Never destroyed, for the same reason `process_worker_pool_state` is not: a
+/// runtime thread may outlive static destruction on a host that unloads the
+/// library, and it writes to its ledger on every park.
+template <typename Ledger>
+auto ledger_registry() -> LedgerRegistry<Ledger>& {
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    static auto* registry = new LedgerRegistry<Ledger>();
+    return *registry;
+}
+
+template <typename Ledger>
+auto acquire_ledger() -> Ledger& {
+    auto& registry = ledger_registry<Ledger>();
+    const std::lock_guard lock(registry.mutex);
+    if (!registry.free.empty()) {
+        Ledger* reused = registry.free.back();
+        registry.free.pop_back();
+        // Deliberately NOT reset. `idle_between` reads a slot's `closed_ns` as a
+        // delta across the window, so zeroing it on reuse would make that delta
+        // underflow and silently drop the reused slot's time. A slot stands for
+        // "some thread of this species", not one particular thread, and for a
+        // SUM that is all the identity needed.
+        return *reused;
+    }
+    return registry.ledgers.emplace_back();
+}
+
+template <typename Ledger>
+void release_ledger(Ledger& ledger) {
+    auto& registry = ledger_registry<Ledger>();
+    const std::lock_guard lock(registry.mutex);
+    registry.free.push_back(&ledger);
+}
+
+/// Read every slot's `project(slot)` interval into a sample.
+template <typename Ledger, typename Project>
+[[nodiscard]] auto sample_ledgers(Project project) -> IdleSample {
+    IdleSample sample;
     sample.at_ns = steady_ns();
-    auto& registry = idle_registry();
+    auto& registry = ledger_registry<Ledger>();
     const std::lock_guard lock(registry.mutex);
     sample.threads.reserve(registry.ledgers.size());
-    for (const auto& ledger : registry.ledgers) {
+    for (const auto& slot : registry.ledgers) {
+        const IntervalLedger& ledger = project(slot);
         sample.threads.emplace_back(ledger.closed_ns.load(std::memory_order_relaxed),
-                                    ledger.park_start_ns.load(std::memory_order_relaxed));
+                                    ledger.open_since_ns.load(std::memory_order_relaxed));
     }
     return sample;
 }
 
-auto pool_idle_between(const PoolIdleSample& begin, const PoolIdleSample& end)
-    -> std::chrono::nanoseconds {
+/// This stage thread's slot, or null off a stage thread. Host TU rather than an
+/// inline header variable, same RTLD_LOCAL reason as `t_on_stage_thread`.
+thread_local StageLedger* t_stage_ledger = nullptr;
+
+}  // namespace
+
+auto sample_pool_idle() -> IdleSample {
+    return sample_ledgers<IntervalLedger>(
+        [](const IntervalLedger& ledger) -> const IntervalLedger& { return ledger; });
+}
+
+auto sample_stage_park() -> IdleSample {
+    return sample_ledgers<StageLedger>(
+        [](const StageLedger& slot) -> const IntervalLedger& { return slot.park; });
+}
+
+auto sample_stage_live() -> IdleSample {
+    return sample_ledgers<StageLedger>(
+        [](const StageLedger& slot) -> const IntervalLedger& { return slot.live; });
+}
+
+void stage_park_begin() noexcept {
+    if (t_stage_ledger != nullptr) {
+        interval_open(t_stage_ledger->park);
+    }
+}
+
+void stage_park_end() noexcept {
+    if (t_stage_ledger != nullptr) {
+        interval_close(t_stage_ledger->park);
+    }
+}
+
+auto idle_between(const IdleSample& begin, const IdleSample& end) -> std::chrono::nanoseconds {
     std::uint64_t total = 0;
     for (std::size_t i = 0; i < end.threads.size(); ++i) {
         const auto [closed_end, start_end] = end.threads[i];
@@ -238,6 +313,8 @@ auto on_stage_thread() noexcept -> bool {
 
 StageThreadScope::StageThreadScope() noexcept {
     t_on_stage_thread = true;
+    t_stage_ledger = &acquire_ledger<StageLedger>();
+    interval_open(t_stage_ledger->live);
     const std::size_t live = g_stage_threads_live.fetch_add(1, std::memory_order_relaxed) + 1;
     // Raise the peak monotonically. A plain `store(max)` would race two threads
     // starting at once into losing one of the increments.
@@ -248,6 +325,22 @@ StageThreadScope::StageThreadScope() noexcept {
 }
 
 StageThreadScope::~StageThreadScope() {
+    if (t_stage_ledger != nullptr) {
+        // Closing the park here is defence, not a live path: every park site
+        // opens its interval through a stack-scoped `RingWaitScope`, whose
+        // destructor closes it on the cancelled path as well as the normal one.
+        // Deleting this line therefore breaks no test, which was verified rather
+        // than assumed. It stays because the cost is one relaxed exchange at
+        // thread exit and the failure it guards against is silent and
+        // cumulative: a slot released with its park still open reads as parked
+        // forever, inflating every later query's window with time no thread
+        // spent. A future park site that forgets its scope should not be able to
+        // corrupt an unrelated measurement.
+        interval_close(t_stage_ledger->park);
+        interval_close(t_stage_ledger->live);
+        release_ledger(*t_stage_ledger);
+        t_stage_ledger = nullptr;
+    }
     g_stage_threads_live.fetch_sub(1, std::memory_order_relaxed);
     t_on_stage_thread = false;
 }
@@ -260,7 +353,7 @@ WorkerPool::WorkerPool(std::size_t threads)
     : impl_(std::make_unique<Impl>()), threads_(threads == 0 ? 1 : threads) {
     impl_->threads.reserve(threads_);
     for (std::size_t i = 0; i < threads_; ++i) {
-        impl_->threads.emplace_back([this, &ledger = new_idle_ledger()] {
+        impl_->threads.emplace_back([this, &ledger = acquire_ledger<IntervalLedger>()] {
             t_on_pool_thread = true;
             while (true) {
                 Task task;
@@ -271,12 +364,9 @@ WorkerPool::WorkerPool(std::size_t threads)
                     // predicate is true on entry and this costs one branch, which
                     // matters because taking a task is the pool's hot path.
                     if (!ready()) {
-                        ledger.park_start_ns.store(steady_ns(), std::memory_order_relaxed);
+                        interval_open(ledger);
                         impl_->work.wait(lock, ready);
-                        const auto started =
-                            ledger.park_start_ns.exchange(0, std::memory_order_relaxed);
-                        ledger.closed_ns.fetch_add(steady_ns() - started,
-                                                   std::memory_order_relaxed);
+                        interval_close(ledger);
                     }
                     if (impl_->stopping && impl_->queue.empty()) {
                         return;

@@ -743,6 +743,46 @@ could not: **q02 is 97.1% empty, q16 85.1%, q22 89.5%** — the small queries ar
 running almost entirely on one thread — while q06, the most parallel query in the
 suite, is still 38.8% empty. Nothing here is anywhere near saturating the pool.
 
+### The other thread species: stage producers
+
+The pool is one of two kinds of runtime thread, and the same question applies to
+the other. A `PipelinedStageOperator`'s producer is long-lived and blocks on
+another thread's progress, so it cannot live in the pool — and having its own
+thread meant having its own accounting hole. `stage_self_ms` measured its work;
+nothing measured its idle.
+
+It parks on **two different rings**, and the distinction turns out to be the
+whole story:
+
+| | ms | |
+|---|---|---|
+| stage thread lifetime (`stage_live_ms`) | 184.4 | 100% |
+| — producing (`stage_self_ms`) | 107.1 | 58.1% |
+| — parked on its CHILD's ring (`stage_ring_wait_ms`) | 77.1 | 41.8% |
+| — parked on its OWN output ring (`stage_park_ms`) | **0.0** | **0.0%** |
+
+**Closure: 99.9%.**
+
+The two need opposite treatment, which is why conflating them showed up
+immediately. A park on the child's ring happens *inside* the producer's profile
+scope, so it is already inside `stage_self_ms` and has to be **subtracted**, like
+every other park. A park on its own output ring happens between pulls, outside
+every scope, so it has to be **added** from the ledger. The first version of this
+measurement added both, and the stage accounting closed at **144%** with
+`stage_self_ms` equal to `stage_live_ms` to one decimal — an over-100% closure
+is what caught it, which is the argument for printing the denominator at all.
+
+**`stage_park_ms` is 0.0 on all 22 queries.** A producer never once filled its
+ring and waited for the consumer to drain it. Combined with `pool_idle_ms == 0.0`
+this is the same result from a third angle: *nothing in this engine is ever
+blocked by a downstream consumer being too slow.* Every ring in the system runs
+dry, never full. The producers are the bottleneck, everywhere, without exception.
+
+And it revises the producer's own numbers: what was reported as 178ms of producer
+work is really **107ms of work and 77ms of waiting on its child**. 42% of stage
+thread lifetime is inherited idle, passed up from a scan that cannot fill the ring
+fast enough.
+
 ### What the zero tells us
 
 `pool_idle_ms == 0.0` everywhere is the useful negative result: workers never run

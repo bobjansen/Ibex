@@ -11291,6 +11291,13 @@ class PipelinedStageOperator final : public Operator {
             while (true) {
                 {
                     std::unique_lock lock(mutex_);
+                    // Backpressure: the producer has filled the ring and the
+                    // consumer has not drained it. Idle time on a runtime-owned
+                    // thread, and the mirror image of the consumer's park at the
+                    // other end of the same ring — a large value here means the
+                    // CONSUMER is the bottleneck. `RingWaitScope` routes it to
+                    // this thread's stage ledger.
+                    const RingWaitScope ring_wait;
                     space_.wait(lock,
                                 [this] { return cancelled_ || ready_chunks_.size() < kCapacity; });
                     if (cancelled_) {

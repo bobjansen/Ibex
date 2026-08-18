@@ -402,3 +402,44 @@ TEST_CASE("worker time is attributed before the batch is settled", "[runtime][pr
 }
 
 }  // namespace
+
+TEST_CASE("a stage thread's two kinds of ring park are told apart", "[runtime][profile]") {
+    // A producer parks on two different rings and they need opposite treatment.
+    // Parking on its CHILD's ring happens inside its own profile scope, so that
+    // time is already in `stage_self_ns` and must be subtracted; parking on its
+    // OWN output ring happens between pulls, outside every scope, and must be
+    // added from the thread's ledger. Counting both the same way made the stage
+    // accounting close at 144% — which is how this was found.
+    auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/1,
+                                                                    /*report=*/false);
+    auto* entry = profile->stage("child ring park");
+    constexpr auto kPark = std::chrono::milliseconds(40);
+
+    const auto park_begin = runtime::sample_stage_park();
+    std::thread producer([&] {
+        const runtime::StageThreadScope stage_thread;
+        // Inside a scope: this is the "waiting on my child" case.
+        const runtime::ExecutionProfileScope scope(entry, runtime::ProfilePhase::Next);
+        const runtime::RingWaitScope ring_wait;
+        std::this_thread::sleep_for(kPark);
+    });
+    producer.join();
+
+    const auto rows = profile->snapshot();
+    const auto it =
+        std::ranges::find_if(rows, [](const auto& row) { return row.label == "child ring park"; });
+    REQUIRE(it != rows.end());
+
+    const auto park_ns = std::chrono::nanoseconds(kPark).count();
+    // Charged to the operator, as idle inside its scope...
+    CHECK(static_cast<long long>(it->stage_ring_wait_ns) >= park_ns * 9 / 10);
+    CHECK(static_cast<long long>(it->stage_self_ns) >= park_ns * 9 / 10);
+    // ...and NOT to the ledger, which would double-count it.
+    CHECK(runtime::idle_between(park_begin, runtime::sample_stage_park()).count() < park_ns / 10);
+
+    // The summary nets it out, so a producer that spent its whole life waiting
+    // on its child reports no producer work.
+    const auto summary = summarize_execution_profile(rows, /*wall_ms=*/100.0, /*workers=*/1);
+    CHECK(summary.stage_ring_wait_ms >= static_cast<double>(park_ns) / 1.0e6 * 0.9);
+    CHECK(summary.stage_self_ms < static_cast<double>(park_ns) / 1.0e6 * 0.1);
+}

@@ -154,40 +154,65 @@ class StageThreadScope {
 /// time a query's profile prints, its stage threads have exited.
 [[nodiscard]] auto stage_thread_peak() noexcept -> std::size_t;
 
-/// A reading of every pool thread's park ledger at one instant.
+/// A reading, at one instant, of how long each runtime thread has spent inside
+/// some state — parked with an empty queue, parked on backpressure, or merely
+/// alive.
 ///
-/// The missing term in the profile's accounting. `pool_work_ms` says how long
-/// workers spent working and `pool_idle_ms` how long they spent parked on ring
-/// BACKPRESSURE, but neither sees a thread parked because the queue was simply
-/// EMPTY — which is most of the machine, and which no operator can be charged
-/// for, since an empty pool belongs to no operator. Sampling at query start and
-/// end attributes it to the query instead.
+/// This is how the profile accounts for time that belongs to no operator.
+/// `pool_work_ms` says how long workers spent working and `pool_idle_ms` how
+/// long they spent parked on ring BACKPRESSURE, but neither sees a thread parked
+/// because the queue was simply EMPTY — which is most of the machine, and which
+/// no operator can be charged for, since an empty pool belongs to nobody.
+/// Sampling at query start and end attributes it to the query instead.
 ///
 /// Sampled rather than accumulated because the interesting case is a thread that
-/// parks before the query and is still parked when it ends: it never wakes, so
-/// it never gets the chance to add anything to a counter. `park_start_ns` is
-/// what lets `pool_idle_between` clip that still-open park to the window.
-struct PoolIdleSample {
+/// enters the state before the query and is still in it when the query ends: it
+/// never leaves, so it never gets the chance to add anything to a counter. The
+/// open interval's start is what lets `idle_between` clip it to the window.
+struct IdleSample {
     /// `steady_clock` reading when the sample was taken.
     std::uint64_t at_ns = 0;
-    /// Per thread: `{park time already closed, current park start or 0}`.
+    /// Per thread: `{time already closed, current interval's start or 0}`.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> threads;
 };
 
-/// Read every pool thread's park ledger. Cheap (one mutex, no clock per thread)
-/// and safe to call at any time, including before the pool exists.
-[[nodiscard]] auto sample_pool_idle() -> PoolIdleSample;
-
-/// Total thread-time pool threads spent parked with NOTHING QUEUED between two
-/// samples, clipped to the window at both ends.
+/// Total thread-time inside the sampled state between two samples, clipped to
+/// the window at both ends.
 ///
-/// Threads that appear only in `end` (the pool grew, or was created mid-window)
-/// are counted from zero. The pairs are read without a lock held across both
-/// fields, so a park that closes between the two reads can be miscounted by at
-/// most its own length, once per thread per sample — irrelevant against a window
-/// of whole milliseconds, and never a systematic bias in one direction.
-[[nodiscard]] auto pool_idle_between(const PoolIdleSample& begin, const PoolIdleSample& end)
+/// Threads that appear only in `end` (the pool grew, a stage thread was spawned
+/// mid-window) are counted from zero. The pairs are read without a lock held
+/// across both fields, so an interval that closes between the two reads can be
+/// miscounted by at most its own length, once per thread per sample —
+/// irrelevant against a window of whole milliseconds, and never a systematic
+/// bias in one direction.
+[[nodiscard]] auto idle_between(const IdleSample& begin, const IdleSample& end)
     -> std::chrono::nanoseconds;
+
+/// Pool threads parked with NOTHING QUEUED. Cheap (one mutex, no clock per
+/// thread) and safe to call at any time, including before the pool exists.
+[[nodiscard]] auto sample_pool_idle() -> IdleSample;
+
+/// Stage threads parked on ring BACKPRESSURE — a producer that has run ahead of
+/// its consumer and has nowhere to put the next chunk.
+///
+/// The pool's equivalent is `pool_idle_ms`, which `run_task` subtracts from
+/// worker time. A stage thread has no `run_task` to subtract it from: its park
+/// sits outside every profile scope, so before this it was not miscounted, it
+/// was simply absent. Two thread species, two accounting paths, and the second
+/// one was missing.
+[[nodiscard]] auto sample_stage_park() -> IdleSample;
+
+/// Stage threads merely EXISTING. The denominator for the other two stage
+/// numbers: a stage thread's lifetime is its work plus its backpressure park, so
+/// `stage_self_ms + stage_park_ms` should exhaust `stage_live_ms`, and the
+/// profile prints all three so that it can be seen not to.
+[[nodiscard]] auto sample_stage_live() -> IdleSample;
+
+/// Open/close the calling thread's backpressure-park interval. No-ops off a
+/// stage thread, so a caller that may run on any thread — `RingWaitScope` — can
+/// call them unconditionally.
+void stage_park_begin() noexcept;
+void stage_park_end() noexcept;
 
 /// Thread budget for compute, from `IBEX_CORES`. Unset or `auto` means
 /// `std::thread::hardware_concurrency()`; an explicit count is used as given;

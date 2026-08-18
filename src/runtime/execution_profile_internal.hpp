@@ -37,6 +37,7 @@ struct ExecutionProfileSnapshotRow {
     std::uint64_t barrier_wait_ns = 0;
     std::uint64_t stage_self_ns = 0;
     std::uint64_t ring_wait_ns = 0;
+    std::uint64_t stage_ring_wait_ns = 0;
     std::uint64_t pool_idle_ns = 0;
 };
 
@@ -107,6 +108,11 @@ struct ExecutionProfileSummary {
     /// number used to be silently folded into `serial_self_ms`, which is what
     /// made `self_ms` exceed `wall_ms` on a query that stages a breaker.
     double stage_self_ms = 0.0;
+    /// Stage-thread time parked on a CHILD's ring, already subtracted from
+    /// `stage_self_ms`. Distinct from the producer's own-output backpressure
+    /// park, which has no enclosing scope and is measured by ledger sampling
+    /// (`sample_stage_park`) rather than counted here.
+    double stage_ring_wait_ms = 0.0;
     /// Whole-query occupancy: `pool_work_ms / (wall_ms * workers)`.
     double occupancy = 0.0;
 };
@@ -215,6 +221,7 @@ class RingWaitScope {
    private:
     ExecutionProfileEntry* entry_ = nullptr;
     bool pool_ = false;
+    bool stage_ = false;
     std::chrono::steady_clock::time_point start_;
 };
 

@@ -49,6 +49,10 @@ struct ExecutionProfileEntry {
     std::atomic<std::uint64_t> stage_self_ns{0};
     /// Calling-thread time parked on a pipeline ring. See `RingWaitScope`.
     std::atomic<std::uint64_t> ring_wait_ns{0};
+    /// STAGE-thread time parked on this operator's child ring — idle inside
+    /// `stage_self_ns`, and subtracted from it for the same reason
+    /// `ring_wait_ns` is subtracted from `next_self_ns`.
+    std::atomic<std::uint64_t> stage_ring_wait_ns{0};
     std::atomic<std::uint64_t> pool_idle_ns{0};
 };
 
@@ -60,7 +64,12 @@ struct ExecutionProfileState::Impl {
     // Baseline for "pool threads parked with nothing queued". Taken at
     // construction so the window is the query's, not the process's — between
     // queries the whole pool is parked, and that idle belongs to nobody.
-    PoolIdleSample pool_idle_begin = sample_pool_idle();
+    IdleSample pool_idle_begin = sample_pool_idle();
+    // The stage thread's two intervals. `live` is the denominator: a stage
+    // thread's existence is its work plus its backpressure park, so
+    // `stage_self_ms + stage_park_ms` should exhaust `stage_live_ms`.
+    IdleSample stage_park_begin_sample = sample_stage_park();
+    IdleSample stage_live_begin_sample = sample_stage_live();
     std::size_t worker_budget = 1;
     bool report = true;
     mutable std::mutex mutex;
@@ -266,23 +275,31 @@ ExecutionProfileState::~ExecutionProfileState() {
     // work + backpressure + unqueued should exhaust it. A shortfall means a
     // fourth bucket nothing is measuring — which this profiler has had four
     // times already, so the closure is printed rather than assumed.
-    const double pool_unqueued_ms =
-        static_cast<double>(pool_idle_between(impl_->pool_idle_begin, sample_pool_idle()).count()) /
-        1.0e6;
+    const auto window_ms = [](const IdleSample& begin, const IdleSample& end) {
+        return static_cast<double>(idle_between(begin, end).count()) / 1.0e6;
+    };
+    const double pool_unqueued_ms = window_ms(impl_->pool_idle_begin, sample_pool_idle());
     const double pool_capacity_ms = total_ms * static_cast<double>(pool_threads);
-    ibex::formatting::print(stderr,
-                            "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
-                            "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
-                            "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
-                            "pool_work_ms={:.3f} pool_idle_ms={:.3f} pool_unqueued_ms={:.3f} "
-                            "pool_capacity_ms={:.3f} occupancy={:.3f} "
-                            "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f}\n",
-                            total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
-                            summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
-                            summary.barrier_wait_ms, summary.ring_wait_ms, summary.pool_work_ms,
-                            summary.pool_idle_ms, pool_unqueued_ms, pool_capacity_ms,
-                            summary.occupancy, pool_threads, stage_thread_peak(),
-                            summary.stage_self_ms);
+    // The stage thread's own accounting, on the same closure principle: a
+    // producer's park had no home at all before this — it sits outside every
+    // profile scope, so unlike a worker's park there was nothing to subtract it
+    // from. `stage_live_ms` is what makes the other two checkable.
+    const double stage_park_ms = window_ms(impl_->stage_park_begin_sample, sample_stage_park());
+    const double stage_live_ms = window_ms(impl_->stage_live_begin_sample, sample_stage_live());
+    ibex::formatting::print(
+        stderr,
+        "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
+        "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
+        "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
+        "pool_work_ms={:.3f} pool_idle_ms={:.3f} pool_unqueued_ms={:.3f} "
+        "pool_capacity_ms={:.3f} occupancy={:.3f} "
+        "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f} "
+        "stage_park_ms={:.3f} stage_ring_wait_ms={:.3f} stage_live_ms={:.3f}\n",
+        total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
+        summary.serial_fraction, summary.amdahl_ceiling, summary.barriers, summary.barrier_wait_ms,
+        summary.ring_wait_ms, summary.pool_work_ms, summary.pool_idle_ms, pool_unqueued_ms,
+        pool_capacity_ms, summary.occupancy, pool_threads, stage_thread_peak(),
+        summary.stage_self_ms, stage_park_ms, summary.stage_ring_wait_ms, stage_live_ms);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);
@@ -334,6 +351,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     std::uint64_t barrier_total = 0;
     std::uint64_t stage_total_ns = 0;
     std::uint64_t ring_wait_total_ns = 0;
+    std::uint64_t stage_ring_wait_total_ns = 0;
     std::uint64_t pool_idle_total_ns = 0;
     for (const auto& row : rows) {
         // `pool_next_ns`/`pool_source_ns` are excluded from `self` on purpose,
@@ -365,7 +383,11 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
         barrier_wait_total_ns += parked_barrier;
         ring_wait_total_ns += parked_ring;
         barrier_total += row.barriers;
-        stage_total_ns += row.stage_self_ns;
+        // A stage thread parked on its child's ring is idle INSIDE its own
+        // scope, so subtract it here rather than reporting it as producer work.
+        const std::uint64_t stage_parked = std::min(row.stage_ring_wait_ns, row.stage_self_ns);
+        stage_total_ns += row.stage_self_ns - stage_parked;
+        stage_ring_wait_total_ns += stage_parked;
         serial_self_ns += self - parked_barrier - parked_ring;
     }
     ExecutionProfileSummary summary;
@@ -376,6 +398,7 @@ auto summarize_execution_profile(const std::vector<ExecutionProfileSnapshotRow>&
     summary.barriers = barrier_total;
     summary.stage_self_ms = static_cast<double>(stage_total_ns) / 1.0e6;
     summary.ring_wait_ms = static_cast<double>(ring_wait_total_ns) / 1.0e6;
+    summary.stage_ring_wait_ms = static_cast<double>(stage_ring_wait_total_ns) / 1.0e6;
     summary.pool_idle_ms = static_cast<double>(pool_idle_total_ns) / 1.0e6;
     summary.serial_fraction = self_total_ns == 0 ? 0.0
                                                  : static_cast<double>(serial_self_ns) /
@@ -427,6 +450,7 @@ auto ExecutionProfileState::snapshot() const -> std::vector<ExecutionProfileSnap
             .barrier_wait_ns = row->barrier_wait_ns.load(std::memory_order_relaxed),
             .stage_self_ns = row->stage_self_ns.load(std::memory_order_relaxed),
             .ring_wait_ns = row->ring_wait_ns.load(std::memory_order_relaxed),
+            .stage_ring_wait_ns = row->stage_ring_wait_ns.load(std::memory_order_relaxed),
             .pool_idle_ns = row->pool_idle_ns.load(std::memory_order_relaxed),
         });
     }
@@ -549,17 +573,42 @@ void record_execution_profile_barrier(ExecutionProfileEntry* entry) noexcept {
 }
 
 RingWaitScope::RingWaitScope() noexcept
-    : entry_(on_stage_thread() ? nullptr : current_execution_profile_entry()),
+    : entry_(current_execution_profile_entry()),
       pool_(on_worker_pool_thread()),
-      start_((entry_ == nullptr && !pool_) ? std::chrono::steady_clock::time_point{}
-                                           : std::chrono::steady_clock::now()) {}
+      stage_(on_stage_thread()),
+      start_(std::chrono::steady_clock::now()) {
+    // A stage thread parks on two different rings, and they need opposite
+    // treatment. Which one this is, is decided by whether a profile frame is
+    // active:
+    //
+    //  * No frame — the producer parked on backpressure from its OWN output
+    //    ring, between pulls, outside every scope. Nothing contains it, so it
+    //    goes to the thread's ledger. This is the case the ledger exists for:
+    //    the producer can sit here for an entire query without waking.
+    //
+    //  * A frame — the producer is inside `child_->next()` and parked on ITS
+    //    CHILD's ring. That time is already inside the enclosing scope and so
+    //    already in `stage_self_ns`; recording it to the ledger as well counted
+    //    it twice, which is exactly how it was found (stage closure read 144%,
+    //    with `stage_self_ms` equal to `stage_live_ms` to one decimal). It is a
+    //    subset, so like every other park it gets subtracted, not added.
+    if (stage_ && entry_ == nullptr) {
+        stage_park_begin();
+    }
+}
 
 RingWaitScope::~RingWaitScope() {
-    if (entry_ == nullptr && !pool_) {
-        return;
-    }
     const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start_);
+    if (stage_) {
+        if (entry_ == nullptr) {
+            stage_park_end();
+        } else if (elapsed.count() > 0) {
+            entry_->stage_ring_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                                 std::memory_order_relaxed);
+        }
+        return;
+    }
     if (elapsed.count() <= 0) {
         return;
     }
@@ -569,8 +618,10 @@ RingWaitScope::~RingWaitScope() {
         add_pool_park_ns(elapsed);
         return;
     }
-    entry_->ring_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
-                                   std::memory_order_relaxed);
+    if (entry_ != nullptr) {
+        entry_->ring_wait_ns.fetch_add(static_cast<std::uint64_t>(elapsed.count()),
+                                       std::memory_order_relaxed);
+    }
 }
 
 void add_pool_park_ns(std::chrono::nanoseconds elapsed) noexcept {

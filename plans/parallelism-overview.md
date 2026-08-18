@@ -334,9 +334,9 @@ Parallel coverage in the reimplemented set differs sharply:
 | Operator | whole-table | chunked |
 |---|---|---|
 | Aggregate | per-group reduce only (`aggregate.cpp:1157`) | partitioned discovery + partial pre-aggregation + parallel emit + parallel slot fill |
-| Filter | bounds scan parallel; **gather serial** (`filter.cpp:3354` passes no `exec`) | two-phase parallel gather |
+| Filter | bounds scan parallel; gather now parallel (I5) | two-phase parallel gather |
 | Join | parallel probe (`join.cpp:1167`) | parallel probe + parallel concat + swapped-probe replay |
-| Distinct | serial | packed-key partitioned |
+| ~~Distinct~~ | ~~serial~~ | **collapsed — one implementation** |
 
 A fix applied to one side routinely does not exist on the other. I15 is the
 worked example: it had to be written into both engines, and doing only
@@ -355,6 +355,55 @@ The duplication tax on the task-scheduler work is avoidable without doing any
 of this first: port the chunked operators to the new primitive and leave the
 whole-table fallbacks on the old one. They are fallbacks, so lagging costs
 correctness nothing and measurable performance almost nothing.
+
+#### Second correction: how narrow the fallback actually is
+
+The entry above already corrected one wrong claim (that the entry point picks
+the engine). Doing the first collapse turned up a second thing this entry got
+wrong, in the same direction — the whole-table path is even less reachable than
+"an `interpret_node` fallback" suggests.
+
+**The whole-table functions run only for a subtree beneath a declined node
+within a single statement.** A `let` materializes, so in
+
+```
+let d = t[distinct { g, v }];
+d[select { m = median(v) }];      // aggregate declines...
+```
+
+the aggregate's child is a `Scan`, not a `Distinct`, and no whole-table
+`distinct` ever runs. Written as one statement it does:
+
+```
+t[distinct { g, v }][select { m = median(v) }];
+```
+
+This was not deduced, it was measured: a mutation making `distinct_table` return
+an error outright did **not** fire on the first shape. Which means a test written
+the natural way — bind, then aggregate — verifies nothing at all while appearing
+to pass. Any future collapse needs its coverage written as a single statement,
+and mutation-checked, or it is testing the operator it already had.
+
+It also lowers I4's remaining urgency another notch. The duplicate
+implementations are not just off the hot path; they are off almost every path.
+This is cleanup and a drift hazard, not latent performance.
+
+#### Progress
+
+**Distinct — COLLAPSED** (`74f6e32`). `interpreter.cpp`'s serial dedup loop
+boxed a `Key` per row; `ChunkedDistinctOperator` has single-column and
+packed-key fast paths. `distinct_table` keeps the whole-table signature and
+delegates: `make_table_source` -> the operator -> `materialize_operator`.
+
+Metadata was checkable rather than assumed: `distinct` is a `RowTransform::
+Subset` keeping every column, and `Subset` "derives exactly like `Preserve`", so
+the deleted `distinct_properties` was the identity the operator already relies on
+by passing properties through. Added the first coverage this path has ever had.
+
+Remaining, in order: **inner join**, **the sort's radix fast path**, then
+**aggregate** — the last one only once the chunked aggregate covers Median and
+quantile, since collapsing removes the decline-and-fall-back path that lets the
+streaming engine be incomplete.
 
 **I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
 serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked
@@ -482,13 +531,17 @@ thread*. That made `self_ms` exceed `wall_ms` on exactly the queries with
 decision is read from — by 79ms across PDS-H SF-1 (884.0 -> 805.0 once
 `stage_self_ns` was split out). Fixed.
 
-**What remains** is the design question, and it belongs to the scheduler: the two
-species should be explicit in the primitive, not one on the books and one beside
-it. Go hands off the M on a blocking syscall; Tokio keeps a separate
-`spawn_blocking` pool. A scheduler that models only CPU-bound fork-join will get
-retrofitted with another untracked thread, so this is an INPUT to item 6 rather
-than something it absorbs. (`stream_buffered.hpp` also detaches a thread, for the
-kafka/ws sources; left alone, as it is not part of a profiled query plan.)
+**What remains** is the design question: the two species should be explicit in
+the primitive, not one on the books and one beside it. Go hands off the M on a
+blocking syscall; Tokio keeps a separate `spawn_blocking` pool.
+
+This was filed as an INPUT to the scheduler track. With that track dropped, it
+stands on its own — and it shrank, because the accounting gap that motivated
+half of it is closed: a stage thread's lifetime, its work, and both kinds of
+park it can take are now measured, and they balance to 99.9%. What is left is
+ergonomics rather than a blind spot. (`stream_buffered.hpp` also detaches a
+thread, for the kafka/ws sources; left alone, as it is not part of a profiled
+query plan.)
 
 **I13 — Cancellation reaches islands and scan pipelines, not intra-operator
 fan-outs** (medium). `interrupt_requested()` appears in
@@ -571,15 +624,16 @@ other half"; the build side remains unthreaded on purpose.
 
 ## Suggested order of attack
 
-Sequenced against the one larger track, a real task scheduler. (A second track
-— weakening first-occurrence group ordering — was considered and REJECTED; see
-item 6.) Roughly half of Part 2 — **I6, I9, I10,
-I11, I12, I14**, and parts of **I7** and **I13** — encodes the cost of a
-fork–join round trip and a barrier, so a task scheduler where submitting is
-cheap and joining does not park a thread rewrites the physics behind those
-numbers. Leave them for the scheduler rather than harmonizing an answer to a
-question that is about to change. The items below are the ones it does not
-touch.
+This list was originally sequenced against one larger track, a real task
+scheduler, with roughly half of Part 2 — **I6, I9, I10, I11, I12, I14**, and
+parts of **I7** and **I13** — deferred to it on the grounds that a scheduler
+where submitting is cheap and joining does not park a thread would rewrite the
+physics behind those numbers.
+
+**That track is now dropped** (item 7), so those items are no longer waiting on
+anything. They are still low priority, but for the ordinary reason — they are
+small — rather than because a rewrite is coming. (A second track — weakening
+first-occurrence group ordering — was considered and REJECTED; see below.)
 
 1. ~~**I8** — move `IBEX_JOIN_PROBE` / `IBEX_STREAM_SCAN` into
    `ExecutionContext`.~~ **Done.** Small, and it restores the "single authority"
@@ -596,34 +650,47 @@ touch.
    (column x range) task shape.~~ **Done**, in both engines, via a shared
    `gather_columns_batched`. It needed doing twice, which is itself an argument
    for the next item.
-4. **Instrument the barriers.** Barrier count and inter-barrier serial time,
-   with `batch.wait()` excluded from operator self-time. Small, and it re-prices
-   everything after it: the scheduler's whole value proposition is "threads idle
-   at barriers", and the current profiler cannot distinguish that from a residue
-   of genuinely serial algorithms (prefix sums, first-occurrence merges, slot
-   growth) — `self_ms` counts the wait. Do this before committing to item 6.
-5. **Instrument first, then decide how much the scheduler is worth.** Item 4
-   gives a number per operator; run it across the PDS-H suite before committing
-   to item 6. The reclaimable share is the `barrier_wait_ms` column, not the
-   whole serial residue, and on the first sample it was the minority.
-6. **The task scheduler** — per-thread queues, work stealing, and a `join` that
-   participates in the queue instead of parking a thread. This is the
-   structural lever: it retires the `on_worker_pool_thread() -> serial` cliff,
-   the `PipelinedStageOperator` raw thread, and intra-batch load imbalance at
-   once, and it absorbs the deferred half of Part 2. Land it as a NEW primitive
-   the existing `submit`/`wait` sites port to incrementally — the byte-identity
-   contract is what makes that refactor safe. Port the chunked operators; leave
-   the whole-table fallbacks on the old primitive.
-7. **I4** — collapse the duplicated implementations, keeping the whole-table
-   signatures. After the scheduler, because it turned out to be internal
-   hygiene rather than a user-facing gap, and because its tax on the scheduler
-   is avoidable (item 6). Order within it is set by completeness:
-   distinct / inner join / sort's radix path, then the aggregate once the
-   chunked one covers Median and quantile.
-8. **I2 + I3** — the type exclusions and the missing multi-Categorical
-   partitioned discovery, once there is a shared predicate to hang them on.
-9. **Elide the first-occurrence merge when nothing downstream reads the order**
-   — see below. Small, and last, because it is worth less than it looks.
+4. ~~**Instrument the barriers.**~~ **Done.** Barrier count, barrier wait, ring
+   wait, stage self-time, worker backpressure park.
+5. ~~**Run the counters across PDS-H and price the scheduler.**~~ **Done**, and
+   it answered the question in the negative — see the measured section above.
+6. ~~**Close the accounting.**~~ **Done.** Pool threads parked with an empty
+   queue (`6350918`) and stage producers (`8f3b6d8`). Closure is 99.6% on the
+   pool and 99.9% on stage threads, so no further instrumentation is warranted
+   and none is planned. The stage work found and fixed a double-count that an
+   over-100% closure exposed.
+7. ~~**The task scheduler.**~~ **DROPPED.** Demoted four times and now refused
+   outright, on measurement rather than inference. `pool_idle_ms` and
+   `stage_park_ms` are both 0.0 across all 22 queries while 68.6% of the pool
+   sits with nothing queued: no thread is ever blocked behind another's work, so
+   there is nothing for stealing to steal. A scheduler redistributes
+   parallelism; it does not manufacture it. Revisit only if a future change
+   raises occupancy far enough that queues actually build.
+8. **I4** — collapse the duplicated implementations, keeping the whole-table
+   signatures. **Promoted** from after the scheduler, since there is no longer a
+   scheduler to come after — and it is the gate on item 9, because the aggregate
+   cannot be parallelized further while four grouping implementations disagree
+   about which one runs. Order within it is set by completeness:
+   ~~distinct~~ (done, `74f6e32`) / inner join / sort's radix path, then the
+   aggregate once the chunked one covers Median and quantile.
+9. **Create parallel work, targeted at the five queries holding half the idle
+   machine.** q13, q21, q18, q10, q20 account for 3113 of 6486ms of unqueued
+   pool time — 48% of the waste in 22.7% of the queries. Attack per operator,
+   biggest first: the aggregate (q13/q18/q10, gated on item 8), then join
+   `assemble_output` (q21/q20/q09), then intra-operator fan-out for the 1:1
+   operators. This replaces the scheduler as the structural lever.
+10. **I2 + I3** — the type exclusions and the missing multi-Categorical
+    partitioned discovery, once there is a shared predicate to hang them on.
+11. **Elide the first-occurrence merge when nothing downstream reads the order**
+    — see below. Small, and last, because it is worth less than it looks.
+
+### Open structural question
+
+Every ring in the engine runs dry and none ever runs full — producers park on a
+child's ring for 42% of their lifetime and on their own output ring for 0.0ms.
+So ring *depth* is irrelevant and producer *count* is the constraint. Worth
+settling whether a staged breaker should have several producers before tuning
+any single operator inside one.
 
 ---
 

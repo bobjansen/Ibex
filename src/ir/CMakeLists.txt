@@ -16,6 +16,7 @@ add_library(ibex_ir STATIC
     nullability.cpp
     optimizer.cpp
     pending_order.cpp
+    predicate_pushdown_pass.cpp
     required_columns.cpp
     column_origins.cpp
     group_key_reduction.cpp

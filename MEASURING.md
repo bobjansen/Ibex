@@ -164,6 +164,102 @@ Rscript benchmarking/bench_r.R --csv ...          # R needs no wrapper
 framework. They are **deliberately not run** as a routine step — do not reach
 for them unless the task is explicitly "publish new numbers".
 
+### Profiling the whole suite
+
+`benchmarking/profile_suite.py` sums the per-statement profile across all 22
+queries and prints the closure columns. Every accounting table in
+`plans/parallelism-overview.md` came from it.
+
+```bash
+python3 benchmarking/profile_suite.py 8
+```
+
+Two things it does that you must also do if you write your own:
+
+* **Run each query twice, parse only the second.** The first pays cold page
+  cache on the Parquet files, and that time lands in decode before any worker
+  starts — parsing it makes every I/O-heavy query look serial.
+* **Print closure, do not assume it.** `pool_work + pool_idle + pool_unqueued`
+  should exhaust `pool_capacity`. If it stops closing, a bucket is unmeasured.
+  That has happened five times here and always in the same direction.
+
+### Timing A/B by hand
+
+`compare_ibex_git.sh` is the supported path, but when you want a specific
+comparison (one binary against another, custom queries) the pattern is:
+
+```bash
+cp build-release/tools/ibex_eval /tmp/eval_target
+git stash -q
+CMAKE_BUILD_PARALLEL_LEVEL=6 cmake --build build-release --target ibex_eval
+cp build-release/tools/ibex_eval /tmp/eval_base
+git stash pop -q
+```
+
+Then run `base, target, base, target...` per query and take **medians**, with one
+warm-up of each first. Do not run all of one side then all of the other; this box
+drifts. Remember to rebuild afterwards — after `git stash pop` the binary in
+`build-release/` is still the *base* build, which has produced at least one
+confusing measurement.
+
+### Proving a code path is reached
+
+Distinct from mutation-testing a test. Make the function itself fail and run the
+query:
+
+```cpp
+auto distinct_table(...) -> std::expected<Table, std::string> {
+    return std::unexpected(std::string("MUTATED reached"));   // temporary
+```
+
+If the query still succeeds, that path is not what runs, and any measurement or
+test you attributed to it is about something else. This is how the `let`-breaks-
+the-chain rule in §4 was found — the obvious test shape did not fire the mutation
+at all.
+
+For the parallel/serial contract, the equivalent is a straight diff:
+
+```bash
+diff <(IBEX_PARALLEL=1 ./build-release/tools/ibex_eval ... q.ibex) \
+     <(IBEX_PARALLEL=0 ./build-release/tools/ibex_eval ... q.ibex)
+```
+
+### perf, and what does not work here
+
+`perf record` works; **hardware counters do not**. This is WSL2, so
+`perf stat -e cache-misses,L1-dcache-load-misses` returns `<not supported>` for
+every PMU event. Do not build an argument on a cache-miss number you did not
+actually get — if you need to test a locality hypothesis, change the layout and
+measure wall time instead.
+
+```bash
+perf record -q -g --call-graph=dwarf,16384 -F 999 -o perf.data -- \
+  ./build-release/tools/ibex_eval --plugin-path build-release/tools case.ibex
+perf report -i perf.data --stdio --no-children --percent-limit 2
+```
+
+Release builds inline aggressively, so expect one enormous symbol
+(`aggregate_table` was 88% of samples) with the actual hot loop invisible inside
+it. perf tells you *which function*, rarely *which line*. Raise `-F` and lengthen
+the run if you get fewer than a few hundred samples — 185 samples is not enough
+to trust a 5% attribution, which is exactly how a component gets wrongly
+exonerated.
+
+### Do not measure right after committing
+
+`.githooks/post-commit` starts a **background scale regression** whenever the
+commit touched `src/runtime/`, `src/codegen/`, `src/ir/` or `include/`. It logs
+to `build-release/post_commit_perf.log`. Anything you time in the next few
+minutes is competing with it and has read up to 30% high in the past.
+
+```bash
+IBEX_SKIP_PERF=1 git commit ...     # skip it for one commit
+tail -f build-release/post_commit_perf.log   # or wait for it
+```
+
+Its own FAIL lines are a prompt to investigate, not evidence — confirm with
+`compare_ibex_git.sh --base HEAD~1 --target HEAD`.
+
 ### PDS-H data
 
 `benchmarking/data/tpch/parquet` is a **symlink** the scale scripts flip between

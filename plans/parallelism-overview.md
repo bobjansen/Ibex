@@ -472,10 +472,43 @@ one core; the useful result is the shallow 1-to-8 improvement, only 1.59x.
 Its remaining caller time contains the deterministic first-occurrence merge
 and output/control work. The merge is independently sized at about 26ms at
 the larger 3M-group q18 case, so deleting it cannot by itself explain the
-whole 86ms. The next experiment must split this node-level timer before a
-radix rewrite: measure discovery, the ordered merge, slot allocation,
-accumulation, and output emission separately. Do not lower q10's gate or tune
-thread counts on this evidence.
+whole 86ms. Do not lower q10's gate or tune thread counts on this evidence.
+
+**q18 perf attribution (2026-08-18).** The node profile was too coarse to
+separate the aggregate phases, so the measurement guide's `perf record` route
+was used. A controlled REPL replay materialized q18's two lineitem columns
+once, then ran eight syntactically distinct but grouping-equivalent
+`sum(l_quantity + constant) by l_orderkey` statements; each ended in `count()`
+to suppress the 1.5M-row intermediate. This makes the aggregate long enough
+for sampling without confounding it with Parquet decode. `perf record -F 999`
+got 913 task-clock samples at one core and 2K at eight, with zero lost samples.
+
+At **one core**, `robin_hood::Table<long,uint32_t>::insertKeyPrepareEmptySpot`
+is 30.7% of samples (and its rehash path another visible 8.0%); the aggregate
+is map construction, as expected. At **eight cores**, 52.9% of task-clock
+samples are pass 3 of `try_discover_partitioned`: the workers' per-partition
+`index.find` / `emplace` loop. Passes 1 (hash/histogram), 2 (scatter), and 4
+(local-to-global gid translation) are only 7.6%, 5.9%, and 2.3%; accumulation
+is 1.8% and parallel output emission 1.9%. The serial ordered merge does not
+appear as the dominant frame. This independently agrees with the shallow
+1-to-8 wall scaling: q18 is still dominated by random high-cardinality hash-map
+construction *inside the workers*, not by a missing fan-out.
+
+So the item-9 aggregate project is now specific: improve the high-cardinality
+partition table's locality/capacity strategy (and test it by wall-clock A/B),
+not a scheduler change or an order-elision-only change. The latter remains a
+bounded, separately correct optimisation, but is not q18's primary lever.
+
+**Rejected cheaply: pass-3 run shortcut.** Scatter retains source order inside
+each partition, and q18's lineitems have short same-order runs, so pass 3 was
+temporarily given the serial path's `previous key -> local gid` shortcut. It
+was semantically sound: the focused parallel aggregate tests passed and q18's
+parallel output was byte-identical to serial. It did **not** pay: 15 interleaved
+answer-checked q18 runs were 137.1 -> 134.6ms (-1.8%, 12.3% spread), and the
+isolated aggregate was 108.6 -> 105.8ms (-2.6%, 27.7% spread). Both are below
+the 13% noise floor, so the branch was removed. The profiler identified where
+CPU samples land, not a wall-clock lever; do not infer the latter from the
+former.
 
 ### What looking for the third collapse actually found
 

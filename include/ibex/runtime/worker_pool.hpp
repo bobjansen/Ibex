@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace ibex::runtime {
 
@@ -149,6 +153,41 @@ class StageThreadScope {
 /// bounded — or even reported — the sum. Peak rather than live, because by the
 /// time a query's profile prints, its stage threads have exited.
 [[nodiscard]] auto stage_thread_peak() noexcept -> std::size_t;
+
+/// A reading of every pool thread's park ledger at one instant.
+///
+/// The missing term in the profile's accounting. `pool_work_ms` says how long
+/// workers spent working and `pool_idle_ms` how long they spent parked on ring
+/// BACKPRESSURE, but neither sees a thread parked because the queue was simply
+/// EMPTY — which is most of the machine, and which no operator can be charged
+/// for, since an empty pool belongs to no operator. Sampling at query start and
+/// end attributes it to the query instead.
+///
+/// Sampled rather than accumulated because the interesting case is a thread that
+/// parks before the query and is still parked when it ends: it never wakes, so
+/// it never gets the chance to add anything to a counter. `park_start_ns` is
+/// what lets `pool_idle_between` clip that still-open park to the window.
+struct PoolIdleSample {
+    /// `steady_clock` reading when the sample was taken.
+    std::uint64_t at_ns = 0;
+    /// Per thread: `{park time already closed, current park start or 0}`.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> threads;
+};
+
+/// Read every pool thread's park ledger. Cheap (one mutex, no clock per thread)
+/// and safe to call at any time, including before the pool exists.
+[[nodiscard]] auto sample_pool_idle() -> PoolIdleSample;
+
+/// Total thread-time pool threads spent parked with NOTHING QUEUED between two
+/// samples, clipped to the window at both ends.
+///
+/// Threads that appear only in `end` (the pool grew, or was created mid-window)
+/// are counted from zero. The pairs are read without a lock held across both
+/// fields, so a park that closes between the two reads can be miscounted by at
+/// most its own length, once per thread per sample — irrelevant against a window
+/// of whole milliseconds, and never a systematic bias in one direction.
+[[nodiscard]] auto pool_idle_between(const PoolIdleSample& begin, const PoolIdleSample& end)
+    -> std::chrono::nanoseconds;
 
 /// Thread budget for compute, from `IBEX_CORES`. Unset or `auto` means
 /// `std::thread::hardware_concurrency()`; an explicit count is used as given;

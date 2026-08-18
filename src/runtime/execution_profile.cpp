@@ -57,6 +57,10 @@ struct ExecutionProfileState::Impl {
         : worker_budget(budget == 0 ? 1 : budget), report(should_report) {}
 
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    // Baseline for "pool threads parked with nothing queued". Taken at
+    // construction so the window is the query's, not the process's — between
+    // queries the whole pool is parked, and that idle belongs to nobody.
+    PoolIdleSample pool_idle_begin = sample_pool_idle();
     std::size_t worker_budget = 1;
     bool report = true;
     mutable std::mutex mutex;
@@ -255,17 +259,30 @@ ExecutionProfileState::~ExecutionProfileState() {
     });
     const std::size_t budget = impl_->worker_budget;
     const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
+    const std::size_t pool_threads = process_worker_pool().size();
+    // Measured directly, rather than inferred as capacity-minus-accounted. Those
+    // two agreeing is the whole point: `pool_unqueued_ms` is what the pool says
+    // about itself, `pool_capacity_ms` is what the clock says was available, and
+    // work + backpressure + unqueued should exhaust it. A shortfall means a
+    // fourth bucket nothing is measuring — which this profiler has had four
+    // times already, so the closure is printed rather than assumed.
+    const double pool_unqueued_ms =
+        static_cast<double>(pool_idle_between(impl_->pool_idle_begin, sample_pool_idle()).count()) /
+        1.0e6;
+    const double pool_capacity_ms = total_ms * static_cast<double>(pool_threads);
     ibex::formatting::print(stderr,
                             "operator profile: wall_ms={:.3f} entries={} workers={} self_ms={:.3f} "
                             "serial_self_ms={:.3f} serial_fraction={:.3f} amdahl_ceiling={:.2f}x "
                             "barriers={} barrier_wait_ms={:.3f} ring_wait_ms={:.3f} "
-                            "pool_work_ms={:.3f} pool_idle_ms={:.3f} occupancy={:.3f} "
+                            "pool_work_ms={:.3f} pool_idle_ms={:.3f} pool_unqueued_ms={:.3f} "
+                            "pool_capacity_ms={:.3f} occupancy={:.3f} "
                             "pool_threads={} stage_threads_peak={} stage_self_ms={:.3f}\n",
                             total_ms, rows.size(), budget, summary.self_ms, summary.serial_self_ms,
                             summary.serial_fraction, summary.amdahl_ceiling, summary.barriers,
                             summary.barrier_wait_ms, summary.ring_wait_ms, summary.pool_work_ms,
-                            summary.pool_idle_ms, summary.occupancy, process_worker_pool().size(),
-                            stage_thread_peak(), summary.stage_self_ms);
+                            summary.pool_idle_ms, pool_unqueued_ms, pool_capacity_ms,
+                            summary.occupancy, pool_threads, stage_thread_peak(),
+                            summary.stage_self_ms);
     for (const auto* row : rows) {
         ExecutionProfileSnapshotRow occupancy_row;
         occupancy_row.span_ns = row->span_ns.load(std::memory_order_relaxed);

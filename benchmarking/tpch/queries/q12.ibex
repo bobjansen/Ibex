@@ -19,18 +19,16 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet")[
-    select { l_orderkey = o_orderkey, o_orderpriority }
-];
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+// Match Polars: orders → lineitem first, then apply all line-level predicates
+// to the joined relation.
+let result = (orders join lineitem on { o_orderkey = l_orderkey })[
     filter (l_shipmode == "MAIL" || l_shipmode == "SHIP")
         && l_commitdate < l_receiptdate
         && l_shipdate < l_commitdate
-        && l_receiptdate >= date"1994-01-01" && l_receiptdate < date"1995-01-01"
-][select { l_orderkey, l_shipmode }];
-
-let result = (lineitem join orders on l_orderkey)[
+        && l_receiptdate >= date"1994-01-01" && l_receiptdate < date"1995-01-01",
     select {
         high_line_count =
             sum(Int64(o_orderpriority == "1-URGENT" || o_orderpriority == "2-HIGH")),

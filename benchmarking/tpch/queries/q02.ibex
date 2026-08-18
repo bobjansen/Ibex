@@ -30,23 +30,16 @@ let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet
 let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
 let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
 
-let selected_parts = part_raw[
-    filter p_size == 15 && like(p_type, "%BRASS"),
-    select { p_partkey, p_mfgr }
-];
-
+// Match the Polars PDS shape: keep the five-way join as one relation and apply
+// the part/region predicates after the joins, then reuse that relation for the
+// per-part minimum and the final minimum-cost join.
 let european_offers = (
-    (
-        selected_parts
-        join partsupp_raw[select { p_partkey = ps_partkey, ps_suppkey, ps_supplycost }]
-            on p_partkey
-    ) join supplier_raw[
-        select { ps_suppkey = s_suppkey, s_acctbal, s_name, s_address, s_phone, s_comment,
-                 s_nationkey }
-    ] on ps_suppkey
-    join nation_raw[select { s_nationkey = n_nationkey, n_name, n_regionkey }] on s_nationkey
-    join region_raw[filter r_name == "EUROPE"][select { n_regionkey = r_regionkey }] on n_regionkey
-);
+    (((part_raw join partsupp_raw on { p_partkey = ps_partkey })
+        join supplier_raw on { ps_suppkey = s_suppkey })
+        join nation_raw on { s_nationkey = n_nationkey })
+        join region_raw on { n_regionkey = r_regionkey })[
+    filter p_size == 15 && like(p_type, "%BRASS") && r_name == "EUROPE"
+];
 
 let minimum_offers = european_offers[
     select { ps_supplycost = min(ps_supplycost) },

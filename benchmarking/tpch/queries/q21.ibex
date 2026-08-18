@@ -36,36 +36,28 @@ let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
 let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
 // Lines belonging to status-F orders.
-let orders_F = orders_raw[filter o_orderstatus == "F"][select { l_orderkey = o_orderkey }];
-let li_F = lineitem_raw[select { l_orderkey, l_suppkey, l_receiptdate, l_commitdate }]
-    semi join orders_F on l_orderkey;
+// Match Polars' q1: orders with more than one supplier, joined to late lines.
+let q1 = (
+    lineitem_raw[
+        select { n_supp_by_order = count() },
+        by { l_orderkey }
+    ][filter n_supp_by_order > 1]
+    join lineitem_raw[filter l_receiptdate > l_commitdate]
+        on { l_orderkey }
+);
 
-let saudi_suppliers = (
-    supplier_raw[select { l_suppkey = s_suppkey, s_name, s_nationkey }]
-    join nation_raw[filter n_name == "SAUDI ARABIA"][select { s_nationkey = n_nationkey }]
-        on s_nationkey
-)[select { l_suppkey, s_name }];
+let q2 = q1[
+    select { n_supp_count = count() },
+    by { l_orderkey }
+];
 
-// Only Saudi late lines can contribute to the final result.
-let l1 = li_F[filter l_receiptdate > l_commitdate][select { l_orderkey, l_suppkey }]
-    semi join saudi_suppliers on l_suppkey;
-let candidate_orders = l1[distinct { l_orderkey }];
-let candidate_li = li_F semi join candidate_orders on l_orderkey;
-
-// exists (another supplier on the order)  ==  order has >1 distinct supplier.
-let n_sup = candidate_li[distinct { l_orderkey, l_suppkey }][
-    select { n_sup = count() }, by { l_orderkey }];
-
-// not exists (another LATE supplier)  ==  order has exactly 1 distinct late supplier.
-let n_late = candidate_li[filter l_receiptdate > l_commitdate][
-    distinct { l_orderkey, l_suppkey }
+let result = (
+    (((q2 join q1 on { l_orderkey })
+        join supplier_raw on { l_suppkey = s_suppkey })
+        join nation_raw on { s_nationkey = n_nationkey })
+        join orders_raw on { l_orderkey = o_orderkey })[
+    filter n_supp_count == 1 && n_name == "SAUDI ARABIA" && o_orderstatus == "F"
 ][
-    select { n_late = count() }, by { l_orderkey }];
-
-let qualifying = ((l1 join n_sup on l_orderkey)[filter n_sup > 1]
-    join n_late on l_orderkey)[filter n_late == 1][select { l_suppkey }];
-
-let result = (qualifying join saudi_suppliers on l_suppkey)[
     select { numwait = count() },
     by { s_name }
 ][

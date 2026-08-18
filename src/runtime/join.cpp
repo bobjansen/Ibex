@@ -1967,4 +1967,59 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     return join_failure(output);
 }
 
+auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
+                           const Table& left, const Table& right, std::string_view counted_column)
+    -> std::optional<Table> {
+    if (join.kind() != ir::JoinKind::Left || join.keys().size() != 1 ||
+        join.predicate().has_value() || join.null_match() != ir::NullMatch::Never ||
+        join.take() != ir::MatchSelection::All || join.expect().asserts_anything() ||
+        !join.pending_order().empty() || aggregate.group_by().size() != 1 ||
+        aggregate.aggregations().size() != 1 ||
+        (aggregate.aggregations().front().func != ir::AggFunc::Count &&
+         !(aggregate.aggregations().front().func == ir::AggFunc::Sum &&
+           counted_column != aggregate.aggregations().front().column.name)) ||
+        aggregate.aggregations().front().column.name.empty() ||
+        aggregate.group_by().front().name != join.keys().front().left) {
+        return std::nullopt;
+    }
+    const auto& key = join.keys().front();
+    const auto& spec = aggregate.aggregations().front();
+    const auto* left_key = left.find_entry(key.left);
+    const auto* right_key = right.find_entry(key.right);
+    const auto* counted = right.find_entry(std::string(counted_column));
+    if (left_key == nullptr || right_key == nullptr || counted == nullptr ||
+        !std::holds_alternative<Column<std::int64_t>>(*left_key->column) ||
+        !std::holds_alternative<Column<std::int64_t>>(*right_key->column) ||
+        left_key->validity.has_value() || right_key->validity.has_value()) {
+        return std::nullopt;
+    }
+    const auto& left_values = std::get<Column<std::int64_t>>(*left_key->column);
+    const auto& right_values = std::get<Column<std::int64_t>>(*right_key->column);
+    robin_hood::unordered_flat_map<std::int64_t, std::size_t> counts;
+    counts.reserve(right.rows());
+    const auto* counted_validity = counted->validity.has_value() ? &*counted->validity : nullptr;
+    for (std::size_t row = 0; row < right.rows(); ++row) {
+        if (counted_validity == nullptr || (*counted_validity)[row]) {
+            ++counts[right_values[row]];
+        }
+    }
+    robin_hood::unordered_flat_set<std::int64_t> seen;
+    seen.reserve(left.rows());
+    for (std::size_t row = 0; row < left.rows(); ++row) {
+        if (!seen.emplace(left_values[row]).second) {
+            return std::nullopt;
+        }
+    }
+    Column<std::int64_t> out_counts;
+    out_counts.resize_for_overwrite(left.rows());
+    for (std::size_t row = 0; row < left.rows(); ++row) {
+        const auto it = counts.find(left_values[row]);
+        out_counts[row] = it == counts.end() ? 0 : static_cast<std::int64_t>(it->second);
+    }
+    Table out;
+    out.add_column(aggregate.group_by().front().name, *left_key->column);
+    out.add_column(spec.alias, std::move(out_counts));
+    return out;
+}
+
 }  // namespace ibex::runtime

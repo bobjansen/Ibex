@@ -11832,6 +11832,76 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 break;
             }
         }
+        const ir::Node* aggregate_child = agg.children().front().get();
+        while (aggregate_child != nullptr &&
+               (aggregate_child->kind() == ir::NodeKind::Project ||
+                aggregate_child->kind() == ir::NodeKind::FilterProject ||
+                aggregate_child->kind() == ir::NodeKind::Update) &&
+               !aggregate_child->children().empty()) {
+            aggregate_child = aggregate_child->children().front().get();
+        }
+        if (streamable && aggregate_child != nullptr &&
+            aggregate_child->kind() == ir::NodeKind::Join) {
+            const auto& join = static_cast<const ir::JoinNode&>(*aggregate_child);
+            const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
+                                   !join.predicate().has_value() && agg.group_by().size() == 1 &&
+                                   agg.aggregations().size() == 1 &&
+                                   (agg.aggregations().front().func == ir::AggFunc::Count ||
+                                    agg.aggregations().front().func == ir::AggFunc::Sum) &&
+                                   !agg.aggregations().front().column.name.empty() &&
+                                   agg.group_by().front().name == join.keys().front().left;
+            if (candidate) {
+                auto left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
+                                              model_out);
+                if (!left_op.has_value()) {
+                    return std::unexpected(std::move(left_op.error()));
+                }
+                auto right_op = build_operator(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
+                if (!right_op.has_value()) {
+                    return std::unexpected(std::move(right_op.error()));
+                }
+                auto left = materialize_operator(std::move(left_op.value()));
+                if (!left.has_value()) {
+                    return std::unexpected(std::move(left.error()));
+                }
+                auto right = materialize_operator(std::move(right_op.value()));
+                if (!right.has_value()) {
+                    return std::unexpected(std::move(right.error()));
+                }
+                std::string counted_column = agg.aggregations().front().column.name;
+                if (agg.children().front()->kind() == ir::NodeKind::Update) {
+                    const auto& update =
+                        static_cast<const ir::UpdateNode&>(*agg.children().front());
+                    for (const auto& field : update.fields()) {
+                        if (field.alias != counted_column) {
+                            continue;
+                        }
+                        robin_hood::unordered_set<std::string> refs;
+                        collect_expr_column_refs(field.expr, refs);
+                        if (refs.size() == 1) {
+                            counted_column = *refs.begin();
+                        }
+                    }
+                }
+                if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
+                    fused.has_value()) {
+                    return make_table_source(std::move(*fused));
+                }
+                auto joined =
+                    join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
+                                    compute_mask, join.suffix(), join.pending_order(),
+                                    join.null_match(), join.expect(), join.take(), &exec);
+                if (!joined.has_value()) {
+                    return std::unexpected(std::move(joined.error()));
+                }
+                auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
+                if (!result.has_value()) {
+                    return std::unexpected(std::move(result.error()));
+                }
+                return make_table_source(std::move(*result));
+            }
+        }
         if (streamable) {
             auto child_op = build_operator(*agg.children().front(), registry, scalars, externs,
                                            exec, model_out);

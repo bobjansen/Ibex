@@ -708,8 +708,40 @@ backpressure and `pool_work_ms` was never inflated. Total real work
 (3053 + 443) / 1286.9 wall = **2.72x achieved on 8 cores**.
 
 The 70% is pool threads sitting in the pool's own `work.wait()` with **nothing
-queued**. That is a different thing from a parked worker, and none of these
-counters see it.
+queued**. That is a different thing from a parked worker.
+
+### The empty pool, measured rather than inferred
+
+The paragraph above derived the 70% by subtraction: capacity minus what the
+counters saw. Given that this profiler had already misreported the serial figure
+three times, a number nothing measures directly was not a number to plan on. It
+is now measured, by `pool_idle_between` over a per-thread park ledger sampled at
+query start and end. Sampled rather than accumulated for one specific reason: a
+thread parked before the query and still parked when it ends never wakes inside
+the window, so it never gets a chance to add to any counter — the fully-idle
+thread, the one that matters most, is exactly the one a counter cannot see.
+
+The report now prints `pool_unqueued_ms` next to `pool_capacity_ms`, so the
+accounting closes or visibly fails to:
+
+| | ms | share of pool capacity |
+|---|---|---|
+| pool capacity (`wall x pool_threads`) | 9853.6 | 100% |
+| — worker work (`pool_work_ms`) | 2997.9 | 30.4% |
+| — worker backpressure park (`pool_idle_ms`) | 0.0 | 0.0% |
+| — **parked with nothing queued** (`pool_unqueued_ms`) | **6815.2** | **69.2%** |
+| unaccounted | 40.5 | 0.4% |
+
+**Closure: 99.6%.** The inferred 70% was right, and there is no fourth bucket.
+The residual 0.4% is sampling skew — a park that closes between reading a
+thread's two ledger fields — and it lands on both sides across queries (a few
+rows read slightly over 100%), so it is noise, not a missing term.
+
+This is the first number in this document that was confirmed rather than
+corrected. It also makes the per-query spread visible, which the subtraction
+could not: **q02 is 97.1% empty, q16 85.1%, q22 89.5%** — the small queries are
+running almost entirely on one thread — while q06, the most parallel query in the
+suite, is still 38.8% empty. Nothing here is anywhere near saturating the pool.
 
 ### What the zero tells us
 

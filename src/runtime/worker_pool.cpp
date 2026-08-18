@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -140,7 +142,91 @@ thread_local bool t_on_stage_thread = false;
 std::atomic<std::size_t> g_stage_threads_live{0};
 std::atomic<std::size_t> g_stage_threads_peak{0};
 
+/// One pool thread's record of time spent parked with an empty queue.
+///
+/// Two fields rather than one running total because a total alone cannot answer
+/// the question. A thread parked for a whole query never wakes inside it, so it
+/// never adds to `closed_ns`; only `park_start_ns` reveals that it was idle the
+/// entire time. Both are needed, and `pool_idle_between` combines them.
+struct IdleLedger {
+    std::atomic<std::uint64_t> closed_ns{0};
+    /// Start of the park in progress, or 0 when this thread is running.
+    std::atomic<std::uint64_t> park_start_ns{0};
+};
+
+struct IdleRegistry {
+    std::mutex mutex;
+    // Deque, not vector: `sample_pool_idle` and the owning thread both hold
+    // references into this, and a vector would invalidate them on growth.
+    std::deque<IdleLedger> ledgers;
+};
+
+/// Never destroyed, for the same reason `process_worker_pool_state` is not: a
+/// pool thread may outlive static destruction on a host that unloads the
+/// library, and it writes to its ledger on every park.
+auto idle_registry() -> IdleRegistry& {
+    static auto* registry = new IdleRegistry();  // NOLINT(cppcoreguidelines-owning-memory)
+    return *registry;
+}
+
+/// Ledgers are never reclaimed when a pool is destroyed. A retired thread's
+/// ledger simply stops changing, so it contributes zero to every later window —
+/// correct, and it keeps the sampler free of any lifetime coupling to the pool.
+auto new_idle_ledger() -> IdleLedger& {
+    auto& registry = idle_registry();
+    const std::lock_guard lock(registry.mutex);
+    return registry.ledgers.emplace_back();
+}
+
+[[nodiscard]] auto steady_ns() noexcept -> std::uint64_t {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+}
+
 }  // namespace
+
+auto sample_pool_idle() -> PoolIdleSample {
+    PoolIdleSample sample;
+    sample.at_ns = steady_ns();
+    auto& registry = idle_registry();
+    const std::lock_guard lock(registry.mutex);
+    sample.threads.reserve(registry.ledgers.size());
+    for (const auto& ledger : registry.ledgers) {
+        sample.threads.emplace_back(ledger.closed_ns.load(std::memory_order_relaxed),
+                                    ledger.park_start_ns.load(std::memory_order_relaxed));
+    }
+    return sample;
+}
+
+auto pool_idle_between(const PoolIdleSample& begin, const PoolIdleSample& end)
+    -> std::chrono::nanoseconds {
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < end.threads.size(); ++i) {
+        const auto [closed_end, start_end] = end.threads[i];
+        const auto [closed_begin, start_begin] =
+            i < begin.threads.size() ? begin.threads[i] : std::pair<std::uint64_t, std::uint64_t>{};
+        // Parks that CLOSED during the window. A park already running at `begin`
+        // closes inside it with its whole length, including the part that
+        // happened before the window opened — subtract that prefix, or a pool
+        // that idled for an hour would charge the hour to the next query.
+        std::uint64_t idle = closed_end >= closed_begin ? closed_end - closed_begin : 0;
+        if (start_begin != 0 && start_begin != start_end && begin.at_ns > start_begin) {
+            idle -= std::min(idle, begin.at_ns - start_begin);
+        }
+        // The park still OPEN at `end`, clipped to the window's start. When it is
+        // the same park seen at `begin` this is the whole window, which is the
+        // never-woke case a pure counter cannot see.
+        if (start_end != 0) {
+            const std::uint64_t from = std::max(start_end, begin.at_ns);
+            if (end.at_ns > from) {
+                idle += end.at_ns - from;
+            }
+        }
+        total += idle;
+    }
+    return std::chrono::nanoseconds(static_cast<std::chrono::nanoseconds::rep>(total));
+}
 
 auto on_worker_pool_thread() noexcept -> bool {
     return t_on_pool_thread;
@@ -174,14 +260,24 @@ WorkerPool::WorkerPool(std::size_t threads)
     : impl_(std::make_unique<Impl>()), threads_(threads == 0 ? 1 : threads) {
     impl_->threads.reserve(threads_);
     for (std::size_t i = 0; i < threads_; ++i) {
-        impl_->threads.emplace_back([this] {
+        impl_->threads.emplace_back([this, &ledger = new_idle_ledger()] {
             t_on_pool_thread = true;
             while (true) {
                 Task task;
                 {
                     std::unique_lock lock(impl_->mutex);
-                    impl_->work.wait(lock,
-                                     [this] { return impl_->stopping || !impl_->queue.empty(); });
+                    const auto ready = [this] { return impl_->stopping || !impl_->queue.empty(); };
+                    // Only clock an actual park. When work is already queued the
+                    // predicate is true on entry and this costs one branch, which
+                    // matters because taking a task is the pool's hot path.
+                    if (!ready()) {
+                        ledger.park_start_ns.store(steady_ns(), std::memory_order_relaxed);
+                        impl_->work.wait(lock, ready);
+                        const auto started =
+                            ledger.park_start_ns.exchange(0, std::memory_order_relaxed);
+                        ledger.closed_ns.fetch_add(steady_ns() - started,
+                                                   std::memory_order_relaxed);
+                    }
                     if (impl_->stopping && impl_->queue.empty()) {
                         return;
                     }

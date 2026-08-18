@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -410,4 +411,126 @@ TEST_CASE("stream-scan and join-probe switches reach the ExecutionContext",
         CHECK(exec.stream_scans);
         CHECK(exec.parallel_join_probe);
     }
+}
+
+// `pool_idle_between` is pure arithmetic over two samples, so the cases that
+// matter are testable without a pool at all — and they are exactly the cases a
+// plain "sum of parks" counter gets wrong.
+TEST_CASE("pool_idle_between clips parks to the sampling window",
+          "[runtime][worker_pool][profile]") {
+    using runtime::PoolIdleSample;
+    const auto idle_ns = [](const PoolIdleSample& begin, const PoolIdleSample& end) {
+        return runtime::pool_idle_between(begin, end).count();
+    };
+
+    SECTION("a thread parked for the whole window is fully counted") {
+        // The case a counter cannot see: the thread never wakes, so it never
+        // adds to any total. Parked since 500, window is [1000, 3000].
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        begin.threads = {{0, 500}};
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{0, 500}};
+        CHECK(idle_ns(begin, end) == 2000);
+    }
+
+    SECTION("park time from before the window is not charged to it") {
+        // Parked since 500, woke at 1400 having closed a 900ns park. Only the
+        // 400ns inside [1000, 3000] is ours.
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        begin.threads = {{0, 500}};
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{900, 0}};
+        CHECK(idle_ns(begin, end) == 400);
+    }
+
+    SECTION("a park that opens inside the window counts from where it opened") {
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        begin.threads = {{0, 0}};
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{0, 2500}};
+        CHECK(idle_ns(begin, end) == 500);
+    }
+
+    SECTION("closed and still-open parks in one window add up") {
+        // Closed 300ns of parks, then parked again at 2600 and stayed there.
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        begin.threads = {{0, 0}};
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{300, 2600}};
+        CHECK(idle_ns(begin, end) == 700);
+    }
+
+    SECTION("threads that appear only in the later sample count from zero") {
+        // A pool created after the window opened: its threads have no baseline.
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{250, 0}, {0, 2000}};
+        CHECK(idle_ns(begin, end) == 250 + 1000);
+    }
+
+    SECTION("a fully busy window reports no idle") {
+        PoolIdleSample begin;
+        begin.at_ns = 1000;
+        begin.threads = {{700, 0}};
+        PoolIdleSample end;
+        end.at_ns = 3000;
+        end.threads = {{700, 0}};
+        CHECK(idle_ns(begin, end) == 0);
+    }
+}
+
+TEST_CASE("a real pool reports the idle its threads actually took",
+          "[runtime][worker_pool][profile]") {
+    constexpr std::size_t kThreads = 4;
+    runtime::WorkerPool pool(kThreads);
+    // Let every thread reach its park before the window opens, so the measured
+    // idle is the window itself rather than thread startup.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    const auto begin = runtime::sample_pool_idle();
+    const auto wall_start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - wall_start)
+                             .count();
+    const auto idle = runtime::pool_idle_between(begin, runtime::sample_pool_idle()).count();
+
+    // A quiet pool of N threads idles for at least N times the window. A lower
+    // bound, not an equality: the ledger registry is process-wide, so the
+    // process pool's own parked threads are in this sum too.
+    CHECK(idle >= wall_ns * static_cast<long long>(kThreads));
+
+    // And work removes idle. Measured as a RATE — threads-worth of idle per unit
+    // of wall time — because that is what subtracts out the background pool,
+    // which idles at the same rate in both windows. An absolute comparison would
+    // be measuring whatever else the test binary happens to have spun up.
+    const auto busy_begin = runtime::sample_pool_idle();
+    const auto busy_start = std::chrono::steady_clock::now();
+    {
+        auto batch = pool.submit(kThreads, [](std::size_t) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        });
+        batch.wait();
+    }
+    const auto busy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - busy_start)
+                             .count();
+    const auto busy_idle =
+        runtime::pool_idle_between(busy_begin, runtime::sample_pool_idle()).count();
+
+    const double quiet_rate = static_cast<double>(idle) / static_cast<double>(wall_ns);
+    const double busy_rate = static_cast<double>(busy_idle) / static_cast<double>(busy_ns);
+    // All four threads were occupied for nearly the whole busy window; require at
+    // least three threads' worth of idle to have disappeared.
+    CHECK(busy_rate < quiet_rate - 3.0);
 }

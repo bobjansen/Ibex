@@ -720,6 +720,35 @@ This removes a shape artifact, but does not change the aggregate conclusion:
 the two-key group discovery remains the dominant q20 cost and the scaling curve
 still flattens between four and eight cores.
 
+### PDS query-shape alignment (2026-08-18)
+
+The checked-in Polars PDS repository is now the reference for benchmark source
+shape. q03, q05, and q10 were aligned to its lazy relation order: joins remain
+in the same sequence, predicates are applied on the joined relation, and the
+intermediate `let` bindings that had materialized filtered inputs were removed.
+The other fixtures were reviewed against the PDS sources; q13, q18, q20 and the
+named aggregate-subquery queries already have corresponding stages, while q07,
+q08 and q09 already use the same join order (with only Ibex-specific key
+renaming). The alignment is therefore structural, not a blanket removal of
+all useful projection pushdown.
+
+The changed fixtures execute successfully. A quick SF-1 sweep (warmup 1,
+three iterations) measured q03/q05/q10 respectively at 1/2/4/8 cores:
+
+| cores | q03 | q05 | q10 |
+|---:|---:|---:|---:|
+| 1 | 70.43ms | 65.75ms | 98.05ms |
+| 2 | 47.14ms | 45.16ms | 83.18ms |
+| 4 | 42.16ms | 39.37ms | 81.58ms |
+| 8 | 37.28ms | 35.58ms | 76.92ms |
+
+For a direct old/new comparison at eight cores (warmup 2, eight iterations),
+the pre-alignment fixture measured **43.51/66.59/82.57ms** for q03/q05/q10;
+the aligned fixture measured **34.74/33.76/70.15ms**. The local checkout of the
+Polars repository has no generated `data/tables` or Python environment, so fresh
+Polars numbers could not be reproduced in this shell; the historical q10 Polars
+reference above (43.6ms) is retained but is not presented as a new matched run.
+
 ### Pass-3 software-pipelined prefetch, second attempt (2026-08-18)
 
 The earlier "Pass-3 software prefetch check" above patched the vendored

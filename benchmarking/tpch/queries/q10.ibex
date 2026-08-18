@@ -18,29 +18,16 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
-    select { c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_comment }
-];
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
 
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let orders = orders_raw[filter o_orderdate >= date"1993-10-01" && o_orderdate < date"1994-01-01"][
-    select { o_orderkey, c_custkey = o_custkey }
-];
-
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let lineitem = lineitem_raw[filter l_returnflag == "R"][
-    select { o_orderkey = l_orderkey, l_extendedprice, l_discount }
-];
-
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    select { c_nationkey = n_nationkey, n_name }
-];
-
-let cust_orders = customer join orders on c_custkey;
-let with_lineitem = cust_orders join lineitem on o_orderkey;
-let joined = with_lineitem join nation on c_nationkey;
-
-let result = joined[
+let result = (((customer join orders on { c_custkey = o_custkey })
+    join lineitem on { o_orderkey = l_orderkey })
+    join nation on { c_nationkey = n_nationkey })[
+    filter o_orderdate >= date"1993-10-01" && o_orderdate < date"1994-01-01"
+        && l_returnflag == "R",
     select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
     by { c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment }
 ][

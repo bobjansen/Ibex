@@ -18,23 +18,18 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer_raw = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let customer = customer_raw[filter c_mktsegment == "BUILDING"][select { c_custkey }];
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
 
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let orders = orders_raw[filter o_orderdate < date"1995-03-15"][
-    select { o_orderkey, c_custkey = o_custkey, o_orderdate, o_shippriority }
-];
-
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let lineitem = lineitem_raw[filter l_shipdate > date"1995-03-15"][
-    select { o_orderkey = l_orderkey, l_extendedprice, l_discount }
-];
-
-let cust_orders = customer join orders on c_custkey;
-let joined = cust_orders join lineitem on o_orderkey;
-
-let result = joined[
+// Keep the same lazy chain as the PDS Polars query: customer → orders →
+// lineitem, followed by the predicates and aggregate on the joined relation.
+let result = (
+    (customer join orders on { c_custkey = o_custkey })
+    join lineitem on { o_orderkey = l_orderkey }
+)[
+    filter c_mktsegment == "BUILDING" && o_orderdate < date"1995-03-15"
+        && l_shipdate > date"1995-03-15",
     select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
     by { o_orderkey, o_orderdate, o_shippriority }
 ][

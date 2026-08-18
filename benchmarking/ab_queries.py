@@ -350,6 +350,32 @@ def main() -> int:
     else:
         print(f"# byte-identical on all {len(rows)} queries")
 
+    # Holm-Bonferroni across the queries. Testing 22 queries at alpha=0.05 means
+    # roughly one spurious verdict per run BY CONSTRUCTION, and a suite A/B is
+    # exactly the setting where someone reads that one row as the finding. Holm
+    # is uniformly more powerful than plain Bonferroni and needs no independence
+    # assumption, which matters here because the queries share a machine.
+    flagged = [r for r in rows if r["verdict"] in ("FASTER", "SLOWER")]
+    if flagged and len(rows) > 1:
+        ordered = sorted(flagged, key=lambda r: r["pvalue"])
+        survivors = []
+        for rank, row in enumerate(ordered):
+            threshold = args.alpha / (len(rows) - rank)
+            if row["pvalue"] <= threshold:
+                survivors.append(row["name"])
+            else:
+                break  # Holm stops at the first failure
+        rejected = [r["name"] for r in ordered if r["name"] not in survivors]
+        if rejected:
+            print(f"# MULTIPLE COMPARISONS: {len(rows)} queries tested at "
+                  f"alpha={args.alpha}, so ~{len(rows) * args.alpha:.0f} false "
+                  f"verdict(s) are expected per run.")
+            print(f"#   Holm-Bonferroni keeps: "
+                  f"{' '.join(survivors) if survivors else 'NOTHING'}")
+            print(f"#   does NOT survive: {' '.join(rejected)} — do not report "
+                  f"{'these' if len(rejected) > 1 else 'this'} as a result "
+                  f"without an independent re-run.")
+
     same = sum(1 for r in rows if r["verdict"] == "same")
     unclear = [r["name"] for r in rows if r["verdict"] == "unclear"]
     moved = [r for r in rows if r["verdict"] in ("FASTER", "SLOWER")]

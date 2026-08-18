@@ -314,11 +314,44 @@ inline auto make_key_col(const ColumnEntry& entry) -> std::optional<KeyCol> {
     return make_key_col(*entry.column, entry.validity.has_value() ? &*entry.validity : nullptr);
 }
 
+/// Fold one column's hash into the running key hash.
+///
+/// Shared by `hash_key_row` (live row) and `hash_key_value` (boxed `Key`),
+/// which MUST produce identical results for the same logical key — a
+/// disagreement makes a probe miss the slot its own group occupies and
+/// silently duplicate it. They were two copies of this expression; now there is
+/// one, so they cannot drift.
+inline void key_hash_mix(std::uint64_t& seed, std::uint64_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+}
+
+/// Final avalanche (murmur3's fmix64), applied once per key.
+///
+/// `key_hash_mix` is boost's `hash_combine`, whose weakness is that it never
+/// diffuses into the LOW bits — and the low bits are exactly what
+/// `KeyRowIndex` masks to pick a slot. `std::hash<int64_t>` is the identity on
+/// libstdc++, so for two small integer keys the combined value is very nearly
+/// `b + (a << 6)`: a linear function of the key values, which linear probing
+/// turns into one long cluster.
+///
+/// Measured, 1M rows, `median(v) by {a, b}` with 9800 groups: **517ms before,
+/// 20ms after**. The pathology needed BOTH multiple keys and a particular table
+/// size, which is why it hid — a single key was always fine (100k groups in
+/// 67ms), and two keys were fine at 5000 groups in an 8192-slot table (20ms)
+/// while collapsing at 9800 in a 16384-slot one. Same load factor, different
+/// mask width: the aliasing pattern depends on how many low bits are taken.
+inline auto key_hash_finalize(std::uint64_t seed) -> std::uint64_t {
+    seed ^= seed >> 33U;
+    seed *= 0xff51afd7ed558ccdULL;
+    seed ^= seed >> 33U;
+    seed *= 0xc4ceb9fe1a85ec53ULL;
+    seed ^= seed >> 33U;
+    return seed;
+}
+
 inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> std::uint64_t {
     std::uint64_t seed = 0;
-    const auto mix = [&seed](std::uint64_t value) {
-        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    };
+    const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
     for (std::size_t i = 0; i < cols.size(); ++i) {
         const KeyCol& col = cols[i];
         if (col.is_null(row)) {
@@ -351,7 +384,7 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
                 break;
         }
     }
-    return seed;
+    return key_hash_finalize(seed);
 }
 
 /// Hash a `Key` exactly as `hash_key_row` hashes the equivalent row.
@@ -370,9 +403,7 @@ inline auto hash_key_row(const std::vector<KeyCol>& cols, std::size_t row) -> st
 /// `ScalarValue` by its held type reproduces `hash_key_row` exactly.
 inline auto hash_key_value(const Key& key) -> std::uint64_t {
     std::uint64_t seed = 0;
-    const auto mix = [&seed](std::uint64_t value) {
-        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    };
+    const auto mix = [&seed](std::uint64_t value) { key_hash_mix(seed, value); };
     for (std::size_t i = 0; i < key.values.size(); ++i) {
         if (key.is_null(i)) {
             mix(0xd1b54a32d192ed03ULL + i);
@@ -390,7 +421,7 @@ inline auto hash_key_value(const Key& key) -> std::uint64_t {
             key.values[i]);
         mix(static_cast<std::uint64_t>(h));
     }
-    return seed;
+    return key_hash_finalize(seed);
 }
 
 /// Does the group's stored key describe this row? Mirrors KeyEq: null matches

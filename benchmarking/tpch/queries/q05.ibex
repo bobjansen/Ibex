@@ -20,41 +20,27 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
-    select { c_custkey, c_nationkey }
-];
+let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
 
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let orders = orders_raw[filter o_orderdate >= date"1994-01-01" && o_orderdate < date"1995-01-01"][
-    select { o_orderkey, c_custkey = o_custkey }
-];
-
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
-    select { o_orderkey = l_orderkey, l_suppkey, l_extendedprice, l_discount }
-];
-
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
-    select { l_suppkey = s_suppkey, c_nationkey = s_nationkey }
-];
-
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet")[
-    select { c_nationkey = n_nationkey, n_name, n_regionkey }
-];
-
-let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
-let region = region_raw[filter r_name == "ASIA"][select { n_regionkey = r_regionkey }];
-
-let cust_orders = customer join orders on c_custkey;
-let with_lineitem = cust_orders join lineitem on o_orderkey;
-let with_supplier = with_lineitem join supplier on { l_suppkey, c_nationkey };
-let with_nation = with_supplier join nation on c_nationkey;
-let joined = with_nation join region on n_regionkey;
-
-let result = joined[
+// Match the PDS Polars chain: region → nation → customer → orders → lineitem
+// → supplier, with filters applied to the joined relation.
+let result = (
+    (((((region join nation on { r_regionkey = n_regionkey })
+        join customer on { n_nationkey = c_nationkey })
+        join orders on { c_custkey = o_custkey })
+        join lineitem on { o_orderkey = l_orderkey })
+        join supplier on { l_suppkey = s_suppkey, n_nationkey = s_nationkey })[
+    filter r_name == "ASIA" && o_orderdate >= date"1994-01-01"
+        && o_orderdate < date"1995-01-01",
     select { revenue = sum(l_extendedprice * (1.0 - l_discount)) },
     by { n_name }
 ][
     order { revenue desc }
-];
+]);
 write_csv(result, "benchmarking/data/tpch/out/q05.csv");
 result;

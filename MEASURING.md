@@ -213,10 +213,33 @@ the base against itself while believing otherwise.
 Exit code is **2** when any output differs, so it can gate. A divergence is a
 correctness result — stop and explain it before reading any timing.
 
-**Run it against itself first if you doubt a result.** `--base X --target X`
-measures the harness's own noise; on this box that is around +1.2% with per-query
-spreads up to 12%, which is why `--noise-pct` defaults to 13 and why a 1–2%
-suite total is a wash rather than a small win.
+It does not use a fixed noise band. The effect size is the **median of the
+per-pair ratios** and significance is a **Wilcoxon signed-rank test** on the
+paired runs, so sensitivity scales with `--repeats` instead of being frozen at
+whatever the box was doing the day someone picked a number. A query it cannot
+resolve is reported `unclear`, not `noise` — those are different claims, and
+`unclear` tells you to raise `--repeats` rather than to drop the idea.
+
+`--repeats` is forced **even**: whichever side runs first in a pair pays a
+first-position penalty, so an odd count leaves that bias uncancelled. With 7
+repeats a same-binary comparison reported `FASTER -12.6%, p=0.047`.
+
+**Run it against itself when you doubt a result.** `--base X --target X` should
+produce `same` and `unclear`, never a verdict. If it produces one, the box is
+too busy to measure on.
+
+Calibration on this box, verified by injecting a known slowdown into a wrapper
+script:
+
+| | 8 repeats | 12–16 repeats |
+|---|---|---|
+| true null (same binary) | no false verdicts | no false verdicts |
+| known ~6% regression | `unclear`, p≈0.08 | `SLOWER`, p≤0.006 |
+
+So **a 5% win is detectable here** — it just needs more than the default number
+of repeats on a noisy query. Read `disp` (how far the base median sits above its
+min) as the box-quietness indicator: single digits is fine, 15%+ means
+corroborate before believing anything.
 
 ### Proving a code path is reached
 
@@ -344,14 +367,32 @@ Use `git stash` to build the baseline binary, and keep both binaries so you can
 interleave. This applies to any edit inside an operator, not just "optimizations"
 — a schema-carrier fix in the join needed it too.
 
-## 6. Timing A/B: interleave, and respect the noise floor
+## 6. Timing A/B: pair the runs, then test the pairs
 
-Serial runs drift on this box. Run `base, target, base, target...` per query and
-take medians. The per-query noise floor is about **±13%**, not ±2%. A 1–2% suite
-total is a wash — say so rather than claiming a win.
+Use `benchmarking/ab_queries.py` (§1a) rather than rolling your own — the design
+details below are the ones that bit while writing it.
+
+Serial runs drift on this box, so sides must be **interleaved and paired**: run
+`i` of each side under the same machine conditions, then reason about the paired
+differences. An unpaired comparison of two sets of timings throws away the only
+thing keeping drift out of the answer.
+
+**Do not use a fixed percentage band.** A wide band is not conservatism, it is
+insensitivity: real optimizations in this codebase land at 5–15% per query, and
+a ±13% band declares most of them invisible. The figure that band came from was
+two untouched queries moving ±13% *in single configurations*, and the conclusion
+drawn at the time was to corroborate a delta across core counts and statistics —
+not to stop looking below 13%.
+
+What to do instead: estimate the effect from the paired ratios, test it with a
+signed-rank test, and let `--repeats` buy sensitivity. Distinguish three
+outcomes, not two — **same** (too small to matter), **unclear** (an effect the
+data cannot separate from noise; raise repeats), and a verdict. Reporting
+`unclear` as "no change" is how a real regression ships.
 
 Check the box is quiet first (`ps --sort=-pcpu -eo pcpu,comm | head`); WSL2
-load average lies. Never run a build while benchmarking.
+load average lies. Never run a build while benchmarking, and see §1a on the
+post-commit hook.
 
 ## 7. Build discipline
 

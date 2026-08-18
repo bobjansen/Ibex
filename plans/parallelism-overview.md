@@ -503,12 +503,60 @@ bounded, separately correct optimisation, but is not q18's primary lever.
 each partition, and q18's lineitems have short same-order runs, so pass 3 was
 temporarily given the serial path's `previous key -> local gid` shortcut. It
 was semantically sound: the focused parallel aggregate tests passed and q18's
-parallel output was byte-identical to serial. It did **not** pay: 15 interleaved
-answer-checked q18 runs were 137.1 -> 134.6ms (-1.8%, 12.3% spread), and the
-isolated aggregate was 108.6 -> 105.8ms (-2.6%, 27.7% spread). Both are below
-the 13% noise floor, so the branch was removed. The profiler identified where
-CPU samples land, not a wall-clock lever; do not infer the latter from the
-former.
+parallel output was byte-identical to serial. The original 15-run report used
+the now-rejected fixed 13% band and is superseded. Under the paired signed-rank
+protocol, a 16-pair base-vs-base q18 control was `same` (+1.1%, p=0.469). The
+candidate was initially `unclear` at 16 pairs (-2.1%, p=0.301), so it was
+extended rather than dismissed. At 32 pairs it was `same` (+0.8%, p=0.466;
+16-16 pair direction). The branch was therefore removed. The profiler
+identified where CPU samples land, not a wall-clock lever; do not infer the
+latter from the former.
+
+**The larger q18 lever: physical order without a certificate.** `lineitem`
+is physically nondecreasing on `l_orderkey` (the file begins with six `1`s,
+then `2`, then a run of `3`s), but the source correctly makes no ordering
+claim. Temporarily bypassing only that proof sent q18 through the existing
+`ChunkedSortedAggregateOperator`; its output was byte-identical and 16 paired
+runs measured **-12.6%, p=0.001**. This is a lower bound, not a valid change:
+a later unsorted chunk would make the streaming aggregate wrong.
+
+An explicit `order { l_orderkey }` is sound but not the answer. The order
+operator must first materialize the source to check it, so the isolated
+aggregate was **+2.5%, p=0.005** at 32 pairs even though the file was already
+ordered. The Parquet footer offers no free proof either: all six row groups have
+an empty `sorting_columns` list. Thus the next real implementation is a
+source-level dynamic ordering certificate / ordered-scan path that validates
+the complete stream before the aggregate can rely on it. Do not encode the
+PDS-H file layout as an unconditional source property.
+
+**Hash-path experiments (2026-08-18).** With the order route excluded, two
+bounded locality ideas were tested and removed. Raising the partition count
+from 8 to 32 made q18 **8.3% slower, p<0.001**: the smaller per-partition maps
+did not repay the wider first-occurrence merge. Reserving each empty partition
+for one quarter of its rows was **-1.2%, p=0.215** (same) at 16 pairs. Neither
+is a lever, and the baseline eight-partition/no-reserve path is restored.
+
+The current SF-1 comparison is already **Ibex 102.95ms versus Polars 121.75ms**
+at eight cores (warm, five measured iterations), so the target is not to add a
+certificate that only this file happens to satisfy. The remaining gap is in the
+hash table itself: the eight-core profile puts 52.9% of samples in pass 3's
+partition-local `find`/`emplace`. A compact-domain direct-index experiment was
+also rejected: its extra domain scan and fallback bookkeeping made the query
+substantially slower, so no source change is retained. The next candidate must
+reduce pass-3 probe cost without assuming physical order or changing the
+partition/merge contract.
+
+The wider scaling check confirms this is not a lucky eight-core point (warm,
+eight Ibex iterations and three Polars iterations):
+
+| cores | Ibex q18 | Polars q18 |
+|---:|---:|---:|
+| 1 | 168.6ms | 512.9ms |
+| 2 | 132.3ms | 284.7ms |
+| 4 | 106.0ms | 183.7ms |
+| 8 | 93.2ms | 146.7ms |
+
+Ibex is faster at every tested width and within 19% of Polars at eight cores.
 
 ### What looking for the third collapse actually found
 

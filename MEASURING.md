@@ -394,6 +394,39 @@ Check the box is quiet first (`ps --sort=-pcpu -eo pcpu,comm | head`); WSL2
 load average lies. Never run a build while benchmarking, and see §1a on the
 post-commit hook.
 
+### Statistics cannot tell you a delta is CAUSED by your change
+
+This is the limit of everything above, and it bites hardest on the results that
+look best.
+
+Builds here are bit-reproducible (verified: three rebuilds, including a header
+touch that recompiled 11 TUs, produce identical bytes). So two binaries that
+differ by one edit also differ in code LAYOUT everywhere, and a layout-induced
+per-query delta is perfectly stable — it reproduces across every repeat, in
+every run, at any p-value you care to demand. No amount of repeats separates it
+from a real speedup, because it is not noise.
+
+A worked example from the hash-clustering fix. Over 22 PDS-H queries at 10
+repeats, q22 came back −8.6% at p=0.002 and survived Holm correction; re-run
+independently at 20 repeats it strengthened to **−9.5%, 19-1 pairs, p<0.001**.
+By every statistical standard, a result. Then the profile:
+
+| node | base | target |
+|---|---|---|
+| `update` | 17.26 ms | 14.47 ms |
+| `scan` | 6.23 ms | 4.54 ms |
+| `join anti keys=1` | 3.43 ms | 3.18 ms |
+
+The time moved in `update` and `scan`, neither of which hashes anything, and
+q22 groups by a single key — the multi-key pathology that commit fixed cannot
+occur in it. So the −9.5% is code layout, not the change.
+
+**Two independent re-runs and a corrected p-value would all have endorsed a
+wrong causal claim.** What settled it was asking which operator moved and
+whether that operator has anything to do with the edit. Always close the loop
+with `IBEX_PROFILE_OPERATORS` on a per-query win before attributing it, and
+prefer a mechanism you can point at over a p-value you can quote.
+
 ## 7. Build discipline
 
 * **`-j 6` total across the whole box**, not per invocation. Two concurrent

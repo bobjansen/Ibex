@@ -13900,3 +13900,57 @@ TEST_CASE("aligned grouped window refuses to split a cross-bucket field",
         REQUIRE((*p)[o] == (*val_col)[r - kGroups]);
     }
 }
+
+// `distinct_table` is the whole-table signature over the chunked operator (I4).
+// It runs ONLY through `interpret_node`, which the chunked builder reaches only
+// for a subtree beneath a node it declined — and only within a single statement,
+// because a `let` materializes and breaks the chain. Every assertion here is on
+// that shape for that reason: written with a `let` between the two clauses, the
+// test passes without executing a line of the code it claims to cover.
+TEST_CASE("distinct beneath a declined aggregate runs the collapsed whole-table path",
+          "[interpreter][distinct][chunked]") {
+    runtime::TableRegistry registry;
+
+    // 12 rows, g cycling 0..2 and v cycling 0..3, so `distinct { g, v }` keeps
+    // all 12 pairs and `median(v)` over them is 1.5. `median` is what forces the
+    // decline: the chunked aggregate does not implement it.
+    {
+        auto ir = require_ir(
+            "Table(12)[update { g = rep([0,1,2]), v = rep([0,1,2,3]) }]"
+            "[distinct { g, v }][select { m = median(v) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 1);
+        const auto& col = std::get<Column<double>>(*result->find("m"));
+        CHECK(col[0] == Catch::Approx(1.5));
+    }
+
+    // Single-column distinct, which takes the operator's fast path rather than
+    // the packed-key one — a different branch of the implementation now shared.
+    {
+        auto ir = require_ir(
+            "Table(12)[update { v = rep([0,1,2,3]) }]"
+            "[distinct { v }][select { m = median(v) }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 1);
+        const auto& col = std::get<Column<double>>(*result->find("m"));
+        CHECK(col[0] == Catch::Approx(1.5));
+    }
+
+    // A string key, so the dedup cannot use the packed-integer store, plus a
+    // grouped aggregate above it. g cycles 0..2 against s cycling "a"/"b", so
+    // the six distinct pairs put {0,2,1} under "a" and {1,0,2} under "b" —
+    // median 1 either way.
+    {
+        auto ir = require_ir(
+            "Table(12)[update { g = rep([0,1,2]), s = rep([\"a\",\"b\"]) }]"
+            "[distinct { g, s }][select { m = median(g) }, by s, order s];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 2);
+        const auto& col = std::get<Column<double>>(*result->find("m"));
+        CHECK(col[0] == Catch::Approx(1.0));
+        CHECK(col[1] == Catch::Approx(1.0));
+    }
+}

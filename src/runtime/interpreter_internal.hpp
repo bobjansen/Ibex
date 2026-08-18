@@ -1126,7 +1126,23 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto columns_table(const Table& input) -> std::expected<Table, std::string>;
-[[nodiscard]] auto distinct_table(const Table& input) -> std::expected<Table, std::string>;
+/// Whole-table `distinct`, implemented in `chunked.cpp` over
+/// `ChunkedDistinctOperator` rather than a second time.
+///
+/// The first I4 convergence: a whole-table SIGNATURE over the chunked
+/// IMPLEMENTATION, the split `ops.hpp` already uses. There used to be a serial
+/// dedup loop here that boxed a `Key` per row and could not be parallel, while
+/// the operator every real query reaches has single-column and packed-key fast
+/// paths. Nothing routed to the serial one except `interpret_node`'s fallback,
+/// so the duplicate bought nothing and could only drift.
+///
+/// Takes `exec` because the implementation is now the chunked operator, which
+/// needs it. Metadata is unchanged by the move: `distinct` is a
+/// `RowTransform::Subset` that keeps every column, and `Subset` derives exactly
+/// like `Preserve`, so the properties the operator passes through are the ones
+/// the old `distinct_properties` computed.
+[[nodiscard]] auto distinct_table(const Table& input, const ExecutionContext& exec)
+    -> std::expected<Table, std::string>;
 
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const Table& table,

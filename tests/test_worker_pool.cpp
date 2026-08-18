@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -26,6 +27,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include "execution_profile_internal.hpp"
 
 using namespace ibex;
 
@@ -413,23 +416,23 @@ TEST_CASE("stream-scan and join-probe switches reach the ExecutionContext",
     }
 }
 
-// `pool_idle_between` is pure arithmetic over two samples, so the cases that
+// `idle_between` is pure arithmetic over two samples, so the cases that
 // matter are testable without a pool at all — and they are exactly the cases a
 // plain "sum of parks" counter gets wrong.
-TEST_CASE("pool_idle_between clips parks to the sampling window",
+TEST_CASE("idle_between clips intervals to the sampling window",
           "[runtime][worker_pool][profile]") {
-    using runtime::PoolIdleSample;
-    const auto idle_ns = [](const PoolIdleSample& begin, const PoolIdleSample& end) {
-        return runtime::pool_idle_between(begin, end).count();
+    using runtime::IdleSample;
+    const auto idle_ns = [](const IdleSample& begin, const IdleSample& end) {
+        return runtime::idle_between(begin, end).count();
     };
 
     SECTION("a thread parked for the whole window is fully counted") {
         // The case a counter cannot see: the thread never wakes, so it never
         // adds to any total. Parked since 500, window is [1000, 3000].
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
         begin.threads = {{0, 500}};
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{0, 500}};
         CHECK(idle_ns(begin, end) == 2000);
@@ -438,20 +441,20 @@ TEST_CASE("pool_idle_between clips parks to the sampling window",
     SECTION("park time from before the window is not charged to it") {
         // Parked since 500, woke at 1400 having closed a 900ns park. Only the
         // 400ns inside [1000, 3000] is ours.
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
         begin.threads = {{0, 500}};
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{900, 0}};
         CHECK(idle_ns(begin, end) == 400);
     }
 
     SECTION("a park that opens inside the window counts from where it opened") {
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
         begin.threads = {{0, 0}};
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{0, 2500}};
         CHECK(idle_ns(begin, end) == 500);
@@ -459,10 +462,10 @@ TEST_CASE("pool_idle_between clips parks to the sampling window",
 
     SECTION("closed and still-open parks in one window add up") {
         // Closed 300ns of parks, then parked again at 2600 and stayed there.
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
         begin.threads = {{0, 0}};
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{300, 2600}};
         CHECK(idle_ns(begin, end) == 700);
@@ -470,19 +473,19 @@ TEST_CASE("pool_idle_between clips parks to the sampling window",
 
     SECTION("threads that appear only in the later sample count from zero") {
         // A pool created after the window opened: its threads have no baseline.
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{250, 0}, {0, 2000}};
         CHECK(idle_ns(begin, end) == 250 + 1000);
     }
 
     SECTION("a fully busy window reports no idle") {
-        PoolIdleSample begin;
+        IdleSample begin;
         begin.at_ns = 1000;
         begin.threads = {{700, 0}};
-        PoolIdleSample end;
+        IdleSample end;
         end.at_ns = 3000;
         end.threads = {{700, 0}};
         CHECK(idle_ns(begin, end) == 0);
@@ -503,7 +506,7 @@ TEST_CASE("a real pool reports the idle its threads actually took",
     const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - wall_start)
                              .count();
-    const auto idle = runtime::pool_idle_between(begin, runtime::sample_pool_idle()).count();
+    const auto idle = runtime::idle_between(begin, runtime::sample_pool_idle()).count();
 
     // A quiet pool of N threads idles for at least N times the window. A lower
     // bound, not an equality: the ledger registry is process-wide, so the
@@ -525,12 +528,81 @@ TEST_CASE("a real pool reports the idle its threads actually took",
     const auto busy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - busy_start)
                              .count();
-    const auto busy_idle =
-        runtime::pool_idle_between(busy_begin, runtime::sample_pool_idle()).count();
+    const auto busy_idle = runtime::idle_between(busy_begin, runtime::sample_pool_idle()).count();
 
     const double quiet_rate = static_cast<double>(idle) / static_cast<double>(wall_ns);
     const double busy_rate = static_cast<double>(busy_idle) / static_cast<double>(busy_ns);
     // All four threads were occupied for nearly the whole busy window; require at
     // least three threads' worth of idle to have disappeared.
     CHECK(busy_rate < quiet_rate - 3.0);
+}
+
+TEST_CASE("a stage thread's backpressure park and lifetime are both accounted",
+          "[runtime][worker_pool][profile]") {
+    // The producer's park is the one piece of runtime idle with no operator to
+    // charge it to: it happens between pulls, outside every profile scope, so
+    // unlike a worker's park there is nothing to subtract it from. It gets its
+    // own ledger, and `stage_live_ms` is the denominator that makes the number
+    // checkable rather than merely printed.
+    const auto park_begin = runtime::sample_stage_park();
+    const auto live_begin = runtime::sample_stage_live();
+
+    std::atomic<bool> release{false};
+    std::mutex mutex;
+    std::condition_variable parked;
+    constexpr auto kPark = std::chrono::milliseconds(60);
+
+    std::thread producer([&] {
+        const runtime::StageThreadScope stage_thread;
+        REQUIRE(runtime::on_stage_thread());
+        {
+            // Exactly what `produce()` does when the ring is full.
+            const runtime::RingWaitScope ring_wait;
+            std::unique_lock lock(mutex);
+            parked.wait(lock, [&] { return release.load(); });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    });
+
+    std::this_thread::sleep_for(kPark);
+    {
+        const std::scoped_lock lock(mutex);
+        release.store(true);
+    }
+    parked.notify_all();
+    producer.join();
+
+    const auto park_ns = runtime::idle_between(park_begin, runtime::sample_stage_park()).count();
+    const auto live_ns = runtime::idle_between(live_begin, runtime::sample_stage_live()).count();
+
+    // The park is measured, not rounded to zero — the state before this change.
+    CHECK(park_ns >= std::chrono::nanoseconds(kPark).count() * 9 / 10);
+    // And it is a subset of the thread's lifetime, which also covers the work
+    // after the park. Both bounds matter: a ledger that double-counted, or one
+    // that leaked the interval past the thread's death, would break the upper.
+    CHECK(live_ns > park_ns);
+    CHECK(park_ns < live_ns);
+
+    // After the thread exits, nothing accrues. A park left open at exit — the
+    // cancelled-while-parked path — would make this window grow without bound.
+    const auto quiet_begin = runtime::sample_stage_park();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(runtime::idle_between(quiet_begin, runtime::sample_stage_park()).count() == 0);
+}
+
+TEST_CASE("stage ledger slots are reused rather than accumulated",
+          "[runtime][worker_pool][profile]") {
+    // Stage threads are spawned per staged breaker per query. Without reuse a
+    // long REPL session would leak a registry slot per breaker ever executed.
+    const auto before = runtime::sample_stage_live().threads.size();
+    for (int i = 0; i < 20; ++i) {
+        std::thread([] {
+            const runtime::StageThreadScope stage_thread;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }).join();
+    }
+    const auto after = runtime::sample_stage_live().threads.size();
+    // Serial threads, so one slot suffices for all twenty. Allow a little slack
+    // for a stage thread another test left running concurrently.
+    CHECK(after <= before + 3);
 }

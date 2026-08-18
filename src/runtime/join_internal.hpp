@@ -6,6 +6,7 @@
 #include <ibex/runtime/interpreter.hpp>
 
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,5 +42,13 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
     ir::NullMatch null_match = ir::NullMatch::Never, const ir::JoinExpect& expect = {},
     ir::MatchSelection take = ir::MatchSelection::All, const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
+
+/// Physical rewrite for a unique-left-key left join followed by
+/// count(right_column) grouped by that key. Returns nullopt when the shape or
+/// runtime proofs are insufficient and the ordinary join must be used.
+[[nodiscard]] auto left_join_count_table(const ir::JoinNode& join,
+                                         const ir::AggregateNode& aggregate, const Table& left,
+                                         const Table& right, std::string_view counted_column)
+    -> std::optional<Table>;
 
 }  // namespace ibex::runtime

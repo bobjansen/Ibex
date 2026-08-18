@@ -465,6 +465,19 @@ one first target rather than three:
 | q18 | `sum(l_quantity)` by `l_orderkey`, 1.5M groups | 85.7ms caller, 227.5ms pool work, 26 barriers | first aggregate target |
 | q10 | seven-key sum over 37,967 input rows | 20.6ms caller, no pool tasks | below the 262k partition-discovery gate; forcing fan-out is not credible |
 
+**q13 join/count fusion (2026-08-18).** The benchmark shape remains
+`filter orders -> left join customers -> count by customer -> count buckets`;
+the query was not rewritten to pre-aggregate orders. The engine now recognizes
+the first aggregate over that left join (including the lowered `count(column)`
+form, which appears as a derived sum), verifies that the left key is unique at
+runtime, and computes right-side counts directly instead of materializing the
+1.5M-row join result. Unsupported types, null keys, duplicate left keys, or
+other join semantics fall back to the existing implementation. `check_answers.py
+q13` remains green. The profiled 8-core statement fell from about **149ms to
+126ms**; three warm whole-script reruns had a median of **103.8ms**, versus the
+earlier roughly **121ms** baseline. The string scan remains the floor, but the
+join and first aggregate no longer pay for the expanded intermediate.
+
 The q18 aggregate profile over `IBEX_CORES={1,2,4,8}` was respectively
 136.2 / 143.8 / 111.0 / 85.7ms caller time (with 0 / 186.9 / 217.5 /
 227.5ms pool work). The single 2-core run is noisy and slightly worse than
@@ -557,6 +570,202 @@ eight Ibex iterations and three Polars iterations):
 | 8 | 93.2ms | 146.7ms |
 
 Ibex is faster at every tested width and within 19% of Polars at eight cores.
+
+### Largest remaining loss versus Polars at eight cores
+
+The full-suite screen was followed by isolated warm reruns (15 Ibex
+iterations; 10 for the next candidates; 10 Polars iterations after warmup):
+
+| query | Ibex | Polars | Ibex minus Polars | diagnosis |
+|---|---:|---:|---:|---|
+| q10 | 69.0ms | 43.6ms | **+25.4ms** | small result (38k rows); serial joins/aggregate and fixed scan/plan overhead |
+| q20 | 72.6ms | 47.4ms | **+25.2ms** | 543k-group two-key aggregate; aggregate node is ~63.5ms and dominates |
+| q13 | 115.7ms | 104.0ms | +11.7ms | join build and scan/decode dominate, not the small second aggregate |
+| q14 | 18.2ms | 10.4ms | +7.8ms | small filtered join; large relative loss but little absolute time |
+
+The first implementation target is **q20's aggregate**, despite q10 winning by
+0.2ms: q20 has a large, measurable operator-level loss rather than mostly fixed
+small-query overhead. The plan is:
+
+1. Capture a phase-level q20 baseline at 1/2/4/8 cores and with statements
+   separated, keeping the paired signed-rank protocol.
+2. Profile pass 3 and the two-key packed-key path; compare probe, merge, and
+   slot initialization costs against the q18 one-key path.
+3. Test one change at a time (packed-key table capacity/locality first), with
+   byte-identical output and the full q20 answer check as gates.
+4. Re-measure q10 separately. Only pursue its serial joins if the gap remains
+   after controlling for its fixed scan/REPL overhead; do not add fan-out to a
+   38k-row plan merely to match Polars' execution strategy.
+
+### q20 packed two-key path check
+
+The q20 aggregate is not taking the 64-bit packed form: both source columns are
+typed `Int64`, so `pair_packs_u64_` is false. It uses the exact `PairIntKey`
+(`uint64_t first, second`) partition path at
+`ChunkedAggregateOperator::process_rows_int_pair`. A controlled materialized
+replay isolates the cost: at eight cores, **63.4% of perf samples** land in
+pass 3's partition-local `find`/`emplace`; accumulation is only 4.1% and the
+merge is not dominant. This is the same shape as q18, but with the wider pair
+key and custom `PairIntKeyHash`.
+
+Two low-risk probes were rejected. Applying the generic final hash avalanche to
+`PairIntKeyHash` measured **73.3ms** for q20 versus the preceding **72.6ms**
+baseline (no gain), and reserving half of each partition's input rows regressed
+q20 to **77.5ms** and q18 to **127.9ms**. Both experiments are reverted.
+
+The implementation plan is therefore narrower: add a runtime-checked 32-bit
+domain path for two `Int64` columns (q20's part/supplier keys fit it), while
+retaining the exact `PairIntKey` fallback for wide or later chunks. The check
+must be stream-safe across chunks, preserve first-occurrence ordering, and be
+benchmarked against q20 and q18 before adoption; no source change is retained
+from the probes above.
+
+**First implementation attempt (2026-08-18).** The state machine described
+above was implemented and passed q20 execution, including the packed-to-exact
+transition design, but it measured **83.4ms** versus the ~72.6ms baseline at
+eight cores. The extra domain scan and the separate u64 state did not repay the
+smaller key. It was removed. A viable version needs the domain certificate from
+Parquet metadata or an existing decode pass, rather than a second row scan.
+
+**Footer retry (2026-08-18).** The certificate was then wired from deferred
+Parquet source statistics: q20's row-group metadata proves both keys are
+non-null and within `uint32_t`, and the packed path was selected without the
+second row scan. `check_answers.py` remained green, including q20. However, a
+controlled 15-run comparison measured **81.4ms with the certificate versus
+77.9ms without it** at eight cores. A cheaper high/low-word hash was also
+tested and measured **80.1ms**, still slower. The packed representation was
+therefore reverted; footer metadata is a valid certificate, but this table
+layout does not make the one-word probe path faster than `PairIntKey`.
+
+### Idea 2 check: two-level grouping
+
+The data shape is promising: across the full lineitem file there are 200,000
+part keys and 799,541 distinct `(part, supplier)` pairs; every part has four
+suppliers (median, p95, and maximum). A parallel two-level implementation was
+tested: it assigned rows by a hash of the first key, gave each worker its own
+first-key directory and tiny second-key vectors, and reused the existing
+first-occurrence merge. It was general (no footer, range, sort, or format
+assumption), but q20 answer verification was not enough to justify its cost.
+The SF-1 difference was small, so it was retested on the checked-in
+SF-4 Parquet fixture (24M lineitem rows). A first 1/2/4/8-core sweep measured
+the two-level path at **553.5/467.6/326.6/263.7ms**, versus
+**526.6/473.5/321.6/271.1ms** for the exact-pair control. Three additional
+8-core repeats gave medians of **270.5ms** and **269.1ms**, respectively.
+The larger fixture therefore did not establish a material win; the apparent
+8-core lead in the first sweep was within run-to-run noise. The two-level code
+was removed, leaving the exact-pair path as the current implementation.
+
+**Pass-3 software prefetch check (2026-08-18).** A local extension to the
+`robin_hood::unordered_flat_map` table exposed the initial probe bucket, and a
+six-row lookahead prefetched the control byte and entry before each pass-3
+probe. It was byte-semantics preserving, but q20 at eight cores regressed from
+**77.2ms to 86.5ms**. The lookahead recomputes the composite-key hash and adds
+work to every row; that cost exceeded the cache-miss latency hidden. The local
+header extension and call site were removed.
+
+**Pass-1 hash reuse check (2026-08-18).** The local table extension was then
+expanded with precomputed-hash lookup and insertion. Pass 1's hash was carried
+alongside each scattered row index, so pass 3 could avoid hashing the key a
+second time. The result remained byte-correct (`q20: OK`), but it was not a
+win: SF-1 at eight cores measured **78.7ms** versus the **77.2ms** control, and
+three SF-4 repeats had a **275.5ms** median versus the earlier **269.1ms**
+control. The extra hash buffer/scatter bandwidth outweighed the saved hash
+work. The extension and hash plumbing were removed.
+
+**Why Polars is not blocked by the same boundary.** Polars encodes the complete
+multi-column key, hashes that key to a partition, and gives each partition its
+own hash table. Group discovery and aggregate updates therefore happen inside
+partition-owned state; only the finished aggregate states need merging. The
+implementation describes one hash table per worker and routing by
+`hash_to_partition` ([source](https://raw.githubusercontent.com/pola-rs/polars/main/crates/polars-core/src/frame/group_by/hashing.rs));
+multi-column keys are encoded before grouping ([source](https://raw.githubusercontent.com/pola-rs/polars/main/crates/polars-core/src/frame/group_by/mod.rs)).
+
+Ibex's operator instead owns one mutable grouping state: the coordinator must
+assign global group IDs before workers can accumulate into private slots. The
+discarded two-level experiment added hash, scatter, local discovery, ID
+translation, and merge passes around that boundary. SF-4 showed those passes
+cancelled the saved probing time. A future win requires a partition-aware
+aggregate API that owns a partition from key discovery through mergeable
+aggregate state, rather than more parallelism after group IDs already exist.
+
+**Idea 4 check: fuse q20's filter into discovery (2026-08-18).** There is no
+remaining filter operator to fuse. The whole-plan profile contains no `filter`
+node under the q20 aggregate: the 1994 date predicate is already pushed into
+`scan __ibex_source_4`, which produces 909,455 rows across six chunks. The
+aggregate then consumes those rows and emits 543,210 groups; its 60.5ms caller
+time and 58.7ms pool work are the dominant block. Moving the predicate into
+pass 3 would duplicate work rather than remove it. Idea 4 is therefore closed;
+the next useful change must reduce pair-group discovery itself.
+
+### Pass-3 software-pipelined prefetch, second attempt (2026-08-18)
+
+The earlier "Pass-3 software prefetch check" above patched the vendored
+`robin_hood.h` directly to expose the probe bucket; this attempt instead kept
+the change entirely inside `chunked.cpp` (`ChunkedAggregateOperator`), to
+check whether the earlier result was specific to that implementation. A
+`RobinHoodShadow<Map>` struct mirrors `Table`'s private member layout (order
+and sizes taken from the vendored header's own "members are sorted so no
+padding occurs" comment: `mHashMultiplier`, `mKeyVals`, `mInfo`,
+`mNumElements`, `mMask`, `mMaxNumElementsAllowed`, `mInfoInc`,
+`mInfoHashShift`), `reinterpret_cast` onto the live map to read those fields,
+and a `static_assert(sizeof(RobinHoodShadow<Map>) == sizeof(Map))` plus a
+runtime check against the public `mask()` guard against a silent layout
+drift — a guard trip disables the prefetch rather than reading garbage, and a
+wrong address is inert (`PREFETCHh` never faults), so the failure mode is a
+wasted hint, not a correctness bug. The shadow was verified standalone first
+(a throwaway harness against the vendored header confirmed `mMask`/`size()`
+agreement and that the computed index matched a real key's found location).
+
+Pass 3's probe loop (the `KeyPartition` `find`/`emplace` loop, shared by
+`q18`'s single-int-key path and `q20`'s exact `PairIntKey` path) was changed
+to compute row `i+K`'s bucket via `prefetch_probe_hint` and issue
+`__builtin_prefetch` on it before the real `find`/`emplace` for row `i`,
+falling back to no prefetch for the loop's last `K` rows. `Hash{}` (the same
+hash type parameter the map itself uses) was reused so the prefetch computes
+the identical `keyToIdx` index arithmetic, minus the `*info` half that
+prefetching has no use for.
+
+For this experiment only, the working PairIntKey call site (q20) was left
+exercising the plain `try_discover_partitioned` path — the two-level
+experiment above was already reverted from the tree before this work started,
+so no bypass was needed; q20 and q18 both ran the same instantiation, just
+with prefetching added.
+
+**Correctness.** All 185 `ctest` cases under `-R "ggregat|roup"` passed, and
+`uv run benchmarking/tpch/check_answers.py q18 q20` reported `OK` for both.
+
+**Measurement.** `benchmarking/ab_queries.py` (base = pre-patch `ibex_eval`,
+target = patched, `IBEX_CORES=8`, SF-1 data, interleaved paired runs):
+
+| K | repeats | q18 delta | q20 delta | geomean | verdict |
+|---|---:|---:|---:|---:|---|
+| 8  | 12 | +2.7% | -2.2% | — | unclear (both queries) |
+| 8  | 26 | -0.6% | -0.2% | -0.4% | same (both under the 2% floor) |
+| 16 | 16 | +3.1% | +0.7% | +1.9% | unclear (q18), same (q20) |
+
+Output was byte-identical on every run. At `K=8` with enough repeats to
+resolve the noise (26 paired runs), both queries land inside the practical-
+effect floor and the paired signed-rank test calls both "same." `K=16` did not
+change the verdict — its q18 pairs were still statistically inconclusive at
+16 repeats, and its geomean is not distinguishable from zero given q18's own
+noise band.
+
+**Verdict: reverted, no material win.** This corroborates the earlier
+vendor-header attempt's conclusion (that one measured an outright regression;
+this one measures a wash) via an independent, in-tree-only implementation, so
+the result is not an artifact of the earlier header patch specifically. The
+shared explanation is the one already on record two sections up ("Why Polars
+is not blocked by the same boundary"): pass 3's cost is the group-discovery
+boundary itself — one shared mutable table per partition, one probe per row —
+and reordering *when* the probe happens does not change *how much* work each
+miss costs. Lookahead adds a second hash computation (`Hash{}(key_at(...))`)
+per row on top of the real probe's own hash, which eats into whatever latency
+the prefetch hides; that is consistent with `K=16`'s slight lean positive
+(q18 +3.1%, i.e. slower) rather than negative. `RobinHoodShadow`,
+`prefetch_probe_hint`, and the pass-3 lookahead loop were removed from
+`chunked.cpp`; the working tree's `src/runtime/chunked.cpp` is unchanged from
+`HEAD`. A future win here still needs the partition-owned aggregate API noted
+in that section, not a cheaper probe for the same access pattern.
 
 ### What looking for the third collapse actually found
 

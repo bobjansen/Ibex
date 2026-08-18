@@ -354,56 +354,6 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     return ExprType::String;
 }
 
-/// `distinct` keeps the FIRST occurrence of each row and appends in input order,
-/// so it removes rows without moving the survivors: a `RowTransform::Subset`,
-/// under which every claim the input made still holds. A subset of a sorted
-/// sequence is sorted, the time index still indexes what is left, and dropping
-/// rows cannot merge two group-major runs. It also never drops a column, so no
-/// key can lose its name: `distinct { a, b }` projects first, in a separate node
-/// whose own derivation applies the presence rule, so by the time this runs no
-/// column is going anywhere and keep-all is the honest fate.
-auto distinct_properties(const Table& input) -> TableProperties {
-    return TableProperties::derive(
-        table_properties_of(input), [](const std::string& name) { return KeyFate::kept(name); },
-        RowTransform::Subset);
-}
-
-auto distinct_table(const Table& input) -> std::expected<Table, std::string> {
-    if (input.columns.empty()) {
-        Table output = input;
-        apply_table_properties(output, distinct_properties(input));
-        return output;
-    }
-    std::size_t rows = input.rows();
-    Table output;
-    output.columns.reserve(input.columns.size());
-    for (const auto& entry : input.columns) {
-        output.add_column(entry.name, make_empty_like(*entry.column));
-    }
-    for (auto& entry : output.columns) {
-        std::visit([&](auto& col) { col.reserve(rows); }, *entry.column);
-    }
-
-    robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen;
-    seen.reserve(rows);
-
-    for (std::size_t row = 0; row < rows; ++row) {
-        Key key;
-        key.values.reserve(input.columns.size());
-        for (const auto& entry : input.columns) {
-            push_key_value(key, entry, row);
-        }
-        if (!seen.insert(std::move(key)).second) {
-            continue;
-        }
-        for (std::size_t col = 0; col < input.columns.size(); ++col) {
-            append_value(output.mutable_column(col), *input.columns[col].column, row);
-        }
-    }
-    apply_table_properties(output, distinct_properties(input));
-    return output;
-}
-
 // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
@@ -469,7 +419,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return distinct_table(child.value());
+            return distinct_table(child.value(), exec);
         }
         case ir::NodeKind::Order: {
             const auto& order = static_cast<const ir::OrderNode&>(node);

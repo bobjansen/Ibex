@@ -9166,6 +9166,19 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
+auto distinct_table(const Table& input, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    // I4 convergence: one implementation, reached through both shapes. The
+    // whole-table signature survives; the whole-table dedup loop does not.
+    //
+    // The source copy is shallow — a `Table` holds shared column handles — so
+    // this costs a vector of names and pointers, not the data. `distinct` on an
+    // empty column list still works: the operator passes such a chunk straight
+    // through, which is what the old `columns.empty()` special case did.
+    auto source = make_table_source(input);
+    return materialize_operator(std::make_unique<ChunkedDistinctOperator>(std::move(source), exec));
+}
+
 namespace {
 
 template <typename Fn>

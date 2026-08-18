@@ -54,6 +54,12 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 - `window` requires TimeFrame operand
 
 ## Benchmarking Notes
+- **Read [MEASURING.md](MEASURING.md) before any performance or verification
+  work.** It covers the failure modes that actually cost time here: starting
+  with the big harness instead of a one-second `IBEX_PROFILE_OPERATORS` run,
+  sweeping one dimension when the bug needs two, tests that cover nothing
+  because the path is unreachable, `pkill` matching its own shell, and reporting
+  a dead run as if it were a result.
 - When a user requests a benchmark command, run that command directly with any
   requested resource caps and wait for it to finish. Do not add backgrounding,
   ad-hoc wrappers, or substitute workflows merely to work around agent-tool

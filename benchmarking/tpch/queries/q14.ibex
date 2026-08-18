@@ -17,15 +17,12 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
-    filter l_shipdate >= date"1995-09-01" && l_shipdate < date"1995-10-01"
-][select { l_partkey, l_extendedprice, l_discount }];
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet")[
-    select { l_partkey = p_partkey, p_type }
-];
-
-let result = (lineitem join part on l_partkey)[
+// Match Polars: join part and lineitem, then apply the ship-date predicate.
+let result = (part join lineitem on { p_partkey = l_partkey })[
+    filter l_shipdate >= date"1995-09-01" && l_shipdate < date"1995-10-01",
     select {
         promo_revenue = 100.0
             * sum(l_extendedprice * (1.0 - l_discount) * Int64(like(p_type, "PROMO%")))

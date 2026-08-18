@@ -39,19 +39,22 @@ let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet
 let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
 let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
 
-let german_supply = (
+let q1 = (
     partsupp_raw[select { ps_partkey, ps_suppkey, ps_supplycost, ps_availqty }]
     join supplier_raw[select { ps_suppkey = s_suppkey, s_nationkey }] on ps_suppkey
-    join nation_raw[filter n_name == "GERMANY"][select { s_nationkey = n_nationkey }] on s_nationkey
-);
+    join nation_raw on { s_nationkey = n_nationkey }
+)[filter n_name == "GERMANY"];
 
-let result = german_supply[
+let q2 = q1[
+    select { tmp = sum(ps_supplycost * ps_availqty) * 0.0001 }
+];
+
+let result = (q1[
     select { value = sum(ps_supplycost * ps_availqty) },
     by { ps_partkey }
-][
-    filter value > scalar(
-        german_supply[select { threshold = sum(ps_supplycost * ps_availqty) * 0.0001 }]
-    )
+]
+cross join q2)[filter value > tmp][
+    select { ps_partkey, value }
 ][
     order { value desc }
 ];

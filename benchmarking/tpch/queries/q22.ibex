@@ -36,16 +36,17 @@ let in_scope = customer_raw[update { cntrycode = substring(c_phone, 0, 2) }][
         || cntrycode == "29" || cntrycode == "30" || cntrycode == "18" || cntrycode == "17"
 ][select { c_custkey, cntrycode, c_acctbal }];
 
-let with_orders = orders_raw[select { c_custkey = o_custkey }];
+let q2 = in_scope[filter c_acctbal > 0.0][
+    select { avg_acctbal = mean(c_acctbal) }
+];
+let q3 = orders_raw[select { c_custkey = o_custkey, o_custkey }][distinct { c_custkey, o_custkey }];
 
-let result = (
-    in_scope[
-        filter c_acctbal > scalar(
-            in_scope[filter c_acctbal > 0.0, select { avg_balance = mean(c_acctbal) }]
-        )
-    ]
-    anti join with_orders on c_custkey
-)[
+let result = ((in_scope left join q3 on { c_custkey })[
+    filter is_null(o_custkey)
+]
+cross join q2)[
+    filter c_acctbal > avg_acctbal
+][
     select { numcust = count(), totacctbal = sum(c_acctbal) },
     by { cntrycode }
 ][

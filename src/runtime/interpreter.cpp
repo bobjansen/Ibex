@@ -782,6 +782,10 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!right) {
                 return std::unexpected(right.error());
             }
+            if (is_streamable_inner_join(join)) {
+                return inner_join_table(left.value(), right.value(), join.keys(), join.suffix(),
+                                        join.pending_order(), exec);
+            }
             const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
             return join_table_impl(left.value(), right.value(), join.kind(), join.keys(), pred,
                                    scalars, compute_mask, join.suffix(), join.pending_order(),

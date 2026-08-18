@@ -1144,6 +1144,30 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string>;
 
+/// Whether this join is the exact semantic subset `ChunkedInnerJoinOperator`
+/// implements: inner, no predicate, one key, `nulls never`, no `expect`
+/// assertion, `take` all.
+///
+/// One definition, two callers — `build_operator` picking the streaming path and
+/// `interpret_node` picking the whole-table adapter. They were written out
+/// separately at first and were character-identical, which is the I4 failure
+/// mode in miniature: a six-clause predicate duplicated across two files, where
+/// a later clause added to one copy silently routes a join the operator cannot
+/// handle. Collapsing the implementation while leaving the gate duplicated would
+/// have replaced one drift hazard with a subtler one.
+[[nodiscard]] auto is_streamable_inner_join(const ir::JoinNode& join) -> bool;
+
+/// Whole-table single-key inner join, implemented over
+/// `ChunkedInnerJoinOperator`. Callers must check `is_streamable_inner_join`
+/// first; richer join semantics remain in `join_table_impl`, which is the
+/// implementation of those semantics rather than a fallback.
+[[nodiscard]] auto inner_join_table(const Table& left, const Table& right,
+                                    const std::vector<ir::JoinKey>& keys,
+                                    const ir::JoinSuffixPolicy& suffix,
+                                    const std::vector<ir::OrderKey>& pending_order,
+                                    const ExecutionContext& exec)
+    -> std::expected<Table, std::string>;
+
 // filter.cpp — vectorized predicate evaluation and filtering.
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const Table& table,
                                 const ScalarRegistry* scalars, RowRange rows)

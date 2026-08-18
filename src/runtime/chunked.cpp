@@ -4011,6 +4011,11 @@ class ChunkedInnerJoinOperator final : public Operator {
             Table left_chunk;
             if (use_materialized_left_) {
                 if (left_materialized_drained_) {
+                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                        auto schema = std::move(*empty_schema_);
+                        empty_schema_.reset();
+                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                    }
                     return std::optional<Chunk>{};
                 }
                 left_materialized_drained_ = true;
@@ -4022,6 +4027,11 @@ class ChunkedInnerJoinOperator final : public Operator {
                     return std::unexpected(std::move(chunk_res.error()));
                 }
                 if (!chunk_res.value().has_value()) {
+                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                        auto schema = std::move(*empty_schema_);
+                        empty_schema_.reset();
+                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                    }
                     return std::optional<Chunk>{};
                 }
                 left_chunk = chunk_to_table(std::move(*chunk_res.value()));
@@ -4031,8 +4041,13 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return std::unexpected(std::move(out.error()));
             }
             if (out->rows() == 0) {
+                // Keep the planned empty table as a schema carrier. A join
+                // with no matches still has its left and right output columns;
+                // without this, a materializing sink sees no chunks at all.
+                empty_schema_ = std::move(*out);
                 continue;
             }
+            emitted_nonempty_ = true;
             return std::optional<Chunk>{table_to_chunk(std::move(*out))};
         }
     }
@@ -5226,15 +5241,28 @@ class ChunkedInnerJoinOperator final : public Operator {
                          std::size_t total, bool li_identity = false, bool ri_identity = false)
         -> std::expected<Table, std::string> {
         Table output;
-        if (total == 0) {
-            return output;
-        }
         if (!right_emit_ready_) {
             if (auto ready = setup_right_emit_schema(left_side); !ready.has_value()) {
                 return std::unexpected(std::move(ready.error()));
             }
         }
         output.columns.reserve(left_side.columns.size() + right_emit_idx_.size());
+
+        // A stream with no matches still has a schema. Returning a bare empty
+        // table here used to be harmless only because the regular chunked path
+        // normally has another node to provide one; the whole-table adapter
+        // must be equivalent to join_table_impl even for an empty result.
+        if (total == 0) {
+            for (std::size_t i = 0; i < left_side.columns.size(); ++i) {
+                output.add_column(std::string(left_emit_names_[i]),
+                                  make_empty_like(*left_side.columns[i].column));
+            }
+            for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
+                output.add_column(std::string(right_emit_names_[e]),
+                                  make_empty_like(*right_.columns[right_emit_idx_[e]].column));
+            }
+            return output;
+        }
 
         // Gather a batch of columns in ONE fan-out. Calling `gather_column` per
         // column instead lets each call fan out its own rows, which submits and
@@ -5421,6 +5449,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     std::optional<Table> left_materialized_;
     bool left_materialized_drained_ = false;
     bool use_materialized_left_ = false;
+    std::optional<Table> empty_schema_;
+    bool emitted_nonempty_ = false;
 
     // Swapped mode: materialized left held for later gather.
     std::optional<Table> left_table_;
@@ -9179,6 +9209,28 @@ auto distinct_table(const Table& input, const ExecutionContext& exec)
     return materialize_operator(std::make_unique<ChunkedDistinctOperator>(std::move(source), exec));
 }
 
+auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
+    // `nulls equal` goes to the materialized join, which implements the policy.
+    // The streaming operators hash and probe on their own and would each need
+    // the same null tagging; sending the opt-in case to the one implementation
+    // that has it keeps a single definition of the semantics.
+    return join.kind() == ir::JoinKind::Inner && !join.predicate().has_value() &&
+           join.keys().size() == 1 && join.null_match() == ir::NullMatch::Never &&
+           !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
+}
+
+auto inner_join_table(const Table& left, const Table& right, const std::vector<ir::JoinKey>& keys,
+                      const ir::JoinSuffixPolicy& suffix,
+                      const std::vector<ir::OrderKey>& pending_order, const ExecutionContext& exec)
+    -> std::expected<Table, std::string> {
+    // I4 convergence: keep the materialized signature used by interpret_node,
+    // but run the same hash join that build_operator selects for this exact
+    // semantic subset. Table sources copy only their column handles.
+    auto source = make_table_source(left);
+    return materialize_operator(std::make_unique<ChunkedInnerJoinOperator>(
+        std::move(source), right, &keys, exec, suffix, &pending_order));
+}
+
 namespace {
 
 template <typename Fn>
@@ -11938,11 +11990,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // one implementation that has it keeps a single definition of the
         // semantics -- and leaves this hot path bit-for-bit unchanged for every
         // join that does not ask for it.
-        const bool streamable_inner =
-            join.kind() == ir::JoinKind::Inner && !join.predicate().has_value() &&
-            join.keys().size() == 1 && join.null_match() == ir::NullMatch::Never &&
-            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
-        if (streamable_inner) {
+        if (is_streamable_inner_join(join)) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             auto left_op =

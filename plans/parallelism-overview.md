@@ -1,7 +1,7 @@
 # Multi-core execution: how it actually works
 
-Status: descriptive, written 2026-08-17 against `main` @ `5d8b442`. This is not
-a plan — it is the map of the machinery the plans keep adding to
+Status: descriptive, updated 2026-08-18 in the worktree after `6f0a03e`. This is
+not a plan — it is the map of the machinery the plans keep adding to
 ([runtime-multithreading-plan.md](runtime-multithreading-plan.md),
 [pipelined-execution-plan.md](pipelined-execution-plan.md),
 [beat-polars-plan.md](beat-polars-plan.md)). Part 1 describes the design in the
@@ -321,10 +321,13 @@ Three different relationships hide under one name:
 * **Delegating** — the chunked operator buffers and calls the whole-table
   function: `order_table`, `filter_table` (+ `_range`/`_limit`), `update_table`,
   `join_table_impl`. Not duplication; the whole-table function is the kernel.
-* **Fully reimplemented** — aggregate, distinct, inner join, and the sort's
-  radix fast path. `aggregate_table` appears in `chunked.cpp` only in a comment.
-  This is the real duplication.
-* **Escape hatch** — the chunked aggregate declines Median/quantile and the
+* **Fully reimplemented** — aggregate, distinct, and inner join. The sort was
+  listed here in an earlier inventory, but that is stale: `ChunkedOrderOperator`
+  concatenates an unsorted stream and calls `order_table`, while
+  `radix_sort_u64_asc` lives once in `sort.cpp` and is shared by rank. There is
+  no second order/radix implementation to collapse. `aggregate_table` appears
+  in `chunked.cpp` only in a comment. This is the real duplication.
+* **Escape hatch** — the chunked aggregate declines Median/quantile/EWMA and the
   whole node runs via `interpret_node` -> `aggregate_table`. This is what lets
   the streaming engine be incomplete, and it is why the aggregate is the LAST
   operator that can be collapsed, not the first.
@@ -348,8 +351,9 @@ the benchmark runs.
 becomes a `TableSource` run through the chunked operator and materialized.
 Sequencing constraint: an operator can only be collapsed once its chunked
 version is COMPLETE, because collapsing removes the decline-and-fall-back path.
-So distinct / inner join / the sort's radix path first, and the aggregate only
-after the chunked one covers Median and quantile.
+So distinct / inner join first, and the aggregate only after the chunked one
+covers Median, quantile, and EWMA. The former "sort's radix path" step is already
+converged, as above.
 
 The duplication tax on the task-scheduler work is avoidable without doing any
 of this first: port the chunked operators to the new primitive and leave the
@@ -400,10 +404,41 @@ Subset` keeping every column, and `Subset` "derives exactly like `Preserve`", so
 the deleted `distinct_properties` was the identity the operator already relies on
 by passing properties through. Added the first coverage this path has ever had.
 
-Remaining, in order: **inner join**, **the sort's radix fast path**, then
-**aggregate** — the last one only once the chunked aggregate covers Median and
-quantile, since collapsing removes the decline-and-fall-back path that lets the
-streaming engine be incomplete.
+**Inner join — COLLAPSED** (worktree after `6f0a03e`). The constrained
+single-key, predicate-free, `nulls never`, unconstrained inner join now keeps
+the whole-table signature but delegates to `ChunkedInnerJoinOperator`; joins
+with predicates, multiple keys, `nulls equal`, `expect`, or `take` remain in
+`join_table_impl`, which is the implementation of those richer semantics.
+
+The fallback test uses the same single-statement shape as distinct:
+`(lhs join rhs on k)[select { m = median(v) }]`. It caught an independent
+chunked bug: an all-unmatched join emitted no morsel, so a materializing sink
+lost the planned output schema. The operator now retains an empty schema carrier
+until EOF. This is required for the adapter to be equivalent to
+`join_table_impl`, not merely a test convenience — and since it changes the
+PRODUCTION operator rather than only the adapter, it was checked against all 22
+PDS-H outputs, which are byte-identical.
+
+The semantic gate is `is_streamable_inner_join`, called by both
+`build_operator` and `interpret_node`. It was written out twice at first, once
+per file, character-identical — the I4 failure mode in miniature. Collapsing the
+implementation while leaving a six-clause predicate duplicated across two files
+would have swapped one drift hazard for a subtler one: a clause added to one
+copy routes a join the operator cannot handle, and nothing would say so.
+
+Release check, against `6f0a03e`, used **three interleaved base/target repeats**
+with two warmups and five timed iterations, `IBEX_CORES=2`, and `taskset -c 2`.
+The direct joins were neutral-to-faster: `inner_join_symbol` **-0.27%**
+(8.786 → 8.762 ms) and `inner_join_user` **-2.45%** (12.259 → 11.959 ms).
+The derived join workloads were `join_filter_rank` **-2.91%** (27.292 →
+26.497 ms) and `join_update_group` **+2.43%** (14.591 → 14.945 ms), the latter
+within the run-level variation. `IBEX_THREADS` is obsolete and was not used in
+this corrected run.
+
+Remaining: **aggregate** — only once the chunked aggregate covers Median,
+quantile, and EWMA, since collapsing removes the decline-and-fall-back path that lets the
+streaming engine be incomplete. The sort/radix item was struck after tracing
+the current code: it already has the intended single implementation.
 
 **I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
 serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked
@@ -671,8 +706,9 @@ first-occurrence group ordering — was considered and REJECTED; see below.)
    scheduler to come after — and it is the gate on item 9, because the aggregate
    cannot be parallelized further while four grouping implementations disagree
    about which one runs. Order within it is set by completeness:
-   ~~distinct~~ (done, `74f6e32`) / inner join / sort's radix path, then the
-   aggregate once the chunked one covers Median and quantile.
+   ~~distinct~~ (done, `74f6e32`) / ~~inner join~~ (done, worktree after
+   `6f0a03e`) / ~~sort's radix path~~ (already converged; no duplicate), then
+   the aggregate once the chunked one covers Median, quantile, and EWMA.
 9. **Create parallel work, targeted at the five queries holding half the idle
    machine.** q13, q21, q18, q10, q20 account for 3113 of 6486ms of unqueued
    pool time — 48% of the waste in 22.7% of the queries. Attack per operator,

@@ -13954,3 +13954,40 @@ TEST_CASE("distinct beneath a declined aggregate runs the collapsed whole-table 
         CHECK(col[1] == Catch::Approx(1.0));
     }
 }
+
+// Like distinct above, this needs one statement: `median` declines the
+// chunked aggregate and therefore makes its join child reach interpret_node.
+// A `let joined = ...` would materialize the join first and never exercise the
+// whole-table adapter this test is meant to pin.
+TEST_CASE("inner join beneath a declined aggregate runs the collapsed whole-table path",
+          "[interpreter][join][chunked]") {
+    runtime::TableRegistry registry;
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2, 2});
+    left.add_column("v", Column<std::int64_t>{10, 20, 30});
+    registry.emplace("lhs", std::move(left));
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{2, 2, 3});
+    right.add_column("score", Column<std::int64_t>{100, 200, 300});
+    registry.emplace("rhs", std::move(right));
+
+    auto ir = require_ir("(lhs join rhs on k)[select { m = median(v) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 1);
+    const auto& col = std::get<Column<double>>(*result->find("m"));
+    // The join has four rows: v is {20, 20, 30, 30}.
+    CHECK(col[0] == Catch::Approx(25.0));
+
+    // No matches likewise reach the adapter in the fallback shape. The
+    // chunked join must retain its schema despite having no non-empty morsel.
+    runtime::Table no_match;
+    no_match.add_column("k", Column<std::int64_t>{99});
+    no_match.add_column("other", Column<std::int64_t>{7});
+    registry.emplace("none", std::move(no_match));
+    auto empty_ir = require_ir("(lhs join none on k)[select { m = median(v) }];");
+    auto empty = runtime::interpret(*empty_ir, registry);
+    REQUIRE(empty.has_value());
+    REQUIRE(empty->rows() == 0);
+    CHECK(empty->find("m") != nullptr);
+}

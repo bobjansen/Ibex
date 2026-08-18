@@ -5,6 +5,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
+#include <ibex/ir/predicate_pushdown_pass.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -176,6 +177,7 @@ auto make_default_pass_manager() -> PassManager {
     PassManager manager;
     manager.add_pass(std::make_unique<DeadPurePreamblePass>());
     manager.add_pass(std::make_unique<CanonicalizePass>());
+    manager.add_pass(make_predicate_pushdown_pass());
     manager.add_pass(std::make_unique<PendingOrderPass>());
     return manager;
 }

@@ -435,10 +435,57 @@ The derived join workloads were `join_filter_rank` **-2.91%** (27.292 →
 within the run-level variation. `IBEX_THREADS` is obsolete and was not used in
 this corrected run.
 
-Remaining: **aggregate** — only once the chunked aggregate covers Median,
-quantile, and EWMA, since collapsing removes the decline-and-fall-back path that lets the
-streaming engine be incomplete. The sort/radix item was struck after tracing
-the current code: it already has the intended single implementation.
+**Aggregate — NOT a collapse, and the entry above was wrong to imply it is.**
+`aggregate_table` is not near-dead fallback code the way `distinct_table` and the
+whole-table join were: a median aggregate is itself the *declining* node, so it
+runs at top level for every median/quantile/EWMA query. Collapsing it means
+implementing those three in a streaming operator — a median needs every value of
+a group retained, which the operator's fixed-size slots deliberately avoid, and
+EWMA's row-order coupling fights the partitioned discovery that makes the chunked
+aggregate fast. And it would not even remove the duplication: a node mixing
+`median(x)` with `sum(y)` needs both in ONE pass, so `aggregate_table` keeps its
+sum/mean/min/max code regardless.
+
+The escape hatch is therefore design, not debt, and I4 is **complete at 2 of 3**.
+The goal was zero DUPLICATED implementations, not zero whole-table ones.
+
+### What looking for the third collapse actually found
+
+Chasing "which grouping implementation should survive" turned up a hash
+pathology instead (`6215c88`). `median(v) by {a, b}` over 1M rows: **517ms at
+9800 groups, 20ms at 5000**, same row count. Not the aggregate, not the group
+count — the key hash.
+
+`hash_key_row` combines with boost's `hash_combine` over `std::hash<int64_t>`
+(the identity on libstdc++) and never finalizes. `hash_combine` does not diffuse
+into the low bits, and `KeyRowIndex` masks the low bits to pick a slot, then
+probes linearly. For two small integer keys the result is nearly `b + (a << 6)`,
+a linear function of the key, so probing degenerates into one cluster. One
+`fmix64` fixes it: **12.9x**, and the 6000→9800 ramp (29/102/258/411/523ms)
+flattens to 31/31/33/43ms.
+
+It hid because it needed **both** multiple keys and a particular table size. A
+single key was always fine — dense integers map to consecutive slots, the best
+case rather than the worst, 100k groups in 67ms. Two keys at 5000 groups in an
+8192-slot table were fine; the same load factor at 9800 in a 16384-slot table was
+not. Different mask width, different aliasing. Any sweep that varied only one of
+those two dimensions would have concluded there was no bug.
+
+Two lessons worth keeping:
+
+* **Three copies of one hash, and the drift bit immediately.** Adding the
+  finalizer to `hash_key_row` and `hash_key_value` left `chunked.cpp`'s
+  `mix_one` behind, and a test failed within one run with a duplicated group —
+  the exact failure the header comment predicts in as many words. The same
+  combine also feeds `multi_cat_find_or_insert`, the chunked aggregate's
+  open-addressed index over small dense categorical codes, which is the ideal
+  input for the pathology; it is finalized too. This is the I4 thesis in one
+  incident: the hazard is not that two implementations exist, it is that a
+  constant is written out more than once.
+* **Two hypotheses were measured and discarded first** — per-group heap
+  indirection (flattening the slot array changed nothing) and group count itself
+  (a single key handles 100k groups in 67ms). Both were plausible and both were
+  wrong, and each cost one build.
 
 **I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
 serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked

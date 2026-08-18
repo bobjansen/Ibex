@@ -3241,8 +3241,16 @@ class ChunkedDistinctOperator final : public Operator {
     /// One column's raw value hashed exactly as `hash_key_row` hashes a
     /// non-null single-column row -- what every hash `key_index_` stores must
     /// use, or a later chunk's probe would miss a migrated group's slot.
+    ///
+    /// Built from the SAME two helpers `hash_key_row` uses rather than
+    /// open-coding the arithmetic, because open-coding it is what broke: adding
+    /// a final avalanche to the two functions in `interpreter_internal.hpp` left
+    /// this third copy behind, and the migrated groups promptly duplicated
+    /// themselves. Expressed this way the three cannot disagree again.
     static auto mix_one(std::uint64_t value) -> std::uint64_t {
-        return value + 0x9e3779b97f4a7c15ULL;
+        std::uint64_t seed = 0;
+        key_hash_mix(seed, value);
+        return key_hash_finalize(seed);
     }
 
     /// Seed `group_order_`/`key_index_` with every value a single-column typed
@@ -6933,10 +6941,16 @@ class ChunkedAggregateOperator final : public Operator {
         -> std::uint64_t {
         std::uint64_t seed = 0;
         for (std::size_t i = 0; i < n; ++i) {
-            const auto value = std::hash<std::int64_t>{}(static_cast<std::int64_t>(codes[i]));
-            seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+            key_hash_mix(seed, std::hash<std::int64_t>{}(static_cast<std::int64_t>(codes[i])));
         }
-        return seed;
+        // Finalized for the same reason `hash_key_row` is: this index masks the
+        // LOW bits to pick a slot and probes linearly, and the combine above
+        // never diffuses into them. Categorical codes are small dense integers,
+        // which is precisely the input that makes the unfinalized combine a
+        // near-linear function of the key and turns the probe into one long
+        // cluster. Nothing outside this index consumes the value, so unlike the
+        // three in `interpreter_internal.hpp` it has no agreement to maintain.
+        return key_hash_finalize(seed);
     }
 
     [[nodiscard]] auto codes_of_group(std::size_t group, std::size_t n_keys) const

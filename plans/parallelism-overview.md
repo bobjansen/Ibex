@@ -449,18 +449,33 @@ sum/mean/min/max code regardless.
 The escape hatch is therefore design, not debt, and I4 is **complete at 2 of 3**.
 The goal was zero DUPLICATED implementations, not zero whole-table ones.
 
-**Aggregate measurement (2026-08-18).** Per `MEASURING.md`, this was a small
-synthetic profile before any suite run: 1M `Double` rows, `median(v)`, about
-9,800 groups, `IBEX_PROFILE_OPERATORS=1`, and `IBEX_CORES={1,2,4,8}` pinned to
-the matching CPU sets. Two key shapes were required. One key measured
-35.4 / 34.4 / 38.4 / 29.5 ms; two keys measured 52.1 / 56.9 / 47.8 / 44.8 ms.
-Thus eight cores buy only 1.20x and 1.16x respectively, not a scaling result
-worth extrapolating from a suite geomean. An independent `IBEX_PARALLEL=0`
-versus enabled run at eight cores was 49.5 versus 46.9 ms on the two-key case.
-The profile agrees: only 12.7 ms of pool work, one barrier, and roughly 1,100%
-profile occupancy across eight workers. The next aggregate change must target
-the serial group/value-collection path; it should not be a generic scheduler or
-thread-count adjustment.
+**Superseded synthetic aggregate measurement (2026-08-18).** An earlier
+median microbenchmark was useful only for finding the two-key hash bug below.
+It did not seed its random input, and it measures the deliberately whole-table
+Median path rather than the standard aggregates responsible for item 9. It is
+not evidence for an item-9 implementation decision.
+
+**Item-9 aggregate triage (2026-08-18).** Fresh `IBEX_PROFILE_OPERATORS=1`
+profiles of the actual PDS-H scripts, `build-release`, `IBEX_CORES=8`, identify
+one first target rather than three:
+
+| query | aggregate shape | result | conclusion |
+|---|---|---|---|
+| q13 | `count(o_orderkey)` by customer, then 42-bucket count | first aggregate: 18.9ms caller + 44.6ms pool work | already uses parallel discovery; the 42-row second aggregate is correctly serial |
+| q18 | `sum(l_quantity)` by `l_orderkey`, 1.5M groups | 85.7ms caller, 227.5ms pool work, 26 barriers | first aggregate target |
+| q10 | seven-key sum over 37,967 input rows | 20.6ms caller, no pool tasks | below the 262k partition-discovery gate; forcing fan-out is not credible |
+
+The q18 aggregate profile over `IBEX_CORES={1,2,4,8}` was respectively
+136.2 / 143.8 / 111.0 / 85.7ms caller time (with 0 / 186.9 / 217.5 /
+227.5ms pool work). The single 2-core run is noisy and slightly worse than
+one core; the useful result is the shallow 1-to-8 improvement, only 1.59x.
+Its remaining caller time contains the deterministic first-occurrence merge
+and output/control work. The merge is independently sized at about 26ms at
+the larger 3M-group q18 case, so deleting it cannot by itself explain the
+whole 86ms. The next experiment must split this node-level timer before a
+radix rewrite: measure discovery, the ordered merge, slot allocation,
+accumulation, and output emission separately. Do not lower q10's gate or tune
+thread counts on this evidence.
 
 ### What looking for the third collapse actually found
 
@@ -763,9 +778,9 @@ first-occurrence group ordering — was considered and REJECTED; see below.)
    raises occupancy far enough that queues actually build.
 8. **I4** — collapse the duplicated implementations, keeping the whole-table
    signatures. **Promoted** from after the scheduler, since there is no longer a
-   scheduler to come after — and it is the gate on item 9, because the aggregate
-   cannot be parallelized further while four grouping implementations disagree
-   about which one runs. Order within it is set by completeness:
+   scheduler to come after. It is no longer a gate on item 9: the standard
+   aggregates in q13/q18/q10 already use the chunked implementation. Order
+   within it is set by completeness:
    ~~distinct~~ (done, `74f6e32`) / ~~inner join~~ (done, worktree after
    `6f0a03e`) / ~~sort's radix path~~ (already converged; no duplicate), then
    the aggregate once the chunked one covers Median, quantile, and EWMA.

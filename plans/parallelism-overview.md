@@ -697,6 +697,29 @@ time and 58.7ms pool work are the dominant block. Moving the predicate into
 pass 3 would duplicate work rather than remove it. Idea 4 is therefore closed;
 the next useful change must reduce pair-group discovery itself.
 
+### q20 shape correction and remeasurement (2026-08-18)
+
+The original q20 fixture was not the same relational shape as the Polars plan:
+it used two semi joins and a correlated `scalar(...)` expression. That made the
+comparison conflate execution strategy with query shape. The fixture now follows
+the explicit stages used by Polars: a filtered line-item aggregate by
+`(l_partkey, l_suppkey)`, a filtered nation and supplier/nation join, then the
+part → partsupp → aggregate → supplier join chain. The result remains byte-
+correct (`q20: OK`).
+
+On the SF-1 fixture, whole-script averages (warmup 2, 8 timed iterations) were:
+
+| cores | previous shape | Polars-shaped fixture | change |
+|---:|---:|---:|---:|
+| 1 | 143.34ms | 127.82ms | -10.8% |
+| 2 | 126.16ms | 108.02ms | -14.4% |
+| 4 | 91.39ms | 85.86ms | -6.1% |
+| 8 | 85.66ms | 81.38ms | -5.0% |
+
+This removes a shape artifact, but does not change the aggregate conclusion:
+the two-key group discovery remains the dominant q20 cost and the scaling curve
+still flattens between four and eight cores.
+
 ### Pass-3 software-pipelined prefetch, second attempt (2026-08-18)
 
 The earlier "Pass-3 software prefetch check" above patched the vendored

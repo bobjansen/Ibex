@@ -2,10 +2,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Bob Jansen
 
-"""Time the 9 implemented PDS-H queries against Polars, reading the same
-Parquet tables benchmarking/tpch/queries/*.ibex use. Mirrors Ibex's own
-query semantics (same filters, join structure, and standard TPC-H
-qualification parameters) so the comparison is apples-to-apples.
+"""Time the 22 PDS-H queries against Polars, reading the same Parquet
+tables benchmarking/tpch/queries/*.ibex use.
+
+Each query body below is a direct, shape-for-shape port of
+polars-benchmark's queries/polars/q*.py (the reference "idiomatic Polars"
+solution the PDS-H benchmark rules were written for): joins in the
+original table order, filters applied where the reference applies them
+(usually after the join, not hand-pushed before it), no manual column
+pruning or join reordering beyond what the reference itself does. That
+keeps this comparison honest under the PDS-H rules ("no inserting new
+operations, e.g. no pruning a table before a join", "joins may not be
+reordered manually") and lets Polars' own lazy optimizer do the pushdown
+work — which is the whole point of comparing against it. Do not
+reintroduce hand-tuned .select()/.filter() placement here; that produced
+a comparison against ourselves, not against Polars. If a query needs a
+non-trivial rewrite (e.g. a correlated subquery), the rewrite should
+match what the reference does, not what looks fastest.
 
 Usage:
   uv run benchmarking/tpch/bench_polars.py [--warmup N] [--iters N] [--out path]
@@ -32,42 +45,49 @@ def q01() -> pl.LazyFrame:
     return (
         scan("lineitem")
         .filter(pl.col("l_shipdate") <= date(1998, 9, 2))
-        .group_by(["l_returnflag", "l_linestatus"])
+        .group_by("l_returnflag", "l_linestatus")
         .agg(
-            sum_qty=pl.sum("l_quantity"),
-            sum_base_price=pl.sum("l_extendedprice"),
-            sum_disc_price=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum(),
-            sum_charge=(
-                pl.col("l_extendedprice") * (1 - pl.col("l_discount")) * (1 + pl.col("l_tax"))
-            ).sum(),
-            avg_qty=pl.mean("l_quantity"),
-            avg_price=pl.mean("l_extendedprice"),
-            avg_disc=pl.mean("l_discount"),
-            count_order=pl.len(),
+            pl.sum("l_quantity").alias("sum_qty"),
+            pl.sum("l_extendedprice").alias("sum_base_price"),
+            (pl.col("l_extendedprice") * (1.0 - pl.col("l_discount")))
+            .sum()
+            .alias("sum_disc_price"),
+            (
+                pl.col("l_extendedprice")
+                * (1.0 - pl.col("l_discount"))
+                * (1.0 + pl.col("l_tax"))
+            )
+            .sum()
+            .alias("sum_charge"),
+            pl.mean("l_quantity").alias("avg_qty"),
+            pl.mean("l_extendedprice").alias("avg_price"),
+            pl.mean("l_discount").alias("avg_disc"),
+            pl.len().alias("count_order"),
         )
-        .sort(["l_returnflag", "l_linestatus"])
+        .sort("l_returnflag", "l_linestatus")
     )
 
 
 def q02() -> pl.LazyFrame:
-    # The correlated subquery, decorrelated the same way Ibex lowers it: the
-    # minimum European supply cost per part, computed once and joined back.
-    european_supply = (
-        scan("partsupp")
+    var1 = 15
+    var2 = "BRASS"
+    var3 = "EUROPE"
+
+    q1 = (
+        scan("part")
+        .join(scan("partsupp"), left_on="p_partkey", right_on="ps_partkey")
         .join(scan("supplier"), left_on="ps_suppkey", right_on="s_suppkey")
         .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
         .join(scan("region"), left_on="n_regionkey", right_on="r_regionkey")
-        .filter(pl.col("r_name") == "EUROPE")
+        .filter(pl.col("p_size") == var1)
+        .filter(pl.col("p_type").str.ends_with(var2))
+        .filter(pl.col("r_name") == var3)
     )
-    minimum_cost = european_supply.group_by("ps_partkey").agg(
-        min_supplycost=pl.min("ps_supplycost")
-    )
+
     return (
-        scan("part")
-        .filter((pl.col("p_size") == 15) & pl.col("p_type").str.ends_with("BRASS"))
-        .join(european_supply, left_on="p_partkey", right_on="ps_partkey")
-        .join(minimum_cost, left_on="p_partkey", right_on="ps_partkey")
-        .filter(pl.col("ps_supplycost") == pl.col("min_supplycost"))
+        q1.group_by("p_partkey")
+        .agg(pl.min("ps_supplycost"))
+        .join(q1, on=["p_partkey", "ps_supplycost"])
         .select(
             "s_acctbal",
             "s_name",
@@ -79,7 +99,7 @@ def q02() -> pl.LazyFrame:
             "s_comment",
         )
         .sort(
-            ["s_acctbal", "n_name", "s_name", "p_partkey"],
+            by=["s_acctbal", "n_name", "s_name", "p_partkey"],
             descending=[True, False, False, False],
         )
         .head(100)
@@ -87,457 +107,567 @@ def q02() -> pl.LazyFrame:
 
 
 def q03() -> pl.LazyFrame:
-    customer = scan("customer").filter(pl.col("c_mktsegment") == "BUILDING").select("c_custkey")
-    orders = (
-        scan("orders")
-        .filter(pl.col("o_orderdate") < date(1995, 3, 15))
-        .select(["o_orderkey", "o_custkey", "o_orderdate", "o_shippriority"])
-    )
-    lineitem = (
-        scan("lineitem")
-        .filter(pl.col("l_shipdate") > date(1995, 3, 15))
-        .select(["l_orderkey", "l_extendedprice", "l_discount"])
-    )
+    var1 = "BUILDING"
+    var2 = date(1995, 3, 15)
+
     return (
-        customer.join(orders, left_on="c_custkey", right_on="o_custkey")
-        .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
-        .group_by(["o_orderkey", "o_orderdate", "o_shippriority"])
-        .agg(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
-        .sort(["revenue", "o_orderdate"], descending=[True, False])
-        .head(10)
-        .select(
-            l_orderkey="o_orderkey", revenue="revenue",
-            o_orderdate="o_orderdate", o_shippriority="o_shippriority",
+        scan("customer")
+        .filter(pl.col("c_mktsegment") == var1)
+        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .filter(pl.col("o_orderdate") < var2)
+        .filter(pl.col("l_shipdate") > var2)
+        .with_columns(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("revenue")
         )
+        .group_by("o_orderkey", "o_orderdate", "o_shippriority")
+        .agg(pl.sum("revenue"))
+        .select(
+            pl.col("o_orderkey").alias("l_orderkey"),
+            "revenue",
+            "o_orderdate",
+            "o_shippriority",
+        )
+        .sort(by=["revenue", "o_orderdate"], descending=[True, False])
+        .head(10)
     )
 
 
 def q04() -> pl.LazyFrame:
-    # SQL's correlated `exists` is a semi join, which is how Ibex writes it too.
-    orders = scan("orders").filter(
-        (pl.col("o_orderdate") >= date(1993, 7, 1)) & (pl.col("o_orderdate") < date(1993, 10, 1))
-    )
-    late = (
-        scan("lineitem")
-        .filter(pl.col("l_commitdate") < pl.col("l_receiptdate"))
-        .select("l_orderkey")
-    )
+    var1 = date(1993, 7, 1)
+    var2 = date(1993, 10, 1)
+
     return (
-        orders.join(late, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+        # SQL exists translates to semi join in Polars API
+        scan("orders")
+        .join(
+            scan("lineitem").filter(pl.col("l_commitdate") < pl.col("l_receiptdate")),
+            left_on="o_orderkey",
+            right_on="l_orderkey",
+            how="semi",
+        )
+        .filter(pl.col("o_orderdate").is_between(var1, var2, closed="left"))
         .group_by("o_orderpriority")
-        .agg(order_count=pl.len())
+        .agg(pl.len().alias("order_count"))
         .sort("o_orderpriority")
     )
 
 
 def q05() -> pl.LazyFrame:
-    customer = scan("customer").select(["c_custkey", "c_nationkey"])
-    orders = (
-        scan("orders")
-        .filter((pl.col("o_orderdate") >= date(1994, 1, 1)) & (pl.col("o_orderdate") < date(1995, 1, 1)))
-        .select(["o_orderkey", "o_custkey"])
-    )
-    lineitem = scan("lineitem").select(["l_orderkey", "l_suppkey", "l_extendedprice", "l_discount"])
-    supplier = scan("supplier").select(["s_suppkey", "s_nationkey"])
-    nation = scan("nation").select(["n_nationkey", "n_name", "n_regionkey"])
-    region = scan("region").filter(pl.col("r_name") == "ASIA").select("r_regionkey")
+    var1 = "ASIA"
+    var2 = date(1994, 1, 1)
+    var3 = date(1995, 1, 1)
+
     return (
-        customer.join(orders, left_on="c_custkey", right_on="o_custkey")
-        .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
-        .join(supplier, left_on="l_suppkey", right_on="s_suppkey")
-        .filter(pl.col("c_nationkey") == pl.col("s_nationkey"))
-        .join(nation, left_on="s_nationkey", right_on="n_nationkey")
-        .join(region, left_on="n_regionkey", right_on="r_regionkey")
+        scan("region")
+        .join(scan("nation"), left_on="r_regionkey", right_on="n_regionkey")
+        .join(scan("customer"), left_on="n_nationkey", right_on="c_nationkey")
+        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .join(
+            scan("supplier"),
+            left_on=["l_suppkey", "n_nationkey"],
+            right_on=["s_suppkey", "s_nationkey"],
+        )
+        .filter(pl.col("r_name") == var1)
+        .filter(pl.col("o_orderdate").is_between(var2, var3, closed="left"))
+        .with_columns(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("revenue")
+        )
         .group_by("n_name")
-        .agg(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
-        .sort("revenue", descending=True)
+        .agg(pl.sum("revenue"))
+        .sort(by="revenue", descending=True)
     )
 
 
 def q06() -> pl.LazyFrame:
+    var1 = date(1994, 1, 1)
+    var2 = date(1995, 1, 1)
+    var3 = 0.05
+    var4 = 0.07
+    var5 = 24
+
     return (
         scan("lineitem")
-        .filter(
-            (pl.col("l_shipdate") >= date(1994, 1, 1))
-            & (pl.col("l_shipdate") < date(1995, 1, 1))
-            & (pl.col("l_discount") >= 0.05)
-            & (pl.col("l_discount") <= 0.07)
-            & (pl.col("l_quantity") < 24)
+        .filter(pl.col("l_shipdate").is_between(var1, var2, closed="left"))
+        .filter(pl.col("l_discount").is_between(var3, var4))
+        .filter(pl.col("l_quantity") < var5)
+        .with_columns(
+            (pl.col("l_extendedprice") * pl.col("l_discount")).alias("revenue")
         )
-        .select(revenue=(pl.col("l_extendedprice") * pl.col("l_discount")).sum())
+        .select(pl.sum("revenue"))
+    )
+
+
+def q07() -> pl.LazyFrame:
+    var1 = "FRANCE"
+    var2 = "GERMANY"
+    var3 = date(1995, 1, 1)
+    var4 = date(1996, 12, 31)
+
+    nations = scan("nation").filter(pl.col("n_name").is_in([var1, var2]))
+
+    return (
+        scan("customer")
+        .join(nations, left_on="c_nationkey", right_on="n_nationkey")
+        .rename({"n_name": "cust_nation"})
+        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
+        .join(nations, left_on="s_nationkey", right_on="n_nationkey")
+        .rename({"n_name": "supp_nation"})
+        .filter(
+            ((pl.col("cust_nation") == var1) & (pl.col("supp_nation") == var2))
+            | ((pl.col("cust_nation") == var2) & (pl.col("supp_nation") == var1))
+        )
+        .filter(pl.col("l_shipdate").is_between(var3, var4))
+        .with_columns(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
+            pl.col("l_shipdate").dt.year().alias("l_year"),
+        )
+        .group_by("supp_nation", "cust_nation", "l_year")
+        .agg(pl.sum("volume").alias("revenue"))
+        .sort(by=["supp_nation", "cust_nation", "l_year"])
+    )
+
+
+def q08() -> pl.LazyFrame:
+    var1 = "BRAZIL"
+    var2 = "AMERICA"
+    var3 = "ECONOMY ANODIZED STEEL"
+    var4 = date(1995, 1, 1)
+    var5 = date(1996, 12, 31)
+
+    n1 = scan("nation").select("n_nationkey", "n_regionkey")
+    n2 = scan("nation").select("n_nationkey", "n_name")
+
+    return (
+        scan("part")
+        .join(scan("lineitem"), left_on="p_partkey", right_on="l_partkey")
+        .join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
+        .join(scan("orders"), left_on="l_orderkey", right_on="o_orderkey")
+        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
+        .join(n1, left_on="c_nationkey", right_on="n_nationkey")
+        .join(scan("region"), left_on="n_regionkey", right_on="r_regionkey")
+        .filter(pl.col("r_name") == var2)
+        .join(n2, left_on="s_nationkey", right_on="n_nationkey")
+        .filter(pl.col("o_orderdate").is_between(var4, var5))
+        .filter(pl.col("p_type") == var3)
+        .select(
+            pl.col("o_orderdate").dt.year().alias("o_year"),
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
+            pl.col("n_name").alias("nation"),
+        )
+        .with_columns(
+            pl.when(pl.col("nation") == var1)
+            .then(pl.col("volume"))
+            .otherwise(0)
+            .alias("_tmp")
+        )
+        .group_by("o_year")
+        .agg((pl.sum("_tmp") / pl.sum("volume")).round(2).alias("mkt_share"))
+        .sort("o_year")
+    )
+
+
+def q09() -> pl.LazyFrame:
+    return (
+        scan("part")
+        .join(scan("partsupp"), left_on="p_partkey", right_on="ps_partkey")
+        .join(scan("supplier"), left_on="ps_suppkey", right_on="s_suppkey")
+        .join(
+            scan("lineitem"),
+            left_on=["p_partkey", "ps_suppkey"],
+            right_on=["l_partkey", "l_suppkey"],
+        )
+        .join(scan("orders"), left_on="l_orderkey", right_on="o_orderkey")
+        .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
+        .filter(pl.col("p_name").str.contains("green"))
+        .select(
+            pl.col("n_name").alias("nation"),
+            pl.col("o_orderdate").dt.year().alias("o_year"),
+            (
+                pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
+                - pl.col("ps_supplycost") * pl.col("l_quantity")
+            ).alias("amount"),
+        )
+        .group_by("nation", "o_year")
+        .agg(pl.sum("amount").round(2).alias("sum_profit"))
+        .sort(by=["nation", "o_year"], descending=[False, True])
     )
 
 
 def q10() -> pl.LazyFrame:
-    customer = scan("customer").select(
-        ["c_custkey", "c_name", "c_address", "c_nationkey", "c_phone", "c_acctbal", "c_comment"]
-    )
-    orders = (
-        scan("orders")
-        .filter((pl.col("o_orderdate") >= date(1993, 10, 1)) & (pl.col("o_orderdate") < date(1994, 1, 1)))
-        .select(["o_orderkey", "o_custkey"])
-    )
-    lineitem = (
-        scan("lineitem")
-        .filter(pl.col("l_returnflag") == "R")
-        .select(["l_orderkey", "l_extendedprice", "l_discount"])
-    )
-    nation = scan("nation").select(["n_nationkey", "n_name"])
+    var1 = date(1993, 10, 1)
+    var2 = date(1994, 1, 1)
+
     return (
-        customer.join(orders, left_on="c_custkey", right_on="o_custkey")
-        .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
-        .join(nation, left_on="c_nationkey", right_on="n_nationkey")
-        .group_by(["c_custkey", "c_name", "c_acctbal", "c_phone", "n_name", "c_address", "c_comment"])
-        .agg(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
-        .sort("revenue", descending=True)
+        scan("customer")
+        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .join(scan("nation"), left_on="c_nationkey", right_on="n_nationkey")
+        .filter(pl.col("o_orderdate").is_between(var1, var2, closed="left"))
+        .filter(pl.col("l_returnflag") == "R")
+        .group_by(
+            "c_custkey",
+            "c_name",
+            "c_acctbal",
+            "c_phone",
+            "n_name",
+            "c_address",
+            "c_comment",
+        )
+        .agg(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+            .sum()
+            .round(2)
+            .alias("revenue")
+        )
+        .select(
+            "c_custkey",
+            "c_name",
+            "revenue",
+            "c_acctbal",
+            "n_name",
+            "c_address",
+            "c_phone",
+            "c_comment",
+        )
+        .sort(by="revenue", descending=True)
         .head(20)
     )
 
 
 def q11() -> pl.LazyFrame:
-    # The uncorrelated scalar subquery: one value, the same for every row. Ibex
-    # broadcasts it with a cross join against the subquery's single row; Polars
-    # folds it into the predicate the same way.
-    german_supply = (
+    var1 = "GERMANY"
+    var2 = 0.0001  # SCALE_FACTOR=1
+
+    q1 = (
         scan("partsupp")
         .join(scan("supplier"), left_on="ps_suppkey", right_on="s_suppkey")
         .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
-        .filter(pl.col("n_name") == "GERMANY")
+        .filter(pl.col("n_name") == var1)
     )
-    value = pl.col("ps_supplycost") * pl.col("ps_availqty")
-    threshold = german_supply.select(threshold=value.sum() * 0.0001)
+    q2 = q1.select(
+        (pl.col("ps_supplycost") * pl.col("ps_availqty")).sum().round(2).alias("tmp")
+        * var2
+    )
+
     return (
-        german_supply.group_by("ps_partkey")
-        .agg(value=value.sum())
-        .join(threshold, how="cross")
-        .filter(pl.col("value") > pl.col("threshold"))
+        q1.group_by("ps_partkey")
+        .agg(
+            (pl.col("ps_supplycost") * pl.col("ps_availqty"))
+            .sum()
+            .round(2)
+            .alias("value")
+        )
+        .join(q2, how="cross")
+        .filter(pl.col("value") > pl.col("tmp"))
         .select("ps_partkey", "value")
         .sort("value", descending=True)
     )
 
 
-def q17() -> pl.LazyFrame:
-    # The correlated subquery, decorrelated the same way Ibex lowers it: 20% of
-    # each part's average order quantity, computed once and joined back. The
-    # average is over ALL of a part's lineitem rows, not just the Brand#23
-    # MED BOX ones, so it is computed before the part filter is applied.
-    lineitem = scan("lineitem")
-    quantity_limit = lineitem.group_by("l_partkey").agg(
-        quantity_limit=0.2 * pl.mean("l_quantity")
-    )
-    part = scan("part").filter(
-        (pl.col("p_brand") == "Brand#23") & (pl.col("p_container") == "MED BOX")
-    )
-    return (
-        lineitem.join(part, left_on="l_partkey", right_on="p_partkey")
-        .join(quantity_limit, on="l_partkey")
-        .filter(pl.col("l_quantity") < pl.col("quantity_limit"))
-        .select(avg_yearly=pl.sum("l_extendedprice") / 7.0)
-    )
-
-
-def q18() -> pl.LazyFrame:
-    # SQL's uncorrelated `in` is a semi join, which is how Ibex writes it too.
-    lineitem = scan("lineitem")
-    big_orders = (
-        lineitem.group_by("l_orderkey")
-        .agg(order_quantity=pl.sum("l_quantity"))
-        .filter(pl.col("order_quantity") > 300)
-        .select("l_orderkey")
-    )
-    return (
-        scan("customer")
-        .select(["c_custkey", "c_name"])
-        .join(scan("orders"), left_on="c_custkey", right_on="o_custkey")
-        .join(lineitem, left_on="o_orderkey", right_on="l_orderkey")
-        .join(big_orders, left_on="o_orderkey", right_on="l_orderkey", how="semi")
-        .group_by(["c_name", "c_custkey", "o_orderkey", "o_orderdate", "o_totalprice"])
-        .agg(sum_quantity=pl.sum("l_quantity"))
-        .sort(["o_totalprice", "o_orderdate"], descending=[True, False])
-        .head(100)
-    )
-
-
-def q20() -> pl.LazyFrame:
-    forest_parts = (
-        scan("part").filter(pl.col("p_name").str.starts_with("forest")).select("p_partkey")
-    )
-    required = (
-        scan("lineitem")
-        .filter(
-            (pl.col("l_shipdate") >= date(1994, 1, 1)) & (pl.col("l_shipdate") < date(1995, 1, 1))
-        )
-        .group_by(["l_partkey", "l_suppkey"])
-        .agg(required=0.5 * pl.sum("l_quantity"))
-    )
-    target = (
-        scan("partsupp")
-        .join(forest_parts, left_on="ps_partkey", right_on="p_partkey", how="semi")
-        .join(required, left_on=["ps_partkey", "ps_suppkey"], right_on=["l_partkey", "l_suppkey"])
-        .filter(pl.col("ps_availqty") > pl.col("required"))
-        .select("ps_suppkey")
-        .unique()
-    )
-    return (
-        scan("supplier")
-        .join(scan("nation").filter(pl.col("n_name") == "CANADA"),
-              left_on="s_nationkey", right_on="n_nationkey")
-        .join(target, left_on="s_suppkey", right_on="ps_suppkey", how="semi")
-        .select(["s_name", "s_address"])
-        .sort("s_name")
-    )
-
-
-def q21() -> pl.LazyFrame:
-    orders_f = scan("orders").filter(pl.col("o_orderstatus") == "F").select("o_orderkey")
-    li_f = scan("lineitem").join(
-        orders_f, left_on="l_orderkey", right_on="o_orderkey", how="semi"
-    )
-    n_sup = (
-        li_f.unique(["l_orderkey", "l_suppkey"])
-        .group_by("l_orderkey")
-        .agg(n_sup=pl.len())
-    )
-    late = li_f.filter(pl.col("l_receiptdate") > pl.col("l_commitdate"))
-    n_late = late.unique(["l_orderkey", "l_suppkey"]).group_by("l_orderkey").agg(n_late=pl.len())
-    qualifying = (
-        late.select(["l_orderkey", "l_suppkey"])
-        .join(n_sup, on="l_orderkey")
-        .filter(pl.col("n_sup") > 1)
-        .join(n_late, on="l_orderkey")
-        .filter(pl.col("n_late") == 1)
-        .select("l_suppkey")
-    )
-    return (
-        qualifying.join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
-        .join(scan("nation").filter(pl.col("n_name") == "SAUDI ARABIA"),
-              left_on="s_nationkey", right_on="n_nationkey")
-        .group_by("s_name")
-        .agg(numwait=pl.len())
-        .sort(["numwait", "s_name"], descending=[True, False])
-        .head(100)
-    )
-
-
-def q22() -> pl.LazyFrame:
-    codes = ["13", "31", "23", "29", "30", "18", "17"]
-    in_scope = (
-        scan("customer")
-        .with_columns(cntrycode=pl.col("c_phone").str.slice(0, 2))
-        .filter(pl.col("cntrycode").is_in(codes))
-        .select(["c_custkey", "cntrycode", "c_acctbal"])
-    )
-    # The uncorrelated threshold: average positive balance among those customers,
-    # broadcast with a cross join (one row) exactly as Ibex does.
-    threshold = in_scope.filter(pl.col("c_acctbal") > 0).select(threshold=pl.mean("c_acctbal"))
-    with_orders = scan("orders").select(c_custkey="o_custkey").unique()
-    return (
-        in_scope.join(threshold, how="cross")
-        .filter(pl.col("c_acctbal") > pl.col("threshold"))
-        .join(with_orders, on="c_custkey", how="anti")
-        .group_by("cntrycode")
-        .agg(numcust=pl.len(), totacctbal=pl.sum("c_acctbal"))
-        .sort("cntrycode")
-    )
-
-
-def q19() -> pl.LazyFrame:
-    lineitem = scan("lineitem")
-    part = scan("part")
-    joined = lineitem.join(part, left_on="l_partkey", right_on="p_partkey")
-    return joined.filter(
-        (pl.col("l_shipinstruct") == "DELIVER IN PERSON")
-        & pl.col("l_shipmode").is_in(["AIR", "AIR REG"])
-        & (
-            (
-                (pl.col("p_brand") == "Brand#12")
-                & pl.col("p_container").is_in(["SM CASE", "SM BOX", "SM PACK", "SM PKG"])
-                & (pl.col("l_quantity") >= 1) & (pl.col("l_quantity") <= 11)
-                & (pl.col("p_size") >= 1) & (pl.col("p_size") <= 5)
-            )
-            | (
-                (pl.col("p_brand") == "Brand#23")
-                & pl.col("p_container").is_in(["MED BAG", "MED BOX", "MED PKG", "MED PACK"])
-                & (pl.col("l_quantity") >= 10) & (pl.col("l_quantity") <= 20)
-                & (pl.col("p_size") >= 1) & (pl.col("p_size") <= 10)
-            )
-            | (
-                (pl.col("p_brand") == "Brand#34")
-                & pl.col("p_container").is_in(["LG CASE", "LG BOX", "LG PACK", "LG PKG"])
-                & (pl.col("l_quantity") >= 20) & (pl.col("l_quantity") <= 30)
-                & (pl.col("p_size") >= 1) & (pl.col("p_size") <= 15)
-            )
-        )
-    ).select(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
-
-def q09() -> pl.LazyFrame:
-    part = scan("part").filter(pl.col("p_name").str.contains("green", literal=True)).select(["p_partkey"])
-    lineitem = scan("lineitem").select(
-        ["l_partkey", "l_suppkey", "l_orderkey", "l_quantity", "l_extendedprice", "l_discount"]
-    )
-    supplier = scan("supplier").select(["s_suppkey", "s_nationkey"])
-    partsupp = scan("partsupp").select(["ps_partkey", "ps_suppkey", "ps_supplycost"])
-    orders = scan("orders").select(["o_orderkey", "o_orderdate"])
-    nation = scan("nation").select(["n_nationkey", "n_name"])
-    return (
-        part.join(lineitem, left_on="p_partkey", right_on="l_partkey")
-        .join(supplier, left_on="l_suppkey", right_on="s_suppkey")
-        .join(partsupp, left_on=["p_partkey", "l_suppkey"], right_on=["ps_partkey", "ps_suppkey"])
-        .join(orders, left_on="l_orderkey", right_on="o_orderkey")
-        .join(nation, left_on="s_nationkey", right_on="n_nationkey")
-        .select(
-            nation=pl.col("n_name"),
-            o_year=pl.col("o_orderdate").dt.year(),
-            amount=pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
-            - pl.col("ps_supplycost") * pl.col("l_quantity"),
-        )
-        .group_by(["nation", "o_year"])
-        .agg(sum_profit=pl.col("amount").sum())
-        .sort(["nation", "o_year"], descending=[False, True])
-    )
-
-def q13() -> pl.LazyFrame:
-    customer = scan("customer").select(["c_custkey"])
-    orders = (
-        scan("orders")
-        .filter(~pl.col("o_comment").str.contains("special.*requests"))
-        .select(["o_custkey", "o_orderkey"])
-    )
-    return (
-        customer.join(orders, left_on="c_custkey", right_on="o_custkey", how="left")
-        .group_by("c_custkey")
-        .agg(c_count=pl.col("o_orderkey").count())
-        .group_by("c_count")
-        .agg(custdist=pl.len())
-        .sort(["custdist", "c_count"], descending=[True, True])
-    )
-
-
-def q16() -> pl.LazyFrame:
-    excluded_suppliers = (
-        scan("supplier")
-        .filter(pl.col("s_comment").str.contains("Customer.*Complaints"))
-        .select("s_suppkey")
-    )
-    part = (
-        scan("part")
-        .filter(
-            (pl.col("p_brand") != "Brand#45")
-            & ~pl.col("p_type").str.starts_with("MEDIUM POLISHED")
-            & pl.col("p_size").is_in([49, 14, 23, 45, 19, 3, 36, 9])
-        )
-        .select(["p_partkey", "p_brand", "p_type", "p_size"])
-    )
-    partsupp = scan("partsupp").select(["ps_partkey", "ps_suppkey"])
-    return (
-        part.join(partsupp, left_on="p_partkey", right_on="ps_partkey")
-        .join(excluded_suppliers, left_on="ps_suppkey", right_on="s_suppkey", how="anti")
-        .unique(subset=["p_brand", "p_type", "p_size", "ps_suppkey"])
-        .group_by(["p_brand", "p_type", "p_size"])
-        .agg(supplier_cnt=pl.len())
-        .sort(["supplier_cnt", "p_brand", "p_type", "p_size"], descending=[True, False, False, False])
-    )
-
-
-def q07() -> pl.LazyFrame:
-    lineitem = scan("lineitem").filter(
-        (pl.col("l_shipdate") >= date(1995, 1, 1)) & (pl.col("l_shipdate") <= date(1996, 12, 31))
-    )
-    n1 = scan("nation").select(supp_nation="n_name", s_nationkey="n_nationkey")
-    n2 = scan("nation").select(cust_nation="n_name", c_nationkey="n_nationkey")
-    return (
-        scan("supplier")
-        .join(lineitem, left_on="s_suppkey", right_on="l_suppkey")
-        .join(scan("orders"), left_on="l_orderkey", right_on="o_orderkey")
-        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
-        .join(n1, on="s_nationkey")
-        .join(n2, on="c_nationkey")
-        .filter(
-            ((pl.col("supp_nation") == "FRANCE") & (pl.col("cust_nation") == "GERMANY"))
-            | ((pl.col("supp_nation") == "GERMANY") & (pl.col("cust_nation") == "FRANCE"))
-        )
-        .with_columns(l_year=pl.col("l_shipdate").dt.year())
-        .group_by(["supp_nation", "cust_nation", "l_year"])
-        .agg(revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
-        .sort(["supp_nation", "cust_nation", "l_year"])
-    )
-
-
-def q08() -> pl.LazyFrame:
-    part = scan("part").filter(pl.col("p_type") == "ECONOMY ANODIZED STEEL").select("p_partkey")
-    orders = scan("orders").filter(
-        (pl.col("o_orderdate") >= date(1995, 1, 1)) & (pl.col("o_orderdate") <= date(1996, 12, 31))
-    )
-    n_supp = scan("nation").select(supp_nation="n_name", s_nationkey="n_nationkey")
-    n_cust = scan("nation").select(c_nationkey="n_nationkey", n_regionkey="n_regionkey")
-    region = scan("region").filter(pl.col("r_name") == "AMERICA").select("r_regionkey")
-    volume = pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
-    return (
-        part.join(scan("lineitem"), left_on="p_partkey", right_on="l_partkey")
-        .join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
-        .join(n_supp, on="s_nationkey")
-        .join(orders, left_on="l_orderkey", right_on="o_orderkey")
-        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
-        .join(n_cust, on="c_nationkey")
-        .join(region, left_on="n_regionkey", right_on="r_regionkey")
-        .with_columns(o_year=pl.col("o_orderdate").dt.year())
-        .group_by("o_year")
-        .agg(
-            mkt_share=(volume * (pl.col("supp_nation") == "BRAZIL")).sum() / volume.sum()
-        )
-        .sort("o_year")
-    )
-
-
 def q12() -> pl.LazyFrame:
-    orders = scan("orders").select(["o_orderkey", "o_orderpriority"])
-    lineitem = scan("lineitem").filter(
-        pl.col("l_shipmode").is_in(["MAIL", "SHIP"])
-        & (pl.col("l_commitdate") < pl.col("l_receiptdate"))
-        & (pl.col("l_shipdate") < pl.col("l_commitdate"))
-        & (pl.col("l_receiptdate") >= date(1994, 1, 1))
-        & (pl.col("l_receiptdate") < date(1995, 1, 1))
-    )
-    high = pl.col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"])
+    var1 = "MAIL"
+    var2 = "SHIP"
+    var3 = date(1994, 1, 1)
+    var4 = date(1995, 1, 1)
+
     return (
-        lineitem.join(orders, left_on="l_orderkey", right_on="o_orderkey")
+        scan("orders")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .filter(pl.col("l_shipmode").is_in([var1, var2]))
+        .filter(pl.col("l_commitdate") < pl.col("l_receiptdate"))
+        .filter(pl.col("l_shipdate") < pl.col("l_commitdate"))
+        .filter(pl.col("l_receiptdate").is_between(var3, var4, closed="left"))
+        .with_columns(
+            line_count=pl.col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"])
+        )
         .group_by("l_shipmode")
-        .agg(high_line_count=high.sum(), low_line_count=(~high).sum())
+        .agg(
+            high_line_count=pl.col("line_count").sum(),
+            low_line_count=pl.col("line_count").not_().sum(),
+        )
         .sort("l_shipmode")
     )
 
 
-def q14() -> pl.LazyFrame:
-    lineitem = scan("lineitem").filter(
-        (pl.col("l_shipdate") >= date(1995, 9, 1)) & (pl.col("l_shipdate") < date(1995, 10, 1))
+def q13() -> pl.LazyFrame:
+    var1 = "special"
+    var2 = "requests"
+
+    orders = scan("orders").filter(
+        pl.col("o_comment").str.contains(f"{var1}.*{var2}").not_()
     )
-    revenue = pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
     return (
-        lineitem.join(scan("part"), left_on="l_partkey", right_on="p_partkey")
+        scan("customer")
+        .join(orders, left_on="c_custkey", right_on="o_custkey", how="left")
+        .group_by("c_custkey")
+        .agg(pl.col("o_orderkey").count().alias("c_count"))
+        .group_by("c_count")
+        .len()
+        .select(pl.col("c_count"), pl.col("len").alias("custdist"))
+        .sort(by=["custdist", "c_count"], descending=[True, True])
+    )
+
+
+def q14() -> pl.LazyFrame:
+    var1 = date(1995, 9, 1)
+    var2 = date(1995, 10, 1)
+
+    return (
+        scan("lineitem")
+        .join(scan("part"), left_on="l_partkey", right_on="p_partkey")
+        .filter(pl.col("l_shipdate").is_between(var1, var2, closed="left"))
         .select(
-            promo_revenue=100.0
-            * (revenue * pl.col("p_type").str.starts_with("PROMO")).sum()
-            / revenue.sum()
+            (
+                100.00
+                * pl.when(pl.col("p_type").str.starts_with("PROMO"))
+                .then(pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+                .otherwise(0)
+                .sum()
+                / (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum()
+            )
+            .round(2)
+            .alias("promo_revenue")
         )
     )
 
 
 def q15() -> pl.LazyFrame:
+    var1 = date(1996, 1, 1)
+    var2 = date(1996, 4, 1)
+
     revenue = (
         scan("lineitem")
-        .filter(
-            (pl.col("l_shipdate") >= date(1996, 1, 1)) & (pl.col("l_shipdate") < date(1996, 4, 1))
-        )
+        .filter(pl.col("l_shipdate").is_between(var1, var2, closed="left"))
         .group_by("l_suppkey")
-        .agg(total_revenue=(pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum())
+        .agg(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+            .sum()
+            .alias("total_revenue")
+        )
+        .select(pl.col("l_suppkey").alias("supplier_no"), pl.col("total_revenue"))
     )
-    peak = revenue.select(pl.max("total_revenue")).collect().item()
+
     return (
         scan("supplier")
-        .join(revenue, left_on="s_suppkey", right_on="l_suppkey")
-        .filter(pl.col("total_revenue") == peak)
-        .select(["s_suppkey", "s_name", "s_address", "s_phone", "total_revenue"])
+        .join(revenue, left_on="s_suppkey", right_on="supplier_no")
+        .filter(pl.col("total_revenue") == pl.col("total_revenue").max())
+        .with_columns(pl.col("total_revenue").round(2))
+        .select("s_suppkey", "s_name", "s_address", "s_phone", "total_revenue")
         .sort("s_suppkey")
+    )
+
+
+def q16() -> pl.LazyFrame:
+    var1 = "Brand#45"
+
+    supplier = scan("supplier").filter(
+        pl.col("s_comment").str.contains(".*Customer.*Complaints.*")
+    ).select(pl.col("s_suppkey"), pl.col("s_suppkey").alias("ps_suppkey"))
+
+    return (
+        scan("part")
+        .join(scan("partsupp"), left_on="p_partkey", right_on="ps_partkey")
+        .filter(pl.col("p_brand") != var1)
+        .filter(pl.col("p_type").str.contains("MEDIUM POLISHED*").not_())
+        .filter(pl.col("p_size").is_in([49, 14, 23, 45, 19, 3, 36, 9]))
+        .join(supplier, left_on="ps_suppkey", right_on="s_suppkey", how="left")
+        .filter(pl.col("ps_suppkey_right").is_null())
+        .group_by("p_brand", "p_type", "p_size")
+        .agg(pl.col("ps_suppkey").n_unique().alias("supplier_cnt"))
+        .sort(
+            by=["supplier_cnt", "p_brand", "p_type", "p_size"],
+            descending=[True, False, False, False],
+        )
+    )
+
+
+def q17() -> pl.LazyFrame:
+    var1 = "Brand#23"
+    var2 = "MED BOX"
+
+    q1 = (
+        scan("part")
+        .filter(pl.col("p_brand") == var1)
+        .filter(pl.col("p_container") == var2)
+        .join(scan("lineitem"), how="inner", left_on="p_partkey", right_on="l_partkey")
+    )
+
+    return (
+        q1.group_by("p_partkey")
+        .agg((0.2 * pl.col("l_quantity").mean()).alias("avg_quantity"))
+        .select(pl.col("p_partkey").alias("key"), pl.col("avg_quantity"))
+        .join(q1, left_on="key", right_on="p_partkey")
+        .filter(pl.col("l_quantity") < pl.col("avg_quantity"))
+        .select((pl.col("l_extendedprice").sum() / 7.0).round(2).alias("avg_yearly"))
+    )
+
+
+def q18() -> pl.LazyFrame:
+    var1 = 300
+
+    q1 = (
+        scan("lineitem")
+        .group_by("l_orderkey")
+        .agg(pl.col("l_quantity").sum().alias("sum_quantity"))
+        .filter(pl.col("sum_quantity") > var1)
+    )
+
+    return (
+        scan("orders")
+        .join(q1, left_on="o_orderkey", right_on="l_orderkey", how="semi")
+        .join(scan("lineitem"), left_on="o_orderkey", right_on="l_orderkey")
+        .join(scan("customer"), left_on="o_custkey", right_on="c_custkey")
+        .group_by("c_name", "o_custkey", "o_orderkey", "o_orderdate", "o_totalprice")
+        .agg(pl.col("l_quantity").sum().alias("col6"))
+        .select(
+            pl.col("c_name"),
+            pl.col("o_custkey").alias("c_custkey"),
+            pl.col("o_orderkey"),
+            pl.col("o_orderdate").alias("o_orderdat"),
+            pl.col("o_totalprice"),
+            pl.col("col6"),
+        )
+        .sort(by=["o_totalprice", "o_orderdat"], descending=[True, False])
+        .head(100)
+    )
+
+
+def q19() -> pl.LazyFrame:
+    return (
+        scan("part")
+        .join(scan("lineitem"), left_on="p_partkey", right_on="l_partkey")
+        .filter(pl.col("l_shipmode").is_in(["AIR", "AIR REG"]))
+        .filter(pl.col("l_shipinstruct") == "DELIVER IN PERSON")
+        .filter(
+            (
+                (pl.col("p_brand") == "Brand#12")
+                & pl.col("p_container").is_in(
+                    ["SM CASE", "SM BOX", "SM PACK", "SM PKG"]
+                )
+                & (pl.col("l_quantity").is_between(1, 11))
+                & (pl.col("p_size").is_between(1, 5))
+            )
+            | (
+                (pl.col("p_brand") == "Brand#23")
+                & pl.col("p_container").is_in(
+                    ["MED BAG", "MED BOX", "MED PKG", "MED PACK"]
+                )
+                & (pl.col("l_quantity").is_between(10, 20))
+                & (pl.col("p_size").is_between(1, 10))
+            )
+            | (
+                (pl.col("p_brand") == "Brand#34")
+                & pl.col("p_container").is_in(
+                    ["LG CASE", "LG BOX", "LG PACK", "LG PKG"]
+                )
+                & (pl.col("l_quantity").is_between(20, 30))
+                & (pl.col("p_size").is_between(1, 15))
+            )
+        )
+        .select(
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+            .sum()
+            .round(2)
+            .alias("revenue")
+        )
+    )
+
+
+def q20() -> pl.LazyFrame:
+    var1 = date(1994, 1, 1)
+    var2 = date(1995, 1, 1)
+    var3 = "CANADA"
+    var4 = "forest"
+
+    q1 = (
+        scan("lineitem")
+        .filter(pl.col("l_shipdate").is_between(var1, var2, closed="left"))
+        .group_by("l_partkey", "l_suppkey")
+        .agg((pl.col("l_quantity").sum() * 0.5).alias("sum_quantity"))
+    )
+    q2 = scan("nation").filter(pl.col("n_name") == var3)
+    q3 = scan("supplier").join(q2, left_on="s_nationkey", right_on="n_nationkey")
+
+    return (
+        scan("part")
+        .filter(pl.col("p_name").str.starts_with(var4))
+        .select(pl.col("p_partkey").unique())
+        .join(scan("partsupp"), left_on="p_partkey", right_on="ps_partkey")
+        .join(
+            q1,
+            left_on=["ps_suppkey", "p_partkey"],
+            right_on=["l_suppkey", "l_partkey"],
+        )
+        .filter(pl.col("ps_availqty") > pl.col("sum_quantity"))
+        .select(pl.col("ps_suppkey").unique())
+        .join(q3, left_on="ps_suppkey", right_on="s_suppkey")
+        .select("s_name", "s_address")
+        .sort("s_name")
+    )
+
+
+def q21() -> pl.LazyFrame:
+    var1 = "SAUDI ARABIA"
+
+    q1 = (
+        scan("lineitem")
+        .group_by("l_orderkey")
+        .agg(pl.col("l_suppkey").len().alias("n_supp_by_order"))
+        .filter(pl.col("n_supp_by_order") > 1)
+        .join(
+            scan("lineitem").filter(pl.col("l_receiptdate") > pl.col("l_commitdate")),
+            on="l_orderkey",
+        )
+    )
+
+    return (
+        q1.group_by("l_orderkey")
+        .agg(pl.col("l_suppkey").len().alias("n_supp_by_order"))
+        .join(q1, on="l_orderkey")
+        .join(scan("supplier"), left_on="l_suppkey", right_on="s_suppkey")
+        .join(scan("nation"), left_on="s_nationkey", right_on="n_nationkey")
+        .join(scan("orders"), left_on="l_orderkey", right_on="o_orderkey")
+        .filter(pl.col("n_supp_by_order") == 1)
+        .filter(pl.col("n_name") == var1)
+        .filter(pl.col("o_orderstatus") == "F")
+        .group_by("s_name")
+        .agg(pl.len().alias("numwait"))
+        .sort(by=["numwait", "s_name"], descending=[True, False])
+        .head(100)
+    )
+
+
+def q22() -> pl.LazyFrame:
+    q1 = (
+        scan("customer")
+        .with_columns(pl.col("c_phone").str.slice(0, 2).alias("cntrycode"))
+        .filter(pl.col("cntrycode").str.contains("13|31|23|29|30|18|17"))
+        .select("c_acctbal", "c_custkey", "cntrycode")
+    )
+
+    q2 = q1.filter(pl.col("c_acctbal") > 0.0).select(
+        pl.col("c_acctbal").mean().alias("avg_acctbal")
+    )
+
+    q3 = scan("orders").select(pl.col("o_custkey").unique()).with_columns(
+        pl.col("o_custkey").alias("c_custkey")
+    )
+
+    return (
+        q1.join(q3, on="c_custkey", how="left")
+        .filter(pl.col("o_custkey").is_null())
+        .join(q2, how="cross")
+        .filter(pl.col("c_acctbal") > pl.col("avg_acctbal"))
+        .group_by("cntrycode")
+        .agg(
+            pl.col("c_acctbal").count().alias("numcust"),
+            pl.col("c_acctbal").sum().round(2).alias("totacctbal"),
+        )
+        .sort("cntrycode")
     )
 
 

@@ -367,6 +367,21 @@ TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is elig
     CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"build"}).contains("build"));
 }
 
+TEST_CASE("deferrable_probe_scans: mapped join key defers under the right-side name",
+          "[ir][scan_predicates][deferred_scan]") {
+    // Q2's p_partkey = ps_partkey join must defer partsupp with its physical
+    // ps_partkey name; the runtime maps the left build keys to that name.
+    auto plan = std::make_unique<ir::JoinNode>(
+        ir::NodeId{20}, ir::JoinKind::Inner,
+        std::vector<ir::JoinKey>{ir::JoinKey{"p_partkey", "ps_partkey"}});
+    plan->add_child(make_scan("part"));
+    plan->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "partsupp"));
+
+    auto deferrable = ir::deferrable_probe_scans(*plan, {"partsupp"});
+    REQUIRE(deferrable.contains("partsupp"));
+    CHECK(deferrable.at("partsupp").key_column == "ps_partkey");
+}
+
 TEST_CASE("deferrable_probe_scans: reaches the scan through project and rename, mapping the key",
           "[ir][scan_predicates][deferred_scan]") {
     // Join key `o_orderkey`; the scan calls it `l_orderkey`.

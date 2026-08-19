@@ -18,6 +18,30 @@
 namespace ibex::ir {
 namespace {
 
+/// Count the top-level AND-conjuncts in `expr` (an OR, a bare comparison, a
+/// call, ... all count as one). A compound predicate like `p_size == 15 &&
+/// like(p_type, '%BRASS')` is far more selective than either conjunct alone;
+/// applying `filter_selectivity` once regardless of conjunct count made every
+/// multi-conjunct filter look ~4x too big to the join-order cost model below
+/// (PDS-H q02: a 2-conjunct part filter, whose true selectivity is ~1/250,
+/// was estimated at 0.25 -- 60x too high -- which was enough to make the
+/// filtered leaf look bigger than its unfiltered join partners and push it
+/// out of the build position).
+auto count_conjuncts(const Expr& expr) -> int {
+    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node);
+        logical != nullptr && logical->op == LogicalOp::And && logical->left != nullptr &&
+        logical->right != nullptr) {
+        return count_conjuncts(*logical->left) + count_conjuncts(*logical->right);
+    }
+    return 1;
+}
+
+/// `filter_selectivity` raised to the conjunct count, treating each conjunct
+/// as an independent restriction (the standard independence assumption).
+auto compound_selectivity(const Expr& predicate, double filter_selectivity) -> double {
+    return std::pow(filter_selectivity, count_conjuncts(predicate));
+}
+
 // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
 // guarded by the switch on node.kind() matching the target node type.
 auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSchemas& schemas,
@@ -48,25 +72,61 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         case NodeKind::Ascribe:
             return child();
 
-        case NodeKind::Filter:
-        case NodeKind::FilterProject:
+        case NodeKind::Filter: {
+            auto input = child();
+            if (!input.rows.has_value()) {
+                return input;
+            }
+            const auto selectivity = compound_selectivity(
+                static_cast<const FilterNode&>(node).predicate(), options.filter_selectivity);
+            const auto selected = static_cast<std::size_t>(
+                std::llround(static_cast<double>(*input.rows) * selectivity));
+            return {.rows = selected, .heuristic = true};
+        }
+        case NodeKind::FilterProject: {
+            auto input = child();
+            if (!input.rows.has_value()) {
+                return input;
+            }
+            const auto selectivity =
+                compound_selectivity(static_cast<const FilterProjectNode&>(node).predicate(),
+                                     options.filter_selectivity);
+            const auto selected = static_cast<std::size_t>(
+                std::llround(static_cast<double>(*input.rows) * selectivity));
+            return {.rows = selected, .heuristic = true};
+        }
         case NodeKind::FilterUpdateProject: {
             auto input = child();
             if (!input.rows.has_value()) {
                 return input;
             }
+            const auto selectivity =
+                compound_selectivity(static_cast<const FilterUpdateProjectNode&>(node).predicate(),
+                                     options.filter_selectivity);
             const auto selected = static_cast<std::size_t>(
-                std::llround(static_cast<double>(*input.rows) * options.filter_selectivity));
+                std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
         }
-        case NodeKind::FilterHead:
+        case NodeKind::FilterHead: {
+            auto input = child();
+            if (!input.rows.has_value()) {
+                return input;
+            }
+            const auto selectivity = compound_selectivity(
+                static_cast<const FilterHeadNode&>(node).predicate(), options.filter_selectivity);
+            const auto selected = static_cast<std::size_t>(
+                std::llround(static_cast<double>(*input.rows) * selectivity));
+            return {.rows = selected, .heuristic = true};
+        }
         case NodeKind::FilterTail: {
             auto input = child();
             if (!input.rows.has_value()) {
                 return input;
             }
+            const auto selectivity = compound_selectivity(
+                static_cast<const FilterTailNode&>(node).predicate(), options.filter_selectivity);
             const auto selected = static_cast<std::size_t>(
-                std::llround(static_cast<double>(*input.rows) * options.filter_selectivity));
+                std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
         }
         case NodeKind::Head: {

@@ -136,18 +136,9 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     auto& filter = static_cast<FilterNode&>(*node);
     auto& join = static_cast<JoinNode&>(*node->mutable_children().front());
     const JoinKind kind = join.kind();
-    if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Right) {
-        return node;  // Outer/Semi/Anti/Cross/Asof: see the header's safety table.
-    }
-    if (!join_keys_are_same_named(join.keys())) {
-        // Moving a predicate would require remapping its column refs per side.
-        //
-        // `normalize_mapped_join_keys` has already folded away every mapped key
-        // whose fold is unobservable, so a mapped key still here means it was
-        // NOT: a Right/Outer join, a key column read on both spellings above
-        // the join, a name that collides across the two sides, or a side whose
-        // schema is not Known and closed. Those cases keep their source order.
-        return node;
+    if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Right &&
+        kind != JoinKind::Semi && kind != JoinKind::Anti) {
+        return node;  // Outer/Cross/Asof: see the header's safety table.
     }
     if (join.children().size() != 2 || join.children()[0] == nullptr ||
         join.children()[1] == nullptr) {
@@ -168,8 +159,29 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     std::vector<Expr> kept_parts;
     for (const Expr* conjunct : conjuncts) {
         Destination dest = classify(*conjunct, left_schema, right_schema, join.keys());
+        // A mapped key has a different name on each input.  A predicate on
+        // that output key may still safely move to its owning (left) input,
+        // but it cannot be copied to the right without rewriting its column
+        // reference.  Keep it left-only; non-key predicates need no remap and
+        // retain the normal side classification.
+        if (!join_keys_are_same_named(join.keys()) && dest == Destination::BothSides) {
+            dest = Destination::Left;
+        }
         // Join-kind gating: only the non-null-supplying side may pre-filter.
-        if (kind == JoinKind::Left && dest != Destination::Left) {
+        // Semi/Anti join the same way here: the left side is exactly the
+        // "preserved" side (its rows survive or don't; the right side never
+        // appears in the output, only in the existence test), so a
+        // left-only conjunct commutes with the join for the same reason it
+        // does for Left -- dropping a row before or after the existence
+        // test changes nothing about which surviving rows are kept, because
+        // the test doesn't read the filtered columns. A right-destined or
+        // BothSides conjunct is left above rather than risked: pushing it
+        // into the right side would change the candidate set the existence
+        // test runs against, which is sound too (equivalent to adding it as
+        // a join condition) but is a different argument this pass does not
+        // make yet.
+        if ((kind == JoinKind::Left || kind == JoinKind::Semi || kind == JoinKind::Anti) &&
+            dest != Destination::Left) {
             dest = dest == Destination::BothSides ? Destination::Left : Destination::Above;
         } else if (kind == JoinKind::Right && dest != Destination::Right) {
             // A key conjunct must stay above too: an unmatched right row's

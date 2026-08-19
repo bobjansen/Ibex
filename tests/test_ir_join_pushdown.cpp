@@ -230,10 +230,38 @@ TEST_CASE("join pushdown: right join pushes right-only conjuncts, keys stay abov
     REQUIRE(join.children()[1]->kind() == ir::NodeKind::Filter);
 }
 
-TEST_CASE("join pushdown: outer and asof joins are never rewritten", "[ir][join_pushdown]") {
-    for (const auto kind : {ir::JoinKind::Outer, ir::JoinKind::Asof, ir::JoinKind::Semi,
-                            ir::JoinKind::Anti, ir::JoinKind::Cross}) {
+TEST_CASE("join pushdown: outer, asof, and cross joins are never rewritten",
+          "[ir][join_pushdown]") {
+    for (const auto kind : {ir::JoinKind::Outer, ir::JoinKind::Asof, ir::JoinKind::Cross}) {
         auto out = ir::push_filters_into_joins(filter_join_tree(kind, eq(col("ax"), lit(1))),
+                                               test_sources());
+        REQUIRE(out->kind() == ir::NodeKind::Filter);
+        REQUIRE(out->children().front()->children()[0]->kind() == ir::NodeKind::Scan);
+        REQUIRE(out->children().front()->children()[1]->kind() == ir::NodeKind::Scan);
+    }
+}
+
+TEST_CASE("join pushdown: semi/anti push a left-only conjunct below, same as left",
+          "[ir][join_pushdown]") {
+    // The left side of a Semi/Anti join is exactly its "preserved" side (a row
+    // survives or doesn't; the right side never appears in the output, only in
+    // the existence test), so a conjunct that only reads left columns commutes
+    // with the join the same way it does for a Left join: q04's `o_orderdate`
+    // range, applied above `orders semi join lineitem`, must land on `orders`
+    // rather than filtering the semi join's ~full output afterward.
+    for (const auto kind : {ir::JoinKind::Semi, ir::JoinKind::Anti}) {
+        auto out = ir::push_filters_into_joins(filter_join_tree(kind, eq(col("ax"), lit(1))),
+                                               test_sources());
+        REQUIRE(out->kind() == ir::NodeKind::Join);
+        REQUIRE(out->children()[0]->kind() == ir::NodeKind::Filter);
+        REQUIRE(scan_name(*out->children()[0]) == "a");
+        REQUIRE(out->children()[1]->kind() == ir::NodeKind::Scan);
+    }
+}
+
+TEST_CASE("join pushdown: semi/anti keep a right-only conjunct above", "[ir][join_pushdown]") {
+    for (const auto kind : {ir::JoinKind::Semi, ir::JoinKind::Anti}) {
+        auto out = ir::push_filters_into_joins(filter_join_tree(kind, eq(col("bx"), lit(1))),
                                                test_sources());
         REQUIRE(out->kind() == ir::NodeKind::Filter);
         REQUIRE(out->children().front()->children()[0]->kind() == ir::NodeKind::Scan);
@@ -277,6 +305,31 @@ TEST_CASE("join pushdown: schema flows through a Project side", "[ir][join_pushd
     REQUIRE(out->kind() == ir::NodeKind::Join);
     REQUIRE(out->children()[0]->kind() == ir::NodeKind::Project);
     REQUIRE(out->children()[1]->kind() == ir::NodeKind::Filter);
+}
+
+TEST_CASE("join pushdown: left predicate crosses a mapped-key join", "[ir][join_pushdown]") {
+    // Q2 joins p_partkey = ps_partkey, then filters p_size.  The key mapping
+    // must not prevent a predicate that only reads the unchanged left side
+    // from moving below that join.
+    ir::SourceSchemas sources;
+    sources.insert_or_assign(
+        "part", ir::SchemaInfo::known({{.name = "p_partkey", .type = ir::ColumnType::Int64},
+                                       {.name = "p_size", .type = ir::ColumnType::Int64}}));
+    sources.insert_or_assign(
+        "partsupp",
+        ir::SchemaInfo::known({{.name = "ps_partkey", .type = ir::ColumnType::Int64},
+                               {.name = "ps_supplycost", .type = ir::ColumnType::Int64}}));
+
+    auto out = ir::push_filters_into_joins(
+        make_filter({1}, eq(col("p_size"), lit(15)),
+                    make_join({2}, ir::JoinKind::Inner, {{"p_partkey", "ps_partkey"}},
+                              make_scan({3}, "part"), make_scan({4}, "partsupp"))),
+        sources);
+
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    REQUIRE(out->children()[0]->kind() == ir::NodeKind::Filter);
+    REQUIRE(scan_name(*out->children()[0]) == "part");
+    REQUIRE(out->children()[1]->kind() == ir::NodeKind::Scan);
 }
 
 TEST_CASE("semi pushdown: key in the left side descends there", "[ir][join_pushdown][semi]") {

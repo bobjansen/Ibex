@@ -4589,6 +4589,18 @@ auto literal_args(const std::vector<ir::Expr>& exprs)
     return args;
 }
 
+/// Highest NodeId anywhere in `node`'s subtree. Used to mint a fresh id for a
+/// synthetic node grafted onto a shared binding's plan, the same convention
+/// `join_pushdown.cpp`/`canonicalize.cpp` use for their own synthesized nodes.
+void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
+    out = std::max(out, node.id().value);
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_shared_plan_max_id(*child, out);
+        }
+    }
+}
+
 /// Executes relational batch scripts whose top-level effects are represented
 /// by ScriptPlan. Scalar, tuple, import, and function semantics remain on the
 /// mature statement-at-a-time path until they have equivalent plan nodes.
@@ -5017,6 +5029,85 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
     };
+
+    // A shared binding's plan is evaluated on its own, inside `evaluate`,
+    // where `ir::required_columns` has no consumer above the plan's root and
+    // so must assume every column is wanted -- there is nothing there to
+    // prove otherwise. But every real consumer (the result plan, a sink's
+    // input, another shared binding's plan referencing this one by name) IS
+    // known already: the whole script was lowered together. Union their
+    // demand for this binding's name and, when it comes out bounded, pin it
+    // to the top of the binding's own plan with a synthetic Project so the
+    // materialization only ever decodes what something downstream reads —
+    // the same narrowing a manual `select {...}` right after the join would
+    // have gotten for free. Left unbounded (a bare reference, a `distinct`,
+    // ...) this changes nothing: the plan keeps reading everything, same as
+    // before.
+    {
+        std::map<std::string, ir::ColumnDemand> external_demand;
+        const auto absorb = [&](const ir::Node& plan) {
+            for (auto& [name, want] : ir::required_columns(plan)) {
+                external_demand[name].merge(want);
+            }
+        };
+        if (script->result) {
+            absorb(*script->result);
+        }
+        for (const auto& sink : script->sinks) {
+            if (sink.input) {
+                absorb(*sink.input);
+            }
+        }
+        for (const auto& shared : script->shared_bindings) {
+            if (shared.plan) {
+                absorb(*shared.plan);
+            }
+        }
+        for (auto& shared : script->shared_bindings) {
+            const auto it = external_demand.find(shared.name);
+            if (it == external_demand.end() || it->second.all || it->second.names.empty()) {
+                continue;
+            }
+            // `required_columns` doesn't track a bare name's provenance past
+            // an Aggregate/Project boundary -- it isn't schema-aware the way
+            // `infer_schema`/`check_column_refs` are, so a name it can't
+            // trace (q15's `max_revenue`, read from a *sibling* subquery over
+            // this same binding, not from this binding itself) gets
+            // attributed to every source visible nearby, this one included.
+            // That's the safe direction for what the pass is actually for --
+            // deciding what a base-table scan may skip decoding, where
+            // wanting one column too many costs nothing. Reusing that set as
+            // an exact projection list is a different job with the opposite
+            // safe direction, so it must not be trusted blind: intersect
+            // against the binding's own statically-known output schema
+            // (Ibex is typed at read time; this schema is not a guess, it's
+            // proven the same way `infer_schema` proves it anywhere else)
+            // and keep only names that plan can actually produce. An
+            // unprovable schema (`is_known` fails, or it's `open`) means
+            // declining the narrowing for this binding rather than acting on
+            // an incomplete one.
+            const auto schema = ir::infer_schema(*shared.plan, reader_schemas);
+            if (!schema.is_known() || schema.is_open()) {
+                continue;
+            }
+            std::vector<ir::ColumnRef> columns;
+            columns.reserve(it->second.names.size());
+            for (const auto& name : it->second.names) {
+                if (schema.find(name) != nullptr) {
+                    columns.push_back(ir::ColumnRef{.name = name});
+                }
+            }
+            if (columns.empty()) {
+                continue;
+            }
+            std::uint64_t max_id = 0;
+            collect_shared_plan_max_id(*shared.plan, max_id);
+            auto project =
+                std::make_unique<ir::ProjectNode>(ir::NodeId{max_id + 1}, std::move(columns));
+            project->add_child(std::move(shared.plan));
+            shared.plan = std::move(project);
+        }
+    }
 
     // Bindings the lowerer marked as shared are evaluated exactly once, in
     // declaration order (a later one may scan an earlier one), before any sink

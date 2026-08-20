@@ -7,6 +7,17 @@ Goal: no field is decoded (or materialized) unless it participates in the
 result — driven by the whole-script plan, not by how the query author split
 statements.
 
+**2026-08-20**: the "ascription, `*`, and what it actually costs" and "SOLVED:
+filter pushdown is schema-blind over readers" sections below (2026-07-17) were
+re-verified against current code and are still accurate — that schema-blind
+lower-time pushdown gap is one of four mechanisms behind the PDS-H
+query-realignment regression tracked in
+[query-shape-conformance-plan.md](query-shape-conformance-plan.md); continue
+that investigation there, not here. This file's later join-reordering content
+(from the same investigation arc) is superseded by the cost-model work in
+memory `project_join_reorder_cost_model` / `src/ir/join_order.cpp` — treat
+anything below about join-order guards as historical, not current state.
+
 ## Where things actually stand (verified 2026-07-16)
 
 The mechanism the goal needs already exists. `try_execute_whole_script`
@@ -34,38 +45,59 @@ path decodes 3.
 
 But three gaps keep this from being the benchmark story:
 
-### Gap 1 — the benchmark never exercises the batch planner
+### Gap 1 — the benchmark never exercises the batch planner. RESOLVED (Stage 3)
 
-`bench_ibex.py` splits each query into statements and pipes them one at a
-time into the REPL (`:timing on`), summing per-statement times. The batch
-planner only engages on whole-file execution (`ibex file.ibex`, `ibex_eval`).
-The queries compensate by hand-fusing scan+filter+select into single
-statements — the author is doing the optimizer's job, and every future query
-must be hand-tuned the same way or silently decode the world.
+`bench_ibex.py` used to split each query into statements and pipe them one
+at a time into the REPL (`:timing on`), summing per-statement times, while
+the batch planner only engaged on whole-file execution (`ibex file.ibex`,
+`ibex_eval`). Stage 3 fixed this: `bench_ibex.py`'s default mode now runs
+each query as ONE `:run <file>` in the warm REPL (`run_query_whole_script`),
+so the batch planner (source hoisting, whole-plan pushdown, join rewrites)
+executes it exactly as `ibex file.ibex` would; the old per-statement summing
+survives only behind `--statements`, for stage breakdowns. `run_bench.sh`
+invokes `bench_ibex.py` with no `--statements` flag, so the published suite
+numbers are whole-script numbers. `--report-planner` / the TSV's `mode`
+column also catch a script silently declining to the statement path (see
+"The gate declines three queries, not one" below), so a decline reads as a
+labeled fallback rather than an unexplained regression. See "Implementation
+notes" for what landed and the numbers it produced.
 
-### Gap 2 — predicate-only columns are still gathered and materialized
+### Gap 2 — predicate-only columns are still gathered and materialized. RESOLVED (Stage 1)
 
-Both drivers compute `required_columns` **before**
-`remove_applied_scan_filters` (statement path `src/repl/repl.cpp:3283`, batch
-path `:4302`). So a column referenced only by a pushed-down filter is in
-`names`, and `project_where` (`src/runtime/lazy_table.cpp:132`) gathers it
-row-by-row into the scan output — which the very next Project drops.
+Both drivers used to compute `required_columns` **before**
+`remove_applied_scan_filters`, so a column referenced only by a pushed-down
+filter was in `names`, and `project_where` gathered it row-by-row into the
+scan output — which the very next Project dropped.
 
 The full-column decode of predicate columns is unavoidable (the selection
-needs them); the *gather + materialization* is pure waste:
+needs them); the *gather + materialization* was the pure waste:
 
 - q03: `l_shipdate` gathered for 3.2M survivors (SF-1)
 - q13: `o_comment` — a ~49-byte string column gathered for ~1.45M survivors
 - q10: `l_returnflag`; q06: `l_quantity` + `l_shipdate`; q19: several
 
-### Gap 3 — multi-scan sources lose pushdown in batch mode
+Fixed by Stage 1: both drivers now run `scan_predicates` →
+`remove_applied_scan_filters` → `required_columns`, in that order (statement
+path `src/repl/repl.cpp:3680-3691`, batch path `:4997-5007`), so a
+predicate-only column never lands in `names`. `LazyTable::project_where`
+(`src/runtime/lazy_table.cpp:656`) still decodes every referenced predicate
+column whole-file to evaluate the selection (`decode_whole_columns`,
+unavoidable), but the gather loop at the same site skips any predicate
+column `names` doesn't contain (`if (!names.contains(entry.name)) continue;`)
+— confirmed still in place. The batch path's `project_where` call
+deliberately omits `&scalars` (`repl.cpp:5092`); that's correct-by-construction
+per the Stage 1 implementation note below, not a leftover bug. See
+"Implementation notes" for the validation (1,147 Release tests, 22/22
+byte-identical on both paths at SF-1).
+
+### Gap 3 — multi-scan sources lose pushdown in batch mode. RESOLVED (Stage 2)
 
 `scan_predicates` erases any source scanned more than once in the plan
-(`src/ir/scan_predicates.cpp:201`, `scan_counts != 1`). Statement-at-a-time
-rarely hits this (each statement scans once); a whole-script plan hits it
-whenever a file is read twice — q07 (nation ×2), q15/q20/q21 (lineitem ×2,
-`lower()` clones bound IR per reference). Measured pinned to SF-1
-(min-of-3, whole process incl. ~0.1s startup):
+(`scan_counts != 1`). Statement-at-a-time rarely hit this (each statement
+scans once); a whole-script plan hit it whenever a file was read twice —
+q07 (nation ×2), q15/q20/q21 (lineitem ×2, `lower()` clones bound IR per
+reference). Measured pinned to SF-1 (min-of-3, whole process incl. ~0.1s
+startup) before the fix:
 
 | query | stmt path | batch path |
 |---|---:|---:|
@@ -73,6 +105,23 @@ whenever a file is read twice — q07 (nation ×2), q15/q20/q21 (lineitem ×2,
 | q21 | 0.81s | 0.90s |
 | q07 | 0.31s | 0.33s |
 | q03 (control, single-scan) | 0.14s | 0.15s |
+
+Fixed by Stage 2: `ir::split_scan_instances` (`src/ir/scan_predicates.cpp:256`)
+renames each scan of a multi-scanned source to `name#k` *before*
+`scan_predicates` runs (called from both drivers — statement path
+`repl.cpp:3657`, batch path `:4966`), so `scan_counts[name#k] == 1` for every
+instance and each keeps its own pushed conjuncts and column demand. The
+driver's `resolve_lazy` maps an instance name back to the one shared
+`LazyTable` (`repl.cpp:3659-3668`), so unfiltered whole-column decodes still
+hit one physical `LazyTable`. The adjacent cheap win also landed:
+`LazyTable::decode_whole_columns` (`lazy_table.cpp:988`) checks `cache_`
+before decoding and inserts what it decodes, so a second scan instance's
+predicate-column decode reuses the first instance's cached whole column
+instead of re-reading pages — this alone was q18's fix (its second lineitem
+instance used to re-read pages through a 399-row Skip-heavy selection, per
+Stage 5's notes). q15 batch improved 0.12s → 0.08s per the Stage 2
+implementation note below; inline self-joins of a lazy source work through
+the statement path too.
 
 So today the batch path is parity-or-mildly-worse on the hand-tuned suite.
 Its wins only appear on queries nobody hand-tuned.

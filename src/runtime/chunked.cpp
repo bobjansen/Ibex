@@ -9247,6 +9247,24 @@ auto inner_join_table(const Table& left, const Table& right, const std::vector<i
 
 namespace {
 
+// The single choke point for "build this subtree, then immediately drain it
+// to a whole Table" — every call site in this file that needs a materialized
+// side (a join's build/probe side, an update's input, an aggregate's fused
+// join operand, ...) with no downstream consumer to overlap the build with
+// routes through here, rather than each hand-rolling its own
+// `build_operator` + `materialize_operator` pair. One place to reason about
+// this pattern instead of N independently-drifting copies.
+auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
+                           const ScalarRegistry* scalars, const ExternRegistry* externs,
+                           const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<Table, std::string> {
+    auto op = build_operator(node, registry, scalars, externs, exec, model_out);
+    if (!op.has_value()) {
+        return std::unexpected(std::move(op.error()));
+    }
+    return materialize_operator(std::move(op.value()));
+}
+
 template <typename Fn>
 
 auto build_unary_materializing_operator(const ir::Node& child_node, const TableRegistry& registry,
@@ -9254,11 +9272,8 @@ auto build_unary_materializing_operator(const ir::Node& child_node, const TableR
                                         const ExternRegistry* externs, const ExecutionContext& exec,
                                         ModelResult* model_out, Fn fn)
     -> std::expected<OperatorPtr, std::string> {
-    auto child_op = build_operator(child_node, registry, scalars, externs, exec, model_out);
-    if (!child_op.has_value()) {
-        return std::unexpected(std::move(child_op.error()));
-    }
-    auto materialized = materialize_operator(std::move(child_op.value()));
+    auto materialized =
+        materialize_row_local(child_node, registry, scalars, externs, exec, model_out);
     if (!materialized.has_value()) {
         return std::unexpected(std::move(materialized.error()));
     }
@@ -9281,19 +9296,11 @@ auto build_binary_materializing_operator(const ir::Node& left_node, const ir::No
                                          const ExternRegistry* externs,
                                          const ExecutionContext& exec, ModelResult* model_out,
                                          Fn fn) -> std::expected<OperatorPtr, std::string> {
-    auto left_op = build_operator(left_node, registry, scalars, externs, exec, model_out);
-    if (!left_op.has_value()) {
-        return std::unexpected(std::move(left_op.error()));
-    }
-    auto right_op = build_operator(right_node, registry, scalars, externs, exec, model_out);
-    if (!right_op.has_value()) {
-        return std::unexpected(std::move(right_op.error()));
-    }
-    auto left = materialize_operator(std::move(left_op.value()));
+    auto left = materialize_row_local(left_node, registry, scalars, externs, exec, model_out);
     if (!left.has_value()) {
         return std::unexpected(std::move(left.error()));
     }
-    auto right = materialize_operator(std::move(right_op.value()));
+    auto right = materialize_row_local(right_node, registry, scalars, externs, exec, model_out);
     if (!right.has_value()) {
         return std::unexpected(std::move(right.error()));
     }
@@ -11851,21 +11858,13 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                                    !agg.aggregations().front().column.name.empty() &&
                                    agg.group_by().front().name == join.keys().front().left;
             if (candidate) {
-                auto left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
-                                              model_out);
-                if (!left_op.has_value()) {
-                    return std::unexpected(std::move(left_op.error()));
-                }
-                auto right_op = build_operator(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
-                if (!right_op.has_value()) {
-                    return std::unexpected(std::move(right_op.error()));
-                }
-                auto left = materialize_operator(std::move(left_op.value()));
+                auto left = materialize_row_local(*join.children()[0], registry, scalars, externs,
+                                                  exec, model_out);
                 if (!left.has_value()) {
                     return std::unexpected(std::move(left.error()));
                 }
-                auto right = materialize_operator(std::move(right_op.value()));
+                auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                                   exec, model_out);
                 if (!right.has_value()) {
                     return std::unexpected(std::move(right.error()));
                 }
@@ -12053,12 +12052,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
             }
-            auto right_op =
-                build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
-            if (!right_op.has_value()) {
-                return std::unexpected(std::move(right_op.error()));
-            }
-            auto right = materialize_operator(std::move(right_op.value()));
+            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }
@@ -12094,12 +12089,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                         &join.pending_order()),
                     stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
             }
-            auto right_op =
-                build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
-            if (!right_op.has_value()) {
-                return std::unexpected(std::move(right_op.error()));
-            }
-            auto right = materialize_operator(std::move(right_op.value()));
+            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }

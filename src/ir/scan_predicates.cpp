@@ -41,11 +41,30 @@ auto projected_scan(const Node& node) -> const ScanNode* {
         return nullptr;
     }
     const Node* child = node.children().front().get();
-    while (child->kind() == NodeKind::Project) {
-        if (child->children().size() != 1 || child->children().front() == nullptr) {
-            return nullptr;
+    while (true) {
+        // A Project subsets columns without renaming, so a predicate's column
+        // names still resolve against whatever is beneath it.
+        if (child->kind() == NodeKind::Project) {
+            if (child->children().size() != 1 || child->children().front() == nullptr) {
+                return nullptr;
+            }
+            child = child->children().front().get();
+            continue;
         }
-        child = child->children().front().get();
+        // A checked Ascribe is a proven identity (see AscribeNode::checked):
+        // it asserts shape, never renames, and `check_ascriptions` has already
+        // verified it against the real source schema before this pass runs.
+        // An unchecked one has no such guarantee (its schema may not be the
+        // physical scan's), so it stays opaque, same as any other node kind.
+        if (child->kind() == NodeKind::Ascribe &&
+            static_cast<const AscribeNode&>(*child).checked()) {
+            if (child->children().size() != 1 || child->children().front() == nullptr) {
+                return nullptr;
+            }
+            child = child->children().front().get();
+            continue;
+        }
+        break;
     }
     if (child->kind() != NodeKind::Scan) {
         return nullptr;

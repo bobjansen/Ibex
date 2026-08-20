@@ -39,6 +39,17 @@ auto schema_of(std::string_view src, const SourceSchemas& sources = {}) -> Schem
     return ibex::ir::infer_schema(*lowered.value(), sources);
 }
 
+// Parses and lowers `src`, handing back the owned tree for tests that need to
+// mutate it (check_ascriptions, fuse_checked_ascriptions) rather than just
+// read its inferred schema.
+auto lowered_of(std::string_view src) -> ibex::ir::NodePtr {
+    auto parsed = ibex::parser::parse(src);
+    REQUIRE(parsed.has_value());
+    auto lowered = ibex::parser::lower(*parsed);
+    REQUIRE(lowered.has_value());
+    return std::move(lowered.value());
+}
+
 // Names of the columns in declaration order.
 auto names(const SchemaInfo& schema) -> std::vector<std::string> {
     std::vector<std::string> out;
@@ -1097,4 +1108,90 @@ TEST_CASE("schema: a cross join preserves both sides' proofs", "[ir][schema]") {
     CHECK(nulls_of(s, "lv") == Nullability::Never);
     CHECK(nulls_of(s, "rv") == Nullability::Never);
     CHECK(nulls_of(s, "ru") == Nullability::Maybe);
+}
+
+// fuse_checked_ascriptions: [[project_ascribe_as_scan_metadata]] -- once
+// check_ascriptions proves Ascribe(Scan), fusion replaces the pair with a
+// bare Scan carrying the ascription as ScanNode::ascribed_schema(), so no
+// later pass has to special-case a checked Ascribe node at all.
+
+TEST_CASE("fuse_checked_ascriptions: a checked Ascribe(Scan) fuses into a bare Scan",
+          "[ir][schema][fuse_checked_ascriptions]") {
+    auto tree = lowered_of("t as DataFrame<{ a: Int64, b: Float64 }>;");
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Ascribe);
+    auto ok = ibex::ir::check_ascriptions(*tree, base_sources());
+    REQUIRE(ok.has_value());
+
+    tree = ibex::ir::fuse_checked_ascriptions(std::move(tree));
+
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Scan);
+    const auto& scan = static_cast<const ibex::ir::ScanNode&>(*tree);
+    CHECK(scan.source_name() == "t");
+    REQUIRE(scan.ascribed_schema().has_value());
+    REQUIRE(scan.ascribed_schema()->fields.size() == 2);
+    CHECK(scan.ascribed_schema()->fields[0].name == "a");
+    CHECK(scan.ascribed_schema()->fields[0].type == ColumnType::Int64);
+    CHECK(scan.ascribed_schema()->fields[1].name == "b");
+    CHECK(scan.ascribed_schema()->fields[1].type == ColumnType::Float64);
+    // A fused Scan carries no children of its own -- the Ascribe wrapper
+    // is gone, not just marked done.
+    CHECK(tree->children().empty());
+}
+
+TEST_CASE("fuse_checked_ascriptions: an unchecked ascription is left exactly as it was",
+          "[ir][schema][fuse_checked_ascriptions]") {
+    // No sources given, so the child's schema is unknown and check_ascriptions
+    // has nothing to prove it against -- checked() stays false.
+    auto tree = lowered_of("t as DataFrame<{ x: Int64, y: Float64 }>;");
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Ascribe);
+    auto ok = ibex::ir::check_ascriptions(*tree, {});
+    REQUIRE(ok.has_value());
+
+    tree = ibex::ir::fuse_checked_ascriptions(std::move(tree));
+
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Ascribe);
+    REQUIRE(tree->children().size() == 1);
+    CHECK(tree->children().front()->kind() == ibex::ir::NodeKind::Scan);
+}
+
+TEST_CASE("fuse_checked_ascriptions: a checked ascription over a non-Scan child is untouched",
+          "[ir][schema][fuse_checked_ascriptions]") {
+    // The grammar permits `base as DataFrame<{...}>` for any base, not just a
+    // bare source name -- here `base` is a Filter over the scan. The rule is
+    // deliberately narrow to the direct Ascribe(Scan) shape, so this must
+    // survive fusion unchanged even though the ascription itself is checked.
+    auto tree = lowered_of("t[filter a > 0] as DataFrame<{ a: Int64, b: Float64, c: String }>;");
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Ascribe);
+    auto ok = ibex::ir::check_ascriptions(*tree, base_sources());
+    REQUIRE(ok.has_value());
+    REQUIRE(static_cast<const ibex::ir::AscribeNode&>(*tree).checked());
+
+    tree = ibex::ir::fuse_checked_ascriptions(std::move(tree));
+
+    REQUIRE(tree->kind() == ibex::ir::NodeKind::Ascribe);
+    REQUIRE(tree->children().size() == 1);
+    CHECK(tree->children().front()->kind() == ibex::ir::NodeKind::Filter);
+}
+
+TEST_CASE("fuse_checked_ascriptions: infer_schema is unchanged by fusion",
+          "[ir][schema][fuse_checked_ascriptions]") {
+    // Highest-risk correctness surface: every schema-aware pass depends on
+    // infer_schema, so a fused Scan must report byte-identical field names,
+    // types and nullability to what the pre-fusion Ascribe(Scan) tree did.
+    auto pre = lowered_of("t as DataFrame<{ a: Int64, b: Float64 }>;");
+    auto post = lowered_of("t as DataFrame<{ a: Int64, b: Float64 }>;");
+    REQUIRE(ibex::ir::check_ascriptions(*post, nullable_sources()).has_value());
+    post = ibex::ir::fuse_checked_ascriptions(std::move(post));
+    REQUIRE(post->kind() == ibex::ir::NodeKind::Scan);
+
+    const auto before = ibex::ir::infer_schema(*pre, nullable_sources());
+    const auto after = ibex::ir::infer_schema(*post, nullable_sources());
+    REQUIRE(before.is_known());
+    REQUIRE(after.is_known());
+    CHECK(names(before) == names(after));
+    for (const auto& name : names(before)) {
+        CHECK(type_of(before, name) == type_of(after, name));
+        CAPTURE(name);
+        CHECK(nulls_of(before, name) == nulls_of(after, name));
+    }
 }

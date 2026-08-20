@@ -3698,6 +3698,9 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             !ok.has_value()) {
             return std::unexpected(ok.error());
         }
+        // Fuse every ascription check_ascriptions just proved into its Scan,
+        // so no later pass has to special-case a checked Ascribe node at all.
+        lowered.value() = ir::fuse_checked_ascriptions(std::move(lowered.value()));
         if (auto err = ir::check_joins(*lowered.value(), context.source_schemas)) {
             return std::unexpected(*err);
         }
@@ -4966,6 +4969,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         if (auto ok = ir::check_ascriptions(*rewritten, schemas); !ok.has_value()) {
             return std::unexpected(ok.error());
         }
+        // Fuse every ascription check_ascriptions just proved into its Scan,
+        // so no later pass has to special-case a checked Ascribe node at all.
+        rewritten = ir::fuse_checked_ascriptions(std::move(rewritten));
         // The same argument for the join keys, and this is the first point they
         // can be checked at all: at lowering a reader call site had no schema,
         // and `schemas` has just gained every source's names and types.

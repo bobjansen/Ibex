@@ -198,6 +198,34 @@ python3 compare_polars_detailed.py \
    git log --oneline <commit1>..<commit2>
    ```
 
+### 3. `show_history.py` / `append_history.py`
+
+A real time series, not just a pair of archived runs. `results/*.tsv` (what the two
+tools above read by default) get overwritten every `run_bench.sh` call, and
+`results/runs/<utc>_<commit>_sf<N>/` only supports comparing two runs you pick by
+hand (`compare_runs.py old new`). `results/history.tsv` is the long-format,
+append-only file that accumulates every archived run — `run_bench.sh` appends to
+it automatically now; `append_history.py --backfill` catches up anything archived
+before that was wired in.
+
+**Usage:**
+```bash
+# One query's trend across every archived run, in commit order
+python3 show_history.py --framework ibex --query q14 --sf 1 --cores 8
+
+# Every query's LATEST run at a glance
+python3 show_history.py --framework ibex --sf 1
+```
+
+Pass `--cores` as well as `--sf` if a run matrix-swept core counts under one
+timestamp (`sf-cores-matrix`-style runs) — otherwise the trend interleaves
+different core counts and looks noisier than it is. Directory names mark a
+dirty (uncommitted-tree) run with a `-dirty` suffix on the commit — e.g.
+`f9969244-dirty` — visible in `ls results/runs/` directly, not just inside
+`manifest.json`, because two runs sharing the same nominal commit label but
+one dirty is exactly the kind of thing that makes a real change look like it
+"didn't happen" on a quick glance.
+
 ## Implementation Details
 
 Both scripts properly handle:

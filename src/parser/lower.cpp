@@ -4831,6 +4831,12 @@ class Lowerer {
             case ir::NodeKind::Scan: {
                 const auto& scan = static_cast<const ir::ScanNode&>(node);
                 clone = builder_.scan(scan.source_name());
+                if (const auto& asc = scan.ascribed_schema(); asc.has_value()) {
+                    // Fusion (fuse_checked_ascriptions) folds a proven
+                    // ascription into the Scan itself; a clone that dropped it
+                    // would silently regress to the unfused, unproven schema.
+                    static_cast<ir::ScanNode&>(*clone).set_ascribed_schema(asc->fields, asc->open);
+                }
                 break;
             }
             case ir::NodeKind::Filter: {

@@ -567,6 +567,15 @@ class Node {
     std::vector<NodePtr> children_;
 };
 
+/// A proven ascription fused onto its `Scan`, in place of a standalone
+/// `AscribeNode` above it. Same shape `AscribeNode` carries (`schema()`/
+/// `open()`) -- see `fuse_checked_ascriptions` in schema.hpp for how a bare
+/// `Scan` comes to carry one.
+struct AscribedSchema {
+    std::vector<SchemaField> fields;
+    bool open = false;
+};
+
 /// Scan node: reads from a named source.
 class ScanNode final : public Node {
    public:
@@ -575,8 +584,20 @@ class ScanNode final : public Node {
 
     [[nodiscard]] auto source_name() const noexcept -> const std::string& { return source_name_; }
 
+    /// The ascribed schema fused onto this scan by `fuse_checked_ascriptions`,
+    /// if any. `std::nullopt` for every ordinary (unascribed) scan -- which is
+    /// every scan constructed before fusion runs, since fusion is the only
+    /// thing that ever sets this.
+    [[nodiscard]] auto ascribed_schema() const noexcept -> const std::optional<AscribedSchema>& {
+        return ascribed_schema_;
+    }
+    void set_ascribed_schema(std::vector<SchemaField> fields, bool open) {
+        ascribed_schema_ = AscribedSchema{.fields = std::move(fields), .open = open};
+    }
+
    private:
     std::string source_name_;
+    std::optional<AscribedSchema> ascribed_schema_;
 };
 
 /// Filter node: applies a predicate to its child.

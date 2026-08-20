@@ -749,6 +749,61 @@ Polars repository has no generated `data/tables` or Python environment, so fresh
 Polars numbers could not be reproduced in this shell; the historical q10 Polars
 reference above (43.6ms) is retained but is not presented as a new matched run.
 
+q02 was subsequently aligned as well: one `part → partsupp → supplier → nation
+→ region` relation, late predicates, then the minimum-cost subquery and reuse in
+the final join. Its eight-core whole-script timing changed from **49.10ms** in
+the old fixture to **464.05ms** in the aligned fixture. This is an intentional
+shape result, not a proposed optimization: Ibex materializes the reused joined
+relation, while Polars keeps the lazy plan and can push predicates and projection
+through both consumers. A fresh Polars number still requires the local PDS runner
+and data environment to be installed.
+
+### Full PDS query-shape audit (2026-08-18)
+
+Comparing every Ibex fixture with the checked-in Polars PDS source shows that
+logical equivalence alone was too weak a criterion. The audit tracks relation
+order, predicate placement, and whether a reused subquery is materialized:
+
+| query | status | remaining difference |
+|---|---|---|
+| q01 | aligned | single-table aggregate |
+| q02 | aligned | five-way chain and reused minimum relation; Ibex materializes lets |
+| q03 | aligned | customer → orders → lineitem chain and late filters |
+| q04 | aligned | orders semi join filtered lineitem, then late date filter |
+| q05 | aligned | region → nation → customer → orders → lineitem → supplier |
+| q06 | aligned | single-table filter/aggregate |
+| q07 | aligned | shared filtered nations, Polars join order, late nation/date filters |
+| q08 | aligned | part → lineitem → supplier → orders → customer → nation → region |
+| q09 | aligned | part → partsupp → supplier → lineitem → orders → nation |
+| q10 | aligned | customer → orders → lineitem → nation and late filters |
+| q11 | aligned | q1 aggregate, q2 threshold, cross join, late comparison |
+| q12 | aligned | orders-first join with late lineitem predicates |
+| q13 | aligned | filtered orders, left join, two aggregates |
+| q14 | aligned | part/lineitem join followed by late date filter |
+| q15 | aligned | supplier/revenue join with explicit global max relation |
+| q16 | aligned | part/partsupp filters, left supplier join, null test |
+| q17 | aligned | shared relevant-lineitem relation and quantity aggregate |
+| q18 | aligned | orders semi join aggregate, then lineitem and customer |
+| q19 | aligned | part-first join with late qualification predicates |
+| q20 | aligned | explicit q1/q2/q3 stages; Ibex materializes reused lets |
+| q21 | aligned | q1 late-line join, q2 per-order count, supplier/nation/order filters |
+| q22 | aligned | q1/q2/q3 stages, left join null test, cross aggregate |
+
+The alignment pass addressed the mismatches one at a time, with an execution
+check after each rewrite. q02 demonstrates that a source-shape match can expose
+a large materialization penalty in Ibex; that penalty is recorded as an engine
+boundary rather than hidden by reverting to a different query shape.
+
+After restoring the local Parquet fixture to SF-1 (the first full check had
+accidentally been run against SF-2), the complete implemented-answer check is
+green: q01–q09, q10–q13, and q14–q22 all report `OK`.
+
+q04 is the first follow-up: it now keeps the raw orders relation on the left of
+the semi join, filters only the lineitem side before joining, and applies the
+order-date predicate afterward. At eight cores it measured **69.24ms** before
+alignment and **393.22ms** after alignment; `q04` executes correctly. The gap is
+the same materialization boundary exposed by q02.
+
 ### Pass-3 software-pipelined prefetch, second attempt (2026-08-18)
 
 The earlier "Pass-3 software prefetch check" above patched the vendored

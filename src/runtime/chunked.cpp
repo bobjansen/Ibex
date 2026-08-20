@@ -3887,6 +3887,51 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::vector<uint8_t> left_cat_matches_;
 };
 
+/// The base Scan under `node`, peeled through a chain of Project/Rename/Update
+/// wrappers (and, with `through_filter`, Filter too) — null when `node` is
+/// not (a simple wrapper around) one scan.
+///
+/// `through_filter` defaults off because `deferred_probe_scan_of` below reuses
+/// this peel and must keep its existing, narrower match: the driver only ever
+/// registers a probe scan for exactly the Project/Rename/Update shape it
+/// proved eligible, never past a Filter, so widening the default here would
+/// silently widen what counts as a deferred probe too.
+auto base_scan_of(const ir::Node& node, bool through_filter = false) -> const ir::ScanNode* {
+    const ir::Node* cur = &node;
+    while (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
+           cur->kind() == ir::NodeKind::Update ||
+           (through_filter && cur->kind() == ir::NodeKind::Filter)) {
+        if (cur->children().size() != 1 || cur->children().front() == nullptr) {
+            return nullptr;
+        }
+        cur = cur->children().front().get();
+    }
+    if (cur->kind() != ir::NodeKind::Scan) {
+        return nullptr;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    return &static_cast<const ir::ScanNode&>(*cur);
+}
+
+/// Whether `source_name` is scanned anywhere under `node` — a self-join or a
+/// binding read on both sides would hit this. Used to rule out running two
+/// subtrees concurrently when they might decode the same `LazyTable`:
+/// `LazyTable::cache_` is a plain, unsynchronized map, so two threads
+/// decoding the same source at once would race on it.
+auto subtree_scans_source(const ir::Node& node, const std::string& source_name) -> bool {
+    if (node.kind() == ir::NodeKind::Scan &&
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        static_cast<const ir::ScanNode&>(node).source_name() == source_name) {
+        return true;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr && subtree_scans_source(*child, source_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// If `right` is a chain of Project/Rename nodes over a Scan whose name the
 /// driver registered as a deferred probe scan, return its registration. The
 /// driver only registers scans it proved eligible (ir::deferrable_probe_scans:
@@ -3902,19 +3947,11 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     if (exec.deferred_scans == nullptr) {
         return {};
     }
-    const ir::Node* cur = &right;
-    while (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
-           cur->kind() == ir::NodeKind::Update) {
-        if (cur->children().size() != 1 || cur->children().front() == nullptr) {
-            return {};
-        }
-        cur = cur->children().front().get();
-    }
-    if (cur->kind() != ir::NodeKind::Scan) {
+    const auto* scan_node = base_scan_of(right);
+    if (scan_node == nullptr) {
         return {};
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& name = static_cast<const ir::ScanNode&>(*cur).source_name();
+    const auto& name = scan_node->source_name();
     const auto* scan = exec.deferred_scan(name);
     // A probe scan is one with a filter slot to publish build-side bounds
     // into. The registry also holds streaming registrations (Phase 1), which
@@ -12072,16 +12109,58 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (is_streamable_inner_join(join)) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
-            auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
-            if (!left_op.has_value()) {
-                return std::unexpected(std::move(left_op.error()));
-            }
             // A deferred probe scan must not be interpreted here — the join
             // publishes build-side bounds into its filter slot first, then
             // interprets the right subtree itself (resolve_deferred_probe).
-            if (const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
-                probe.scan != nullptr) {
+            // Decided up front: it also gates the POC overlap below, which
+            // only applies to the ordinary (non-probe) right side.
+            const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
+            const ir::ScanNode* right_scan =
+                probe.scan == nullptr ? base_scan_of(*join.children()[1], /*through_filter=*/true)
+                                      : nullptr;
+
+            // POC — plans/parallelism-overview.md, "multiple producers": the
+            // left side's build and this join's own right-side materialize
+            // have no data dependency on each other, yet build_operator's
+            // single-threaded recursion runs them one after another. Confirmed
+            // on q10 by direct profiling: the orders and lineitem filters run
+            // in separate, non-overlapping windows summing to ~40% of the
+            // query's wall time despite neither reading the other's output.
+            // Overlap them on a raw std::thread (matching
+            // PipelinedStageOperator's own pattern, not a pool submission —
+            // nesting a pool submission inside another would hit WorkerPool's
+            // non-reentrant guard) when it is structurally safe to: no
+            // deferred probe (that path is required to stay sequential — its
+            // filter is derived FROM the left/build side), no model output to
+            // race on (ModelResult* is not thread-safe), and the right side is
+            // a plain base scan whose source does not already appear in the
+            // left subtree (a self-join or repeated binding would race on
+            // `LazyTable::cache_`, which is a plain, unsynchronized map — see
+            // `subtree_scans_source`).
+            const bool overlap =
+                right_scan != nullptr && model_out == nullptr &&
+                !subtree_scans_source(*join.children()[0], right_scan->source_name());
+
+            std::expected<OperatorPtr, std::string> left_op;
+            std::expected<Table, std::string> right;
+            bool right_materialized = false;
+            if (overlap) {
+                std::thread producer([&] {
+                    right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                                  exec, model_out);
+                });
+                left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
+                                         model_out);
+                producer.join();
+                right_materialized = true;
+            } else {
+                left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
+                                         model_out);
+            }
+            if (!left_op.has_value()) {
+                return std::unexpected(std::move(left_op.error()));
+            }
+            if (probe.scan != nullptr) {
                 return make_pipelined_stage_if(
                     std::make_unique<ChunkedInnerJoinOperator>(
                         std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
@@ -12089,8 +12168,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                         &join.pending_order()),
                     stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
             }
-            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
+            if (!right_materialized) {
+                right = materialize_row_local(*join.children()[1], registry, scalars, externs, exec,
+                                              model_out);
+            }
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }

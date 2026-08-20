@@ -1390,6 +1390,72 @@ design the minimal single-call-site "prefetch the next table" change in
 `build_operator`/`chunked.cpp`, with the same caution as every other attempt
 in this territory this session.
 
+### POC against q10 (2026-08-20) — landed, real but smaller than the synthetic estimate; not generalized
+
+Scoped to exactly one call site: the `is_streamable_inner_join` branch of
+`build_operator_impl`'s `Join` case (`chunked.cpp`). When the right side has
+no deferred probe registered (that path stays sequential by necessity — its
+filter is derived FROM the left/build side, so it cannot start early), a raw
+`std::thread` now runs the right side's `materialize_row_local` concurrently
+with `build_operator(left)`, joining before the `ChunkedInnerJoinOperator` is
+constructed — same pattern `PipelinedStageOperator` already uses, not a pool
+submission.
+
+**Guarded, not unconditional.** Two real hazards, not hypothetical ones:
+`ModelResult*` isn't thread-safe (skip when `model_out != nullptr`), and
+`LazyTable::cache_` is a plain, unsynchronized `robin_hood::unordered_map` —
+confirmed by reading `lazy_table.cpp`, not assumed — so decoding the same
+`LazyTable` from two threads at once would race. The right side must resolve
+to a single base `Scan` (peeled through Project/Rename/Update/Filter — a new
+`through_filter` flag on the existing `base_scan_of` helper, shared with
+`deferred_probe_scan_of`, defaulted off there so its own matching semantics
+don't silently widen) whose source name does not already appear anywhere in
+the left subtree (`subtree_scans_source`, new) — which rules out self-joins
+and repeated bindings.
+
+**First landed version was a silent no-op** — worth recording since it
+wasted a benchmarking round: `base_scan_of` originally didn't peel through
+`Filter`, and q10's `orders`/`customer` right-hand sides are `Filter(Scan)`
+after predicate pushdown, not bare scans. The guard evaluated false on every
+join and the "before/after" comparison showed no difference, which read as
+"doesn't help in practice" until a one-line `IBEX_DEBUG_OVERLAP` stderr print
+(added, used, then removed) showed `overlap=0` on all three joins. Lesson:
+when a guarded fast path shows zero measured effect, check whether it fired
+before concluding it doesn't help — this one hadn't run at all.
+
+**Result, once actually firing** (`right=__ibex_source_2`/`__ibex_source_1`
+confirmed via the same debug print, i.e. 2 of q10's 3 joins — the third,
+`…join lineitem`, correctly stays sequential because it legitimately holds a
+deferred probe): correctness — `IBEX_PARALLEL=1` vs `=0` byte-identical
+diff, all 22 `check_answers.py`, full `ctest` (1643/1643) twice, the second
+run specifically to catch intermittent concurrency flakiness now that the
+path is real. Performance — interleaved A/B against a separately-built
+baseline binary (not just before/after in place, to avoid exactly the
+mistake above from recurring), SF-1, `IBEX_CORES=8`, `IBEX_PROFILE_OPERATORS=1`
+wall_ms for the query's top-level entry, 8 paired runs:
+
+    base:    162.2 143.3 197.5 177.3 129.1 138.3 136.8 127.0   median 140.8
+    patched: 139.3 147.0 166.2 130.3 117.6 129.6 123.1 119.1   median 129.9
+
+Patched faster in **8 of 8** paired runs (binomial p ≈ 0.008, one-sided) —
+consistent despite a noisy box (the run-3 outliers on both sides), median
+**~8% faster**. Smaller than the synthetic harness's ~15%: expected, not a
+red flag — only 2 of 3 joins are eligible here (the deferred-probe join is
+correctly excluded), and the two producers now compete with the rest of the
+query's own pool work rather than having the whole 8-core pool to themselves
+the way the isolated benchmark did.
+
+**Explicitly not generalized, per this session's decision.** Left untouched:
+the `streamable_semi_anti` sibling branch (same shape, same argument would
+apply), `build_binary_materializing_operator` (the non-streaming join
+fallback and `Matmul`'s shared choke point — touching it would cover more
+operators at once but was deliberately out of scope for a POC), and any
+attempt to widen `overlap`'s eligibility beyond "right resolves to one base
+scan" (e.g. letting the right side itself be a small join). Next session:
+decide whether to generalize now that the mechanism is proven, or stop here
+— this section plus the diff in `chunked.cpp` (search `POC` there) is the
+resume point either way.
+
 ---
 
 ## Rejected: weakening first-occurrence group ordering

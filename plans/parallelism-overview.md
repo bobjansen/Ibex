@@ -1238,6 +1238,112 @@ So ring *depth* is irrelevant and producer *count* is the constraint. Worth
 settling whether a staged breaker should have several producers before tuning
 any single operator inside one.
 
+### First pass at the multiple-producers question (2026-08-20) — refined, not answered; STOPPED before writing code
+
+Asked to dig into the question above. Session context: this followed the
+[[project_query_shape_conformance_regression]] investigation, and a fresh
+Ibex-vs-Polars core-scaling measurement (published artifact, SF-2, PDS-H)
+showed Ibex winning single-threaded (0.85x Polars) but losing badly by 8
+cores (1.46x Polars' time; suite speedup 1->8 cores 1.83x vs Polars' 3.15x)
+— independent, suite-level confirmation of this document's own "machine is
+mostly idle" diagnosis, which is what motivated returning to this plan
+instead of chasing more individual queries.
+
+**First checked whether this document's other findings were still current
+before trusting them** (a lesson learned the hard way earlier the same
+session, see [[feedback_engine_owns_join_order]] and the
+query-shape-conformance plan's own corrections). Two were stale:
+
+- The **q04 finding** ("q04, the query that exposed both errors" section
+  above — semi-join build side fully serial, unimplemented) turned out to
+  already be fixed, commit `7fde36d`, landed the same day the diagnosis was
+  written but never marked done here. See that section's own addendum.
+- **Item 9's "join `assemble_output` (q21/q20/q09)" sub-target** turned out
+  to already be resolved too (I15's `gather_columns_batched`, already
+  landed) — re-profiled fresh and those joins' `assemble_output` is cheap
+  and parallel; what dominates their wall time is `ring_wait_ms` on the
+  right-side scan, a producer-side cost, not a join-assembly gap. See the
+  addendum on item 9 above.
+
+**Then investigated the actual question — "should a staged breaker have
+several producers" — and it turned out to need reframing, not a yes/no.**
+`IBEX_PARALLEL_STATS=1` across q04/q09/q13/q18/q10/q20/q21 shows
+`stage_threads_peak`/`pipelined_stages` already reaching 2-3 concurrently
+(q09: 2, q18: 3, q10: 2), and q09 also shows `parallel_probes=5` — the
+architecture already runs multiple concurrent producers when the plan
+shape naturally produces them (nested streamable joins, deferred/dynamic-key
+probes). So "only one producer, ever" is not quite the finding.
+
+**The real gap, found by comparing occupancy across sibling scans/filters
+within one query, not by re-deriving the suite-wide 70% figure**: in q10,
+the lineitem-derived filter (node 47) runs at **65% pool occupancy** — real,
+already-parallel work — while a much smaller, logically-independent filter
+on `orders` (node 46) runs at only **18.5% occupancy** in its own separate
+time window (13.3ms of q10's 39.9ms wall). Nothing in `orders` depends on
+lineitem's result — they only combine at the join afterward — but
+`build_operator` recurses depth-first through a left-deep join chain, so
+each right-hand table's decode only *starts* when that specific join node is
+reached in the recursion; `orders`' decode doesn't begin until the lineitem
+side of the chain ahead of it has resolved. 65% + 18.5% = 83.5% < 100%, so
+there is real, quantifiable slack for the two to run concurrently instead of
+back-to-back. Rough sizing against q10's own wall time: up to ~10-30% wall
+reduction on queries with more than one meaningfully-sized non-dominant
+scan, if that overlap were realized — real, not the whole gap, and every
+table read through this repo's own pattern query files at SF-1/SF-2 sizing
+suggests most PDS-H tables besides lineitem/orders are small enough that
+the win concentrates in queries touching lineitem AND orders AND a third
+sizeable table together (q10, q03, q09 are the closest matches measured so
+far; q05/q07/q08 not yet checked).
+
+**The concrete mechanism, not yet implemented**: every table's `LazyTable`
+is already resolved (schema known, ready to decode) before query execution
+begins — the driver builds `lazy_sources` for every source up front (see
+`repl.cpp`'s `evaluate` lambda, referenced earlier in this document). What
+never happens is starting a table's *decode* before the join that consumes
+it is actually reached. The fix shape would be: kick off the next
+not-yet-consumed base table's decode on a background thread (the same
+raw-`std::thread` pattern `PipelinedStageOperator` already uses, not a pool
+submission — nesting a pool submission inside another would hit
+`WorkerPool`'s non-reentrant guard) as soon as its `LazyTable` is known,
+rather than waiting for `build_operator`'s depth-first recursion to reach
+that join node. This is architecturally different from what
+`PipelinedStageOperator` already does (overlap ONE scan's decode with ITS
+OWN immediate consumer) — this would overlap decode of table N+1 with the
+join/build work for tables 1..N, a genuinely new axis of overlap.
+
+**STOPPED here, deliberately, before writing any code.** This exact
+subsystem (`chunked.cpp`'s pipelining and materialize boundaries) has a
+five-times-reverted track record in this same session
+([[project_ascribe_pipeline_barrier]] / Mechanism 5 in the
+query-shape-conformance plan) — every attempt at "let something run more
+eagerly/concurrently" hit a subtle multi-consumer or
+materialize-then-drain interaction that cost more than it won, including
+one unreproduced hang. A "prefetch the next table's decode" change touches
+the same territory (when a lazy source's `cache_` gets written, from which
+thread, consumed by whom) and deserves the same caution.
+
+**Two candidate next steps for whoever resumes this, not yet chosen
+between:**
+1. **De-risk the estimate first**: a controlled synthetic benchmark — two
+   independent large Parquet scans, decoded sequentially vs. deliberately
+   concurrently via a throwaway harness outside any real query plan or
+   `chunked.cpp` code path — to confirm the ~65%-occupancy-leaves-~35%-slack
+   arithmetic actually delivers real wall-clock savings on this box before
+   any production code changes.
+2. **Scope narrowly against a real query**: pick ONE query where the
+   opportunity is clearest (q10, per the measurement above) and design the
+   minimal, single-call-site version of "prefetch the next table" rather
+   than a general mechanism, following this session's now-repeated lesson
+   (Mechanism 3, Mechanism 5) that a heuristic checked against one or two
+   cases and generalized too early has repeatedly cost more than it won on
+   this codebase.
+
+Neither was started. **This is the correct resume point for the next
+session on this specific thread** — do not re-derive the above from
+scratch; start from "de-risk via synthetic benchmark" or "scope against
+q10," whichever the session decides, with this section's numbers as the
+starting evidence.
+
 ---
 
 ## Rejected: weakening first-occurrence group ordering

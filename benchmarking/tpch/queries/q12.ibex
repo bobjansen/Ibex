@@ -19,8 +19,17 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_orderpriority: String
+}>;
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_shipdate: Date,
+    l_commitdate: Date,
+    l_receiptdate: Date,
+    l_shipmode: String
+}>;
 
 // Match Polars: orders → lineitem first, then apply all line-level predicates
 // to the joined relation.

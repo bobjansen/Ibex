@@ -24,11 +24,17 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet")[
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64
+}>[
     select { c_custkey }
 ];
 
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_custkey: Int64,
+    o_comment: String
+}>;
 let orders = orders_raw[filter !like(o_comment, "%special%requests%")][
     select { c_custkey = o_custkey, o_orderkey }
 ];

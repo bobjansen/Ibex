@@ -30,9 +30,20 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64,
+    c_name: String
+}>;
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_custkey: Int64,
+    o_totalprice: Float64,
+    o_orderdate: Date
+}>;
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_quantity: Float64
+}>;
 
 // The `in` set: orders whose line items total more than 300 units. One column,
 // named to the key the semi join probes on.

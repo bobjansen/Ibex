@@ -24,8 +24,16 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_brand: String,
+    p_container: String
+}>;
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_partkey: Int64,
+    l_quantity: Float64,
+    l_extendedprice: Float64
+}>;
 
 let selected_parts = part_raw[
     filter p_brand == "Brand#23" && p_container == "MED BOX",

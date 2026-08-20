@@ -30,10 +30,25 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_name: String,
+    s_nationkey: Int64
+}>;
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String
+}>;
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_orderstatus: String
+}>;
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_suppkey: Int64,
+    l_commitdate: Date,
+    l_receiptdate: Date
+}>;
 
 // Lines belonging to status-F orders.
 // Match Polars' q1: orders with more than one supplier, joined to late lines.

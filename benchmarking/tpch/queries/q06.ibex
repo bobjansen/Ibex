@@ -14,7 +14,12 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_quantity: Float64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_shipdate: Date
+}>;
 
 let result = lineitem[
     filter l_shipdate >= date"1994-01-01" && l_shipdate < date"1995-01-01"

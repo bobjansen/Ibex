@@ -18,9 +18,22 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64,
+    c_mktsegment: String
+}>;
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_custkey: Int64,
+    o_orderdate: Date,
+    o_shippriority: Int64
+}>;
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_shipdate: Date
+}>;
 
 // Keep the same lazy chain as the PDS Polars query: customer → orders →
 // lineitem, followed by the predicates and aggregate on the joined relation.

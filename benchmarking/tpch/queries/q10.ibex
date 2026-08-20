@@ -18,10 +18,30 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64,
+    c_name: String,
+    c_address: String,
+    c_nationkey: Int64,
+    c_phone: String,
+    c_acctbal: Float64,
+    c_comment: String
+}>;
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_custkey: Int64,
+    o_orderdate: Date
+}>;
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_returnflag: String
+}>;
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String
+}>;
 
 let result = (((customer join orders on { c_custkey = o_custkey })
     join lineitem on { o_orderkey = l_orderkey })

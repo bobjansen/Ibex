@@ -337,18 +337,6 @@ auto match_probe_chain(const Node& node, std::string key)
                 }
                 break;
             }
-            case NodeKind::Ascribe: {
-                // A checked Ascribe is a proven identity (see
-                // AscribeNode::checked): it asserts shape, never renames, and
-                // never drops or reorders rows -- exactly as safe to walk
-                // through as Project, and for the same reason Mechanism 2
-                // needed the same case in `projected_scan` above. An
-                // unchecked one has no such guarantee, so it stays opaque.
-                if (!static_cast<const AscribeNode&>(*cur).checked()) {
-                    return std::nullopt;
-                }
-                break;
-            }
             case NodeKind::Rename: {
                 for (const auto& rs : static_cast<const RenameNode&>(*cur).renames()) {
                     if (rs.new_name == key) {
@@ -395,41 +383,6 @@ auto match_probe_chain(const Node& node, std::string key)
     }
 }
 
-/// Whether `node`'s subtree contains an operator that can reduce row count
-/// below what its own input held: Filter (and its fused forms), Head/Tail/
-/// TopK, Distinct, or a join that isn't a plain unpredicated inner (semi/anti
-/// narrow by definition; a predicated inner can reject rows an unpredicated
-/// one never would). Used to gate deferred-probe eligibility below: deferring
-/// a scan only pays off when the corresponding join's BUILD side is a
-/// genuinely reduced slice of its own source, not the whole table joined
-/// bare — see the economics note on `collect_deferrable`.
-auto contains_row_reducing_node(const Node& node) -> bool {
-    switch (node.kind()) {
-        case NodeKind::Filter:
-        case NodeKind::FilterProject:
-        case NodeKind::FilterUpdateProject:
-        case NodeKind::FilterHead:
-        case NodeKind::FilterTail:
-        case NodeKind::Head:
-        case NodeKind::Tail:
-        case NodeKind::TopK:
-        case NodeKind::Distinct:
-            return true;
-        case NodeKind::Join: {
-            const auto& join = static_cast<const JoinNode&>(node);
-            if (join.kind() != JoinKind::Inner || join.predicate().has_value()) {
-                return true;
-            }
-            break;
-        }
-        default:
-            break;
-    }
-    return std::ranges::any_of(node.children(), [](const NodePtr& child) {
-        return child != nullptr && contains_row_reducing_node(*child);
-    });
-}
-
 void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         const std::map<std::string, std::size_t>& counts,
                         std::map<std::string, DeferrableProbeScan>& out) {
@@ -440,25 +393,9 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
         // that mapping directly, so a mapped key is as eligible as a
         // same-named one; requiring normalization here turns an otherwise
         // selective mapped join into a whole-table probe scan.
-        //
-        // Deferring only pays off when the join is actually selective from
-        // the probe side's perspective — most PDS-H joins are a bare PK-FK
-        // relationship (every fact row matches something), so an unfiltered
-        // build side means the deferred/per-chunk decode ends up touching
-        // essentially the whole probe table anyway, paying real overhead
-        // (uncached, repeated small decodes) for none of the benefit a
-        // parallel bulk decode already gets for free. Measured: q12
-        // (`orders join lineitem`, orders unfiltered before the join) lost to
-        // a single parallel decode by ~3x when this fired unconditionally.
-        // `contains_row_reducing_node` is a structural stand-in for "the
-        // build side is smaller than its own source" — cheap, no cardinality
-        // estimate needed, and correct in the direction that matters: no
-        // filter anywhere on the build side means no evidence deferring
-        // helps, so decline rather than guess.
         if (join.kind() == JoinKind::Inner && join.keys().size() == 1 &&
             !join.predicate().has_value() && join.children().size() == 2 &&
-            join.children()[0] != nullptr && join.children()[1] != nullptr &&
-            contains_row_reducing_node(*join.children()[0])) {
+            join.children()[1] != nullptr) {
             if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {
                 if (const auto count = counts.find(match->first);

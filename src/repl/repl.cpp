@@ -1557,6 +1557,80 @@ auto derive_column_distinct(const runtime::LazyTable& lazy) -> ir::ColumnDistinc
     return out;
 }
 
+/// Distinct values actually present in a decoded column. Used only on a
+/// bounded SAMPLE (one row-group unit), never a whole source -- see
+/// `make_relation_sampler` below. Null-agnostic: a null isn't a distinct
+/// value, but at the sample sizes and join-key columns this runs on, folding
+/// one null in as a spurious extra "value" moves a cost-model estimate by
+/// noise, not by a wrong decision.
+auto count_distinct_in_column(const runtime::ColumnValue& column) -> std::size_t {
+    // Every Column<T> specialization's `value_type` is directly comparable
+    // (Column<std::string> and Column<Categorical> both give a
+    // std::string_view, not an owning std::string), so one index loop covers
+    // every alternative in the variant with no per-type branching.
+    return std::visit(
+        [](const auto& col) -> std::size_t {
+            std::set<typename std::decay_t<decltype(col)>::value_type> seen;
+            const auto n = col.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                seen.insert(col[i]);
+            }
+            return seen.size();
+        },
+        column);
+}
+
+/// Builds the `ir::RelationSamplerFn` join ordering uses to see past what
+/// Parquet footer statistics alone can: a filter's real selectivity, and a
+/// join key's real distinct count (see `join_order.cpp`'s
+/// `kMaxReorderRelations` and `cardinality.cpp`'s `distinct_below` for why
+/// this exists and what it fixes). Always reads exactly ONE scan unit (one
+/// Parquet row group, or the whole source if it has no unit decomposition) --
+/// bounded, not a full-table decode, because this runs during PLANNING, not
+/// execution. `lazy_sources` is captured by reference and must outlive every
+/// call, which holds for the duration of one `evaluate()` invocation (the
+/// only caller).
+auto make_relation_sampler(LazyTableRegistry& lazy_sources) -> ir::RelationSamplerFn {
+    return [&lazy_sources](
+               const std::string& source, const ir::Expr* predicate,
+               const std::vector<std::string>& columns) -> std::optional<ir::RelationSample> {
+        const auto it = lazy_sources.find(source);
+        if (it == lazy_sources.end()) {
+            return std::nullopt;
+        }
+        auto& lazy = *it->second;
+        const auto units = lazy.scan_units();
+        if (units.empty()) {
+            return std::nullopt;
+        }
+        const auto& unit = units.front();
+        const std::set<std::string> names(columns.begin(), columns.end());
+        std::vector<ir::Expr> conjuncts;
+        if (predicate != nullptr) {
+            conjuncts.push_back(*predicate);
+        }
+        // A predicate that needs the scalar-variable registry (a `let`-bound
+        // literal in the filter, not embedded directly) or a dynamic join-key
+        // filter isn't sampleable this way; declining is the right answer,
+        // not a wrong estimate.
+        auto sampled = lazy.project_where_unit(names, conjuncts, unit, command_exec());
+        if (!sampled.has_value()) {
+            return std::nullopt;
+        }
+        ir::RelationSample result;
+        result.sampled_rows = unit.rows;
+        if (predicate != nullptr) {
+            result.predicate_passed = sampled->rows();
+        }
+        for (const auto& column : columns) {
+            if (const auto* value = sampled->find(column)) {
+                result.distinct.emplace(column, count_distinct_in_column(*value));
+            }
+        }
+        return result;
+    };
+}
+
 /// Validates that `column` satisfies the scalar element type declared in `type`.
 /// Returns nullopt on success, or an error message on failure.
 auto validate_column_type(const runtime::ColumnValue& column, const parser::Type& type)
@@ -4829,6 +4903,27 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             source_stats.distinct.insert_or_assign(source.source_name,
                                                    derive_column_distinct(*lazy.value()));
             lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
+        }
+        // `make_relation_sampler` (real, data-sampled filter selectivity and
+        // key-distinct counts) is built but gated OFF by default: measured
+        // against the full suite, a one-row-group sample regressed q10 5x
+        // (86ms -> 474ms) by giving `resolve_key_distincts` a WORSE
+        // o_orderkey/l_orderkey distinct estimate than the footer span it was
+        // meant to improve on -- q10's join keys are not uniformly
+        // distributed across row groups, so "the first row group" is not a
+        // representative sample of the whole file. The infrastructure
+        // (RelationSamplerFn, the sampled-selectivity path in
+        // join_order.cpp's collect_left_deep, and the sampled-distinct path
+        // in cardinality.cpp's distinct_below) is real and was
+        // correctness-verified where it WAS exercised (see
+        // join_reorder.cpp's connecting_keys fix, found via this work). What
+        // it needs before going live unconditionally is a sampling strategy
+        // that's actually representative -- multiple row groups, or a
+        // validated confidence bound on the single-unit estimate -- not a
+        // bigger reorder cap. IBEX_EXPERIMENTAL_JOIN_SAMPLING opts in for
+        // that follow-up work to A/B against without a rebuild.
+        if (std::getenv("IBEX_EXPERIMENTAL_JOIN_SAMPLING") != nullptr) {
+            source_stats.sample = make_relation_sampler(lazy_sources);
         }
 
         // Uniqueness is the one thing the planner cannot infer about a base

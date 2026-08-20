@@ -202,15 +202,39 @@ auto schemas_are_unambiguous(const std::vector<const Node*>& leaves, const std::
     return true;
 }
 
+/// The edge whose keys can actually join `candidate` onto `selected` in the
+/// NEW order: `candidate`'s own schema must carry every key, and some member
+/// of `selected` (any one -- left-deep join keys never need to come from a
+/// single specific relation) must carry it too. Mirrors `join_order.cpp`'s
+/// `connecting_edge`/`has_all_keys`/`group_carries` exactly, because the
+/// order this rewrites was CHOSEN using that logic -- using a different
+/// notion of "connects" here can pick an edge the model never justified.
+///
+/// The previous version of this function checked only `candidate <=
+/// edge.right` (a leftover of `Edge::right` happening to equal `candidate`
+/// for a chain reordered close to its original shape): with the reorder
+/// guard raised past 5 relations this returned the wrong edge's keys for a
+/// later position, building a JoinNode whose keys don't exist in either
+/// child's schema -- caught at RUNTIME ("join key not found in right:
+/// ps_suppkey (available: p_partkey)" on q09), not at planning time, because
+/// nothing here re-validates the edge against the actual schemas.
 auto connecting_keys(std::size_t candidate, const std::vector<std::size_t>& selected,
-                     const std::vector<Edge>& edges) -> const std::vector<std::string>* {
+                     const std::vector<Edge>& edges, const std::vector<SchemaInfo>& leaf_schemas)
+    -> const std::vector<std::string>* {
+    const auto& candidate_schema = leaf_schemas[candidate];
     for (const auto& edge : edges) {
-        const bool candidate_in_edge = candidate <= edge.right;
-        const bool selected_in_edge = std::ranges::any_of(
-            selected, [&](std::size_t relation) { return relation <= edge.right; });
-        if (candidate_in_edge && selected_in_edge &&
-            std::ranges::any_of(selected,
-                                [&](std::size_t relation) { return relation != candidate; })) {
+        const bool candidate_has_keys = std::ranges::all_of(edge.keys, [&](const std::string& key) {
+            return candidate_schema.find(key) != nullptr;
+        });
+        if (!candidate_has_keys) {
+            continue;
+        }
+        const bool selected_has_keys = std::ranges::all_of(edge.keys, [&](const std::string& key) {
+            return std::ranges::any_of(selected, [&](std::size_t member) {
+                return leaf_schemas[member].find(key) != nullptr;
+            });
+        });
+        if (selected_has_keys) {
             return &edge.keys;
         }
     }
@@ -237,6 +261,14 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
         !schemas_are_unambiguous(preview, preview_edges, stats.schemas)) {
         return child;
     }
+    // Computed from `preview` (before `take_left_deep` moves the leaves out)
+    // because `connecting_keys` needs every leaf's schema available at once,
+    // not just the two `take_left_deep` currently holds.
+    std::vector<SchemaInfo> leaf_schemas;
+    leaf_schemas.reserve(preview.size());
+    for (const auto* leaf : preview) {
+        leaf_schemas.push_back(infer_schema(*leaf, stats.schemas));
+    }
 
     std::vector<NodePtr> leaves;
     std::vector<Edge> edges;
@@ -247,7 +279,7 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
     std::vector<std::size_t> selected{order->front()};
     for (std::size_t pos = 1; pos < order->size(); ++pos) {
         const std::size_t candidate = (*order)[pos];
-        const auto* keys = connecting_keys(candidate, selected, edges);
+        const auto* keys = connecting_keys(candidate, selected, edges, leaf_schemas);
         if (keys == nullptr || leaves[candidate] == nullptr) {
             return nullptr;
         }

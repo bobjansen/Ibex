@@ -287,6 +287,30 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
     switch (node.kind()) {
         case NodeKind::Scan: {
             const auto& scan = static_cast<const ScanNode&>(node);
+            // A real sample beats the footer: `stats.distinct` below is a
+            // `min(rows, max-min+1)` span estimate, exact for a dense key but
+            // far too high for a sparse or skip-patterned one (TPC-H's
+            // l_orderkey generator skips values, so a 6M-row footer span
+            // overstates its true ~1.5M distinct count by 4x -- the error
+            // that broke an earlier unguarded join-reorder attempt on q09).
+            // Extrapolating a sample's observed distinct count by how much of
+            // the source it covers tracks the true count far better, because
+            // it's reading the actual skip pattern instead of assuming a
+            // dense fill.
+            if (stats.sample) {
+                if (auto sample = stats.sample(scan.source_name(), nullptr, {column})) {
+                    const auto found = sample->distinct.find(column);
+                    const auto total = stats.rows.find(scan.source_name());
+                    if (found != sample->distinct.end() && sample->sampled_rows > 0 &&
+                        total != stats.rows.end() && total->second > 0) {
+                        const double scale = static_cast<double>(total->second) /
+                                             static_cast<double>(sample->sampled_rows);
+                        const double extrapolated = static_cast<double>(found->second) * scale;
+                        return static_cast<std::size_t>(
+                            std::min(extrapolated, static_cast<double>(total->second)));
+                    }
+                }
+            }
             const auto source = stats.distinct.find(scan.source_name());
             if (source == stats.distinct.end()) {
                 return std::nullopt;

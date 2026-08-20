@@ -7,9 +7,11 @@
 #include <ibex/ir/schema.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ibex::ir {
 
@@ -31,10 +33,43 @@ using SourceColumnDistinct = std::map<std::string, ColumnDistinct>;
 /// What the planner knows about the sources a plan reads, before any of it is
 /// decoded. Bundled because these three are always wanted together and are
 /// threaded through every costing entry point.
+/// One relation's real, data-sampled statistics -- a bounded decode of a
+/// single unit (e.g. one Parquet row group), not the whole source. Real
+/// numbers from actual data are the only way to see what footer min/max
+/// cannot: a filter's true selectivity, and a sparse/skip-patterned key's
+/// true distinct count (a footer span on `l_orderkey` reads far higher than
+/// its true distinct count -- TPC-H's order-key generator skips values --
+/// which is what made an earlier unguarded join-order attempt regress q09;
+/// see join_order.cpp's kMaxReorderRelations for the full history).
+struct RelationSample {
+    std::size_t sampled_rows = 0;
+    /// Present only when a predicate was given and evaluated successfully.
+    std::optional<std::size_t> predicate_passed;
+    /// Distinct values observed per requested column, present only for
+    /// columns the sampler could actually decode and count.
+    std::map<std::string, std::size_t> distinct;
+};
+
+/// Samples `source` for a caller costing a join order past what footer
+/// statistics alone can safely support. `predicate`, if non-null, is
+/// evaluated against the sample and the RESULT's rows (not `columns`'
+/// distinct counts, which are then counted on the FILTERED sample -- callers
+/// wanting raw, unfiltered distinct counts pass `predicate = nullptr`).
+/// Returns nullopt when the source cannot be sampled at all (not lazy, no
+/// units, decode failed) -- callers must fall back to the heuristic estimate
+/// for such a source, never treat nullopt as "zero selectivity" or "no
+/// distinct values".
+using RelationSamplerFn = std::function<std::optional<RelationSample>(
+    const std::string& source, const Expr* predicate, const std::vector<std::string>& columns)>;
+
 struct SourceStats {
     SourceRowCounts rows;
     SourceSchemas schemas;
     SourceColumnDistinct distinct;
+    /// Optional: see RelationSamplerFn. Unset (default) means "no sampling
+    /// available", the same as it always was -- every existing caller that
+    /// default-constructs SourceStats keeps the pure footer/heuristic path.
+    RelationSamplerFn sample;
 };
 
 struct CardinalityEstimate {

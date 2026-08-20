@@ -93,6 +93,8 @@ auto column_type_name(ir::ColumnType type) -> std::string_view {
             return "Date";
         case ir::ColumnType::Timestamp:
             return "Timestamp";
+        case ir::ColumnType::Categorical:
+            return "Categorical";
     }
     return "?";
 }
@@ -1634,7 +1636,7 @@ class Lowerer {
                                                                  "' is not present in the input"});
                 }
                 if (field.type.has_value() && have->type.has_value() &&
-                    *have->type != *field.type) {
+                    !ir::ascription_type_satisfies(*have->type, *field.type)) {
                     return std::unexpected(
                         LowerError{.message = "schema ascription: column '" + field.name + "' is " +
                                               std::string(column_type_name(*have->type)) +

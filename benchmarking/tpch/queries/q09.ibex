@@ -25,12 +25,35 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_name: String
+}>;
+let partsupp = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+    ps_partkey: Int64,
+    ps_suppkey: Int64,
+    ps_supplycost: Float64
+}>;
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_nationkey: Int64
+}>;
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_partkey: Int64,
+    l_suppkey: Int64,
+    l_quantity: Float64,
+    l_extendedprice: Float64,
+    l_discount: Float64
+}>;
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_orderdate: Date
+}>;
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String
+}>;
 
 // Match Polars: part → partsupp → supplier → lineitem (composite key) →
 // orders → nation, with the green-part predicate applied after the chain.

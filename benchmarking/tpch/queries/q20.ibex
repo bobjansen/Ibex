@@ -20,11 +20,31 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
-let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_name: String,
+    s_address: String,
+    s_nationkey: Int64
+}>;
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String
+}>;
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+    ps_partkey: Int64,
+    ps_suppkey: Int64,
+    ps_availqty: Int64
+}>;
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_name: String
+}>;
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_partkey: Int64,
+    l_suppkey: Int64,
+    l_quantity: Float64,
+    l_shipdate: Date
+}>;
 
 // Follow the explicit relational shape used by Polars: materialize the
 // line-item aggregate, the filtered nation, and the supplier/nation join, then

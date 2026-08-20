@@ -27,8 +27,14 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let customer_raw = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
+let customer_raw = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64,
+    c_phone: String,
+    c_acctbal: Float64
+}>;
+let orders_raw = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_custkey: Int64
+}>;
 
 // Customers in the seven target country codes, carrying the derived code.
 let in_scope = customer_raw[update { cntrycode = substring(c_phone, 0, 2) }][

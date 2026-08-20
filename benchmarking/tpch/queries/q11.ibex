@@ -35,9 +35,20 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+    ps_partkey: Int64,
+    ps_suppkey: Int64,
+    ps_availqty: Int64,
+    ps_supplycost: Float64
+}>;
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_nationkey: Int64
+}>;
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String
+}>;
 
 let q1 = (
     partsupp_raw[select { ps_partkey, ps_suppkey, ps_supplycost, ps_availqty }]

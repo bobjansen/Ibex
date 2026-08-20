@@ -1669,17 +1669,24 @@ suite or PDS-H generally) with the same "self-join whose sole purpose is
 feeding a cardinality comparison" shape, to have more than one data point
 before designing a rewrite rule.
 
-**The honest, immediately-available option**: the old hand-fused text is
-verified correct and 2.4-2.5x faster on today's engine, right now, with zero
-engine-code risk. Swapping `benchmarking/tpch/queries/q21.ibex` back to that
-text would close the gap immediately — at the cost of reversing the
-"match natural query shape" principle `eb5231c` established, for this one
-query. That's a call for whoever owns the benchmark suite's goals, not one
-to make unilaterally here; the text is not currently staged anywhere in the
-tree (experiments live in this session's scratchpad only, not committed).
+**RULED OUT 2026-08-20**: hand-swapping the old query text back in, even
+though it's verified correct and faster. Standing project rule, restated by
+the user when this was raised: **join order and rewrite shape are the
+engine's responsibility, not the query writer's** — the engine is free to
+reorder/rewrite; the author of a `.ibex` query is not expected to hand-encode
+a specific join structure to get good performance, which is exactly what the
+old hand-fused text does (and exactly what `eb5231c` moved the suite away
+from testing). So the only acceptable fix here is a real planner capability,
+not a text substitution — this isn't a "which do you prefer" tradeoff, it's
+already decided.
 
 **Where this leaves q21**: real, well-understood now (not just diagnosed),
-and NOT a quick fix — either accept the shape tradeoff and hand-restore the
-old query text, or treat "recognize distinct-count-replaceable self-joins"
-as its own scoped planner project with its own plan, informed by more
-than one example query first.
+and genuinely NOT a quick fix — it needs "recognize distinct-count-replaceable
+self-joins" as its own scoped planner project, informed by more than one
+example query first (see above: one query's evidence isn't enough to design
+a rewrite rule safely, per this plan's own repeated Mechanism-3/5 lesson).
+Next concrete step, not yet done: survey PDS-H (this suite and/or the wider
+benchmark) for other queries with the same shape — a self-join whose only
+consumer is a cardinality/existence comparison (`== 1`, `> 1`, `exists`) —
+before scoping the rule itself. Until that survey exists, this stays a named,
+understood gap rather than an active work item.

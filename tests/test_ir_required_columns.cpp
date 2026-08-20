@@ -47,6 +47,15 @@ auto with_child(ir::NodePtr parent, ir::NodePtr child) -> ir::NodePtr {
     return parent;
 }
 
+/// A build side with a real filter on it -- `deferrable_probe_scans`
+/// declines an unfiltered build side (see `contains_row_reducing_node`'s
+/// economics note), so any test exercising deferred-scan eligibility needs
+/// its build side to look like this, not a bare `make_scan`.
+auto filtered_build(std::string name) -> ir::NodePtr {
+    return with_child(std::make_unique<ir::FilterNode>(ir::NodeId{100}, gt_zero("a")),
+                      make_scan(std::move(name)));
+}
+
 }  // namespace
 
 TEST_CASE("required_columns: a bare scan demands every column", "[ir][required_columns]") {
@@ -357,8 +366,8 @@ auto inner_join(ir::NodePtr left, ir::NodePtr right, std::string key) -> ir::Nod
 
 TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is eligible",
           "[ir][scan_predicates][deferred_scan]") {
-    auto plan =
-        inner_join(make_scan("build"), std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+    auto plan = inner_join(filtered_build("build"),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
 
     auto deferrable = ir::deferrable_probe_scans(*plan, {"t"});
     REQUIRE(deferrable.contains("t"));
@@ -374,7 +383,7 @@ TEST_CASE("deferrable_probe_scans: mapped join key defers under the right-side n
     auto plan = std::make_unique<ir::JoinNode>(
         ir::NodeId{20}, ir::JoinKind::Inner,
         std::vector<ir::JoinKey>{ir::JoinKey{"p_partkey", "ps_partkey"}});
-    plan->add_child(make_scan("part"));
+    plan->add_child(filtered_build("part"));
     plan->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "partsupp"));
 
     auto deferrable = ir::deferrable_probe_scans(*plan, {"partsupp"});
@@ -389,7 +398,7 @@ TEST_CASE("deferrable_probe_scans: reaches the scan through project and rename, 
         ir::NodeId{3},
         std::vector<ir::RenameSpec>{{.new_name = "o_orderkey", .old_name = "l_orderkey"}});
     auto plan = inner_join(
-        make_scan("build"),
+        filtered_build("build"),
         with_child(std::move(rename),
                    with_child(std::make_unique<ir::ProjectNode>(
                                   ir::NodeId{2}, refs({"l_orderkey", "l_extendedprice"})),
@@ -399,6 +408,36 @@ TEST_CASE("deferrable_probe_scans: reaches the scan through project and rename, 
     auto deferrable = ir::deferrable_probe_scans(*plan, {"lineitem"});
     REQUIRE(deferrable.contains("lineitem"));
     CHECK(deferrable.at("lineitem").key_column == "l_orderkey");
+}
+
+TEST_CASE("deferrable_probe_scans: an unfiltered build side blocks eligibility",
+          "[ir][scan_predicates][deferred_scan]") {
+    // Mechanism 3's economics gate: deferring only pays off when the build
+    // side is a genuinely reduced slice of its own source (see
+    // `contains_row_reducing_node`). A bare `orders join lineitem`-shaped
+    // join (q12's real regression) has nothing reducing `build`'s row count,
+    // so lineitem must NOT be marked deferrable even though the scan-chain
+    // matching that the other tests exercise succeeds fine on its own.
+    auto plan =
+        inner_join(make_scan("build"), std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+
+    CHECK(ir::deferrable_probe_scans(*plan, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: a build side reduced by a nested join still counts",
+          "[ir][scan_predicates][deferred_scan]") {
+    // The row-reducing operator doesn't have to sit directly under the join
+    // — a filter buried inside a nested join chain on the build side still
+    // proves the build side isn't the whole bare source.
+    auto nested_build =
+        inner_join(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{101}, gt_zero("a")),
+                              make_scan("dim")),
+                   make_scan("bridge"), "k");
+    auto plan = inner_join(std::move(nested_build),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"), "id");
+
+    auto deferrable = ir::deferrable_probe_scans(*plan, {"t"});
+    CHECK(deferrable.contains("t"));
 }
 
 TEST_CASE("deferrable_probe_scans: a residual filter in the chain blocks eligibility",

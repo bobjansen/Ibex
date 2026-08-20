@@ -103,7 +103,16 @@ archive_run() {
     dirty=false
     [[ -n "$(git -C "$IBEX_ROOT" status --porcelain 2>/dev/null)" ]] && dirty=true
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    dir="$RESULTS/runs/${stamp}_${commit:0:8}_sf${SCALE}"
+    # A dirty run's commit label names its PARENT commit, not the code that
+    # actually ran — two runs can show the identical "<stamp>_<commit>" prefix
+    # while one is clean and the other is a since-uncommitted change, which is
+    # exactly the mix-up that made a real fix look like it had "disappeared"
+    # when eyeballed via `ls`. Marking it in the directory name, not only
+    # buried in manifest.json, is what makes that visible without opening a
+    # file.
+    local dirty_suffix=""
+    [[ "$dirty" == true ]] && dirty_suffix="-dirty"
+    dir="$RESULTS/runs/${stamp}_${commit:0:8}${dirty_suffix}_sf${SCALE}"
     mkdir -p "$dir"
 
     local measured=("ibex" "ibex-st" "polars" "polars-st") carried=()
@@ -144,6 +153,13 @@ archive_run() {
     echo
     echo "archived to ${dir#"$IBEX_ROOT"/}"
     [[ "$dirty" == true ]] && echo "  WARNING: working tree was dirty — this run is not reproducible"
+
+    # results/*.tsv (the "latest" files) get overwritten every run, and this
+    # archive directory only supports comparing two runs you pick by hand
+    # (compare_runs.py). Append this run's numbers to the one file that is
+    # never overwritten, so a query's trend across commits is one `show_history.py`
+    # call instead of opening N manifests by hand.
+    python3 "$SCRIPT_DIR/append_history.py" "$dir" || true
     return 0
 }
 

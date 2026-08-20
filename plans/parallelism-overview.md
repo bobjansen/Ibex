@@ -1187,6 +1187,44 @@ first-occurrence group ordering — was considered and REJECTED; see below.)
    biggest first: the aggregate (q13/q18/q10, gated on item 8), then join
    `assemble_output` (q21/q20/q09), then intra-operator fan-out for the 1:1
    operators. This replaces the scheduler as the structural lever.
+
+   **Re-checked 2026-08-20, all three sub-targets found further along than
+   this entry suggests — do not restart any of them without re-reading
+   below.**
+   - **Intra-operator fan-out (the q04 case)**: DONE, see the q04 section
+     below — landed same-day as its own diagnosis, just never marked here.
+   - **Join `assemble_output` (q21/q20/q09)**: re-profiled fresh
+     (`IBEX_PROFILE_OPERATORS=1`, SF-1, 8 cores) — in all three queries the
+     join node's `pool_work_ms` is small and `ring_wait_ms` accounts for
+     essentially all of `next_self_ms` (q09: 48.1/48.2ms; q21: comparable
+     shape from this session's earlier q21 profiling). That means the join
+     itself already assembles its output cheaply and in parallel (this is
+     what I15's `gather_columns_batched` fix — item 3, already DONE — was
+     for); what actually dominates is the main thread parked waiting on the
+     right-side scan/decode, which is a **producer-side** cost per the
+     "Idle is not automatically reclaimable" section below, not a
+     reclaimable join-assembly gap. This sub-item is not a live target as
+     stated; if it's worth pursuing at all, it's really a decode-throughput
+     or multi-producer question (see the "Open structural question" below),
+     not a join fix.
+   - **The aggregate (q13/q18/q10/q20)**: unchanged — this is the one
+     sub-target genuinely still open, and it's already the most-explored
+     item in this document (prefetch, hash reuse, packed-key domain
+     narrowing, two-level grouping, pass-3 shortcuts — all tried, all
+     measured, all rejected, see the sections above). The document's own
+     conclusion stands: a real win needs a partition-owned aggregate API,
+     not another probe-cost trick. Treat every previously-tried idea here as
+     closed; re-attempting one without new evidence repeats
+     [[project_query_shape_conformance_regression]]'s Mechanism-3/5 mistake
+     from the same session this note was written in.
+
+   **Net effect: item 9 as originally scoped is now much closer to done than
+   open.** The one real remaining thread is the aggregate's partition-owned
+   architecture question, which is a bigger project than "create parallel
+   work" implied — and the producer/consumer ring-wait pattern surfacing in
+   q04/q09/q21 alike points at the "Open structural question" below
+   (multiple producers per staged breaker) as the more promising next
+   direction than another operator-level pass.
 10. **I2 + I3** — the type exclusions and the missing multi-Categorical
     partitioned discovery, once there is a shared predicate to hang them on.
 11. **Elide the first-occurrence merge when nothing downstream reads the order**
@@ -1442,3 +1480,24 @@ It parallelizes cleanly and deterministically: the pass only ever sets a flag,
 never inserts, so `seen` is immutable throughout. Store a dense index instead of
 a flag, give each worker a `vector<char>` over 57k slots (~57KB), and OR them —
 byte-identical, no atomics. Sizing: 16.7ms of 63.9ms wall.
+
+**DONE — landed same-day as this diagnosis, commit `7fde36d` ("Parallelize the
+semi-join's swapped-build intersection scan"), never marked here.** Caught
+2026-08-20 when asked to resume this plan: the design above is implemented
+verbatim in `init_int_swapped` (`chunked.cpp`, `intersect_worker_count` +
+per-worker `vector<char>` + OR-merge, gated the same way `kMinParallelPredicateRows`
+gates the left-side pass). Re-profiled fresh rather than trusted stale:
+`join semi keys=1` now shows `pool_tasks=8`, real `pool_work_ms`, and the
+node's remaining time is essentially all `ring_wait_ms` (waiting on the
+right-side scan/decode, not the build) — the genuinely-serial block this
+section identified is gone. Wall-clock also moved: SF-1/8-core Ibex q04
+53.5ms → **~31.5-33ms** (warmup 3/iters 8), Polars 39.9ms → **~22-28ms**
+same conditions (both engines faster than this doc's numbers for unrelated
+reasons — box/version drift over two days of other work — so the ratio,
+not the absolute figures, is the fair comparison: ~1.34x then, ~1.3-1.4x
+now, roughly unchanged). **No further action here** — this specific,
+fully-scoped item is closed. Lesson for reading the rest of this document:
+verify a "next step" against the current tree before starting it, the same
+way [[project_query_shape_conformance_regression]] had to re-learn twice in
+one session — this plan is old enough that other items below may have the
+same problem.

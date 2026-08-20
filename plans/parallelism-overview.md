@@ -1344,6 +1344,52 @@ scratch; start from "de-risk via synthetic benchmark" or "scope against
 q10," whichever the session decides, with this section's numbers as the
 starting evidence.
 
+### De-risk synthetic benchmark (2026-08-20) — result: real, ~15%
+
+Chose option 1. `libs/parquet/bench_multi_producer.cpp` (+ its
+`add_executable` in `libs/parquet/CMakeLists.txt`, target
+`ibex_bench_multi_producer`) decodes `lineitem`'s and `orders`' actual q10
+columns via `LazyTable::project()` — the real Parquet decode path — outside
+any query plan or `chunked.cpp` code path: sequential (lineitem then orders)
+vs. concurrent (orders decoded on a raw `std::thread`, matching
+`PipelinedStageOperator`'s own pattern, while the main thread decodes
+lineitem), interleaved A/B per this repo's own methodology
+([[project_bench_interleaved_methodology]]), against SF-2 Parquet.
+
+**Result, three independent runs (`IBEX_CORES=8`, 15-20 interleaved reps
+each):**
+
+    sequential median  concurrent median  delta
+    72.33 ms            61.13 ms          15.5% faster
+    73.08 ms            61.13 ms          16.4% faster
+    72.19 ms            61.85 ms          14.3% faster
+    70.75 ms            59.22 ms          16.3% faster
+
+Consistently ~14-16%, squarely inside the ~10-30% estimate the occupancy
+arithmetic (65% + 18.5% = 83.5% < 100%) predicted, and reproducible across
+runs on the same box — not noise. **The slack is real and does convert to
+wall-clock savings**, which was the open question this experiment existed to
+answer before touching `chunked.cpp`.
+
+This does not by itself validate the *production* mechanism sketched above —
+it shows the two decodes CAN overlap productively, not that wiring
+"start table N+1's decode as soon as its `LazyTable` is known" into
+`build_operator`'s recursion is safe or captures the same win once real
+join/build work, ring backpressure, and the worker pool's own contention are
+in the loop. That is exactly the part this session's five-times-reverted
+history warns about (see the STOPPED note above) and is still unstarted.
+
+The throwaway harness is left in the tree (not deleted) since it is cheap to
+keep, self-contained, and useful for re-checking this number after any
+future change to the decode path; delete it once the real fix lands or the
+thread is abandoned.
+
+**Resume point, updated:** the de-risk step is done and passed. The next
+step is "scope narrowly against q10" (option 2 above), still unstarted —
+design the minimal single-call-site "prefetch the next table" change in
+`build_operator`/`chunked.cpp`, with the same caution as every other attempt
+in this territory this session.
+
 ---
 
 ## Rejected: weakening first-occurrence group ordering

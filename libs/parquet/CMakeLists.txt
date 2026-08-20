@@ -370,3 +370,24 @@ add_custom_command(
 )
 add_custom_target(ibex_parquet_stub DEPENDS "${_ibex_parquet_stub}")
 add_dependencies(ibex_parquet_plugin ibex_parquet_stub)
+
+# THROWAWAY: de-risks the "multiple producers" idea in
+# plans/parallelism-overview.md before any chunked.cpp change. Not installed,
+# not referenced by anything else — delete once that question is answered.
+add_executable(ibex_bench_multi_producer bench_multi_producer.cpp)
+target_include_directories(ibex_bench_multi_producer PRIVATE "${IBEX_ROOT}/include")
+target_include_directories(ibex_bench_multi_producer
+    SYSTEM PRIVATE
+        "${arrow_SOURCE_DIR}/cpp/src"
+        "${arrow_SOURCE_DIR}/cpp/src/generated"
+        "${arrow_BINARY_DIR}/src"
+)
+set_target_properties(ibex_bench_multi_producer PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_link_libraries(ibex_bench_multi_producer
+    PRIVATE ibex_parquet arrow_shared parquet_shared robin_hood::robin_hood)
+if(TARGET Ibex::Sanitizers)
+    target_link_libraries(ibex_bench_multi_producer PRIVATE Ibex::Sanitizers)
+endif()

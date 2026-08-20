@@ -24,11 +24,35 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet");
-let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
-let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_mfgr: String,
+    p_type: String,
+    p_size: Int64
+}>;
+let partsupp_raw = read_parquet("benchmarking/data/tpch/parquet/partsupp.parquet") as DataFrame<{
+    ps_partkey: Int64,
+    ps_suppkey: Int64,
+    ps_supplycost: Float64
+}>;
+let supplier_raw = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_name: String,
+    s_address: String,
+    s_nationkey: Int64,
+    s_phone: String,
+    s_acctbal: Float64,
+    s_comment: String
+}>;
+let nation_raw = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String,
+    n_regionkey: Int64
+}>;
+let region_raw = read_parquet("benchmarking/data/tpch/parquet/region.parquet") as DataFrame<{
+    r_regionkey: Int64,
+    r_name: String
+}>;
 
 // Match the Polars PDS shape: keep the five-way join as one relation and apply
 // the part/region predicates after the joins, then reuse that relation for the

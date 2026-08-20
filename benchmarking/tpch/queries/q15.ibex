@@ -19,14 +19,24 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let revenue = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet")[
+let revenue = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_suppkey: Int64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_shipdate: Date
+}>[
     filter l_shipdate >= date"1996-01-01" && l_shipdate < date"1996-04-01"
 ][
     select { total_revenue = sum(l_extendedprice * (1.0 - l_discount)) },
     by { s_suppkey = l_suppkey }
 ];
 
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet")[
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_name: String,
+    s_address: String,
+    s_phone: String
+}>[
     select { s_suppkey, s_name, s_address, s_phone }
 ];
 

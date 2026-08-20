@@ -17,8 +17,16 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_partkey: Int64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_shipdate: Date
+}>;
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_type: String
+}>;
 
 // Match Polars: join part and lineitem, then apply the ship-date predicate.
 let result = (part join lineitem on { p_partkey = l_partkey })[

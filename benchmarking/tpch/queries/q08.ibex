@@ -23,15 +23,41 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
-let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet");
-let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet");
-let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet");
-let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet");
+let part = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_type: String
+}>;
+let lineitem = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_orderkey: Int64,
+    l_partkey: Int64,
+    l_suppkey: Int64,
+    l_extendedprice: Float64,
+    l_discount: Float64
+}>;
+let supplier = read_parquet("benchmarking/data/tpch/parquet/supplier.parquet") as DataFrame<{
+    s_suppkey: Int64,
+    s_nationkey: Int64
+}>;
+let orders = read_parquet("benchmarking/data/tpch/parquet/orders.parquet") as DataFrame<{
+    o_orderkey: Int64,
+    o_custkey: Int64,
+    o_orderdate: Date
+}>;
+let customer = read_parquet("benchmarking/data/tpch/parquet/customer.parquet") as DataFrame<{
+    c_custkey: Int64,
+    c_nationkey: Int64
+}>;
+let nation = read_parquet("benchmarking/data/tpch/parquet/nation.parquet") as DataFrame<{
+    n_nationkey: Int64,
+    n_name: String,
+    n_regionkey: Int64
+}>;
 let n1 = nation[select { c_nationkey = n_nationkey, n_regionkey }];
 let n2 = nation[select { s_nationkey = n_nationkey, supp_nation = n_name }];
-let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet");
+let region = read_parquet("benchmarking/data/tpch/parquet/region.parquet") as DataFrame<{
+    r_regionkey: Int64,
+    r_name: String
+}>;
 
 // Match Polars: part → lineitem → supplier → orders → customer → n1 → region,
 // then the supplier-nation join and late date/type predicates.

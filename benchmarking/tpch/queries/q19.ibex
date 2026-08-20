@@ -25,8 +25,20 @@
 extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
 extern fn write_csv(df: DataFrame, path: String) -> Int from "csv.hpp";
 
-let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet");
-let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet");
+let lineitem_raw = read_parquet("benchmarking/data/tpch/parquet/lineitem.parquet") as DataFrame<{
+    l_partkey: Int64,
+    l_quantity: Float64,
+    l_extendedprice: Float64,
+    l_discount: Float64,
+    l_shipinstruct: String,
+    l_shipmode: String
+}>;
+let part_raw = read_parquet("benchmarking/data/tpch/parquet/part.parquet") as DataFrame<{
+    p_partkey: Int64,
+    p_brand: String,
+    p_size: Int64,
+    p_container: String
+}>;
 
 // Match Polars' part-first relation order; apply all qualification predicates
 // only after the part/lineitem join.

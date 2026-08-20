@@ -1585,10 +1585,101 @@ regressed in this measurement — q12 is fully resolved at 83ms against no
 old-baseline number to compare, but nowhere near the multi-hundred-ms
 regression the original Mechanism 3 diagnosis described). **The suggested
 order of attack above is superseded**: there is no longer a ranked list of
-four mechanisms to work through. There is q21 (a real, scoped, planner-level
-filter-pushdown-through-aggregation gap, unrelated to Ascribe or scan
-fusion), q22 (smaller, unstarted), and q09 (unconfirmed, needs a clean
-re-measurement before it's even a lead). Start with q21 if resuming this
-plan — it is 91% of the total remaining gap (309 of the 340ms difference
-between the current 2199ms total and the true parity point) and has had a
-clear diagnosis sitting unactioned since this plan's first draft.
+four mechanisms to work through. There is q21 (see below — real, scoped, but
+NOT the filter-pushdown gap this plan originally guessed), q22 (smaller,
+unstarted), and q09 (unconfirmed, needs a clean re-measurement before it's
+even a lead).
+
+## q21, investigated 2026-08-20 — the original diagnosis was wrong about the mechanism, right about the query
+
+This plan's very first draft guessed q21's gap was "needs a filter pushed
+back through a self-join and two aggregates" (the `o_orderstatus == "F"`
+filter, applied late in the realigned query vs. early in the old hand-fused
+one). **Tested directly and that specific hypothesis is false.**
+
+**Confirmed the gap is real and large first**: the literal pre-`eb5231c`
+hand-fused query text (`git show eb5231c~1:...q21.ibex`), run against
+*today's* engine, is ~212-220ms warm at SF-2/8c vs. the current query's
+~527-552ms — a robust 2.4-2.5x, reproduced 3 rounds interleaved, still
+correct (0/100 row mismatches against the official SF-1 answer file).
+
+**Tested the guessed fix — filter `orders` to `"F"` and semi-join it into
+`lineitem` before the aggregates, nothing else changed**: no win. Slightly
+*slower* than the current query (verified correct, 0/100 mismatches). The
+early semi-join pass costs about what the smaller aggregate saves — `"F"`
+status is ~50% of orders, not a small fraction, so restricting to it doesn't
+shrink the dominant cost much.
+
+**Tested a deeper rewrite mirroring the old query's full candidate-narrowing
+chain** (restrict further to orders with at least one late Saudi-supplier
+line, via a `distinct`+semi-join chain, *before* the aggregates) **on top of
+the F-status restriction, keeping the current query's `count()`-based
+aggregate shape**: also verified correct (0/100 mismatches), but markedly
+*worse* — 684-967ms warm, worse than both the current query and the F-only
+attempt. Confirmed with a serial (`IBEX_PARALLEL=0`) run too, ruling out a
+scheduling artifact: old-hand ~460-556ms serial vs. this rewrite ~1.3-1.8s
+serial, same 2.5-3x gap persists without any parallelism in play at all.
+
+**The actual lever, found by profiling both queries' operators
+(`IBEX_PROFILE_OPERATORS=1`) and comparing shapes, not by more guessing**:
+the old hand-fused query computes `n_sup`/`n_late` (the two distinct-supplier
+counts q21's `exists`/`not exists` need) as **per-order scalar aggregates** —
+`candidate_li[distinct { l_orderkey, l_suppkey }][select { n = count() }, by
+{ l_orderkey }]` — then joins those two small, already-aggregated,
+one-row-per-order tables together. The current query (and every rewrite
+tried here that kept its shape) instead **self-joins at line granularity
+first, aggregates after**: `candidate_li[grouped, filter >1] JOIN
+candidate_li[filter late] on { l_orderkey }`. That join's output size is the
+*product* of each side's per-order line counts, summed over orders — an
+order with 5 lines where 2 are late contributes up to 5×2=10 join rows
+before any reduction happens. Confirmed directly: even after adding the deep
+candidate-narrowing on top, this rewrite's join still processed ~3.66M rows —
+the same order of magnitude as the *unnarrowed* current query's join,
+because narrowing which orders qualify does nothing to shrink the
+per-order multiplicative blowup once an order does qualify. The old query
+never pays this cost at all: `distinct`+`count()` per order is O(lines),
+never O(lines²)-shaped, regardless of how many suppliers or how much lateness
+an order has.
+
+**This means the plan's original framing was wrong about the mechanism.**
+It isn't a missing filter-pushdown rule — filter pushdown was tested directly
+and doesn't move the number. It's that the realigned query's algorithm has a
+genuine join-shaped cost the old query's `distinct`-based algorithm never
+incurs, and no filter-pushdown-style rewrite closes that gap; only
+restructuring the *aggregation strategy itself* (self-join-then-count →
+distinct-then-small-join) does, and that specific restructuring is exactly
+the classic TPC-H q21 "collapse an `exists`/`not exists` pair into two
+distinct-supplier counts" trick a human author applies by hand — not a
+generic optimizer rule like predicate pushdown. Automatically discovering
+"replace this self-join-and-aggregate subplan with an equivalent
+distinct-and-count subplan, because the join's only consumer is a `== 1`/`>
+1` scalar test" is a real query-rewrite capability (recognizing when a join
+computed only to feed a cardinality comparison can be replaced by a cheaper
+aggregate that computes the same cardinality directly) — bigger and more
+speculative than anything else in this plan, closer to a research question
+than a scoped fix.
+
+**What was NOT done**: writing that general rewrite rule. It's out of scope
+for the confidence this session has in it — one query's evidence isn't
+enough to design a rule safely (per this plan's own repeated lesson: a
+heuristic that fixes what it was checked against and regresses everything
+else nearby, see Mechanism 3 and Mechanism 5's five combined attempts). If
+this is worth pursuing, the next step is finding 2-3 more queries (in this
+suite or PDS-H generally) with the same "self-join whose sole purpose is
+feeding a cardinality comparison" shape, to have more than one data point
+before designing a rewrite rule.
+
+**The honest, immediately-available option**: the old hand-fused text is
+verified correct and 2.4-2.5x faster on today's engine, right now, with zero
+engine-code risk. Swapping `benchmarking/tpch/queries/q21.ibex` back to that
+text would close the gap immediately — at the cost of reversing the
+"match natural query shape" principle `eb5231c` established, for this one
+query. That's a call for whoever owns the benchmark suite's goals, not one
+to make unilaterally here; the text is not currently staged anywhere in the
+tree (experiments live in this session's scratchpad only, not committed).
+
+**Where this leaves q21**: real, well-understood now (not just diagnosed),
+and NOT a quick fix — either accept the shape tradeoff and hand-restore the
+old query text, or treat "recognize distinct-count-replaceable self-joins"
+as its own scoped planner project with its own plan, informed by more
+than one example query first.

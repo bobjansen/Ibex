@@ -4,8 +4,11 @@
 #pragma once
 
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +39,46 @@ struct ReplConfig {
     /// are used as a fallback so that plugins and their accompanying .ibex stubs
     /// can live in the same directory.
     std::vector<std::string> import_search_paths;
+};
+
+/// A structured value produced by evaluating an expression in a REPL session.
+/// Terminal callers continue to use the existing formatter; programmatic
+/// callers (such as the local UI server) can render tables themselves.
+struct ExecutionResult {
+    bool ok = false;
+    std::optional<runtime::Table> table;
+    std::optional<runtime::ScalarValue> scalar;
+    std::string error;
+    std::optional<std::size_t> error_line;
+    std::optional<std::size_t> error_column;
+};
+
+struct EnvironmentTable {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> columns;
+    std::size_t rows = 0;
+    bool lazy = false;
+};
+
+/// Stateful programmatic facade over the same evaluator used by an interactive
+/// REPL. Each instance owns its bindings, while the supplied extern registry
+/// and configuration retain the normal plugin/import behavior.
+class ReplSession {
+   public:
+    ReplSession(const ReplConfig& config, runtime::ExternRegistry& registry);
+    ~ReplSession();
+    ReplSession(ReplSession&&) noexcept;
+    auto operator=(ReplSession&&) noexcept -> ReplSession&;
+    ReplSession(const ReplSession&) = delete;
+    auto operator=(const ReplSession&) -> ReplSession& = delete;
+
+    [[nodiscard]] auto execute(std::string_view source) -> ExecutionResult;
+    [[nodiscard]] auto environment() const -> std::vector<EnvironmentTable>;
+    [[nodiscard]] auto erase(std::string_view name) -> bool;
+
+   private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 /// Run the interactive REPL loop.

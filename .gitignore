@@ -53,6 +53,11 @@ benchmarking/aws/.config
 .venv/
 **/__pycache__/**
 
+# Bundled browser UI dependencies and output
+ui/node_modules/
+ui/dist/
+ui/tsconfig.tsbuildinfo
+
 .claude
 .codex
 

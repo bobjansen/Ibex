@@ -3,6 +3,9 @@
 
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#if defined(IBEX_HAS_UI)
+#include <ibex/ui/server.hpp>
+#endif
 
 #if defined(IBEX_HAS_PARQUET_BACKEND)
 #include <ibex/parquet/backend.hpp>
@@ -46,6 +49,14 @@ auto main(int argc, char** argv) -> int {
     app.add_option("--history-file", history_file,
                    "Read/write REPL history at this path. Defaults to IBEX_HISTORY_FILE "
                    "or ~/.ibex_history.");
+#if defined(IBEX_HAS_UI)
+    std::uint16_t ui_port = 8765;
+    std::string ui_web_root;
+    auto* ui = app.add_subcommand("ui", "Start the local browser-based query workbench");
+    ui->add_option("--port", ui_port, "Loopback port to listen on")->default_val(8765);
+    ui->add_option("--web-root", ui_web_root,
+                   "Directory containing the bundled UI assets (defaults beside the executable)");
+#endif
 
     CLI11_PARSE(app, argc, argv);
 
@@ -82,6 +93,18 @@ auto main(int argc, char** argv) -> int {
     if (!import_path.empty()) {
         config.import_search_paths.push_back(import_path);
     }
+
+#if defined(IBEX_HAS_UI)
+    if (*ui) {
+        std::filesystem::path web_root = ui_web_root;
+        if (web_root.empty()) {
+            web_root = ibex::tools::executable_directory() / "ui";
+        }
+        return ibex::ui::run_server(
+            ibex::ui::ServerConfig{.port = ui_port, .web_root = std::move(web_root), .repl = config},
+            registry);
+    }
+#endif
 
     // File argument(s): run each script and exit. Otherwise start the REPL.
     if (!scripts.empty()) {

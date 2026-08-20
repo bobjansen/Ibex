@@ -1563,6 +1563,20 @@ box contention, wider than any other query's variance. Before treating it as
 a lead, re-measure with the interleaved-adjacent protocol
 (`feedback_bench_interleaved_methodology`), not a single run.
 
+**Re-run at `warmup 5 / iters 10` (2x the reps), twice back to back, on
+request (the single `warmup 2 / iters 6` run above was reasonably
+questioned)**: totals 2244.8ms and 2300.4ms (round-to-round delta 2.5%,
+individual queries mostly within ±10% — consistent with this box's known
+noise floor, not a methodology gap). q21 specifically was the most stable
+number in the whole suite (559.9 vs 567.7ms, 1.4% delta) — its 2.33-2.4x
+regression is a real, robust effect, not noise. The excl-q21 parity finding
+holds at the heavier rep count too (1684.9/1665 = 1.012, round 1; consistent
+direction round 2). q09 stayed in the same 259-280ms band both heavy-rep
+rounds — tighter than the single-run number suggested, though still not
+checked with a true interleaved A/B against an old-baseline binary, so its
+status as "not tied to a named mechanism" stands but "noisy" should be
+downgraded to "just not yet compared against a baseline."
+
 **Where this leaves the plan**: Mechanisms 1, 2, 4, and 5 are done —
 landed, moot, or (Mechanism 5) closed with the architectural fix
 superseding the leaf-patch attempts. Mechanism 3 is reverted and open but

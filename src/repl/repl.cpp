@@ -1357,8 +1357,11 @@ auto column_type_matches(const runtime::ColumnValue& col, parser::ScalarType exp
 }
 
 /// IR column type of a runtime column, for building static schemas from
-/// concrete tables. Categorical columns report as String; anything unrecognised
-/// is left untyped (nullopt) — the column is still known to exist.
+/// concrete tables. Categorical is reported distinctly from String -- see
+/// `ir::ColumnType::Categorical` -- so anything costing a fusion decision on
+/// column type can tell a dictionary-coded column from a decoded string one.
+/// Anything unrecognised is left untyped (nullopt) — the column is still
+/// known to exist.
 auto column_ir_type(const runtime::ColumnValue& col) -> std::optional<ir::ColumnType> {
     if (std::holds_alternative<Column<std::int64_t>>(col)) {
         return ir::ColumnType::Int64;
@@ -1369,9 +1372,11 @@ auto column_ir_type(const runtime::ColumnValue& col) -> std::optional<ir::Column
     if (std::holds_alternative<Column<bool>>(col)) {
         return ir::ColumnType::Bool;
     }
-    if (std::holds_alternative<Column<std::string>>(col) ||
-        std::holds_alternative<Column<Categorical>>(col)) {
+    if (std::holds_alternative<Column<std::string>>(col)) {
         return ir::ColumnType::String;
+    }
+    if (std::holds_alternative<Column<Categorical>>(col)) {
+        return ir::ColumnType::Categorical;
     }
     if (std::holds_alternative<Column<Date>>(col)) {
         return ir::ColumnType::Date;

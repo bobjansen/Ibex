@@ -116,6 +116,16 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 [[nodiscard]] auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& args)
     -> std::optional<std::string>;
 
+/// Whether a schema-inferred physical column type satisfies a written
+/// ascription type. Not plain equality: `parser::ScalarType` has no
+/// `Categorical` spelling, so a user ascribing a dictionary-encoded column
+/// always writes `String` -- `have` may be `Categorical` where `field` is
+/// `String`, and that must pass. Shared between the lowerer's static check
+/// (before any source schema is known to be safe to trust) and
+/// `check_ascriptions`' proof (once it is) so the two can't silently diverge
+/// on this again.
+[[nodiscard]] auto ascription_type_satisfies(ColumnType have, ColumnType field) noexcept -> bool;
+
 /// Prove every ascription in `root` that sits over a statically known input
 /// schema, marking it checked (see `AscribeNode::checked`). Returns the first
 /// ascription that provably fails -- a fatal user error, and one worth raising

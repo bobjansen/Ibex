@@ -18,6 +18,29 @@ target_link_libraries(ibex_repl_bin
         CLI11::CLI11
 )
 
+if(TARGET Ibex::ui)
+    target_link_libraries(ibex_repl_bin PRIVATE Ibex::ui)
+    target_compile_definitions(ibex_repl_bin PRIVATE IBEX_HAS_UI=1)
+endif()
+
+if(TARGET ibex_ui_assets)
+    add_dependencies(ibex_repl_bin ibex_ui_assets)
+endif()
+
+# Keep the local UI's normal plugin directory complete when building `ibex`.
+# The UI itself does not import these libraries: users opt into their exposed
+# functions with ordinary Ibex `import` declarations.
+foreach(_ibex_ui_plugin_target
+        ibex_csv_plugin
+        ibex_data_gen_plugin
+        ibex_parquet_plugin
+        ibex_adbc_plugin)
+    if(TARGET ${_ibex_ui_plugin_target})
+        add_dependencies(ibex_repl_bin ${_ibex_ui_plugin_target})
+    endif()
+endforeach()
+unset(_ibex_ui_plugin_target)
+
 if(TARGET Ibex::parquet)
     target_link_libraries(ibex_repl_bin PRIVATE Ibex::parquet)
     target_compile_definitions(ibex_repl_bin PRIVATE IBEX_HAS_PARQUET_BACKEND=1)

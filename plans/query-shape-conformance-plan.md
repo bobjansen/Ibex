@@ -931,15 +931,69 @@ gate's fate). 1643/1643 ctest, 22/22 `check_answers.py` reconfirmed at the
 reverted state.
 
 **Where this leaves Mechanism 3**: back to its original, pre-2026-08-20-fix
-status — `match_probe_chain` does not see through `Ascribe`, and q09/q12 stay
-protected by the ascription accident documented at the top of this section,
-not by a real fix. A real fix needs an actual cardinality estimate at the
+status — `match_probe_chain` does not see through `Ascribe`. The idea is not
+dead: a real fix needs an actual cardinality estimate at the
 `collect_deferrable` decision point (the same kind of input the "Cost gate"
 design-scope section above already scoped for a *different* fusion decision —
 `make_relation_sampler`/`column_stats()` are the same inputs this gate would
-need too) rather than a structural proxy. Do not re-attempt the
-structural-proxy shape a second time without a real selectivity signal behind
-it.
+need too) rather than a structural proxy. Real per-source row counts are
+already computed and available at both driver call sites
+(`row_counts.insert_or_assign(source.source_name, lazy.value()->rows())`,
+`repl.cpp` ~4885) for free (footer metadata, no scan) — a build-side-vs-
+probe-side row-count ratio is a much better-grounded signal than "does the
+build side contain a Filter node" and is the natural next thing to try,
+**but needs calibrating against more than 2 data points** (q08's `part`
+400K/lineitem 12M ≈ 3.3%, defer-and-win; q12's `orders` 3M/lineitem 12M ≈
+25%, defer-and-lose, at SF-2 — a threshold that separates these two is not
+yet validated against the rest of the suite's deferred-probe-eligible shapes).
+Do not re-attempt the pure-structural-proxy shape a second time; a
+row-count-ratio version is worth trying, but treat 2 data points as a
+starting hypothesis, not a calibrated threshold (`feedback_no_premature_constant_tuning`).
+
+**Correction, found while chasing the row-count idea (2026-08-20, same
+session), then corrected a second time after a right challenge**: the
+"q09/q12 stay protected by the ascription accident" framing above is not
+accurate for q12 specifically. Traced with temporary debug instrumentation in
+`collect_deferrable` (added and reverted within this session, not
+committed): on the current tree, `match_probe_chain` on q12's `orders join
+lineitem` fails because the join's right side is a **`Filter` node directly
+wrapping the lineitem `Scan`** — `l_shipmode`/`l_commitdate`/`l_receiptdate`'s
+predicates have already been pushed onto the scan by the time
+`deferrable_probe_scans`' second call site runs.
+
+**This first write-up called that "incidentally fixed... as a side effect of
+unrelated architectural work" — that claim was wrong, caught on review.**
+Ascription unblocking `push_filters_into_joins` is not new and not
+incidental: it is the mechanism Mechanism 1's own section above already
+documents (`lowerer.source_schemas()` treats a checked `Ascribe` as Known
+schema from the second call site onward, which is *why* "Ascribing the
+reader restores it" — that sentence is from the original 2026-07-17 finding,
+re-verified live earlier the same session as this plan's "RE-VERIFIED LIVE"
+note). Mechanism 4's section names this exact interaction already:
+"ascription specifically... enables Mechanism 1's pushdown, which lands a
+filter on the scan, which `scan_predicates` fuses into `project_where`'s
+selective path." q12 is ascribed (`as DataFrame<{...}>` on both `orders` and
+`lineitem`), so this Filter-on-Scan shape is simply q12 exhibiting the
+already-known, already-documented behavior — not a new consequence of
+Ascribe-as-Scan-metadata, and not evidence that Mechanism 1's real gap (the
+*first* `push_filters_into_joins` call site, `lower.cpp:5186`, which runs
+before any schema — ascribed or not — exists yet) is fixed. That gap is
+unchanged and unconfirmed either way; nothing this session touched it.
+
+**What's still real and useful from this trace, correctly scoped**: q12's
+`lineitem` doesn't reach `collect_deferrable`'s decision point at all,
+because Mechanism 1 (as already understood, via ascription) already routed
+its filter onto the scan, and Mechanism 2 (landed) lets that filter fuse
+into `project_where`'s selective decode directly — a materially different,
+already-existing path than deferred-probe, that happens to also solve q12's
+regression without needing Mechanism 3 at all. That interaction (Mechanism 1
++ Mechanism 2 jointly routing some deferred-probe-eligible-looking joins away
+from `collect_deferrable` before it ever runs) is real and worth accounting
+for before calibrating a row-count-ratio gate: **re-survey which queries
+still reach `collect_deferrable`'s decision point on the current tree before
+assuming the eligible set matches what the original Mechanism 3 write-up
+measured** — it may have shrunk for reasons unrelated to any fix attempted
+here.
 
 ### Mechanism 4 — a predicate column's whole-file decode stalls on task imbalance (RETARGETED 2026-08-20 — not project_where, and not select_bounds)
 
@@ -1457,3 +1511,70 @@ future session — the next concrete step is enumerating those drain points
 build path in `chunked.cpp`) rather than another blind full-suite A/B.
 q04/q01/q03/q21 remain regressed relative to the pre-Mechanism-2 baseline
 with no safe fix landed this session.
+
+## Final full-suite re-measurement, 2026-08-20 — the gap has almost entirely closed, and it's now one query
+
+Everything above this section was written incrementally, chasing one
+mechanism at a time; two of the "still needs a fix" claims made along the way
+(Mechanism 1 for q12, Mechanism 4's `fusable_string_conjuncts` item for q13)
+turned out to be stale the moment they were actually checked against the
+current tree — see the corrections inline above. That pattern (reasoning
+from old diagnoses instead of re-measuring) was worth breaking out of
+entirely: this section is one clean, full 22-query SF-2/8-core run against
+the tree as it stands at `38b8c4d` (Mechanism 2 + Ascribe-as-Scan-metadata +
+dictionary sharding landed; Mechanism 3's gate reverted), `warmup 2 / iters
+6`, box idle (`ps --sort=-pcpu` checked first), compared line-by-line against
+this plan's very first baseline table.
+
+| query | old (hand-fused) | current (min ms) | ratio |
+|---|---:|---:|---:|
+| q21 | 233 | 542.0 | **2.33x — still the whole story** |
+| q22 | 49 | 64.5 | **1.32x — real, unexplained, unchanged** |
+| q14 | 32 | 36.3 | 1.14x |
+| q06 | 23 | 20.7 | 0.90x — resolved |
+| q15 | 42 | 39.3 | 0.94x — resolved |
+| q13 | 132 | 107.4 | 0.81x — resolved |
+| **total (22 queries)** | **1898** | **2199.4** | **1.159** |
+| **total excluding q21** | **1665** | **1657.4** | **0.995 — parity** |
+
+**Every query the original four mechanisms named (q06, q13, q15, q14) is at
+or better than the old hand-fused baseline.** Pulling q21 out of the total
+shows the other 21 queries are, in aggregate, at parity with the pre-`eb5231c`
+hand-fused baseline (0.995x) — the +13-16% suite-wide regression this whole
+plan was opened to chase is now **entirely concentrated in one query**, not
+spread across the suite the way the original baseline table suggested.
+
+**q21 is not a new finding** — it was already flagged, at the very top of
+this plan's "What's NOT explained by any of the above" section, as a genuine
+planner gap unrelated to Ascribe: the realigned query aggregates the entire
+unfiltered ~12M-row lineitem table twice before joining down to
+`o_orderstatus == "F"`, where the hand-written original filtered `orders` to
+`"F"` and semi-joined it in *before* aggregating. That diagnosis stands and
+is now the ONLY substantial remaining item — not one of four, one of one.
+**q22** (1.32x) is the other item this plan's earlier sections already
+flagged as a separate, unstarted rewrite-shape investigation (`anti join` →
+`left join`+`is_null`, `scalar()` → `cross join`) — small next to q21 but
+real and unmoved by anything landed this session.
+
+**q09 measured 238-270ms here**, not obviously tied to any named mechanism
+and not measured cleanly enough this session to trust as a finding — it swung
+between ~125ms and ~300ms across this session's various runs depending on
+box contention, wider than any other query's variance. Before treating it as
+a lead, re-measure with the interleaved-adjacent protocol
+(`feedback_bench_interleaved_methodology`), not a single run.
+
+**Where this leaves the plan**: Mechanisms 1, 2, 4, and 5 are done —
+landed, moot, or (Mechanism 5) closed with the architectural fix
+superseding the leaf-patch attempts. Mechanism 3 is reverted and open but
+demonstrably low-priority now (its target queries, q09/q12, aren't visibly
+regressed in this measurement — q12 is fully resolved at 83ms against no
+old-baseline number to compare, but nowhere near the multi-hundred-ms
+regression the original Mechanism 3 diagnosis described). **The suggested
+order of attack above is superseded**: there is no longer a ranked list of
+four mechanisms to work through. There is q21 (a real, scoped, planner-level
+filter-pushdown-through-aggregation gap, unrelated to Ascribe or scan
+fusion), q22 (smaller, unstarted), and q09 (unconfirmed, needs a clean
+re-measurement before it's even a lead). Start with q21 if resuming this
+plan — it is 91% of the total remaining gap (309 of the 340ms difference
+between the current 2199ms total and the true parity point) and has had a
+clear diagnosis sitting unactioned since this plan's first draft.

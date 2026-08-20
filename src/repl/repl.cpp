@@ -41,6 +41,7 @@
 #include <expected>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -98,6 +99,11 @@ using FunctionSourceRegistry = robin_hood::unordered_map<std::string, std::strin
 using DeclarationDocRegistry = robin_hood::unordered_map<std::string, std::string>;
 using ImportRegistry = robin_hood::unordered_set<std::string>;
 using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::ColumnValue>;
+
+// Programmatic users can observe the value which the terminal REPL would
+// render. It is thread-local so a future server with worker threads does not
+// accidentally hand a result to another request.
+thread_local ExecutionResult* active_execution_result = nullptr;
 
 struct BoundCallArg {
     const parser::Param* param = nullptr;
@@ -939,6 +945,17 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
 // same formatting the REPL applies to a bare expression statement. Shared by
 // the top-level statement printer and the `print(...)` builtin.
 void render_eval_value(const EvalValue& value) {
+    if (active_execution_result != nullptr) {
+        if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
+            active_execution_result->scalar = *scalar;
+        } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
+            runtime::Table temp;
+            temp.add_column("column", *col);
+            active_execution_result->table = std::move(temp);
+        } else {
+            active_execution_result->table = std::get<runtime::Table>(value);
+        }
+    }
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
         ibex::formatting::print("{}\n", format_scalar(*scalar));
     } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
@@ -5606,6 +5623,191 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
     if (config.verbose) {
         std::clog << "Ibex REPL exiting\n";
     }
+}
+
+namespace {
+
+// The mature statement evaluator reports diagnostics to stdout because it was
+// written for the terminal REPL. Keep that behavior intact, but capture it at
+// the programmatic boundary until diagnostics have a native structured sink.
+// This process-wide redirect is serialized and is only used by the local UI
+// server; ordinary REPL and batch execution never take this path.
+std::mutex execution_capture_mutex;
+
+class StdoutCapture {
+   public:
+    StdoutCapture() {
+        std::fflush(stdout);
+        std::cout.flush();
+        file_ = std::tmpfile();
+        if (file_ == nullptr) {
+            return;
+        }
+#ifdef _WIN32
+        original_fd_ = _dup(_fileno(stdout));
+        if (original_fd_ >= 0 && _dup2(_fileno(file_), _fileno(stdout)) == 0) {
+            active_ = true;
+        }
+#else
+        original_fd_ = dup(fileno(stdout));
+        if (original_fd_ >= 0 && dup2(fileno(file_), fileno(stdout)) == 0) {
+            active_ = true;
+        }
+#endif
+    }
+
+    ~StdoutCapture() { restore(); }
+
+    StdoutCapture(const StdoutCapture&) = delete;
+    auto operator=(const StdoutCapture&) -> StdoutCapture& = delete;
+
+    [[nodiscard]] auto take() -> std::string {
+        restore(false);
+        if (file_ == nullptr) {
+            return {};
+        }
+        std::rewind(file_);
+        std::string output;
+        std::array<char, 4096> buffer{};
+        while (const auto count = std::fread(buffer.data(), 1, buffer.size(), file_)) {
+            output.append(buffer.data(), count);
+        }
+        std::fclose(file_);
+        file_ = nullptr;
+        return output;
+    }
+
+   private:
+    void restore(bool close_file = true) {
+        if (active_) {
+            std::fflush(stdout);
+            std::cout.flush();
+#ifdef _WIN32
+            static_cast<void>(_dup2(original_fd_, _fileno(stdout)));
+            static_cast<void>(_close(original_fd_));
+#else
+            static_cast<void>(dup2(original_fd_, fileno(stdout)));
+            static_cast<void>(close(original_fd_));
+#endif
+            original_fd_ = -1;
+            active_ = false;
+        }
+        if (close_file && file_ != nullptr) {
+            std::fclose(file_);
+            file_ = nullptr;
+        }
+    }
+
+    FILE* file_ = nullptr;
+    int original_fd_ = -1;
+    bool active_ = false;
+};
+
+auto error_from_output(std::string output) -> std::string {
+    const auto start = output.rfind("error: ");
+    if (start == std::string::npos) {
+        return output;
+    }
+    output.erase(0, start + std::string_view("error: ").size());
+    if (const auto end = output.find('\n'); end != std::string::npos) {
+        output.erase(end);
+    }
+    return output;
+}
+
+}  // namespace
+
+class ReplSession::Impl {
+   public:
+    Impl(const ReplConfig& config, runtime::ExternRegistry& registry)
+        : config(config), registry(registry), tables(build_builtin_tables()) {}
+
+    ReplConfig config;
+    runtime::ExternRegistry& registry;
+    runtime::TableRegistry tables;
+    LazyTableRegistry lazy_tables;
+    runtime::ScalarRegistry scalars;
+    ColumnRegistry columns;
+    ModelRegistry models;
+    FunctionRegistry functions;
+    CompileTimeListRegistry compile_time_lists;
+    ExternDeclRegistry extern_decls;
+    FunctionSourceRegistry function_sources;
+    DeclarationDocRegistry declaration_docs;
+    ImportRegistry imports;
+    robin_hood::unordered_set<std::string> loaded_plugins;
+};
+
+ReplSession::ReplSession(const ReplConfig& config, runtime::ExternRegistry& registry)
+    : impl_(std::make_unique<Impl>(config, registry)) {}
+
+ReplSession::~ReplSession() = default;
+ReplSession::ReplSession(ReplSession&&) noexcept = default;
+auto ReplSession::operator=(ReplSession&&) noexcept -> ReplSession& = default;
+
+auto ReplSession::execute(std::string_view source) -> ExecutionResult {
+    ExecutionResult result;
+    const std::string normalized = normalize_input(source);
+    auto parsed = parser::parse(normalized);
+    if (!parsed) {
+        result.error = parsed.error().message;
+        result.error_line = parsed.error().line;
+        result.error_column = parsed.error().column;
+        return result;
+    }
+
+    const auto comments = collect_script_comment_lines(normalized);
+    const auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
+    std::scoped_lock lock(execution_capture_mutex);
+    StdoutCapture capture;
+    active_execution_result = &result;
+    const bool ok = execute_statements(
+        parsed->statements, impl_->tables, impl_->lazy_tables, impl_->scalars, impl_->columns,
+        impl_->models, impl_->functions, impl_->compile_time_lists, impl_->extern_decls,
+        impl_->registry, impl_->config.plugin_search_paths, impl_->loaded_plugins,
+        impl_->config.import_search_paths, nullptr, &doc_comment_groups, &impl_->function_sources,
+        &impl_->declaration_docs, &impl_->imports, normalized);
+    active_execution_result = nullptr;
+    const std::string output = capture.take();
+    result.ok = ok;
+    if (!ok) {
+        result.error = error_from_output(output);
+        if (result.error.empty()) {
+            result.error = "query execution failed";
+        }
+    }
+    return result;
+}
+
+auto ReplSession::environment() const -> std::vector<EnvironmentTable> {
+    std::vector<EnvironmentTable> result;
+    result.reserve(impl_->tables.size() + impl_->lazy_tables.size());
+    for (const auto& [name, table] : impl_->tables) {
+        EnvironmentTable entry{.name = name, .columns = {}, .rows = table.rows()};
+        entry.columns.reserve(table.columns.size());
+        for (const auto& column : table.columns) {
+            entry.columns.emplace_back(column.name, column_type_name(*column.column));
+        }
+        result.push_back(std::move(entry));
+    }
+    for (const auto& [name, table] : impl_->lazy_tables) {
+        EnvironmentTable entry{.name = name, .columns = {}, .rows = table->rows(), .lazy = true};
+        entry.columns.reserve(table->schema().columns.size());
+        for (const auto& column : table->schema().columns) {
+            entry.columns.emplace_back(column.name, column_type_name(*column.column));
+        }
+        result.push_back(std::move(entry));
+    }
+    std::ranges::sort(result, {}, &EnvironmentTable::name);
+    return result;
+}
+
+auto ReplSession::erase(std::string_view name) -> bool {
+    const std::string key(name);
+    return impl_->tables.erase(key) != 0 || impl_->lazy_tables.erase(key) != 0 ||
+           impl_->scalars.erase(key) != 0 || impl_->columns.erase(key) != 0 ||
+           impl_->models.erase(key) != 0 || impl_->functions.erase(key) != 0 ||
+           impl_->compile_time_lists.erase(key) != 0 || impl_->extern_decls.erase(key) != 0;
 }
 
 }  // namespace ibex::repl

@@ -115,6 +115,40 @@ TEST_CASE("REPL accepts scalar expression statements") {
     REQUIRE(ibex::repl::execute_script("1+1;", registry));
 }
 
+TEST_CASE("REPL session preserves bindings and returns structured results", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto binding = session.execute("let numbers = Table { value = [1, 2, 3] };");
+    REQUIRE(binding.ok);
+    const auto result = session.execute("numbers[filter value > 1];");
+    REQUIRE(result.ok);
+    REQUIRE(result.table.has_value());
+    REQUIRE(result.table->rows() == 2);
+
+    const auto environment = session.environment();
+    REQUIRE(std::ranges::any_of(environment, [](const auto& entry) {
+        return entry.name == "numbers" && entry.rows == 3;
+    }));
+    REQUIRE(session.erase("numbers"));
+    REQUIRE_FALSE(session.erase("numbers"));
+}
+
+TEST_CASE("REPL session returns parser locations and runtime diagnostics", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto parse_error = session.execute("trades[filter price >];");
+    REQUIRE_FALSE(parse_error.ok);
+    REQUIRE_FALSE(parse_error.error.empty());
+    REQUIRE(parse_error.error_line.has_value());
+    REQUIRE(parse_error.error_column.has_value());
+
+    const auto runtime_error = session.execute("unknown_table;");
+    REQUIRE_FALSE(runtime_error.ok);
+    REQUIRE(runtime_error.error.find("unknown table") != std::string::npos);
+}
+
 TEST_CASE("REPL print builtin displays tables, scalars, and columns", "[repl][print]") {
     ibex::runtime::ExternRegistry registry;
     // Table expression, scalar, and a column all render without error.

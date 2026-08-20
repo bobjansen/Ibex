@@ -127,6 +127,20 @@ using SourceSchemas = robin_hood::unordered_map<std::string, SchemaInfo>;
 [[nodiscard]] auto check_ascriptions(Node& root, const SourceSchemas& sources)
     -> std::expected<void, std::string>;
 
+/// Bottom-up rewrite: replace every `Ascribe(Scan)` pair where the `Ascribe`
+/// is `checked()` with a single `Scan` carrying the ascription as its
+/// `ScanNode::ascribed_schema()`. Call this immediately after
+/// `check_ascriptions` succeeds -- fusion is what keeps a proven ascription
+/// from ever being a distinct node every later pass has to special-case (see
+/// `[[project_ascribe_as_scan_metadata]]`).
+///
+/// Deliberately narrow: only the direct `Ascribe(Scan)` shape fires. An
+/// unchecked `Ascribe`, or a checked `Ascribe` over anything other than a bare
+/// `Scan` (a join, a filtered subquery -- the grammar allows `base as
+/// DataFrame<{...}>` for any `base`), is left exactly as it was, still
+/// carried by the existing `Ascribe`-aware code paths.
+[[nodiscard]] auto fuse_checked_ascriptions(NodePtr root) -> NodePtr;
+
 /// Validate every join in `node`'s subtree against the statically inferred
 /// schemas of its two inputs: each `on` key names a column of its own side, the
 /// two sides of a key agree on type, and the output names resolve.

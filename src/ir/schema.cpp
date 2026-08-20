@@ -585,6 +585,32 @@ auto check_ascriptions(Node& root, const SourceSchemas& sources)
     return {};
 }
 
+auto fuse_checked_ascriptions(NodePtr root) -> NodePtr {
+    if (!root) {
+        return root;
+    }
+    auto& kids = root->mutable_children();
+    for (auto& child : kids) {
+        if (child != nullptr) {
+            child = fuse_checked_ascriptions(std::move(child));
+        }
+    }
+    if (root->kind() != NodeKind::Ascribe) {
+        return root;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& asc = static_cast<const AscribeNode&>(*root);
+    if (!asc.checked() || kids.size() != 1 || kids.front() == nullptr ||
+        kids.front()->kind() != NodeKind::Scan) {
+        return root;
+    }
+    NodePtr scan_owned = std::move(kids.front());
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    auto& scan = static_cast<ScanNode&>(*scan_owned);
+    scan.set_ascribed_schema(asc.schema(), asc.open());
+    return scan_owned;
+}
+
 namespace {
 
 /// The granularity at which the *runtime* compares two join keys. Its column
@@ -758,6 +784,20 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
 
         case NodeKind::Scan: {
             const auto& scan = static_cast<const ScanNode&>(node);
+            if (const auto& asc = scan.ascribed_schema(); asc.has_value()) {
+                // Mirrors the Ascribe case below: the ascription fixes names
+                // and types, the underlying source (when known) still fixes
+                // nullability -- fusion moved the node, not the reasoning.
+                std::vector<SchemaField> out = asc->fields;
+                if (auto it = sources.find(scan.source_name()); it != sources.end()) {
+                    for (auto& field : out) {
+                        if (const auto* from_input = it->second.find(field.name)) {
+                            field.nulls = from_input->nulls;
+                        }
+                    }
+                }
+                return SchemaInfo::known(std::move(out), /*open=*/false);
+            }
             if (auto it = sources.find(scan.source_name()); it != sources.end()) {
                 return it->second;
             }

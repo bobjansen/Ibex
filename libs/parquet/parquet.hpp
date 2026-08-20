@@ -2055,7 +2055,7 @@ constexpr std::size_t kAbandonMinRows = 1 << 18;
 /// indices. False means the column is nested, which has no fused answer at all.
 template <typename DType>
 inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf_index, int group,
-                                    std::size_t group_rows, std::size_t base,
+                                    std::size_t shard_rows, std::size_t base, std::size_t skip,
                                     const ibex::runtime::DynamicScanFilter& filter,
                                     ibex::runtime::Selection& selected) -> bool {
     using Raw = typename DType::c_type;
@@ -2070,15 +2070,19 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
     }
     const bool optional = descriptor->max_definition_level() != 0;
     auto typed = std::static_pointer_cast<parquet::TypedColumnReader<DType>>(column);
+    if (skip > 0 &&
+        typed->Skip(static_cast<std::int64_t>(skip)) != static_cast<std::int64_t>(skip)) {
+        throw std::runtime_error("read_parquet: key column shard skip ended before its start");
+    }
 
     std::unique_ptr<Raw[]> values(new Raw[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
     std::unique_ptr<std::int16_t[]> definitions(
         new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
 
     std::size_t row = 0;
-    while (row < group_rows && typed->HasNext()) {
+    while (row < shard_rows && typed->HasNext()) {
         const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
-            static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            static_cast<std::size_t>(kDirectDecodeBatchRows), shard_rows - row));
         std::int64_t values_read = 0;
         const std::int64_t levels_read = typed->ReadBatch(
             request, optional ? definitions.get() : nullptr, nullptr, values.get(), &values_read);
@@ -2107,19 +2111,67 @@ inline auto filtered_key_group_scan(parquet::arrow::FileReader& reader, int leaf
         }
         row += static_cast<std::size_t>(levels_read);
     }
-    if (row != group_rows) {
+    if (row != shard_rows) {
         throw std::runtime_error("read_parquet: key column ended before its row group");
     }
     return true;
 }
 
-/// A row group this scan will actually decode, with the file row index its
-/// first row sits at. Groups the footer proves cannot match are never in here.
+/// A row-group SHARD this scan will actually decode: `rows` values starting
+/// `skip` rows into physical row group `index`, whose file-global row index is
+/// `base` (already offset by `skip`). Groups the footer proves cannot match
+/// are never in here. A shard is either a whole row group (`skip == 0`, `rows
+/// == the group's row count`) or one piece of one split by `split_scan_groups`
+/// below — both shapes run through the same scan code.
 struct KeyScanGroup {
     int index;
     std::size_t base;
     std::size_t rows;
+    std::size_t skip = 0;
 };
+
+/// Subdivide each scan group so at least `target` independent shards exist,
+/// giving the fused filter scans a finer parallelism axis than "one task per
+/// row group" — the axis alone caps a table with 1-6 row groups (every SF-1
+/// PDS-H dimension table has exactly one) at 1-6x regardless of core count.
+/// `parquet::ColumnReader::Skip` lets any shard start decoding partway through
+/// a physical row group (cheaper than a full decode of the skipped rows, and
+/// what makes this correct: each shard gets its own fresh reader/cursor from
+/// `RowGroup(index)->Column(leaf)`, so concurrent shards of the same physical
+/// group never share mutable decoder state).
+///
+/// Shards below `kMinScanShardRows` are not worth the extra `Skip()` call, so
+/// a small group is left whole; this also makes the function a no-op when
+/// `target <= 1`, which callers rely on to skip splitting entirely when the
+/// query is not running parallel.
+inline auto split_scan_groups(std::vector<KeyScanGroup> groups, std::size_t target)
+    -> std::vector<KeyScanGroup> {
+    constexpr std::size_t kMinScanShardRows = 1 << 16;  // 65536
+    if (target <= 1) {
+        return groups;
+    }
+    std::vector<KeyScanGroup> split;
+    split.reserve(groups.size() * target);
+    for (const auto& group : groups) {
+        const std::size_t shards =
+            std::min(target, std::max<std::size_t>(1, group.rows / kMinScanShardRows));
+        if (shards <= 1) {
+            split.push_back(group);
+            continue;
+        }
+        const std::size_t shard_rows = (group.rows + shards - 1) / shards;
+        std::size_t offset = 0;
+        while (offset < group.rows) {
+            const std::size_t take = std::min(shard_rows, group.rows - offset);
+            split.push_back(KeyScanGroup{.index = group.index,
+                                         .base = group.base + offset,
+                                         .rows = take,
+                                         .skip = group.skip + offset});
+            offset += take;
+        }
+    }
+    return split;
+}
 
 /// Row groups worth decoding, in file order. A group whose stats range is
 /// disjoint from the build keys' range cannot contribute a match, so it is
@@ -2213,7 +2265,8 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
         std::size_t passing = 0;
         for (std::size_t i = 0; i < groups.size(); ++i) {
             if (!filtered_key_group_scan<DType>(*readers.front(), leaf_index, groups[i].index,
-                                                groups[i].rows, groups[i].base, filter, parts[i])) {
+                                                groups[i].rows, groups[i].base, groups[i].skip,
+                                                filter, parts[i])) {
                 return std::nullopt;
             }
             scanned += groups[i].rows;
@@ -2242,8 +2295,8 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
                     return;
                 }
                 if (!filtered_key_group_scan<DType>(*readers[worker], leaf_index, groups[i].index,
-                                                    groups[i].rows, groups[i].base, filter,
-                                                    parts[i])) {
+                                                    groups[i].rows, groups[i].base, groups[i].skip,
+                                                    filter, parts[i])) {
                     nested.store(true, std::memory_order_relaxed);
                     stop.store(true, std::memory_order_relaxed);
                     return;
@@ -2289,10 +2342,13 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
 /// every row), and there is no abandon rule — a filter that passes almost
 /// everything still has to be evaluated.
 
-/// One row group's contribution, appended as absolute row indices. False means
-/// the column is nested, which has no fused answer at all.
+/// One row-group shard's contribution, appended as absolute row indices
+/// (`skip` rows into the physical group, same convention as the key scan's
+/// `KeyScanGroup` — see `split_scan_groups`). False means the column is
+/// nested, which has no fused answer at all.
 inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int leaf_index,
-                                       int group, std::size_t group_rows, std::size_t base,
+                                       int group, std::size_t shard_rows, std::size_t base,
+                                       std::size_t skip,
                                        const ibex::runtime::StringScanFilter& filter,
                                        ibex::runtime::Selection& selected) -> bool {
     auto column = reader.parquet_reader()->RowGroup(group)->Column(leaf_index);
@@ -2305,6 +2361,10 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
     }
     const bool optional = descriptor->max_definition_level() != 0;
     auto typed = std::static_pointer_cast<parquet::ByteArrayReader>(column);
+    if (skip > 0 &&
+        typed->Skip(static_cast<std::int64_t>(skip)) != static_cast<std::int64_t>(skip)) {
+        throw std::runtime_error("read_parquet: string column shard skip ended before its start");
+    }
 
     std::unique_ptr<parquet::ByteArray[]> values(
         new parquet::ByteArray[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
@@ -2320,9 +2380,9 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
     };
 
     std::size_t row = 0;
-    while (row < group_rows && typed->HasNext()) {
+    while (row < shard_rows && typed->HasNext()) {
         const auto request = static_cast<std::int64_t>(std::min<std::size_t>(
-            static_cast<std::size_t>(kDirectDecodeBatchRows), group_rows - row));
+            static_cast<std::size_t>(kDirectDecodeBatchRows), shard_rows - row));
         std::int64_t values_read = 0;
         const std::int64_t levels_read = typed->ReadBatch(
             request, optional ? definitions.get() : nullptr, nullptr, values.get(), &values_read);
@@ -2352,7 +2412,7 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
         }
         row += static_cast<std::size_t>(levels_read);
     }
-    if (row != group_rows) {
+    if (row != shard_rows) {
         throw std::runtime_error("read_parquet: string column ended before its row group");
     }
     return true;
@@ -2385,7 +2445,8 @@ inline auto filtered_string_selection(std::span<parquet::arrow::FileReader* cons
     if (readers.size() <= 1 || groups.size() <= 1) {
         for (std::size_t i = 0; i < groups.size(); ++i) {
             if (!filtered_string_group_scan(*readers.front(), leaf_index, groups[i].index,
-                                            groups[i].rows, groups[i].base, filter, parts[i])) {
+                                            groups[i].rows, groups[i].base, groups[i].skip, filter,
+                                            parts[i])) {
                 return std::nullopt;
             }
         }
@@ -2403,7 +2464,8 @@ inline auto filtered_string_selection(std::span<parquet::arrow::FileReader* cons
                     return;
                 }
                 if (!filtered_string_group_scan(*readers[worker], leaf_index, groups[i].index,
-                                                groups[i].rows, groups[i].base, filter, parts[i])) {
+                                                groups[i].rows, groups[i].base, groups[i].skip,
+                                                filter, parts[i])) {
                     nested.store(true, std::memory_order_relaxed);
                     return;
                 }
@@ -2549,9 +2611,12 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                                       ->Column(leaf_index)
                                       ->physical_type();
             const auto& metadata = *reader_->parquet_reader()->metadata();
+            const auto target = scan_shard_target(unit, exec);
             if (physical == parquet::Type::INT64) {
                 const auto groups = restrict_to_unit(
-                    filtered_key_scan_groups<parquet::Int64Type>(metadata, leaf_index, filter),
+                    split_scan_groups(
+                        filtered_key_scan_groups<parquet::Int64Type>(metadata, leaf_index, filter),
+                        target),
                     unit);
                 auto readers = parallel_readers(groups.size(), exec);
                 return filtered_key_selection<parquet::Int64Type>(std::span{readers}, leaf_index,
@@ -2559,7 +2624,9 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             }
             if (physical == parquet::Type::INT32) {
                 const auto groups = restrict_to_unit(
-                    filtered_key_scan_groups<parquet::Int32Type>(metadata, leaf_index, filter),
+                    split_scan_groups(
+                        filtered_key_scan_groups<parquet::Int32Type>(metadata, leaf_index, filter),
+                        target),
                     unit);
                 auto readers = parallel_readers(groups.size(), exec);
                 return filtered_key_selection<parquet::Int32Type>(std::span{readers}, leaf_index,
@@ -2599,7 +2666,9 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                 parquet::Type::BYTE_ARRAY) {
                 return std::optional<ibex::runtime::Selection>{};
             }
-            const auto groups = restrict_to_unit(whole_file_scan_groups(metadata), unit);
+            const auto groups = restrict_to_unit(
+                split_scan_groups(whole_file_scan_groups(metadata), scan_shard_target(unit, exec)),
+                unit);
             auto readers = parallel_readers(groups.size(), exec);
             return filtered_string_selection(std::span{readers}, leaf_index, filter, groups);
         } catch (const std::exception& e) {
@@ -2642,6 +2711,28 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
             return group.base < unit->start || group.base >= end;
         });
         return groups;
+    }
+
+    /// How many shards `split_scan_groups` should aim for before the fused
+    /// scans plan their row groups. Mirrors `parallel_readers`' own gate
+    /// exactly (same fields, same thresholds) because splitting only pays when
+    /// that call is actually going to hand out more than one reader — a `unit`
+    /// is already exactly one row group scheduled by a level above (splitting
+    /// it further would just add `Skip()` calls with no reader to run them
+    /// concurrently), and the on-worker-pool-thread / row-count / factory
+    /// checks are the same "would this run serial anyway" question
+    /// `parallel_readers` asks. Returning 1 makes `split_scan_groups` a no-op.
+    [[nodiscard]] auto scan_shard_target(const ibex::runtime::SourceUnit* unit,
+                                         const ibex::runtime::ExecutionContext& exec) const
+        -> std::size_t {
+        if (unit != nullptr || factory_ == nullptr || !exec.parallel ||
+            rows_ < std::max(exec.parallel_min_rows, kParallelDecodeMinRows) ||
+            ibex::runtime::on_worker_pool_thread()) {
+            return 1;
+        }
+        const auto& pool = ibex::runtime::process_worker_pool();
+        return std::min(exec.parallel_threads != 0 ? exec.parallel_threads : pool.size(),
+                        pool.size());
     }
 
     /// Readers to spread `units` independent pieces of decode work over: this

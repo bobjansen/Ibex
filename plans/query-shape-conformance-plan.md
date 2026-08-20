@@ -885,6 +885,62 @@ counts") plus the full suite (1641/1641) pass. q09/q12 confirmed unaffected
 join — `collect_deferrable` is Inner-only, never reached this path anyway).
 Kept.
 
+**REVERTED 2026-08-20, same day, after a full-suite re-check the "kept" verdict
+above never ran.** Everything above this paragraph was checked against three
+named queries (q04, q09, q12) individually, never against the other 19. A
+clean, contention-free full-suite SF-2/8-core A/B (interleaved binary swap,
+same technique as elsewhere in this doc, `warmup 2 / iters 5`, box confirmed
+idle via `ps --sort=-pcpu` first) surfaced a real regression the targeted
+checks missed entirely: **q08 (`part join lineitem` unfiltered, six more joins
+before any predicate lands) went from ~77-80ms to ~155-170ms, a clean ~2x**,
+isolated by rebuilding with only `scan_predicates.cpp` swapped between the two
+commits (chunked.cpp's `materialize_row_local` refactor confirmed innocent —
+same fast number either way). Full-suite totals: 2230ms without the gate,
+2459ms with it — **+10.3%, this fix is a net loss on the suite it shipped
+with, not a win.**
+
+**Why q08 falsifies the heuristic**: `contains_row_reducing_node` uses "does
+the build side contain a Filter/Head/Tail/TopK/Distinct/predicated-join
+node" as a stand-in for "the build side is smaller than the probe side" — but
+in q08, `part` (the build side of `part join lineitem`) has no filter at that
+point in the chain (the `p_type` predicate lands six joins later) yet is still
+genuinely tiny relative to `lineitem` (200K vs 12M rows at SF-2) purely
+because it's a dimension table with no row-reducing operator anywhere near it.
+Presence-of-filter and "small relative to the probe side" are different
+properties, and this heuristic conflates them: it correctly blocks q12's
+`orders join lineitem` (orders is itself large and unfiltered, a real
+whole-table-vs-whole-table join) but wrongly blocks q08's `part join lineitem`
+(part is small by construction, not by filtering) using the same test.
+
+**The two pieces don't decompose cleanly, either** — this was checked before
+reverting, not assumed: keeping only the `Ascribe`-transparency half of the
+`match_probe_chain` change (dropping the `contains_row_reducing_node`
+condition) reintroduces the *original* q12 regression this whole mechanism
+exists to prevent, for the reason given further up this section (ascription
+was accidentally blocking `match_probe_chain` from ever reaching q12's
+lineitem at all; making it transparent without a gate unblocks the same bad
+unconditional deferral). So there is no free subset of this change to keep —
+it needs a real selectivity/cardinality signal (row counts from footer stats
+or `column_stats()`, not a structural Filter-node proxy) to tell q08's shape
+apart from q12's, which is unbuilt. **Fully reverted**
+(`src/ir/scan_predicates.cpp` and its two new tests in
+`test_ir_required_columns.cpp` back to pre-Mechanism-3-gate state; the
+`chunked.cpp` `materialize_row_local` consolidation is kept, since it's
+confirmed perf-neutral on its own and a legitimate dedup regardless of this
+gate's fate). 1643/1643 ctest, 22/22 `check_answers.py` reconfirmed at the
+reverted state.
+
+**Where this leaves Mechanism 3**: back to its original, pre-2026-08-20-fix
+status — `match_probe_chain` does not see through `Ascribe`, and q09/q12 stay
+protected by the ascription accident documented at the top of this section,
+not by a real fix. A real fix needs an actual cardinality estimate at the
+`collect_deferrable` decision point (the same kind of input the "Cost gate"
+design-scope section above already scoped for a *different* fusion decision —
+`make_relation_sampler`/`column_stats()` are the same inputs this gate would
+need too) rather than a structural proxy. Do not re-attempt the
+structural-proxy shape a second time without a real selectivity signal behind
+it.
+
 ### Mechanism 4 — a predicate column's whole-file decode stalls on task imbalance (RETARGETED 2026-08-20 — not project_where, and not select_bounds)
 
 Originally framed as "`project_where`'s fused path's barrier stalls", by

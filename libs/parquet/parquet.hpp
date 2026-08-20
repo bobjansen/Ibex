@@ -1432,25 +1432,44 @@ inline auto decode_physical_column(parquet::arrow::FileReader& reader, int leaf_
 using ShardDecodeFn = std::function<std::size_t(
     parquet::arrow::FileReader&, const DirectDecodeGroups&, std::size_t, std::size_t)>;
 
+/// Runs once, on the calling thread, after every `ShardDecodeFn` call for a
+/// column has returned; finishes assembling `entry.column`. Only dictionary
+/// needs one — see `ShardedColumn`'s comment.
+using ShardFinalizeFn = std::function<void(ibex::runtime::ColumnEntry& entry)>;
+
 /// A column whose row-group ranges can be decoded independently, with its
 /// buffer already allocated and its decoder bound to that buffer.
 ///
 /// What makes the ranges independent is that every range's output row count is
 /// known before any decoding happens — from the footer, or from where the
 /// selection crosses the range's row bounds — so each range owns a disjoint
-/// slice of one flat buffer and there is nothing to merge afterwards. The
-/// result is the same bytes the serial decode would have written.
+/// slice of one flat buffer and there is nothing to merge afterwards, for
+/// every type except one. The result is the same bytes the serial decode
+/// would have written.
 ///
-/// The types left out each fail that test for their own reason. A string's
-/// destination offset depends on the total length of every preceding row.
-/// A dictionary column's codes only mean anything against a per-row-group
-/// dictionary that has to be unified. `Column<bool>` packs 64 rows into a word,
-/// so neighbouring ranges would write the same word. And a column with nulls
-/// shares a validity bitmap, which has that same word-sharing problem — hence
-/// the null-free requirement rather than a null-handling shard path.
+/// `Column<bool>` packs 64 rows into a word, so neighbouring ranges would
+/// write the same word; a string's destination offset depends on the total
+/// length of every preceding row; and a column with nulls shares a validity
+/// bitmap, which has that same word-sharing problem — hence the null-free
+/// requirement rather than a null-handling shard path, for every shardable
+/// type including dictionary.
+///
+/// Dictionary is the one type that IS split despite needing a merge: its
+/// codes are fixed-width, so writing them is exactly as parallel as any
+/// numeric type — what differs is that a code only means something against
+/// the per-row-group dictionary it was read with, and each shard reads its
+/// own. `finalize`, run once on the calling thread after every shard's
+/// `decode_range` has returned, unifies those per-shard dictionaries into one
+/// and remaps the codes already written in place — the same per-chunk-to-one
+/// remap `build_categorical_column` already does across Arrow chunks, done
+/// here across shard outputs instead, and just as cheap for the same reason:
+/// this path only exists for low-cardinality columns, so there are a handful
+/// of strings to unify against millions of already-written codes.
 struct ShardedColumn {
     ibex::runtime::ColumnEntry entry;
     ShardDecodeFn decode_range;
+    /// Empty for every type except dictionary. See the class comment.
+    ShardFinalizeFn finalize;
 };
 
 /// Size the destination buffer, hand its address to a decoder bound to it, and
@@ -1481,6 +1500,83 @@ inline auto sharded_numeric(ibex::runtime::ColumnEntry& entry, int leaf_index,
             throw std::runtime_error("read_parquet: sharded decode produced the wrong row count");
         }
         return emitted;
+    };
+}
+
+/// Plans a dictionary column's shard. Codes are fixed-width, so writing them
+/// is exactly as parallel as any numeric shard — `decode_range` writes each
+/// row group's codes straight into the shared flat buffer, LOCAL to that row
+/// group's own dictionary (there is no way to know ahead of time what a row
+/// group's dictionary holds). `finalize` then unifies the per-shard local
+/// dictionaries into one global one and remaps the already-written codes in
+/// place, on the calling thread, once every shard has decoded — the same
+/// per-chunk-to-one remap `build_categorical_column` does across Arrow
+/// chunks, done here across shard outputs instead.
+inline void sharded_dictionary(ShardedColumn& planned, int leaf_index,
+                               const ibex::runtime::Selection* selection,
+                               const DirectDecodeGroups& groups, std::size_t output_rows) {
+    const auto num_shards = static_cast<std::size_t>(groups.end - groups.begin);
+    auto codes = std::make_shared<std::vector<std::int32_t>>(output_rows, 0);
+    auto local_dicts = std::make_shared<std::vector<std::vector<std::string>>>(num_shards);
+    // {output_start, rows} per shard, in row-group order. A shard the
+    // selection rejects entirely is never decoded and keeps {0, 0}, which
+    // `finalize`'s remap loop treats as nothing to do.
+    auto shard_bounds =
+        std::make_shared<std::vector<std::pair<std::size_t, std::size_t>>>(num_shards);
+    std::int32_t* const base = codes->data();
+    const int groups_begin = groups.begin;
+
+    planned.decode_range = [base, leaf_index, selection, local_dicts, shard_bounds, groups_begin](
+                               parquet::arrow::FileReader& reader, const DirectDecodeGroups& range,
+                               std::size_t output_start, std::size_t rows) -> std::size_t {
+        const auto shard = static_cast<std::size_t>(range.begin - groups_begin);
+        DirectValidity validity(rows);
+        std::vector<std::int32_t> local_codes;
+        local_codes.reserve(rows);
+        const auto emitted = decode_dictionary_column(reader, leaf_index, selection, range,
+                                                      (*local_dicts)[shard], local_codes, validity);
+        if (emitted != rows || validity.position != rows || validity.has_null) {
+            throw std::runtime_error(
+                "read_parquet: sharded dictionary decode produced the wrong row count");
+        }
+        std::copy(local_codes.begin(), local_codes.end(), base + output_start);
+        (*shard_bounds)[shard] = {output_start, rows};
+        return emitted;
+    };
+
+    planned.finalize = [codes, local_dicts,
+                        shard_bounds](ibex::runtime::ColumnEntry& entry) mutable {
+        std::vector<std::string> global_dict;
+        std::map<std::string, std::int32_t, std::less<>> global_index;
+        auto intern = [&](const std::string& value) {
+            auto [it, inserted] = global_index.try_emplace(value, 0);
+            if (inserted) {
+                it->second = static_cast<std::int32_t>(global_dict.size());
+                global_dict.push_back(value);
+            }
+            return it->second;
+        };
+        std::int32_t* const codes_base = codes->data();
+        for (std::size_t shard = 0; shard < local_dicts->size(); ++shard) {
+            const auto [output_start, rows] = (*shard_bounds)[shard];
+            if (rows == 0) {
+                continue;
+            }
+            std::vector<std::int32_t> remap;
+            remap.reserve((*local_dicts)[shard].size());
+            for (const auto& value : (*local_dicts)[shard]) {
+                remap.push_back(intern(value));
+            }
+            for (std::size_t i = output_start; i < output_start + rows; ++i) {
+                const auto local = codes_base[i];
+                if (local < 0 || static_cast<std::size_t>(local) >= remap.size()) {
+                    throw std::runtime_error("read_parquet: invalid sharded dictionary code");
+                }
+                codes_base[i] = remap[static_cast<std::size_t>(local)];
+            }
+        }
+        entry.column = std::make_shared<ibex::runtime::ColumnValue>(
+            ibex::Column<ibex::Categorical>{std::move(global_dict), std::move(*codes)});
     };
 }
 
@@ -1564,6 +1660,9 @@ inline auto plan_sharded_column(parquet::arrow::FileReader& reader, const arrow:
                 [scale](std::int64_t value) { return ibex::Timestamp{value * scale}; });
             break;
         }
+        case arrow::Type::DICTIONARY:
+            sharded_dictionary(planned, leaf_index, selection, groups, output_rows);
+            break;
         default:
             return std::nullopt;
     }
@@ -1889,6 +1988,15 @@ inline auto direct_decode_table(std::span<parquet::arrow::FileReader* const> rea
             }
         });
         batch.wait();
+    }
+
+    // Every shard for every column has now decoded. Dictionary is the only
+    // planned type that leaves work for the calling thread — see
+    // `ShardedColumn`'s comment — so this is cheap for every other column.
+    for (auto& column : planned) {
+        if (column.has_value() && column->finalize) {
+            column->finalize(column->entry);
+        }
     }
 
     ibex::runtime::Table out;

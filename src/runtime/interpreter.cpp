@@ -770,6 +770,13 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                         return std::holds_alternative<Column<Date>>(col);
                     case ir::ColumnType::Timestamp:
                         return std::holds_alternative<Column<Timestamp>>(col);
+                    case ir::ColumnType::Categorical:
+                        // Unreachable here for the same reason as emitter.cpp's
+                        // twin switch: no `parser::ScalarType` spells this, so a
+                        // written ascription's `type` is never Categorical. A
+                        // physically Categorical column is matched by the String
+                        // arm above, same as before this type was split out.
+                        return std::holds_alternative<Column<Categorical>>(col);
                 }
                 return false;
             };

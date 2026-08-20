@@ -582,6 +582,12 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                         return "Date";
                     case ir::ColumnType::Timestamp:
                         return "Timestamp";
+                    case ir::ColumnType::Categorical:
+                        // Unreachable from parsed source: no `parser::ScalarType`
+                        // spells this, so a written ascription field never carries
+                        // it. Handled for switch exhaustiveness, not because emitted
+                        // code can reach this arm.
+                        return "String";
                 }
                 return "Int64";
             };

@@ -22,6 +22,14 @@
 
 namespace ibex::ir {
 
+auto ascription_type_satisfies(ColumnType have, ColumnType field) noexcept -> bool {
+    if (have == field) {
+        return true;
+    }
+    return (have == ColumnType::Categorical && field == ColumnType::String) ||
+           (have == ColumnType::String && field == ColumnType::Categorical);
+}
+
 auto SchemaInfo::find(std::string_view name) const -> const SchemaField* {
     if (!known_) {
         return nullptr;
@@ -531,6 +539,8 @@ auto type_name(ColumnType type) -> std::string_view {
             return "Date";
         case ColumnType::Timestamp:
             return "Timestamp";
+        case ColumnType::Categorical:
+            return "Categorical";
     }
     return "?";
 }
@@ -542,11 +552,8 @@ auto check_one(const AscribeNode& asc, const SchemaInfo& input)
         if (have == nullptr) {
             return std::unexpected("schema ascription: missing column '" + field.name + "'");
         }
-        // Plain equality is right here even though the interpreter's check is
-        // lenient about Categorical: `column_ir_type` maps both Column<string>
-        // and Column<Categorical> to ColumnType::String, so the distinction the
-        // interpreter has to tolerate does not exist at the schema level.
-        if (field.type.has_value() && have->type.has_value() && *have->type != *field.type) {
+        if (field.type.has_value() && have->type.has_value() &&
+            !ascription_type_satisfies(*have->type, *field.type)) {
             return std::unexpected("schema ascription: column '" + field.name + "' is " +
                                    std::string(type_name(*have->type)) +
                                    " but the ascription requires " +
@@ -638,6 +645,9 @@ auto key_kind(ColumnType type) -> KeyKind {
         case ColumnType::Bool:
             return KeyKind::Bool;
         case ColumnType::String:
+        case ColumnType::Categorical:
+            // A dictionary-encoded column still compares as a string join
+            // key at this granularity -- see the enum's own doc comment.
             return KeyKind::String;
         case ColumnType::Date:
             return KeyKind::Date;

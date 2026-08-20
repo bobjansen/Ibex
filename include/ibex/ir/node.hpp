@@ -449,6 +449,14 @@ enum class ColumnType : std::uint8_t {
     String,
     Date,
     Timestamp,
+    /// A dictionary-encoded string column (`Column<Categorical>` at runtime).
+    /// Distinct from `String` because its cost shape is an integer's, not a
+    /// variable-width string's: fixed-width dictionary codes plus a small,
+    /// shared dictionary, not one allocation per row. No `parser::ScalarType`
+    /// spells this -- a user always ascribes such a column as `String`, so
+    /// every comparison against a user-written type must treat `String` and
+    /// `Categorical` as compatible, never merely equal.
+    Categorical,
 };
 
 /// Whether a column may hold nulls.

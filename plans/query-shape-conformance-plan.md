@@ -1690,3 +1690,43 @@ benchmark) for other queries with the same shape — a self-join whose only
 consumer is a cardinality/existence comparison (`== 1`, `> 1`, `exists`) —
 before scoping the rule itself. Until that survey exists, this stays a named,
 understood gap rather than an active work item.
+
+**Survey done 2026-08-20 — result: q21 is the ONLY query in the suite with
+this shape.** This suite implements the full canonical 22-query TPC-H/PDS-H
+set, so there's no wider pool to check beyond it. Read all 22 for their
+existence/cardinality logic:
+
+- **q04** (`exists`) and **q18** (`in` subquery): existence tests, both map
+  directly to Ibex's `semi join` primitive — no self-join needed, existence
+  has a first-class operator.
+- **q16** (`not in`) and **q22** (`not exists`): non-existence — `left join`
+  + `is_null`, or anti join. Same story.
+- **q02** and **q17**: correlated scalar `MIN`/`AVG`, decorrelated into a
+  grouped aggregate + join — a scalar broadcast, not a cardinality test.
+- **q20**: compares a computed aggregate sum directly against a column value
+  (`Float64(ps_availqty) > sum_quantity`) — no self-join, no cardinality
+  comparison.
+- **q01, q03, q05, q06, q07, q09, q10, q12, q13, q14, q19**: plain N-way
+  equijoin chains across *different* tables, aggregates as terminal output —
+  not an intermediate cardinality test feeding another filter.
+
+**Why q21 is the outlier**: every other query's "does a match exist"
+question is expressible as `semi`/`anti join` directly (existence is a
+first-class operator in this engine), which sidesteps the self-join-blowup
+problem entirely. q21 needs `== 1`/`> 1` — an actual *cardinality* value, not
+a yes/no existence test — and that's the one thing no join primitive here
+computes directly; only a self-join-then-aggregate (or the old query's
+distinct-then-count) can produce it.
+
+**This changes the recommendation, not just the status.** A general rewrite
+rule built from exactly one example query is a worse idea now than it looked
+before the survey (see the plan's own repeated lesson: Mechanism 3 and
+Mechanism 5's five combined attempts, all from heuristics checked against too
+few cases). With zero other examples in the canonical suite to validate a
+rule against, and no evidence the shape is common in real workloads either
+(not checked — out of scope here), the cost/benefit of building "recognize
+distinct-count-replaceable self-joins" as a general planner capability no
+longer clears the bar this plan's own standing lesson sets. **Recommend:
+close this as a known, understood, single-query gap — not a work item** —
+unless real-world query telemetry (outside this synthetic suite) turns up
+more instances of the same shape to design against.

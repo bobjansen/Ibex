@@ -3901,19 +3901,15 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 };
 
 /// The base Scan under `node`, peeled through a chain of Project/Rename/Update
-/// wrappers (and, with `through_filter`, Filter too) — null when `node` is
-/// not (a simple wrapper around) one scan.
-///
-/// `through_filter` defaults off because `deferred_probe_scan_of` below reuses
-/// this peel and must keep its existing, narrower match: the driver only ever
-/// registers a probe scan for exactly the Project/Rename/Update shape it
-/// proved eligible, never past a Filter, so widening the default here would
-/// silently widen what counts as a deferred probe too.
-auto base_scan_of(const ir::Node& node, bool through_filter = false) -> const ir::ScanNode* {
+/// wrappers — null when `node` is not (a simple wrapper around) one scan.
+/// Deliberately not past Filter: `deferred_probe_scan_of` reuses this peel,
+/// and the driver only ever registers a probe scan for exactly the
+/// Project/Rename/Update shape it proved eligible, so widening the peel here
+/// would silently widen what counts as a deferred probe too.
+auto base_scan_of(const ir::Node& node) -> const ir::ScanNode* {
     const ir::Node* cur = &node;
     while (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
-           cur->kind() == ir::NodeKind::Update ||
-           (through_filter && cur->kind() == ir::NodeKind::Filter)) {
+           cur->kind() == ir::NodeKind::Update) {
         if (cur->children().size() != 1 || cur->children().front() == nullptr) {
             return nullptr;
         }

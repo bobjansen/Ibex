@@ -1403,10 +1403,11 @@ join/build work, ring backpressure, and the worker pool's own contention are
 in the loop. That is exactly the part this session's five-times-reverted
 history warns about (see the STOPPED note above) and is still unstarted.
 
-The throwaway harness is left in the tree (not deleted) since it is cheap to
-keep, self-contained, and useful for re-checking this number after any
-future change to the decode path; delete it once the real fix lands or the
-thread is abandoned.
+The throwaway harness was left in the tree after this experiment ("cheap to
+keep, useful for re-checking"), and has since been **deleted** (2026-08-21):
+the thread it de-risked is abandoned — the production overlap was removed
+entirely — which is exactly the "delete it" condition. Its measurement lives
+here; `git log` has the file if the number ever needs re-checking.
 
 **Resume point, updated:** the de-risk step is done and passed. The next
 step is "scope narrowly against q10" (option 2 above), still unstarted —

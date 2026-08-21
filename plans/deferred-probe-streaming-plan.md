@@ -1,8 +1,10 @@
 # Parallel deferred-probe streaming plan
 
 Status: blocked on a probe-side selectivity estimate. Stage 2 (streaming
-skeleton) is landed and committed, correct, but still unreachable by any
-current TPC-H query. Stage 3 (Filter admission) was attempted, measured, and
+skeleton) landed, was instrumented as unreachable by any current TPC-H query,
+and has since been **removed from the tree** — the code is recoverable in full
+from commit `c5ab31ca` if the selectivity estimate ever makes it reachable
+again. Stage 3 (Filter admission) was attempted, measured, and
 reverted: it fixed q03 (+2.6-3.2x at 1 core, +30-45% at 2-8) by finally
 making it eligible for the existing two-phase mechanism, but broke q12
 (same 1-core-win/2-8-core-collapse shape `project_where` failed with
@@ -15,6 +17,8 @@ Written: 2026-08-21
 Revised: 2026-08-21 (Stage 1 complete — design narrowed, see "Stage 1 findings")
 Revised: 2026-08-21 (Stage 2 complete — see the Stage 2 entry under "Staged implementation")
 Revised: 2026-08-21 (Stage 3 attempted and reverted — see the Stage 3 entry under "Staged implementation")
+Revised: 2026-08-21 (Stage 2 code removed as unreachable, ahead of the
+kernel-pipeline restructure — `plans/kernel-pipeline-execution-plan.md`)
 
 ## Problem
 

@@ -155,6 +155,44 @@ class StageThreadScope {
     auto operator=(StageThreadScope&&) -> StageThreadScope& = delete;
 };
 
+/// RAII slot in the global compute-helper-thread budget: a bound on raw
+/// `std::thread`s that overlap two independent subtrees' work outside any
+/// `WorkerPool` (`chunked.cpp`'s "multiple producers" pattern — one side
+/// materializes on a raw thread while the caller builds the other, because
+/// `WorkerPool::submit` refuses reentrant calls and the caller may already be
+/// on a non-pool-worker thread that itself needs to stay free).
+///
+/// Such a thread is invisible to `WorkerPool`'s own accounting and, unlike a
+/// pool submission, nothing else bounds how many accumulate — a recursive
+/// caller (nested joins, say) can spawn one per recursion level, each
+/// competing for the same physical cores as the pool's own compute fan-outs.
+/// This is that bound, budgeted against `compute_thread_count()` (not any
+/// one pool's thread count: a helper thread does compute-shaped work, and
+/// compute measurably regresses under oversubscription — see
+/// `compute_thread_count()`'s doc).
+///
+/// Construct before spawning the raw thread; check `acquired()` first and
+/// take the sequential path instead if it is false. Recursion then degrades
+/// to serial once the budget is exhausted, the same "outermost wins" policy
+/// `on_worker_pool_thread()` already gives pool submissions.
+class HelperThreadSlot {
+   public:
+    HelperThreadSlot() noexcept;
+    ~HelperThreadSlot();
+    HelperThreadSlot(const HelperThreadSlot&) = delete;
+    auto operator=(const HelperThreadSlot&) -> HelperThreadSlot& = delete;
+    HelperThreadSlot(HelperThreadSlot&&) = delete;
+    auto operator=(HelperThreadSlot&&) -> HelperThreadSlot& = delete;
+
+    /// Whether this slot actually holds a budget unit. False means the
+    /// budget was exhausted when this was constructed; the caller must not
+    /// spawn its raw thread and should run sequentially instead.
+    [[nodiscard]] auto acquired() const noexcept -> bool { return acquired_; }
+
+   private:
+    bool acquired_;
+};
+
 /// Most stage threads alive at once since process start.
 ///
 /// Reported alongside the pool size because the process runs

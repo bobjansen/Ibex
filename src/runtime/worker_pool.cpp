@@ -349,39 +349,6 @@ auto stage_thread_peak() noexcept -> std::size_t {
     return g_stage_threads_peak.load(std::memory_order_relaxed);
 }
 
-namespace {
-std::atomic<std::size_t> g_helper_threads_live{0};
-}  // namespace
-
-HelperThreadSlot::HelperThreadSlot() noexcept {
-    // compute_thread_count(), not any WorkerPool's size(): a helper thread
-    // does compute-shaped work (materializing an operator subtree), and
-    // compute measurably regresses under oversubscription while decode's
-    // pool size is deliberately oversubscribed for a different reason. See
-    // compute_thread_count()'s doc comment.
-    const std::size_t budget = compute_thread_count();
-    std::size_t live = g_helper_threads_live.load(std::memory_order_relaxed);
-    for (;;) {
-        if (live >= budget) {
-            acquired_ = false;
-            return;
-        }
-        if (g_helper_threads_live.compare_exchange_weak(live, live + 1,
-                                                        std::memory_order_relaxed)) {
-            acquired_ = true;
-            return;
-        }
-        // CAS lost the race (another thread changed `live`); retry with the
-        // freshly-read value `compare_exchange_weak` already wrote back.
-    }
-}
-
-HelperThreadSlot::~HelperThreadSlot() {
-    if (acquired_) {
-        g_helper_threads_live.fetch_sub(1, std::memory_order_relaxed);
-    }
-}
-
 WorkerPool::WorkerPool(std::size_t threads)
     : impl_(std::make_unique<Impl>()), threads_(threads == 0 ? 1 : threads) {
     impl_->threads.reserve(threads_);

@@ -11,6 +11,7 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
@@ -4129,8 +4130,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     static constexpr std::size_t kStreamRightThreshold = 65536;
 
     auto initialize() -> std::optional<std::string> {
+        if (keys_->size() == 2) {
+            return initialize_pair();
+        }
         if (keys_->size() != 1) {
-            return "ChunkedInnerJoinOperator only supports single-key joins";
+            return "ChunkedInnerJoinOperator only supports single-key or two-Int64-key joins";
         }
         if (deferred_probe_ != nullptr) {
             if (auto err = resolve_deferred_probe()) {
@@ -4195,6 +4199,293 @@ class ChunkedInnerJoinOperator final : public Operator {
             return err;
         }
         return std::nullopt;
+    }
+
+    /// Two-fixed-width-int-key path: narrow first cut of the streaming
+    /// two-key join (plans/parallelism-overview.md's "stream multi-key
+    /// joins" item). `right_` is already a whole `Table` by construction (the
+    /// call site always materializes it, same as the single-key path), so
+    /// the only real decision left is which side to index: this always
+    /// materializes `left_` too and builds on whichever side is smaller --
+    /// the same motivation as `initialize()`'s single-key swap decision, and
+    /// necessary here because the call site cannot know in advance which
+    /// side a two-key join chain puts on which name (TPC-H q09's `lineitem`
+    /// join has the multi-million-row side as `right_`; indexing it
+    /// unconditionally was measured a >2x regression before this fix).
+    /// Deferred-probe filter pushdown into a large scan (the bigger lever
+    /// still on the table for a large *streamed* side) stays out of scope --
+    /// `DynamicScanFilter`/`DeferredScan` are single-column throughout, and
+    /// extending them is a separate, larger change.
+    auto initialize_pair() -> std::optional<std::string> {
+        if (deferred_probe_ != nullptr) {
+            return "ChunkedInnerJoinOperator: deferred probe not supported for two-key joins";
+        }
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* rkey0 = right_.find(k0.right);
+        if (rkey0 == nullptr) {
+            return "join key not found in right table: " + k0.right;
+        }
+        const ColumnValue* rkey1 = right_.find(k1.right);
+        if (rkey1 == nullptr) {
+            return "join key not found in right table: " + k1.right;
+        }
+        const auto* rcol0 = std::get_if<Column<std::int64_t>>(rkey0);
+        const auto* rcol1 = std::get_if<Column<std::int64_t>>(rkey1);
+        if (rcol0 == nullptr || rcol1 == nullptr) {
+            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to be "
+                   "Int64";
+        }
+        auto left_res = MaterializeOperator(std::move(left_)).run();
+        if (!left_res.has_value()) {
+            return std::move(left_res.error());
+        }
+        Table left_table = std::move(*left_res);
+        const std::size_t n_left = left_table.rows();
+        const std::size_t n_right = right_.rows();
+        pair_mode_ = true;
+
+        if (n_left <= n_right) {
+            // Build on the (smaller) left, scan right row-by-row: same shape
+            // as single-key `Mode::Swapped` / `emit_swapped`.
+            const ColumnValue* lkey0 = left_table.find(k0.left);
+            if (lkey0 == nullptr) {
+                return "join key not found in left table: " + k0.left;
+            }
+            const ColumnValue* lkey1 = left_table.find(k1.left);
+            if (lkey1 == nullptr) {
+                return "join key not found in left table: " + k1.left;
+            }
+            const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
+            const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
+            if (lcol0 == nullptr || lcol1 == nullptr) {
+                return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
+                       "be Int64";
+            }
+            const auto* le0 = left_table.find_entry(k0.left);
+            const auto* le1 = left_table.find_entry(k1.left);
+            const ValidityBitmap* lv0 =
+                le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
+            const ValidityBitmap* lv1 =
+                le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
+            build_pair_index(*lcol0, *lcol1, lv0, lv1);
+            left_table_ = std::move(left_table);
+            mode_ = Mode::Swapped;
+            return std::nullopt;
+        }
+
+        // Build on the (smaller) right; left is already fully materialized,
+        // so it is drained as a single chunk through the existing
+        // `use_materialized_left_` mechanism rather than re-wrapped in an
+        // operator.
+        const auto* re0 = right_.find_entry(k0.right);
+        const auto* re1 = right_.find_entry(k1.right);
+        const ValidityBitmap* rv0 =
+            re0 != nullptr && re0->validity.has_value() ? &*re0->validity : nullptr;
+        const ValidityBitmap* rv1 =
+            re1 != nullptr && re1->validity.has_value() ? &*re1->validity : nullptr;
+        build_pair_index(*rcol0, *rcol1, rv0, rv1);
+        left_materialized_ = std::move(left_table);
+        use_materialized_left_ = true;
+        return std::nullopt;
+    }
+
+    // Swapped pair-mode counterpart of `emit_swapped`: the pair index is on
+    // `left_table_`, so `right_`'s rows are the probe side. Reuses
+    // `probe_swapped` unchanged -- it is already generic over a
+    // `head_of(row)` callback -- with the null check folded into `head_of`
+    // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
+    // member, since a row here is null when EITHER key is.
+    auto emit_swapped_pair() -> std::expected<Table, std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* rkey0 = right_.find(k0.right);
+        if (rkey0 == nullptr) {
+            return std::unexpected("join key not found in right table: " + k0.right);
+        }
+        const ColumnValue* rkey1 = right_.find(k1.right);
+        if (rkey1 == nullptr) {
+            return std::unexpected("join key not found in right table: " + k1.right);
+        }
+        const auto* col0 = std::get_if<Column<std::int64_t>>(rkey0);
+        const auto* col1 = std::get_if<Column<std::int64_t>>(rkey1);
+        if (col0 == nullptr || col1 == nullptr) {
+            return std::unexpected(
+                "inner join: right key type mismatch (two-key join expects Int64)");
+        }
+        if (!left_table_.has_value()) {
+            return std::unexpected(
+                "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
+        }
+        const auto* e0 = right_.find_entry(k0.right);
+        const auto* e1 = right_.find_entry(k1.right);
+        const ValidityBitmap* v0 =
+            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
+        const ValidityBitmap* v1 =
+            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+        const auto* d0 = col0->data();
+        const auto* d1 = col1->data();
+        const std::size_t n_right = right_.rows();
+
+        const auto head_of = [&](std::size_t r) -> std::size_t {
+            if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
+                return kNil;
+            }
+            PairKey key{static_cast<std::uint64_t>(d0[r]), static_cast<std::uint64_t>(d1[r])};
+            auto it = pair_heads_.find(key);
+            return it == pair_heads_.end() ? kNil : it->second;
+        };
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        probe_swapped(n_right, head_of, li, ri);
+
+        const Table& left_table = *left_table_;
+        Table left_copy;
+        left_copy.columns.reserve(left_table.columns.size());
+        for (const auto& c : left_table.columns) {
+            left_copy.add_column(c.name, *c.column);
+            left_copy.columns.back().validity = c.validity;
+        }
+        return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
+    }
+
+    // Build the chained hash index for the two-key path, same chain-of-equal
+    // rows convention as `build_scalar` (reverse iteration so the chain walks
+    // forward during probe). A row with either key null is never indexed --
+    // null never matches, not even another null (same policy as the
+    // single-key path).
+    void build_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
+                          const ValidityBitmap* v0, const ValidityBitmap* v1) {
+        const std::size_t n = col0.size();
+        chain_next_.assign(n, kNil);
+        pair_heads_.reserve(n);
+        const auto* d0 = col0.data();
+        const auto* d1 = col1.data();
+        for (std::size_t r = n; r-- > 0;) {
+            if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
+                continue;
+            }
+            PairKey key{static_cast<std::uint64_t>(d0[r]), static_cast<std::uint64_t>(d1[r])};
+            auto [it, inserted] = pair_heads_.try_emplace(key, r);
+            if (!inserted) {
+                chain_next_[r] = it->second;
+                it->second = r;
+                build_unique_ = false;
+            }
+        }
+    }
+
+    // Same two shapes as `probe_scalar` (parallel fan-out via
+    // `probe_ranges_parallel`, then a unique-build fast path, then the
+    // general chained walk) but with an explicit null check instead of the
+    // single-bitmap `probe_is_null` member, since a probe row here is null
+    // when EITHER key is.
+    template <typename IsNull, typename GetKey>
+    auto probe_pair(std::size_t n, IsNull is_null, GetKey get_key, std::vector<std::size_t>& li,
+                    std::vector<std::size_t>& ri) -> bool {
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                if (is_null(l)) {
+                    continue;
+                }
+                auto it = pair_heads_.find(get_key(l));
+                if (it == pair_heads_.end()) {
+                    continue;
+                }
+                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                    out_l.push_back(l);
+                    out_r.push_back(cur);
+                }
+            }
+        };
+        if (probe_ranges_parallel(n, li, ri, scan)) {
+            return build_unique_ && li.size() == n;
+        }
+        if (build_unique_) {
+            li.resize(n);
+            ri.resize(n);
+            std::size_t* lp = li.data();
+            std::size_t* rp = ri.data();
+            std::size_t out = 0;
+            for (std::size_t l = 0; l < n; ++l) {
+                if (is_null(l)) {
+                    continue;
+                }
+                auto it = pair_heads_.find(get_key(l));
+                if (it == pair_heads_.end()) {
+                    continue;
+                }
+                lp[out] = l;
+                rp[out] = it->second;
+                ++out;
+            }
+            li.resize(out);
+            ri.resize(out);
+            return out == n;
+        }
+        for (std::size_t l = 0; l < n; ++l) {
+            if (is_null(l)) {
+                continue;
+            }
+            auto it = pair_heads_.find(get_key(l));
+            if (it == pair_heads_.end()) {
+                continue;
+            }
+            std::size_t cur = it->second;
+            while (cur != kNil) {
+                li.push_back(l);
+                ri.push_back(cur);
+                cur = chain_next_[cur];
+            }
+        }
+        return false;
+    }
+
+    auto probe_chunk_pair(Table left_chunk) -> std::expected<Table, std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* key0 = left_chunk.find(k0.left);
+        if (key0 == nullptr) {
+            return std::unexpected("join key not found in left chunk: " + k0.left);
+        }
+        const ColumnValue* key1 = left_chunk.find(k1.left);
+        if (key1 == nullptr) {
+            return std::unexpected("join key not found in left chunk: " + k1.left);
+        }
+        const auto* col0 = std::get_if<Column<std::int64_t>>(key0);
+        const auto* col1 = std::get_if<Column<std::int64_t>>(key1);
+        if (col0 == nullptr || col1 == nullptr) {
+            return std::unexpected(
+                "inner join: left key type mismatch (two-key join expects "
+                "Int64)");
+        }
+        const auto* e0 = left_chunk.find_entry(k0.left);
+        const auto* e1 = left_chunk.find_entry(k1.left);
+        const ValidityBitmap* v0 =
+            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
+        const ValidityBitmap* v1 =
+            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        const std::size_t n = left_chunk.rows();
+        li.reserve(n);
+        ri.reserve(n);
+
+        const auto* d0 = col0->data();
+        const auto* d1 = col1->data();
+        const auto is_null = [&](std::size_t r) {
+            return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
+        };
+        const auto get_key = [&](std::size_t r) {
+            return PairKey{static_cast<std::uint64_t>(d0[r]), static_cast<std::uint64_t>(d1[r])};
+        };
+        const bool li_identity = probe_pair(n, is_null, get_key, li, ri);
+
+        const std::size_t total = li_identity ? ri.size() : li.size();
+        return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
     }
 
     /// The probe side is an undecoded lazy scan. When it is worth it, drain
@@ -5092,6 +5383,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
+        if (pair_mode_) {
+            return probe_chunk_pair(std::move(left_chunk));
+        }
         const ColumnValue* key = left_chunk.find(keys_->front().left);
         if (key == nullptr) {
             return std::unexpected("join key not found in left chunk: " + keys_->front().left);
@@ -5195,6 +5489,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     // cache-missing lookups. `hits` costs one entry per *matching* right row,
     // so it is bounded by the output row count.
     auto emit_swapped() -> std::expected<Table, std::string> {
+        if (pair_mode_) {
+            return emit_swapped_pair();
+        }
         const ColumnValue* rkey = right_.find(keys_->front().right);
         if (rkey == nullptr) {
             return std::unexpected("join key not found in right table: " + keys_->front().right);
@@ -5490,6 +5787,24 @@ class ChunkedInnerJoinOperator final : public Operator {
     robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads_;
     robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
         string_heads_;
+    // Two-fixed-width-int-key path (see `initialize_pair`): both key values
+    // pack into one 128-bit-ish struct, injective with no knowledge of their
+    // domains -- same trick as the aggregate's own `PairIntKey`, but this is a
+    // separate type since the two classes don't share member scope.
+    bool pair_mode_ = false;
+    struct PairKey {
+        std::uint64_t a = 0;
+        std::uint64_t b = 0;
+        [[nodiscard]] friend auto operator==(const PairKey&, const PairKey&) -> bool = default;
+    };
+    struct PairKeyHash {
+        auto operator()(const PairKey& key) const noexcept -> std::size_t {
+            std::uint64_t h = key.a * 0x9e3779b97f4a7c15ULL;
+            h ^= key.b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return static_cast<std::size_t>(h);
+        }
+    };
+    robin_hood::unordered_flat_map<PairKey, std::size_t, PairKeyHash> pair_heads_;
     /// One worker's slice of a parallel probe. Members so the vectors keep
     /// their capacity across chunks instead of reallocating per probe.
     struct ProbePart {
@@ -9289,6 +9604,38 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
            !join.expect().asserts_anything() && join.take() == ir::MatchSelection::All;
 }
 
+/// Two-fixed-width-int-key inner join (plans/parallelism-overview.md's
+/// "stream multi-key joins" item; TPC-H q09's `lineitem` join is the
+/// motivating case). Same structural gate as `is_streamable_inner_join`
+/// plus a static schema check -- both keys, on both sides, must be provably
+/// `Int64` -- so an ineligible pair (a string key, an unascribed/Unknown
+/// schema) falls through to `build_binary_materializing_operator` exactly
+/// as it does today, never into a code path that could fail at runtime.
+/// `ChunkedInnerJoinOperator::initialize_pair` re-checks the actual runtime
+/// column type regardless -- this is a routing optimization, not the sole
+/// guarantee of correctness.
+auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
+    if (join.kind() != ir::JoinKind::Inner || join.predicate().has_value() ||
+        join.keys().size() != 2 || join.null_match() != ir::NullMatch::Never ||
+        join.expect().asserts_anything() || join.take() != ir::MatchSelection::All) {
+        return false;
+    }
+    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
+    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
+    if (!left_schema.is_known() || !right_schema.is_known()) {
+        return false;
+    }
+    for (const ir::JoinKey& key : join.keys()) {
+        const ir::SchemaField* lf = left_schema.find(key.left);
+        const ir::SchemaField* rf = right_schema.find(key.right);
+        if (lf == nullptr || rf == nullptr || !lf->type.has_value() || !rf->type.has_value() ||
+            *lf->type != ir::ColumnType::Int64 || *rf->type != ir::ColumnType::Int64) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto inner_join_table(const Table& left, const Table& right, const std::vector<ir::JoinKey>& keys,
                       const ir::JoinSuffixPolicy& suffix,
                       const std::vector<ir::OrderKey>& pending_order, const ExecutionContext& exec)
@@ -12232,6 +12579,35 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 right = materialize_row_local(*join.children()[1], registry, scalars, externs, exec,
                                               model_out);
             }
+            if (!right.has_value()) {
+                return std::unexpected(std::move(right.error()));
+            }
+            return make_pipelined_stage_if(
+                std::make_unique<ChunkedInnerJoinOperator>(
+                    std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
+                    join.suffix(), &join.pending_order()),
+                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+        }
+        // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
+        // "stream multi-key joins" item, first cut): same shape as the
+        // single-key streamable path just above, minus the deferred-probe
+        // and multiple-producers-overlap machinery -- this always builds the
+        // hash index on a fully materialized `right_` and streams `left_`
+        // chunk by chunk through `ChunkedInnerJoinOperator`'s pair-key path,
+        // replacing `join_table_impl`'s whole-table hash join for exactly
+        // this shape. Deferred-probe filter pushdown into a large right-side
+        // scan (the bigger lever for e.g. TPC-H q09's lineitem) is out of
+        // scope here; see `ChunkedInnerJoinOperator::initialize_pair`.
+        if (is_streamable_pair_int_join(join)) {
+            const bool stage_probe =
+                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+            auto left_op =
+                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+            if (!left_op.has_value()) {
+                return std::unexpected(std::move(left_op.error()));
+            }
+            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }

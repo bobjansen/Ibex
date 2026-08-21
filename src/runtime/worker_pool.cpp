@@ -617,6 +617,12 @@ auto process_worker_pool() -> WorkerPool& {
     return *state.pool;
 }
 
+auto existing_worker_pool_size() -> std::size_t {
+    auto& state = process_worker_pool_state();
+    const std::lock_guard lock(state.mutex);
+    return state.pool == nullptr ? 0 : state.pool->size();
+}
+
 void shutdown_process_worker_pool() {
     auto& state = process_worker_pool_state();
     std::unique_ptr<WorkerPool> pool;

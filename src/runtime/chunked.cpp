@@ -9353,16 +9353,23 @@ auto build_binary_materializing_operator(const ir::Node& left_node, const ir::No
                                          const ExecutionContext& exec, ModelResult* model_out,
                                          Fn fn) -> std::expected<OperatorPtr, std::string> {
     // Multiple producers (plans/parallelism-overview.md): tried overlapping
-    // `left_node`/`right_node`'s materializations on a raw std::thread here
-    // and measured a net regression on the full PDS-H suite (q09 +57%,
-    // q04/q06/q07/q08/q19 also worse) -- this choke point is reached by
-    // deeply nested join chains (q09's 6-way join lowers to nested binary
-    // joins here), where each level's overlap spawns another producer thread
-    // that itself recurses into more pool work, oversubscribing the pool
-    // instead of overlapping two genuinely idle cores the way the single
-    // is_streamable_inner_join call site does. Reverted; see
-    // plans/parallelism-overview.md's "generalize multiple producers"
-    // section before trying again here.
+    // `left_node`/`right_node`'s materializations on a raw std::thread here,
+    // twice. First attempt (unbudgeted): net regression on the full PDS-H
+    // suite (q09 +57%, q04/q06/q07/q08/q19 also worse). Second attempt,
+    // under `HelperThreadSlot`'s recursion-accumulation budget (see the
+    // is_streamable_inner_join call site below): q09 STILL regressed
+    // (+47.5%), and the budget provably wasn't the reason -- q09 hits this
+    // function exactly once (verified with a temporary entry-count trace),
+    // so there was never a recursive pile-up here for a budget to bound in
+    // the first place, and re-testing at budget=1/2/8 all gave the same
+    // ~230-250ms. The actual cost is structural, not concurrency-count: this
+    // function materializes BOTH sides fully (unlike is_streamable_inner_join,
+    // which builds the left as a cheap lazy operator and only materializes
+    // the right), so overlapping two already-expensive full materializations
+    // contends for the same cores/memory bandwidth rather than filling idle
+    // ones. Reverted a second time; a future attempt here needs a
+    // cost-aware gate (e.g. skip when both sides are large), not a
+    // thread-count budget.
     auto left = materialize_row_local(left_node, registry, scalars, externs, exec, model_out);
     if (!left.has_value()) {
         return std::unexpected(std::move(left.error()));
@@ -12115,11 +12122,16 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             // Multiple producers: tried the same overlap as the inner-join
-            // site below here too, and it measured a net regression (q04
-            // +19% on the full PDS-H suite, isolated and reproduced under
-            // interleaved A/B) -- reverted. See
-            // plans/parallelism-overview.md's "generalize multiple
-            // producers" section before trying again here.
+            // site below here too, twice. First attempt (unbudgeted): q04
+            // regressed +19%. Second attempt, under `HelperThreadSlot`: q04
+            // and q18 both STILL regressed, and in both cases the overlap is
+            // entered exactly once per query (verified with a temporary
+            // entry-count trace) -- there is no recursive pile-up here for a
+            // budget to bound, so the budget was never going to help. The
+            // cost is inherent to overlapping this specific pair of sides,
+            // not to how many raw threads accumulate. Reverted a second
+            // time; see plans/parallelism-overview.md's "generalize
+            // multiple producers" section before trying again here.
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
@@ -12177,8 +12189,17 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             const bool structurally_safe =
                 probe.scan == nullptr && model_out == nullptr &&
                 !subtrees_share_source(*join.children()[0], *join.children()[1]);
-            const HelperThreadSlot helper_slot;
-            const bool overlap = structurally_safe && helper_slot.acquired();
+            // The slot is only worth acquiring once everything else already
+            // says yes -- constructing it unconditionally would hold a
+            // budget unit for this call's whole subtree-build duration even
+            // on a structurally-ineligible call (a self-join, a deferred
+            // probe), needlessly starving a sibling or nested call that
+            // could actually use it.
+            std::optional<HelperThreadSlot> helper_slot;
+            if (structurally_safe) {
+                helper_slot.emplace();
+            }
+            const bool overlap = structurally_safe && helper_slot->acquired();
 
             std::expected<OperatorPtr, std::string> left_op;
             std::expected<Table, std::string> right;

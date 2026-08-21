@@ -1,11 +1,19 @@
 # Parallel deferred-probe streaming plan
 
-Status: in progress — Stage 2 code landed and synthetically validated, but
-unreachable by any current TPC-H query (see Stage 2 below); real-query
-measurement blocked on Stage 3 (`Filter` admission) or a different target.
+Status: blocked on a probe-side selectivity estimate. Stage 2 (streaming
+skeleton) is landed and committed, correct, but still unreachable by any
+current TPC-H query. Stage 3 (Filter admission) was attempted, measured, and
+reverted: it fixed q03 (+2.6-3.2x at 1 core, +30-45% at 2-8) by finally
+making it eligible for the existing two-phase mechanism, but broke q12
+(same 1-core-win/2-8-core-collapse shape `project_where` failed with
+before), because q12's build side has no real selectivity and the whole
+deferred-probe apparatus is pure overhead for it — the known, still-open
+`project_deferred_probe_no_cost_model.md` gap. Next step needs that
+estimate, not more streaming-mechanism work.
 Written: 2026-08-21
 Revised: 2026-08-21 (Stage 1 complete — design narrowed, see "Stage 1 findings")
 Revised: 2026-08-21 (Stage 2 complete — see the Stage 2 entry under "Staged implementation")
+Revised: 2026-08-21 (Stage 3 attempted and reverted — see the Stage 3 entry under "Staged implementation")
 
 ## Problem
 
@@ -256,21 +264,82 @@ evaluation into Parquet.
    forces the pre-existing whole-materialize behavior even when streaming is
    eligible, for A/B timing against an identical registered/declined scenario.
 
-3. Extend the same loop to wrapped shapes: call `interpret_wrapped_right`
-   per unit's Table (registry-shadowed, as it is today) instead of once
-   over the whole scan. Needs renamed-key, computed-update, and
-   filter-only-column tests before being kept.
+3. **Attempted; reverted.** Extended `match_probe_chain` (scan_predicates.cpp)
+   to admit a row-local `Filter` above the probe scan — same
+   `is_subset_evaluable_expr` gate as Update's fields — and flipped
+   `base_scan_of`'s `through_filter` argument (an already-present, previously
+   unused seam) at its one call site so the two stayed in step. This is
+   exactly q03/q12's own shape and made both register for the first time.
 
-4. Apply the same loop shape to the two-key pair path
-   (`resolve_deferred_probe_pair` / `emit_swapped_pair`).
+   **First cut had a real correctness bug**, caught by `check_answers.py`
+   before any benchmarking: `try_two_phase_probe`'s `Precomputed` branch
+   computes its `li`/`ri` output-index arrays from a hash probe over
+   candidate rows *before* `interpret_wrapped_right` ever runs the wrapper
+   chain — sound when the chain is only Project/Rename/Update (always 1:1 on
+   rows), but a newly-admitted Filter can drop rows there, desyncing those
+   already-computed indices from the shorter, now-filtered `right_`. Fixed by
+   adding `chain_contains_filter` and forcing such a chain through the
+   `RightMaterialized` branch instead (which re-derives everything from
+   `right_` only after the filter has run, so it was never at risk). Root
+   cause and fix are recorded here because this exact class of bug — an
+   old invariant ("this scan is never Filter-wrapped") silently baked into
+   a hash-probe-then-materialize shortcut — is likely to recur if a future
+   change touches probe-side eligibility again; grep for `chain_contains_filter`
+   before adding another such shortcut. A regression test now pins both the
+   positive case (row-local filter admitted) and the negative one (a
+   non-row-local filter, e.g. containing `window_start`, still blocked) in
+   `test_ir_required_columns.cpp`.
 
-5. Harden cancellation, error propagation, ordering, and backpressure across
-   `DeferredScanSourceOperator`'s existing unit window and the new probe
-   loop. The new loop remains subject to `build_side_worth_deferring` (or
-   its explicit successor) exactly as the whole-materialize path is today.
+   **Benchmarked (interleaved, `IBEX_CORES` 1/2/8, build-release) after the
+   fix, correctness clean (`check_answers.py` 22/22,
+   `ctest` 1646/1646, byte-identical across core counts):**
 
-6. Run the full correctness and performance gate. Keep the path only if it
-   scales and wins at realistic core counts.
+   - q03: a clean win at every core count — roughly 0.23–0.28s → 0.086s at
+     1 core, 0.09–0.10s → 0.07s at 2 cores, 0.09–0.11s → 0.058s at 8 cores.
+     q03 resolves via the *existing* two-phase `Precomputed`/`RightMaterialized`
+     mechanism (already measured safe and fast elsewhere), not the new
+     Stage 2 streaming code — the win is purely from finally being eligible
+     for machinery that already worked well, which it had never reached
+     before because of the very Filter decline this step removed.
+   - q12: a clear loss — roughly flat at 1 core (~0.20–0.24s either way),
+     then baseline (not registered at all, pre-Stage-3) pulls away sharply
+     while the newly-registered query stays flat: ~0.052s vs ~0.19s at 2
+     cores, ~0.045s vs ~0.16s at 8 cores. **This is the same shape the
+     `project_where` attempt failed with** (win at 1 core, collapse at
+     2/8), now reproduced through a different mechanism. Isolating further
+     with `IBEX_DEBUG_PROBE_STREAM_DISABLE=1` (same registration, Stage 2/3
+     streaming forced off, falling through to the plain `interpret_node`
+     whole-materialize) showed *that* path is faster than streaming
+     (~0.153s/0.13s/0.116s at 1/2/8 cores) but still much slower than the
+     original unregistered baseline. So the loss is not really about
+     streaming-vs-whole-materialize at all: q12's build side (`orders`,
+     unfiltered) covers essentially all of `lineitem`'s key domain, so its
+     Bloom rejects nothing, and the *entire* deferred-probe apparatus — left
+     materialization, Bloom build, Phase A's whole-column key scan that then
+     gets thrown away by the escape hatch — is pure overhead with no
+     pruning to pay for it. This is the already-documented, unresolved
+     `project_deferred_probe_no_cost_model.md` gap, now tripped by a new
+     entry point (registration-time `Filter` eligibility) rather than the
+     one it was originally diagnosed on.
+
+   **Reverted in full** (`match_probe_chain`'s Filter case, the
+   `base_scan_of` flip, `chain_contains_filter`, and the
+   `test_ir_required_columns.cpp` test changes) back to the Stage 2
+   checkpoint commit. q03's measured win is real and worth returning to, but
+   only once probe-side registration has an actual selectivity estimate —
+   the same cost-model gap this plan's own "Problem" section already named
+   — so that q12-shaped joins (referentially-complete build side, near-zero
+   real pruning) are excluded at registration time instead of paying full
+   overhead and then discovering there was nothing to prune. Attempting that
+   estimate is out of scope for this plan; it belongs with
+   `project_deferred_probe_no_cost_model.md`.
+
+4. Not started. Depends on Stage 3 landing on a cost-model-gated basis first;
+   revisit scope once that exists.
+
+5. Not started, same dependency as Stage 4.
+
+6. Not started.
 
 ## Validation and acceptance criteria
 

@@ -669,26 +669,52 @@ AppleClang, or MSVC 2022. Ninja is recommended on Linux and macOS; CMake's
 Visual Studio generator works on Windows.
 
 ```bash
-# Debug with Clang or GCC (with sanitizers)
+# Debug with Clang or GCC (with sanitizers and Parquet)
 cmake -B build -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DIBEX_ENABLE_SANITIZERS=ON
+  -DIBEX_ENABLE_SANITIZERS=ON \
+  -DIBEX_BUILD_PARQUET=ON \
+  -DIBEX_BUILD_ADBC=OFF \
+  -DIBEX_BUILD_PYTHON_BRIDGE=OFF
 cmake --build build
 ctest --test-dir build --output-on-failure
 
-# Release with Clang or GCC
+# Release with Clang or GCC and Parquet
 cmake -B build-release -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DIBEX_BUILD_PARQUET=ON \
+  -DIBEX_BUILD_ADBC=OFF \
+  -DIBEX_BUILD_PYTHON_BRIDGE=OFF
 cmake --build build-release
 
 # Windows, from a Developer PowerShell
-cmake -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DIBEX_BUILD_PARQUET=ON -DIBEX_BUILD_ADBC=OFF -DIBEX_BUILD_PYTHON_BRIDGE=OFF
 cmake --build build-release --config Release
 ```
+
+The bundled Parquet plugin fetches and builds Apache Arrow automatically. The
+ADBC plugin is optional and additionally requires an ADBC C/C++ driver manager
+(`adbc.h` and `libadbc_driver_manager`), so the standard build leaves it off.
+To enable it with conda-forge:
+
+```bash
+mamba create -n ibex-adbc -c conda-forge adbc-driver-manager
+mamba activate ibex-adbc
+cmake -B build-release -DIBEX_BUILD_ADBC=ON -DCMAKE_PREFIX_PATH="$CONDA_PREFIX"
+```
+
+On supported Debian/Ubuntu releases, Apache Arrow's APT repository provides
+the equivalent `libadbc-driver-manager-dev` package. The ADBC driver manager
+only supplies the API: install an appropriate ADBC database driver separately.
+The experimental Python bridge is independent of the native plugins and needs
+a working Python interpreter plus development headers. The commands above turn
+it off to keep a native build from failing on systems without those headers. To
+enable it, pass `-DIBEX_BUILD_PYTHON_BRIDGE=ON` and, if needed,
+`-DIBEX_PYTHON_EXECUTABLE=/path/to/python`.
 
 ### Build Options
 
@@ -700,6 +726,9 @@ cmake --build build-release --config Release
 | `IBEX_BUILD_TESTS`          | `ON`    | Build Catch2 test suite            |
 | `IBEX_BUILD_TOOLS`          | `ON`    | Build REPL binary                  |
 | `IBEX_BUILD_EXAMPLES`       | `ON`    | Build example programs             |
+| `IBEX_BUILD_PARQUET`        | `ON`    | Build the bundled Parquet plugin   |
+| `IBEX_BUILD_ADBC`           | `OFF`   | Build the ADBC plugin (requires the system driver manager) |
+| `IBEX_BUILD_PYTHON_BRIDGE`  | `ON`    | Build the experimental pyarrow Python bridge |
 | `IBEX_USE_CCACHE`           | `ON`    | Use ccache if found, to speed up rebuilds |
 
 ## Architecture

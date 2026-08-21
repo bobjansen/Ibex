@@ -3,20 +3,32 @@
 
 add_library(ibex_adbc_plugin SHARED adbc.cpp)
 
+set(_ibex_adbc_prefix_hints)
+if(DEFINED ENV{CONDA_PREFIX} AND NOT "$ENV{CONDA_PREFIX}" STREQUAL "")
+    list(APPEND _ibex_adbc_prefix_hints "$ENV{CONDA_PREFIX}")
+endif()
+
 find_path(ADBC_INCLUDE_DIR
     NAMES adbc.h
+    HINTS ${_ibex_adbc_prefix_hints}
+    PATH_SUFFIXES include
 )
 
 find_library(ADBC_DRIVER_MANAGER_LIBRARY
     NAMES adbc_driver_manager libadbc_driver_manager
+    HINTS ${_ibex_adbc_prefix_hints}
+    PATH_SUFFIXES lib
 )
 
 if(NOT ADBC_INCLUDE_DIR OR NOT ADBC_DRIVER_MANAGER_LIBRARY)
     message(FATAL_ERROR
         "IBEX_BUILD_ADBC=ON requires an installed ADBC driver manager "
-        "(missing adbc.h or libadbc_driver_manager)."
+        "(missing adbc.h or libadbc_driver_manager). Activate the Conda "
+        "environment that provides it or set CMAKE_PREFIX_PATH to that environment."
     )
 endif()
+
+unset(_ibex_adbc_prefix_hints)
 
 set_target_properties(ibex_adbc_plugin PROPERTIES
     OUTPUT_NAME adbc

@@ -765,7 +765,9 @@ built with the normal CMake build and requires Node.js/npm. On Linux, the UI is
 confined with Landlock to `--data-dir`; when that option is omitted, its data
 access is confined to the directory from which it was launched. Configured
 plugin directories remain readable (but not writable) so bundled imports such
-as `import "parquet";` continue to work.
+as `import "parquet";` continue to work. Providing `--data-dir` also makes it
+the UI process's working directory, so query paths may be relative to that
+directory.
 
 ### REPL Commands
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/scan_predicates.hpp>
@@ -383,8 +384,41 @@ auto match_probe_chain(const Node& node, std::string key)
     }
 }
 
+// Whether the join's build side (LEFT) is worth deferring the probe (RIGHT)
+// scan for: the build side must publish key bounds tight enough to actually
+// prune the probe scan's decode. Compares the build side's ESTIMATED row
+// count (`estimate_cardinality`, which sees through filters) against the
+// probe source's own EXACT row count (footer metadata, `row_counts`). An
+// unfiltered or otherwise-unshrunk build side yields a bound spanning the
+// scan's whole key domain -- pruning nothing while still paying full eager
+// materialization of the build side, a pure loss (see
+// project_deferred_probe_no_cost_model.md). `row_counts` empty or the
+// estimate unavailable means "no information": permissive by default,
+// matching every existing caller (see the header doc).
+auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_source,
+                                const SourceRowCounts& row_counts, const SourceSchemas& schemas)
+    -> bool {
+    if (row_counts.empty()) {
+        return true;  // gate disabled: caller supplied no cardinality info
+    }
+    const auto probe_rows = row_counts.find(probe_source);
+    if (probe_rows == row_counts.end()) {
+        return true;  // probe source's own size unknown: nothing to compare against
+    }
+    const CardinalityEstimate build_est =
+        estimate_cardinality(*join.children()[0], row_counts, schemas);
+    if (!build_est.rows.has_value()) {
+        return true;  // build side unestimable: decline to guess, stay permissive
+    }
+    // Slack factor: estimates are approximate (heuristic filter selectivity,
+    // footer-span distinct counts), so require the build side to be clearly
+    // smaller rather than gating on any margin at all.
+    return *build_est.rows * 2 < probe_rows->second;
+}
+
 void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         const std::map<std::string, std::size_t>& counts,
+                        const SourceRowCounts& row_counts, const SourceSchemas& schemas,
                         std::map<std::string, DeferrableProbeScan>& out) {
     if (node.kind() == NodeKind::Join) {
         const auto& join = static_cast<const JoinNode&>(node);
@@ -405,11 +439,13 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
         // multi-key joins" follow-up, TPC-H q09's lineitem join).
         if (join.kind() == JoinKind::Inner &&
             (join.keys().size() == 1 || join.keys().size() == 2) && !join.predicate().has_value() &&
-            join.children().size() == 2 && join.children()[1] != nullptr) {
+            join.children().size() == 2 && join.children()[0] != nullptr &&
+            join.children()[1] != nullptr) {
             if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {
                 if (const auto count = counts.find(match->first);
-                    count != counts.end() && count->second == 1) {
+                    count != counts.end() && count->second == 1 &&
+                    build_side_worth_deferring(join, match->first, row_counts, schemas)) {
                     out.emplace(match->first,
                                 DeferrableProbeScan{.key_column = std::move(match->second)});
                 }
@@ -418,7 +454,7 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
     }
     for (const auto& child : node.children()) {
         if (child != nullptr) {
-            collect_deferrable(*child, sources, counts, out);
+            collect_deferrable(*child, sources, counts, row_counts, schemas, out);
         }
     }
 }
@@ -456,7 +492,8 @@ auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
     return out;
 }
 
-auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
+auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources,
+                            const SourceRowCounts& row_counts, const SourceSchemas& schemas)
     -> std::map<std::string, DeferrableProbeScan> {
     std::map<std::string, DeferrableProbeScan> out;
     if (sources.empty()) {
@@ -464,7 +501,7 @@ auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sourc
     }
     std::map<std::string, std::size_t> counts;
     count_scan_occurrences(root, counts);
-    collect_deferrable(root, sources, counts, out);
+    collect_deferrable(root, sources, counts, row_counts, schemas, out);
     return out;
 }
 

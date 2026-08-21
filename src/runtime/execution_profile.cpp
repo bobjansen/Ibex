@@ -268,7 +268,17 @@ ExecutionProfileState::~ExecutionProfileState() {
     });
     const std::size_t budget = impl_->worker_budget;
     const auto summary = summarize_execution_profile(snapshot(), total_ms, budget);
-    const std::size_t pool_threads = process_worker_pool().size();
+    // `existing_worker_pool_size()`, not `process_worker_pool().size()`: the
+    // latter constructs the pool as a side effect of asking. For a statement
+    // that never otherwise touches the pool (a bare `extern fn` declaration,
+    // say), that construction would happen HERE, after `pool_idle_begin` was
+    // already sampled empty at construction -- so the new workers' own
+    // thread-startup latency reads as idle time against a window whose
+    // capacity is computed from that statement's near-zero wall time,
+    // producing `pool_unqueued_ms` many multiples of `pool_capacity_ms`.
+    // Reading a pool that was never created as zero threads (zero capacity)
+    // is correct: the pool played no role in this window.
+    const std::size_t pool_threads = existing_worker_pool_size();
     // Measured directly, rather than inferred as capacity-minus-accounted. Those
     // two agreeing is the whole point: `pool_unqueued_ms` is what the pool says
     // about itself, `pool_capacity_ms` is what the clock says was available, and

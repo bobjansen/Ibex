@@ -92,6 +92,15 @@ class WorkerPool {
 /// code and would otherwise each get their own pool (the RTLD_LOCAL trap).
 [[nodiscard]] auto process_worker_pool() -> WorkerPool&;
 
+/// The process-wide pool's thread count if it has already been created, or 0
+/// otherwise -- never constructs it. `process_worker_pool().size()` reads the
+/// same number but creates the pool as a side effect of asking; a caller that
+/// only wants to know "how big would capacity accounting be" (the profiler)
+/// must not spend a query's first pool-touch on a report line, or the new
+/// pool's own thread-startup latency gets counted as idle time against a
+/// window whose capacity was computed before the pool existed.
+[[nodiscard]] auto existing_worker_pool_size() -> std::size_t;
+
 /// Stop and join the process-wide worker pool, if it has been created.
 ///
 /// Hosts which unload the Ibex shared library before their process exits (R's

@@ -4,7 +4,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import Editor, { type OnMount } from "@monaco-editor/react";
-import { flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import "./styles.css";
 
@@ -30,25 +29,24 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function Grid({ page }: { page: Page }) {
   const parentRef = useRef<HTMLDivElement>(null);
-  const table = useReactTable({
-    data: page.rows,
-    columns: page.columns.map((column, index) => ({ id: column.name, header: `${column.name} · ${column.type}`, accessorFn: (row: unknown[]) => row[index] })),
-    getCoreRowModel: getCoreRowModel(),
-  });
-  const rows = table.getRowModel().rows;
-  const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => parentRef.current, estimateSize: () => 30, overscan: 12 });
+  const virtualizer = useVirtualizer({ count: page.rows.length, getScrollElement: () => parentRef.current, estimateSize: () => 30, overscan: 12 });
+  const columns = { gridTemplateColumns: `repeat(${page.columns.length}, minmax(140px, 1fr))` };
+  // Execute responses are deliberately capped at 200 rows. Rendering that
+  // bounded first page directly avoids relying on a scroll-container size
+  // measurement before the result pane is laid out; accumulated pages remain
+  // virtualized.
+  const isBoundedPage = page.rows.length <= 200;
+  const bodyStyle = isBoundedPage ? undefined : { height: virtualizer.getTotalSize() };
+  const renderRow = (row: unknown[], key: string | number, transform?: string) => <div className={`grid-row${isBoundedPage ? " direct-row" : ""}`} key={key} style={{ ...columns, transform }}>
+    {row.map((value, index) => <span key={page.columns[index].name}>{value === null ? <em>NULL</em> : String(value)}</span>)}
+  </div>;
   return <div className="result-grid" ref={parentRef}>
-    <table>
-      <thead>{table.getHeaderGroups().map(group => <tr key={group.id}>{group.headers.map(header => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead>
-      <tbody style={{ height: virtualizer.getTotalSize() }}>
-        {virtualizer.getVirtualItems().map(item => {
-          const row = rows[item.index];
-          return <tr key={row.id} style={{ transform: `translateY(${item.start}px)` }}>
-            {row.getVisibleCells().map(cell => <td key={cell.id}>{cell.getValue() === null ? <em>NULL</em> : String(cell.getValue())}</td>)}
-          </tr>;
-        })}
-      </tbody>
-    </table>
+    <div className="grid-header" style={columns}>{page.columns.map(column => <strong key={column.name}>{column.name} <small>{column.type}</small></strong>)}</div>
+    <div className="grid-body" style={bodyStyle}>
+      {isBoundedPage
+        ? page.rows.map((row, index) => renderRow(row, index))
+        : virtualizer.getVirtualItems().map(item => renderRow(page.rows[item.index], String(item.key), `translateY(${item.start}px)`))}
+    </div>
   </div>;
 }
 
@@ -60,6 +58,7 @@ function App() {
   const [error, setError] = useState<string>();
   const [scalar, setScalar] = useState<unknown>();
   const [running, setRunning] = useState(false);
+  const runRef = useRef<() => void>(() => {});
 
   const refreshEnvironment = useCallback(async () => {
     const response = await api<Environment>("/api/v1/environment");
@@ -79,6 +78,7 @@ function App() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Request failed"); }
     finally { setRunning(false); }
   }, [source]);
+  runRef.current = () => { void run(); };
 
   const remove = useCallback(async (name: string) => {
     const response = await api<Environment>(`/api/v1/environment/${encodeURIComponent(name)}`, { method: "DELETE" });
@@ -97,7 +97,7 @@ function App() {
     monaco.languages.register({ id: "ibex" });
     monaco.languages.setMonarchTokensProvider("ibex", { tokenizer: { root: [[/\b(let|fn|filter|select|update|by|window|import|extern|from)\b/, "keyword"], [/\b(Int|Int64|Float64|String|Bool|DataFrame|TimeFrame)\b/, "type"], [/\/\/.*$/, "comment"], [/"([^"\\]|\\.)*"/, "string"], [/\d+(\.\d+)?/, "number"]] } });
     monaco.editor.setModelLanguage(editor.getModel()!, "ibex");
-    editor.addAction({ id: "run-query", label: "Run query", keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], run });
+    editor.addAction({ id: "run-query", label: "Run query", keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], run: () => runRef.current() });
   };
 
   const resultSummary = useMemo(() => page ? `${page.total_rows.toLocaleString()} rows` : scalar !== undefined ? "Scalar result" : "No result", [page, scalar]);
@@ -107,8 +107,10 @@ function App() {
     </aside>
     <section className="workspace"><header className="toolbar"><strong>Ibex</strong><button className="run" disabled={running} onClick={() => void run()}>{running ? "Running…" : "Run"}<kbd>⌘↵</kbd></button></header>
       <div className="editor"><Editor height="100%" theme="vs-dark" defaultLanguage="ibex" value={source} onChange={value => setSource(value ?? "")} onMount={onMount} options={{ minimap: { enabled: false }, fontSize: 14, automaticLayout: true }} /></div>
-      {error && <div className="error"><strong>Query error</strong><pre>{error}</pre></div>}
-      <section className="results"><header><strong>Results</strong><span>{resultSummary}</span>{resultId && <span className="muted">paged result {resultId}</span>}{page && page.rows.length < page.total_rows && <button onClick={() => void loadMore()}>Load more</button>}</header>{page && <Grid page={page} />}{scalar !== undefined && <output>{String(scalar)}</output>}</section>
+      <section className="output-pane">
+        {error && <div className="error"><strong>Query error</strong><pre>{error}</pre></div>}
+        <section className="results"><header><strong>Results</strong><span>{resultSummary}</span>{resultId && <span className="muted">paged result {resultId}</span>}{page && page.rows.length < page.total_rows && <button onClick={() => void loadMore()}>Load more</button>}</header>{page && <Grid page={page} />}{scalar !== undefined && <output>{String(scalar)}</output>}</section>
+      </section>
     </section>
   </main>;
 }

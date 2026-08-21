@@ -52,10 +52,15 @@ auto main(int argc, char** argv) -> int {
 #if defined(IBEX_HAS_UI)
     std::uint16_t ui_port = 8765;
     std::string ui_web_root;
+    std::string ui_data_dir;
     auto* ui = app.add_subcommand("ui", "Start the local browser-based query workbench");
     ui->add_option("--port", ui_port, "Loopback port to listen on")->default_val(8765);
     ui->add_option("--web-root", ui_web_root,
                    "Directory containing the bundled UI assets (defaults beside the executable)");
+    ui->add_option(
+          "--data-dir", ui_data_dir,
+          "Directory the browser workbench may read and write (defaults to the current directory)")
+        ->type_name("DIR");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -100,9 +105,11 @@ auto main(int argc, char** argv) -> int {
         if (web_root.empty()) {
             web_root = ibex::tools::executable_directory() / "ui";
         }
-        return ibex::ui::run_server(
-            ibex::ui::ServerConfig{.port = ui_port, .web_root = std::move(web_root), .repl = config},
-            registry);
+        return ibex::ui::run_server(ibex::ui::ServerConfig{.port = ui_port,
+                                                           .web_root = std::move(web_root),
+                                                           .data_directory = std::move(ui_data_dir),
+                                                           .repl = config},
+                                    registry);
     }
 #endif
 

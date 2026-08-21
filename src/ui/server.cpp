@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-#include <ibex/ui/server.hpp>
-
 #include <ibex/runtime/table_format.hpp>
-
-#include <nlohmann/json.hpp>
+#include <ibex/ui/server.hpp>
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -18,6 +15,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -25,6 +23,13 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/landlock.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -46,11 +51,15 @@ using json = nlohmann::json;
 #ifdef _WIN32
 using Socket = SOCKET;
 constexpr Socket kInvalidSocket = INVALID_SOCKET;
-auto close_socket(Socket socket) -> void { closesocket(socket); }
+auto close_socket(Socket socket) -> void {
+    closesocket(socket);
+}
 #else
 using Socket = int;
 constexpr Socket kInvalidSocket = -1;
-auto close_socket(Socket socket) -> void { close(socket); }
+auto close_socket(Socket socket) -> void {
+    close(socket);
+}
 #endif
 
 struct HttpRequest {
@@ -69,10 +78,16 @@ struct Session {
     std::uint64_t next_result_id = 1;
 };
 
+struct StaticAsset {
+    std::filesystem::path path;
+    std::string contents;
+};
+
+using StaticAssets = std::map<std::string, StaticAsset, std::less<>>;
+
 auto lower(std::string text) -> std::string {
-    std::ranges::transform(text, text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    std::ranges::transform(text, text.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return text;
 }
 
@@ -141,10 +156,14 @@ auto read_request(Socket socket) -> std::optional<HttpRequest> {
 
 auto mime_type(const std::filesystem::path& path) -> std::string_view {
     const auto extension = path.extension().string();
-    if (extension == ".js") return "text/javascript; charset=utf-8";
-    if (extension == ".css") return "text/css; charset=utf-8";
-    if (extension == ".svg") return "image/svg+xml";
-    if (extension == ".ico") return "image/x-icon";
+    if (extension == ".js")
+        return "text/javascript; charset=utf-8";
+    if (extension == ".css")
+        return "text/css; charset=utf-8";
+    if (extension == ".svg")
+        return "image/svg+xml";
+    if (extension == ".ico")
+        return "image/x-icon";
     return "text/html; charset=utf-8";
 }
 
@@ -169,19 +188,21 @@ auto send_response(Socket socket, int status, std::string_view status_text, std:
 #else
         const auto remaining = text.size() - sent;
 #endif
-        const auto count = send(socket, text.data() + sent,
-                                remaining, 0);
-        if (count <= 0) return;
+        const auto count = send(socket, text.data() + sent, remaining, 0);
+        if (count <= 0)
+            return;
         sent += static_cast<std::size_t>(count);
     }
 }
 
 auto session_id(const HttpRequest& request) -> std::optional<std::string> {
     const auto it = request.headers.find("cookie");
-    if (it == request.headers.end()) return std::nullopt;
+    if (it == request.headers.end())
+        return std::nullopt;
     constexpr std::string_view prefix = "ibex_session=";
     const auto start = it->second.find(prefix);
-    if (start == std::string::npos) return std::nullopt;
+    if (start == std::string::npos)
+        return std::nullopt;
     const auto value_start = start + prefix.size();
     const auto end = it->second.find(';', value_start);
     return it->second.substr(value_start, end - value_start);
@@ -199,19 +220,26 @@ auto column_type(const runtime::ColumnValue& value) -> std::string {
     return std::visit(
         [](const auto& column) -> std::string {
             using T = typename std::decay_t<decltype(column)>::value_type;
-            if constexpr (std::same_as<T, std::int64_t>) return "Int64";
-            if constexpr (std::same_as<T, double>) return "Float64";
-            if constexpr (std::same_as<T, std::string>) return "String";
-            if constexpr (std::same_as<T, Categorical>) return "Categorical";
-            if constexpr (std::same_as<T, Date>) return "Date";
-            if constexpr (std::same_as<T, Timestamp>) return "Timestamp";
+            if constexpr (std::same_as<T, std::int64_t>)
+                return "Int64";
+            if constexpr (std::same_as<T, double>)
+                return "Float64";
+            if constexpr (std::same_as<T, std::string>)
+                return "String";
+            if constexpr (std::same_as<T, Categorical>)
+                return "Categorical";
+            if constexpr (std::same_as<T, Date>)
+                return "Date";
+            if constexpr (std::same_as<T, Timestamp>)
+                return "Timestamp";
             return "Bool";
         },
         value);
 }
 
 auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
-    if (runtime::is_null(entry, row)) return nullptr;
+    if (runtime::is_null(entry, row))
+        return nullptr;
     return std::visit(
         [row](const auto& column) -> json {
             using T = typename std::decay_t<decltype(column)>::value_type;
@@ -238,11 +266,13 @@ auto table_page(const runtime::Table& table, std::size_t offset, std::size_t lim
     json rows = json::array();
     for (std::size_t row = start; row < end; ++row) {
         json values = json::array();
-        for (const auto& entry : table.columns) values.push_back(cell_json(entry, row));
+        for (const auto& entry : table.columns)
+            values.push_back(cell_json(entry, row));
         rows.push_back(std::move(values));
     }
-    return {{"kind", "table"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
-            {"offset", start}, {"limit", limit}, {"total_rows", table.rows()}};
+    return {{"kind", "table"},         {"columns", std::move(columns)},
+            {"rows", std::move(rows)}, {"offset", start},
+            {"limit", limit},          {"total_rows", table.rows()}};
 }
 
 auto bounded_limit(const json& body) -> std::size_t {
@@ -250,9 +280,11 @@ auto bounded_limit(const json& body) -> std::size_t {
     return std::clamp<std::size_t>(requested, 1, 1000);
 }
 
-auto query_size(std::string_view target, std::string_view key, std::size_t fallback) -> std::size_t {
+auto query_size(std::string_view target, std::string_view key, std::size_t fallback)
+    -> std::size_t {
     const auto question = target.find('?');
-    if (question == std::string_view::npos) return fallback;
+    if (question == std::string_view::npos)
+        return fallback;
     std::string_view query = target.substr(question + 1);
     while (!query.empty()) {
         const auto ampersand = query.find('&');
@@ -265,7 +297,8 @@ auto query_size(std::string_view target, std::string_view key, std::size_t fallb
                 return fallback;
             }
         }
-        if (ampersand == std::string_view::npos) break;
+        if (ampersand == std::string_view::npos)
+            break;
         query.remove_prefix(ampersand + 1);
     }
     return fallback;
@@ -293,29 +326,135 @@ auto environment_json(const Session& session) -> json {
         for (const auto& [name, type] : table.columns) {
             columns.push_back({{"name", name}, {"type", type}});
         }
-        tables.push_back({{"name", table.name}, {"rows", table.rows}, {"lazy", table.lazy},
+        tables.push_back({{"name", table.name},
+                          {"rows", table.rows},
+                          {"lazy", table.lazy},
                           {"columns", std::move(columns)}});
     }
     return {{"tables", std::move(tables)}};
 }
 
-auto static_file(const std::filesystem::path& root, std::string_view target)
-    -> std::optional<std::pair<std::filesystem::path, std::string>> {
+auto load_static_assets(const std::filesystem::path& root) -> std::optional<StaticAssets> {
+    StaticAssets assets;
+    std::error_code ec;
+    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        if (!it->is_regular_file(ec))
+            continue;
+        const auto relative = std::filesystem::relative(it->path(), root, ec);
+        if (ec)
+            return std::nullopt;
+        std::ifstream input(it->path(), std::ios::binary);
+        if (!input)
+            return std::nullopt;
+        assets.emplace(
+            '/' + relative.generic_string(),
+            StaticAsset{.path = it->path(),
+                        .contents = std::string(std::istreambuf_iterator<char>(input), {})});
+    }
+    if (ec || !assets.contains("/index.html"))
+        return std::nullopt;
+    return assets;
+}
+
+auto static_file(const StaticAssets& assets, std::string_view target) -> const StaticAsset* {
     const auto query = target.find('?');
     const std::string relative(target.substr(0, query));
     std::filesystem::path requested = relative == "/" ? "index.html" : relative.substr(1);
     requested = requested.lexically_normal();
     if (requested.empty() || requested.is_absolute() || requested.string().contains("..")) {
+        return nullptr;
+    }
+    const auto found = assets.find('/' + requested.generic_string());
+    if (found != assets.end())
+        return &found->second;
+    return &assets.at("/index.html");  // SPA navigation fallback.
+}
+
+#if defined(__linux__)
+constexpr __u64 kLandlockFilesystemAccess =
+    LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE |
+    LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+    LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
+    LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+    LANDLOCK_ACCESS_FS_MAKE_SYM | LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE;
+
+constexpr __u64 kLandlockReadExecuteAccess =
+    LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+
+auto add_landlock_path_rule(int ruleset_fd, const std::filesystem::path& directory,
+                            __u64 allowed_access) -> std::optional<std::string> {
+    const int directory_fd = open(directory.c_str(), O_PATH | O_CLOEXEC);
+    if (directory_fd < 0) {
+        return "could not open a Landlock allow-list directory";
+    }
+    landlock_path_beneath_attr rule{.allowed_access = allowed_access, .parent_fd = directory_fd};
+    const int add_result = static_cast<int>(
+        syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0));
+    close(directory_fd);
+    if (add_result != 0) {
+        return "could not add a directory to the Landlock ruleset";
+    }
+    return std::nullopt;
+}
+
+auto enable_landlock(const std::filesystem::path& data_directory,
+                     const std::vector<std::filesystem::path>& read_only_directories)
+    -> std::optional<std::string> {
+    const int abi = static_cast<int>(
+        syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION));
+    if (abi < 3) {
+        return "Landlock ABI 3 or newer is required to confine reads and writes";
+    }
+    landlock_ruleset_attr ruleset_attr{};
+    ruleset_attr.handled_access_fs = kLandlockFilesystemAccess;
+    const int ruleset_fd = static_cast<int>(
+        syscall(SYS_landlock_create_ruleset, &ruleset_attr, sizeof(ruleset_attr), 0));
+    if (ruleset_fd < 0)
+        return "could not create the Landlock ruleset";
+    if (const auto error =
+            add_landlock_path_rule(ruleset_fd, data_directory, kLandlockFilesystemAccess)) {
+        close(ruleset_fd);
+        return error;
+    }
+    for (const auto& directory : read_only_directories) {
+        if (const auto error =
+                add_landlock_path_rule(ruleset_fd, directory, kLandlockReadExecuteAccess)) {
+            close(ruleset_fd);
+            return error;
+        }
+    }
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0) {
+        close(ruleset_fd);
+        return "could not enforce the Landlock ruleset";
+    }
+    close(ruleset_fd);
+    return std::nullopt;
+}
+
+auto readable_plugin_directories(const repl::ReplConfig& config)
+    -> std::optional<std::vector<std::filesystem::path>> {
+    std::vector<std::filesystem::path> directories;
+    const auto add_directories = [&directories](const std::vector<std::string>& paths) -> bool {
+        std::error_code ec;
+        for (const auto& path : paths) {
+            const auto canonical = std::filesystem::weakly_canonical(path, ec);
+            if (ec || !std::filesystem::is_directory(canonical))
+                return false;
+            directories.push_back(canonical);
+        }
+        return true;
+    };
+    if (!add_directories(config.plugin_search_paths) ||
+        !add_directories(config.import_search_paths)) {
         return std::nullopt;
     }
-    auto path = root / requested;
-    if (!std::filesystem::is_regular_file(path)) {
-        path = root / "index.html";  // SPA navigation fallback.
-    }
-    std::ifstream input(path, std::ios::binary);
-    if (!input) return std::nullopt;
-    return std::pair{path, std::string(std::istreambuf_iterator<char>(input), {})};
+    std::ranges::sort(directories);
+    directories.erase(std::unique(directories.begin(), directories.end()), directories.end());
+    return directories;
 }
+#endif
 
 }  // namespace
 
@@ -325,12 +464,41 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                   << "'\n";
         return 1;
     }
+    const auto assets = load_static_assets(config.web_root);
+    if (!assets) {
+        std::cerr << "error: could not load Ibex UI assets from '" << config.web_root.string()
+                  << "'\n";
+        return 1;
+    }
+
+    std::error_code ec;
+    const auto requested_data_directory =
+        config.data_directory.empty() ? std::filesystem::current_path(ec) : config.data_directory;
+    const auto data_directory = std::filesystem::weakly_canonical(requested_data_directory, ec);
+    if (ec || !std::filesystem::is_directory(data_directory)) {
+        std::cerr << "error: UI data directory is not an existing directory: '"
+                  << requested_data_directory.string() << "'\n";
+        return 1;
+    }
+#if defined(__linux__)
+    const auto plugin_directories = readable_plugin_directories(config.repl);
+    if (!plugin_directories) {
+        std::cerr << "error: could not resolve a configured UI plugin directory\n";
+        return 1;
+    }
+    if (const auto error = enable_landlock(data_directory, *plugin_directories)) {
+        std::cerr << "error: " << *error << "\n";
+        return 1;
+    }
+#endif
 #ifdef _WIN32
     WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+        return 1;
 #endif
     const Socket listener = socket(AF_INET, SOCK_STREAM, 0);
-    if (listener == kInvalidSocket) return 1;
+    if (listener == kInvalidSocket)
+        return 1;
     int reuse = 1;
     static_cast<void>(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
                                  reinterpret_cast<const char*>(&reuse), sizeof(reuse)));
@@ -350,7 +518,8 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
     std::map<std::string, std::unique_ptr<Session>, std::less<>> sessions;
     while (true) {
         const Socket client = accept(listener, nullptr, nullptr);
-        if (client == kInvalidSocket) continue;
+        if (client == kInvalidSocket)
+            continue;
         const auto request = read_request(client);
         if (!request) {
             close_socket(client);
@@ -383,18 +552,23 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                 } else if (execution.table.has_value()) {
                     const std::string result_id = std::to_string(session.next_result_id++);
                     session.results.insert_or_assign(result_id, std::move(*execution.table));
-                    while (session.results.size() > 16) session.results.erase(session.results.begin());
+                    while (session.results.size() > 16)
+                        session.results.erase(session.results.begin());
                     response["result_id"] = result_id;
-                    response["result"] = table_page(session.results.at(result_id), 0, bounded_limit(body));
+                    response["result"] =
+                        table_page(session.results.at(result_id), 0, bounded_limit(body));
                 } else if (execution.scalar.has_value()) {
-                    response["result"] = {{"kind", "scalar"}, {"value", scalar_json(*execution.scalar)}};
+                    response["result"] = {{"kind", "scalar"},
+                                          {"value", scalar_json(*execution.scalar)}};
                 } else {
                     response["result"] = {{"kind", "none"}};
                 }
                 send_response(client, 200, "OK", response.dump(), "application/json; charset=utf-8",
                               created_cookie);
-            } else if (request->method == "GET" && request->target.starts_with("/api/v1/results/")) {
-                const auto raw = request->target.substr(std::string_view("/api/v1/results/").size());
+            } else if (request->method == "GET" &&
+                       request->target.starts_with("/api/v1/results/")) {
+                const auto raw =
+                    request->target.substr(std::string_view("/api/v1/results/").size());
                 const auto question = raw.find('?');
                 const std::string result_id = raw.substr(0, question);
                 const auto result = session.results.find(result_id);
@@ -404,20 +578,25 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                     const auto offset = query_size(request->target, "offset", 0);
                     const auto limit = std::clamp(query_size(request->target, "limit", 200),
                                                   std::size_t{1}, std::size_t{1000});
-                    send_response(client, 200, "OK", table_page(result->second, offset, limit).dump());
+                    send_response(client, 200, "OK",
+                                  table_page(result->second, offset, limit).dump());
                 }
-            } else if (request->method == "DELETE" && request->target.starts_with("/api/v1/environment/")) {
-                const auto name = request->target.substr(std::string_view("/api/v1/environment/").size());
+            } else if (request->method == "DELETE" &&
+                       request->target.starts_with("/api/v1/environment/")) {
+                const auto name =
+                    request->target.substr(std::string_view("/api/v1/environment/").size());
                 const bool removed = session.repl.erase(name);
                 send_response(client, removed ? 200 : 404, removed ? "OK" : "Not Found",
                               environment_json(session).dump(), "application/json; charset=utf-8",
                               created_cookie);
             } else if (request->method == "GET") {
-                const auto asset = static_file(config.web_root, request->target);
+                const auto asset = static_file(*assets, request->target);
                 if (!asset) {
-                    send_response(client, 404, "Not Found", "Not found", "text/plain; charset=utf-8");
+                    send_response(client, 404, "Not Found", "Not found",
+                                  "text/plain; charset=utf-8");
                 } else {
-                    send_response(client, 200, "OK", asset->second, mime_type(asset->first), created_cookie);
+                    send_response(client, 200, "OK", asset->contents, mime_type(asset->path),
+                                  created_cookie);
                 }
             } else {
                 send_response(client, 404, "Not Found", R"({"error":"unknown endpoint"})");

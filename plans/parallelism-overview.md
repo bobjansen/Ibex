@@ -1565,6 +1565,54 @@ existing decode/compute fan-outs, checking nothing already-working regresses
 — *before* re-attempting the two reverted generalizations (items 2 and 3
 above) under the new cap.
 
+**Built (2026-08-21), and the diagnosis above was wrong about q09's actual
+mechanism.** `HelperThreadSlot` landed as designed — an RAII budget slot,
+one atomic counter, budgeted against `compute_thread_count()`, only
+acquired when a call site's other structural-safety checks already pass
+(an earlier version acquired unconditionally, wasting a slot on
+structurally-ineligible calls; tightened before this measurement). Wired
+into the surviving `is_streamable_inner_join` site as a pure refactor
+first — full-suite interleaved A/B confirmed behavior-neutral (+0.15%
+geomean) after tracking down one persistent-looking regression (q22, +4%
+in two separate runs including with binary-swap order reversed) to pure
+noise, proven with a temporary debug counter showing `HelperThreadSlot` is
+never even constructed during q22's execution (its only join is `left
+join`, not `Inner`).
+
+Then re-enabled both reverted sites (`streamable_semi_anti`,
+`build_binary_materializing_operator`) under the budget. **Both still
+regressed** — q09 +47.5%, q04/q18 also worse — and this time the budget's
+absence wasn't a plausible excuse: a temporary entry-count trace showed
+`build_binary_materializing_operator` is hit **exactly once** for q09 (the
+lineitem join is its only 2-key join; everything else in the 5-way chain
+is single-key and goes through `is_streamable_inner_join` instead), and
+`streamable_semi_anti` is hit exactly once each for q04 and q18. There was
+never a recursive pile-up for the budget to bound at any of these three
+queries — re-testing at budget=1, 2, and 8 all gave q09 the same
+~230–250ms, conclusively ruling out thread-count as the mechanism.
+
+So the original diagnosis — "recursion spawns one raw thread per nesting
+level, oversubscribing the machine" — was wrong, or at least incomplete,
+for these specific queries. The actual cost is structural:
+`build_binary_materializing_operator` fully materializes **both** sides
+(unlike `is_streamable_inner_join`, which builds the left as a cheap lazy
+operator and only materializes the right), so overlapping two
+already-expensive full materializations contends for the same
+cores/memory bandwidth instead of filling idle ones. Why `streamable_semi_anti`
+loses despite sharing the asymmetric lazy-left shape is still unexplained —
+worth a similar profiling pass if this is revisited, rather than assuming
+it is the same mechanism.
+
+Both re-enablements reverted a second time; `HelperThreadSlot` and the
+tightened `is_streamable_inner_join` site are kept, since that part is
+verified real and safe. Net state: exactly the same reachable behavior as
+before this sub-investigation, plus a budget mechanism that is correct and
+tested but has, so far, not found a case it actually helps. A future
+attempt at the two reverted sites needs a **cost-aware** gate (e.g. skip
+when both sides are large/expensive to materialize), not a thread-count
+one — and should profile *why* before generalizing again, not just
+re-measure after.
+
 ---
 
 ## Rejected: weakening first-occurrence group ordering

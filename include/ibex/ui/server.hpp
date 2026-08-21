@@ -14,6 +14,9 @@ struct ServerConfig {
     /// Bind address is deliberately fixed to loopback by the implementation.
     std::uint16_t port = 8765;
     std::filesystem::path web_root;
+    /// Directory the browser workbench may access for user data.  When empty,
+    /// the server uses its launch directory.
+    std::filesystem::path data_directory;
     repl::ReplConfig repl;
 };
 

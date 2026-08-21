@@ -754,14 +754,18 @@ IBEX_LIBRARY_PATH=./build-release/tools ./build-release/tools/ibex
 Start the local workbench with:
 
 ```bash
-./build-release/tools/ibex ui
+./build-release/tools/ibex ui --data-dir ./data
 ```
 
 It prints a loopback URL (by default `http://127.0.0.1:8765`). The UI keeps one
 REPL session per browser session, shows tables and schemas in an Environment
 pane, supports `Ctrl/Cmd+Enter` to run the editor, and pages result rows so a
 query never sends an unbounded result set to the browser. The bundled UI is
-built with the normal CMake build and requires Node.js/npm.
+built with the normal CMake build and requires Node.js/npm. On Linux, the UI is
+confined with Landlock to `--data-dir`; when that option is omitted, its data
+access is confined to the directory from which it was launched. Configured
+plugin directories remain readable (but not writable) so bundled imports such
+as `import "parquet";` continue to work.
 
 ### REPL Commands
 

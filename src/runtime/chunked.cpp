@@ -12165,12 +12165,20 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // non-reentrant guard) when it is structurally safe to: no
             // deferred probe (that path is required to stay sequential — its
             // filter is derived FROM the left/build side), no model output to
-            // race on (ModelResult* is not thread-safe), and neither side
-            // scans a source the other also scans (a self-join or repeated
-            // binding would race on `LazyTable::cache_`, which is a plain,
-            // unsynchronized map — see `subtrees_share_source`).
-            const bool overlap = probe.scan == nullptr && model_out == nullptr &&
-                                 !subtrees_share_source(*join.children()[0], *join.children()[1]);
+            // race on (ModelResult* is not thread-safe), neither side scans a
+            // source the other also scans (a self-join or repeated binding
+            // would race on `LazyTable::cache_`, which is a plain,
+            // unsynchronized map — see `subtrees_share_source`), and a spare
+            // slot in the global helper-thread budget (`HelperThreadSlot`) —
+            // this call sits under recursive join lowering, and without a
+            // bound a deeply nested join tree could spawn one raw thread per
+            // level; the budget makes recursion degrade to serial once it is
+            // exhausted instead of oversubscribing the machine.
+            const bool structurally_safe =
+                probe.scan == nullptr && model_out == nullptr &&
+                !subtrees_share_source(*join.children()[0], *join.children()[1]);
+            const HelperThreadSlot helper_slot;
+            const bool overlap = structurally_safe && helper_slot.acquired();
 
             std::expected<OperatorPtr, std::string> left_op;
             std::expected<Table, std::string> right;

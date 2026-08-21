@@ -997,12 +997,12 @@ conservative. Either it wants its own constant or the knob wants a name that is
 not about rows.
 
 **I11 — Some gates construct the pool before deciding they do not want it**
-(low). `chunked.cpp:3034` and `:3617` bind `process_worker_pool()` before testing
-`exec_->parallel`, and `island_worker_count` calls `pool.size()`
-unconditionally. The pool spawns its threads eagerly in the constructor
-(`worker_pool.cpp:129`), so `IBEX_PARALLEL=0` still pays for N threads —
-even though `configure_parallel_from_env` goes out of its way *not* to construct
-a pool just to size a profile.
+— **RESOLVED** (2026-08-21). The distinct packed partition gate and the
+semi/anti `select_rows` now test `exec.parallel` (and the other always-serial
+conditions) *before* touching `process_worker_pool()`, and
+`island_worker_count` returns 0 up front when `exec.parallel` is off — a
+serial island, which the contract already requires to be byte-identical.
+`IBEX_PARALLEL=0` no longer pays for N eager pool threads on a large query.
 
 ### Structural
 
@@ -1612,6 +1612,20 @@ attempt at the two reverted sites needs a **cost-aware** gate (e.g. skip
 when both sides are large/expensive to materialize), not a thread-count
 one — and should profile *why* before generalizing again, not just
 re-measure after.
+
+**Removed entirely (2026-08-21), ahead of the kernel-pipeline restructure.**
+With both generalizations dead and the surviving site worth only ~3% on q10
+in-suite, the whole remnant went: the `is_streamable_inner_join` overlap
+(raw `std::thread` + `subtrees_share_source` + `subtree_scans_source`) and
+`HelperThreadSlot` itself. The join builder is back to serial
+left-build-then-right-materialize. The measurement record above is the
+durable asset; recover the code from `38d6b307`/`190235b2`/`a3b39c6d` if a
+cost-aware gate is ever justified. Branch concurrency now has zero
+footprint in the builder — the kernel-pipeline plan's "no concurrent
+independent branches until measured worthwhile" starts from a clean slate.
+`PipelinedStageOperator`'s stage thread is untouched: it is the
+source-to-breaker overlap the pipeline executor wants to keep, not a
+branch-concurrency experiment.
 
 ---
 

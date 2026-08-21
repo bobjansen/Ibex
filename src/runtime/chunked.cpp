@@ -66,18 +66,6 @@
 
 namespace ibex::runtime {
 
-/// Defined near the end of this file, right after `DeferredScanSourceOperator`
-/// (which it wraps): declared here, at namespace scope rather than inside the
-/// anonymous namespace below, because its definition sits past the point
-/// where that anonymous namespace has already been closed and reopened for
-/// the last time, and a mismatched-linkage forward declaration would silently
-/// create a second, unrelated internal-linkage entity. `ChunkedInnerJoinOperator`
-/// (inside the anonymous namespace) uses it from `resolve_deferred_probe`'s
-/// Stage 2 streaming-probe path — see plans/deferred-probe-streaming-plan.md.
-[[nodiscard]] auto make_deferred_probe_stream(const DeferredScan& scan,
-                                              std::vector<SourceUnit> units,
-                                              const ExecutionContext& exec) -> OperatorPtr;
-
 namespace {
 
 /// Append `src`'s validity for `src_rows` rows onto `dst`, which currently
@@ -3044,16 +3032,19 @@ class ChunkedDistinctOperator final : public Operator {
         // rows already emitted. Every condition below therefore either holds
         // for the whole query (the context and the pool are fixed) or, like the
         // row gate, guards only the first use.
-        auto& pool = process_worker_pool();
         if (packed_part_count_ == 0) {
             constexpr std::size_t kMinRows = 1U << 15U;
             if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
                 rows < kMinRows) {
                 return false;
             }
+            // Bound to the eligibility check above: constructing the pool
+            // spawns its threads eagerly, and a `IBEX_PARALLEL=0` query must
+            // not pay for them just to be told it is serial.
+            const std::size_t pool_size = process_worker_pool().size();
             const std::size_t budget =
-                exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
-            const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
+                exec_->parallel_threads != 0 ? exec_->parallel_threads : pool_size;
+            const std::size_t workers = std::min({budget, pool_size, std::size_t{64}});
             if (workers < 2) {
                 return false;
             }
@@ -3084,6 +3075,7 @@ class ChunkedDistinctOperator final : public Operator {
             }
             state.seen.clear();
         }
+        auto& pool = process_worker_pool();
         const std::size_t part_count = packed_part_count_;
         const std::size_t workers = part_count;
         const std::uint64_t part_mask = part_count - 1;
@@ -3704,16 +3696,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// require.
     template <typename Pred>
     auto select_rows(std::size_t rows, Pred pred) -> std::vector<std::size_t> {
-        auto& pool = process_worker_pool();
-        const std::size_t budget = (exec_ != nullptr && exec_->parallel_threads != 0)
-                                       ? exec_->parallel_threads
-                                       : pool.size();
-        const std::size_t workers = std::min(budget, pool.size());
-        // `submit` CLAMPS its worker count to the pool size, so a range count
-        // above it would leave those ranges unvisited and silently drop rows.
-        const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows));
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || ranges < 2 ||
-            rows < kMinParallelPredicateRows) {
+        auto serial_select = [&] {
             std::vector<std::size_t> idx;
             idx.reserve(rows);
             for (std::size_t row = 0; row < rows; ++row) {
@@ -3722,6 +3705,23 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 }
             }
             return idx;
+        };
+        // The context checks come before the pool binding for the same reason
+        // as everywhere else: constructing the pool spawns its threads
+        // eagerly, and a serial query must not pay for them.
+        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
+            rows < kMinParallelPredicateRows) {
+            return serial_select();
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t budget =
+            (exec_->parallel_threads != 0) ? exec_->parallel_threads : pool.size();
+        const std::size_t workers = std::min(budget, pool.size());
+        // `submit` CLAMPS its worker count to the pool size, so a range count
+        // above it would leave those ranges unvisited and silently drop rows.
+        const std::size_t ranges = std::max<std::size_t>(1, std::min(workers, rows));
+        if (ranges < 2) {
+            return serial_select();
         }
 
         const std::size_t grain = (rows + ranges - 1) / ranges;
@@ -3926,44 +3926,6 @@ auto base_scan_of(const ir::Node& node, bool through_filter = false) -> const ir
     return &static_cast<const ir::ScanNode&>(*cur);
 }
 
-/// Whether `source_name` is scanned anywhere under `node` — a self-join or a
-/// binding read on both sides would hit this. Used to rule out running two
-/// subtrees concurrently when they might decode the same `LazyTable`:
-/// `LazyTable::cache_` is a plain, unsynchronized map, so two threads
-/// decoding the same source at once would race on it.
-auto subtree_scans_source(const ir::Node& node, const std::string& source_name) -> bool {
-    if (node.kind() == ir::NodeKind::Scan &&
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        static_cast<const ir::ScanNode&>(node).source_name() == source_name) {
-        return true;
-    }
-    for (const auto& child : node.children()) {
-        if (child != nullptr && subtree_scans_source(*child, source_name)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/// Whether `a` and `b` scan any source in common -- the general form of
-/// `subtree_scans_source` for two arbitrary subtrees (either may be a single
-/// scan, a join, a chain of filters, anything). Used to gate running two
-/// subtrees concurrently: `LazyTable::cache_` is a plain, unsynchronized map,
-/// so two threads decoding the same source at once would race on it.
-auto subtrees_share_source(const ir::Node& a, const ir::Node& b) -> bool {
-    if (a.kind() == ir::NodeKind::Scan &&
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        subtree_scans_source(b, static_cast<const ir::ScanNode&>(a).source_name())) {
-        return true;
-    }
-    for (const auto& child : a.children()) {
-        if (child != nullptr && subtrees_share_source(*child, b)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /// If `right` is a chain of Project/Rename nodes over a Scan whose name the
 /// driver registered as a deferred probe scan, return its registration. The
 /// driver only registers scans it proved eligible (ir::deferrable_probe_scans:
@@ -4070,40 +4032,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         if (mode_ == Mode::Swapped) {
-            if (deferred_probe_stream_ != nullptr) {
-                // Stage 2 streaming-probe path: pull one source unit at a
-                // time into `right_` and reuse the ordinary `emit_swapped()`
-                // per unit, instead of emitting once over a whole-materialize
-                // `right_`. Ordering/backpressure are exactly
-                // `deferred_probe_stream_`'s existing unit-window contract —
-                // see plans/deferred-probe-streaming-plan.md.
-                while (true) {
-                    auto chunk_res = deferred_probe_stream_->next();
-                    if (!chunk_res.has_value()) {
-                        return std::unexpected(std::move(chunk_res.error()));
-                    }
-                    if (!chunk_res.value().has_value()) {
-                        deferred_probe_stream_.reset();
-                        if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                            auto schema = std::move(*empty_schema_);
-                            empty_schema_.reset();
-                            return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                        }
-                        return std::optional<Chunk>{};
-                    }
-                    right_ = chunk_to_table(std::move(*chunk_res.value()));
-                    auto out = emit_swapped();
-                    if (!out.has_value()) {
-                        return std::unexpected(std::move(out.error()));
-                    }
-                    if (out->rows() == 0) {
-                        empty_schema_ = std::move(*out);
-                        continue;
-                    }
-                    emitted_nonempty_ = true;
-                    return std::optional<Chunk>{table_to_chunk(std::move(*out))};
-                }
-            }
             if (swapped_emitted_) {
                 return std::optional<Chunk>{};
             }
@@ -4187,13 +4115,6 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return err;
             }
             if (mode_ == Mode::Precomputed) {
-                return std::nullopt;
-            }
-            if (mode_ == Mode::Swapped) {
-                // try_stream_probe_scan already built the left index and
-                // handed off to deferred_probe_stream_; right_ is left
-                // empty on purpose (units arrive lazily in next()), so none
-                // of the ordinary side-picking logic below may run.
                 return std::nullopt;
             }
         }
@@ -4621,10 +4542,6 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// simply not carry.
     auto resolve_deferred_probe() -> std::optional<std::string> {
         DynamicScanFilter& slot = *deferred_probe_->filter;
-        if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
-            std::fprintf(stderr, "[probe_stream] resolve_deferred_probe entered, lazy_rows=%zu\n",
-                         deferred_probe_->lazy->rows());
-        }
         // Pre-filter row count: an upper bound on the decoded size, good
         // enough to decide whether the probe side is large enough to bother.
         if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
@@ -4642,10 +4559,6 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (auto err = try_two_phase_probe(slot, outcome)) {
                 return err;
             }
-            if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
-                std::fprintf(stderr, "[probe_stream] two_phase_outcome=%d\n",
-                             static_cast<int>(outcome));
-            }
             if (outcome == TwoPhase::Precomputed) {
                 deferred_probe_ = nullptr;
                 mode_ = Mode::Precomputed;
@@ -4658,12 +4571,6 @@ class ChunkedInnerJoinOperator final : public Operator {
                 deferred_probe_ = nullptr;
                 return std::nullopt;
             }
-            if (auto err = try_stream_probe_scan()) {
-                return err;
-            }
-            if (deferred_probe_stream_ != nullptr) {
-                return std::nullopt;
-            }
         }
         auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
                                     deferred_externs_, *deferred_exec_);
@@ -4672,69 +4579,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         right_ = std::move(right.value());
         deferred_probe_ = nullptr;
-        return std::nullopt;
-    }
-
-    /// Stage 2 of plans/deferred-probe-streaming-plan.md: a bare, unwrapped
-    /// probe `Scan` — no Project/Rename/Update/Filter above it — can be
-    /// probed one source unit at a time instead of materialized whole via
-    /// `interpret_node`. Direct-scan-only and Int64-keyed-only for now (see
-    /// the plan's staged scope); a wrapped scan, a scan with no unit
-    /// decomposition, or any other key type declines and leaves every field
-    /// untouched, so the caller falls through to the existing
-    /// whole-materialize path unchanged.
-    ///
-    /// On success this goes straight to `Mode::Swapped` — the build (left)
-    /// side is already materialized and indexed here, exactly as
-    /// `initialize()` would have done once `right_` was known to be the
-    /// larger side — and leaves `deferred_probe_stream_` set as the signal
-    /// for `next()` to pull units instead of emitting `right_` once.
-    auto try_stream_probe_scan() -> std::optional<std::string> {
-        // Stage 2 A/B knob only, for plans/deferred-probe-streaming-plan.md's
-        // measurement: forces the pre-existing whole-materialize behavior
-        // even when streaming would otherwise be eligible, so the same
-        // registered/declined-two-phase scenario can be timed both ways.
-        // Not a production switch; remove once Stage 2 is measured.
-        if (std::getenv("IBEX_DEBUG_PROBE_STREAM_DISABLE") != nullptr) {
-            return std::nullopt;
-        }
-        if (deferred_right_node_->kind() != ir::NodeKind::Scan) {
-            return std::nullopt;  // wrapped scan: Stage 3
-        }
-        auto units = deferred_scan_units(*deferred_probe_);
-        if (units.empty()) {
-            return std::nullopt;  // no unit decomposition to stream
-        }
-        const std::string& left_key_name = keys_->front().left;
-        const ColumnValue* lkey = left_materialized_->find(left_key_name);
-        if (lkey == nullptr) {
-            return "join key not found in left table: " + left_key_name;
-        }
-        ExprType kind = ExprType::Int;
-        if (auto err = detect_key_kind(*lkey, kind)) {
-            return err;
-        }
-        if (kind != ExprType::Int) {
-            // A categorical/string dictionary is not proven stable across
-            // units yet (`resolve_categorical_heads` assumes one dictionary
-            // for the whole probe side); decline rather than risk it.
-            return std::nullopt;
-        }
-        key_kind_ = kind;
-        if (auto err = build_index(*left_materialized_, left_key_name)) {
-            return err;
-        }
-        left_table_ = std::move(*left_materialized_);
-        left_materialized_.reset();
-        use_materialized_left_ = false;
-        deferred_probe_stream_ =
-            make_deferred_probe_stream(*deferred_probe_, std::move(units), *deferred_exec_);
-        mode_ = Mode::Swapped;
-        deferred_probe_ = nullptr;
-        if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
-            std::fprintf(stderr, "[probe_stream] streaming=1 source=%s\n",
-                         deferred_probe_name_.c_str());
-        }
         return std::nullopt;
     }
 
@@ -6045,13 +5889,6 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Swapped mode: materialized left held for later gather.
     std::optional<Table> left_table_;
     bool swapped_emitted_ = false;
-
-    // Swapped mode, streaming variant (deferred-probe-streaming-plan.md
-    // Stage 2): non-null when the probe (right) side is being pulled one
-    // source unit at a time from a deferred scan instead of already sitting
-    // whole in `right_`. `next()` refills `right_` from each unit and calls
-    // the same `emit_swapped()` used by the whole-materialize case.
-    OperatorPtr deferred_probe_stream_;
 
     // Precomputed mode: the two-phase deferred probe assembled the whole
     // join output during initialization.
@@ -10497,8 +10334,7 @@ auto build_binary_materializing_operator(const ir::Node& left_node, const ir::No
     // `left_node`/`right_node`'s materializations on a raw std::thread here,
     // twice. First attempt (unbudgeted): net regression on the full PDS-H
     // suite (q09 +57%, q04/q06/q07/q08/q19 also worse). Second attempt,
-    // under `HelperThreadSlot`'s recursion-accumulation budget (see the
-    // is_streamable_inner_join call site below): q09 STILL regressed
+    // under a since-removed helper-thread budget: q09 STILL regressed
     // (+47.5%), and the budget provably wasn't the reason -- q09 hits this
     // function exactly once (verified with a temporary entry-count trace),
     // so there was never a recursive pile-up here for a budget to bound in
@@ -11717,9 +11553,12 @@ class TwoPhaseFilterOperator final : public Operator {
 
 [[nodiscard]] auto island_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
     -> std::size_t {
-    if (morsel_count < 2) {
+    if (morsel_count < 2 || !exec.parallel) {
         return 0;
     }
+    // Past the parallel gate: consulting the pool here is free of the
+    // construct-before-declining hazard because a parallel query has already
+    // built it (or is about to, on its first fan-out).
     const std::size_t pool_size = process_worker_pool().size();
     const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
     const std::size_t workers =
@@ -12171,11 +12010,6 @@ class DeferredScanSourceOperator final : public Operator {
     std::uint64_t sequence_ = 0;
     std::size_t window_ = 1;
 };
-
-auto make_deferred_probe_stream(const DeferredScan& scan, std::vector<SourceUnit> units,
-                                const ExecutionContext& exec) -> OperatorPtr {
-    return std::make_unique<DeferredScanSourceOperator>(scan, std::move(units), exec);
-}
 
 // A one-chunk source owned by one scan-pipeline worker. The worker replaces
 // the pending chunk for every source unit it claims, then pulls the private
@@ -13267,11 +13101,11 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (streamable_semi_anti) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
-            // Multiple producers: tried the same overlap as the inner-join
-            // site below here too, twice. First attempt (unbudgeted): q04
-            // regressed +19%. Second attempt, under `HelperThreadSlot`: q04
-            // and q18 both STILL regressed, and in both cases the overlap is
-            // entered exactly once per query (verified with a temporary
+            // Multiple producers: tried the same overlap the inner-join site
+            // once had here too, twice. First attempt (unbudgeted): q04
+            // regressed +19%. Second attempt, under a since-removed
+            // helper-thread budget: q04 and q18 both STILL regressed, and in
+            // both cases the overlap is entered exactly once per query (verified with a temporary
             // entry-count trace) -- there is no recursive pile-up here for a
             // budget to bound, so the budget was never going to help. The
             // cost is inherent to overlapping this specific pair of sides,
@@ -13306,63 +13140,17 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // A deferred probe scan must not be interpreted here — the join
             // publishes build-side bounds into its filter slot first, then
             // interprets the right subtree itself (resolve_deferred_probe).
-            // Decided up front: it also gates the POC overlap below, which
-            // only applies to the ordinary (non-probe) right side.
             const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
 
             // Multiple producers (plans/parallelism-overview.md): the left
-            // side's build and this join's own right-side materialize have no
-            // data dependency on each other, yet build_operator's
-            // single-threaded recursion runs them one after another. Confirmed
-            // on q10 by direct profiling: the orders and lineitem filters run
-            // in separate, non-overlapping windows summing to ~40% of the
-            // query's wall time despite neither reading the other's output.
-            // Overlap them on a raw std::thread (matching
-            // PipelinedStageOperator's own pattern, not a pool submission —
-            // nesting a pool submission inside another would hit WorkerPool's
-            // non-reentrant guard) when it is structurally safe to: no
-            // deferred probe (that path is required to stay sequential — its
-            // filter is derived FROM the left/build side), no model output to
-            // race on (ModelResult* is not thread-safe), neither side scans a
-            // source the other also scans (a self-join or repeated binding
-            // would race on `LazyTable::cache_`, which is a plain,
-            // unsynchronized map — see `subtrees_share_source`), and a spare
-            // slot in the global helper-thread budget (`HelperThreadSlot`) —
-            // this call sits under recursive join lowering, and without a
-            // bound a deeply nested join tree could spawn one raw thread per
-            // level; the budget makes recursion degrade to serial once it is
-            // exhausted instead of oversubscribing the machine.
-            const bool structurally_safe =
-                probe.scan == nullptr && model_out == nullptr &&
-                !subtrees_share_source(*join.children()[0], *join.children()[1]);
-            // The slot is only worth acquiring once everything else already
-            // says yes -- constructing it unconditionally would hold a
-            // budget unit for this call's whole subtree-build duration even
-            // on a structurally-ineligible call (a self-join, a deferred
-            // probe), needlessly starving a sibling or nested call that
-            // could actually use it.
-            std::optional<HelperThreadSlot> helper_slot;
-            if (structurally_safe) {
-                helper_slot.emplace();
-            }
-            const bool overlap = structurally_safe && helper_slot->acquired();
-
-            std::expected<OperatorPtr, std::string> left_op;
-            std::expected<Table, std::string> right;
-            bool right_materialized = false;
-            if (overlap) {
-                std::thread producer([&] {
-                    right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                                  exec, model_out);
-                });
-                left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
-                                         model_out);
-                producer.join();
-                right_materialized = true;
-            } else {
-                left_op = build_operator(*join.children()[0], registry, scalars, externs, exec,
-                                         model_out);
-            }
+            // build and the right materialize were overlapped on a raw
+            // std::thread here for a time (q10 ~-3% in-suite), but every
+            // widening of the idea measured worse and was reverted, and the
+            // site was removed ahead of the kernel-pipeline restructure —
+            // branch concurrency needs a cost-aware gate, not a thread-count
+            // one. Left builds first, then the right materializes.
+            auto left_op =
+                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
             }
@@ -13374,10 +13162,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                         &join.pending_order()),
                     stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
             }
-            if (!right_materialized) {
-                right = materialize_row_local(*join.children()[1], registry, scalars, externs, exec,
-                                              model_out);
-            }
+            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
             if (!right.has_value()) {
                 return std::unexpected(std::move(right.error()));
             }

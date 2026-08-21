@@ -48,9 +48,23 @@ SUBJECT="$(git log -1 --format=%s HEAD)"
 (
     {
         echo "=== $COMMIT  $(date -Is)  ${SUBJECT}"
-        if "$ROOT/benchmarking/run_scale_regression.sh" --iters 10 2>&1 |
-            grep -E 'FAIL|Geometric mean|passed'; then
-            :
+        # Capture everything first: a `grep` straight off the pipe only ever
+        # shows its matching lines, so a script error whose text matches none
+        # of them (e.g. a path/parsing bug in run_scale_regression.sh itself)
+        # used to vanish silently -- every commit in this log up to and
+        # including b5e98a7 shows the header/footer with nothing between them
+        # because of exactly that; the underlying script had been erroring
+        # out on a stale README table path this whole time. Falling back to
+        # the tail of the raw output means a future break is visible instead
+        # of silently empty.
+        perf_output="$("$ROOT/benchmarking/run_scale_regression.sh" --iters 10 2>&1)"
+        perf_status=$?
+        summary="$(printf '%s\n' "$perf_output" | grep -E 'FAIL|Geometric mean|passed' || true)"
+        if [[ -n "$summary" ]]; then
+            printf '%s\n' "$summary"
+        else
+            echo "[perf] no FAIL/Geometric-mean/passed line (exit $perf_status) -- raw tail:"
+            printf '%s\n' "$perf_output" | tail -20
         fi
         echo "    (informational — confirm any FAIL with compare_ibex_git.sh --base HEAD~1)"
         echo

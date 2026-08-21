@@ -22,8 +22,10 @@ else
     BUILD_DIR="$IBEX_ROOT/build"
 fi
 
-README_PATH="$IBEX_ROOT/README.md"
+README_PATH=""
+README_EXPLICIT=0
 ROWS=4000000
+ROWS_EXPLICIT=0
 WARMUP=2
 ITERS=15
 ALLOWED_REGRESSION_PCT=10
@@ -33,8 +35,8 @@ OUT="$SCRIPT_DIR/results/ibex_scale_regression.tsv"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build-dir) BUILD_DIR="$2"; shift 2 ;;
-        --readme) README_PATH="$2"; shift 2 ;;
-        --rows) ROWS="$2"; shift 2 ;;
+        --readme) README_PATH="$2"; README_EXPLICIT=1; shift 2 ;;
+        --rows) ROWS="$2"; ROWS_EXPLICIT=1; shift 2 ;;
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters) ITERS="$2"; shift 2 ;;
         --allowed-regression-pct) ALLOWED_REGRESSION_PCT="$2"; shift 2 ;;
@@ -63,9 +65,53 @@ EOF
     esac
 done
 
-if [[ ! -f "$README_PATH" ]]; then
-    echo "error: missing README baseline: $README_PATH" >&2
-    exit 1
+# The baseline table used to live inline in README.md; it has since moved to
+# its own generated file (`benchmarking/results/scales_readme.md`, produced by
+# `run_scale_suite.sh --to-readme`) while README.md now just links out to the
+# hosted benchmarks page. Both locations are tried unless the caller pins one
+# explicitly with --readme, so this keeps working through either layout
+# instead of failing silently the way it did when README.md's table moved out
+# from under a hardcoded default (caught via `.githooks/post-commit`'s log
+# going quiet with no PASS/FAIL for every commit on this branch).
+has_table() {
+    [[ -f "$1" ]] && grep -qE '^\s*\|\s*query\b.*\bibex\b' "$1"
+}
+
+if [[ "$README_EXPLICIT" -eq 1 ]]; then
+    if [[ ! -f "$README_PATH" ]]; then
+        echo "error: missing README baseline: $README_PATH" >&2
+        exit 1
+    fi
+    if ! has_table "$README_PATH"; then
+        echo "error: no benchmark table with an 'ibex' column found in $README_PATH" >&2
+        exit 1
+    fi
+else
+    CANDIDATES=("$IBEX_ROOT/README.md" "$IBEX_ROOT/benchmarking/results/scales_readme.md")
+    for candidate in "${CANDIDATES[@]}"; do
+        if has_table "$candidate"; then
+            README_PATH="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$README_PATH" ]]; then
+        echo "error: no benchmark table with an 'ibex' column found in any of:" >&2
+        printf '  %s\n' "${CANDIDATES[@]}" >&2
+        exit 1
+    fi
+fi
+
+# The snapshot declares the row count it was captured at ("... on
+# **N rows** ..."); default to that instead of a hardcoded 4,000,000 so a
+# fresh run is comparable to whatever snapshot was actually found, rather
+# than silently diffing absolute milliseconds at mismatched row counts. An
+# explicit --rows always wins.
+if [[ "$ROWS_EXPLICIT" -eq 0 ]]; then
+    snapshot_rows="$(grep -oE 'on \*\*[0-9,]+ rows\*\*' "$README_PATH" | head -1 |
+        grep -oE '[0-9,]+' | tr -d ',')"
+    if [[ -n "$snapshot_rows" ]]; then
+        ROWS="$snapshot_rows"
+    fi
 fi
 
 mkdir -p "$(dirname "$OUT")"

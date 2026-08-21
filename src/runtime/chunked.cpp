@@ -66,6 +66,18 @@
 
 namespace ibex::runtime {
 
+/// Defined near the end of this file, right after `DeferredScanSourceOperator`
+/// (which it wraps): declared here, at namespace scope rather than inside the
+/// anonymous namespace below, because its definition sits past the point
+/// where that anonymous namespace has already been closed and reopened for
+/// the last time, and a mismatched-linkage forward declaration would silently
+/// create a second, unrelated internal-linkage entity. `ChunkedInnerJoinOperator`
+/// (inside the anonymous namespace) uses it from `resolve_deferred_probe`'s
+/// Stage 2 streaming-probe path — see plans/deferred-probe-streaming-plan.md.
+[[nodiscard]] auto make_deferred_probe_stream(const DeferredScan& scan,
+                                              std::vector<SourceUnit> units,
+                                              const ExecutionContext& exec) -> OperatorPtr;
+
 namespace {
 
 /// Append `src`'s validity for `src_rows` rows onto `dst`, which currently
@@ -4058,6 +4070,40 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         if (mode_ == Mode::Swapped) {
+            if (deferred_probe_stream_ != nullptr) {
+                // Stage 2 streaming-probe path: pull one source unit at a
+                // time into `right_` and reuse the ordinary `emit_swapped()`
+                // per unit, instead of emitting once over a whole-materialize
+                // `right_`. Ordering/backpressure are exactly
+                // `deferred_probe_stream_`'s existing unit-window contract —
+                // see plans/deferred-probe-streaming-plan.md.
+                while (true) {
+                    auto chunk_res = deferred_probe_stream_->next();
+                    if (!chunk_res.has_value()) {
+                        return std::unexpected(std::move(chunk_res.error()));
+                    }
+                    if (!chunk_res.value().has_value()) {
+                        deferred_probe_stream_.reset();
+                        if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                            auto schema = std::move(*empty_schema_);
+                            empty_schema_.reset();
+                            return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                        }
+                        return std::optional<Chunk>{};
+                    }
+                    right_ = chunk_to_table(std::move(*chunk_res.value()));
+                    auto out = emit_swapped();
+                    if (!out.has_value()) {
+                        return std::unexpected(std::move(out.error()));
+                    }
+                    if (out->rows() == 0) {
+                        empty_schema_ = std::move(*out);
+                        continue;
+                    }
+                    emitted_nonempty_ = true;
+                    return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+                }
+            }
             if (swapped_emitted_) {
                 return std::optional<Chunk>{};
             }
@@ -4141,6 +4187,13 @@ class ChunkedInnerJoinOperator final : public Operator {
                 return err;
             }
             if (mode_ == Mode::Precomputed) {
+                return std::nullopt;
+            }
+            if (mode_ == Mode::Swapped) {
+                // try_stream_probe_scan already built the left index and
+                // handed off to deferred_probe_stream_; right_ is left
+                // empty on purpose (units arrive lazily in next()), so none
+                // of the ordinary side-picking logic below may run.
                 return std::nullopt;
             }
         }
@@ -4568,6 +4621,10 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// simply not carry.
     auto resolve_deferred_probe() -> std::optional<std::string> {
         DynamicScanFilter& slot = *deferred_probe_->filter;
+        if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
+            std::fprintf(stderr, "[probe_stream] resolve_deferred_probe entered, lazy_rows=%zu\n",
+                         deferred_probe_->lazy->rows());
+        }
         // Pre-filter row count: an upper bound on the decoded size, good
         // enough to decide whether the probe side is large enough to bother.
         if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
@@ -4585,6 +4642,10 @@ class ChunkedInnerJoinOperator final : public Operator {
             if (auto err = try_two_phase_probe(slot, outcome)) {
                 return err;
             }
+            if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
+                std::fprintf(stderr, "[probe_stream] two_phase_outcome=%d\n",
+                             static_cast<int>(outcome));
+            }
             if (outcome == TwoPhase::Precomputed) {
                 deferred_probe_ = nullptr;
                 mode_ = Mode::Precomputed;
@@ -4597,6 +4658,12 @@ class ChunkedInnerJoinOperator final : public Operator {
                 deferred_probe_ = nullptr;
                 return std::nullopt;
             }
+            if (auto err = try_stream_probe_scan()) {
+                return err;
+            }
+            if (deferred_probe_stream_ != nullptr) {
+                return std::nullopt;
+            }
         }
         auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
                                     deferred_externs_, *deferred_exec_);
@@ -4605,6 +4672,69 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         right_ = std::move(right.value());
         deferred_probe_ = nullptr;
+        return std::nullopt;
+    }
+
+    /// Stage 2 of plans/deferred-probe-streaming-plan.md: a bare, unwrapped
+    /// probe `Scan` — no Project/Rename/Update/Filter above it — can be
+    /// probed one source unit at a time instead of materialized whole via
+    /// `interpret_node`. Direct-scan-only and Int64-keyed-only for now (see
+    /// the plan's staged scope); a wrapped scan, a scan with no unit
+    /// decomposition, or any other key type declines and leaves every field
+    /// untouched, so the caller falls through to the existing
+    /// whole-materialize path unchanged.
+    ///
+    /// On success this goes straight to `Mode::Swapped` — the build (left)
+    /// side is already materialized and indexed here, exactly as
+    /// `initialize()` would have done once `right_` was known to be the
+    /// larger side — and leaves `deferred_probe_stream_` set as the signal
+    /// for `next()` to pull units instead of emitting `right_` once.
+    auto try_stream_probe_scan() -> std::optional<std::string> {
+        // Stage 2 A/B knob only, for plans/deferred-probe-streaming-plan.md's
+        // measurement: forces the pre-existing whole-materialize behavior
+        // even when streaming would otherwise be eligible, so the same
+        // registered/declined-two-phase scenario can be timed both ways.
+        // Not a production switch; remove once Stage 2 is measured.
+        if (std::getenv("IBEX_DEBUG_PROBE_STREAM_DISABLE") != nullptr) {
+            return std::nullopt;
+        }
+        if (deferred_right_node_->kind() != ir::NodeKind::Scan) {
+            return std::nullopt;  // wrapped scan: Stage 3
+        }
+        auto units = deferred_scan_units(*deferred_probe_);
+        if (units.empty()) {
+            return std::nullopt;  // no unit decomposition to stream
+        }
+        const std::string& left_key_name = keys_->front().left;
+        const ColumnValue* lkey = left_materialized_->find(left_key_name);
+        if (lkey == nullptr) {
+            return "join key not found in left table: " + left_key_name;
+        }
+        ExprType kind = ExprType::Int;
+        if (auto err = detect_key_kind(*lkey, kind)) {
+            return err;
+        }
+        if (kind != ExprType::Int) {
+            // A categorical/string dictionary is not proven stable across
+            // units yet (`resolve_categorical_heads` assumes one dictionary
+            // for the whole probe side); decline rather than risk it.
+            return std::nullopt;
+        }
+        key_kind_ = kind;
+        if (auto err = build_index(*left_materialized_, left_key_name)) {
+            return err;
+        }
+        left_table_ = std::move(*left_materialized_);
+        left_materialized_.reset();
+        use_materialized_left_ = false;
+        deferred_probe_stream_ =
+            make_deferred_probe_stream(*deferred_probe_, std::move(units), *deferred_exec_);
+        mode_ = Mode::Swapped;
+        deferred_probe_ = nullptr;
+        if (std::getenv("IBEX_DEBUG_PROBE_STREAM") != nullptr) {
+            std::fprintf(stderr, "[probe_stream] streaming=1 source=%s\n",
+                         deferred_probe_name_.c_str());
+        }
         return std::nullopt;
     }
 
@@ -5915,6 +6045,13 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Swapped mode: materialized left held for later gather.
     std::optional<Table> left_table_;
     bool swapped_emitted_ = false;
+
+    // Swapped mode, streaming variant (deferred-probe-streaming-plan.md
+    // Stage 2): non-null when the probe (right) side is being pulled one
+    // source unit at a time from a deferred scan instead of already sitting
+    // whole in `right_`. `next()` refills `right_` from each unit and calls
+    // the same `emit_swapped()` used by the whole-materialize case.
+    OperatorPtr deferred_probe_stream_;
 
     // Precomputed mode: the two-phase deferred probe assembled the whole
     // join output during initialization.
@@ -12034,6 +12171,11 @@ class DeferredScanSourceOperator final : public Operator {
     std::uint64_t sequence_ = 0;
     std::size_t window_ = 1;
 };
+
+auto make_deferred_probe_stream(const DeferredScan& scan, std::vector<SourceUnit> units,
+                                const ExecutionContext& exec) -> OperatorPtr {
+    return std::make_unique<DeferredScanSourceOperator>(scan, std::move(units), exec);
+}
 
 // A one-chunk source owned by one scan-pipeline worker. The worker replaces
 // the pending chunk for every source unit it claims, then pulls the private

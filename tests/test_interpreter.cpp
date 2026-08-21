@@ -16,12 +16,14 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <barrier>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <thread>
 
@@ -13405,6 +13407,156 @@ TEST_CASE("Swapped-mode join probe fans out across workers and matches the seria
         }
         CHECK(mismatches == 0);
     }
+}
+
+// Fixture for plans/deferred-probe-streaming-plan.md Stage 2: a reader with
+// two columns — "pkey" (the join key) and "payload" — that supports both a
+// whole-source decode (unit == nullptr, needed by
+// deferred_scan_key_selection's Phase A key scan) and a per-unit decode
+// (needed by DeferredScanSourceOperator once Phase A declines).
+//
+// The join demands both columns; "pkey" is deliberately NOT a useful
+// per-column probe here because Phase A's escape hatch already decoded it
+// whole into LazyTable's cache_ before declining, and project_where_unit
+// correctly (deliberately, see lazy_table.hpp's project_where doc) reuses a
+// cached whole column instead of re-decoding it per unit — a real
+// optimization, not a gap. "payload" is never touched by Phase A (only the
+// key column is), so it is the column that actually proves per-unit
+// streaming happened.
+struct StreamProbeReaderState {
+    std::atomic<int> whole_decode_calls{0};
+    std::atomic<int> unit_payload_decode_calls{0};
+};
+
+class StreamProbeReader final : public runtime::LazySourceReader {
+   public:
+    static constexpr std::size_t kTotalRows = 200000;
+    static constexpr std::size_t kUnitRows = 50000;
+    static constexpr std::int64_t kBuildDomain = 100;  // must match the build side's key count
+
+    explicit StreamProbeReader(std::shared_ptr<StreamProbeReaderState> state)
+        : state_(std::move(state)) {}
+
+    auto decode_units() -> std::vector<runtime::SourceUnit> override {
+        std::vector<runtime::SourceUnit> units;
+        for (std::size_t start = 0; start < kTotalRows; start += kUnitRows) {
+            units.push_back({.start = start, .rows = kUnitRows});
+        }
+        return units;
+    }
+
+    auto decode(const std::vector<std::string>& names, const runtime::Selection* selection,
+                const runtime::SourceUnit* unit, const runtime::ExecutionContext&)
+        -> std::expected<runtime::Table, std::string> override {
+        if (unit == nullptr) {
+            state_->whole_decode_calls.fetch_add(1);
+        } else if (std::find(names.begin(), names.end(), "payload") != names.end()) {
+            state_->unit_payload_decode_calls.fetch_add(1);
+        }
+        const std::size_t begin = unit != nullptr ? unit->start : 0;
+        const std::size_t end = unit != nullptr ? unit->start + unit->rows : kTotalRows;
+
+        std::vector<std::size_t> rows;
+        if (selection == nullptr) {
+            rows.reserve(end - begin);
+            for (std::size_t row = begin; row < end; ++row) {
+                rows.push_back(row);
+            }
+        } else {
+            for (const std::size_t row : *selection) {
+                if (row >= begin && row < end) {
+                    rows.push_back(row);
+                }
+            }
+        }
+
+        runtime::Table out;
+        for (const auto& name : names) {
+            std::vector<std::int64_t> values;
+            values.reserve(rows.size());
+            if (name == "pkey") {
+                // Dense, deterministic coverage of [0, kBuildDomain): every
+                // row's key exists in a build side holding exactly
+                // kBuildDomain unique keys, so real membership is 100% —
+                // comfortably over kMembershipPassRateCutoff (0.75) and
+                // forcing the escape hatch.
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row) % kBuildDomain);
+                }
+            } else if (name == "payload") {
+                for (const std::size_t row : rows) {
+                    values.push_back(static_cast<std::int64_t>(row));
+                }
+            } else {
+                return std::unexpected("stream probe reader received an unknown column");
+            }
+            out.add_column(std::string(name), Column<std::int64_t>{std::move(values)});
+        }
+        out.logical_rows = rows.size();
+        return out;
+    }
+
+   private:
+    std::shared_ptr<StreamProbeReaderState> state_;
+};
+
+TEST_CASE("Deferred probe streams a bare probe scan unit by unit when two-phase declines",
+          "[runtime][join][deferred_probe]") {
+    // Build side: every key in the probe's domain, once each, so the join is
+    // a clean 1:1 match and the expected output row count is exactly the
+    // probe's row count.
+    runtime::Table build;
+    {
+        std::vector<std::int64_t> keys(StreamProbeReader::kBuildDomain);
+        std::iota(keys.begin(), keys.end(), 0);
+        build.add_column("bkey", Column<std::int64_t>{std::move(keys)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("build", std::move(build));
+
+    auto state = std::make_shared<StreamProbeReaderState>();
+    runtime::Table schema;
+    schema.add_column("pkey", Column<std::int64_t>{});
+    schema.add_column("payload", Column<std::int64_t>{});
+    auto lazy = std::make_shared<runtime::LazyTable>(
+        std::move(schema), StreamProbeReader::kTotalRows,
+        [state]() -> std::expected<runtime::LazySourceReaderPtr, std::string> {
+            return runtime::LazySourceReaderPtr{std::make_unique<StreamProbeReader>(state)};
+        });
+    runtime::DeferredScanRegistry deferred;
+    deferred.emplace(
+        "probe", runtime::DeferredScan{.lazy = std::move(lazy),
+                                       .conjuncts = {},
+                                       .demand = {"pkey", "payload"},
+                                       .demand_all = false,
+                                       .key_column = "pkey",
+                                       .filter = std::make_shared<runtime::DynamicScanFilter>()});
+
+    auto ir = require_ir(
+        "(build join probe on { bkey = pkey })[select { n = count(pkey), total = "
+        "sum(payload) }];");
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+
+    // Proves the escape hatch actually declined two-phase (a whole-column
+    // Phase A key scan ran) and the new path then streamed "payload" — never
+    // touched by Phase A — unit by unit, rather than materializing it whole
+    // in one call the way the old `interpret_node` fallback would have.
+    CHECK(state->whole_decode_calls.load() >= 1);
+    CHECK(state->unit_payload_decode_calls.load() >= 4);
+
+    const auto* n = std::get_if<Column<std::int64_t>>(out->find("n"));
+    REQUIRE(n != nullptr);
+    REQUIRE(n->size() == 1);
+    CHECK((*n)[0] == static_cast<std::int64_t>(StreamProbeReader::kTotalRows));
+
+    const auto* total = std::get_if<Column<std::int64_t>>(out->find("total"));
+    REQUIRE(total != nullptr);
+    REQUIRE(total->size() == 1);
+    constexpr std::int64_t kRows = static_cast<std::int64_t>(StreamProbeReader::kTotalRows);
+    CHECK((*total)[0] == kRows * (kRows - 1) / 2);
 }
 
 // Ordering by a Categorical column ranks its DICTIONARY and maps each row's

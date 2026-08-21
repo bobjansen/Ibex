@@ -29,6 +29,7 @@ complete enough to move under `plans/done/`.
 
 | Plan | Notes |
 |---|---|
+| [deferred-probe-streaming-plan.md](deferred-probe-streaming-plan.md) | Parallel, bounded deferred-probe chunks through row-local right-side wrappers; preserves the Parquet boundary and requires multicore q12 validation. |
 | [pipelined-execution-plan.md](pipelined-execution-plan.md) | **Phase 2 partially implemented.** Multi-chunk correctness, lazy row-group streaming, concurrent scan decoding, ordered source→map overlap, and a bounded streamed join-probe handoff landed. SF-1 improves 2.5–4.6% at 2–8 cores; SF-4 improves 0.6–3.7% at 4–8. The two-core SF-4 crossover (+6.9%) and q18 are explicit follow-ups. A one-producer admission gate was measured worse and withdrawn. Open: progress-aware admission/backpressure and general breaker scheduling |
 | [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md) | **Prereq for runtime-multithreading, before its Phase 0.** The master plan's parity gate needs schema/metadata/validity/categorical-backing comparison; the current `run_parity.sh` only `diff`s stdout and can see none of that. Build an in-process structured `Table`-vs-`Table` comparator + case matrix. |
 | [julia-integration-plan.md](julia-integration-plan.md) | Ibex.jl package, `ibex"""..."""` macro, Arrow/Tables.jl interop, DataFrames.jl benchmark baseline |

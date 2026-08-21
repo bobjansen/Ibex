@@ -1,0 +1,381 @@
+# Kernel-oriented pipeline execution
+
+Status: **proposed architecture plan.** This is a deliberate replacement for
+the current execution architecture over several migrations, not a promise to
+rewrite the runtime in one change. It borrows Umbra's useful separation of
+logical planning, physical pipelines, and morsel execution, while explicitly
+rejecting query JIT/code generation. Ibex's execution backend remains compiled
+C++ with a broad library of specialized, template-instantiated vector kernels.
+
+Read [MEASURING.md](../MEASURING.md),
+[parallelism-overview.md](parallelism-overview.md), and
+[chunked-execution-plan.md](chunked-execution-plan.md) first. This plan owns
+the *architecture* that eventually replaces their ad-hoc execution seams; it
+does not invalidate their correctness contracts, chunked-source work, or
+existing measured kernel improvements.
+
+## Why make this change
+
+`src/runtime/chunked.cpp` is the physical planner, the implementation of most
+streaming operators, the home of parallel islands and pipelined stages, and a
+large set of operator-specific eligibility rules. Those responsibilities have
+grown together because `build_operator(const ir::Node&)` lowers logical nodes
+directly into mutable `Operator::next()` objects.
+
+That coupling has three costs:
+
+1. **A physical choice has no representation.** “Stream this two-key join”,
+   “materialize this aggregate”, and “run this row-local chain as an island”
+   are branches inside the builder rather than inspectable plan decisions.
+2. **Parallelism is an operator-local afterthought.** A kernel can fan out, but
+   a query cannot naturally expose source-to-breaker work as an independently
+   scheduled pipeline. The measured idle pool is therefore usually empty, not
+   queued behind a poor scheduler.
+3. **Specialisation and semantics are entangled.** One source file decides
+   logical eligibility, output ordering, source safety, execution mode,
+   pipeline buffering, and the typed fast path. Adding one fast path makes
+   every other concern harder to audit.
+
+The goal is not a generic task graph, work stealing, or JIT. It is a physical
+plan composed of explicit pipeline stages, each executing a carefully selected
+C++ kernel over a vector/morsel. The result should make both serial and
+multi-core execution easier to improve without weakening Ibex's byte-identical
+answer contract.
+
+## Non-goals
+
+* No LLVM, assembler, runtime C++ compilation, bytecode, or query JIT.
+* No big-bang AST replacement and no surface-language change.
+* No general DAG scheduler, cross-query concurrency, or work stealing unless
+  later measurements show queued work that requires it.
+* No loss of pushdown, categorical encodings, null semantics, source-global
+  selection, deterministic error selection, or byte-identical output.
+* No automatic removal of all materialization: order, global aggregate, window,
+  reshape, and rich join semantics may remain real barriers.
+
+## Target architecture
+
+```text
+parser AST
+    |  parse, spans, syntax sugar, functions and blocks
+    v
+typed logical IR
+    |  relational semantics, schema/properties, optimizer rewrites
+    v
+physical plan
+    |  algorithms, pipelines, barriers, source demand, DOP/memory policy
+    v
+pipeline executable
+    |  kernel selection and typed state layouts
+    v
+morsel executor
+    |  source partitions, bounded handoffs, cancellation, ordered merge
+    v
+Table / stream sink
+```
+
+### 1. Preserve the AST; narrow its job
+
+The parser AST should continue to represent user syntax, source spans,
+functions, blocks, imports, effects, and syntactic sugar. It is not the place
+to represent execution pipelines. The existing lowering phase should be made
+the one-way boundary: after semantic analysis, no runtime component inspects
+`parser::ast`.
+
+Do not redesign AST ownership or replace its `variant` representation as part
+of this project. That is a high-risk language/compiler migration with no
+credible path to the multicore result. Reconsider it only if a concrete
+language feature exposes a lowering limitation.
+
+### 2. Make logical IR purely logical
+
+The logical IR owns relational meaning:
+
+* scans, filters, projects, joins, aggregates, order, windows, reshape, model;
+* expression and null semantics;
+* schema, ordering, unique-key, nullability, and origin proofs;
+* optimizer rewrites such as projection/predicate pushdown and join ordering.
+
+It must not encode execution accidents such as `FilterProject`, `TopK`,
+`is_streamable_inner_join`, a particular join key representation, or whether a
+source is safe to call from a worker. Existing fused logical node kinds may
+remain as compatibility input during migration, but the optimizer should
+eventually express fusion as a physical pipeline choice.
+
+The logical plan is immutable once optimization finishes. Give every node a
+stable, printable identity and make its derived properties available through a
+single analysis result, rather than recomputing ad-hoc facts in physical
+builder branches.
+
+### 3. Add an explicit physical plan
+
+Introduce a private `runtime::physical` plan with data-only, inspectable nodes.
+It is the sole owner of algorithm selection and execution capability.
+
+Suggested first vocabulary:
+
+| Class | Physical nodes | Contract |
+|---|---|---|
+| Source | `TableScan`, `LazyScan`, `ExternSource` | produces numbered morsels and source-global positions |
+| Pipeline map | `Filter`, `Project`, `Update`, `Rename` | vector in → vector out; fusable with adjacent maps |
+| Build barrier | `HashBuild`, `HashAggregateBuild`, `SortBuild`, `Materialize` | consumes a stream before the dependent phase starts |
+| Probe/output | `HashProbe`, `AggregateEmit`, `OrderedMerge` | consumes morsels using immutable or partition-owned build state |
+| Fallback | `MaterializedCall` | explicit adapter for as-yet-unmigrated semantics |
+
+Each node declares, rather than implies:
+
+* input/output schema and `TableProperties` transfer;
+* streaming, blocking, or semi-blocking behavior;
+* partitionability and output-order rule;
+* worker-local, partition-owned, and query-global state;
+* memory estimate/limit and maximum useful DOP;
+* supported kernel families and a reason when the fast path declines.
+
+`explain physical` (initially a test/debug formatter) must print this plan,
+including barriers, selected kernels, DOP allocation, source demand/pushdowns,
+and fallback reasons. A plan that cannot explain why it materialized is not an
+acceptable replacement for the current branches.
+
+### 4. Pipeline units, not a query DAG scheduler
+
+A pipeline is a maximal chain from a partitionable source or a barrier output
+to its next breaker. A pipeline has one producer contract and one consumer
+contract; a breaker owns its build state and creates the next pipeline after
+its build phase completes.
+
+The executor schedules numbered morsels for a pipeline using the existing
+process pool and query lease. Workers dynamically claim source ranges, run the
+pipeline's selected map kernel, and publish ordered results to a bounded
+handoff. The caller remains the ordered consumer. A pipeline is free to be
+serial when its cost model declines fan-out.
+
+This is intentionally smaller than a general scheduler:
+
+* no nested pool submissions—outer pipeline DOP wins;
+* no work stealing or futures;
+* no concurrent independent branches until explicit DOP partitioning and
+  bandwidth admission are measured worthwhile;
+* no raw `std::thread` escape hatches outside one executor-owned handoff API.
+
+The immediate benefit is not magical overlap. It is that the query has a
+first-class, auditable location to create it when an algorithm actually can
+produce independent morsels.
+
+### 5. A broad, templated kernel library
+
+Replace query-specific generated code with a small number of composable kernel
+interfaces and many statically compiled specializations.
+
+```cpp
+template <class Type, class NullPolicy, class Selection, class Expr>
+void filter_project_kernel(const ColumnView<Type, NullPolicy>& input,
+                           Selection& selection, OutputWriter& output,
+                           const Expr& expr, KernelContext& context);
+```
+
+The exact signatures may differ; the ownership model must not:
+
+* `ColumnView`/`ChunkView` are non-owning and carry length, validity, encoding,
+  and offsets explicitly.
+* `Selection` is an explicit bitmap/index/range choice, never a hidden
+  `std::vector` convention.
+* `OutputWriter` owns pre-sized disjoint output ranges or a worker-private
+  buffer; variable-width output follows count → prefix sum → scatter.
+* `KernelContext` owns scratch, cancellation checks, deterministic RNG stream,
+  and profiling counters, never query-global mutable state.
+
+Start with closed dispatch at pipeline construction, not virtual calls per row:
+
+1. Select data representation (fixed width, bool bitmap, string,
+   categorical), null policy, expression shape, and selection shape once.
+2. Construct a typed `PipelineKernel` closure/function pointer for that
+   combination.
+3. Call it per morsel. It may call two or three composable kernels, but no
+   logical-node visitor or `variant` dispatch belongs in the row loop.
+
+Kernel families should be shared across operators. For example, the same
+gather, validity, scatter, hash, and expression kernels serve filter output,
+join assembly, sort gather, and aggregate emission. This formalizes the
+successful convergence work already done around gather behavior.
+
+### 6. Ownership-oriented breakers
+
+The initial physical algorithms should follow state ownership, not an attempt
+to make every node universally streaming:
+
+* **Hash join:** one build-side state, immutable after build; probe pipeline
+  streams source-order morsels; each morsel emits its own match segment;
+  ordered merge reconstructs probe order.
+* **Hash aggregate:** fixed logical hash partitions own key maps and aggregate
+  slots; workers claim partitions/morsels; deterministic first-row metadata is
+  retained for final P-way ordering. Partition count is data-derived/fixed,
+  never core-count-derived.
+* **Order/distinct/window:** begin as explicit barriers with reused kernels;
+  migrate only once their cross-morsel state and output rules are specified.
+* **Fallback semantics:** `MaterializedCall` is honest and profiled. It
+  preserves rich operators (median, quantile, EWMA, predicates, reshape, etc.)
+  until a physical implementation is complete.
+
+## Migration phases
+
+### Phase 0 — freeze contracts and gain observability
+
+No performance claim.
+
+1. Document `Chunk`, `Morsel`, `Operator::next()`, materialization, source
+   selection/index space, and `TableProperties` contracts in one place.
+2. Add structured serial-vs-chunked comparison for values, schema, validity,
+   categorical backing, ordering, time index, and error selection.
+3. Add a physical-plan debug dump prototype for a small read-only logical-plan
+   walker; it must change no runtime behavior.
+4. Establish a corpus spanning row-local maps, all column representations,
+   empty input/schema carrier, multi-chunk source grains, joins, aggregates,
+   order, window, and a fallback node.
+
+Exit: the current path has a captured baseline plan/properties and the corpus
+can distinguish an unsupported physical shape from an incorrect result.
+
+### Phase 1 — introduce logical-to-physical planning beside `build_operator`
+
+1. Define the physical node types and immutable `PhysicalPlan` arena/value
+   ownership.
+2. Lower only `Scan → Filter → Project/Rename → row-local Update` into the
+   physical plan; all other nodes produce explicit `MaterializedCall` barriers.
+3. Implement `explain physical` tests covering selected maps, pushdown demand,
+   materialization reasons, properties, and decline reasons.
+4. Keep `build_operator` as the executor for the fallback; it receives the
+   *lowered physical plan*, not a raw logical node, on the migrated path.
+
+Exit: simple queries use the new planner and have exactly the old outputs and
+source pushdowns, with no required performance win.
+
+### Phase 2 — migrate row-local execution to reusable kernels
+
+1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
+2. Port filter/project/rename/row-local update kernels one representation at a
+   time, preserving the current fast kernels rather than rewriting them.
+3. Build static dispatch tables at pipeline construction. Add explicit kernel
+   capability declarations and unit tests for dispatch choice.
+4. Run the physical map pipeline serially first; only then use the existing
+   morsel executor for it.
+5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds once
+   physical-pipeline fusion proves equivalent.
+
+Exit: every migrated map has one kernel family used by both serial and parallel
+execution; no physical `next()` implementation duplicates its row loop.
+
+### Phase 3 — make the executor own handoffs and DOP
+
+1. Make the physical pipeline executor the only implementation allowed to own
+   a bounded producer/consumer handoff or spawn a helper thread.
+2. Represent pipeline DOP and memory budget in `ExecutionContext` child
+   budgets; an inner kernel observes the allocation and cannot seize the full
+   pool.
+3. Migrate existing parallel islands and pipelined scan/stage mechanisms to
+   the executor without changing their eligibility policy.
+4. Eliminate raw-thread construction from individual join/builder branches.
+5. Track per-pipeline runnable time, worker capacity, queue/backpressure time,
+   and ordered-merge time. Keep the existing accounting closure invariant.
+
+Exit: the old parallel-island abstraction is an implementation mode of a
+physical map pipeline, not a second executor.
+
+### Phase 4 — migrate the high-value breakers
+
+Order is driven by measured serial time and semantic completeness, not by
+operator count.
+
+1. **Hash join:** migrate the existing supported single-key/two-Int64-key
+   streaming paths as `HashBuild + HashProbe`; retain all other join semantics
+   behind `MaterializedCall`.
+2. **Hash aggregate:** migrate the current partition-owned paths and express
+   discovery, per-partition slots, final ordering, and output emission as
+   distinct physical phases. Keep median/quantile/EWMA fallback explicit.
+3. **Distinct and ordered operations:** use the established kernel/selection
+   library; migrate only where their global state has a complete contract.
+4. Delete the corresponding `chunked.cpp` classes only after the physical path
+   handles every previously supported shape and the fallback is mutation-tested.
+
+Exit: q09/q18/q20-shaped plans have inspectable physical plans and their
+existing fast paths no longer depend on special builder branches.
+
+### Phase 5 — retire the monolith and simplify IR
+
+1. Split implementation by ownership: `physical_planner`, `pipeline_executor`,
+   `kernels/`, and one file/family per breaker.
+2. Move logical fusion/selection out of `ir::NodeKind`; leave compatibility
+   lowering only until serialized tests and tools no longer need it.
+3. Remove obsolete `build_operator` recursion and migrate `interpret_node` to
+   an explicit physical fallback adapter.
+4. Make planner/executor/kernel tests independently runnable.
+
+Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit;
+logical planning, physical selection, kernel behavior, and scheduling have
+separate owners.
+
+## Acceptance gates
+
+Every phase must meet all of these before the next one starts:
+
+* Full parser/IR test suite, because logical/physical boundary changes touch
+  lowering and plan semantics.
+* Byte-identical serial and parallel results across multiple chunk grains,
+  including null, string, categorical, empty-schema, error, and interruption
+  cases.
+* Mutation tests proving a migrated query reaches the physical implementation
+  and proving unsupported semantics reach its fallback.
+* Plan-shape assertions: pushdowns, output properties, barriers, and fallbacks
+  are all inspectable and expected.
+* Measurements follow `MEASURING.md`: profile a discriminating micro-case
+  first; then compare interleaved A/B builds; finally validate relevant PDS-H
+  queries at pinned 1/2/4/8 cores. Report no performance result without a
+  byte-identity check and accounting closure.
+
+The performance bar is initially **no regression** for Phase 1 and a migrated
+serial map path. A multicore improvement is accepted only when it improves
+end-to-end wall time under the paired protocol, not merely pool work or a
+kernel microbenchmark. The goal is more useful parallel work, not a higher
+thread count.
+
+## Risks and decisions to make early
+
+| Risk | Decision / mitigation |
+|---|---|
+| A “physical IR” mirrors every logical node and adds ceremony | Begin with only source, map pipeline, hash build/probe, materialize, and fallback. Add nodes only when an algorithm needs a different lifecycle. |
+| Template explosion harms build time/binary size | Specialize on representation and null/selection policy first; use runtime parameters for uncommon expression details; measure compile size/time per family. |
+| Kernel extraction regresses the current tuned path | Port existing kernels behind the new interface before changing algorithms; retain a direct fast path where the abstraction demonstrably costs. |
+| A new executor becomes an unmeasured scheduler project | Preserve the current pool and outermost-wins policy. Require queue/occupancy evidence before adding work stealing or branch concurrency. |
+| Fallback hides most plans forever | Make every fallback explicit in `explain physical`, profiled, and covered by a migration backlog keyed by its measured cost. |
+| Logical/physical split loses source pushdowns | Source demand is a physical-plan input derived once from logical analysis; assert plan shape and reader calls in tests. |
+
+## First implementation slice
+
+Do not start by moving a join or aggregate. The first change should be a
+behavior-preserving vertical slice:
+
+```text
+logical Scan → Filter → Project
+      ↓
+physical Lazy/TableScan → MapPipeline(Filter, Project)
+      ↓
+existing serial chunk execution
+```
+
+It proves all new ownership boundaries with manageable semantics, exposes the
+physical plan, reuses the existing vector kernels, and permits a direct
+serial-vs-parallel morsel comparison later. Only after that slice has held its
+correctness and no-regression gates should it replace the map-island executor
+or touch a pipeline breaker.
+
+## Relation to Umbra
+
+Umbra's relevant design is the staged path from AST through relational algebra
+and an execution IR to pipeline-oriented morsel execution, not its machine-code
+backends. Ibex substitutes a precompiled templated/vector-kernel backend for
+Umbra IR + Flying Start/LLVM generation. This is a conscious trade: it retains
+low implementation and query-startup complexity while gaining the plan and
+execution separation needed to make a broad kernel library composable.
+
+See Kersten, Leis, and Neumann, *Tidy Tuples and Flying Start* (VLDB Journal,
+2021), especially its architecture and compilation-pipeline discussion:
+<https://link.springer.com/article/10.1007/s00778-020-00643-4>.

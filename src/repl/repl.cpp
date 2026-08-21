@@ -4949,7 +4949,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             // proof reads are reusable execution work.  This analysis is
             // conservative with respect to the current (pre-reorder) plan:
             // a later plan that declines a probe simply keeps a useful cache.
-            const auto deferred_probes = ir::deferrable_probe_scans(*rewritten, lazy_names);
+            const auto deferred_probes =
+                ir::deferrable_probe_scans(*rewritten, lazy_names, row_counts, schemas);
             for (const auto& [source_name, columns] :
                  ir::plan_join_key_origins(*rewritten, schemas)) {
                 const auto lazy = lazy_sources.find(source_name);
@@ -5067,7 +5068,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         runtime::ExecutionContext exec{.deferred_scans = &deferred_scans,
                                        .execution_profile = nullptr};
         runtime::configure_parallel_from_env(exec);
-        for (auto& [name, info] : ir::deferrable_probe_scans(*rewritten, deferrable_names)) {
+        for (auto& [name, info] :
+             ir::deferrable_probe_scans(*rewritten, deferrable_names, row_counts, schemas)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
             if (needed == demand.end() || lazy == nullptr) {

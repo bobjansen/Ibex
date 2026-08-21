@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
@@ -70,7 +71,20 @@ struct DeferrableProbeScan {
 [[nodiscard]] auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
     -> robin_hood::unordered_map<std::string, std::set<std::string>>;
 
-[[nodiscard]] auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources)
+/// `row_counts`/`schemas`, when supplied, gate eligibility on estimated size:
+/// a source is only returned when the join's BUILD side (the side that will
+/// publish key bounds into this scan's filter slot) is estimated to be
+/// smaller than this scan's own (exact, footer-known) row count. An unfiltered
+/// or otherwise unestimable build side means the published bound would span
+/// the scan's whole key domain -- pruning nothing while still paying full
+/// eager materialization of the build side, a pure loss (see
+/// project_deferred_probe_no_cost_model.md / TPC-H q12). Omitting both
+/// (leaving them default-empty) disables the gate entirely and keeps the
+/// original, purely structural eligibility -- every existing caller does this
+/// today, including every unit test below.
+[[nodiscard]] auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources,
+                                          const SourceRowCounts& row_counts = {},
+                                          const SourceSchemas& schemas = {})
     -> std::map<std::string, DeferrableProbeScan>;
 
 /// Remove row-local filters which have already been applied by a lazy source.

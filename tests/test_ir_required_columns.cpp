@@ -421,7 +421,7 @@ TEST_CASE("deferrable_probe_scans: a scan consumed twice is never deferred",
     CHECK(ir::deferrable_probe_scans(*plan, {"t"}).empty());
 }
 
-TEST_CASE("deferrable_probe_scans: non-inner, multi-key, and predicate joins are ineligible",
+TEST_CASE("deferrable_probe_scans: non-inner, 3+-key, and predicate joins are ineligible",
           "[ir][scan_predicates][deferred_scan]") {
     auto left_join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Left,
                                                     std::vector<ir::JoinKey>{"id"});
@@ -429,17 +429,33 @@ TEST_CASE("deferrable_probe_scans: non-inner, multi-key, and predicate joins are
     left_join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
     CHECK(ir::deferrable_probe_scans(*left_join, {"t"}).empty());
 
-    auto two_key = std::make_unique<ir::JoinNode>(ir::NodeId{6}, ir::JoinKind::Inner,
-                                                  std::vector<ir::JoinKey>{"id", "id2"});
-    two_key->add_child(make_scan("build"));
-    two_key->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
-    CHECK(ir::deferrable_probe_scans(*two_key, {"t"}).empty());
+    // Two keys is eligible (see the positive case below, "deferred scan
+    // filtering for two-key joins" -- the runtime pushes a filter over the
+    // FIRST component only). Three or more stays out of scope: the runtime's
+    // `is_streamable_pair_int_join` only ever recognizes exactly two.
+    auto three_key = std::make_unique<ir::JoinNode>(ir::NodeId{6}, ir::JoinKind::Inner,
+                                                    std::vector<ir::JoinKey>{"id", "id2", "id3"});
+    three_key->add_child(make_scan("build"));
+    three_key->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+    CHECK(ir::deferrable_probe_scans(*three_key, {"t"}).empty());
 
     auto with_pred = std::make_unique<ir::JoinNode>(ir::NodeId{7}, ir::JoinKind::Inner,
                                                     std::vector<ir::JoinKey>{"id"}, gt_zero("a"));
     with_pred->add_child(make_scan("build"));
     with_pred->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
     CHECK(ir::deferrable_probe_scans(*with_pred, {"t"}).empty());
+}
+
+TEST_CASE("deferrable_probe_scans: a two-key inner join is eligible on its first component",
+          "[ir][scan_predicates][deferred_scan]") {
+    auto two_key = std::make_unique<ir::JoinNode>(ir::NodeId{6}, ir::JoinKind::Inner,
+                                                  std::vector<ir::JoinKey>{"id", "id2"});
+    two_key->add_child(make_scan("build"));
+    two_key->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{2}, "t"));
+
+    auto deferrable = ir::deferrable_probe_scans(*two_key, {"t"});
+    REQUIRE(deferrable.contains("t"));
+    CHECK(deferrable.at("t").key_column == "id");
 }
 
 TEST_CASE("deferrable_probe_scans: a project that drops the join key blocks eligibility",

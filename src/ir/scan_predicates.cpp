@@ -393,9 +393,19 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
         // that mapping directly, so a mapped key is as eligible as a
         // same-named one; requiring normalization here turns an otherwise
         // selective mapped join into a whole-table probe scan.
-        if (join.kind() == JoinKind::Inner && join.keys().size() == 1 &&
-            !join.predicate().has_value() && join.children().size() == 2 &&
-            join.children()[1] != nullptr) {
+        //
+        // A two-key join is also eligible, filtering on its FIRST component
+        // only (independent-component pruning: membership in that one column
+        // is necessary but not sufficient for the pair match, so it can only
+        // reject rows, never wrongly admit one -- the runtime still checks
+        // both keys exactly once decoded). Deliberately not both components
+        // yet: `DynamicScanFilter`/`DeferredScan` are single-column, and this
+        // is the POC for whether scan-altitude pruning is the lever at all
+        // before extending them (plans/parallelism-overview.md's "stream
+        // multi-key joins" follow-up, TPC-H q09's lineitem join).
+        if (join.kind() == JoinKind::Inner &&
+            (join.keys().size() == 1 || join.keys().size() == 2) && !join.predicate().has_value() &&
+            join.children().size() == 2 && join.children()[1] != nullptr) {
             if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {
                 if (const auto count = counts.find(match->first);

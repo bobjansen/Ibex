@@ -4203,22 +4203,19 @@ class ChunkedInnerJoinOperator final : public Operator {
 
     /// Two-fixed-width-int-key path: narrow first cut of the streaming
     /// two-key join (plans/parallelism-overview.md's "stream multi-key
-    /// joins" item). `right_` is already a whole `Table` by construction (the
-    /// call site always materializes it, same as the single-key path), so
-    /// the only real decision left is which side to index: this always
-    /// materializes `left_` too and builds on whichever side is smaller --
-    /// the same motivation as `initialize()`'s single-key swap decision, and
-    /// necessary here because the call site cannot know in advance which
-    /// side a two-key join chain puts on which name (TPC-H q09's `lineitem`
-    /// join has the multi-million-row side as `right_`; indexing it
-    /// unconditionally was measured a >2x regression before this fix).
-    /// Deferred-probe filter pushdown into a large scan (the bigger lever
-    /// still on the table for a large *streamed* side) stays out of scope --
-    /// `DynamicScanFilter`/`DeferredScan` are single-column throughout, and
-    /// extending them is a separate, larger change.
+    /// joins" item). Non-deferred case: `right_` is already a whole `Table`
+    /// by construction (the call site materializes it, same as the
+    /// single-key path), so the only real decision left is which side to
+    /// index: this materializes `left_` too and builds on whichever side is
+    /// smaller -- the same motivation as `initialize()`'s single-key swap
+    /// decision, and necessary here because the call site cannot know in
+    /// advance which side a two-key join chain puts on which name (TPC-H
+    /// q09's `lineitem` join has the multi-million-row side as `right_`;
+    /// indexing it unconditionally was measured a >2x regression before this
+    /// fix). Deferred case: see `resolve_deferred_probe_pair`.
     auto initialize_pair() -> std::optional<std::string> {
         if (deferred_probe_ != nullptr) {
-            return "ChunkedInnerJoinOperator: deferred probe not supported for two-key joins";
+            return resolve_deferred_probe_pair();
         }
         const ir::JoinKey& k0 = keys_->at(0);
         const ir::JoinKey& k1 = keys_->at(1);
@@ -4236,42 +4233,26 @@ class ChunkedInnerJoinOperator final : public Operator {
             return "ChunkedInnerJoinOperator: two-key join currently requires both keys to be "
                    "Int64";
         }
-        auto left_res = MaterializeOperator(std::move(left_)).run();
-        if (!left_res.has_value()) {
-            return std::move(left_res.error());
+        Table left_table;
+        if (use_materialized_left_ && left_materialized_.has_value()) {
+            // `resolve_deferred_probe_pair` already drained the left child
+            // while deciding whether a scan filter was worth publishing.
+            left_table = std::move(*left_materialized_);
+            left_materialized_.reset();
+            use_materialized_left_ = false;
+        } else {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            left_table = std::move(*left_res);
         }
-        Table left_table = std::move(*left_res);
         const std::size_t n_left = left_table.rows();
         const std::size_t n_right = right_.rows();
         pair_mode_ = true;
 
         if (n_left <= n_right) {
-            // Build on the (smaller) left, scan right row-by-row: same shape
-            // as single-key `Mode::Swapped` / `emit_swapped`.
-            const ColumnValue* lkey0 = left_table.find(k0.left);
-            if (lkey0 == nullptr) {
-                return "join key not found in left table: " + k0.left;
-            }
-            const ColumnValue* lkey1 = left_table.find(k1.left);
-            if (lkey1 == nullptr) {
-                return "join key not found in left table: " + k1.left;
-            }
-            const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
-            const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
-            if (lcol0 == nullptr || lcol1 == nullptr) {
-                return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
-                       "be Int64";
-            }
-            const auto* le0 = left_table.find_entry(k0.left);
-            const auto* le1 = left_table.find_entry(k1.left);
-            const ValidityBitmap* lv0 =
-                le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
-            const ValidityBitmap* lv1 =
-                le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
-            build_pair_index(*lcol0, *lcol1, lv0, lv1);
-            left_table_ = std::move(left_table);
-            mode_ = Mode::Swapped;
-            return std::nullopt;
+            return build_left_pair_index_and_swap(std::move(left_table));
         }
 
         // Build on the (smaller) right; left is already fully materialized,
@@ -4288,6 +4269,97 @@ class ChunkedInnerJoinOperator final : public Operator {
         left_materialized_ = std::move(left_table);
         use_materialized_left_ = true;
         return std::nullopt;
+    }
+
+    // Build on the (smaller) left, scan right row-by-row: same shape as
+    // single-key `Mode::Swapped` / `emit_swapped`. Factored out of
+    // `initialize_pair` so `resolve_deferred_probe_pair` (which always
+    // builds on left -- the deferred side is definitionally the one too
+    // large to materialize first) can reuse it.
+    auto build_left_pair_index_and_swap(Table left_table) -> std::optional<std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* lkey0 = left_table.find(k0.left);
+        if (lkey0 == nullptr) {
+            return "join key not found in left table: " + k0.left;
+        }
+        const ColumnValue* lkey1 = left_table.find(k1.left);
+        if (lkey1 == nullptr) {
+            return "join key not found in left table: " + k1.left;
+        }
+        const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
+        const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
+        if (lcol0 == nullptr || lcol1 == nullptr) {
+            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
+                   "be Int64";
+        }
+        const auto* le0 = left_table.find_entry(k0.left);
+        const auto* le1 = left_table.find_entry(k1.left);
+        const ValidityBitmap* lv0 =
+            le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
+        const ValidityBitmap* lv1 =
+            le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
+        build_pair_index(*lcol0, *lcol1, lv0, lv1);
+        left_table_ = std::move(left_table);
+        mode_ = Mode::Swapped;
+        return std::nullopt;
+    }
+
+    /// Deferred-probe POC for the two-key path (plans/parallelism-overview.md
+    /// "deferred scan filtering for two-key joins", TPC-H q09's `lineitem`
+    /// join). Reuses the existing single-key deferred-scan machinery
+    /// unchanged: builds the (small) left side first, publishes a
+    /// `DynamicScanFilter` over `keys_->at(0)` ONLY -- one component, not
+    /// both -- into the scan's filter slot, then lets the source's normal
+    /// decode-time pruning narrow the right side before it is ever
+    /// materialized. Membership in one component is necessary but not
+    /// sufficient for the pair match, so this can only produce harmless
+    /// false positives (rows sharing q09's l_partkey but not l_suppkey);
+    /// `build_left_pair_index_and_swap`'s exact pair probe afterward is what
+    /// actually enforces both keys, unchanged from the non-deferred path.
+    ///
+    /// Same `kStreamRightThreshold` gate as the single-key
+    /// `resolve_deferred_probe`: below it, publishing a filter (a Bloom plus
+    /// a sort/unique pass over the whole build side) can only add cost, not
+    /// recover it, since the deferred side was never going to be expensive to
+    /// decode in the first place. First cut of this POC always materialized
+    /// left and published a filter regardless of size -- measured a clean,
+    /// unanimous +8.4% regression on q05 (its `join supplier on
+    /// {l_suppkey=s_suppkey, n_nationkey=s_nationkey}` is exactly this
+    /// shape, `supplier` fitting in one row group with nothing to prune).
+    /// Below the threshold this falls through to `initialize_pair`'s
+    /// ordinary side-picking, reusing the already-drained left side via
+    /// `left_materialized_`/`use_materialized_left_` rather than draining it
+    /// twice.
+    ///
+    /// No two-phase probe (`try_two_phase_probe`'s candidate-selection
+    /// optimization) here -- that is a further, separable lever on top of
+    /// scan-altitude pruning, and this POC is scoped to answering whether
+    /// pruning the scan itself is worth it at all before adding more on top.
+    auto resolve_deferred_probe_pair() -> std::optional<std::string> {
+        DynamicScanFilter& slot = *deferred_probe_->filter;
+        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            publish_build_filter_column(*left_res, keys_->at(0).left, slot);
+            left_materialized_ = std::move(*left_res);
+            use_materialized_left_ = true;
+        }
+        slot.ready = true;
+        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                    deferred_externs_, *deferred_exec_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(*right);
+        deferred_probe_ = nullptr;
+        if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
+            std::fprintf(stderr, "[pair_defer] filter_published=%d right_rows_after_filter=%zu\n",
+                         static_cast<int>(use_materialized_left_), right_.rows());
+        }
+        return initialize_pair();
     }
 
     // Swapped pair-mode counterpart of `emit_swapped`: the pair index is on
@@ -4759,7 +4831,16 @@ class ChunkedInnerJoinOperator final : public Operator {
     // pruning, the fused key scan uses the raw bounds for row-group
     // skipping.
     void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
-        const auto* entry = build.find_entry(keys_->front().left);
+        publish_build_filter_column(build, keys_->front().left, slot);
+    }
+
+    // Component-selecting variant for the two-key deferred-probe POC
+    // (`resolve_deferred_probe_pair`): publishes a filter over exactly one
+    // named build-side column instead of always `keys_->front().left`, since
+    // the pair join's scan filter only ever covers one of the two keys.
+    void publish_build_filter_column(const Table& build, const std::string& key_name,
+                                     DynamicScanFilter& slot) const {
+        const auto* entry = build.find_entry(key_name);
         if (entry == nullptr) {
             return;
         }
@@ -13165,22 +13246,32 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
         }
         // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
-        // "stream multi-key joins" item, first cut): same shape as the
-        // single-key streamable path just above, minus the deferred-probe
-        // and multiple-producers-overlap machinery -- this always builds the
-        // hash index on a fully materialized `right_` and streams `left_`
-        // chunk by chunk through `ChunkedInnerJoinOperator`'s pair-key path,
-        // replacing `join_table_impl`'s whole-table hash join for exactly
-        // this shape. Deferred-probe filter pushdown into a large right-side
-        // scan (the bigger lever for e.g. TPC-H q09's lineitem) is out of
-        // scope here; see `ChunkedInnerJoinOperator::initialize_pair`.
+        // "stream multi-key joins" item): same shape as the single-key
+        // streamable path just above, minus the multiple-producers-overlap
+        // machinery -- this builds the hash index on the smaller of the two
+        // sides and streams/scans the other through
+        // `ChunkedInnerJoinOperator`'s pair-key path, replacing
+        // `join_table_impl`'s whole-table hash join for exactly this shape.
+        // A deferred-probe right side (e.g. TPC-H q09's lineitem) is honored
+        // exactly like the single-key branch above; see
+        // `ChunkedInnerJoinOperator::resolve_deferred_probe_pair` for the
+        // one-component filter this POC pushes into the scan.
         if (is_streamable_pair_int_join(join)) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+            const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
                 return std::unexpected(std::move(left_op.error()));
+            }
+            if (probe.scan != nullptr) {
+                return make_pipelined_stage_if(
+                    std::make_unique<ChunkedInnerJoinOperator>(
+                        std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
+                        externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
+                        &join.pending_order()),
+                    stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
             }
             auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
                                                exec, model_out);

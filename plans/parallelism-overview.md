@@ -1173,6 +1173,30 @@ first-occurrence group ordering — was considered and REJECTED; see below.)
    there is nothing for stealing to steal. A scheduler redistributes
    parallelism; it does not manufacture it. Revisit only if a future change
    raises occupancy far enough that queues actually build.
+
+   **Re-measured 2026-08-21 at `190235b`** (39 commits after the `6f0a03e`
+   verdict above, `benchmarking/profile_suite.py 8`) after a question about
+   whether the 3-day-old numbers were stale enough to distrust — they were
+   worth re-checking, and the verdict survives:
+
+   | | `6f0a03e` (2026-08-18) | `190235b` (2026-08-21) |
+   |---|---|---|
+   | occupancy (`pool_work_ms` / capacity) | 30.4% | 32.8% |
+   | parked with nothing queued (`pool_unqueued_ms` / capacity) | 69.2% | 66.9% |
+   | worker backpressure park (`pool_idle_ms` / capacity) | 0.0% | ~0.01% (2.1 of 15430.2ms) |
+   | closure | 99.6% | 99.7% |
+
+   Occupancy moved a couple points — real work landed in between (decode
+   threading, parallel fused Parquet filter scans, dictionary sharding) — but
+   `pool_idle_ms` is still, for all practical purposes, zero everywhere. The
+   fact the scheduler track's refusal rests on (nothing ever sits queued
+   behind a busy worker, so there is nothing to steal) is current, not stale.
+   Reentrant/work-stealing pool machinery is still not justified by measurement
+   as of this commit. This does NOT bear on the *separate* raw-thread-count
+   problem found the same day in the "Generalization attempt (2026-08-21)"
+   section below — `pool_idle_ms` only accounts for the pool's own workers,
+   and the runaway raw `std::thread`s from `build_binary_materializing_operator`
+   were never pool workers, so they don't show up in this number either way.
 8. **I4** — collapse the duplicated implementations, keeping the whole-table
    signatures. **Promoted** from after the scheduler, since there is no longer a
    scheduler to come after. It is no longer a gate on item 9: the standard
@@ -1502,6 +1526,44 @@ this session: item 1 kept (flat-to-slightly-positive, no measured downside),
 items 2 and 3 reverted with the reasoning above left in `chunked.cpp` as
 comments at both call sites, so a future attempt starts from what already
 failed rather than re-discovering it.
+
+**Root cause, restated precisely, and the proposed fix for next time.** The
+regression is not "the pool schedules badly" — item 7 above, re-measured the
+same day, confirms `pool_idle_ms` is still ~0 everywhere, so there is no
+demand-side scheduling problem for a smarter/reentrant pool to solve here.
+The actual defect is that the overlap's raw `std::thread`s live entirely
+outside `WorkerPool`'s accounting. `submit()` refuses reentrant calls from a
+pool worker (`on_worker_pool_thread()`, `worker_pool.cpp:408` —
+non-reentrant, "outermost wins, inner levels degrade to serial" by design),
+which is exactly why the overlap used a raw thread instead: it needed to run
+concurrently with a *non-pool-worker* caller. But nothing bounds how many of
+those raw threads pile up — `build_binary_materializing_operator` is
+recursive, so q09's 6-way join spawns up to one raw thread per nesting level,
+each also submitting its own decode/compute work into the same fixed
+`threads_`, oversubscribing physical cores under deep join trees even though
+`WorkerPool` itself never grows.
+
+**Suggested fix (not yet built): give the pool a global cap on concurrently-
+live "helper" threads, budgeted against the *compute* budget
+(`compute_thread_count()`, not decode's deliberately-oversubscribed
+`threads_` — compute measurably regresses under oversubscription per §1.2's
+"two thread budgets" table).** Concretely: `WorkerPool::try_acquire_helper()
+-> bool` / `release_helper()` backed by one atomic counter. Every raw-thread
+overlap site calls `try_acquire_helper()` before spawning; on failure it
+falls back to the existing sequential path, exactly the way inner pool
+submissions already degrade under the non-reentrant guard. Recursion then
+self-limits — q09's join tree spawns helpers until the budget's exhausted,
+then serializes — instead of growing unboundedly with tree depth. This is
+deliberately NOT reentrant/work-stealing submission machinery (item 7's
+"nothing to steal" finding argues against building that), and it does not
+touch `submit()`'s contract at all; it is a second, independent budget
+sitting next to the pool rather than a change to how the pool schedules its
+own queue. Still a `WorkerPool`-adjacent core-file change with whole-engine
+blast radius (every parallel path shares the same pool/header), so it should
+land and be verified on its own — full ctest + full-suite A/B against the
+existing decode/compute fan-outs, checking nothing already-working regresses
+— *before* re-attempting the two reverted generalizations (items 2 and 3
+above) under the new cap.
 
 ---
 

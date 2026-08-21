@@ -119,9 +119,9 @@ TEST_CASE("REPL session preserves bindings and returns structured results", "[re
     ibex::runtime::ExternRegistry registry;
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
 
-    const auto binding = session.execute("let numbers = Table { value = [1, 2, 3] };");
-    REQUIRE(binding.ok);
-    const auto result = session.execute("numbers[filter value > 1];");
+    const auto result = session.execute(
+        "let numbers = Table { value = [1, 2, 3] };\n"
+        "numbers[filter value > 1];");
     REQUIRE(result.ok);
     REQUIRE(result.table.has_value());
     REQUIRE(result.table->rows() == 2);

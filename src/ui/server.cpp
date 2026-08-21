@@ -304,6 +304,54 @@ auto query_size(std::string_view target, std::string_view key, std::size_t fallb
     return fallback;
 }
 
+auto url_decode(std::string_view encoded) -> std::optional<std::string> {
+    std::string decoded;
+    decoded.reserve(encoded.size());
+    const auto hex_value = [](char character) -> std::optional<unsigned char> {
+        if (character >= '0' && character <= '9')
+            return static_cast<unsigned char>(character - '0');
+        if (character >= 'a' && character <= 'f')
+            return static_cast<unsigned char>(character - 'a' + 10);
+        if (character >= 'A' && character <= 'F')
+            return static_cast<unsigned char>(character - 'A' + 10);
+        return std::nullopt;
+    };
+    for (std::size_t index = 0; index < encoded.size(); ++index) {
+        if (encoded[index] != '%') {
+            decoded.push_back(encoded[index]);
+            continue;
+        }
+        if (index + 2 >= encoded.size())
+            return std::nullopt;
+        const auto high = hex_value(encoded[index + 1]);
+        const auto low = hex_value(encoded[index + 2]);
+        if (!high || !low)
+            return std::nullopt;
+        decoded.push_back(static_cast<char>((*high << 4U) | *low));
+        index += 2;
+    }
+    return decoded;
+}
+
+auto query_value(std::string_view target, std::string_view key) -> std::optional<std::string> {
+    const auto question = target.find('?');
+    if (question == std::string_view::npos)
+        return std::nullopt;
+    std::string_view query = target.substr(question + 1);
+    while (!query.empty()) {
+        const auto ampersand = query.find('&');
+        const auto item = query.substr(0, ampersand);
+        const auto equals = item.find('=');
+        if (equals != std::string_view::npos && item.substr(0, equals) == key) {
+            return url_decode(item.substr(equals + 1));
+        }
+        if (ampersand == std::string_view::npos)
+            break;
+        query.remove_prefix(ampersand + 1);
+    }
+    return std::nullopt;
+}
+
 auto scalar_json(const runtime::ScalarValue& value) -> json {
     return std::visit(
         [](const auto& scalar) -> json {
@@ -332,6 +380,59 @@ auto environment_json(const Session& session) -> json {
                           {"columns", std::move(columns)}});
     }
     return {{"tables", std::move(tables)}};
+}
+
+auto is_beneath(const std::filesystem::path& path, const std::filesystem::path& root) -> bool {
+    auto path_it = path.begin();
+    for (auto root_it = root.begin(); root_it != root.end(); ++root_it, ++path_it) {
+        if (path_it == path.end() || *path_it != *root_it)
+            return false;
+    }
+    return true;
+}
+
+auto data_directory_json(const std::filesystem::path& root, std::string_view requested_path)
+    -> std::optional<json> {
+    std::filesystem::path relative(requested_path.empty() ? "." : requested_path);
+    relative = relative.lexically_normal();
+    if (relative.is_absolute() || std::ranges::find(relative, "..") != relative.end()) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    const auto directory = std::filesystem::weakly_canonical(root / relative, ec);
+    if (ec || !is_beneath(directory, root) || !std::filesystem::is_directory(directory, ec)) {
+        return std::nullopt;
+    }
+    std::vector<json> entries;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const auto canonical = std::filesystem::weakly_canonical(it->path(), ec);
+        if (ec || !is_beneath(canonical, root))
+            continue;
+        const bool is_directory = it->is_directory(ec);
+        if (ec)
+            continue;
+        const auto entry_relative = std::filesystem::relative(canonical, root, ec);
+        if (ec)
+            continue;
+        entries.push_back({{"name", canonical.filename().string()},
+                           {"path", canonical.string()},
+                           {"relative_path", entry_relative.generic_string()},
+                           {"directory", is_directory}});
+    }
+    if (ec)
+        return std::nullopt;
+    std::ranges::sort(entries, [](const json& lhs, const json& rhs) {
+        if (lhs["directory"] != rhs["directory"])
+            return lhs["directory"] > rhs["directory"];
+        return lhs["name"] < rhs["name"];
+    });
+    const auto directory_relative = std::filesystem::relative(directory, root, ec);
+    if (ec)
+        return std::nullopt;
+    const auto directory_path =
+        directory_relative == "." ? "" : directory_relative.generic_string();
+    return json{{"path", directory_path}, {"entries", std::move(entries)}};
 }
 
 auto load_static_assets(const std::filesystem::path& root) -> std::optional<StaticAssets> {
@@ -491,6 +592,14 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
         return 1;
     }
 #endif
+    if (!config.data_directory.empty()) {
+        std::filesystem::current_path(data_directory, ec);
+        if (ec) {
+            std::cerr << "error: could not change to UI data directory: '"
+                      << data_directory.string() << "'\n";
+            return 1;
+        }
+    }
 #ifdef _WIN32
     WSADATA data{};
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
@@ -537,6 +646,16 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
             if (request->method == "GET" && request->target == "/api/v1/environment") {
                 send_response(client, 200, "OK", environment_json(session).dump(),
                               "application/json; charset=utf-8", created_cookie);
+            } else if (request->method == "GET" && request->target.starts_with("/api/v1/files")) {
+                const auto relative_path = query_value(request->target, "path");
+                if (!relative_path) {
+                    send_response(client, 400, "Bad Request", R"({"error":"invalid file path"})");
+                } else if (const auto files = data_directory_json(data_directory, *relative_path)) {
+                    send_response(client, 200, "OK", files->dump(),
+                                  "application/json; charset=utf-8", created_cookie);
+                } else {
+                    send_response(client, 404, "Not Found", R"({"error":"directory not found"})");
+                }
             } else if (request->method == "POST" && request->target == "/api/v1/execute") {
                 const json body = json::parse(request->body);
                 const auto execution = session.repl.execute(body.value("source", ""));

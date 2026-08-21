@@ -3932,6 +3932,25 @@ auto subtree_scans_source(const ir::Node& node, const std::string& source_name) 
     return false;
 }
 
+/// Whether `a` and `b` scan any source in common -- the general form of
+/// `subtree_scans_source` for two arbitrary subtrees (either may be a single
+/// scan, a join, a chain of filters, anything). Used to gate running two
+/// subtrees concurrently: `LazyTable::cache_` is a plain, unsynchronized map,
+/// so two threads decoding the same source at once would race on it.
+auto subtrees_share_source(const ir::Node& a, const ir::Node& b) -> bool {
+    if (a.kind() == ir::NodeKind::Scan &&
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        subtree_scans_source(b, static_cast<const ir::ScanNode&>(a).source_name())) {
+        return true;
+    }
+    for (const auto& child : a.children()) {
+        if (child != nullptr && subtrees_share_source(*child, b)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// If `right` is a chain of Project/Rename nodes over a Scan whose name the
 /// driver registered as a deferred probe scan, return its registration. The
 /// driver only registers scans it proved eligible (ir::deferrable_probe_scans:
@@ -9333,6 +9352,17 @@ auto build_binary_materializing_operator(const ir::Node& left_node, const ir::No
                                          const ExternRegistry* externs,
                                          const ExecutionContext& exec, ModelResult* model_out,
                                          Fn fn) -> std::expected<OperatorPtr, std::string> {
+    // Multiple producers (plans/parallelism-overview.md): tried overlapping
+    // `left_node`/`right_node`'s materializations on a raw std::thread here
+    // and measured a net regression on the full PDS-H suite (q09 +57%,
+    // q04/q06/q07/q08/q19 also worse) -- this choke point is reached by
+    // deeply nested join chains (q09's 6-way join lowers to nested binary
+    // joins here), where each level's overlap spawns another producer thread
+    // that itself recurses into more pool work, oversubscribing the pool
+    // instead of overlapping two genuinely idle cores the way the single
+    // is_streamable_inner_join call site does. Reverted; see
+    // plans/parallelism-overview.md's "generalize multiple producers"
+    // section before trying again here.
     auto left = materialize_row_local(left_node, registry, scalars, externs, exec, model_out);
     if (!left.has_value()) {
         return std::unexpected(std::move(left.error()));
@@ -12084,6 +12114,12 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (streamable_semi_anti) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+            // Multiple producers: tried the same overlap as the inner-join
+            // site below here too, and it measured a net regression (q04
+            // +19% on the full PDS-H suite, isolated and reproduced under
+            // interleaved A/B) -- reverted. See
+            // plans/parallelism-overview.md's "generalize multiple
+            // producers" section before trying again here.
             auto left_op =
                 build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
             if (!left_op.has_value()) {
@@ -12115,13 +12151,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // Decided up front: it also gates the POC overlap below, which
             // only applies to the ordinary (non-probe) right side.
             const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
-            const ir::ScanNode* right_scan =
-                probe.scan == nullptr ? base_scan_of(*join.children()[1], /*through_filter=*/true)
-                                      : nullptr;
 
-            // POC — plans/parallelism-overview.md, "multiple producers": the
-            // left side's build and this join's own right-side materialize
-            // have no data dependency on each other, yet build_operator's
+            // Multiple producers (plans/parallelism-overview.md): the left
+            // side's build and this join's own right-side materialize have no
+            // data dependency on each other, yet build_operator's
             // single-threaded recursion runs them one after another. Confirmed
             // on q10 by direct profiling: the orders and lineitem filters run
             // in separate, non-overlapping windows summing to ~40% of the
@@ -12132,14 +12165,12 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             // non-reentrant guard) when it is structurally safe to: no
             // deferred probe (that path is required to stay sequential — its
             // filter is derived FROM the left/build side), no model output to
-            // race on (ModelResult* is not thread-safe), and the right side is
-            // a plain base scan whose source does not already appear in the
-            // left subtree (a self-join or repeated binding would race on
-            // `LazyTable::cache_`, which is a plain, unsynchronized map — see
-            // `subtree_scans_source`).
-            const bool overlap =
-                right_scan != nullptr && model_out == nullptr &&
-                !subtree_scans_source(*join.children()[0], right_scan->source_name());
+            // race on (ModelResult* is not thread-safe), and neither side
+            // scans a source the other also scans (a self-join or repeated
+            // binding would race on `LazyTable::cache_`, which is a plain,
+            // unsynchronized map — see `subtrees_share_source`).
+            const bool overlap = probe.scan == nullptr && model_out == nullptr &&
+                                 !subtrees_share_source(*join.children()[0], *join.children()[1]);
 
             std::expected<OperatorPtr, std::string> left_op;
             std::expected<Table, std::string> right;

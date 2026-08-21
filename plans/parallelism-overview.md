@@ -1456,6 +1456,53 @@ decide whether to generalize now that the mechanism is proven, or stop here
 — this section plus the diff in `chunked.cpp` (search `POC` there) is the
 resume point either way.
 
+**Generalization attempt (2026-08-21) — two of three reverted, net result
+flat.** Tried all three items above. Landed one, reverted two, after full-suite
+measurement (not just q10) showed why:
+
+1. *Widened `overlap`'s eligibility* at the original `is_streamable_inner_join`
+   site: dropped "right resolves to one base scan" in favor of a general
+   `subtrees_share_source(a, b)` (walks both arbitrary subtrees, checks for a
+   common `Scan` source) — kept. Full-suite interleaved A/B, 6 paired rounds,
+   SF-1, `IBEX_CORES=8`: geomean **-0.16%**, i.e. flat within noise. q10 itself
+   showed ~-3% here (smaller than the original isolated ~-8%, as expected —
+   more of the pool is contended once the whole suite, not just one query,
+   competes for it). No query regressed outside the noise band once re-checked
+   with more rounds (q11/q21 both looked like +5-7% "regressions" on a first
+   6-round pass and shrank to noise — -1.6%/+3.6% — on a second, dedicated
+   5-round pass; q06, which the diff doesn't touch at all, moved +4.4% on the
+   same first pass, confirming that band is box noise, not signal).
+2. *Same overlap in `streamable_semi_anti`*: added, then reverted. Isolated via
+   interleaved A/B (same methodology): q04 regressed **+19%**, reproduced
+   cleanly on a dedicated re-run of just q04/q06/q07/q08/q09/q19 with the
+   inner-join widening alone active (q04 was the only one of those still
+   moved; the rest were back to noise). q04's `exists` semi join's right side
+   is not the cheap single-scan case the original POC was scoped to, and
+   competing with the left side's own pool work for the join's build lost more
+   than the overlap gained.
+3. *Same overlap in `build_binary_materializing_operator`* (join fallback +
+   `Matmul`): added, then reverted — this was the dominant loss. q09 alone
+   went **+57%** with all three generalizations active; disabling only this
+   one dropped it back to ~+5% (within noise once re-measured interleaved).
+   Root cause: this choke point is where deeply nested join chains land (q09's
+   6-way join lowers to nested binary joins that *each* hit this function), so
+   each nesting level spawned another producer thread that itself recursed
+   into more pool submissions — oversubscribing the pool rather than
+   overlapping two genuinely idle cores the way the single-scan q10 case does.
+   The POC's "no model output, no shared source" safety gate says nothing
+   about *how much pool work* either side does, and at this choke point that
+   turned out to be the thing that mattered.
+
+**Lesson for next time a `chunked.cpp` change generalizes past its original,
+measured call site: re-measure the full suite, not the query that motivated
+the POC, and interleave — a first-pass 6-round full-suite table flagged two
+queries as regressed that were noise, and would have flagged q04 as fine
+had q04 not been in the initial per-query breakdown at all.** Net state after
+this session: item 1 kept (flat-to-slightly-positive, no measured downside),
+items 2 and 3 reverted with the reasoning above left in `chunked.cpp` as
+comments at both call sites, so a future attempt starts from what already
+failed rather than re-discovering it.
+
 ---
 
 ## Rejected: weakening first-occurrence group ordering

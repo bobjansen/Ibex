@@ -9,7 +9,8 @@ making it eligible for the existing two-phase mechanism, but broke q12
 before), because q12's build side has no real selectivity and the whole
 deferred-probe apparatus is pure overhead for it — the known, still-open
 `project_deferred_probe_no_cost_model.md` gap. Next step needs that
-estimate, not more streaming-mechanism work.
+estimate, not more streaming-mechanism work — scoped in
+[deferred-probe-selectivity-cost-model-plan.md](deferred-probe-selectivity-cost-model-plan.md).
 Written: 2026-08-21
 Revised: 2026-08-21 (Stage 1 complete — design narrowed, see "Stage 1 findings")
 Revised: 2026-08-21 (Stage 2 complete — see the Stage 2 entry under "Staged implementation")

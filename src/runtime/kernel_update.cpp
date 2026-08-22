@@ -749,10 +749,29 @@ auto try_shared_string_interpolation_update(const Chunk& input,
     return result;
 }
 
-/// The shared Table/Chunk binary writer owns values only; this Chunk adapter
-/// supplies the transport-preserving result shape and the expression's merged
-/// validity.  It intentionally runs before the older representation-specific
-/// helpers below, which remain as a conservative fallback during the port.
+/// Try exactly one field on every direct ChunkView family.  Multi-field
+/// updates call this in declaration order; if any field declines, their caller
+/// discards the tentative chunks and delegates the original update intact.
+auto try_direct_update_field(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                             const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_literal_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_numeric_tree_update(input, fields, scalars); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_string_length_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
+        return output;
+    }
+    return try_shared_string_interpolation_update(input, fields, scalars);
+}
+
 }  // namespace
 
 auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
@@ -1020,22 +1039,7 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
         bool all_direct = true;
         for (const auto& field : fields) {
             const std::vector<ir::FieldSpec> one_field{field};
-            std::optional<Chunk> next = try_metadata_alias_update(current, one_field);
-            if (!next.has_value()) {
-                next = try_literal_update(current, one_field);
-            }
-            if (!next.has_value()) {
-                next = try_numeric_tree_update(current, one_field, scalars);
-            }
-            if (!next.has_value()) {
-                next = try_string_length_update(current, one_field);
-            }
-            if (!next.has_value()) {
-                next = try_native_bool_update(current, one_field, scalars);
-            }
-            if (!next.has_value()) {
-                next = try_shared_string_interpolation_update(current, one_field, scalars);
-            }
+            auto next = try_direct_update_field(current, one_field, scalars);
             if (!next.has_value()) {
                 all_direct = false;
                 break;
@@ -1046,26 +1050,12 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             return current;
         }
     }
-    if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
-        return std::move(*output);
-    }
     if (!exec.parallel) {
-        if (auto output = try_literal_update(input, fields); output.has_value()) {
+        if (auto output = try_direct_update_field(input, fields, scalars); output.has_value()) {
             return std::move(*output);
         }
-        if (auto output = try_numeric_tree_update(input, fields, scalars); output.has_value()) {
-            return std::move(*output);
-        }
-        if (auto output = try_string_length_update(input, fields); output.has_value()) {
-            return std::move(*output);
-        }
-        if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
-            return std::move(*output);
-        }
-        if (auto output = try_shared_string_interpolation_update(input, fields, scalars);
-            output.has_value()) {
-            return std::move(*output);
-        }
+    } else if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
+        return std::move(*output);
     }
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;

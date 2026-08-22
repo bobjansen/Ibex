@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "ibex/runtime/table_properties.hpp"
+#include "kernel_update.hpp"
 #include "zorro.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
@@ -356,6 +357,12 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
 auto try_write_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange range,
                                   ExprType output_kind, const ScalarRegistry* scalars,
                                   std::int64_t* dst_int, double* dst_double) -> bool {
+    const auto kind = output_kind == ExprType::Int ? kernel::FixedWidthNumericKind::Int
+                                                   : kernel::FixedWidthNumericKind::Double;
+    if (kernel::write_fixed_width_numeric_binary(expr, PredicateInput(input), range, scalars, kind,
+                                                 {.ints = dst_int, .doubles = dst_double})) {
+        return true;
+    }
     const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
     if (bin == nullptr || (output_kind != ExprType::Int && output_kind != ExprType::Double)) {
         return false;

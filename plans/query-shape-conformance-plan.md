@@ -1,5 +1,9 @@
 # PDS-H query-shape conformance regression
 
+> References to `decode-fusion-plan.md` (removed from the tree
+> 2026-08-22; in git history) point at the original investigation whose
+> live findings this plan's Mechanism sections carry forward.
+
 ## Purpose
 
 Commit `eb5231c` ("Match query shapes") rewrote `benchmarking/tpch/queries/*.ibex`
@@ -18,7 +22,7 @@ plan's investigation so far.
 
 Related: [[project_join_reorder_cost_model]] and [[project_q02_q04_regression_two_bugs]]
 (memory) cover the join-order and semi/anti-join fixes already landed against
-the same realignment. [decode-fusion-plan.md](decode-fusion-plan.md)'s
+the same realignment. decode-fusion-plan.md (in git history)'s
 "Correction: ascription, `*`, and what it actually costs" and "SOLVED: filter
 pushdown is schema-blind over readers" sections (2026-07-17) are the ancestor
 of one of the four mechanisms below — re-verified still accurate against

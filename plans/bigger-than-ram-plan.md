@@ -6,7 +6,7 @@ Large datasets blow past RAM in two shapes: large archives at rest
 (many-GB-to-TB Parquet, often partitioned by date or another key) and ad hoc
 joins/sorts over history that's larger than the box. The chunked execution
 substrate
-(`plans/chunked-execution-plan.md`) already solved the *streaming compute*
+(the removed `plans/chunked-execution-plan.md`) already solved the *streaming compute*
 half of this — scan/filter/project/aggregate-on-sorted-input run in bounded
 memory today. What's missing is the *out-of-core* half: operators that are
 still correct only because they assume the working set fits in RAM, and a
@@ -14,7 +14,7 @@ storage layer (Parquet, ADBC) that still reads/writes whole tables at once
 instead of streaming row groups/batches.
 
 This plan is scoped to closing that gap. It does not revisit anything
-`chunked-execution-plan.md` already tracks (in-memory fusion, canonicalize
+the removed `chunked-execution-plan.md` tracked (in-memory fusion, canonicalize
 rules, streaming aggregate function coverage) — it assumes that substrate and
 adds the disk-spill and pushdown-read layer on top of it.
 
@@ -33,7 +33,7 @@ adds the disk-spill and pushdown-read layer on top of it.
 | Memory budgeting | No concept anywhere in the runtime of a memory ceiling, spill directory, or disk-backed intermediate. `grep spill` only turns up the categorical grouping "dense array vs hash map" *representation* switch (`src/runtime/chunked.cpp`), which is an in-memory algorithmic choice, not disk spill | Every "materializing" fallback above has no escape valve — it either fits or it OOMs |
 
 The throughline: every breaker that isn't yet chunk-native in
-`chunked-execution-plan.md`'s "Chunk-aware but materializing" table is also a
+the removed `chunked-execution-plan.md`'s "Chunk-aware but materializing" table is also a
 bigger-than-RAM risk. That plan tracks *whether an operator streams at all*;
 this plan tracks *what streaming operators do once their own state (a sort
 run, a hash build side, a Parquet row group) is itself too big for RAM*.
@@ -88,7 +88,7 @@ built on it.
 ### Phase 2 — External sort
 
 Replaces the "buffer all chunks, call `order_table`" fallback shared by
-`Order` and `AsTimeframe` (`chunked-execution-plan.md`'s materializing table,
+`Order` and `AsTimeframe` (the removed `chunked-execution-plan.md`'s materializing table,
 rows 1–2) with a real external merge sort:
 
 1. Accumulate chunks in memory, sort each run in place once the budget is
@@ -99,7 +99,7 @@ rows 1–2) with a real external merge sort:
    perspective.
 3. `Tail` on a non-`Order`/non-`Filter` child (currently `tail_table` on full
    materialization) becomes free once external sort exists for the
-   descending-key case, closing chunked-execution-plan's "Remaining fusion
+   descending-key case, closing the removed chunked-execution-plan's "Remaining fusion
    opportunities" item on streaming `Tail`.
 4. This also unblocks the *sorted* streaming `Aggregate`
    (`ChunkedSortedAggregateOperator`) for inputs that arrive unsorted but
@@ -268,7 +268,7 @@ spill correct and tested first.
   one) to the unbudgeted in-memory path. Add a parity test that forces
   spilling via a deliberately tiny `IBEX_MAX_MEMORY` and diffs against the
   unbudgeted run — the same technique already used for the streaming
-  std/skew/kurtosis parity test in `chunked-execution-plan.md`.
+  std/skew/kurtosis parity test in the removed `chunked-execution-plan.md`.
   Extend `tools/ibex_fusion_bench` (or a bigger-than-RAM counterpart) with a
   budgeted-vs-unbudgeted ratio check rather than just a pass/fail parity
   test, following the existing fusion-invariants-gate pattern.
@@ -292,7 +292,8 @@ spill correct and tested first.
 
 ## Relationship to Other Plans
 
-- **`plans/chunked-execution-plan.md`** is the prerequisite substrate: every
+- **`plans/chunked-execution-plan.md`** (removed from the tree 2026-08-22;
+  in git history) was the prerequisite substrate: every
   phase here targets a row in that plan's "Chunk-aware but materializing"
   table and turns "materializes, but bounded operator count" into
   "materializes only up to a memory budget, then spills." That plan's own

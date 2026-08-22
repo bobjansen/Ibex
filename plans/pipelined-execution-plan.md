@@ -6,7 +6,7 @@ join-probe handoff have landed. The general scheduler across arbitrary pipeline
 breakers remains open.
 Written 2026-08-14 from the thread sweep below; status updated 2026-08-16.
 Read `plans/runtime-multithreading-plan.md` and
-`plans/chunked-execution-plan.md` first; this proposes the thing both of them
+the removed `plans/chunked-execution-plan.md` first (git history); this proposes the thing
 stop short of, and it supersedes neither.
 
 ## The measurement that motivates it
@@ -124,7 +124,7 @@ No performance goal. Get more than one chunk flowing and find out what breaks.
   currently used only by islands and tests).
 - Run the full PDS-H answer check and the 1574-test suite with it on, at several
   grains including pathological ones (1 row, 1 chunk, prime-sized).
-- Extend the parity comparator (`plans/serial-parity-comparator-plan.md`) to
+- Extend the parity comparator (`plans/done/serial-parity-comparator-plan.md`) to
   assert chunked-vs-single-chunk equality structurally, not by diffing stdout.
 
 Exit criterion: every query is byte-identical at every grain. Expect real bugs

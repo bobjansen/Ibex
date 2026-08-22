@@ -1242,6 +1242,16 @@ first-occurrence group ordering — was considered and REJECTED; see below.)
      [[project_query_shape_conformance_regression]]'s Mechanism-3/5 mistake
      from the same session this note was written in.
 
+     **Partition-owned status (2026-08-22).** The first production piece of
+     that API landed (`4fedf2a4`): the PairIntKey shape runs default-on for
+     q20's `by { l_partkey, l_suppkey }` shape (-14.9% to -18.1% at 8 cores,
+     kill switch `IBEX_DISABLE_OWNED_PAIR_AGG=1`). The Int64 single-key
+     prototype (q18's shape) measured only -7.6% row-wise / flat
+     partition-outer against the ≥10% bar, was never promoted past its
+     `IBEX_AGG_PARTITION_MODE` env gate, and has been **removed** from the
+     tree — recoverable from `4fedf2a4` if a widening of the owned path ever
+     wants its two-ordering comparison back.
+
    **Net effect: item 9 as originally scoped is now much closer to done than
    open.** The one real remaining thread is the aggregate's partition-owned
    architecture question, which is a bigger project than "create parallel

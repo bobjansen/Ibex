@@ -2063,6 +2063,11 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
             runtime::ParallelIslandStats stats;
             require_tables_equal(serial, run_parallel(src, tables, 7, threads, &stats));
             CHECK(stats.parallel_fields.load() > 0);
+            // The direct writer intentionally accepts only one binary node;
+            // the nested first field below remains on the fused-tree fallback.
+            if (std::string_view(src) != "t[update { n = price * qty + 1 }][filter n > 100];") {
+                CHECK(stats.parallel_direct_numeric_fields.load() > 0);
+            }
         }
     }
 

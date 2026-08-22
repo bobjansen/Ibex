@@ -347,6 +347,137 @@ auto try_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange r
     return std::nullopt;
 }
 
+/// Write the simple arithmetic subset directly into a caller-owned dense
+/// range.  `evaluate_field_maybe_parallel` owns one full output column already;
+/// allocating a temporary column for every morsel and copying it into that
+/// output throws away the zero-copy property that makes field-level splitting
+/// worthwhile.  Keep this deliberately narrower than the fused tree below:
+/// decline is cheap and retains the established evaluator for nested calls.
+auto try_write_fast_update_binary(const ir::Expr& expr, const Table& input, RowRange range,
+                                  ExprType output_kind, const ScalarRegistry* scalars,
+                                  std::int64_t* dst_int, double* dst_double) -> bool {
+    const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
+    if (bin == nullptr || (output_kind != ExprType::Int && output_kind != ExprType::Double)) {
+        return false;
+    }
+    auto left = resolve_fast_operand(*bin->left, input, scalars);
+    auto right = resolve_fast_operand(*bin->right, input, scalars);
+    if (!left.has_value() || !right.has_value() || left->kind == ExprType::String ||
+        right->kind == ExprType::String || left->kind == ExprType::Date ||
+        right->kind == ExprType::Date || left->kind == ExprType::Timestamp ||
+        right->kind == ExprType::Timestamp) {
+        return false;
+    }
+
+    const std::size_t rows = range.count;
+    const std::size_t begin = range.begin;
+    if (output_kind == ExprType::Double) {
+        if (dst_double == nullptr) {
+            return false;
+        }
+        const double* lp = (left->is_column && left->kind == ExprType::Double)
+                               ? std::get<Column<double>>(*left->column).data() + begin
+                               : nullptr;
+        const double* rp = (right->is_column && right->kind == ExprType::Double)
+                               ? std::get<Column<double>>(*right->column).data() + begin
+                               : nullptr;
+        if ((!left->is_column || lp != nullptr) && (!right->is_column || rp != nullptr)) {
+            const double ls = left->is_column ? 0.0 : get_double_value(*left, 0);
+            const double rs = right->is_column ? 0.0 : get_double_value(*right, 0);
+            auto write = [&](auto op_fn) {
+                if (lp != nullptr && rp != nullptr) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        dst_double[i] = op_fn(lp[i], rp[i]);
+                } else if (lp != nullptr) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        dst_double[i] = op_fn(lp[i], rs);
+                } else if (rp != nullptr) {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        dst_double[i] = op_fn(ls, rp[i]);
+                } else {
+                    for (std::size_t i = 0; i < rows; ++i)
+                        dst_double[i] = op_fn(ls, rs);
+                }
+            };
+            switch (bin->op) {
+                case ir::ArithmeticOp::Add:
+                    write([](double a, double b) { return a + b; });
+                    break;
+                case ir::ArithmeticOp::Sub:
+                    write([](double a, double b) { return a - b; });
+                    break;
+                case ir::ArithmeticOp::Mul:
+                    write([](double a, double b) { return a * b; });
+                    break;
+                case ir::ArithmeticOp::Div:
+                    write([](double a, double b) { return a / b; });
+                    break;
+                case ir::ArithmeticOp::Mod:
+                    write([](double a, double b) { return std::fmod(a, b); });
+                    break;
+            }
+            return true;
+        }
+        for (std::size_t row = 0; row < rows; ++row) {
+            dst_double[row] = apply_double_op(bin->op, get_double_value(*left, begin + row),
+                                              get_double_value(*right, begin + row));
+        }
+        return true;
+    }
+
+    if (dst_int == nullptr) {
+        return false;
+    }
+    const std::int64_t* lp = (left->is_column && left->kind == ExprType::Int)
+                                 ? std::get<Column<std::int64_t>>(*left->column).data() + begin
+                                 : nullptr;
+    const std::int64_t* rp = (right->is_column && right->kind == ExprType::Int)
+                                 ? std::get<Column<std::int64_t>>(*right->column).data() + begin
+                                 : nullptr;
+    if ((!left->is_column || lp != nullptr) && (!right->is_column || rp != nullptr)) {
+        const std::int64_t ls = left->is_column ? 0 : get_int_value(*left, 0);
+        const std::int64_t rs = right->is_column ? 0 : get_int_value(*right, 0);
+        auto write = [&](auto op_fn) {
+            if (lp != nullptr && rp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    dst_int[i] = op_fn(lp[i], rp[i]);
+            } else if (lp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    dst_int[i] = op_fn(lp[i], rs);
+            } else if (rp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    dst_int[i] = op_fn(ls, rp[i]);
+            } else {
+                for (std::size_t i = 0; i < rows; ++i)
+                    dst_int[i] = op_fn(ls, rs);
+            }
+        };
+        switch (bin->op) {
+            case ir::ArithmeticOp::Add:
+                write([](std::int64_t a, std::int64_t b) { return a + b; });
+                break;
+            case ir::ArithmeticOp::Sub:
+                write([](std::int64_t a, std::int64_t b) { return a - b; });
+                break;
+            case ir::ArithmeticOp::Mul:
+                write([](std::int64_t a, std::int64_t b) { return a * b; });
+                break;
+            case ir::ArithmeticOp::Div:
+                write([](std::int64_t a, std::int64_t b) { return safe_idiv(a, b); });
+                break;
+            case ir::ArithmeticOp::Mod:
+                write([](std::int64_t a, std::int64_t b) { return safe_imod(a, b); });
+                break;
+        }
+        return true;
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        dst_int[row] = apply_int_op(bin->op, get_int_value(*left, begin + row),
+                                    get_int_value(*right, begin + row));
+    }
+    return true;
+}
+
 }  // namespace
 
 // Pure double→double row-wise math builtins (sqrt/log/exp/trig + the
@@ -2672,6 +2803,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     // Only the validity survives the task; the values are already in `out`.
     std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
     std::atomic<std::size_t> cursor{0};
+    std::atomic<bool> used_direct_numeric_writer{false};
     auto batch = pool.submit(threads, [&](std::size_t) {
         while (true) {
             const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
@@ -2680,7 +2812,16 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
             }
             const std::size_t begin = index * grain;
             const std::size_t count = std::min(grain, rows - begin);
-            auto piece = evaluate_field(expr, table, RowRange{.begin = begin, .count = count}, ctx);
+            const RowRange range{.begin = begin, .count = count};
+            if (try_write_fast_update_binary(
+                    expr, table, range, inferred.value(), ctx.scalars,
+                    dst_int != nullptr ? dst_int + begin : nullptr,
+                    dst_double != nullptr ? dst_double + begin : nullptr)) {
+                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
+                used_direct_numeric_writer.store(true, std::memory_order_relaxed);
+                continue;
+            }
+            auto piece = evaluate_field(expr, table, range, ctx);
             if (!piece.has_value()) {
                 pieces[index] = std::unexpected(std::move(piece.error()));
                 continue;
@@ -2709,6 +2850,11 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         }
     });
     batch.wait();
+
+    if (used_direct_numeric_writer.load(std::memory_order_relaxed) &&
+        exec.parallel_stats != nullptr) {
+        exec.parallel_stats->parallel_direct_numeric_fields.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Lowest failing morsel wins, so the reported error does not depend on
     // thread timing — the same rule the island merger uses.

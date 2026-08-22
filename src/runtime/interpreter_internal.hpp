@@ -102,13 +102,13 @@ class PredicateInput {
           rows_(
               [](const void* state) noexcept { return static_cast<const Table*>(state)->rows(); }),
           find_([](const void* state, const std::string& name) noexcept -> const ColumnEntry* {
-              const auto* table = static_cast<const Table*>(state);
-              return table->find_entry(name);
+              const auto* input_table = static_cast<const Table*>(state);
+              return input_table->find_entry(name);
           }),
           table_(&table) {}
 
-    PredicateInput(const void* state, RowsFn rows, FindFn find) noexcept
-        : state_(state), rows_(rows), find_(find) {}
+    PredicateInput(const void* state, RowsFn rows_fn, FindFn find_fn) noexcept
+        : state_(state), rows_(rows_fn), find_(find_fn) {}
 
     [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_(state_); }
     [[nodiscard]] auto find(const std::string& name) const noexcept -> const ColumnEntry* {

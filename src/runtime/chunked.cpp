@@ -10329,18 +10329,15 @@ void configure_parallel_from_env(ExecutionContext& exec) {
 // output identity for every input morsel. Keeping the construction (especially
 // FUP's gather set) here prevents the two planners from drifting as range-aware
 // kernels replace these chunked implementations.
-auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
-                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                  const ExecutionContext& exec, bool preserve_empty_morsels)
+auto build_row_local_map_operator(MapKernelCapability capability, const ir::Node& node,
+                                  OperatorPtr child, const ScalarRegistry* scalars,
+                                  const ExternRegistry* externs, const ExecutionContext& exec,
+                                  bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
     // The physical planner and the parallel-island builder meet here.  Both
     // consume the same closed construction-time capability rather than each
     // keeping a node-kind admission switch that can drift from the plan.
-    const auto capability = map_kernel_capability(node);
-    if (!capability.has_value()) {
-        return std::unexpected("row-local map factory: unsupported kernel capability");
-    }
-    switch (*capability) {
+    switch (capability) {
         case MapKernelCapability::FilterGather: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
             return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(),
@@ -10393,6 +10390,18 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
         }
     }
     return std::unexpected("row-local map factory: unknown kernel capability");
+}
+
+auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
+                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                  const ExecutionContext& exec, bool preserve_empty_morsels)
+    -> std::expected<OperatorPtr, std::string> {
+    const auto capability = map_kernel_capability(node);
+    if (!capability.has_value()) {
+        return std::unexpected("row-local map factory: unsupported kernel capability");
+    }
+    return build_row_local_map_operator(*capability, node, std::move(child), scalars, externs, exec,
+                                        preserve_empty_morsels);
 }
 
 // The base of one worker's island chain: a source the worker points at the
@@ -12378,7 +12387,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         if (!child.has_value()) {
             return child;
         }
-        return build_row_local_map_operator(node, std::move(child.value()), scalars, externs, exec,
+        return build_row_local_map_operator(plan.kernel_capabilities[index], node,
+                                            std::move(child.value()), scalars, externs, exec,
                                             false);
     }
     auto* entry = execution_profile_entry(exec.execution_profile, node);
@@ -12387,8 +12397,9 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
-            result = build_row_local_map_operator(node, std::move(result.value()), scalars, externs,
-                                                  exec, false);
+            result = build_row_local_map_operator(plan.kernel_capabilities[index], node,
+                                                  std::move(result.value()), scalars, externs, exec,
+                                                  false);
         }
     }
     if (!result.has_value()) {

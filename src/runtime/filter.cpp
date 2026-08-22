@@ -142,102 +142,6 @@ auto merge_validity(const ValidityBitmap* a, std::size_t a_off, const ValidityBi
 
 namespace {
 
-// values/mask mirror the _pext_u64(values, mask) intrinsic's own calling convention.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept -> std::uint64_t {
-#ifdef __BMI2__
-    return _pext_u64(values, mask);
-#else
-    std::uint64_t packed = 0;
-    unsigned out_bit = 0;
-    while (mask != 0) {
-        const auto bit = static_cast<unsigned>(std::countr_zero(mask));
-        packed |= ((values >> bit) & std::uint64_t{1}) << out_bit;
-        ++out_bit;
-        mask &= (mask - 1);
-    }
-    return packed;
-#endif
-}
-
-/// The words of a bit-packed output that a single gather may share with another
-/// gather running at the same time.
-///
-/// A gather writes a contiguous run of output bits, so it can only meet a
-/// neighbour at the two ends of that run: every word strictly between them has
-/// all 64 of its bits inside this run and is exclusively owned. Marking just
-/// those two words is what keeps the atomics off the hot loop.
-///
-/// When a run is short enough to sit inside one word, `first == last` and that
-/// single word is written atomically — which is also the case where three or
-/// more gathers can meet in one word, and it needs no special handling because
-/// OR is commutative and associative.
-struct SharedBitWords {
-    std::size_t first = 0;
-    std::size_t last = 0;
-
-    /// For a run of `count` bits starting at output bit `begin`. An empty run
-    /// writes nothing, so its bounds are never consulted.
-    [[nodiscard]] static auto of_run(std::size_t begin, std::size_t count) noexcept
-        -> SharedBitWords {
-        constexpr std::size_t kBitsPerWord = 64;
-        return {.first = begin / kBitsPerWord,
-                .last = (begin + (count == 0 ? 0 : count - 1)) / kBitsPerWord};
-    }
-
-    [[nodiscard]] auto contains(std::size_t word) const noexcept -> bool {
-        return word == first || word == last;
-    }
-};
-
-/// OR `bits` into output word `index`, atomically iff that word may be shared
-/// with a concurrent gather.
-///
-/// Sound only because every bit-packed destination is zero-filled before any
-/// gather runs and these writes only ever *set* bits — so the interleaving
-/// cannot matter. A write that had to clear a bit could not use this, which is
-/// why the validity gather below skips its false bits instead of assigning
-/// them. A plain store to an exclusively-owned word races with nothing: sharing
-/// a cache line with an atomic write is a performance question, not a
-/// correctness one.
-inline void or_bits_into_word(std::uint64_t* words, std::size_t index, std::uint64_t bits,
-                              SharedBitWords shared) noexcept {
-    if (bits == 0) {
-        return;
-    }
-    if (shared.contains(index)) {
-#ifdef __cpp_lib_atomic_ref
-        std::atomic_ref<std::uint64_t>(words[index]).fetch_or(bits, std::memory_order_relaxed);
-#else
-        // Apple's libc++ (macOS clang-werror leg) doesn't ship std::atomic_ref yet.
-        // std::atomic<uint64_t> is a lock-free integral specialization and therefore
-        // layout-compatible with a plain uint64_t, so a reinterpret_cast view gives
-        // the same fetch-OR without needing atomic_ref.
-        reinterpret_cast<std::atomic<std::uint64_t>*>(&words[index])
-            ->fetch_or(bits, std::memory_order_relaxed);
-#endif
-    } else {
-        words[index] |= bits;
-    }
-}
-
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
-                             Column<bool>::word_type* dst_words, std::size_t& out_bit,
-                             SharedBitWords shared) noexcept -> void {
-    if (count == 0) {
-        return;
-    }
-    constexpr std::size_t kBitsPerWord = sizeof(Column<bool>::word_type) * 8;
-    const std::size_t dst_word = out_bit / kBitsPerWord;
-    const auto shift = static_cast<unsigned>(out_bit % kBitsPerWord);
-    or_bits_into_word(dst_words, dst_word, packed << shift, shared);
-    if (shift != 0 && count > kBitsPerWord - shift) {
-        or_bits_into_word(dst_words, dst_word + 1, packed >> (kBitsPerWord - shift), shared);
-    }
-    out_bit += count;
-}
-
 auto pack_mask_word_scalar(const std::uint8_t* mp, const std::uint8_t* vp, std::size_t lim) noexcept
     -> std::uint64_t {
     std::uint64_t bits = 0;
@@ -2469,54 +2373,31 @@ void gather_selection_into(Table& output, const Table& input,
                         kernel::OutputSpan<Code>{
                             .data = out->codes_data(), .begin = dst.row, .count = sel.kept});
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
-                    const uint32_t* src_off = src.offsets_data();
-                    uint32_t* dst_off = out->offsets_data();
-                    char* dst_char = out->chars_data();
-                    const char* src_char = src.chars_data();
-                    auto cur = static_cast<uint32_t>(char_base);
-                    std::size_t j = dst.row;
-                    for_each_selected_row(sel, rows, [&](std::size_t si) {
-                        const uint32_t len = src_off[si + 1] - src_off[si];
-                        std::memcpy(dst_char + cur, src_char + src_off[si], len);
-                        cur += len;
-                        dst_off[++j] = cur;
-                    });
+                    kernel::gather_selected_strings(
+                        kernel::StringView{.offsets = src.offsets_data(),
+                                           .chars = src.chars_data(),
+                                           .rows = src.size()},
+                        kernel::Selection{kernel::RowWordBlocks{
+                            .words = sel.keep_words.data(),
+                            .word_count = sel.keep_words.size(),
+                            .row_base = rows.begin,
+                        }},
+                        kernel::StringOutputSpan{
+                            .offsets = out->offsets_data(),
+                            .chars = out->chars_data(),
+                            .begin = dst.row,
+                            .count = sel.kept,
+                            .char_base = static_cast<std::uint32_t>(char_base)});
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
-                    auto* dst_words = out->words_data();
-                    const auto shared = SharedBitWords::of_run(dst.row, sel.kept);
-                    std::size_t out_bit = dst.row;
-                    for (std::size_t w = 0; w < sel.keep_words.size(); ++w) {
-                        const std::uint64_t select = sel.keep_words[w];
-                        if (select == 0) {
-                            continue;
-                        }
-                        // `select` bit b is range row w*64+b, i.e. source row
-                        // rows.begin + w*64 + b — which is only word `w` of the
-                        // source when the range starts on a word boundary.
-                        // Otherwise the 64 source bits straddle two words.
-                        const std::size_t src_bit = rows.begin + (w * 64);
-                        std::uint64_t src_bits = 0;
-                        if (!src.is_external()) {
-                            const auto* __restrict src_words = src.words_data();
-                            const std::size_t src_words_n = (src.size() + 63) / 64;
-                            const std::size_t sw = src_bit / 64;
-                            const auto shift = static_cast<unsigned>(src_bit % 64);
-                            src_bits = src_words[sw] >> shift;
-                            if (shift != 0 && sw + 1 < src_words_n) {
-                                src_bits |= src_words[sw + 1] << (64 - shift);
-                            }
-                        } else {
-                            const std::size_t count =
-                                std::min<std::size_t>(64, src.size() - src_bit);
-                            for (std::size_t bit = 0; bit < count; ++bit) {
-                                src_bits |= static_cast<std::uint64_t>(src[src_bit + bit]) << bit;
-                            }
-                        }
-                        const std::uint64_t packed = pack_selected_bool_bits(src_bits, select);
-                        append_packed_bool_bits(packed,
-                                                static_cast<std::size_t>(std::popcount(select)),
-                                                dst_words, out_bit, shared);
-                    }
+                    kernel::gather_selected_bool(
+                        kernel::BoolView(src),
+                        kernel::Selection{kernel::RowWordBlocks{
+                            .words = sel.keep_words.data(),
+                            .word_count = sel.keep_words.size(),
+                            .row_base = rows.begin,
+                        }},
+                        kernel::BoolOutputSpan{
+                            .words = out->words_data(), .begin = dst.row, .count = sel.kept});
                 } else {
                     using T = ColT::value_type;
                     kernel::gather_selected(
@@ -2543,14 +2424,14 @@ void gather_selection_into(Table& output, const Table& input,
             const auto& src_bm = *src_entry.validity;
             auto& dst_bm = *dst_entry.validity;
             auto* dst_words = dst_bm.words_data();
-            const auto shared = SharedBitWords::of_run(dst.row, sel.kept);
+            const auto shared = kernel::SharedBitWords::of_run(dst.row, sel.kept);
             std::size_t j = dst.row;
             std::size_t word = shared.first;
             std::uint64_t acc = 0;
             for_each_selected_row(sel, rows, [&](std::size_t si) {
                 const std::size_t target = j / 64;
                 if (target != word) {
-                    or_bits_into_word(dst_words, word, acc, shared);
+                    kernel::or_bits_into_word(dst_words, word, acc, shared);
                     acc = 0;
                     word = target;
                 }
@@ -2559,7 +2440,7 @@ void gather_selection_into(Table& output, const Table& input,
                 }
                 ++j;
             });
-            or_bits_into_word(dst_words, word, acc, shared);
+            kernel::or_bits_into_word(dst_words, word, acc, shared);
         }
     }
 }

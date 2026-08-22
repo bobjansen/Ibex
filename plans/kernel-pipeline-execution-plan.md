@@ -412,6 +412,18 @@ Gates: debug ctest 1664/1664 and optimized kernel-map tests pass; the
 geomean over 88 cases.  Next: Phase 2 item 3's static dispatch table and
 capability declarations.
 
+**Phase 2 item 3, first slice (2026-08-22, pending performance gate).**
+`MapKernelCapability` declares the closed construction-time family:
+filter gather, metadata map, row-local update, filter-project gather, and
+filter-update-project gather.  The unconditional members live in one static
+table; the conditional Update member remains explicitly shape-checked.  Every
+migrated physical-plan step stores its selected capability, giving the plan an
+auditable dispatch choice before an operator is constructed.  Physical-plan
+tests pin the representative filter-project, metadata-map, and row-local
+update choices.  Gate so far: debug ctest 1664/1664.  Next: route the shared
+map-operator construction through this capability table, then run the
+interleaved A/B.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

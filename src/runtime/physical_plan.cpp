@@ -47,25 +47,7 @@ auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
 /// (updates parallelize inside the operator instead), which is an execution
 /// choice the physical plan must not inherit as a shape decision.
 auto is_map_step(const ir::Node& node) -> bool {
-    switch (node.kind()) {
-        case ir::NodeKind::Filter:
-        case ir::NodeKind::Project:
-        case ir::NodeKind::Rename:
-        case ir::NodeKind::FilterProject:
-        case ir::NodeKind::FilterUpdateProject:
-            return true;
-        case ir::NodeKind::Update: {
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            const auto& update = static_cast<const ir::UpdateNode&>(node);
-            return update.guard() == nullptr && update.group_by().empty() &&
-                   update.tuple_fields().empty() &&
-                   std::all_of(
-                       update.fields().begin(), update.fields().end(),
-                       [](const ir::FieldSpec& f) { return ir::is_row_local_update_expr(f.expr); });
-        }
-        default:
-            return false;
-    }
+    return map_kernel_capability(node).has_value();
 }
 
 /// Whether `node` can serve as a pipeline source, and with which kind.
@@ -112,6 +94,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             return plan;
         }
         plan.steps.push_back(cur);
+        plan.kernel_capabilities.push_back(*map_kernel_capability(*cur));
         cur = children.front().get();
     }
 

@@ -6,8 +6,41 @@
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
+#include <array>
 
 namespace ibex::runtime {
+
+auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKernelCapability> {
+    struct Entry {
+        ir::NodeKind kind;
+        MapKernelCapability capability;
+    };
+    // The unconditional members of the closed family.  This is consulted once
+    // at pipeline construction and copied into physical::Plan, never per row.
+    static constexpr std::array kTable{
+        Entry{ir::NodeKind::Filter, MapKernelCapability::FilterGather},
+        Entry{ir::NodeKind::Project, MapKernelCapability::MetadataMap},
+        Entry{ir::NodeKind::Rename, MapKernelCapability::MetadataMap},
+        Entry{ir::NodeKind::FilterProject, MapKernelCapability::FilterProjectGather},
+        Entry{ir::NodeKind::FilterUpdateProject, MapKernelCapability::FilterUpdateProjectGather},
+    };
+    for (const auto& entry : kTable) {
+        if (entry.kind == node.kind()) {
+            return entry.capability;
+        }
+    }
+    if (node.kind() == ir::NodeKind::Update) {
+        const auto& update = static_cast<const ir::UpdateNode&>(node);
+        if (update.guard() == nullptr && update.group_by().empty() &&
+            update.tuple_fields().empty() &&
+            std::ranges::all_of(update.fields(), [](const ir::FieldSpec& field) {
+                return ir::is_row_local_update_expr(field.expr);
+            })) {
+            return MapKernelCapability::RowLocalUpdate;
+        }
+    }
+    return std::nullopt;
+}
 
 auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
     switch (kind) {

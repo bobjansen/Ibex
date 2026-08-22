@@ -26,12 +26,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
+#include "kernel_gather.hpp"
 #include "runtime_internal.hpp"
 
 using namespace ibex;
@@ -211,5 +213,63 @@ TEST_CASE("a parallel validity gather equals a serial one", "[runtime][gather][p
     for (std::size_t i = 0; i < kRows; ++i) {
         CAPTURE(i);
         REQUIRE(serial[i] == parallel[i]);
+    }
+}
+
+TEST_CASE("kernel validity gather packs selected bits and preserves false output bits",
+          "[runtime][gather][kernel]") {
+    runtime::ValidityBitmap src{true, false, true, false, false, true, true, false, true};
+    const std::uint64_t selected[] = {0b1111'0111};
+    runtime::ValidityBitmap dst(7, false);
+
+    runtime::kernel::gather_selected_validity(
+        runtime::kernel::ValidityView(src),
+        runtime::kernel::Selection{
+            runtime::kernel::RowWordBlocks{.words = selected, .word_count = 1, .row_base = 0}},
+        runtime::kernel::BoolOutputSpan{.words = dst.words_data(), .begin = 0, .count = 7});
+
+    // Selected source rows are 0, 1, 2, 4, 5, 6, 7: validity is copied while
+    // false rows remain the zero-filled destination bits.
+    const bool expected[] = {true, false, true, false, true, true, false};
+    for (std::size_t i = 0; i < std::size(expected); ++i) {
+        CAPTURE(i);
+        CHECK(dst[i] == expected[i]);
+    }
+}
+
+TEST_CASE("kernel validity gather handles an externally offset source and adjoining windows",
+          "[runtime][gather][kernel]") {
+    // Logical source starts at bit 3, deliberately not a word or byte boundary.
+    const auto bytes = std::make_shared<std::vector<std::uint8_t>>(16, 0);
+    for (std::size_t i = 0; i < 100; ++i) {
+        if (i % 3 != 1) {
+            const std::size_t bit = 3 + i;
+            (*bytes)[bit / 8] |= std::uint8_t{1} << (bit % 8);
+        }
+    }
+    const std::shared_ptr<const void> owner = bytes;
+    const auto src = runtime::ValidityBitmap::from_external(owner, bytes->data(), 3, 100);
+    runtime::ValidityBitmap dst(103, false);
+    std::uint64_t select[2] = {~std::uint64_t{0}, (std::uint64_t{1} << 36) - 1};
+
+    // Two output windows meet in word 1.  Each only sets true bits, so their
+    // atomic OR boundary cannot clobber the other's false bits or true bits.
+    runtime::kernel::gather_selected_validity(
+        runtime::kernel::ValidityView(src),
+        runtime::kernel::Selection{
+            runtime::kernel::RowWordBlocks{.words = select, .word_count = 1, .row_base = 0}},
+        runtime::kernel::BoolOutputSpan{.words = dst.words_data(), .begin = 3, .count = 64});
+    runtime::kernel::gather_selected_validity(
+        runtime::kernel::ValidityView(src),
+        runtime::kernel::Selection{
+            runtime::kernel::RowWordBlocks{.words = select + 1, .word_count = 1, .row_base = 64}},
+        runtime::kernel::BoolOutputSpan{.words = dst.words_data(), .begin = 67, .count = 36});
+
+    CHECK_FALSE(dst[0]);
+    CHECK_FALSE(dst[1]);
+    CHECK_FALSE(dst[2]);
+    for (std::size_t i = 0; i < 100; ++i) {
+        CAPTURE(i);
+        CHECK(dst[3 + i] == (i % 3 != 1));
     }
 }

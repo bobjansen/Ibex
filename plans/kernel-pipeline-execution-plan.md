@@ -237,6 +237,37 @@ can distinguish an unsupported physical shape from an incorrect result.
 
 ### Phase 1 — introduce logical-to-physical planning beside `build_operator`
 
+**Status: landed (2026-08-22).** `src/runtime/physical_plan.{hpp,cpp}` define
+the Phase 1 vocabulary — `MapPipeline` (source + top-down map steps) and
+`MaterializedCall` with a structured reason — plus `explain_physical` and
+process-wide path counters. `build_operator_impl` consults the planner
+serially; a migrated plan composes the identical operator chain through
+`build_physical_map_step`, with per-step profile entries nested exactly as
+the per-kind switch's recursion produced them. Validated: full `ctest`
+(1651, including interpreter/codegen parity) and 22/22 `check_answers.py`
+under both `IBEX_PARALLEL` settings. Implementation notes, all deliberate:
+
+* **Serial executor only.** With `parallel` on, the island seam stays the
+  pipeline's executor (an island *is* the parallel mode of a map pipeline),
+  and a chain the seam declines at its root does not route into the planner:
+  the old recursion may still form an island around a shorter eligible
+  sub-chain (an ineligible outer predicate does not make an inner projection
+  ineligible), which a whole-chain plan would silently serialize.
+* **Fused kinds are first-class steps.** Canonicalize R5/R6 mean the tree
+  that exists is `FilterProject`/`FilterUpdateProject`, not
+  `Project(Filter(...))`; the planner lowers the tree as built.
+* **Update row-locality mirrors the switch, not `execution_capability`.**
+  Capability also declines a bare row-local update, but for island copy-cost
+  reasons (updates parallelize inside the operator); that is an execution
+  choice the plan must not inherit as a shape decision. `is_map_step`
+  duplicates the switch's own gate (no guard, no `by`, no tuple fields, all
+  fields `is_row_local_update_expr`) and must move in step with it.
+* **The plan borrows the IR** (like `ParallelIslandCandidate`) and must not
+  outlive it; `Plan::root`/`steps`/`source_node` are non-owning.
+* Source classification (`TableScan`/`LazyScan`/`ExternSource`) and the
+  three `FallbackReason`s cover the shapes the tests exercise; the vocabulary
+  grows when Phase 2 kernels need more than `const ir::Node*` steps.
+
 1. Define the physical node types and immutable `PhysicalPlan` arena/value
    ownership.
 2. Lower only `Scan → Filter → Project/Rename → row-local Update` into the

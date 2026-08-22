@@ -438,7 +438,7 @@ selection as the physical map executor replaces its remaining chunked adapter.
 
 **Phase 2 item 3, plan-to-factory handoff (2026-08-22, `598b6401`).** The
 serial physical composer now passes each capability recorded in
-`Plan::kernel_capabilities` directly to the shared map factory; it does not
+`Plan` directly to the shared map factory; it does not
 classify the IR again.  The parallel paths use the same factory through the
 one capability-producing wrapper at their construction boundary.  This makes
 the plan's dispatch choice executable rather than diagnostic-only.  Gates:
@@ -463,6 +463,18 @@ interleaved A/B against `HEAD~1` measured +1.19% total / 0.997× geomean over
 88 cases (0.999× for ibex-only).  Every case is noise; this metadata-only
 slice has no performance signal.  Next: make the map factory consume the
 signature when it replaces the remaining chunked adapter.
+
+**Phase 2 item 3, static factory dispatch (2026-08-22, pending performance
+gate).** `physical::Plan` now stores a `MapKernelDispatch` for every map step:
+the proven capability plus its factory function selected from the closed static
+table. The serial physical composer invokes that stored factory directly, so
+there is no capability switch at step execution. Parallel-island construction
+uses the same table through the compatibility wrapper. Tests pin a non-null
+factory for representative filter-project, metadata-map, and row-local-update
+plans; physical tests pass 79 assertions and full debug ctest passes
+1675/1675. This is construction-only dispatch work, so its automatic check is
+informational. Next: consume source signatures in an actual physical map
+executor, starting serially.
 
 **Row-local update kernel seam (2026-08-22, `27685ecd`).**
 `kernel::update_row_local_chunk` is now the one chunk-level entry point for

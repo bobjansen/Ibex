@@ -10306,67 +10306,94 @@ void configure_parallel_from_env(ExecutionContext& exec) {
 // output identity for every input morsel. Keeping the construction (especially
 // FUP's gather set) here prevents the two planners from drifting as range-aware
 // kernels replace these chunked implementations.
+auto build_filter_gather_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry* scalars,
+                             const ExternRegistry*, const ExecutionContext&,
+                             bool preserve_empty_morsels)
+    -> std::expected<OperatorPtr, std::string> {
+    const auto& filter = static_cast<const ir::FilterNode&>(node);
+    return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(), scalars,
+                                                   preserve_empty_morsels);
+}
+
+auto build_metadata_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry*,
+                        const ExternRegistry*, const ExecutionContext&, bool)
+    -> std::expected<OperatorPtr, std::string> {
+    if (node.kind() == ir::NodeKind::Project) {
+        const auto& project = static_cast<const ir::ProjectNode&>(node);
+        return std::make_unique<ChunkedProjectOperator>(std::move(child), &project.columns());
+    }
+    const auto& rename = static_cast<const ir::RenameNode&>(node);
+    return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
+}
+
+auto build_row_local_update_map(const ir::Node& node, OperatorPtr child,
+                                const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                const ExecutionContext& exec, bool)
+    -> std::expected<OperatorPtr, std::string> {
+    const auto& update = static_cast<const ir::UpdateNode&>(node);
+    return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(), scalars,
+                                                   externs, exec);
+}
+
+auto build_filter_project_gather_map(const ir::Node& node, OperatorPtr child,
+                                     const ScalarRegistry* scalars, const ExternRegistry*,
+                                     const ExecutionContext&, bool preserve_empty_morsels)
+    -> std::expected<OperatorPtr, std::string> {
+    const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+    return std::make_unique<ChunkedFilterProjectOperator>(
+        std::move(child), &fp.predicate(), &fp.columns(), scalars, preserve_empty_morsels);
+}
+
+auto build_filter_update_project_gather_map(const ir::Node& node, OperatorPtr child,
+                                            const ScalarRegistry* scalars,
+                                            const ExternRegistry* externs,
+                                            const ExecutionContext& exec,
+                                            bool preserve_empty_morsels)
+    -> std::expected<OperatorPtr, std::string> {
+    const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+    robin_hood::unordered_set<std::string> update_outputs;
+    robin_hood::unordered_set<std::string> needed;
+    for (const auto& field : fup.fields()) {
+        update_outputs.insert(field.alias);
+        collect_expr_column_refs(field.expr, needed);
+    }
+    for (const auto& column : fup.project_columns()) {
+        if (!update_outputs.contains(column.name)) {
+            needed.insert(column.name);
+        }
+    }
+    std::vector<ir::ColumnRef> gather_columns;
+    gather_columns.reserve(needed.size());
+    for (const auto& name : needed) {
+        gather_columns.push_back(ir::ColumnRef{.name = name});
+    }
+    return std::make_unique<ChunkedFilterUpdateProjectOperator>(
+        std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
+        std::move(gather_columns), scalars, externs, exec, preserve_empty_morsels);
+}
+
+auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory {
+    static constexpr std::array<MapKernelFactory, 5> factories{
+        &build_filter_gather_map,
+        &build_metadata_map,
+        &build_row_local_update_map,
+        &build_filter_project_gather_map,
+        &build_filter_update_project_gather_map,
+    };
+    const auto index = static_cast<std::size_t>(capability);
+    return index < factories.size() ? factories[index] : nullptr;
+}
+
 auto build_row_local_map_operator(MapKernelCapability capability, const ir::Node& node,
                                   OperatorPtr child, const ScalarRegistry* scalars,
                                   const ExternRegistry* externs, const ExecutionContext& exec,
                                   bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    // The physical planner and the parallel-island builder meet here.  Both
-    // consume the same closed construction-time capability rather than each
-    // keeping a node-kind admission switch that can drift from the plan.
-    switch (capability) {
-        case MapKernelCapability::FilterGather: {
-            const auto& filter = static_cast<const ir::FilterNode&>(node);
-            return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(),
-                                                           scalars, preserve_empty_morsels);
-        }
-        case MapKernelCapability::MetadataMap: {
-            if (node.kind() == ir::NodeKind::Project) {
-                const auto& project = static_cast<const ir::ProjectNode&>(node);
-                return std::make_unique<ChunkedProjectOperator>(std::move(child),
-                                                                &project.columns());
-            }
-            const auto& rename = static_cast<const ir::RenameNode&>(node);
-            return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
-        }
-        case MapKernelCapability::RowLocalUpdate: {
-            // Only reachable for an update `execution_capability(const Node&)`
-            // proved row-local: unguarded, ungrouped, scalar-only fields, no
-            // tuple assignment. An update never drops rows, so it needs no
-            // empty-morsel handling to stay 1:1.
-            const auto& update = static_cast<const ir::UpdateNode&>(node);
-            return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(),
-                                                           scalars, externs, exec);
-        }
-        case MapKernelCapability::FilterProjectGather: {
-            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
-            return std::make_unique<ChunkedFilterProjectOperator>(
-                std::move(child), &fp.predicate(), &fp.columns(), scalars, preserve_empty_morsels);
-        }
-        case MapKernelCapability::FilterUpdateProjectGather: {
-            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-            robin_hood::unordered_set<std::string> update_outputs;
-            robin_hood::unordered_set<std::string> needed;
-            for (const auto& field : fup.fields()) {
-                update_outputs.insert(field.alias);
-                collect_expr_column_refs(field.expr, needed);
-            }
-            for (const auto& column : fup.project_columns()) {
-                if (!update_outputs.contains(column.name)) {
-                    needed.insert(column.name);
-                }
-            }
-            std::vector<ir::ColumnRef> gather_columns;
-            gather_columns.reserve(needed.size());
-            for (const auto& name : needed) {
-                gather_columns.push_back(ir::ColumnRef{.name = name});
-            }
-            return std::make_unique<ChunkedFilterUpdateProjectOperator>(
-                std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-                std::move(gather_columns), scalars, externs, exec, preserve_empty_morsels);
-        }
+    const MapKernelFactory factory = map_kernel_factory(capability);
+    if (factory == nullptr) {
+        return std::unexpected("row-local map factory: unknown kernel capability");
     }
-    return std::unexpected("row-local map factory: unknown kernel capability");
+    return factory(node, std::move(child), scalars, externs, exec, preserve_empty_morsels);
 }
 
 auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
@@ -12364,9 +12391,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         if (!child.has_value()) {
             return child;
         }
-        return build_row_local_map_operator(plan.kernel_capabilities[index], node,
-                                            std::move(child.value()), scalars, externs, exec,
-                                            false);
+        return plan.kernel_dispatch[index].factory(node, std::move(child.value()), scalars, externs,
+                                                   exec, false);
     }
     auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
@@ -12374,9 +12400,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
-            result = build_row_local_map_operator(plan.kernel_capabilities[index], node,
-                                                  std::move(result.value()), scalars, externs, exec,
-                                                  false);
+            result = plan.kernel_dispatch[index].factory(node, std::move(result.value()), scalars,
+                                                         externs, exec, false);
         }
     }
     if (!result.has_value()) {

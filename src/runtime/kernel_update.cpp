@@ -3,6 +3,8 @@
 
 #include "kernel_update.hpp"
 
+#include <ibex/runtime/safe_arith.hpp>
+
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "kernel_types.hpp"
@@ -60,8 +62,7 @@ auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir:
         return std::nullopt;
     }
     const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
-    if (binary == nullptr || binary->op == ir::ArithmeticOp::Div ||
-        binary->op == ir::ArithmeticOp::Mod) {
+    if (binary == nullptr) {
         return std::nullopt;
     }
     const auto* left = std::get_if<ir::ColumnRef>(&binary->left->node);
@@ -101,9 +102,12 @@ auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir:
             for (std::size_t row = 0; row < view.rows(); ++row)
                 output[row] = lhs.value(row) * rhs.value(row);
             break;
-        case ir::ArithmeticOp::Mod:
         case ir::ArithmeticOp::Div:
             return std::nullopt;
+        case ir::ArithmeticOp::Mod:
+            for (std::size_t row = 0; row < view.rows(); ++row)
+                output[row] = safe_imod(lhs.value(row), rhs.value(row));
+            break;
     }
 
     std::optional<ValidityBitmap> validity;
@@ -145,8 +149,7 @@ auto try_fixed_width_int_literal_update(const Chunk& input,
     if (fields.size() != 1)
         return std::nullopt;
     const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
-    if (binary == nullptr || binary->op == ir::ArithmeticOp::Div ||
-        binary->op == ir::ArithmeticOp::Mod)
+    if (binary == nullptr)
         return std::nullopt;
     const auto* left_column = std::get_if<ir::ColumnRef>(&binary->left->node);
     const auto* right_column = std::get_if<ir::ColumnRef>(&binary->right->node);
@@ -188,8 +191,10 @@ auto try_fixed_width_int_literal_update(const Chunk& input,
                 output[row] = value * *scalar;
                 break;
             case ir::ArithmeticOp::Div:
-            case ir::ArithmeticOp::Mod:
                 return std::nullopt;
+            case ir::ArithmeticOp::Mod:
+                output[row] = column_left ? safe_imod(value, *scalar) : safe_imod(*scalar, value);
+                break;
         }
     }
     std::optional<ValidityBitmap> validity;

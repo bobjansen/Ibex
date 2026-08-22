@@ -545,6 +545,17 @@ interleaved A/B against `HEAD~1` measured −0.22% total / 0.998× geomean over
 This is neutral noise. Next: extract checked integer divide/modulo only with
 their established zero-divisor contract, keeping parallel updates delegated.
 
+**Checked Int64 modulo update port (2026-08-22, pending performance gate).**
+The Int64 view kernels now use `safe_imod` for column-pair and literal modulo,
+preserving the language's zero-divisor-to-zero contract. Int64 division stays
+on `update_table`: its inferred result type is Double, so treating it as an
+Int64 output would violate the existing evaluator contract. These computed
+kernels remain serial-only while parallel updates retain evaluator scheduling
+and accounting. Focused kernel coverage pins literal zero-divisor behavior;
+full debug ctest passes 1674/1674. Next: run one combined A/B, then move to
+the next bounded row-local shape only if it has a similarly clear output and
+validity contract.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

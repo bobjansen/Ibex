@@ -5,8 +5,13 @@ the pipelined-execution Phase 2 slices (streamed scan units, concurrent decode,
 source→map pipeline, join-probe handoff) landed. This is the umbrella plan: it
 sets the target, decomposes the remaining gap into workstreams with expected
 payoffs, and sequences them. It supersedes nothing — it points into
-`pipelined-execution-plan.md`, `runtime-multithreading-plan.md`,
-`chunked-execution-plan.md`, and `join-perf-plan.md` for mechanism.
+`pipelined-execution-plan.md`, `runtime-multithreading-plan.md`, and
+`join-perf-plan.md` for mechanism (the former fourth input,
+`chunked-execution-plan.md`, was removed from the tree 2026-08-22; its
+open items live in the kernel-pipeline plan and bigger-than-ram).
+Absorbed `pds.md` (the 2026-08-11 status snapshot this grew out of) on
+2026-08-22: §5 and §6 took its still-unique traps and dead ends, §8 keeps
+its baseline record.
 
 ## 1. What "beat Polars" means, in numbers
 
@@ -397,8 +402,9 @@ when a consumer actually requires contiguity. Consumers that iterate chunks
 contiguous view is built at most once on first demand (same pattern as
 `LazyTable::cache_`, same single-query lease making it safe).
 
-This is `chunked-execution-plan.md` territory and touches the binding/registry
-contract, so scope it as its own design note before coding. It is the only way
+This touches the binding/registry contract (formerly
+`chunked-execution-plan.md` territory; that file is in git history), so
+scope it as its own design note before coding. It is the only way
 the "wins track output size" ceiling lifts; without it every streamed query that
 binds a large intermediate pays a copy Polars doesn't.
 
@@ -497,7 +503,20 @@ predicted win survives measurement.
   canary for scan health), q18/q21/q22 (sink concat), q20 (aggregate gates),
   2-core totals (the cliff).
 - Interleaved A/B with a layout control for anything narrower than the suite;
-  ±10% box drift means never compare absolute totals across sessions.
+  ±10% box drift means never compare absolute totals across sessions. Drift
+  quantified once and worth keeping (from the pds.md baseline): a single round
+  resolves nothing under ~10%; three rounds resolve ~5%; ~5% effects need 5+
+  interleaved rounds; ~3% needed 18. Several apparent findings evaporated at
+  higher round counts.
+- **The data symlink flips per scale factor.**
+  `benchmarking/data/tpch/parquet` is a symlink the bench script retargets;
+  pin explicit `parquet_sf<N>` paths in any A/B or a stale symlink silently
+  doubles every number.
+- **The serial-vs-parallel answer diff has exactly three legitimate
+  exceptions** — q01, q09, q15 differ in the last ulp from the parallel
+  group-by float reduction (deterministic across thread counts, unlike the
+  serial summation order). Every other output must be byte-identical; a diff
+  showing a fourth file is a bug, not drift.
 - **Allocation-shaped changes must also be measured cold.** The harness runs 22
   queries in one warm process, so the allocator hands back already-faulted pages
   and first-touch cost is invisible to it — W2's slot fill is −4.3% on a cold
@@ -521,7 +540,25 @@ decode window (+52% RSS, zero wall); static one-producer admission gate;
 lowering the int-partition row gate; footer-bytes small-query gate; naive
 morsel islands around 1:1 operators; AVX2 filter left-pack; more island
 *coverage* (pushdown structurally excludes it — intra-operator and pipeline
-parallelism are the only tools that fit PDS-H).
+parallelism are the only tools that fit PDS-H). Two more, carried from the
+pds.md baseline because they are recorded nowhere else:
+
+- **Categorical code hashing in the generic group-by path.** Hashing and
+  comparing Categorical keys by dictionary code bought only 8% and produced
+  **wrong answers on q16**: its group keys come from a join, so different
+  chunks carry different dictionaries and codes are not comparable. The
+  single-Cat fast path survives only on "dictionaries only grow and never
+  reorder", which stops holding once a join sits between source and group-by.
+  A sound version needs per-column dictionary-pointer tracking plus an index
+  rebuild on every new dictionary — real machinery for 8%. Related trap:
+  q10's expensive key columns (`c_name`, `c_address`, `c_phone`, `c_comment`)
+  are `Column<std::string>`, NOT Categorical — their Parquet pages fall back
+  to PLAIN when the dictionary overflows. Any plan assuming TPC-H strings
+  are Categorical is wrong.
+- **Functional-dependency group-key reduction** — built, passed everything,
+  reverted because the discovery point does not cover q10 (customer is never
+  the build side, so `c_custkey`'s uniqueness is never observed). Full
+  narrative and the two bugs found while building it: §8.4.
 
 ## 7. What winning looks like
 
@@ -531,3 +568,133 @@ Polars at every core count**, which is the headline the single-core work
 earned and the multi-core work has so far been giving away. Re-verify at SF-4
 and on the AWS 4-physical-core box before publishing any number
 ([[project_bench_two_tier_framework]]).
+
+## 8. Appendix — the PDS-H baseline record (was `pds.md`, 2026-08-11)
+
+`pds.md` was the status snapshot taken at `f916e13`, five days before this
+plan; the plan's §1–§5 supersede its analysis. Kept here, compressed, are the
+things that exist nowhere else: the full per-query standings, the provenance
+of its six open levers, and two findings with design detail worth preserving.
+The original file is in git history at the commit that absorbed it.
+
+### 8.1 Standings, 2026-08-11 (min of 5, 8 pinned cores, whole-script)
+
+SF-1:
+
+| query | ibex | ibex-st | polars | polars-st | ibex/polars | st/st |
+|---|---:|---:|---:|---:|---:|---:|
+| q01 | 70.8 | 202.4 | 68.7 | 296.5 | 1.03x | 0.68x |
+| q02 | 27.8 | 27.5 | 39.0 | 56.7 | 0.71x | 0.48x |
+| q03 | 49.6 | 71.5 | 31.4 | 86.6 | 1.58x | 0.82x |
+| q04 | 69.8 | 93.6 | 31.9 | 87.6 | 2.19x | 1.07x |
+| q05 | 73.8 | 122.9 | 53.0 | 144.6 | 1.39x | 0.85x |
+| q06 | 15.5 | 43.7 | 12.7 | 28.2 | 1.23x | 1.55x |
+| q07 | 47.4 | 80.7 | 110.1 | 265.8 | 0.43x | 0.30x |
+| q08 | 32.3 | 73.1 | 43.5 | 96.4 | 0.74x | 0.76x |
+| q09 | 98.9 | 168.1 | 83.0 | 225.8 | 1.19x | 0.74x |
+| q10 | 92.3 | 113.5 | 43.3 | 92.3 | 2.13x | 1.23x |
+| q11 | 24.1 | 24.1 | 22.5 | 22.8 | 1.07x | 1.06x |
+| q12 | 42.3 | 70.7 | 37.4 | 124.9 | 1.13x | 0.57x |
+| q13 | 193.9 | 185.7 | 108.5 | 209.4 | 1.79x | 0.89x |
+| q14 | 18.8 | 38.5 | 10.7 | 29.6 | 1.75x | 1.30x |
+| q15 | 31.0 | 47.7 | 23.0 | 56.3 | 1.35x | 0.85x |
+| q16 | 61.4 | 54.2 | 26.2 | 33.3 | 2.34x | 1.63x |
+| q17 | 17.8 | 41.6 | 81.9 | 350.0 | 0.22x | 0.12x |
+| q18 | 184.7 | 192.0 | 176.2 | 641.0 | 1.05x | 0.30x |
+| q19 | 35.8 | 59.6 | 16.0 | 50.4 | 2.23x | 1.18x |
+| q20 | 114.1 | 131.5 | 50.2 | 179.8 | 2.27x | 0.73x |
+| q21 | 194.6 | 235.0 | 285.9 | 1020 | 0.68x | 0.23x |
+| q22 | 33.1 | 36.5 | 26.2 | 41.4 | 1.26x | 0.88x |
+| **total** | **1.53 s** | 2.11 s | 1.38 s | 4.14 s | **1.11x** | 0.51x |
+| **geomean** | 52.4 | 77.6 | 44.2 | 109.8 | **1.19x** | **0.71x** |
+
+SF-2 (same protocol): total 3.08 s / 2.59 s (1.19x), geomean 1.30x, st/st
+0.68x; MT gain ibex 1.60×, polars 3.08×. The gap concentrated in q10
+(2.13×→2.95×), q16 (2.34×→3.28×), q13 (1.79×→2.40×). Comfortably ahead: q17,
+q07, q21, q02, q08 — the dynamic-filter-pushdown and semi-join queries.
+
+The framing that survives from these tables: single-threaded Ibex was ahead
+(st/st 0.71×/0.68×) and the whole deficit was scaling — which is why §1's
+arithmetic (don't match Polars' scaling, raise the parallel fraction from ~44%
+to ~60–65%) is the strategy.
+
+### 8.2 The 2026-08-11 round — decode parallelism
+
+Seven commits, cumulative suite effect ≈ −3.7% then −14%; ibex MT gain
+1.01× → 1.48×/1.60×: `f86465c` parallel Parquet decode, `ac5713c` parallel
+group-by accumulate, `c838a35` range-split fused-bounds filter, `ec0bf8b`
+ExecutionContext-driven decoder, `ec62911` row-range gather, `ac60c6d`
+row-group key-filter scan (q17 −28%), `f916e13` row-group fixed-width decode.
+
+Two lessons that generalized: **our own pushdown competes with the
+parallelizer** (projection pushdown and late materialization strip the join
+emit to one column so a column-axis gather has nothing to split; decode
+fusion leaves no operator for the island planner to thread), and **queue
+indivisible tasks first** (q01's whole-column dictionary decodes queued
+behind ~30 shard tasks set the finish time; reordering turned 6.5% slower
+into 13.7% faster).
+
+### 8.3 Where the six 2026-08-11 levers went
+
+| lever | disposition |
+|---|---|
+| 1. Parallel high-cardinality group discovery | DONE for integer keys (q18 −20%, q20 −12.5%, q13 −10%); the PairIntKey partition-owned path landed 2026-08-21 (`4fedf2a4`, q20 −14.9…−18.1% at 8c) |
+| 2. Fuse q13's join into aggregation | landed 2026-08-18 (`6ed55728`, join/count fusion; profiled 149→126 ms, whole-script median ~104 ms) |
+| 3. q10 mixed-key fast paths / redundant group keys | the FD-reduction half was built and reverted (§8.4); the mixed-key coverage notes live in `parallelism-overview.md`'s aggregate sections |
+| 4. q16 `distinct`, q04 semi-join | q04's serial swapped-build landed (`7fde36d`, q04 53.5→~32 ms); q16's composite-categorical distinct remains the I3 gap in `parallelism-overview.md` |
+| 5. Multithreaded scheduling across operators | W3 above |
+| 6. Small-query decode-threading tax | W5 above |
+
+Also from that round, now tracked elsewhere: the filter-only string column is
+never materialized (`2975559`, q13 −17.8%; design and traps in
+`decode-fusion-plan.md`), and the operator-profile mechanics
+(`serial_fraction`, `amdahl_ceiling`, occupancy) are documented in
+`MEASURING.md`.
+
+### 8.4 Functional-dependency group-key reduction — built, reverted
+
+The full mechanism was implemented — `FunctionalDependency` on
+`TableProperties` with a transitive closure, a `derive()` rule retiring a
+dependency when either end is dropped/renamed/overwritten, join-side emission
+from the existing `build_unique_` flag, and aggregate-side key reduction
+rewriting dropped keys as `first()` aggregates. It compiled, passed 22/22
+answers and the full test suite.
+
+Reverted because **the discovery point does not cover q10.** Every
+`build_index` call shows the three joins building on `nation(c_nationkey)`,
+`orders(c_custkey)`, and `cust_orders(o_orderkey)` — `customer` is never the
+build side (the planner correctly indexes the smaller filtered `orders`,
+57,069 rows, and probes with `customer`, 150,000), so `customer.c_custkey`'s
+uniqueness is never observed. The discoverable dependency
+(`o_orderkey -> everything`) has a determinant that is not a group key, and
+`o_orderkey -> c_name` does not yield `c_custkey -> c_name`.
+
+Two bugs found while building it, worth knowing if it is rebuilt:
+
+- The indexed side's key column is usually **not in the join output** — an
+  equi-join emits one copy, from the other side — so the determinant must be
+  looked up under the counterpart key's name.
+- Nulls break the claim: two rows null in the determinant need not come from
+  the same source row, so a dependency may only be claimed for a column with
+  no validity bitmap. An inner join's own key is safe (a null key matches
+  nothing).
+
+To make it fire, uniqueness must be observed on the **probe** side (a
+duplicate-detection set over already-hashed probe keys — ~150k inserts of
+speculative work) or at the scan. A design fork needing its own measurement.
+
+### 8.5 Mapped join keys were a silent deoptimization (`465d0d3`)
+
+`a join b on { id_1 = id_2 }` was answer-equivalent to the rename-to-match
+idiom and slower: filter pushdown, semi/anti pushdown (q18's essential
+rewrite), the reorder cost model (q03 −23%, q02 −29%), join ordering, and
+deferrable-probe registration all key on bare column names, so the mapped
+spelling lost every one. Rewriting q03 to it cost **+13.4% min / +16.4%
+median**. The passes were not wrong; nothing normalized their input.
+`ir::normalize_mapped_join_keys` now renames the right side's key to the
+left's wherever the fold is unobservable (Inner/Left/Semi/Anti, right key
+unread above, no cross-side name collision), from `push_filters_into_joins`
+which precedes every other join pass. Residual, documented at each gate:
+Right and Outer joins, and any join whose right key column really is read
+above it — those need an order-restoring Project or an equivalence-class key
+model in `join_reorder`/`join_order`.

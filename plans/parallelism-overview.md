@@ -1641,6 +1641,54 @@ branch-concurrency experiment.
 
 ---
 
+## Deferred-probe streaming: stopped, code removed, reopening conditions
+
+The deferred-probe streaming plan (and its selectivity-cost-model scoping
+follow-up) were removed from the tree on 2026-08-22 after this sequence;
+this section is the durable residue. Full history: git history at the
+removal commit's parent (`deferred-probe-streaming-plan.md`,
+`deferred-probe-selectivity-cost-model-plan.md`).
+
+**What happened.** Stage 1 (mapping `LazyTable`/deferred-probe/`DeferredScanSourceOperator`
+onto the existing demand machinery) landed and is production. Stage 2 (a
+streaming probe path for bare, unwrapped probe scans, `c5ab31ca`) was
+instrumented as unreachable — every registering query resolves via
+`try_two_phase_probe` first — and was removed. Stage 3 (admitting a row-local
+`Filter` above the probe scan) was measured and reverted: q03 won 2.6–3.2×
+at 1 core by finally reaching the *existing* two-phase mechanism, but q12
+collapsed at 2/8 cores because its build side (`orders`, unfiltered,
+referentially complete) covers the probe key domain — the Bloom rejects
+nothing and the whole apparatus is pure overhead. Stage 4 was never started.
+
+**The trap worth keeping verbatim.** Stage 3's first cut had a real
+correctness bug caught by `check_answers.py` before any benchmarking:
+`try_two_phase_probe`'s `Precomputed` branch computes its `li`/`ri` output
+indices from a hash probe over candidate rows *before*
+`interpret_wrapped_right` runs the wrapper chain — sound while the chain is
+Project/Rename/Update (always 1:1), wrong the moment a newly-admitted Filter
+can drop rows there, desyncing precomputed indices from the shorter
+`right_`. This class — an old "this scan is never Filter-wrapped" invariant
+silently baked into a hash-probe-then-materialize shortcut — will recur
+anytime probe-side eligibility widens.
+
+**Reopening conditions (the selectivity cost model, scoped but unbuilt).**
+The registration gate is a row-count proxy
+(`build_side_worth_deferring`: estimated build rows × 2 < probe rows); it
+cannot see key-domain coverage, which is what the decision needs. Three
+prior attempts already rule out the obvious designs: a structural
+"was this side filtered" proxy (reverted, −10.3% suite — wrongly declines
+q08's unfiltered-but-genuinely-small `part`); sampled distinct counts; and
+footer distinct counts (inflated on `l_orderkey`-shaped columns). The
+surviving candidate: trace the build key's origin table via
+`column_origin_of` and compare that table's own row count to the build
+side's estimated filtered rows — q03-shaped joins (filtered build side over
+a larger domain) pass, q12-shaped (unfiltered, referentially complete)
+decline at registration time. Validation gates if built: q03/q12/q08 as the
+pass/decline/decline trio, `check_answers.py` both `IBEX_PARALLEL`
+settings, and the full-suite interleaved A/B that killed Stage 3.
+
+---
+
 ## Rejected: weakening first-occurrence group ordering
 
 Considered and turned down on 2026-08-17. Recorded because the argument for it

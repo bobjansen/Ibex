@@ -7,12 +7,20 @@ logical planning, physical pipelines, and morsel execution, while explicitly
 rejecting query JIT/code generation. Ibex's execution backend remains compiled
 C++ with a broad library of specialized, template-instantiated vector kernels.
 
-Read [MEASURING.md](../MEASURING.md),
-[parallelism-overview.md](parallelism-overview.md), and
-[chunked-execution-plan.md](chunked-execution-plan.md) first. This plan owns
-the *architecture* that eventually replaces their ad-hoc execution seams; it
-does not invalidate their correctness contracts, chunked-source work, or
-existing measured kernel improvements.
+Read [MEASURING.md](../MEASURING.md) and
+[parallelism-overview.md](parallelism-overview.md) first.
+`chunked-execution-plan.md` — formerly the third input here — was removed
+from the tree on 2026-08-22 (in git history); this plan owns
+the *architecture* that replaces its ad-hoc execution seams and does not
+invalidate its correctness contracts, chunked-source work, or
+existing measured kernel improvements. Its three open items were absorbed:
+the extern chunked-source contract (stable schema, ownership, categorical
+dictionaries, EOF/error signalling) belongs with Phase 0/2's contract
+documentation and bigger-than-ram's Phase 4;
+`MaterializeOperator`'s schema/dictionary/validity-across-chunks hardening
+is Phase 2's validity-API work; the materializing breakers are Phase 4/5's
+own list. Its R1–R21 canonicalize table is documented in-source
+(`include/ibex/ir/canonicalize.hpp`).
 
 ## Why make this change
 
@@ -226,8 +234,9 @@ already existed, and where the remainder lives — so the phase gate reads as
 a decision rather than an accident.
 
 1. **Contract documentation — deferred, now Phase 2's first deliverable.**
-   The knowledge exists (parallelism-overview Part 1, chunked-execution-plan,
-   the `operator.hpp`/`morsel.hpp` doc comments) but not in one place.
+   The knowledge exists (parallelism-overview Part 1, the removed
+   chunked-execution-plan, the `operator.hpp`/`morsel.hpp` doc comments)
+   but not in one place.
    Writing it down is the input to Phase 2's first step (extracting the
    `ChunkView`/selection/validity/output-writer APIs *is* stating the
    contracts), so it lands there as a commit, not here as a promise.
@@ -235,7 +244,7 @@ a decision rather than an accident.
    `runtime::compare_tables` (`table_compare.hpp`) is the authoritative
    predicate for schema, metadata, values, validity, and categorical
    code/dictionary backing, and the structured parity gate runs it in CI.
-   This also retires [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md)'s
+   This also retires serial-parity-comparator-plan.md's (now only in git history)
    deliverable — its README status was stale. Still missing, and folded into
    Phase 2's per-representation gates: a named serial-vs-chunked *runner*
    (same query under `IBEX_PARALLEL=0`/`1`, compared structurally rather

@@ -5,6 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -323,6 +324,55 @@ TEST_CASE("Row-local double binary update preserves nullable division", "[kernel
     REQUIRE(quotient[0] == 3.0);
     REQUIRE(updated->columns[2].validity.has_value());
     REQUIRE_FALSE((*updated->columns[2].validity)[1]);
+}
+
+TEST_CASE("Row-local Int64 division writes Double and preserves IEEE/null semantics",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("numerator", Column<std::int64_t>{9, 1, 8},
+                     runtime::ValidityBitmap{true, false, true});
+    chunk.add_column("denominator", Column<std::int64_t>{2, 0, 0});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "quotient",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Div,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "numerator"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "denominator"}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& quotient = std::get<Column<double>>(*updated->columns[2].column);
+    REQUIRE(quotient[0] == 4.5);
+    REQUIRE(std::isinf(quotient[2]));
+    REQUIRE(updated->columns[2].validity.has_value());
+    REQUIRE((*updated->columns[2].validity)[0]);
+    REQUIRE_FALSE((*updated->columns[2].validity)[1]);
+    REQUIRE((*updated->columns[2].validity)[2]);
+}
+
+TEST_CASE("Row-local Int64 literal division writes Double", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{9, 10});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "half",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Div,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2}}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& half = std::get<Column<double>>(*updated->columns[1].column);
+    REQUIRE(half[0] == 4.5);
+    REQUIRE(half[1] == 5.0);
 }
 
 TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "[kernel][update]") {

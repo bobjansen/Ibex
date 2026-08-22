@@ -12,6 +12,7 @@ add_library(ibex_runtime STATIC
     filter.cpp
     interpreter.cpp
     join.cpp
+    kernel_filter.cpp
     kernel_update.cpp
     lazy_table.cpp
     model.cpp

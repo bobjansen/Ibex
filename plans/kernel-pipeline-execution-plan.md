@@ -476,6 +476,17 @@ plans; physical tests pass 79 assertions and full debug ctest passes
 informational. Next: consume source signatures in an actual physical map
 executor, starting serially.
 
+**Chunk filter-kernel seam (2026-08-22, pending performance gate).** The
+ordinary filter and fused filter-project operators now delegate their
+Chunk→Table evaluator bridge to `kernel::filter_chunk` and
+`kernel::filter_project_chunk`. Those entry points preserve a morsel's
+`sequence` and `row_offset`, keeping schema-carrier handling in the operators
+while giving the physical executor reusable per-morsel filter kernels. Focused
+coverage pins selected values and identity; physical execution coverage passes
+48 assertions and full debug ctest passes 1676/1676. Next: extend the seam to
+the filter-update-project shape, then replace the bridge internals with the
+representation-aware gather path already selected by source signatures.
+
 **Row-local update kernel seam (2026-08-22, `27685ecd`).**
 `kernel::update_row_local_chunk` is now the one chunk-level entry point for
 the row-local Update capability.  It owns the Chunk→Table evaluator boundary

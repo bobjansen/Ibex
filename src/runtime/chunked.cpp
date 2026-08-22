@@ -63,6 +63,7 @@
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
+#include "kernel_filter.hpp"
 #include "kernel_types.hpp"
 #include "kernel_update.hpp"
 #include "model_internal.hpp"
@@ -237,21 +238,19 @@ class ChunkedFilterOperator final : public Operator {
             }
             Chunk input = std::move(*chunk_res.value());
             const auto identity = chunk_identity_of(input);
-            const Table t = chunk_to_table(std::move(input));
-            auto filtered = filter_table(t, *predicate_, scalars_);
+            auto filtered = kernel::filter_chunk(std::move(input), *predicate_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
             }
             if (!filtered->columns.empty() && filtered->rows() == 0) {
                 if (preserve_empty_morsels_) {
-                    return std::optional<Chunk>{
-                        table_to_chunk(std::move(filtered.value()), identity)};
+                    return std::optional<Chunk>{std::move(filtered.value())};
                 }
-                schema_.hold(std::move(filtered.value()), identity);
+                schema_.hold(chunk_to_table(std::move(filtered.value())), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(filtered.value()), identity)};
+            return std::optional<Chunk>{std::move(filtered.value())};
         }
     }
 
@@ -346,20 +345,20 @@ class ChunkedFilterProjectOperator final : public Operator {
             }
             Chunk input = std::move(*chunk_res.value());
             const auto identity = chunk_identity_of(input);
-            const Table t = chunk_to_table(std::move(input));
-            auto out = filter_project_table(t, *predicate_, *columns_, scalars_);
+            auto out =
+                kernel::filter_project_chunk(std::move(input), *predicate_, *columns_, scalars_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
             if (!out->columns.empty() && out->rows() == 0) {
                 if (preserve_empty_morsels_) {
-                    return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
+                    return std::optional<Chunk>{std::move(out.value())};
                 }
-                schema_.hold(std::move(out.value()), identity);
+                schema_.hold(chunk_to_table(std::move(out.value())), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
+            return std::optional<Chunk>{std::move(out.value())};
         }
     }
 

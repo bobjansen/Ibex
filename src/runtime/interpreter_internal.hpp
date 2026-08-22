@@ -84,6 +84,45 @@ struct RowRange {
     }
 };
 
+/// Read-only column lookup contract for vectorized predicate evaluation.
+///
+/// A predicate only needs a row count and named column entries for its
+/// range-native paths (comparisons, 3VL, null tests, and categorical
+/// membership).  Keeping that smaller contract explicit lets a chunk use the
+/// same evaluator without constructing a transient Table and its name index.
+/// `table()` is deliberately optional: whole-table builtins still require the
+/// richer Table surface and their callers must take the existing Table path.
+class PredicateInput {
+   public:
+    using RowsFn = std::size_t (*)(const void*) noexcept;
+    using FindFn = const ColumnEntry* (*)(const void*, const std::string&) noexcept;
+
+    PredicateInput(const Table& table) noexcept
+        : state_(&table),
+          rows_(
+              [](const void* state) noexcept { return static_cast<const Table*>(state)->rows(); }),
+          find_([](const void* state, const std::string& name) noexcept -> const ColumnEntry* {
+              const auto* table = static_cast<const Table*>(state);
+              return table->find_entry(name);
+          }),
+          table_(&table) {}
+
+    PredicateInput(const void* state, RowsFn rows, FindFn find) noexcept
+        : state_(state), rows_(rows), find_(find) {}
+
+    [[nodiscard]] auto rows() const noexcept -> std::size_t { return rows_(state_); }
+    [[nodiscard]] auto find(const std::string& name) const noexcept -> const ColumnEntry* {
+        return find_(state_, name);
+    }
+    [[nodiscard]] auto table() const noexcept -> const Table* { return table_; }
+
+   private:
+    const void* state_ = nullptr;
+    RowsFn rows_ = nullptr;
+    FindFn find_ = nullptr;
+    const Table* table_ = nullptr;
+};
+
 // Column result: either a pointer into the table (zero-copy) or an owned computed column,
 // plus optional validity tracking for null propagation.
 struct ColResult {
@@ -1200,6 +1239,9 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
     -> std::expected<Table, std::string>;
 
 // filter.cpp — vectorized predicate evaluation and filtering.
+[[nodiscard]] auto compute_mask(const ir::Expr& expr, const PredicateInput& input,
+                                const ScalarRegistry* scalars, RowRange rows)
+    -> std::expected<Mask, std::string>;
 [[nodiscard]] auto compute_mask(const ir::Expr& expr, const Table& table,
                                 const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<Mask, std::string>;
@@ -1207,7 +1249,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto eval_coalesce_column(const ir::CallExpr& call, const Table& input,
                                         const ScalarRegistry* scalars, RowRange rows)
     -> std::expected<ComputedColumn, std::string>;
-[[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const Table& table,
+[[nodiscard]] auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
                                   const ScalarRegistry* scalars, RowRange rows,
                                   std::optional<ir::Duration> window = std::nullopt,
                                   bool window_aligned = false)
@@ -1222,8 +1264,8 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto merge_validity(const ValidityBitmap* a, std::size_t a_off,
                                   const ValidityBitmap* b, std::size_t b_off, std::size_t n)
     -> std::optional<ValidityBitmap>;
-[[nodiscard]] auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange rows)
-    -> std::optional<ValidityBitmap>;
+[[nodiscard]] auto collect_expr_validity(const ir::Expr& expr, const PredicateInput& input,
+                                         RowRange rows) -> std::optional<ValidityBitmap>;
 [[nodiscard]] auto filter_table(const Table& input, const ir::Expr& predicate,
                                 const ScalarRegistry* scalars) -> std::expected<Table, std::string>;
 /// True when every sub-expression of `expr` is evaluated by a range-aware path,
@@ -1295,6 +1337,10 @@ struct FilterSelection {
                                             const ScalarRegistry* scalars, RowRange rows,
                                             std::size_t row_limit)
     -> std::expected<FilterSelection, std::string>;
+[[nodiscard]] auto compute_filter_selection(const PredicateInput& input, const ir::Expr& predicate,
+                                            const ScalarRegistry* scalars, RowRange rows,
+                                            std::size_t row_limit)
+    -> std::expected<FilterSelection, std::string>;
 
 /// A filter's output columns, and where each one reads from:
 /// `src_of_dst[d]` indexes `input.columns` for output column `d`.
@@ -1345,6 +1391,9 @@ struct GatherDest {
 void gather_selection_into(Table& output, const Table& input,
                            const std::vector<std::size_t>& src_of_dst, const FilterSelection& sel,
                            RowRange rows, GatherDest dst);
+[[nodiscard]] auto filter_table_selection(const Table& input, const FilterSelection& selection,
+                                          const std::vector<ir::ColumnRef>* project, RowRange rows)
+    -> std::expected<Table, std::string>;
 
 /// True when the columns `src_of_dst` selects can be gathered into by several
 /// threads at once.

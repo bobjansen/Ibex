@@ -12,6 +12,39 @@ namespace ibex::runtime::kernel {
 
 namespace {
 
+auto predicate_input(const ChunkView& view) -> PredicateInput {
+    return PredicateInput{
+        &view,
+        [](const void* state) noexcept { return static_cast<const ChunkView*>(state)->rows(); },
+        [](const void* state, const std::string& name) noexcept -> const ColumnEntry* {
+            const auto& input = *static_cast<const ChunkView*>(state);
+            const auto position = input.find_column(name);
+            return position.has_value() ? &input.entry(*position) : nullptr;
+        }};
+}
+
+auto is_chunk_predicate_native(const ir::Expr& expr) -> bool {
+    return std::visit(
+        [](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef> || std::is_same_v<T, ir::Literal>) {
+                return true;
+            } else if constexpr (std::is_same_v<T, ir::BinaryExpr> ||
+                                 std::is_same_v<T, ir::CompareExpr>) {
+                return is_chunk_predicate_native(*node.left) &&
+                       is_chunk_predicate_native(*node.right);
+            } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
+                return is_chunk_predicate_native(*node.left) &&
+                       (node.right == nullptr || is_chunk_predicate_native(*node.right));
+            } else if constexpr (std::is_same_v<T, ir::IsNullExpr>) {
+                return is_chunk_predicate_native(*node.operand);
+            } else {
+                return false;
+            }
+        },
+        expr.node);
+}
+
 auto chunk_from_filtered(std::expected<Table, std::string> filtered, std::uint64_t sequence,
                          std::size_t row_offset) -> std::expected<Chunk, std::string> {
     if (!filtered.has_value()) {
@@ -23,12 +56,33 @@ auto chunk_from_filtered(std::expected<Table, std::string> filtered, std::uint64
     return output;
 }
 
+auto filter_chunk_range_native(Chunk input, const ir::Expr& predicate,
+                               const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
+                               const ScalarRegistry* scalars) -> std::expected<Chunk, std::string> {
+    const std::uint64_t sequence = input.sequence;
+    const std::size_t row_offset = input.row_offset;
+    const ChunkView view(input);
+    const std::size_t rows = view.rows();
+    auto selection = compute_filter_selection(predicate_input(view), predicate, scalars,
+                                              ::ibex::runtime::RowRange::whole(rows), row_limit);
+    if (!selection) {
+        return std::unexpected(std::move(selection.error()));
+    }
+    return chunk_from_filtered(
+        filter_table_selection(chunk_to_table(std::move(input)), *selection, project,
+                               ::ibex::runtime::RowRange::whole(rows)),
+        sequence, row_offset);
+}
+
 }  // namespace
 
 auto filter_chunk(Chunk input, const ir::Expr& predicate, const ScalarRegistry* scalars)
     -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
+    if (is_chunk_predicate_native(predicate)) {
+        return filter_chunk_range_native(std::move(input), predicate, nullptr, 0, scalars);
+    }
     return chunk_from_filtered(filter_table(chunk_to_table(std::move(input)), predicate, scalars),
                                sequence, row_offset);
 }
@@ -38,6 +92,9 @@ auto filter_project_chunk(Chunk input, const ir::Expr& predicate,
     -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
+    if (is_chunk_predicate_native(predicate)) {
+        return filter_chunk_range_native(std::move(input), predicate, &columns, 0, scalars);
+    }
     return chunk_from_filtered(
         filter_project_table(chunk_to_table(std::move(input)), predicate, columns, scalars),
         sequence, row_offset);
@@ -47,6 +104,9 @@ auto filter_limit_chunk(Chunk input, const ir::Expr& predicate, std::size_t row_
                         const ScalarRegistry* scalars) -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
+    if (is_chunk_predicate_native(predicate)) {
+        return filter_chunk_range_native(std::move(input), predicate, nullptr, row_limit, scalars);
+    }
     return chunk_from_filtered(
         filter_table_limit(chunk_to_table(std::move(input)), predicate, row_limit, scalars),
         sequence, row_offset);

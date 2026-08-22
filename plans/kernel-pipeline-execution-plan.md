@@ -424,15 +424,17 @@ update choices.  Gate so far: debug ctest 1664/1664.  Next: route the shared
 map-operator construction through this capability table, then run the
 interleaved A/B.
 
-**Phase 2 item 3, construction routing (2026-08-22, pending performance
-gate).** `build_row_local_map_operator` now consumes
+**Phase 2 item 3, construction routing (2026-08-22, `d738c07d`).**
+`build_row_local_map_operator` now consumes
 `MapKernelCapability`, the same capability selected into `physical::Plan`,
 rather than re-admitting nodes through its own node-kind switch.  This is the
 shared factory used by both serial physical-plan composition and parallel
 islands, so the construction-time selection is now one vocabulary across both
-paths.  Gates so far: physical serial execution and parallel pipeline tests,
-then debug ctest 1664/1664.  Run the interleaved A/B before closing item 3's
-first dispatch slice.
+paths.  Gates: physical serial execution and parallel pipeline tests, then
+debug ctest 1664/1664; the 8-repeat interleaved A/B against `HEAD~1` measured
++0.06% total / 0.999× geomean over 88 cases.  This is a neutral dispatch-only
+change.  Next: extend capability declarations with representation/null-policy
+selection as the physical map executor replaces its remaining chunked adapter.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

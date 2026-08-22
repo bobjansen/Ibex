@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -90,12 +92,27 @@ class ChunkView {
     [[nodiscard]] auto column(std::size_t pos) const noexcept -> const ColumnValue& {
         return *chunk_->columns.at(pos).column;
     }
+    [[nodiscard]] auto entry(std::size_t pos) const noexcept -> const ColumnEntry& {
+        return chunk_->columns.at(pos);
+    }
+    [[nodiscard]] auto find_column(std::string_view name) const noexcept
+        -> std::optional<std::size_t> {
+        for (std::size_t pos = 0; pos < columns(); ++pos) {
+            if (entry(pos).name == name) {
+                return pos;
+            }
+        }
+        return std::nullopt;
+    }
     [[nodiscard]] auto validity(std::size_t pos) const noexcept
         -> const std::optional<ValidityBitmap>& {
         return chunk_->columns.at(pos).validity;
     }
     [[nodiscard]] auto row_offset() const noexcept -> std::size_t { return chunk_->row_offset; }
     [[nodiscard]] auto sequence() const noexcept -> std::uint64_t { return chunk_->sequence; }
+    [[nodiscard]] auto properties() const noexcept -> const TableProperties& {
+        return chunk_->properties();
+    }
 
     /// Typed view of column `pos`; terminates on a representation mismatch,
     /// which is a pipeline-construction bug (dispatch chose the wrong
@@ -110,6 +127,38 @@ class ChunkView {
    private:
     const Chunk* chunk_;
 };
+
+/// One output column of a metadata-only map. `source_position` is resolved by
+/// the pipeline before this kernel runs; the copied `ColumnEntry` keeps its
+/// shared column/validity ownership, while `name` gives project/rename its
+/// output label.
+struct MappedChunkColumn {
+    std::size_t source_position = 0;
+    std::string name;
+};
+
+/// Project or relabel a chunk without visiting a value row.  The map is an
+/// explicit position-addressed kernel input, so project/rename do not rebuild
+/// a Table index or hide a name lookup in their row-local execution path.
+/// `properties` has already been derived by the caller because whether a
+/// column was dropped (project) or relabeled (rename) is logical semantics,
+/// not an ownership decision for this kernel.
+[[nodiscard]] inline auto map_chunk(ChunkView input, std::span<const MappedChunkColumn> map,
+                                    const TableProperties& properties) -> Chunk {
+    Chunk output;
+    output.columns.reserve(map.size());
+    for (const auto& mapped : map) {
+        output.columns.push_back(input.entry(mapped.source_position));
+        output.columns.back().name = mapped.name;
+    }
+    output.set_properties(properties);
+    output.sequence = input.sequence();
+    output.row_offset = input.row_offset();
+    if (output.columns.empty() && input.columns() == 0) {
+        output.logical_rows = input.rows();
+    }
+    return output;
+}
 
 /// The explicit selection shapes a kernel may be handed (CONTRACTS.md §2):
 /// never a hidden `std::vector` convention. All three address the SOURCE

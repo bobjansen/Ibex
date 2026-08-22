@@ -73,6 +73,33 @@ TEST_CASE("ChunkView exposes position, index space, and typed views", "[kernel][
     REQUIRE(price.data() == std::get<Column<std::int64_t>>(view.column(0)).data());
 }
 
+TEST_CASE("ChunkView metadata map shares columns and preserves morsel identity", "[kernel][map]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20});
+    chunk.add_column("vol", Column<double>{1.5, 2.5}, runtime::ValidityBitmap{true, false});
+    chunk.row_offset = 64;
+    chunk.sequence = 3;
+    const auto input_column = chunk.columns[1].column;
+
+    const ChunkView view(chunk);
+    const std::vector<runtime::kernel::MappedChunkColumn> map{
+        {.source_position = 1, .name = "volume"}, {.source_position = 0, .name = "price"}};
+    const auto props = runtime::TableProperties::derive(
+        view.properties(),
+        [](const std::string& name) -> runtime::KeyFate { return runtime::KeyFate::kept(name); },
+        runtime::RowTransform::Preserve);
+    const auto output = runtime::kernel::map_chunk(view, map, props);
+
+    REQUIRE(output.columns.size() == 2);
+    REQUIRE(output.columns[0].name == "volume");
+    REQUIRE(output.columns[1].name == "price");
+    REQUIRE(output.columns[0].column == input_column);
+    REQUIRE(output.columns[0].validity.has_value());
+    REQUIRE_FALSE((*output.columns[0].validity)[1]);
+    REQUIRE(output.row_offset == 64);
+    REQUIRE(output.sequence == 3);
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

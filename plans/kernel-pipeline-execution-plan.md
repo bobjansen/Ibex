@@ -332,8 +332,17 @@ the one-place statement of the `Chunk`, `sequence`/`row_offset` index space,
 `next()` pull protocol, materialization, `TableProperties`, source/demand,
 and determinism contracts, each pointing at its owning header and naming the
 known hardening debt (extern-source dictionary sharing, sink validity
-widening). Next: item 1 below, extracting the kernel APIs — stating those
-contracts in code.
+widening). Item 1's first slice also landed (2026-08-22):
+`src/runtime/kernel_types.hpp` — non-owning `ColumnView<T>` (fixed-width
+representations only, per the one-at-a-time order; bool/string views come
+with their own access shapes), `ChunkView` (position-addressed, carrying the
+source index space), and the explicit `Selection` variant
+(`RowRange`/`RowIndices`/`RowBitmap`), with tests. One API lesson already
+banked: validity is a raw pointer on the view, never
+`const std::optional<ValidityBitmap>&` — an optional-by-const-ref silently
+materializes a temporary from a bare bitmap and dangles the view. Resume
+point: `OutputWriter` + `KernelContext`, then the first kernel port
+(fixed-width filter gather) onto the views, one representation at a time.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

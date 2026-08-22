@@ -184,6 +184,31 @@ TEST_CASE("Row-local update writes string interpolation into a presized slab", "
     CHECK((*updated->columns[1].validity)[2]);
 }
 
+TEST_CASE("Row-local interpolation reads categorical dictionary codes", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("symbol",
+                     Column<Categorical>{std::vector<std::string>{"AAPL", "GOOG"},
+                                         std::vector<Column<Categorical>::code_type>{1, 0, 1}},
+                     runtime::ValidityBitmap{true, false, true});
+    ir::CallExpr interpolation{.callee = "__interp", .args = {}, .named_args = {}};
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"sym="}}}));
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "symbol"}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "label", .expr = ir::Expr{.node = std::move(interpolation)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& label = std::get<Column<std::string>>(*updated->columns[1].column);
+    CHECK(label[0] == "sym=GOOG");
+    CHECK(label[1].empty());
+    CHECK(label[2] == "sym=GOOG");
+    REQUIRE(updated->columns[1].validity.has_value());
+    CHECK_FALSE((*updated->columns[1].validity)[1]);
+}
+
 TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20, 30});

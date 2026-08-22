@@ -228,6 +228,28 @@ TEST_CASE("Row-local double binary update preserves nullable division", "[kernel
     REQUIRE_FALSE((*updated->columns[2].validity)[1]);
 }
 
+TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20}, runtime::ValidityBitmap{true, false});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "doubled",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mul,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2}}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& doubled = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    REQUIRE(doubled[0] == 20);
+    REQUIRE(updated->columns[1].validity.has_value());
+    REQUIRE_FALSE((*updated->columns[1].validity)[1]);
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

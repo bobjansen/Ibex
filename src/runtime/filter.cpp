@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "ibex/runtime/table_properties.hpp"
+#include "kernel_gather.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
@@ -2454,10 +2455,19 @@ void gather_selection_into(Table& output, const Table& input,
                         "filter_table: source/destination gather column type mismatch");
                 }
                 if constexpr (std::is_same_v<ColT, Column<Categorical>>) {
-                    const auto* sp = src.codes_data();
-                    auto* dp = out->codes_data();
-                    std::size_t j = dst.row;
-                    for_each_selected_row(sel, rows, [&](std::size_t si) { dp[j++] = sp[si]; });
+                    // Codes are a flat int32 array (CONTRACTS.md §1: one
+                    // shared dictionary, codes copied verbatim), so the
+                    // categorical gather IS the fixed-width kernel over codes.
+                    using Code = Column<Categorical>::code_type;
+                    kernel::gather_selected(
+                        kernel::ColumnView<Code>(src.codes_data(), src.size(), nullptr),
+                        kernel::Selection{kernel::RowWordBlocks{
+                            .words = sel.keep_words.data(),
+                            .word_count = sel.keep_words.size(),
+                            .row_base = rows.begin,
+                        }},
+                        kernel::OutputSpan<Code>{
+                            .data = out->codes_data(), .begin = dst.row, .count = sel.kept});
                 } else if constexpr (std::is_same_v<ColT, Column<std::string>>) {
                     const uint32_t* src_off = src.offsets_data();
                     uint32_t* dst_off = out->offsets_data();
@@ -2509,10 +2519,15 @@ void gather_selection_into(Table& output, const Table& input,
                     }
                 } else {
                     using T = ColT::value_type;
-                    const T* sp = src.data();
-                    T* dp = out->data();
-                    std::size_t j = dst.row;
-                    for_each_selected_row(sel, rows, [&](std::size_t si) { dp[j++] = sp[si]; });
+                    kernel::gather_selected(
+                        kernel::ColumnView<T>(src.data(), src.size(), nullptr),
+                        kernel::Selection{kernel::RowWordBlocks{
+                            .words = sel.keep_words.data(),
+                            .word_count = sel.keep_words.size(),
+                            .row_base = rows.begin,
+                        }},
+                        kernel::OutputSpan<T>{
+                            .data = out->data(), .begin = dst.row, .count = sel.kept});
                 }
             },
             *src_entry.column);

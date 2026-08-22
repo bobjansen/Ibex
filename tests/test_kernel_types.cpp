@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "kernel_gather.hpp"
 #include "kernel_types.hpp"
 
 namespace {
@@ -89,4 +90,95 @@ TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     REQUIRE(selection_rows(Selection{masked}, 6) == 2);
     REQUIRE(masked.test(4));
     REQUIRE_FALSE(masked.test(0));
+}
+
+TEST_CASE("RowWordBlocks counts and iterates like the filter's mask", "[kernel][selection]") {
+    // keep rows 1, 2, 7 in the first word and 64+3 in the second, over a
+    // range beginning at absolute row 5.
+    const std::vector<std::uint64_t> words{0b10000110U, 0b1000U};
+    const ibex::runtime::kernel::RowWordBlocks blocks{
+        .words = words.data(), .word_count = words.size(), .row_base = 5};
+    REQUIRE(ibex::runtime::kernel::selection_rows(ibex::runtime::kernel::Selection{blocks}, 100) ==
+            4);
+
+    Column<std::int64_t> col;
+    for (int i = 0; i < 80; ++i) {
+        col.push_back(i);
+    }
+    std::vector<std::int64_t> out(4, -1);
+    ibex::runtime::kernel::gather_selected(
+        ibex::runtime::kernel::ColumnView<std::int64_t>(col.data(), col.size(), nullptr),
+        ibex::runtime::kernel::Selection{blocks},
+        ibex::runtime::kernel::OutputSpan<std::int64_t>{
+            .data = out.data(), .begin = 0, .count = 4});
+    // word 0, bits 1/2/7 are absolute rows 6/7/12; word 1, bit 3 is row 5+67.
+    REQUIRE(out[0] == 6);
+    REQUIRE(out[1] == 7);
+    REQUIRE(out[2] == 12);
+    REQUIRE(out[3] == 72);
+}
+
+TEST_CASE("gather_selected over every selection shape agrees", "[kernel][gather]") {
+    Column<std::int64_t> col;
+    for (int i = 0; i < 10; ++i) {
+        col.push_back(100 + i);
+    }
+    using ibex::runtime::kernel::ColumnView;
+    using ibex::runtime::kernel::OutputSpan;
+    using ibex::runtime::kernel::Selection;
+    const ColumnView<std::int64_t> view(col.data(), col.size(), nullptr);
+
+    // Survivors: rows 2, 3, 5, 8 — expressed three ways.
+    const std::vector<std::size_t> indices{2, 3, 5, 8};
+    ibex::runtime::ValidityBitmap keep;
+    for (int i = 0; i < 10; ++i) {
+        keep.push_back(i == 2 || i == 3 || i == 5 || i == 8);
+    }
+    // rows 2,3,5,8 are bits 2,3,5,8 of word 0; word 1 is empty and must be
+    // skipped by the iteration.
+    const std::vector<std::uint64_t> blocks{(1U << 2) | (1U << 3) | (1U << 5) | (1U << 8), 0U};
+
+    std::vector<std::int64_t> a(4), b(4), c(4), d(4);
+    ibex::runtime::kernel::gather_selected(
+        view, Selection{ibex::runtime::kernel::RowIndices{indices.data(), indices.size()}},
+        OutputSpan<std::int64_t>{a.data(), 0, 4});
+    ibex::runtime::kernel::gather_selected(view, Selection{ibex::runtime::kernel::RowBitmap{&keep}},
+                                           OutputSpan<std::int64_t>{b.data(), 0, 4});
+    ibex::runtime::kernel::gather_selected(
+        view, Selection{ibex::runtime::kernel::RowWordBlocks{blocks.data(), blocks.size(), 0}},
+        OutputSpan<std::int64_t>{c.data(), 0, 4});
+    // A contiguous range: rows 2..5 (4 rows) — same count, different rows, to
+    // prove the copy arm does not just agree with the others by accident.
+    ibex::runtime::kernel::gather_selected(view, Selection{ibex::runtime::kernel::RowRange{2, 6}},
+                                           OutputSpan<std::int64_t>{d.data(), 0, 4});
+
+    REQUIRE(a[0] == 102);
+    REQUIRE(a[1] == 103);
+    REQUIRE(a[2] == 105);
+    REQUIRE(a[3] == 108);
+    REQUIRE(b == a);
+    REQUIRE(c == a);
+    REQUIRE(d[0] == 102);
+    REQUIRE(d[1] == 103);
+    REQUIRE(d[2] == 104);
+    REQUIRE(d[3] == 105);
+}
+
+TEST_CASE("gather_selected honours the output offset for disjoint windows", "[kernel][gather]") {
+    Column<std::int64_t> col{1, 2, 3, 4, 5, 6};
+    using ibex::runtime::kernel::ColumnView;
+    using ibex::runtime::kernel::OutputSpan;
+    using ibex::runtime::kernel::Selection;
+    std::vector<std::int64_t> out(6, -1);
+    // Two workers, disjoint windows of one presized buffer: rows [0,3) at
+    // offset 0, rows [3,6) at offset 3 — the two-phase filter's shape.
+    ibex::runtime::kernel::gather_selected(
+        ColumnView<std::int64_t>(col.data(), col.size(), nullptr),
+        Selection{ibex::runtime::kernel::RowRange{0, 3}},
+        OutputSpan<std::int64_t>{out.data(), 0, 3});
+    ibex::runtime::kernel::gather_selected(
+        ColumnView<std::int64_t>(col.data(), col.size(), nullptr),
+        Selection{ibex::runtime::kernel::RowRange{3, 6}},
+        OutputSpan<std::int64_t>{out.data(), 3, 3});
+    REQUIRE(out == std::vector<std::int64_t>{1, 2, 3, 4, 5, 6});
 }

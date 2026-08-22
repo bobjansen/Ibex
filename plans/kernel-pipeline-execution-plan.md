@@ -398,6 +398,19 @@ tests (30,228 assertions) pass; the 8-repeat, interleaved A/B against
 classified `noise` (and byte-identical output).  Next: project/rename maps
 onto `ChunkView`, then the item-3 dispatch table.
 
+**Project and rename maps ported (2026-08-22, pending performance gate).**
+`ChunkView` now exposes position-resolved entries, lookup, and properties;
+`map_chunk` is the shared metadata-only map kernel.  It copies `ColumnEntry`
+handles (therefore shares column payload and validity), applies output labels,
+and carries `sequence`/`row_offset` unchanged.  `ChunkedProjectOperator` no
+longer round-trips through `Table`; it resolves the selected positions over the
+view and derives its dropped-key properties before calling the kernel.
+`ChunkedRenameOperator` uses the same map with relabeled properties.  The
+kernel test pins shared ownership, validity, labels, and morsel identity.
+Gates so far: debug ctest 1664/1664 and optimized kernel-map tests pass.
+Run the interleaved A/B before recording the final gate.  Next: Phase 2 item
+3's static dispatch table and capability declarations.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

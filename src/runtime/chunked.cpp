@@ -62,6 +62,7 @@
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
+#include "kernel_types.hpp"
 #include "model_internal.hpp"
 #include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
@@ -283,9 +284,9 @@ class ChunkedFilterOperator final : public Operator {
     SchemaCarrier schema_;
 };
 
-/// Per-chunk project: pulls a chunk, reuses `project_table` to select
-/// and rename columns, and forwards the result. Stateless and order
-/// preserving; no inter-chunk coordination is needed.
+/// Per-chunk project: resolves its metadata map over a ChunkView, shares the
+/// selected column entries, and forwards it. Stateless and order preserving;
+/// no inter-chunk coordination or Table round-trip is needed.
 class ChunkedProjectOperator final : public Operator {
    public:
     ChunkedProjectOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* columns)
@@ -300,13 +301,39 @@ class ChunkedProjectOperator final : public Operator {
             return std::optional<Chunk>{};
         }
         Chunk input = std::move(*chunk_res.value());
-        const auto identity = chunk_identity_of(input);
-        const Table t = chunk_to_table(std::move(input));
-        auto projected = project_table(t, *columns_);
-        if (!projected.has_value()) {
-            return std::unexpected(std::move(projected.error()));
+        const kernel::ChunkView view(input);
+        std::vector<kernel::MappedChunkColumn> map;
+        map.reserve(columns_->size());
+        for (const auto& col : *columns_) {
+            if (col.name.empty()) {
+                if (const auto& time_index = view.properties().time_index();
+                    time_index.has_value() && std::ranges::none_of(map, [&](const auto& mapped) {
+                        return mapped.name == *time_index;
+                    })) {
+                    const auto pos = view.find_column(*time_index);
+                    if (!pos.has_value()) {
+                        return std::unexpected("select column not found: " + *time_index);
+                    }
+                    map.push_back({.source_position = *pos, .name = *time_index});
+                }
+                continue;
+            }
+            const auto pos = view.find_column(col.name);
+            if (!pos.has_value()) {
+                return std::unexpected("select column not found: " + col.name);
+            }
+            map.push_back({.source_position = *pos, .name = col.name});
         }
-        return std::optional<Chunk>{table_to_chunk(std::move(projected.value()), identity)};
+        const auto props = TableProperties::derive(
+            view.properties(),
+            [&](const std::string& name) -> KeyFate {
+                return std::ranges::any_of(map,
+                                           [&](const auto& mapped) { return mapped.name == name; })
+                           ? KeyFate::kept(name)
+                           : KeyFate::dropped();
+            },
+            RowTransform::Preserve);
+        return std::optional<Chunk>{kernel::map_chunk(view, map, props)};
     }
 
    private:
@@ -640,40 +667,37 @@ class ChunkedRenameOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Chunk chunk = std::move(*chunk_res.value());
+        Chunk input = std::move(*chunk_res.value());
+        const kernel::ChunkView view(input);
+        std::vector<kernel::MappedChunkColumn> map;
+        map.reserve(view.columns());
         for (const auto& spec : *renames_) {
-            bool found = false;
-            for (auto& col : chunk.columns) {
-                if (col.name == spec.old_name) {
-                    col.name = spec.new_name;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            if (!view.find_column(spec.old_name).has_value()) {
                 return std::unexpected("rename: column not found: " + spec.old_name);
             }
         }
-        // Rewrite the chunk's order-sensitive metadata through the same shared
-        // rule as the serial `rename_table`, so a renamed sort key / time index
-        // is relabeled here too rather than left carrying its old column name.
-        if (chunk.ordering().has_value() || chunk.time_index().has_value() ||
-            !chunk.grouped_by().empty()) {
-            auto props = TableProperties::derive(
-                TableProperties::recovered(chunk.ordering(), chunk.time_index(),
-                                           chunk.grouped_by()),
-                [&](const std::string& name) -> KeyFate {
-                    for (const auto& spec : *renames_) {
-                        if (spec.old_name == name) {
-                            return KeyFate::kept(spec.new_name);
-                        }
-                    }
-                    return KeyFate::kept(name);
-                },
-                RowTransform::Preserve);
-            chunk.set_properties(props);
+        for (std::size_t pos = 0; pos < view.columns(); ++pos) {
+            std::string name = view.entry(pos).name;
+            for (const auto& spec : *renames_) {
+                if (spec.old_name == name) {
+                    name = spec.new_name;
+                    break;
+                }
+            }
+            map.push_back({.source_position = pos, .name = std::move(name)});
         }
-        return std::optional<Chunk>{std::move(chunk)};
+        const auto props = TableProperties::derive(
+            view.properties(),
+            [&](const std::string& name) -> KeyFate {
+                for (const auto& spec : *renames_) {
+                    if (spec.old_name == name) {
+                        return KeyFate::kept(spec.new_name);
+                    }
+                }
+                return KeyFate::kept(name);
+            },
+            RowTransform::Preserve);
+        return std::optional<Chunk>{kernel::map_chunk(view, map, props)};
     }
 
    private:

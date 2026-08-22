@@ -10,11 +10,23 @@
 
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
+#include "kernel_filter.hpp"
 #include "kernel_types.hpp"
 
 namespace ibex::runtime::kernel {
 
 namespace {
+
+auto predicate_input(const ChunkView& view) -> PredicateInput {
+    return PredicateInput{
+        &view,
+        [](const void* state) noexcept { return static_cast<const ChunkView*>(state)->rows(); },
+        [](const void* state, const std::string& name) noexcept -> const ColumnEntry* {
+            const auto& input = *static_cast<const ChunkView*>(state);
+            const auto position = input.find_column(name);
+            return position.has_value() ? &input.entry(*position) : nullptr;
+        }};
+}
 
 auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
     -> std::optional<Chunk> {
@@ -81,6 +93,59 @@ auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fi
                                 scalar_from_literal(*literal), view.rows())),
                             .validity = std::nullopt};
     if (const auto existing = view.find_column(fields.front().alias); existing.has_value()) {
+        result.columns[*existing] = entry;
+    } else {
+        result.columns.push_back(entry);
+    }
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
+auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                            const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1 || !supports_native_chunk_predicate(fields.front().expr)) {
+        return std::nullopt;
+    }
+    const bool is_boolean = std::holds_alternative<ir::CompareExpr>(fields.front().expr.node) ||
+                            std::holds_alternative<ir::LogicalExpr>(fields.front().expr.node) ||
+                            std::holds_alternative<ir::IsNullExpr>(fields.front().expr.node);
+    if (!is_boolean) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    auto mask = compute_mask(fields.front().expr, predicate_input(view), scalars,
+                             ::ibex::runtime::RowRange::whole(view.rows()));
+    if (!mask.has_value()) {
+        return std::nullopt;
+    }
+    Column<bool> values;
+    values.resize(view.rows());
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        values.set(row, mask->value[row] != 0);
+    }
+    std::optional<ValidityBitmap> validity;
+    if (mask->valid.has_value()) {
+        ValidityBitmap bits(view.rows(), false);
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            bits.set(row, (*mask->valid)[row] != 0);
+        }
+        validity = std::move(bits);
+    }
+    Chunk result = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(std::move(values)),
+                            .validity = std::move(validity)};
+    if (existing.has_value()) {
         result.columns[*existing] = entry;
     } else {
         result.columns.push_back(entry);
@@ -572,6 +637,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     }
     if (!exec.parallel) {
         if (auto output = try_literal_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {

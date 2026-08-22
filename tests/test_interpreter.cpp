@@ -2847,6 +2847,49 @@ TEST_CASE("update + by partitions lag per group with null boundary",
     }
 }
 
+TEST_CASE("update + by scatters packed strings and categorical codes", "[update][grouped]") {
+    // Groups are evaluated in group-major slices, but both variable-width
+    // outputs must return to this original interleaved row order.
+    runtime::Table table;
+    table.add_column("g", Column<std::string>{"x", "y", "x", "y"});
+    table.add_column("name", Column<std::string>{"a", "b", "", "d"},
+                     runtime::ValidityBitmap{true, true, false, true});
+    table.add_column("category",
+                     Column<Categorical>{std::vector<std::string>{"red", "blue"},
+                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                     runtime::ValidityBitmap{true, true, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir("t[update { tag = `v=${name}`, copied = category }, by g];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* tag_entry = result->find_entry("tag");
+    REQUIRE(tag_entry != nullptr);
+    const auto& tag = std::get<Column<std::string>>(*tag_entry->column);
+    CHECK(tag[0] == "v=a");
+    CHECK(tag[1] == "v=b");
+    CHECK(tag[2].empty());
+    CHECK(tag[3] == "v=d");
+    REQUIRE(tag_entry->validity.has_value());
+    CHECK((*tag_entry->validity)[0]);
+    CHECK((*tag_entry->validity)[1]);
+    CHECK_FALSE((*tag_entry->validity)[2]);
+    CHECK((*tag_entry->validity)[3]);
+
+    const auto* copied_entry = result->find_entry("copied");
+    REQUIRE(copied_entry != nullptr);
+    const auto& copied = std::get<Column<Categorical>>(*copied_entry->column);
+    CHECK(copied.dictionary() == std::vector<std::string>{"red", "blue"});
+    CHECK(copied.code_at(0) == 0);
+    CHECK(copied.code_at(1) == 1);
+    CHECK(copied.code_at(2) == 0);
+    CHECK(copied.code_at(3) == 1);
+    REQUIRE(copied_entry->validity.has_value());
+    CHECK_FALSE((*copied_entry->validity)[2]);
+}
+
 TEST_CASE("per-row evaluation propagates null without reading payloads",
           "[interpreter][update][null]") {
     // The per-row evaluator represents a null cell as an ExprValue Null read

@@ -221,10 +221,13 @@ class SchemaCarrier {
 class ChunkedFilterOperator final : public Operator {
    public:
     ChunkedFilterOperator(OperatorPtr child, const ir::Expr* predicate,
-                          const ScalarRegistry* scalars, bool preserve_empty_morsels = false)
+                          const ScalarRegistry* scalars,
+                          kernel::FilterChunkRoute route = kernel::FilterChunkRoute::Auto,
+                          bool preserve_empty_morsels = false)
         : child_(std::move(child)),
           predicate_(predicate),
           scalars_(scalars),
+          route_(route),
           preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -238,7 +241,7 @@ class ChunkedFilterOperator final : public Operator {
             }
             Chunk input = std::move(*chunk_res.value());
             const auto identity = chunk_identity_of(input);
-            auto filtered = kernel::filter_chunk(std::move(input), *predicate_, scalars_);
+            auto filtered = kernel::filter_chunk(std::move(input), *predicate_, scalars_, route_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
             }
@@ -258,6 +261,7 @@ class ChunkedFilterOperator final : public Operator {
     OperatorPtr child_;
     const ir::Expr* predicate_;
     const ScalarRegistry* scalars_;
+    kernel::FilterChunkRoute route_;
     bool preserve_empty_morsels_ = false;
     SchemaCarrier schema_;
 };
@@ -298,11 +302,14 @@ class ChunkedFilterProjectOperator final : public Operator {
    public:
     ChunkedFilterProjectOperator(OperatorPtr child, const ir::Expr* predicate,
                                  const std::vector<ir::ColumnRef>* columns,
-                                 const ScalarRegistry* scalars, bool preserve_empty_morsels = false)
+                                 const ScalarRegistry* scalars,
+                                 kernel::FilterChunkRoute route = kernel::FilterChunkRoute::Auto,
+                                 bool preserve_empty_morsels = false)
         : child_(std::move(child)),
           predicate_(predicate),
           columns_(columns),
           scalars_(scalars),
+          route_(route),
           preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -316,8 +323,8 @@ class ChunkedFilterProjectOperator final : public Operator {
             }
             Chunk input = std::move(*chunk_res.value());
             const auto identity = chunk_identity_of(input);
-            auto out =
-                kernel::filter_project_chunk(std::move(input), *predicate_, *columns_, scalars_);
+            auto out = kernel::filter_project_chunk(std::move(input), *predicate_, *columns_,
+                                                    scalars_, route_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
@@ -338,6 +345,7 @@ class ChunkedFilterProjectOperator final : public Operator {
     const ir::Expr* predicate_;
     const std::vector<ir::ColumnRef>* columns_;
     const ScalarRegistry* scalars_;
+    kernel::FilterChunkRoute route_;
     bool preserve_empty_morsels_ = false;
     SchemaCarrier schema_;
 };
@@ -532,13 +540,13 @@ class ChunkedFilterTailOperator final : public Operator {
 /// allowing computed fields in the select.
 class ChunkedFilterUpdateProjectOperator final : public Operator {
    public:
-    ChunkedFilterUpdateProjectOperator(OperatorPtr child, const ir::Expr* predicate,
-                                       const std::vector<ir::FieldSpec>* fields,
-                                       const std::vector<ir::ColumnRef>* project_columns,
-                                       std::vector<ir::ColumnRef> gather_columns,
-                                       const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                       const ExecutionContext& exec,
-                                       bool preserve_empty_morsels = false)
+    ChunkedFilterUpdateProjectOperator(
+        OperatorPtr child, const ir::Expr* predicate, const std::vector<ir::FieldSpec>* fields,
+        const std::vector<ir::ColumnRef>* project_columns,
+        std::vector<ir::ColumnRef> gather_columns, const ScalarRegistry* scalars,
+        const ExternRegistry* externs, const ExecutionContext& exec,
+        kernel::FilterChunkRoute route = kernel::FilterChunkRoute::Auto,
+        bool preserve_empty_morsels = false)
         : child_(std::move(child)),
           predicate_(predicate),
           fields_(fields),
@@ -547,6 +555,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
           scalars_(scalars),
           externs_(externs),
           exec_(&exec),
+          route_(route),
           preserve_empty_morsels_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -562,7 +571,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             const auto identity = chunk_identity_of(input);
             auto projected = kernel::filter_update_project_chunk(
                 std::move(input), *predicate_, *fields_, *project_columns_, gather_columns_,
-                scalars_, externs_, *exec_);
+                scalars_, externs_, *exec_, route_);
             if (!projected.has_value()) {
                 return std::unexpected(std::move(projected.error()));
             }
@@ -591,6 +600,7 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
     const ScalarRegistry* scalars_;
     const ExternRegistry* externs_;
     const ExecutionContext* exec_;
+    kernel::FilterChunkRoute route_;
     bool preserve_empty_morsels_ = false;
 };
 
@@ -10267,17 +10277,52 @@ void configure_parallel_from_env(ExecutionContext& exec) {
 // output identity for every input morsel. Keeping the construction (especially
 // FUP's gather set) here prevents the two planners from drifting as range-aware
 // kernels replace these chunked implementations.
+auto physical_filter_route(const ir::Expr& predicate,
+                           const std::vector<ColumnKernelSignature>* source_signature)
+    -> kernel::FilterChunkRoute {
+    // A populated signature is the physical planner's proof that this is a
+    // registered table scan with one of the representations the Chunk gather
+    // family owns. Lazy/extern sources intentionally arrive without that
+    // proof and retain the compatibility route.
+    if (source_signature == nullptr || source_signature->empty() ||
+        !kernel::supports_native_chunk_predicate(predicate)) {
+        return kernel::FilterChunkRoute::Auto;
+    }
+    for (const auto& signature : *source_signature) {
+        switch (signature.representation) {
+            case ColumnRepresentation::FixedWidth:
+            case ColumnRepresentation::PackedBool:
+            case ColumnRepresentation::StringSlabs:
+            case ColumnRepresentation::CategoricalCodes:
+                break;
+            default:
+                return kernel::FilterChunkRoute::Auto;
+        }
+        switch (signature.null_policy) {
+            case KernelNullPolicy::AllValid:
+            case KernelNullPolicy::Nullable:
+                break;
+            default:
+                return kernel::FilterChunkRoute::Auto;
+        }
+    }
+    return kernel::FilterChunkRoute::NativePredicate;
+}
+
 auto build_filter_gather_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry* scalars,
                              const ExternRegistry*, const ExecutionContext&,
+                             const std::vector<ColumnKernelSignature>* source_signature,
                              bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
     const auto& filter = static_cast<const ir::FilterNode&>(node);
-    return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(), scalars,
-                                                   preserve_empty_morsels);
+    return std::make_unique<ChunkedFilterOperator>(
+        std::move(child), &filter.predicate(), scalars,
+        physical_filter_route(filter.predicate(), source_signature), preserve_empty_morsels);
 }
 
 auto build_metadata_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry*,
-                        const ExternRegistry*, const ExecutionContext&, bool)
+                        const ExternRegistry*, const ExecutionContext&,
+                        const std::vector<ColumnKernelSignature>*, bool)
     -> std::expected<OperatorPtr, std::string> {
     if (node.kind() == ir::NodeKind::Project) {
         const auto& project = static_cast<const ir::ProjectNode&>(node);
@@ -10289,7 +10334,8 @@ auto build_metadata_map(const ir::Node& node, OperatorPtr child, const ScalarReg
 
 auto build_row_local_update_map(const ir::Node& node, OperatorPtr child,
                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                const ExecutionContext& exec, bool)
+                                const ExecutionContext& exec,
+                                const std::vector<ColumnKernelSignature>*, bool)
     -> std::expected<OperatorPtr, std::string> {
     const auto& update = static_cast<const ir::UpdateNode&>(node);
     return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(), scalars,
@@ -10298,18 +10344,20 @@ auto build_row_local_update_map(const ir::Node& node, OperatorPtr child,
 
 auto build_filter_project_gather_map(const ir::Node& node, OperatorPtr child,
                                      const ScalarRegistry* scalars, const ExternRegistry*,
-                                     const ExecutionContext&, bool preserve_empty_morsels)
+                                     const ExecutionContext&,
+                                     const std::vector<ColumnKernelSignature>* source_signature,
+                                     bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
     const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
     return std::make_unique<ChunkedFilterProjectOperator>(
-        std::move(child), &fp.predicate(), &fp.columns(), scalars, preserve_empty_morsels);
+        std::move(child), &fp.predicate(), &fp.columns(), scalars,
+        physical_filter_route(fp.predicate(), source_signature), preserve_empty_morsels);
 }
 
-auto build_filter_update_project_gather_map(const ir::Node& node, OperatorPtr child,
-                                            const ScalarRegistry* scalars,
-                                            const ExternRegistry* externs,
-                                            const ExecutionContext& exec,
-                                            bool preserve_empty_morsels)
+auto build_filter_update_project_gather_map(
+    const ir::Node& node, OperatorPtr child, const ScalarRegistry* scalars,
+    const ExternRegistry* externs, const ExecutionContext& exec,
+    const std::vector<ColumnKernelSignature>* source_signature, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
     const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
     robin_hood::unordered_set<std::string> update_outputs;
@@ -10330,7 +10378,8 @@ auto build_filter_update_project_gather_map(const ir::Node& node, OperatorPtr ch
     }
     return std::make_unique<ChunkedFilterUpdateProjectOperator>(
         std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-        std::move(gather_columns), scalars, externs, exec, preserve_empty_morsels);
+        std::move(gather_columns), scalars, externs, exec,
+        physical_filter_route(fup.predicate(), source_signature), preserve_empty_morsels);
 }
 
 auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory {
@@ -10354,7 +10403,7 @@ auto build_row_local_map_operator(MapKernelCapability capability, const ir::Node
     if (factory == nullptr) {
         return std::unexpected("row-local map factory: unknown kernel capability");
     }
-    return factory(node, std::move(child), scalars, externs, exec, preserve_empty_morsels);
+    return factory(node, std::move(child), scalars, externs, exec, nullptr, preserve_empty_morsels);
 }
 
 auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
@@ -12353,7 +12402,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
             return child;
         }
         return plan.kernel_dispatch[index].factory(node, std::move(child.value()), scalars, externs,
-                                                   exec, false);
+                                                   exec, &plan.source_signature, false);
     }
     auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
@@ -12361,8 +12410,9 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
-            result = plan.kernel_dispatch[index].factory(node, std::move(result.value()), scalars,
-                                                         externs, exec, false);
+            result =
+                plan.kernel_dispatch[index].factory(node, std::move(result.value()), scalars,
+                                                    externs, exec, &plan.source_signature, false);
         }
     }
     if (!result.has_value()) {

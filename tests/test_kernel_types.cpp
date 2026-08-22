@@ -418,6 +418,32 @@ TEST_CASE("Row-local Int64 and Double literal update writes Double", "[kernel][u
     REQUIRE(remainder[1] == 1.5);
 }
 
+TEST_CASE("Row-local comparison update packs Bool and carries 3VL validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20, 30},
+                     runtime::ValidityBitmap{true, false, true});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "expensive",
+         .expr = ir::Expr{
+             .node = ir::CompareExpr{
+                 .op = ir::CompareOp::Gt,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right = ir::make_expr_ptr(
+                     ir::Expr{.node = ir::Literal{.value = std::int64_t{15}}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& expensive = std::get<Column<bool>>(*updated->columns[1].column);
+    REQUIRE_FALSE(expensive[0]);
+    REQUIRE(expensive[2]);
+    REQUIRE(updated->columns[1].validity.has_value());
+    REQUIRE((*updated->columns[1].validity)[0]);
+    REQUIRE_FALSE((*updated->columns[1].validity)[1]);
+    REQUIRE((*updated->columns[1].validity)[2]);
+}
+
 TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20}, runtime::ValidityBitmap{true, false});

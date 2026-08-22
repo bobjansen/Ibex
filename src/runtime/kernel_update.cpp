@@ -40,6 +40,48 @@ struct NumericOperand {
     ExprType kind = ExprType::Int;
 };
 
+using UnaryDoubleFn = double (*)(double);
+
+auto lookup_unary_double(std::string_view name) -> UnaryDoubleFn {
+    if (name == "sqrt")
+        return [](double value) { return std::sqrt(value); };
+    if (name == "log")
+        return [](double value) { return std::log(value); };
+    if (name == "exp")
+        return [](double value) { return std::exp(value); };
+    if (name == "log2")
+        return [](double value) { return std::log2(value); };
+    if (name == "log10")
+        return [](double value) { return std::log10(value); };
+    if (name == "sin")
+        return [](double value) { return std::sin(value); };
+    if (name == "cos")
+        return [](double value) { return std::cos(value); };
+    if (name == "tan")
+        return [](double value) { return std::tan(value); };
+    if (name == "asin")
+        return [](double value) { return std::asin(value); };
+    if (name == "acos")
+        return [](double value) { return std::acos(value); };
+    if (name == "atan")
+        return [](double value) { return std::atan(value); };
+    if (name == "sinh")
+        return [](double value) { return std::sinh(value); };
+    if (name == "cosh")
+        return [](double value) { return std::cosh(value); };
+    if (name == "tanh")
+        return [](double value) { return std::tanh(value); };
+    if (name == "abs")
+        return [](double value) { return std::fabs(value); };
+    if (name == "floor")
+        return [](double value) { return std::floor(value); };
+    if (name == "ceil")
+        return [](double value) { return std::ceil(value); };
+    if (name == "trunc")
+        return [](double value) { return std::trunc(value); };
+    return nullptr;
+}
+
 auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
                              const ScalarRegistry* scalars) -> std::optional<NumericOperand> {
     if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
@@ -102,6 +144,243 @@ auto numeric_double_value(const NumericOperand& operand) -> double {
     return operand.kind == ExprType::Int
                ? static_cast<double>(std::get<std::int64_t>(operand.scalar))
                : std::get<double>(operand.scalar);
+}
+
+struct NumericTreeNode {
+    enum class Kind : std::uint8_t {
+        IntColumn,
+        DoubleColumn,
+        IntScalar,
+        DoubleScalar,
+        Binary,
+        Min,
+        Max,
+        Unary
+    };
+
+    Kind kind = Kind::IntScalar;
+    ExprType type = ExprType::Int;
+    ir::ArithmeticOp op = ir::ArithmeticOp::Add;
+    std::uint32_t left = 0;
+    std::uint32_t right = 0;
+    const std::int64_t* ints = nullptr;
+    const double* doubles = nullptr;
+    std::int64_t int_scalar = 0;
+    double double_scalar = 0.0;
+    UnaryDoubleFn unary = nullptr;
+};
+
+auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
+                          const ScalarRegistry* scalars, std::vector<NumericTreeNode>& nodes)
+    -> std::optional<std::uint32_t> {
+    if (const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node)) {
+        const auto left = compile_numeric_tree(*binary->left, input, scalars, nodes);
+        const auto right = compile_numeric_tree(*binary->right, input, scalars, nodes);
+        if (!left.has_value() || !right.has_value()) {
+            return std::nullopt;
+        }
+        const ExprType type = binary->op == ir::ArithmeticOp::Div ||
+                                      nodes[*left].type == ExprType::Double ||
+                                      nodes[*right].type == ExprType::Double
+                                  ? ExprType::Double
+                                  : ExprType::Int;
+        nodes.push_back({.kind = NumericTreeNode::Kind::Binary,
+                         .type = type,
+                         .op = binary->op,
+                         .left = *left,
+                         .right = *right});
+        return static_cast<std::uint32_t>(nodes.size() - 1);
+    }
+    if (const auto* call = std::get_if<ir::CallExpr>(&expr.node)) {
+        if ((call->callee == "pmin" || call->callee == "pmax") && call->args.size() >= 2 &&
+            call->named_args.empty()) {
+            auto accumulated = compile_numeric_tree(*call->args.front(), input, scalars, nodes);
+            if (!accumulated.has_value()) {
+                return std::nullopt;
+            }
+            for (std::size_t arg = 1; arg < call->args.size(); ++arg) {
+                const auto next = compile_numeric_tree(*call->args[arg], input, scalars, nodes);
+                if (!next.has_value()) {
+                    return std::nullopt;
+                }
+                const ExprType type = nodes[*accumulated].type == ExprType::Double ||
+                                              nodes[*next].type == ExprType::Double
+                                          ? ExprType::Double
+                                          : ExprType::Int;
+                nodes.push_back({.kind = call->callee == "pmin" ? NumericTreeNode::Kind::Min
+                                                                : NumericTreeNode::Kind::Max,
+                                 .type = type,
+                                 .left = *accumulated,
+                                 .right = *next});
+                accumulated = static_cast<std::uint32_t>(nodes.size() - 1);
+            }
+            return accumulated;
+        }
+        if (call->args.size() == 1 && call->named_args.empty()) {
+            const UnaryDoubleFn unary = lookup_unary_double(call->callee);
+            if (unary != nullptr) {
+                const auto child = compile_numeric_tree(*call->args.front(), input, scalars, nodes);
+                if (!child.has_value() || ((call->callee == "abs" || call->callee == "floor" ||
+                                            call->callee == "ceil" || call->callee == "trunc") &&
+                                           nodes[*child].type != ExprType::Double)) {
+                    return std::nullopt;
+                }
+                nodes.push_back({.kind = NumericTreeNode::Kind::Unary,
+                                 .type = ExprType::Double,
+                                 .left = *child,
+                                 .unary = unary});
+                return static_cast<std::uint32_t>(nodes.size() - 1);
+            }
+        }
+    }
+    const auto operand = resolve_numeric_operand(expr, input, scalars);
+    if (!operand.has_value()) {
+        return std::nullopt;
+    }
+    NumericTreeNode node{.type = operand->kind};
+    if (operand->is_column) {
+        if (operand->kind == ExprType::Int) {
+            node.kind = NumericTreeNode::Kind::IntColumn;
+            node.ints = std::get<Column<std::int64_t>>(*operand->column).data();
+        } else {
+            node.kind = NumericTreeNode::Kind::DoubleColumn;
+            node.doubles = std::get<Column<double>>(*operand->column).data();
+        }
+    } else if (operand->kind == ExprType::Int) {
+        node.kind = NumericTreeNode::Kind::IntScalar;
+        node.int_scalar = numeric_int_value(*operand);
+    } else {
+        node.kind = NumericTreeNode::Kind::DoubleScalar;
+        node.double_scalar = numeric_double_value(*operand);
+    }
+    nodes.push_back(node);
+    return static_cast<std::uint32_t>(nodes.size() - 1);
+}
+
+auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                             const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    const auto source = predicate_input(view);
+    std::vector<NumericTreeNode> nodes;
+    nodes.reserve(8);
+    const auto root = compile_numeric_tree(fields.front().expr, source, scalars, nodes);
+    if (!root.has_value()) {
+        return std::nullopt;
+    }
+    const auto eval_double = [&](auto&& self, std::uint32_t index, std::size_t row) -> double {
+        const auto& node = nodes[index];
+        switch (node.kind) {
+            case NumericTreeNode::Kind::IntColumn:
+                return static_cast<double>(node.ints[row]);
+            case NumericTreeNode::Kind::DoubleColumn:
+                return node.doubles[row];
+            case NumericTreeNode::Kind::IntScalar:
+                return static_cast<double>(node.int_scalar);
+            case NumericTreeNode::Kind::DoubleScalar:
+                return node.double_scalar;
+            case NumericTreeNode::Kind::Min:
+                return std::min(self(self, node.left, row), self(self, node.right, row));
+            case NumericTreeNode::Kind::Max:
+                return std::max(self(self, node.left, row), self(self, node.right, row));
+            case NumericTreeNode::Kind::Unary:
+                return node.unary(self(self, node.left, row));
+            case NumericTreeNode::Kind::Binary: {
+                const double left = self(self, node.left, row);
+                const double right = self(self, node.right, row);
+                switch (node.op) {
+                    case ir::ArithmeticOp::Add:
+                        return left + right;
+                    case ir::ArithmeticOp::Sub:
+                        return left - right;
+                    case ir::ArithmeticOp::Mul:
+                        return left * right;
+                    case ir::ArithmeticOp::Div:
+                        return left / right;
+                    case ir::ArithmeticOp::Mod:
+                        return std::fmod(left, right);
+                }
+            }
+        }
+        invariant_violation("numeric tree: unhandled double node");
+    };
+    const auto eval_int = [&](auto&& self, std::uint32_t index, std::size_t row) -> std::int64_t {
+        const auto& node = nodes[index];
+        switch (node.kind) {
+            case NumericTreeNode::Kind::IntColumn:
+                return node.ints[row];
+            case NumericTreeNode::Kind::IntScalar:
+                return node.int_scalar;
+            case NumericTreeNode::Kind::Min:
+                return std::min(self(self, node.left, row), self(self, node.right, row));
+            case NumericTreeNode::Kind::Max:
+                return std::max(self(self, node.left, row), self(self, node.right, row));
+            case NumericTreeNode::Kind::Binary: {
+                const std::int64_t left = self(self, node.left, row);
+                const std::int64_t right = self(self, node.right, row);
+                switch (node.op) {
+                    case ir::ArithmeticOp::Add:
+                        return left + right;
+                    case ir::ArithmeticOp::Sub:
+                        return left - right;
+                    case ir::ArithmeticOp::Mul:
+                        return left * right;
+                    case ir::ArithmeticOp::Div:
+                        invariant_violation("numeric tree: Int division widens to Double");
+                    case ir::ArithmeticOp::Mod:
+                        return safe_imod(left, right);
+                }
+                return 0;  // exhaustive switch; keeps strict compilers aware.
+            }
+            case NumericTreeNode::Kind::DoubleColumn:
+            case NumericTreeNode::Kind::DoubleScalar:
+            case NumericTreeNode::Kind::Unary:
+                invariant_violation("numeric tree: Double node in Int expression");
+        }
+        invariant_violation("numeric tree: unhandled Int node");
+    };
+
+    ColumnValue values;
+    if (nodes[*root].type == ExprType::Int) {
+        Column<std::int64_t> output;
+        output.resize_for_overwrite(view.rows());
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            output.data()[row] = eval_int(eval_int, *root, row);
+        }
+        values = std::move(output);
+    } else {
+        Column<double> output;
+        output.resize_for_overwrite(view.rows());
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            output.data()[row] = eval_double(eval_double, *root, row);
+        }
+        values = std::move(output);
+    }
+    Chunk output = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{
+        .name = fields.front().alias,
+        .column = std::make_shared<ColumnValue>(std::move(values)),
+        .validity = collect_expr_validity(fields.front().expr, source,
+                                          ::ibex::runtime::RowRange::whole(view.rows()))};
+    if (existing.has_value()) {
+        output.columns[*existing] = entry;
+    } else {
+        output.columns.push_back(entry);
+    }
+    output.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return output;
 }
 
 auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
@@ -201,45 +480,7 @@ auto try_unary_double_update(const Chunk& input, const std::vector<ir::FieldSpec
     if (source_ref == nullptr || source_ref->lexical) {
         return std::nullopt;
     }
-    const auto unary = [&]() -> double (*)(double) {
-        if (call->callee == "sqrt")
-            return [](double value) { return std::sqrt(value); };
-        if (call->callee == "log")
-            return [](double value) { return std::log(value); };
-        if (call->callee == "exp")
-            return [](double value) { return std::exp(value); };
-        if (call->callee == "log2")
-            return [](double value) { return std::log2(value); };
-        if (call->callee == "log10")
-            return [](double value) { return std::log10(value); };
-        if (call->callee == "sin")
-            return [](double value) { return std::sin(value); };
-        if (call->callee == "cos")
-            return [](double value) { return std::cos(value); };
-        if (call->callee == "tan")
-            return [](double value) { return std::tan(value); };
-        if (call->callee == "asin")
-            return [](double value) { return std::asin(value); };
-        if (call->callee == "acos")
-            return [](double value) { return std::acos(value); };
-        if (call->callee == "atan")
-            return [](double value) { return std::atan(value); };
-        if (call->callee == "sinh")
-            return [](double value) { return std::sinh(value); };
-        if (call->callee == "cosh")
-            return [](double value) { return std::cosh(value); };
-        if (call->callee == "tanh")
-            return [](double value) { return std::tanh(value); };
-        if (call->callee == "abs")
-            return [](double value) { return std::fabs(value); };
-        if (call->callee == "floor")
-            return [](double value) { return std::floor(value); };
-        if (call->callee == "ceil")
-            return [](double value) { return std::ceil(value); };
-        if (call->callee == "trunc")
-            return [](double value) { return std::trunc(value); };
-        return nullptr;
-    }();
+    const UnaryDoubleFn unary = lookup_unary_double(call->callee);
     if (unary == nullptr) {
         return std::nullopt;
     }
@@ -1387,6 +1628,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
                 next = try_literal_update(current, one_field);
             }
             if (!next.has_value()) {
+                next = try_numeric_tree_update(current, one_field, scalars);
+            }
+            if (!next.has_value()) {
                 next = try_unary_double_update(current, one_field);
             }
             if (!next.has_value()) {
@@ -1428,6 +1672,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     }
     if (!exec.parallel) {
         if (auto output = try_literal_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_numeric_tree_update(input, fields, scalars); output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_unary_double_update(input, fields); output.has_value()) {

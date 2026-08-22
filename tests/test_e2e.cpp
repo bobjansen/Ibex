@@ -2088,6 +2088,33 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
     }
 }
 
+TEST_CASE("E2E: categorical interpolation writes parallel string windows", "[e2e][parallel]") {
+    constexpr std::size_t kRows = 1000;
+    std::vector<Column<Categorical>::code_type> codes;
+    codes.reserve(kRows);
+    runtime::ValidityBitmap validity;
+    validity.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        codes.push_back(static_cast<Column<Categorical>::code_type>(row % 3));
+        validity.push_back(row % 11 != 5);
+    }
+    runtime::Table table;
+    table.add_column(
+        "symbol",
+        Column<Categorical>{std::vector<std::string>{"AAPL", "GOOG", "MSFT"}, std::move(codes)},
+        std::move(validity));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(table));
+
+    const auto* source = "t[update { label = `sym=${symbol}` }];";
+    const auto serial = run(source, tables);
+    for (const std::size_t threads : {2U, 8U}) {
+        runtime::ParallelIslandStats stats;
+        require_tables_equal(serial, run_parallel(source, tables, 7, threads, &stats));
+        CHECK(stats.parallel_fields.load() > 0);
+    }
+}
+
 TEST_CASE("E2E: parallel island leaves a non-row-local update serial", "[e2e][parallel]") {
     auto tables = make_wide_island_table(1000);
     // Each of these would be silently wrong per morsel: the transform reads

@@ -552,9 +552,22 @@ on `update_table`: its inferred result type is Double, so treating it as an
 Int64 output would violate the existing evaluator contract. These computed
 kernels remain serial-only while parallel updates retain evaluator scheduling
 and accounting. Focused kernel coverage pins literal zero-divisor behavior;
-full debug ctest passes 1674/1674. Next: run one combined A/B, then move to
-the next bounded row-local shape only if it has a similarly clear output and
-validity contract.
+full debug ctest passes 1674/1674. The combined 8-repeat A/B against `HEAD~1`
+measured +3.90% total / 0.965× geomean over 88 cases (0.964× ibex-only;
+0.994× parse-inclusive). This small dispatch-only change has no plausible
+per-query hot-path mechanism, so the result is recorded as non-actionable
+measurement variation. Next: take a broader row-local update step, then
+consolidate map-kernel selection into a construction-time dispatch descriptor.
+
+**Literal assignment update port (2026-08-22, pending performance gate).**
+Single-field literal assignments now use the chunk kernel in serial mode. The
+kernel broadcasts the literal across the output chunk, replaces any existing
+column (including clearing obsolete validity), or appends it, and derives the
+same metadata fate as `update_table`. Parallel execution still delegates to
+the established evaluator so its scheduling and accounting contract stays
+intact. Focused kernel coverage pins replacement of a nullable Int64 column;
+full debug ctest passes 1675/1675. Next: consolidate capability selection into
+a construction-time dispatch descriptor rather than add more one-off probes.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

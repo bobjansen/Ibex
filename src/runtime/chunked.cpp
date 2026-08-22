@@ -53,6 +53,8 @@
 #include <variant>
 #include <vector>
 
+#include "physical_plan.hpp"
+
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif
@@ -12319,6 +12321,51 @@ class PipelinedStageOperator final : public Operator {
     });
 }
 
+/// Compose one step of a migrated physical map pipeline (Phase 1 of
+/// plans/kernel-pipeline-execution-plan.md). Walks the plan top-down so the
+/// per-step profile scopes nest exactly the way the per-kind switch's
+/// recursion did, wraps each constructed operator with
+/// `profile_operator`, and builds the source through the *public*
+/// `build_operator` so every Scan/ExternCall streaming decision below stays
+/// in its existing branch. The operator tree is therefore identical to the
+/// pre-planner construction; the plan is the decision record, not a second
+/// semantics.
+auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
+                             const TableRegistry& registry, const ScalarRegistry* scalars,
+                             const ExternRegistry* externs, const ExecutionContext& exec,
+                             ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    const auto build_child = [&] -> std::expected<OperatorPtr, std::string> {
+        if (index + 1 == plan.steps.size()) {
+            return build_operator(*plan.source_node, registry, scalars, externs, exec, model_out);
+        }
+        return build_physical_map_step(plan, index + 1, registry, scalars, externs, exec,
+                                       model_out);
+    };
+    const ir::Node& node = *plan.steps[index];
+    if (exec.execution_profile == nullptr) {
+        auto child = build_child();
+        if (!child.has_value()) {
+            return child;
+        }
+        return build_row_local_map_operator(node, std::move(child.value()), scalars, externs, exec,
+                                            false);
+    }
+    auto* entry = execution_profile_entry(exec.execution_profile, node);
+    std::expected<OperatorPtr, std::string> result;
+    {
+        ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        result = build_child();
+        if (result.has_value()) {
+            result = build_row_local_map_operator(node, std::move(result.value()), scalars, externs,
+                                                  exec, false);
+        }
+    }
+    if (!result.has_value()) {
+        return result;
+    }
+    return profile_operator(std::move(result.value()), exec.execution_profile, node);
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -12362,14 +12409,36 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                         deferred != nullptr && deferred->filter == nullptr) {
                         auto units = deferred_scan_units(*deferred);
                         if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
+                            physical::note_map_pipeline_executed();
                             return build_pipelined_scan(island.operators, true, *deferred,
                                                         std::move(units), scalars, externs, exec);
                         }
                     }
                 }
             }
+            physical::note_map_pipeline_executed();
             return build_parallel_island(island, registry, scalars, externs, exec, model_out);
         }
+        // Not island-eligible at this root: fall through to the existing
+        // per-kind construction. The recursion below may still form an island
+        // around a shorter sub-chain (an ineligible outer predicate does not
+        // make an inner projection ineligible), which is why a declined
+        // analysis does NOT route into the physical planner's executor here.
+    }
+
+    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md Phase 1).
+    // Serial mode only for now: the island above already owns the parallel
+    // execution of the same pipeline. A migrated plan composes the identical
+    // operator chain — same constructors, same per-node profile entries, same
+    // source construction (the source goes through the public build_operator,
+    // so every Scan/ExternCall streaming decision below is unchanged).
+    if (!exec.parallel) {
+        const physical::Plan plan = physical::plan_physical(node, registry, externs);
+        if (plan.migrated) {
+            physical::note_map_pipeline_executed();
+            return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
+        }
+        physical::note_materialized_call(plan.reason);
     }
 
     // A deferred lazy scan can be streamed instead of materialized. Everything

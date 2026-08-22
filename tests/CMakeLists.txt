@@ -23,6 +23,7 @@ set(IBEX_TEST_SOURCES
     test_ir_join_order.cpp
     test_ir_join_output.cpp
     test_ir_join_reorder.cpp
+    test_kernel_types.cpp
     test_physical_plan.cpp
     test_ir_node.cpp
     test_ir_optimizer.cpp

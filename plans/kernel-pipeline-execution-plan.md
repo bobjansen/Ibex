@@ -382,7 +382,7 @@ guarded intrinsic that compiles at home can still break the A/B build.
 Next: the validity gather (skip-false monotonic writes), then the
 project/rename maps onto `ChunkView`, then the item-3 dispatch table.
 
-**Validity representation ported (2026-08-22, pending performance gate).**
+**Validity representation ported (2026-08-22, `94ee0249`).**
 `ValidityView` now gives the kernel vocabulary the same owned-word versus
 external-byte/bit-offset normalization as `BoolView`, and
 `gather_selected_validity` compacts it through every `Selection` shape.  Its
@@ -392,10 +392,11 @@ windows retain the shared-word atomic-OR safety rule without a clear/write
 race.  The filter no longer owns a validity row loop; it constructs the view
 and calls this kernel beside the other representations.  Unit coverage pins
 selected false bits, an externally offset Arrow-compatible source, and two
-adjoining output windows.  Gates so far: debug ctest 1663/1663 and the
-release gather tests (30,228 assertions) pass.  The interleaved A/B run is in
-progress; record its result before calling this port fully gated.  Next:
-project/rename maps onto `ChunkView`, then the item-3 dispatch table.
+adjoining output windows.  Gates: debug ctest 1663/1663 and the release gather
+tests (30,228 assertions) pass; the 8-repeat, interleaved A/B against
+`HEAD~1` measured +0.32% total / 0.999× geomean over 88 cases, with every case
+classified `noise` (and byte-identical output).  Next: project/rename maps
+onto `ChunkView`, then the item-3 dispatch table.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

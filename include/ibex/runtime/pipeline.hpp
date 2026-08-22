@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -32,6 +33,31 @@ enum class MapKernelCapability : std::uint8_t {
     FilterProjectGather,
     FilterUpdateProjectGather,
 };
+
+/// Storage shape selected once when a physical map pipeline is constructed.
+/// Fixed-width covers numeric and temporal columns; categorical values gather
+/// their flat codes while retaining the shared dictionary separately.
+enum class ColumnRepresentation : std::uint8_t {
+    FixedWidth,
+    PackedBool,
+    StringSlabs,
+    CategoricalCodes,
+};
+
+enum class KernelNullPolicy : std::uint8_t { AllValid, Nullable };
+
+struct ColumnKernelSignature {
+    ColumnRepresentation representation = ColumnRepresentation::FixedWidth;
+    KernelNullPolicy null_policy = KernelNullPolicy::AllValid;
+
+    friend auto operator==(const ColumnKernelSignature&, const ColumnKernelSignature&)
+        -> bool = default;
+};
+
+/// Derive the representation/null-policy part of a kernel dispatch choice.
+[[nodiscard]] auto column_kernel_signature(const ColumnValue& column,
+                                           const std::optional<ValidityBitmap>& validity) noexcept
+    -> ColumnKernelSignature;
 
 /// The row-local kernel family a node can construct, or nullopt when the node
 /// must remain outside this closed dispatch table.  A row-local Update is the

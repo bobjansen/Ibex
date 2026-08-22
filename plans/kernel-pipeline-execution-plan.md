@@ -447,6 +447,21 @@ A/B against `HEAD~1` measured +0.35% total / 0.998× geomean over 88 cases.
 This is neutral dispatch-only noise.  Next: representation/null-policy
 selection as the physical map executor replaces its remaining chunked adapter.
 
+**Phase 2 item 3, source signatures (2026-08-22, pending performance gate).**
+The physical planner now records a `ColumnKernelSignature` for each resolved
+`TableScan` source column: fixed-width, packed-bool, string-slabs, or
+categorical-codes, together with all-valid versus nullable policy.  The
+signature is a construction-time data fact, not a second type-dispatch path;
+the selected map capability remains the execution authority until the physical
+executor consumes both inputs.  `explain_physical` renders the compact ordered
+signature, so the pending representation-aware selection is inspectable.
+Unregistered/lazy and extern sources deliberately carry no signature because
+their columns do not exist at planning time.  Tests pin the registered source
+shape, a nullable categorical direct signature, and the diagnostic rendering.
+Gates: debug physical-plan tests and full ctest 1665/1665.  Next: make the map
+factory consume the signature when it replaces the remaining chunked adapter,
+then run one interleaved A/B for this and that handoff together.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

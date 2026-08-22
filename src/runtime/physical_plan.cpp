@@ -38,6 +38,30 @@ auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
     }
 }
 
+auto representation_name(ColumnRepresentation representation) -> std::string_view {
+    switch (representation) {
+        case ColumnRepresentation::FixedWidth:
+            return "fixed-width";
+        case ColumnRepresentation::PackedBool:
+            return "packed-bool";
+        case ColumnRepresentation::StringSlabs:
+            return "string-slabs";
+        case ColumnRepresentation::CategoricalCodes:
+            return "categorical-codes";
+    }
+    return "unknown";
+}
+
+auto kernel_null_policy_name(KernelNullPolicy policy) -> std::string_view {
+    switch (policy) {
+        case KernelNullPolicy::AllValid:
+            return "all-valid";
+        case KernelNullPolicy::Nullable:
+            return "nullable";
+    }
+    return "unknown";
+}
+
 /// Whether `node` is a map step this planner lowers. Filter-shaped kinds are
 /// maps unconditionally; an `Update` is a map exactly when the per-kind
 /// switch's own gate says so — no guard, no `by`, no tuple assignment, every
@@ -112,6 +136,18 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     }
     plan.source = source;
     plan.source_node = cur;
+    if (source == SourceKind::TableScan) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& scan = static_cast<const ir::ScanNode&>(*cur);
+        const auto source_it = registry.find(scan.source_name());
+        if (source_it != registry.end()) {
+            plan.source_signature.reserve(source_it->second.columns.size());
+            for (const auto& entry : source_it->second.columns) {
+                plan.source_signature.push_back(
+                    column_kernel_signature(*entry.column, entry.validity));
+            }
+        }
+    }
     plan.migrated = true;
     return plan;
 }
@@ -164,6 +200,16 @@ auto explain_physical(const Plan& plan) -> std::string {
             break;
     }
     out += "\n";
+    if (!plan.source_signature.empty()) {
+        out += "  source signature:";
+        for (const auto& signature : plan.source_signature) {
+            out += " ";
+            out += representation_name(signature.representation);
+            out += "/";
+            out += kernel_null_policy_name(signature.null_policy);
+        }
+        out += "\n";
+    }
     return out;
 }
 

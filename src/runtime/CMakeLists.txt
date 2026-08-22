@@ -3,6 +3,7 @@
 
 add_library(ibex_runtime STATIC
     aggregate.cpp
+    chunk_conversion.cpp
     chunked.cpp
     env.cpp
     execution_profile.cpp
@@ -11,6 +12,7 @@ add_library(ibex_runtime STATIC
     filter.cpp
     interpreter.cpp
     join.cpp
+    kernel_update.cpp
     lazy_table.cpp
     model.cpp
     ops.cpp

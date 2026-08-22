@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "kernel_filter.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
 #include "kernel_update.hpp"
@@ -119,6 +120,27 @@ TEST_CASE("Row-local update kernel preserves chunk identity", "[kernel][update]"
     REQUIRE(updated->columns.size() == 2);
     REQUIRE(updated->columns[1].name == "alias");
     REQUIRE(updated->columns[1].column == input_column);
+}
+
+TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20, 30});
+    chunk.sequence = 7;
+    chunk.row_offset = 128;
+    const ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{10}}})}};
+
+    auto filtered = runtime::kernel::filter_chunk(std::move(chunk), predicate, nullptr);
+    REQUIRE(filtered.has_value());
+    REQUIRE(filtered->sequence == 7);
+    REQUIRE(filtered->row_offset == 128);
+    const auto& price = std::get<Column<std::int64_t>>(*filtered->columns[0].column);
+    REQUIRE(price.size() == 2);
+    REQUIRE(price[0] == 20);
+    REQUIRE(price[1] == 30);
 }
 
 TEST_CASE("Row-local alias update overwrites keys without copying its source", "[kernel][update]") {

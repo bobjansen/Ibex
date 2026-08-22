@@ -5,6 +5,9 @@
 
 #include <ibex/runtime/safe_arith.hpp>
 
+#include <cmath>
+#include <type_traits>
+
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "kernel_types.hpp"
@@ -346,7 +349,7 @@ auto try_fixed_width_double_binary_update(const Chunk& input,
     if (fields.size() != 1)
         return std::nullopt;
     const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
-    if (binary == nullptr || binary->op == ir::ArithmeticOp::Mod)
+    if (binary == nullptr)
         return std::nullopt;
     const auto* left = std::get_if<ir::ColumnRef>(&binary->left->node);
     const auto* right = std::get_if<ir::ColumnRef>(&binary->right->node);
@@ -358,61 +361,95 @@ auto try_fixed_width_double_binary_update(const Chunk& input,
         return std::nullopt;
     const auto left_position = view.find_column(left->name);
     const auto right_position = view.find_column(right->name);
-    if (!left_position.has_value() || !right_position.has_value() ||
-        !std::holds_alternative<Column<double>>(view.column(*left_position)) ||
-        !std::holds_alternative<Column<double>>(view.column(*right_position)))
+    if (!left_position.has_value() || !right_position.has_value())
         return std::nullopt;
 
-    const auto lhs = view.view<double>(*left_position);
-    const auto rhs = view.view<double>(*right_position);
-    Column<double> values;
-    values.resize_for_overwrite(view.rows());
-    double* output = values.data();
-    for (std::size_t row = 0; row < view.rows(); ++row) {
-        switch (binary->op) {
-            case ir::ArithmeticOp::Add:
-                output[row] = lhs.value(row) + rhs.value(row);
-                break;
-            case ir::ArithmeticOp::Sub:
-                output[row] = lhs.value(row) - rhs.value(row);
-                break;
-            case ir::ArithmeticOp::Mul:
-                output[row] = lhs.value(row) * rhs.value(row);
-                break;
-            case ir::ArithmeticOp::Div:
-                output[row] = lhs.value(row) / rhs.value(row);
-                break;
-            case ir::ArithmeticOp::Mod:
-                return std::nullopt;
-        }
-    }
-    std::optional<ValidityBitmap> validity;
-    if (view.validity(*left_position).has_value() || view.validity(*right_position).has_value()) {
-        ValidityBitmap bits(view.rows(), true);
-        bool any_invalid = false;
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            const bool valid = lhs.is_valid(row) && rhs.is_valid(row);
-            bits.set(row, valid);
-            any_invalid = any_invalid || !valid;
-        }
-        if (any_invalid)
-            validity = std::move(bits);
-    }
-    Chunk result = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = std::move(validity)};
-    if (existing.has_value())
-        result.columns[*existing] = entry;
-    else
-        result.columns.push_back(entry);
-    result.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+    std::optional<Chunk> result;
+    std::visit(
+        [&](const auto& left_values) {
+            using L = typename std::decay_t<decltype(left_values)>::value_type;
+            if constexpr (std::is_same_v<L, std::int64_t> || std::is_same_v<L, double>) {
+                std::visit(
+                    [&](const auto& right_values) {
+                        using R = typename std::decay_t<decltype(right_values)>::value_type;
+                        if constexpr (std::is_same_v<R, std::int64_t> ||
+                                      std::is_same_v<R, double>) {
+                            // Int64/Int64 was already claimed by the exact-width
+                            // kernels above. Any pair reaching this visitor has
+                            // a Double input and therefore a Double result.
+                            if constexpr (std::is_same_v<L, std::int64_t> &&
+                                          std::is_same_v<R, std::int64_t>) {
+                                return;
+                            }
+                            const ColumnView<L> lhs(left_values,
+                                                    view.validity(*left_position).has_value()
+                                                        ? &*view.validity(*left_position)
+                                                        : nullptr);
+                            const ColumnView<R> rhs(right_values,
+                                                    view.validity(*right_position).has_value()
+                                                        ? &*view.validity(*right_position)
+                                                        : nullptr);
+                            Column<double> values;
+                            values.resize_for_overwrite(view.rows());
+                            double* output = values.data();
+                            for (std::size_t row = 0; row < view.rows(); ++row) {
+                                const double l = static_cast<double>(lhs.value(row));
+                                const double r = static_cast<double>(rhs.value(row));
+                                switch (binary->op) {
+                                    case ir::ArithmeticOp::Add:
+                                        output[row] = l + r;
+                                        break;
+                                    case ir::ArithmeticOp::Sub:
+                                        output[row] = l - r;
+                                        break;
+                                    case ir::ArithmeticOp::Mul:
+                                        output[row] = l * r;
+                                        break;
+                                    case ir::ArithmeticOp::Div:
+                                        output[row] = l / r;
+                                        break;
+                                    case ir::ArithmeticOp::Mod:
+                                        output[row] = std::fmod(l, r);
+                                        break;
+                                }
+                            }
+                            std::optional<ValidityBitmap> validity;
+                            if (view.validity(*left_position).has_value() ||
+                                view.validity(*right_position).has_value()) {
+                                ValidityBitmap bits(view.rows(), true);
+                                bool any_invalid = false;
+                                for (std::size_t row = 0; row < view.rows(); ++row) {
+                                    const bool valid = lhs.is_valid(row) && rhs.is_valid(row);
+                                    bits.set(row, valid);
+                                    any_invalid = any_invalid || !valid;
+                                }
+                                if (any_invalid)
+                                    validity = std::move(bits);
+                            }
+                            Chunk output_chunk = input;
+                            const auto existing = view.find_column(fields.front().alias);
+                            const ColumnEntry entry{
+                                .name = fields.front().alias,
+                                .column = std::make_shared<ColumnValue>(std::move(values)),
+                                .validity = std::move(validity)};
+                            if (existing.has_value())
+                                output_chunk.columns[*existing] = entry;
+                            else
+                                output_chunk.columns.push_back(entry);
+                            output_chunk.set_properties(TableProperties::derive(
+                                view.properties(),
+                                [&](const std::string& name) -> KeyFate {
+                                    return name == fields.front().alias ? KeyFate::overwritten()
+                                                                        : KeyFate::kept(name);
+                                },
+                                RowTransform::Preserve));
+                            result = std::move(output_chunk);
+                        }
+                    },
+                    view.column(*right_position));
+            }
         },
-        RowTransform::Preserve));
+        view.column(*left_position));
     return result;
 }
 

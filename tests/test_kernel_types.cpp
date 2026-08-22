@@ -375,6 +375,29 @@ TEST_CASE("Row-local Int64 literal division writes Double", "[kernel][update]") 
     REQUIRE(half[1] == 5.0);
 }
 
+TEST_CASE("Row-local mixed numeric update writes Double and ANDs validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("whole", Column<std::int64_t>{7, 9}, runtime::ValidityBitmap{true, false});
+    chunk.add_column("fraction", Column<double>{2.5, 4.0});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "remainder",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mod,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "whole"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "fraction"}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& remainder = std::get<Column<double>>(*updated->columns[2].column);
+    REQUIRE(remainder[0] == 2.0);
+    REQUIRE(updated->columns[2].validity.has_value());
+    REQUIRE_FALSE((*updated->columns[2].validity)[1]);
+}
+
 TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20}, runtime::ValidityBitmap{true, false});

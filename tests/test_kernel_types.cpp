@@ -143,6 +143,39 @@ TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {
     REQUIRE(price[1] == 30);
 }
 
+TEST_CASE("Filter chunk project and limit share direct predicate selection", "[kernel][filter]") {
+    const ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Ge,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{20}}})}};
+
+    runtime::Chunk projected_input;
+    projected_input.add_column("price", Column<std::int64_t>{10, 20, 30, 40});
+    projected_input.add_column("qty", Column<std::int64_t>{1, 2, 3, 4});
+    const std::vector<ir::ColumnRef> project{{.name = "qty"}};
+    auto projected = runtime::kernel::filter_project_chunk(std::move(projected_input), predicate,
+                                                           project, nullptr);
+    REQUIRE(projected.has_value());
+    REQUIRE(projected->columns.size() == 1);
+    REQUIRE(projected->columns[0].name == "qty");
+    const auto& qty = std::get<Column<std::int64_t>>(*projected->columns[0].column);
+    REQUIRE(qty.size() == 3);
+    REQUIRE(qty[0] == 2);
+    REQUIRE(qty[1] == 3);
+    REQUIRE(qty[2] == 4);
+
+    runtime::Chunk limited_input;
+    limited_input.add_column("price", Column<std::int64_t>{10, 20, 30, 40});
+    auto limited =
+        runtime::kernel::filter_limit_chunk(std::move(limited_input), predicate, 2, nullptr);
+    REQUIRE(limited.has_value());
+    const auto& price = std::get<Column<std::int64_t>>(*limited->columns[0].column);
+    REQUIRE(price.size() == 2);
+    REQUIRE(price[0] == 20);
+    REQUIRE(price[1] == 30);
+}
+
 TEST_CASE("Row-local alias update overwrites keys without copying its source", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20});

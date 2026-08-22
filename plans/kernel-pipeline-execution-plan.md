@@ -464,6 +464,21 @@ interleaved A/B against `HEAD~1` measured +1.19% total / 0.997× geomean over
 slice has no performance signal.  Next: make the map factory consume the
 signature when it replaces the remaining chunked adapter.
 
+**Row-local update kernel seam (2026-08-22, pending performance gate).**
+`kernel::update_row_local_chunk` is now the one chunk-level entry point for
+the row-local Update capability.  It owns the Chunk→Table evaluator boundary
+and restores `sequence`/`row_offset` after the established `update_table`
+semantics finish; `ChunkedUpdateOperator` delegates to it rather than owning
+that conversion itself.  The conversion pair is shared internal runtime code,
+so every remaining chunked operator retains the same representation of table
+metadata and zero-column logical rows instead of carrying a second copy of
+that bridge.  This is deliberately a seam extraction, not a claim that
+`update_table`'s fixed-width, packed-bool, string, categorical, and validity
+loops are ported yet.  The new kernel test pins alias buffer sharing and
+morsel identity; full debug ctest passes 1666/1666.  Next: peel the row-local
+field evaluator's first representation-specific fast path onto views, then
+run one interleaved A/B for this boundary change.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

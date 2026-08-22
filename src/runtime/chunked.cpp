@@ -59,10 +59,12 @@
 #include <immintrin.h>
 #endif
 
+#include "chunk_conversion_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_internal.hpp"
 #include "kernel_types.hpp"
+#include "kernel_update.hpp"
 #include "model_internal.hpp"
 #include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
@@ -102,29 +104,6 @@ void append_validity(std::optional<ValidityBitmap>& dst, std::size_t dst_rows,
     for (std::size_t r = 0; r < src_rows; ++r) {
         dst->push_back(src.has_value() ? (*src)[r] : true);
     }
-}
-
-auto chunk_to_table(Chunk chunk) -> Table {
-    Table t;
-    t.columns = std::move(chunk.columns);
-    for (std::size_t i = 0; i < t.columns.size(); ++i) {
-        t.index[t.columns[i].name] = i;
-    }
-    t.set_properties(chunk.properties());
-    if (t.columns.empty()) {  // logical_rows is only meaningful when column-less
-        t.logical_rows = chunk.logical_rows;
-    }
-    return t;
-}
-
-auto table_to_chunk(Table table) -> Chunk {
-    Chunk c;
-    c.columns = std::move(table.columns);
-    c.set_properties(table.properties());
-    if (c.columns.empty()) {  // logical_rows is only meaningful when column-less
-        c.logical_rows = table.logical_rows;
-    }
-    return c;
 }
 
 /// Morsel identity survives every one-input/one-output parallel-map operator.
@@ -732,14 +711,12 @@ class ChunkedUpdateOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Chunk input = std::move(*chunk_res.value());
-        const auto identity = chunk_identity_of(input);
-        Table t = chunk_to_table(std::move(input));
-        auto out = update_table(std::move(t), *fields_, scalars_, externs_, *exec_);
+        auto out = kernel::update_row_local_chunk(std::move(*chunk_res.value()), *fields_, scalars_,
+                                                  externs_, *exec_);
         if (!out.has_value()) {
             return std::unexpected(std::move(out.error()));
         }
-        return std::optional<Chunk>{table_to_chunk(std::move(out.value()), identity)};
+        return std::optional<Chunk>{std::move(out.value())};
     }
 
    private:

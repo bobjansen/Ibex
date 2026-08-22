@@ -10,6 +10,7 @@
 
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
+#include "kernel_update.hpp"
 
 namespace {
 
@@ -98,6 +99,26 @@ TEST_CASE("ChunkView metadata map shares columns and preserves morsel identity",
     REQUIRE_FALSE((*output.columns[0].validity)[1]);
     REQUIRE(output.row_offset == 64);
     REQUIRE(output.sequence == 3);
+}
+
+TEST_CASE("Row-local update kernel preserves chunk identity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20});
+    chunk.sequence = 9;
+    chunk.row_offset = 128;
+    const auto input_column = chunk.columns.front().column;
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "alias", .expr = ir::Expr{.node = ir::ColumnRef{.name = "price"}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->sequence == 9);
+    REQUIRE(updated->row_offset == 128);
+    REQUIRE(updated->columns.size() == 2);
+    REQUIRE(updated->columns[1].name == "alias");
+    REQUIRE(updated->columns[1].column == input_column);
 }
 
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {

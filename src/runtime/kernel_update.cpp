@@ -459,7 +459,7 @@ auto try_fixed_width_double_literal_update(const Chunk& input,
     if (fields.size() != 1)
         return std::nullopt;
     const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
-    if (binary == nullptr || binary->op == ir::ArithmeticOp::Mod)
+    if (binary == nullptr)
         return std::nullopt;
     const auto* left_column = std::get_if<ir::ColumnRef>(&binary->left->node);
     const auto* right_column = std::get_if<ir::ColumnRef>(&binary->right->node);
@@ -484,58 +484,81 @@ auto try_fixed_width_double_literal_update(const Chunk& input,
         return std::nullopt;
     const auto source_position =
         view.find_column(column_left ? left_column->name : right_column->name);
-    if (!source_position.has_value() ||
-        !std::holds_alternative<Column<double>>(view.column(*source_position)))
+    if (!source_position.has_value())
         return std::nullopt;
-    const auto source = view.view<double>(*source_position);
-    Column<double> values;
-    values.resize_for_overwrite(view.rows());
-    double* output = values.data();
-    for (std::size_t row = 0; row < view.rows(); ++row) {
-        const double value = source.value(row);
-        switch (binary->op) {
-            case ir::ArithmeticOp::Add:
-                output[row] = column_left ? value + scalar : scalar + value;
-                break;
-            case ir::ArithmeticOp::Sub:
-                output[row] = column_left ? value - scalar : scalar - value;
-                break;
-            case ir::ArithmeticOp::Mul:
-                output[row] = value * scalar;
-                break;
-            case ir::ArithmeticOp::Div:
-                output[row] = column_left ? value / scalar : scalar / value;
-                break;
-            case ir::ArithmeticOp::Mod:
-                return std::nullopt;
-        }
-    }
-    std::optional<ValidityBitmap> validity;
-    if (view.validity(*source_position).has_value()) {
-        ValidityBitmap bits(view.rows(), true);
-        bool any_invalid = false;
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            bits.set(row, source.is_valid(row));
-            any_invalid = any_invalid || !source.is_valid(row);
-        }
-        if (any_invalid)
-            validity = std::move(bits);
-    }
-    Chunk result = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = std::move(validity)};
-    if (existing.has_value())
-        result.columns[*existing] = entry;
-    else
-        result.columns.push_back(entry);
-    result.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+
+    std::optional<Chunk> result;
+    std::visit(
+        [&](const auto& source_values) {
+            using T = typename std::decay_t<decltype(source_values)>::value_type;
+            if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                // The exact Int64 kernel above owns Int64-with-Int64. This
+                // route covers any expression involving a Double instead.
+                if constexpr (std::is_same_v<T, std::int64_t>) {
+                    if (double_scalar == nullptr) {
+                        return;
+                    }
+                }
+                const ColumnView<T> source(source_values,
+                                           view.validity(*source_position).has_value()
+                                               ? &*view.validity(*source_position)
+                                               : nullptr);
+                Column<double> values;
+                values.resize_for_overwrite(view.rows());
+                double* output = values.data();
+                for (std::size_t row = 0; row < view.rows(); ++row) {
+                    const double value = static_cast<double>(source.value(row));
+                    switch (binary->op) {
+                        case ir::ArithmeticOp::Add:
+                            output[row] = column_left ? value + scalar : scalar + value;
+                            break;
+                        case ir::ArithmeticOp::Sub:
+                            output[row] = column_left ? value - scalar : scalar - value;
+                            break;
+                        case ir::ArithmeticOp::Mul:
+                            output[row] = value * scalar;
+                            break;
+                        case ir::ArithmeticOp::Div:
+                            output[row] = column_left ? value / scalar : scalar / value;
+                            break;
+                        case ir::ArithmeticOp::Mod:
+                            output[row] =
+                                column_left ? std::fmod(value, scalar) : std::fmod(scalar, value);
+                            break;
+                    }
+                }
+                std::optional<ValidityBitmap> validity;
+                if (view.validity(*source_position).has_value()) {
+                    ValidityBitmap bits(view.rows(), true);
+                    bool any_invalid = false;
+                    for (std::size_t row = 0; row < view.rows(); ++row) {
+                        const bool valid = source.is_valid(row);
+                        bits.set(row, valid);
+                        any_invalid = any_invalid || !valid;
+                    }
+                    if (any_invalid)
+                        validity = std::move(bits);
+                }
+                Chunk output_chunk = input;
+                const auto existing = view.find_column(fields.front().alias);
+                const ColumnEntry entry{.name = fields.front().alias,
+                                        .column = std::make_shared<ColumnValue>(std::move(values)),
+                                        .validity = std::move(validity)};
+                if (existing.has_value())
+                    output_chunk.columns[*existing] = entry;
+                else
+                    output_chunk.columns.push_back(entry);
+                output_chunk.set_properties(TableProperties::derive(
+                    view.properties(),
+                    [&](const std::string& name) -> KeyFate {
+                        return name == fields.front().alias ? KeyFate::overwritten()
+                                                            : KeyFate::kept(name);
+                    },
+                    RowTransform::Preserve));
+                result = std::move(output_chunk);
+            }
         },
-        RowTransform::Preserve));
+        view.column(*source_position));
     return result;
 }
 

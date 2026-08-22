@@ -398,6 +398,26 @@ TEST_CASE("Row-local mixed numeric update writes Double and ANDs validity", "[ke
     REQUIRE_FALSE((*updated->columns[2].validity)[1]);
 }
 
+TEST_CASE("Row-local Int64 and Double literal update writes Double", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{7, 9});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "remainder",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mod,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.5}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& remainder = std::get<Column<double>>(*updated->columns[1].column);
+    REQUIRE(remainder[0] == 2.0);
+    REQUIRE(remainder[1] == 1.5);
+}
+
 TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20}, runtime::ValidityBitmap{true, false});

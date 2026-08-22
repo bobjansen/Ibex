@@ -508,6 +508,15 @@ coverage pins a multiply result; focused kernel-update tests and full debug
 ctest 1669/1669 pass.  Next: verify this first computed fast path, then extend
 to nullable fixed-width inputs rather than broadening its semantics blindly.
 
+**Nullable Int64 binary update port (2026-08-22, pending performance gate).**
+The same column-pair add/subtract/multiply kernel now accepts nullable Int64
+inputs.  Its value loop remains branch-free; when either input has validity it
+makes a separate AND pass and retains a bitmap only if an output row is null.
+The direct test pins the mixed-null mask; focused kernel-update tests and full
+debug ctest 1670/1670 pass.  Division/modulo, scalars, mixed types, and
+multi-field snapshots remain delegated to `update_table`.  Next: run one
+combined interleaved A/B for the all-valid and nullable computed-field ports.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

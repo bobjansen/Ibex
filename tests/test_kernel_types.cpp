@@ -181,6 +181,30 @@ TEST_CASE("Row-local fixed-width binary update uses all-valid column views", "[k
     REQUIRE(product[2] == 44);
 }
 
+TEST_CASE("Row-local fixed-width binary update ANDs nullable input validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("left", Column<std::int64_t>{2, 3, 4},
+                     runtime::ValidityBitmap{true, false, true});
+    chunk.add_column("right", Column<std::int64_t>{5, 7, 11},
+                     runtime::ValidityBitmap{true, true, false});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "sum",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Add,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "left"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "right"}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->columns[2].validity.has_value());
+    REQUIRE((*updated->columns[2].validity)[0]);
+    REQUIRE_FALSE((*updated->columns[2].validity)[1]);
+    REQUIRE_FALSE((*updated->columns[2].validity)[2]);
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

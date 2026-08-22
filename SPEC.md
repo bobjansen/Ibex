@@ -3857,9 +3857,8 @@ depends entirely on the transport:
 - **User-space / in-process transports:** if the source reads from a
   user-space queue and there is no independent producer thread, messages
   produced during the `StreamTimeout` window may be lost. The plugin author
-  is responsible for arranging OS-level or thread-level buffering so that
-  data accumulates safely until the source is called again. For a convenient
-  zero-extra-copy solution see `StreamBuffered` (§12.7).
+  is responsible for arranging their own thread-safe producer queue so that
+  data accumulates safely until the source is called again.
 
 `StreamTimeout` is meaningful only for `TimeBucket` streams; for `PerRow`
 streams it is silently ignored.
@@ -4040,92 +4039,6 @@ immediately when the first tick belonging to the next minute arrives
 the wall-clock check to fire close to the bucket boundary while the source
 stays live and misses no messages. A `udp_recv` that blocks indefinitely
 delays emission until the next tick arrives.
-
-### 13.7 StreamBuffered: Ready-Made Producer Queue for In-Process Sources
-
-For user-space / in-process transports the runtime provides
-`ibex::runtime::StreamBuffered` — a helper that combines an SPSC
-(single-producer, single-consumer) ring buffer with a compatible `ExternFn`,
-so the plugin author does not need to implement their own thread-safe queue.
-
-> **Note:** Ibex still maintains its own internal TimeBucket accumulation buffer.
-> `StreamBuffered` provides the producer-side queue that feeds that buffer — it
-> replaces whatever ad-hoc buffering the plugin would otherwise need.
-
-#### How it works
-
-1. The plugin registers a source using `make_buffered_source(producer_fn)`.
-2. When the Ibex event loop first calls the source it reads the ring capacity
-   from the first Int argument, initialises `StreamBuffered(capacity)`, and
-   launches the producer callback in a detached thread.
-3. The **producer thread** pushes batches via `buf.write(table)` and signals
-   completion with `buf.close()`.
-4. On every subsequent call the **event loop** drains the ring:
-   - Ring non-empty → returns the next `Table` (rows > 0).
-   - Ring empty, not closed → returns `StreamTimeout{}` so the wall-clock
-     bucket flush can fire without blocking the consumer.
-   - Ring empty, closed → returns an empty `Table` (EOF) to stop the loop.
-
-#### API summary
-
-There are two usage styles depending on whether capacity should come from
-the Ibex query or from C++.
-
-**Preferred — capacity from the Ibex query (`make_buffered_source`)**
-
-```cpp
-#include <ibex/runtime/stream_buffered.hpp>
-
-// C++ plugin: only the data-production logic, no capacity decision.
-registry.register_table("my_src",
-    ibex::runtime::make_buffered_source([](ibex::runtime::StreamBuffered& buf) {
-        for (auto& batch : my_data_source) buf.write(batch);
-        buf.close();
-    }));
-```
-
-```
-// Ibex query: capacity is a tuning parameter alongside resample, filters, etc.
-extern fn my_src(capacity: Int) -> TimeFrame from "plugin.hpp";
-Stream {
-    source    = my_src(512),
-    transform = [resample 1s, select { close = last(price) }],
-    sink      = my_sink()
-};
-```
-
-**Manual — capacity chosen in C++ (`StreamBuffered` directly)**
-
-```cpp
-// Use when the plugin owns the producer lifecycle explicitly.
-auto buf = std::make_shared<ibex::runtime::StreamBuffered>(/*capacity=*/256);
-registry.register_table("my_src", buf->make_source_fn());
-
-std::thread producer([buf] {
-    buf->write(my_table);   // blocks (yields) if ring is full
-    buf->close();
-});
-```
-
-#### Comparison with kernel-backed sockets
-
-| Property | `StreamBuffered` | UDP with SO_RCVTIMEO |
-|---|---|---|
-| Producer-side buffer | User-space SPSC ring (provided) | Kernel socket buffer (OS-managed) |
-| Plugin author writes own queue | No | No |
-| Overflow behaviour | Producer blocks (backpressure) | Kernel drops datagrams |
-| Suitable for | In-process queues, shared memory | Network sources |
-
-For kernel-backed transports (UDP/TCP), use the `StreamTimeout{}` pattern
-directly without `StreamBuffered` — the kernel already provides an equivalent
-ring buffer at no extra cost.
-
-#### Concurrency guarantees
-
-`write()` and `close()` must be called from a single producer thread.
-The `ExternFn` returned by `make_source_fn()` is called only from the Ibex
-event loop (single consumer).  The two sides are separated by cache-line-
-aligned atomic indices so no mutex is required on the hot path.
 
 ---
 

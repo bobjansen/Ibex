@@ -297,6 +297,92 @@ auto try_fixed_width_double_binary_update(const Chunk& input,
     return result;
 }
 
+auto try_fixed_width_double_literal_update(const Chunk& input,
+                                           const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1)
+        return std::nullopt;
+    const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
+    if (binary == nullptr || binary->op == ir::ArithmeticOp::Mod)
+        return std::nullopt;
+    const auto* left_column = std::get_if<ir::ColumnRef>(&binary->left->node);
+    const auto* right_column = std::get_if<ir::ColumnRef>(&binary->right->node);
+    const auto* left_literal = std::get_if<ir::Literal>(&binary->left->node);
+    const auto* right_literal = std::get_if<ir::Literal>(&binary->right->node);
+    const bool column_left = left_column != nullptr && right_literal != nullptr;
+    const bool column_right = right_column != nullptr && left_literal != nullptr;
+    if ((!column_left && !column_right) || (column_left && left_column->lexical) ||
+        (column_right && right_column->lexical))
+        return std::nullopt;
+    const auto* literal = column_left ? right_literal : left_literal;
+    const double* double_scalar = std::get_if<double>(&literal->value);
+    const std::int64_t* int_scalar = std::get_if<std::int64_t>(&literal->value);
+    if (double_scalar == nullptr && int_scalar == nullptr)
+        return std::nullopt;
+    const double scalar =
+        double_scalar != nullptr ? *double_scalar : static_cast<double>(*int_scalar);
+
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index())
+        return std::nullopt;
+    const auto source_position =
+        view.find_column(column_left ? left_column->name : right_column->name);
+    if (!source_position.has_value() ||
+        !std::holds_alternative<Column<double>>(view.column(*source_position)))
+        return std::nullopt;
+    const auto source = view.view<double>(*source_position);
+    Column<double> values;
+    values.resize_for_overwrite(view.rows());
+    double* output = values.data();
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        const double value = source.value(row);
+        switch (binary->op) {
+            case ir::ArithmeticOp::Add:
+                output[row] = column_left ? value + scalar : scalar + value;
+                break;
+            case ir::ArithmeticOp::Sub:
+                output[row] = column_left ? value - scalar : scalar - value;
+                break;
+            case ir::ArithmeticOp::Mul:
+                output[row] = value * scalar;
+                break;
+            case ir::ArithmeticOp::Div:
+                output[row] = column_left ? value / scalar : scalar / value;
+                break;
+            case ir::ArithmeticOp::Mod:
+                return std::nullopt;
+        }
+    }
+    std::optional<ValidityBitmap> validity;
+    if (view.validity(*source_position).has_value()) {
+        ValidityBitmap bits(view.rows(), true);
+        bool any_invalid = false;
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            bits.set(row, source.is_valid(row));
+            any_invalid = any_invalid || !source.is_valid(row);
+        }
+        if (any_invalid)
+            validity = std::move(bits);
+    }
+    Chunk result = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(std::move(values)),
+                            .validity = std::move(validity)};
+    if (existing.has_value())
+        result.columns[*existing] = entry;
+    else
+        result.columns.push_back(entry);
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
 }  // namespace
 
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
@@ -305,14 +391,20 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
         return std::move(*output);
     }
-    if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {
-        return std::move(*output);
-    }
-    if (auto output = try_fixed_width_int_literal_update(input, fields); output.has_value()) {
-        return std::move(*output);
-    }
-    if (auto output = try_fixed_width_double_binary_update(input, fields); output.has_value()) {
-        return std::move(*output);
+    if (!exec.parallel) {
+        if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_fixed_width_int_literal_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_fixed_width_double_binary_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_fixed_width_double_literal_update(input, fields);
+            output.has_value()) {
+            return std::move(*output);
+        }
     }
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;

@@ -2413,34 +2413,20 @@ void gather_selection_into(Table& output, const Table& input,
             },
             *src_entry.column);
 
-        // Validity travels with the same selected row set.
-        //
-        // Accumulated a word at a time rather than a bit at a time, so the
-        // shared-word rule applies per word instead of per bit. A false bit is
-        // simply not written: the destination is zero-filled, so skipping it
-        // gives the same answer *and* keeps every write monotonic, which is
-        // what lets a shared word be OR-ed in atomically.
+        // Validity travels with the same selected row set.  The kernel leaves
+        // false bits clear in the zero-filled destination, making its writes
+        // monotonic and therefore safe at shared output-word boundaries.
         if (src_entry.validity.has_value()) {
-            const auto& src_bm = *src_entry.validity;
-            auto& dst_bm = *dst_entry.validity;
-            auto* dst_words = dst_bm.words_data();
-            const auto shared = kernel::SharedBitWords::of_run(dst.row, sel.kept);
-            std::size_t j = dst.row;
-            std::size_t word = shared.first;
-            std::uint64_t acc = 0;
-            for_each_selected_row(sel, rows, [&](std::size_t si) {
-                const std::size_t target = j / 64;
-                if (target != word) {
-                    kernel::or_bits_into_word(dst_words, word, acc, shared);
-                    acc = 0;
-                    word = target;
-                }
-                if (src_bm[si]) {
-                    acc |= std::uint64_t{1} << (j % 64);
-                }
-                ++j;
-            });
-            kernel::or_bits_into_word(dst_words, word, acc, shared);
+            kernel::gather_selected_validity(
+                kernel::ValidityView(*src_entry.validity),
+                kernel::Selection{kernel::RowWordBlocks{
+                    .words = sel.keep_words.data(),
+                    .word_count = sel.keep_words.size(),
+                    .row_base = rows.begin,
+                }},
+                kernel::BoolOutputSpan{.words = dst_entry.validity->words_data(),
+                                       .begin = dst.row,
+                                       .count = sel.kept});
         }
     }
 }

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstring>
@@ -229,6 +231,44 @@ struct BoolOutputSpan {
     std::size_t count = 0;  // bits to write
 };
 
+/// Non-owning view of a validity bitmap.  As with BoolView, `source_word`
+/// normalizes the owned-word and Arrow-compatible external-byte layouts.  A
+/// validity gather is deliberately a set-only operation: its destination is
+/// pre-sized and zero-filled, and false source bits are left untouched.
+class ValidityView {
+   public:
+    ValidityView(const ValidityBitmap& bitmap) noexcept : bitmap_(&bitmap) {}
+
+    [[nodiscard]] auto rows() const noexcept -> std::size_t { return bitmap_->size(); }
+    [[nodiscard]] auto bit(std::size_t row) const noexcept -> bool { return (*bitmap_)[row]; }
+
+    /// The 64 logical validity bits at `[start_row, start_row + 64)`, with
+    /// out-of-range bits clear.  An external bitmap may begin at any bit in
+    /// its byte buffer, so read that representation bytewise rather than
+    /// pretending its first logical bit is word-aligned.
+    [[nodiscard]] auto source_word(std::size_t start_row) const noexcept -> std::uint64_t {
+        if (!bitmap_->is_external()) {
+            const auto* __restrict src_words = bitmap_->words_data();
+            const std::size_t sw = start_row / 64;
+            const auto shift = static_cast<unsigned>(start_row % 64);
+            std::uint64_t bits = src_words[sw] >> shift;
+            if (shift != 0 && sw + 1 < bitmap_->word_count()) {
+                bits |= src_words[sw + 1] << (64 - shift);
+            }
+            return bits;
+        }
+        const std::size_t count = std::min<std::size_t>(64, rows() - start_row);
+        std::uint64_t bits = 0;
+        for (std::size_t bit = 0; bit < count; ++bit) {
+            bits |= static_cast<std::uint64_t>((*bitmap_)[start_row + bit]) << bit;
+        }
+        return bits;
+    }
+
+   private:
+    const ValidityBitmap* bitmap_;
+};
+
 /// The bool gather kernel. `RowWordBlocks` is the hot shape (filter output);
 /// the index/bitmap shapes fall back to bit-at-a-time sets, which nothing
 /// hot uses yet — correctness first, they exist so the Selection contract is
@@ -249,6 +289,56 @@ inline auto gather_selected_bool(BoolView src, const Selection& selection,
                     const std::uint64_t src_bits = src.source_word(sel.row_base + (w * 64));
                     const std::uint64_t packed = pack_selected_bool_bits(src_bits, select);
                     append_packed_bool_bits(packed, static_cast<std::size_t>(std::popcount(select)),
+                                            out.words, out_bit, shared);
+                }
+            } else {
+                const auto each = [&](std::size_t row) {
+                    if (src.bit(row)) {
+                        or_bits_into_word(out.words, out_bit / 64,
+                                          std::uint64_t{1} << (out_bit % 64), shared);
+                    }
+                    ++out_bit;
+                };
+                if constexpr (std::is_same_v<S, RowRange>) {
+                    for (std::size_t r = sel.begin; r < sel.end; ++r) {
+                        each(r);
+                    }
+                } else if constexpr (std::is_same_v<S, RowIndices>) {
+                    for (std::size_t i = 0; i < sel.count; ++i) {
+                        each(sel[i]);
+                    }
+                } else {  // RowBitmap
+                    for (std::size_t r = 0; r < src.rows(); ++r) {
+                        if (sel.test(r)) {
+                            each(r);
+                        }
+                    }
+                }
+            }
+        },
+        selection);
+}
+
+/// Gather validity bits through `selection` into a zero-filled output window.
+/// This is intentionally not an assignment kernel: leaving false bits clear
+/// makes every write monotonic, so windows that meet in a destination word can
+/// use the same atomic-OR boundary rule as bool gathers.
+inline auto gather_selected_validity(ValidityView src, const Selection& selection,
+                                     BoolOutputSpan out) noexcept -> void {
+    const SharedBitWords shared = SharedBitWords::of_run(out.begin, out.count);
+    std::size_t out_bit = out.begin;
+    std::visit(
+        [&](const auto& sel) {
+            using S = std::decay_t<decltype(sel)>;
+            if constexpr (std::is_same_v<S, RowWordBlocks>) {
+                for (std::size_t w = 0; w < sel.word_count; ++w) {
+                    const std::uint64_t select = sel.words[w];
+                    if (select == 0) {
+                        continue;
+                    }
+                    const std::uint64_t valid = src.source_word(sel.row_base + (w * 64));
+                    append_packed_bool_bits(pack_selected_bool_bits(valid, select),
+                                            static_cast<std::size_t>(std::popcount(select)),
                                             out.words, out_bit, shared);
                 }
             } else {

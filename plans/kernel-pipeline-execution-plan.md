@@ -535,11 +535,15 @@ coverage pins nullable multiplication; full debug ctest passes 1672/1672.
 Next: run one combined A/B for the computed-update ports, then decide whether
 the checked-arithmetic contract is worth extracting.
 
-**Double literal update port (2026-08-22, pending performance gate).**
+**Double literal update port (2026-08-22, `8ef3b243`).**
 Double columns now accept Int64 or Double literals for add/subtract/multiply/divide
 through the view kernel, covering `price * 2`. Computed view kernels are serial-only
 for now: parallel updates retain the established evaluator's field scheduling and
-accounting contract. Full debug ctest 1673/1673 passes.
+accounting contract. Full debug ctest 1673/1673 passes. The combined 8-repeat
+interleaved A/B against `HEAD~1` measured −0.22% total / 0.998× geomean over
+88 cases (0.997× ibex-only); the three parse-inclusive cases were 1.022×.
+This is neutral noise. Next: extract checked integer divide/modulo only with
+their established zero-divisor contract, keeping parallel updates delegated.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

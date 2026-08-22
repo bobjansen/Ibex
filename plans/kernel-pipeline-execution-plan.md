@@ -436,6 +436,15 @@ debug ctest 1664/1664; the 8-repeat interleaved A/B against `HEAD~1` measured
 change.  Next: extend capability declarations with representation/null-policy
 selection as the physical map executor replaces its remaining chunked adapter.
 
+**Phase 2 item 3, plan-to-factory handoff (2026-08-22, pending performance
+gate).** The serial physical composer now passes each capability recorded in
+`Plan::kernel_capabilities` directly to the shared map factory; it does not
+classify the IR again.  The parallel paths use the same factory through the
+one capability-producing wrapper at their construction boundary.  This makes
+the plan's dispatch choice executable rather than diagnostic-only.  Gates:
+physical execution tests and debug ctest 1664/1664.  Run the interleaved A/B
+before closing this handoff.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

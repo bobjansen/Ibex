@@ -124,6 +124,40 @@ TEST_CASE("Row-local update kernel preserves chunk identity", "[kernel][update]"
     REQUIRE(updated->columns[1].column == input_column);
 }
 
+TEST_CASE("Row-local multi-field update reads earlier direct fields", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20});
+    chunk.sequence = 9;
+    chunk.row_offset = 128;
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "doubled",
+         .expr =
+             ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Mul,
+                                             .left = ir::make_expr_ptr(
+                                                 ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                                             .right = ir::make_expr_ptr(ir::Expr{
+                                                 .node = ir::Literal{.value = std::int64_t{2}}})}}},
+        {.alias = "next",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Add,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "doubled"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}})}}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->sequence == 9);
+    REQUIRE(updated->row_offset == 128);
+    const auto& doubled = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    const auto& next = std::get<Column<std::int64_t>>(*updated->columns[2].column);
+    CHECK(doubled[0] == 20);
+    CHECK(doubled[1] == 40);
+    CHECK(next[0] == 21);
+    CHECK(next[1] == 41);
+}
+
 TEST_CASE("Row-local update shares the fixed-width numeric writer with scalar bindings",
           "[kernel][update]") {
     runtime::Chunk chunk;

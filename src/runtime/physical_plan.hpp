@@ -56,6 +56,7 @@ struct Plan {
     const ir::Node* source_node = nullptr;
     std::vector<const ir::Node*> steps;
     std::vector<MapKernelCapability> kernel_capabilities;
+    std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
 };
 

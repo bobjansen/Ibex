@@ -67,6 +67,13 @@ TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical
     REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
     REQUIRE(plan.source_node != nullptr);
     REQUIRE(plan.source_node->kind() == ir::NodeKind::Scan);
+    REQUIRE(plan.source_signature ==
+            std::vector{runtime::ColumnKernelSignature{runtime::ColumnRepresentation::FixedWidth,
+                                                       runtime::KernelNullPolicy::AllValid},
+                        runtime::ColumnKernelSignature{runtime::ColumnRepresentation::StringSlabs,
+                                                       runtime::KernelNullPolicy::AllValid},
+                        runtime::ColumnKernelSignature{runtime::ColumnRepresentation::PackedBool,
+                                                       runtime::KernelNullPolicy::AllValid}});
 }
 
 TEST_CASE("Physical plan lowers select-only and row-local update chains", "[physical][plan]") {
@@ -91,6 +98,17 @@ TEST_CASE("Physical plan classifies an unregistered scan as LazyScan", "[physica
     const auto plan = runtime::physical::plan_physical(*ir, trades_registry(), nullptr);
     REQUIRE(plan.migrated);
     REQUIRE(plan.source == runtime::physical::SourceKind::LazyScan);
+}
+
+TEST_CASE("Column kernel signatures capture storage representation and null policy",
+          "[physical][plan]") {
+    const runtime::ColumnValue categorical =
+        Column<Categorical>{{"A", "B"}, {std::int32_t{0}, std::int32_t{1}}};
+    const std::optional<runtime::ValidityBitmap> nullable{runtime::ValidityBitmap{true, false}};
+
+    REQUIRE(runtime::column_kernel_signature(categorical, nullable) ==
+            runtime::ColumnKernelSignature{runtime::ColumnRepresentation::CategoricalCodes,
+                                           runtime::KernelNullPolicy::Nullable});
 }
 
 TEST_CASE("Physical plan declines breakers and grouped updates with reasons", "[physical][plan]") {
@@ -132,6 +150,8 @@ TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical]
     REQUIRE(text.find("MapPipeline") != std::string::npos);
     REQUIRE(text.find("  FilterProject\n") != std::string::npos);
     REQUIRE(text.find("source: TableScan(trades)") != std::string::npos);
+    REQUIRE(text.find("  source signature: fixed-width/all-valid string-slabs/all-valid "
+                      "packed-bool/all-valid\n") != std::string::npos);
 
     const auto [fallback_tree, fallback] = serial_plan("trades[order { price }];");
     const std::string declined = runtime::physical::explain_physical(fallback);

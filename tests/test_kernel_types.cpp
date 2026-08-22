@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "kernel_filter.hpp"
@@ -149,6 +150,38 @@ TEST_CASE("Row-local update shares the fixed-width numeric writer with scalar bi
     REQUIRE(adjusted[2] == 37);
     REQUIRE(updated->columns[1].validity.has_value());
     REQUIRE_FALSE((*updated->columns[1].validity)[1]);
+}
+
+TEST_CASE("Row-local update writes string interpolation into a presized slab", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("name", Column<std::string>{"a", "", "c"},
+                     runtime::ValidityBitmap{true, false, true});
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("suffix", std::string{"!"});
+
+    ir::CallExpr interpolation{.callee = "__interp", .args = {}, .named_args = {}};
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"row="}}}));
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "name"}}));
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "suffix", .lexical = true}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "label", .expr = ir::Expr{.node = std::move(interpolation)}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, &scalars, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& label = std::get<Column<std::string>>(*updated->columns[1].column);
+    REQUIRE(label.size() == 3);
+    CHECK(label[0] == "row=a!");
+    CHECK(label[1].empty());
+    CHECK(label[2] == "row=c!");
+    REQUIRE(updated->columns[1].validity.has_value());
+    CHECK((*updated->columns[1].validity)[0]);
+    CHECK_FALSE((*updated->columns[1].validity)[1]);
+    CHECK((*updated->columns[1].validity)[2]);
 }
 
 TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {

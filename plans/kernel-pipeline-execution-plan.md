@@ -344,6 +344,26 @@ materializes a temporary from a bare bitmap and dangles the view. Resume
 point: `OutputWriter` + `KernelContext`, then the first kernel port
 (fixed-width filter gather) onto the views, one representation at a time.
 
+**First kernel port landed (2026-08-22, `c2debfa6`).**
+`kernel_gather.hpp` adds `OutputSpan<T>` (the fixed-width OutputWriter: a
+pre-sized disjoint window of a count/prefix-sum-owned buffer) and
+`gather_selected(ColumnView, Selection, OutputSpan)` with closed
+compile-time dispatch over four selection shapes — `RowRange` (one
+contiguous copy), `RowIndices`, `RowBitmap`, and `RowWordBlocks`, the
+engine's native 64-row mask, added to the vocabulary for exactly this
+port. `filter_table`'s fixed-width and categorical-code arms now call the
+kernel; string/bool arms and the shared-word validity gather are the next
+representations. `ColumnView`'s constraint became trivially-copyable
+value types rather than "a `Column<T>` exists" — categorical codes are a
+flat int32 array with no `Column<uint32_t>`, and that gather IS the
+fixed-width kernel over codes. Gates: ctest 1657/1657, answers 22/22
+both `IBEX_PARALLEL` settings, and the MEASURING.md interleaved A/B
+(88 cases) read **-4.71% total / 1.055× geomean, every case `noise`** —
+neutral, as a port of the identical loop must be. Next: the bool and
+string gather representations, then validity, then the project/rename
+maps — at which point the dispatch table (item 3) has a full family to
+table-ize.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

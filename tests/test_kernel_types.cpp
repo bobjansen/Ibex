@@ -492,6 +492,36 @@ TEST_CASE("Row-local unary Double update writes a nullable whole column", "[kern
     REQUIRE((*updated->columns[1].validity)[2]);
 }
 
+TEST_CASE("Row-local string length update reads slabs and categorical codes", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("text", Column<std::string>{"café", "日本語"},
+                     runtime::ValidityBitmap{true, false});
+    Column<Categorical> category(std::vector<std::string>{"é", "plain"});
+    category.push_code(0);
+    category.push_code(1);
+    chunk.add_column("category", std::move(category));
+
+    ir::CallExpr characters{.callee = "length", .args = {}, .named_args = {}};
+    characters.args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "text"}}));
+    ir::CallExpr bytes{.callee = "byte_length", .args = {}, .named_args = {}};
+    bytes.args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "category"}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "characters", .expr = ir::Expr{.node = std::move(characters)}},
+        {.alias = "bytes", .expr = ir::Expr{.node = std::move(bytes)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& character_counts = std::get<Column<std::int64_t>>(*updated->columns[2].column);
+    const auto& byte_counts = std::get<Column<std::int64_t>>(*updated->columns[3].column);
+    CHECK(character_counts[0] == 4);
+    CHECK(character_counts[1] == 3);
+    CHECK(byte_counts[0] == 2);
+    CHECK(byte_counts[1] == 5);
+    REQUIRE(updated->columns[2].validity.has_value());
+    CHECK_FALSE((*updated->columns[2].validity)[1]);
+}
+
 TEST_CASE("Row-local Int64 division writes Double and preserves IEEE/null semantics",
           "[kernel][update]") {
     runtime::Chunk chunk;

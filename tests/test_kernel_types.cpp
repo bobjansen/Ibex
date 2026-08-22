@@ -250,6 +250,27 @@ TEST_CASE("Row-local Int64 literal update preserves nullable source validity", "
     REQUIRE_FALSE((*updated->columns[1].validity)[1]);
 }
 
+TEST_CASE("Row-local Int64 literal modulo keeps zero-divisor semantics", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "remainder",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mod,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& remainder = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    REQUIRE(remainder[0] == 0);
+    REQUIRE(remainder[1] == 0);
+}
+
 TEST_CASE("Row-local Double literal update accepts an Int literal", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<double>{1.5, 2.5});

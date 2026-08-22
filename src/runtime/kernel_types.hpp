@@ -31,16 +31,12 @@ namespace ibex::runtime::kernel {
 /// need their own access shapes rather than a lie that pretends they are
 /// arrays.
 
-/// A column whose values are a flat array of `T`. This is a type-level
-/// claim: it holds only for the fixed-width `Column` alternatives, which is
-/// why construction is constrained below.
-template <typename T>
-concept FlatColumn = requires(const Column<T>& col, std::size_t row) {
-    { col.data() } -> std::same_as<const T*>;
-    { col.size() } -> std::same_as<std::size_t>;
-};
-
-/// Non-owning view of one fixed-width column plus its optional validity.
+/// Non-owning view of one fixed-width value array plus its optional
+/// validity. Constrained to trivially-copyable value types: that is the
+/// type-level claim "a flat array a kernel may copy by `sizeof(T)`" — it
+/// covers the fixed-width `Column` alternatives AND raw code arrays
+/// (`Column<Categorical>::codes_data()` is `const uint32_t*`, with no
+/// `Column<uint32_t>` existing).
 /// `validity == nullptr` means every row is valid — the zero-overhead
 /// common case CONTRACTS.md §1 defines; `is_valid` never branches on a
 /// `nullopt` per row.
@@ -51,7 +47,7 @@ concept FlatColumn = requires(const Column<T>& col, std::size_t row) {
 /// expression, and the view is left dangling — the plan-borrowing trap in
 /// miniature. The borrowing rule is the view's contract.
 template <typename T>
-    requires FlatColumn<T>
+    requires std::is_trivially_copyable_v<T>
 class ColumnView {
    public:
     ColumnView(const T* data, std::size_t rows, const ValidityBitmap* validity) noexcept
@@ -141,7 +137,19 @@ struct RowBitmap {
     [[nodiscard]] auto test(std::size_t row) const noexcept -> bool { return (*bits)[row]; }
 };
 
-using Selection = std::variant<RowRange, RowIndices, RowBitmap>;
+/// The engine's native mask shape: 64-row keep-word blocks, as produced by
+/// `compute_filter_selection` and consumed word-at-a-time everywhere a
+/// filter's survivors are compacted. Words are relative to `row_base`
+/// (word `w`, bit `b` denotes source row `row_base + w*64 + b`); iteration
+/// yields absolute source rows, ascending — the convention
+/// `for_each_selected_row` established.
+struct RowWordBlocks {
+    const std::uint64_t* words = nullptr;
+    std::size_t word_count = 0;
+    std::size_t row_base = 0;
+};
+
+using Selection = std::variant<RowRange, RowIndices, RowBitmap, RowWordBlocks>;
 
 /// Number of surviving rows a selection denotes. `RowBitmap` cannot answer
 /// without the source length, which its caller supplies.
@@ -154,6 +162,12 @@ using Selection = std::variant<RowRange, RowIndices, RowBitmap>;
                 std::size_t n = 0;
                 for (std::size_t r = 0; r < source_rows; ++r) {
                     n += sel.test(r) ? 1U : 0U;
+                }
+                return n;
+            } else if constexpr (std::is_same_v<S, RowWordBlocks>) {
+                std::size_t n = 0;
+                for (std::size_t w = 0; w < sel.word_count; ++w) {
+                    n += static_cast<std::size_t>(std::popcount(sel.words[w]));
                 }
                 return n;
             } else {

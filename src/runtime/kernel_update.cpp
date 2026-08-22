@@ -6,8 +6,10 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string_view>
 #include <type_traits>
 
 #include "chunk_conversion_internal.hpp"
@@ -301,6 +303,105 @@ auto try_unary_double_update(const Chunk& input, const std::vector<ir::FieldSpec
         },
         view.column(*source_position));
     return result;
+}
+
+auto utf8_codepoint_count(std::string_view text) noexcept -> std::int64_t {
+    std::int64_t count = 0;
+    for (std::size_t offset = 0; offset < text.size();) {
+        const auto lead = static_cast<unsigned char>(text[offset]);
+        std::size_t advance = 1;
+        if (lead >= 0xF0U) {
+            advance = 4;
+        } else if (lead >= 0xE0U) {
+            advance = 3;
+        } else if (lead >= 0xC0U) {
+            advance = 2;
+        }
+        offset += std::min(advance, text.size() - offset);
+        ++count;
+    }
+    return count;
+}
+
+/// `length` and `byte_length` are the string representation's equivalent of
+/// a fixed-width whole-column transform.  Categorical inputs count each
+/// dictionary value once before reading its flat code stream; slab strings
+/// read their offsets directly.  The evaluator remains responsible for
+/// literals and computed-string arguments.
+auto try_string_length_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty() ||
+        (call->callee != "length" && call->callee != "byte_length")) {
+        return std::nullopt;
+    }
+    const auto* source_ref = std::get_if<ir::ColumnRef>(&call->args.front()->node);
+    if (source_ref == nullptr || source_ref->lexical) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    const auto source_position = view.find_column(source_ref->name);
+    if (!source_position.has_value()) {
+        return std::nullopt;
+    }
+    const bool bytes = call->callee == "byte_length";
+    const auto measure = [bytes](std::string_view text) -> std::int64_t {
+        return bytes ? static_cast<std::int64_t>(text.size()) : utf8_codepoint_count(text);
+    };
+
+    Column<std::int64_t> values;
+    values.resize_for_overwrite(view.rows());
+    bool handled = false;
+    if (const auto* strings = std::get_if<Column<std::string>>(&view.column(*source_position))) {
+        const StringView source{.offsets = strings->offsets_data(),
+                                .chars = strings->chars_data(),
+                                .rows = strings->size()};
+        for (std::size_t row = 0; row < source.rows; ++row) {
+            values.data()[row] =
+                measure(std::string_view{source.chars + source.offsets[row], source.row_len(row)});
+        }
+        handled = true;
+    } else if (const auto* categorical =
+                   std::get_if<Column<Categorical>>(&view.column(*source_position))) {
+        const auto& dictionary = categorical->dictionary();
+        std::vector<std::int64_t> dictionary_lengths(dictionary.size());
+        for (std::size_t code = 0; code < dictionary.size(); ++code) {
+            dictionary_lengths[code] = measure(dictionary[code]);
+        }
+        const auto* codes = categorical->codes_data();
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            values.data()[row] = dictionary_lengths[static_cast<std::size_t>(codes[row])];
+        }
+        handled = true;
+    }
+    if (!handled) {
+        return std::nullopt;
+    }
+
+    Chunk output = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(std::move(values)),
+                            .validity = view.validity(*source_position)};
+    if (existing.has_value()) {
+        output.columns[*existing] = entry;
+    } else {
+        output.columns.push_back(entry);
+    }
+    output.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return output;
 }
 
 auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
@@ -1289,6 +1390,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
                 next = try_unary_double_update(current, one_field);
             }
             if (!next.has_value()) {
+                next = try_string_length_update(current, one_field);
+            }
+            if (!next.has_value()) {
                 next = try_native_bool_update(current, one_field, scalars);
             }
             if (!next.has_value()) {
@@ -1327,6 +1431,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             return std::move(*output);
         }
         if (auto output = try_unary_double_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_string_length_update(input, fields); output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {

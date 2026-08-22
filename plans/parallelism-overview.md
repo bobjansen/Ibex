@@ -1046,9 +1046,10 @@ This was filed as an INPUT to the scheduler track. With that track dropped, it
 stands on its own — and it shrank, because the accounting gap that motivated
 half of it is closed: a stage thread's lifetime, its work, and both kinds of
 park it can take are now measured, and they balance to 99.9%. What is left is
-ergonomics rather than a blind spot. (`stream_buffered.hpp` also detaches a
-thread, for the kafka/ws sources; left alone, as it is not part of a profiled
-query plan.)
+ergonomics rather than a blind spot. (`stream_buffered.hpp`, which also
+detached a thread for in-process stream sources, was removed entirely on
+2026-08-22 — its only consumer was its own e2e test; the kafka plugin never
+used it — so the stage thread is now the runtime's only non-pool species.)
 
 **I13 — Cancellation reaches islands and scan pipelines, not intra-operator
 fan-outs** (medium). `interrupt_requested()` appears in

@@ -1149,6 +1149,50 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
                             const ScalarRegistry* scalars, const ExternRegistry* externs,
                             const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
+    // An update's fields are ordered: a later field reads the chunk produced by
+    // every earlier one.  Keep the direct route all-or-nothing, though.  If a
+    // field is outside its narrow vocabulary, discard this tentative chunk and
+    // let update_table evaluate the original complete update.
+    if (!exec.parallel && fields.size() > 1) {
+        Chunk current = input;
+        bool all_direct = true;
+        for (const auto& field : fields) {
+            const std::vector<ir::FieldSpec> one_field{field};
+            std::optional<Chunk> next = try_metadata_alias_update(current, one_field);
+            if (!next.has_value()) {
+                next = try_literal_update(current, one_field);
+            }
+            if (!next.has_value()) {
+                next = try_native_bool_update(current, one_field, scalars);
+            }
+            if (!next.has_value()) {
+                next = try_shared_string_interpolation_update(current, one_field, scalars);
+            }
+            if (!next.has_value()) {
+                next = try_shared_fixed_width_numeric_binary_update(current, one_field, scalars);
+            }
+            if (!next.has_value()) {
+                next = try_fixed_width_int_binary_update(current, one_field);
+            }
+            if (!next.has_value()) {
+                next = try_fixed_width_int_literal_update(current, one_field);
+            }
+            if (!next.has_value()) {
+                next = try_fixed_width_double_binary_update(current, one_field);
+            }
+            if (!next.has_value()) {
+                next = try_fixed_width_double_literal_update(current, one_field);
+            }
+            if (!next.has_value()) {
+                all_direct = false;
+                break;
+            }
+            current = std::move(*next);
+        }
+        if (all_direct) {
+            return current;
+        }
+    }
     if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
         return std::move(*output);
     }

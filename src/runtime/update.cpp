@@ -3548,6 +3548,65 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                     }
                 }
 
+                if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                    // The old and replacement categoricals can carry distinct
+                    // dictionaries. Rebuild the result dictionary in final-row
+                    // order (the established appender contract), but memoize
+                    // each input code's output code. Repeated categories then
+                    // copy one code instead of hashing their label per row.
+                    using Code = Col::code_type;
+                    constexpr Code kUnmapped = -1;
+                    Col out;
+                    out.reserve(n);
+                    std::vector<Code> old_codes(
+                        oldc != nullptr ? oldc->dictionary_size() : std::size_t{0}, kUnmapped);
+                    std::vector<Code> new_codes(src.dictionary_size(), kUnmapped);
+                    std::optional<Code> empty_code;
+                    const auto append_remapped = [&](const Col& source, std::size_t row,
+                                                     std::vector<Code>& remap) {
+                        const Code input_code = source.code_at(row);
+                        if (input_code >= 0 &&
+                            static_cast<std::size_t>(input_code) < remap.size() &&
+                            remap[static_cast<std::size_t>(input_code)] != kUnmapped) {
+                            out.push_code(remap[static_cast<std::size_t>(input_code)]);
+                            return;
+                        }
+                        out.push_back(source[row]);
+                        if (input_code >= 0 &&
+                            static_cast<std::size_t>(input_code) < remap.size()) {
+                            remap[static_cast<std::size_t>(input_code)] =
+                                out.code_at(out.size() - 1);
+                        }
+                    };
+
+                    ValidityBitmap valid(n, true);
+                    bool any_invalid = false;
+                    std::size_t source_row = 0;
+                    for (std::size_t i = 0; i < n; ++i) {
+                        bool is_valid = false;
+                        if (matched_bytes[i] != 0) {
+                            const std::size_t si = subset ? source_row++ : i;
+                            append_remapped(src, si, new_codes);
+                            is_valid = !new_valid.has_value() || (*new_valid)[si];
+                        } else if (oldc != nullptr) {
+                            append_remapped(*oldc, i, old_codes);
+                            is_valid = old_valid == nullptr || (*old_valid)[i];
+                        } else {
+                            if (!empty_code.has_value()) {
+                                out.push_back(std::string_view{});
+                                empty_code = out.code_at(out.size() - 1);
+                            } else {
+                                out.push_code(*empty_code);
+                            }
+                        }
+                        valid.set(i, is_valid);
+                        any_invalid = any_invalid || !is_valid;
+                    }
+                    return {ColumnValue{std::move(out)},
+                            any_invalid ? std::optional<ValidityBitmap>{std::move(valid)}
+                                        : std::nullopt};
+                }
+
                 Col out;
                 ColumnAppender<Col> appender(out, n);
                 ValidityBitmap valid(n, true);

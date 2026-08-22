@@ -6919,6 +6919,40 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         CHECK_FALSE((*entry->validity)[3]);
         CHECK(label.offsets_data()[4] == 8);
     }
+
+    // Guarded categorical writes may combine two dictionaries. The output
+    // preserves the appender's final-row dictionary order while repeated
+    // source codes are remapped once and then copied directly.
+    {
+        runtime::Table t;
+        t.add_column("label",
+                     Column<Categorical>{std::vector<std::string>{"old", "keep", "gone"},
+                                         std::vector<Column<Categorical>::code_type>{0, 0, 1, 2}},
+                     runtime::ValidityBitmap{true, true, true, false});
+        t.add_column("replacement",
+                     Column<Categorical>{std::vector<std::string>{"new", "ignored"},
+                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                     runtime::ValidityBitmap{true, true, false, true});
+        t.add_column("g", Column<std::string>{"x", "y", "x", "y"});
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        auto ir = require_ir(R"(t[where g == "x" update { label = replacement }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("label");
+        REQUIRE(entry != nullptr);
+        const auto& label = std::get<Column<Categorical>>(*entry->column);
+        CHECK(label.dictionary() == std::vector<std::string>{"new", "old", "gone"});
+        CHECK(label.code_at(0) == 0);
+        CHECK(label.code_at(1) == 1);
+        CHECK(label.code_at(2) == 0);
+        CHECK(label.code_at(3) == 2);
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0]);
+        CHECK((*entry->validity)[1]);
+        CHECK_FALSE((*entry->validity)[2]);
+        CHECK_FALSE((*entry->validity)[3]);
+    }
 }
 
 // Skew and kurtosis keep their higher moments in the operator's per-group

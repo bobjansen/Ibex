@@ -182,3 +182,106 @@ TEST_CASE("gather_selected honours the output offset for disjoint windows", "[ke
         OutputSpan<std::int64_t>{out.data(), 3, 3});
     REQUIRE(out == std::vector<std::int64_t>{1, 2, 3, 4, 5, 6});
 }
+
+TEST_CASE("Bool gather kernel: word-block selection matches per-bit truth",
+          "[kernel][gather][bool]") {
+    // 130 bools so the word machinery straddles word boundaries.
+    Column<bool> src;
+    std::vector<bool> truth;
+    for (int i = 0; i < 130; ++i) {
+        const bool v = (i % 3) == 0 || i == 97;
+        src.push_back(v);
+        truth.push_back(v);
+    }
+    // Keep rows 1, 64, 65, 129 (bits 1 of word 0; bits 0,1 of word 1; bit 1 of word 2).
+    const std::vector<std::uint64_t> sel_words{(1U << 1), 0b11U, (1U << 1)};
+    const ibex::runtime::kernel::RowWordBlocks blocks{
+        .words = sel_words.data(), .word_count = sel_words.size(), .row_base = 0};
+
+    std::vector<std::uint64_t> out_words(1, 0);  // 4 survivors fit one word
+    ibex::runtime::kernel::gather_selected_bool(
+        ibex::runtime::kernel::BoolView(src), ibex::runtime::kernel::Selection{blocks},
+        ibex::runtime::kernel::BoolOutputSpan{.words = out_words.data(), .begin = 0, .count = 4});
+
+    const auto bit = [&](std::size_t i) { return (out_words[i / 64] >> (i % 64)) & 1U; };
+    REQUIRE(bit(0) == truth[1]);
+    REQUIRE(bit(1) == truth[64]);
+    REQUIRE(bit(2) == truth[65]);
+    REQUIRE(bit(3) == truth[129]);
+    // Nothing beyond the run was set.
+    REQUIRE((out_words[0] >> 4) == 0);
+}
+
+TEST_CASE("Bool gather kernel: disjoint windows OR without clobbering", "[kernel][gather][bool]") {
+    Column<bool> src;
+    for (int i = 0; i < 100; ++i) {
+        src.push_back(i % 2 == 0);
+    }
+    std::vector<std::uint64_t> out_words(2, 0);
+    // Window A: rows [10, 20) at bit offset 10; window B: rows [20, 30) at 20.
+    ibex::runtime::kernel::gather_selected_bool(
+        ibex::runtime::kernel::BoolView(src),
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{10, 20}},
+        ibex::runtime::kernel::BoolOutputSpan{.words = out_words.data(), .begin = 10, .count = 10});
+    ibex::runtime::kernel::gather_selected_bool(
+        ibex::runtime::kernel::BoolView(src),
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{20, 30}},
+        ibex::runtime::kernel::BoolOutputSpan{.words = out_words.data(), .begin = 20, .count = 10});
+    // Output bits [10, 30) hold source rows 10..29: even rows are true.
+    for (std::size_t i = 10; i < 30; ++i) {
+        const bool got = ((out_words[i / 64] >> (i % 64)) & 1U) != 0;
+        INFO("bit " << i);
+        REQUIRE(got == (i % 2 == 0));
+    }
+    REQUIRE((out_words[0] & 0x3FFU) == 0);  // bits [0,10) untouched
+}
+
+TEST_CASE("String gather kernel: word-block selection packs slabs and offsets",
+          "[kernel][gather][string]") {
+    // Build a source: "a", "bb", "", "ccc", "dd" with offsets 0,1,3,3,6,8.
+    Column<std::string> src{"a", "bb", "", "ccc", "dd"};
+    // Keep rows 0, 2, 3, 4.
+    const std::vector<std::uint64_t> sel_words{(1U << 0) | (1U << 2) | (1U << 3) | (1U << 4)};
+    const ibex::runtime::kernel::RowWordBlocks blocks{
+        .words = sel_words.data(), .word_count = sel_words.size(), .row_base = 0};
+
+    std::vector<char> chars(6);
+    std::vector<std::uint32_t> offsets(5, 9999);
+    ibex::runtime::kernel::gather_selected_strings(
+        ibex::runtime::kernel::StringView{
+            .offsets = src.offsets_data(), .chars = src.chars_data(), .rows = src.size()},
+        ibex::runtime::kernel::Selection{blocks},
+        ibex::runtime::kernel::StringOutputSpan{.offsets = offsets.data(),
+                                                .chars = chars.data(),
+                                                .begin = 0,
+                                                .count = 4,
+                                                .char_base = 0});
+
+    // Rows kept: "a" (len 1), "" (0), "ccc" (3), "dd" (2) -> 6 chars total.
+    REQUIRE(offsets[1] == 1);
+    REQUIRE(offsets[2] == 1);
+    REQUIRE(offsets[3] == 4);
+    REQUIRE(offsets[4] == 6);
+    const std::string packed(chars.begin(), chars.end());
+    REQUIRE(packed == "acccdd");
+}
+
+TEST_CASE("String gather kernel: offset window continues a prior run", "[kernel][gather][string]") {
+    Column<std::string> src{"xx", "yy", "zzz"};
+    // Window over rows [2,3) written at output begin=1, continuing after a
+    // hypothetical first window that ended at char_base=4 ("xxyy" equivalent).
+    std::vector<char> chars(7);
+    std::vector<std::uint32_t> offsets(3, 9999);
+    offsets[1] = 4;  // the previous window's end offset — this kernel's contract
+    ibex::runtime::kernel::gather_selected_strings(
+        ibex::runtime::kernel::StringView{
+            .offsets = src.offsets_data(), .chars = src.chars_data(), .rows = src.size()},
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{2, 3}},
+        ibex::runtime::kernel::StringOutputSpan{.offsets = offsets.data(),
+                                                .chars = chars.data(),
+                                                .begin = 1,
+                                                .count = 1,
+                                                .char_base = 4});
+    REQUIRE(offsets[2] == 7);
+    REQUIRE(std::string(chars.begin() + 4, chars.begin() + 7) == "zzz");
+}

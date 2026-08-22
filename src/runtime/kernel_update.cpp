@@ -139,6 +139,82 @@ auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir:
     return result;
 }
 
+auto try_fixed_width_double_binary_update(const Chunk& input,
+                                          const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1)
+        return std::nullopt;
+    const auto* binary = std::get_if<ir::BinaryExpr>(&fields.front().expr.node);
+    if (binary == nullptr || binary->op == ir::ArithmeticOp::Mod)
+        return std::nullopt;
+    const auto* left = std::get_if<ir::ColumnRef>(&binary->left->node);
+    const auto* right = std::get_if<ir::ColumnRef>(&binary->right->node);
+    if (left == nullptr || right == nullptr || left->lexical || right->lexical)
+        return std::nullopt;
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index())
+        return std::nullopt;
+    const auto left_position = view.find_column(left->name);
+    const auto right_position = view.find_column(right->name);
+    if (!left_position.has_value() || !right_position.has_value() ||
+        !std::holds_alternative<Column<double>>(view.column(*left_position)) ||
+        !std::holds_alternative<Column<double>>(view.column(*right_position)))
+        return std::nullopt;
+
+    const auto lhs = view.view<double>(*left_position);
+    const auto rhs = view.view<double>(*right_position);
+    Column<double> values;
+    values.resize_for_overwrite(view.rows());
+    double* output = values.data();
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        switch (binary->op) {
+            case ir::ArithmeticOp::Add:
+                output[row] = lhs.value(row) + rhs.value(row);
+                break;
+            case ir::ArithmeticOp::Sub:
+                output[row] = lhs.value(row) - rhs.value(row);
+                break;
+            case ir::ArithmeticOp::Mul:
+                output[row] = lhs.value(row) * rhs.value(row);
+                break;
+            case ir::ArithmeticOp::Div:
+                output[row] = lhs.value(row) / rhs.value(row);
+                break;
+            case ir::ArithmeticOp::Mod:
+                return std::nullopt;
+        }
+    }
+    std::optional<ValidityBitmap> validity;
+    if (view.validity(*left_position).has_value() || view.validity(*right_position).has_value()) {
+        ValidityBitmap bits(view.rows(), true);
+        bool any_invalid = false;
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            const bool valid = lhs.is_valid(row) && rhs.is_valid(row);
+            bits.set(row, valid);
+            any_invalid = any_invalid || !valid;
+        }
+        if (any_invalid)
+            validity = std::move(bits);
+    }
+    Chunk result = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(std::move(values)),
+                            .validity = std::move(validity)};
+    if (existing.has_value())
+        result.columns[*existing] = entry;
+    else
+        result.columns.push_back(entry);
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
 }  // namespace
 
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
@@ -148,6 +224,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
         return std::move(*output);
     }
     if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {
+        return std::move(*output);
+    }
+    if (auto output = try_fixed_width_double_binary_update(input, fields); output.has_value()) {
         return std::move(*output);
     }
     const std::uint64_t sequence = input.sequence;

@@ -517,6 +517,14 @@ debug ctest 1670/1670 pass.  Division/modulo, scalars, mixed types, and
 multi-field snapshots remain delegated to `update_table`.  Next: run one
 combined interleaved A/B for the all-valid and nullable computed-field ports.
 
+**Double binary update port (2026-08-22, pending performance gate).**
+All-valid and nullable Double column-pair add/subtract/multiply/divide fields
+now take the same direct `ChunkView` route; nullable output validity is again
+the AND of the operands.  Modulo and mixed/scalar shapes remain on the
+established evaluator.  The kernel test pins nullable division, and full debug
+ctest passes 1671/1671.  Next: capture the combined computed-update A/B, then
+consider scalar operands or checked integer division as separate contracts.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

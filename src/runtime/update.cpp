@@ -2500,11 +2500,26 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         return std::unexpected("window: grouped update produced no columns");
     }
 
-    // Allocate output's new columns at full size, with the same types as the
-    // first sub-result. Strings/categoricals would need a different scatter
-    // strategy (per-row write isn't free for flat-buffer strings); rolling /
-    // lag / fill ops produce numeric columns in practice, so reject the
-    // string/categorical case explicitly until that's needed.
+    std::vector<bool> variable_output(written_field_names.size(), false);
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+        const auto* sample = first->find(written_field_names[f]);
+        if (sample == nullptr) {
+            return std::unexpected("window: missing new column '" + written_field_names[f] +
+                                   "' in sub-result");
+        }
+        variable_output[f] = std::holds_alternative<Column<std::string>>(*sample) ||
+                             std::holds_alternative<Column<Categorical>>(*sample);
+    }
+    struct VariableTaskPiece {
+        std::vector<std::optional<ColumnEntry>> fields;
+    };
+    std::vector<VariableTaskPiece> variable_pieces(
+        tasks.size(), VariableTaskPiece{.fields = std::vector<std::optional<ColumnEntry>>(
+                                            written_field_names.size())});
+
+    // Allocate fixed-width output columns at full size. Variable-width results
+    // stay task-local until every window has completed; assembling them once in
+    // output order preserves their packed storage and dictionary contracts.
     //
     // Shares column pointers with its source, exactly as the time-major path
     // shares them with `input`. NOT a move: `slice_source` still refers to
@@ -2517,7 +2532,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 if constexpr (std::is_same_v<ColT, Column<std::string>> ||
                               std::is_same_v<ColT, Column<Categorical>>) {
                     return std::unexpected(
-                        "window + by: scatter of string/Categorical results not yet implemented");
+                        "window: variable-width result reached fixed-width path");
                 } else if constexpr (std::is_same_v<ColT, Column<bool>>) {
                     ColT out;
                     out.resize(rows);
@@ -2540,16 +2555,15 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             },
             sample);
     };
-    for (const auto& fname : written_field_names) {
-        const auto* sample = first->find(fname);
-        if (sample == nullptr) {
-            return std::unexpected("window: missing new column '" + fname + "' in sub-result");
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+        if (variable_output[f]) {
+            continue;
         }
-        auto full = allocate_full(*sample);
+        auto full = allocate_full(*first->find(written_field_names[f]));
         if (!full.has_value()) {
             return std::unexpected(full.error());
         }
-        output.add_column(fname, std::move(full.value()));
+        output.add_column(written_field_names[f], std::move(full.value()));
     }
 
     auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
@@ -2563,7 +2577,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 }
                 if constexpr (std::is_same_v<DT, Column<std::string>> ||
                               std::is_same_v<DT, Column<Categorical>>) {
-                    return "window: scatter for string/Categorical not implemented";
+                    return "window: variable-width scatter reached fixed-width path";
                 } else if constexpr (std::is_same_v<DT, Column<bool>>) {
                     for (std::size_t i = 0; i < indices.size(); ++i) {
                         dcol.set(indices[i], (*scol)[i]);
@@ -2621,24 +2635,29 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
 
     // Resolved once: `find` walks a hash map, and every group would otherwise
     // repeat that per field.
-    std::vector<ColumnValue*> dst_columns;
-    dst_columns.reserve(written_field_names.size());
-    for (const auto& fname : written_field_names) {
-        dst_columns.push_back(output.find(fname));
+    std::vector<ColumnValue*> dst_columns(written_field_names.size(), nullptr);
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+        if (!variable_output[f]) {
+            dst_columns[f] = output.find(written_field_names[f]);
+        }
     }
 
     // One group's whole contribution: run the windowed update over its slice,
     // then scatter the new columns into the rows it owns. Groups own disjoint
     // rows, which is exactly what makes them independent of each other.
-    auto scatter_group = [&](const Table& sub,
+    auto scatter_group = [&](std::size_t task, const Table& sub,
                              std::span<const std::size_t> indices) -> std::optional<std::string> {
         for (std::size_t f = 0; f < written_field_names.size(); ++f) {
-            const auto* src = sub.find(written_field_names[f]);
+            const auto* src = sub.find_entry(written_field_names[f]);
             if (src == nullptr) {
                 return "window: missing column '" + written_field_names[f] +
                        "' in grouped sub-result";
             }
-            if (auto err = scatter_into(*dst_columns[f], *src, indices)) {
+            if (variable_output[f]) {
+                variable_pieces[task].fields[f] = *src;
+                continue;
+            }
+            if (auto err = scatter_into(*dst_columns[f], *src->column, indices)) {
                 return err;
             }
             scatter_validity(f, sub, indices);
@@ -2646,7 +2665,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         return std::nullopt;
     };
 
-    if (auto err = scatter_group(*first, out_slot(0))) {
+    if (auto err = scatter_group(0, *first, out_slot(0))) {
         return std::unexpected(*err);
     }
 
@@ -2658,7 +2677,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             if (!sub.has_value()) {
                 return std::unexpected(sub.error());
             }
-            if (auto err = scatter_group(*sub, out_slot(g))) {
+            if (auto err = scatter_group(g, *sub, out_slot(g))) {
                 return std::unexpected(*err);
             }
         }
@@ -2695,7 +2714,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                         if (!sub.has_value()) {
                             err = std::move(sub.error());
                         } else {
-                            err = scatter_group(*sub, out_slot(g));
+                            err = scatter_group(g, *sub, out_slot(g));
                         }
                     } catch (const std::exception& e) {
                         err = std::string("window + by: worker exception: ") + e.what();
@@ -2726,6 +2745,111 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         auto idx_it = output.index.find(written_field_names[f]);
         if (idx_it != output.index.end()) {
             output.columns[idx_it->second].validity = std::move(output_validity[f]);
+        }
+    }
+
+    // Tasks already describe the final group-major order, so walk their
+    // contiguous output runs rather than reconstructing original row indices.
+    // This is also what preserves categorical dictionary insertion order.
+    for (std::size_t f = 0; f < written_field_names.size(); ++f) {
+        if (!variable_output[f]) {
+            continue;
+        }
+        const bool has_validity = std::ranges::any_of(variable_pieces, [&](const auto& piece) {
+            return piece.fields[f]->validity.has_value();
+        });
+        if (std::holds_alternative<Column<std::string>>(*variable_pieces[0].fields[f]->column)) {
+            std::size_t total_chars = 0;
+            for (std::size_t task = 0; task < tasks.size(); ++task) {
+                const auto& source =
+                    std::get<Column<std::string>>(*variable_pieces[task].fields[f]->column);
+                for (std::size_t local = 0; local < source.size(); ++local) {
+                    const std::size_t count =
+                        source.offsets_data()[local + 1] - source.offsets_data()[local];
+                    if (count > std::numeric_limits<std::uint32_t>::max() - total_chars) {
+                        return std::unexpected("window + by: string output exceeds uint32 offsets");
+                    }
+                    total_chars += count;
+                }
+            }
+            Column<std::string> result;
+            result.resize_for_gather(rows, total_chars);
+            auto* offsets = result.offsets_data();
+            char* chars = result.chars_data();
+            offsets[0] = 0;
+            std::uint32_t cursor = 0;
+            std::size_t row = 0;
+            std::optional<ValidityBitmap> validity;
+            if (has_validity) {
+                validity = ValidityBitmap(rows, true);
+            }
+            for (std::size_t task = 0; task < tasks.size(); ++task) {
+                const auto& entry = *variable_pieces[task].fields[f];
+                const auto& source = std::get<Column<std::string>>(*entry.column);
+                for (std::size_t local = 0; local < source.size(); ++local, ++row) {
+                    const auto begin = source.offsets_data()[local];
+                    const auto end = source.offsets_data()[local + 1];
+                    if (end != begin) {
+                        std::memcpy(chars + cursor, source.chars_data() + begin, end - begin);
+                    }
+                    cursor += end - begin;
+                    offsets[row + 1] = cursor;
+                    if (validity.has_value() && entry.validity.has_value()) {
+                        validity->set(row, (*entry.validity)[local]);
+                    }
+                }
+            }
+            if (validity.has_value()) {
+                output.add_column(written_field_names[f], ColumnValue{std::move(result)},
+                                  std::move(*validity));
+            } else {
+                output.add_column(written_field_names[f], ColumnValue{std::move(result)});
+            }
+            continue;
+        }
+
+        using CategoricalColumn = Column<Categorical>;
+        using Code = CategoricalColumn::code_type;
+        constexpr Code kUnmapped = -1;
+        CategoricalColumn result;
+        result.reserve(rows);
+        std::vector<std::vector<Code>> remaps(tasks.size());
+        for (std::size_t task = 0; task < tasks.size(); ++task) {
+            const auto& source =
+                std::get<CategoricalColumn>(*variable_pieces[task].fields[f]->column);
+            remaps[task].assign(source.dictionary_size(), kUnmapped);
+        }
+        std::optional<ValidityBitmap> validity;
+        if (has_validity) {
+            validity = ValidityBitmap(rows, true);
+        }
+        std::size_t row = 0;
+        for (std::size_t task = 0; task < tasks.size(); ++task) {
+            const auto& entry = *variable_pieces[task].fields[f];
+            const auto& source = std::get<CategoricalColumn>(*entry.column);
+            auto& remap = remaps[task];
+            for (std::size_t local = 0; local < source.size(); ++local, ++row) {
+                const Code input_code = source.code_at(local);
+                if (input_code >= 0 && static_cast<std::size_t>(input_code) < remap.size() &&
+                    remap[static_cast<std::size_t>(input_code)] != kUnmapped) {
+                    result.push_code(remap[static_cast<std::size_t>(input_code)]);
+                } else {
+                    result.push_back(source[local]);
+                    if (input_code >= 0 && static_cast<std::size_t>(input_code) < remap.size()) {
+                        remap[static_cast<std::size_t>(input_code)] =
+                            result.code_at(result.size() - 1);
+                    }
+                }
+                if (validity.has_value() && entry.validity.has_value()) {
+                    validity->set(row, (*entry.validity)[local]);
+                }
+            }
+        }
+        if (validity.has_value()) {
+            output.add_column(written_field_names[f], ColumnValue{std::move(result)},
+                              std::move(*validity));
+        } else {
+            output.add_column(written_field_names[f], ColumnValue{std::move(result)});
         }
     }
 

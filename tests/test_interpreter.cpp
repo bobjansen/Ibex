@@ -3196,6 +3196,61 @@ TEST_CASE("windowed rolling partitions per `by` group", "[interpreter][window][g
     }
 }
 
+TEST_CASE("grouped window scatters packed strings and categorical codes",
+          "[interpreter][window][grouped]") {
+    // The input is time-major but the grouped window emits group-major rows.
+    // Variable-width outputs must follow that same order while retaining nulls.
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(0), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(3)});
+    table.add_column("g", Column<std::string>{"x", "y", "x", "y"});
+    table.add_column("name", Column<std::string>{"a", "b", "", "d"},
+                     runtime::ValidityBitmap{true, true, false, true});
+    table.add_column("category",
+                     Column<Categorical>{std::vector<std::string>{"red", "blue"},
+                                         std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}},
+                     runtime::ValidityBitmap{true, true, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", table);
+
+    auto ir = require_ir(
+        "as_timeframe(t, \"ts\")[window 10ns, by g, update { tag = `v=${name}`, copied = category "
+        "}];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* group = std::get_if<Column<std::string>>(result->find("g"));
+    const auto* tag_entry = result->find_entry("tag");
+    const auto* copied_entry = result->find_entry("copied");
+    REQUIRE(group != nullptr);
+    REQUIRE(tag_entry != nullptr);
+    REQUIRE(copied_entry != nullptr);
+    CHECK((*group)[0] == "x");
+    CHECK((*group)[1] == "x");
+    CHECK((*group)[2] == "y");
+    CHECK((*group)[3] == "y");
+
+    const auto& tag = std::get<Column<std::string>>(*tag_entry->column);
+    CHECK(tag[0] == "v=a");
+    CHECK(tag[1].empty());
+    CHECK(tag[2] == "v=b");
+    CHECK(tag[3] == "v=d");
+    REQUIRE(tag_entry->validity.has_value());
+    CHECK((*tag_entry->validity)[0]);
+    CHECK_FALSE((*tag_entry->validity)[1]);
+    CHECK((*tag_entry->validity)[2]);
+    CHECK((*tag_entry->validity)[3]);
+
+    const auto& copied = std::get<Column<Categorical>>(*copied_entry->column);
+    CHECK(copied.dictionary() == std::vector<std::string>{"red", "blue"});
+    CHECK(copied.code_at(0) == 0);
+    CHECK(copied.code_at(1) == 0);
+    CHECK(copied.code_at(2) == 1);
+    CHECK(copied.code_at(3) == 1);
+    REQUIRE(copied_entry->validity.has_value());
+    CHECK_FALSE((*copied_entry->validity)[1]);
+}
+
 // --- row-order guard for order-dependent functions ----------------------------
 // A grouped op leaves the table group-major, which breaks the time index into
 // per-group runs. An unpartitioned lag/lead then reads across a group boundary

@@ -6398,272 +6398,6 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
-    /// Fused discover-and-accumulate prototype for a single fixed-width-int
-    /// key (TPC-H q18's `by { l_orderkey }` is the motivating shape). Returns
-    /// false to fall back to the existing path (`try_discover_partitioned` +
-    /// `accumulate_gids`) whenever the mode is off, the shape is outside this
-    /// prototype's scope (Sum/Double and Count only -- see the plan's
-    /// production sequencing, which widens key shapes and functions only
-    /// after this slice measures), or the one-time admission gate declines.
-    template <typename KeyAt>
-    auto try_owned_int(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
-                       const std::vector<const ColumnEntry*>& agg_entries) -> bool {
-        const AggPartitionMode mode = agg_partition_mode();
-        if (mode == AggPartitionMode::Baseline) {
-            return false;
-        }
-        if (!owned_mode_) {
-            if (n_groups_ > 0 || partitioned_active_ || owned_is_pair_) {
-                return false;
-            }
-            for (std::size_t a = 0; a < n_aggs_; ++a) {
-                if (plan_[a].func != ir::AggFunc::Sum && plan_[a].func != ir::AggFunc::Count) {
-                    return false;
-                }
-                if (plan_[a].func == ir::AggFunc::Sum && plan_[a].kind != ExprType::Double) {
-                    return false;
-                }
-            }
-            if (scratch_stride_ != 0) {
-                return false;  // Sum/Count need no scratch; a stray moments agg would.
-            }
-            if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
-                return false;
-            }
-            // No row-count floor here, unlike `try_discover_partitioned`'s
-            // `kDefaultPartitionMinRows`: this path only ever gets ONE
-            // admission chance (the `n_groups_ > 0` check above, with no
-            // seeding-from-serial-fallback capability -- deliberately out of
-            // scope for this prototype slice). A source that morselizes into
-            // chunks smaller than that threshold (q20's ~150k-row chunks
-            // measured against a 262144 floor) would have every chunk decline
-            // and the serial fallback would create groups on chunk 1,
-            // permanently blocking admission on chunk 2 before cumulative
-            // rows ever crossed the floor. Opt-in via IBEX_AGG_PARTITION_MODE
-            // already means the caller accepts the overhead of partitioning
-            // a possibly-small first chunk.
-            auto& pool0 = process_worker_pool();
-            const std::size_t budget0 =
-                exec_->parallel_threads != 0 ? exec_->parallel_threads : pool0.size();
-            if (std::min(budget0, pool0.size()) < 2) {
-                return false;
-            }
-        }
-
-        auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
-        const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
-        std::size_t part_count = 1;
-        while (part_count * 2 <= workers) {
-            part_count *= 2;
-        }
-        const std::uint64_t part_mask = part_count - 1;
-        if (owned_int_partitions_.size() < part_count) {
-            owned_int_partitions_.resize(part_count);
-        }
-
-        // Pass 1: histogram (identical shape to `try_discover_partitioned`).
-        const std::size_t ranges = workers;
-        const std::size_t grain = (rows + ranges - 1) / ranges;
-        part_of_row_.resize(rows);
-        std::vector<std::size_t> counts(ranges * part_count, 0);
-        {
-            auto batch = pool.submit(ranges, [&](std::size_t r) {
-                const std::size_t begin = r * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                std::size_t* row_counts = counts.data() + (r * part_count);
-                robin_hood::hash<std::int64_t> hasher;
-                for (std::size_t row = begin; row < end; ++row) {
-                    const auto part = static_cast<std::uint8_t>(hasher(key_at(row)) & part_mask);
-                    part_of_row_[row] = part;
-                    ++row_counts[part];
-                }
-            });
-            batch.wait();
-        }
-        std::vector<std::size_t> offsets(ranges * part_count, 0);
-        std::vector<std::size_t> part_begin(part_count + 1, 0);
-        {
-            std::size_t running = 0;
-            for (std::size_t p = 0; p < part_count; ++p) {
-                part_begin[p] = running;
-                for (std::size_t r = 0; r < ranges; ++r) {
-                    offsets[(r * part_count) + p] = running;
-                    running += counts[(r * part_count) + p];
-                }
-            }
-            part_begin[part_count] = running;
-        }
-        scatter_rows_.resize(rows);
-        {
-            auto batch = pool.submit(ranges, [&](std::size_t r) {
-                const std::size_t begin = r * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                std::size_t* cursor = offsets.data() + (r * part_count);
-                for (std::size_t row = begin; row < end; ++row) {
-                    scatter_rows_[cursor[part_of_row_[row]]++] = row;
-                }
-            });
-            batch.wait();
-        }
-
-        // Bind each Sum(Double) aggregate's column/validity once; Count needs
-        // neither. The admission gate above guarantees no other function
-        // reaches here.
-        std::vector<const double*> sum_cols(n_aggs_, nullptr);
-        std::vector<const ValidityBitmap*> sum_validity(n_aggs_, nullptr);
-        std::vector<std::uint8_t> is_count(n_aggs_, 0);
-        for (std::size_t a = 0; a < n_aggs_; ++a) {
-            if (plan_[a].func == ir::AggFunc::Count) {
-                is_count[a] = 1;
-                continue;
-            }
-            sum_cols[a] = std::get<Column<double>>(*agg_entries[a]->column).data();
-            sum_validity[a] =
-                agg_entries[a]->validity.has_value() ? &*agg_entries[a]->validity : nullptr;
-        }
-
-        // Pass 3: discover this chunk's groups AND (InlineRowWise) accumulate
-        // into the partition's OWN slot array in the same per-row loop, using
-        // the partition-LOCAL id directly -- no global gid is ever assigned.
-        // `gids[row]` is left holding the local id (not translated), which
-        // PartitionOuter's second pass below reads instead of re-hashing.
-        const std::uint64_t row_base = owned_rows_seen_;
-        {
-            std::atomic<std::size_t> cursor{0};
-            auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
-                for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
-                     p = cursor.fetch_add(1, std::memory_order_relaxed)) {
-                    auto& partition = owned_int_partitions_[p];
-                    for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
-                        const std::size_t row = scatter_rows_[i];
-                        const std::int64_t key = key_at(row);
-                        auto it = partition.index.find(key);
-                        std::uint32_t local{};
-                        if (it == partition.index.end()) {
-                            local = static_cast<std::uint32_t>(partition.keys.size());
-                            partition.index.emplace(key, local);
-                            partition.keys.push_back(key);
-                            partition.first_rows.push_back(row_base + row);
-                            partition.slots.resize((local + 1) * n_aggs_);  // AggSlotCore{} default
-                        } else {
-                            local = it->second;
-                        }
-                        gids[row] = local;
-                        if (mode == AggPartitionMode::InlineRowWise) {
-                            for (std::size_t a = 0; a < n_aggs_; ++a) {
-                                AggSlotCore& slot = partition.slots[(local * n_aggs_) + a];
-                                if (is_count[a] != 0) {
-                                    ++slot.count;
-                                } else if (sum_validity[a] == nullptr || (*sum_validity[a])[row]) {
-                                    slot.double_value += sum_cols[a][row];
-                                    slot.mark_present();
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-            batch.wait();
-        }
-
-        if (mode == AggPartitionMode::PartitionOuter) {
-            // Same fused shape, but aggregate-outer / row-inner over each
-            // partition's own scattered range -- the shape
-            // `accumulate_columns_into` uses, just partition-local and reading
-            // the local id `gids[row]` pass 3 already resolved rather than a
-            // translated global one. Tests whether Ibex's column-oriented
-            // accumulator shape matters once fused, per the plan's own
-            // caution that inline row-wise "could regress queries with
-            // several aggregates."
-            std::atomic<std::size_t> cursor{0};
-            auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
-                for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
-                     p = cursor.fetch_add(1, std::memory_order_relaxed)) {
-                    auto& partition = owned_int_partitions_[p];
-                    for (std::size_t a = 0; a < n_aggs_; ++a) {
-                        for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
-                            const std::size_t row = scatter_rows_[i];
-                            const std::uint32_t local = gids[row];
-                            AggSlotCore& slot = partition.slots[(local * n_aggs_) + a];
-                            if (is_count[a] != 0) {
-                                ++slot.count;
-                            } else if (sum_validity[a] == nullptr || (*sum_validity[a])[row]) {
-                                slot.double_value += sum_cols[a][row];
-                                slot.mark_present();
-                            }
-                        }
-                    }
-                }
-            });
-            batch.wait();
-        }
-
-        owned_rows_seen_ += rows;
-        owned_mode_ = true;
-        if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            std::fprintf(stderr, "[agg_owned_int] chunk rows=%zu part_count=%zu total_rows=%llu\n",
-                         rows, owned_int_partitions_.size(),
-                         static_cast<unsigned long long>(owned_rows_seen_));
-        }
-        return true;
-    }
-
-    /// Walk every `owned_int_partitions_` entry once, in first-occurrence
-    /// order (a P-way merge over `first_rows`, same algorithm as
-    /// `try_discover_partitioned`'s per-chunk merge -- just run once, at
-    /// final emission, instead of incrementally after every chunk), and copy
-    /// each group's partition-local slot into the ordinary global
-    /// `int_order_`/`flat_slots_` arrays `build_output_chunk` already knows
-    /// how to read. No separate emission path needed: after this call,
-    /// `build_output_chunk` runs completely unmodified.
-    void finalize_owned_int() {
-        if (owned_finalized_) {
-            return;
-        }
-        owned_finalized_ = true;
-        const std::size_t part_count = owned_int_partitions_.size();
-        std::vector<std::size_t> cursors(part_count, 0);
-        std::size_t total = 0;
-        for (const auto& partition : owned_int_partitions_) {
-            total += partition.keys.size();
-        }
-        n_groups_ = total;
-        int_order_.resize(total);
-        AggSlotCore* fs = flat_slots_.grow_uninitialized(total * n_aggs_).data();
-        // grow_uninitialized returns the TAIL span; since flat_slots_ starts
-        // empty in owned mode (size_group_arrays() is never called), the tail
-        // IS the whole array, and every slot below is unconditionally
-        // overwritten -- no zero-fill pass needed at all, unlike the baseline
-        // path's `fill_slots_parallel`/`fill_default`.
-        std::size_t g = 0;
-        while (true) {
-            std::size_t best = part_count;
-            std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
-            for (std::size_t p = 0; p < part_count; ++p) {
-                if (cursors[p] >= owned_int_partitions_[p].keys.size()) {
-                    continue;
-                }
-                if (owned_int_partitions_[p].first_rows[cursors[p]] < best_row) {
-                    best_row = owned_int_partitions_[p].first_rows[cursors[p]];
-                    best = p;
-                }
-            }
-            if (best == part_count) {
-                break;
-            }
-            const auto& partition = owned_int_partitions_[best];
-            const std::size_t local = cursors[best];
-            int_order_[g] = partition.keys[local];
-            for (std::size_t a = 0; a < n_aggs_; ++a) {
-                fs[(g * n_aggs_) + a] = partition.slots[(local * n_aggs_) + a];
-            }
-            ++cursors[best];
-            ++g;
-        }
-    }
-
     // Single fixed-width-integer key: probe a value -> gid map directly, the way
     // process_rows_str does for strings. Date/Timestamp are read as their raw
     // integer (days / nanos), which is order- and equality-faithful.
@@ -6707,10 +6441,6 @@ class ChunkedAggregateOperator final : public Operator {
 
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
-
-        if (try_owned_int(key_at, rows, gids, agg_entries)) {
-            return std::nullopt;
-        }
 
         if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
                 key_at, rows, gids, int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
@@ -6767,18 +6497,15 @@ class ChunkedAggregateOperator final : public Operator {
     /// Production PairIntKey ownership path (TPC-H q20's
     /// `by { l_partkey, l_suppkey }` is the motivating shape; validated
     /// there at -16.5%, 8/8 paired wins, 8 cores, vs. a q18/Int64 prototype
-    /// that measured only -7.6% and was deferred rather than shipped --
-    /// see plans/parallelism-overview.md). Deliberately narrower than the
-    /// `try_owned_int` prototype it was forked from:
+    /// that measured only -7.6%, was never promoted, and has since been
+    /// removed -- see plans/parallelism-overview.md). Deliberately narrow:
     ///
     /// - Exactly one aggregate, Sum(Double) or Count. q18 and q20 both only
     ///   ever exercise one, so nothing measures whether row-wise fusion beats
     ///   partition-outer/aggregate-outer accumulation once a query carries
     ///   several -- widen only after that shape is actually benchmarked.
-    /// - Row-wise fusion only (the `PartitionOuter` second pass the
-    ///   `try_owned_int` prototype still carries is dropped here entirely):
-    ///   with exactly one aggregate a second full row scan can only add
-    ///   cost, never locality it does not already have.
+    /// - Row-wise fusion only: with exactly one aggregate a second full row
+    ///   scan can only add cost, never locality it does not already have.
     /// - No env-var mode selector: this runs whenever eligible, the same way
     ///   `try_discover_partitioned` has no toggle either. `IBEX_DISABLE_
     ///   OWNED_PAIR_AGG=1` is a kill switch for the unusual case that needs
@@ -6817,7 +6544,6 @@ class ChunkedAggregateOperator final : public Operator {
             if (std::min(budget0, pool0.size()) < 2) {
                 return false;
             }
-            owned_is_pair_ = true;
         }
 
         auto& pool = process_worker_pool();
@@ -6940,8 +6666,9 @@ class ChunkedAggregateOperator final : public Operator {
         return true;
     }
 
-    /// Pair-key counterpart of `finalize_owned_int`; see there for the
-    /// algorithm. Populates `pair_order_`/`flat_slots_` -- the arrays
+    /// Walk every `owned_pair_partitions_` entry once, in first-occurrence
+    /// order (a P-way merge over `first_rows`, run once at final emission),
+    /// and populate `pair_order_`/`flat_slots_` -- the arrays
     /// `build_output_chunk`'s `pair_int_fast_path_` branch already reads.
     void finalize_owned_pair() {
         if (owned_finalized_) {
@@ -9022,16 +8749,12 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
     auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
-        // Owned-partition prototype: the deferred first-occurrence merge runs
+        // Owned-partition mode: the deferred first-occurrence merge runs
         // exactly once, here, right before the ordinary emission logic below
         // -- which then runs completely unmodified, reading the same
-        // int_order_/pair_order_/flat_slots_/n_groups_ it always has.
+        // pair_order_/flat_slots_/n_groups_ it always has.
         if (owned_mode_) {
-            if (owned_is_pair_) {
-                finalize_owned_pair();
-            } else {
-                finalize_owned_int();
-            }
+            finalize_owned_pair();
         }
 
         Chunk out;
@@ -9477,37 +9200,14 @@ class ChunkedAggregateOperator final : public Operator {
     std::vector<std::size_t> scatter_rows_;
     std::uint64_t rows_seen_ = 0;
 
-    // --- Partition-owned aggregation prototype (plans/parallelism-overview.md
-    // "stream multi-key joins" successor, step 2). Env-gated via
-    // IBEX_AGG_PARTITION_MODE; entirely inert (byte-identical to the existing
-    // path) when unset. De-risking prototype only -- see `try_owned_int` for
-    // the gates that keep it out of any shape it does not explicitly support.
-    enum class AggPartitionMode : std::uint8_t {
-        Baseline = 0,
-        InlineRowWise = 1,
-        PartitionOuter = 2
-    };
-    [[nodiscard]] static auto agg_partition_mode() -> AggPartitionMode {
-        static const AggPartitionMode mode = [] {
-            const char* env = std::getenv("IBEX_AGG_PARTITION_MODE");
-            if (env == nullptr) {
-                return AggPartitionMode::Baseline;
-            }
-            switch (std::atoi(env)) {
-                case 1:
-                    return AggPartitionMode::InlineRowWise;
-                case 2:
-                    return AggPartitionMode::PartitionOuter;
-                default:
-                    return AggPartitionMode::Baseline;
-            }
-        }();
-        return mode;
-    }
+    // --- Partition-owned aggregation (plans/parallelism-overview.md "stream
+    // multi-key joins" successor, step 2): the PairIntKey path only, admitted
+    // by `try_owned_pair`'s gates. `IBEX_DISABLE_OWNED_PAIR_AGG=1` is its kill
+    // switch.
 
     /// A partition's group discovery AND its own final aggregate state --
     /// no global gid, no global `flat_slots_` entry, until
-    /// `finalize_owned_int`/`finalize_owned_pair` walk every partition once at
+    /// `finalize_owned_pair` walks every partition once at
     /// final emission to restore first-occurrence order (plans doc: "moves
     /// that merge... does not eliminate the ordered merge itself").
     template <typename Key, typename Hash, typename Eq = std::equal_to<Key>>
@@ -9517,14 +9217,12 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<std::uint64_t> first_rows;
         std::vector<AggSlotCore> slots;  ///< n_local_groups * n_aggs_
     };
-    std::vector<OwnedPartition<std::int64_t, robin_hood::hash<std::int64_t>>> owned_int_partitions_;
     std::vector<OwnedPartition<PairIntKey, PairIntKeyHash>> owned_pair_partitions_;
     /// Set once this operator has committed to owned-partition mode. Per the
     /// plan's safety note, only ever ADMITTED before any other discovery path
     /// (serial or `try_discover_partitioned`) has created a group -- widening
     /// to seed/migrate an in-progress run is out of scope for this prototype.
     bool owned_mode_ = false;
-    bool owned_is_pair_ = false;
     bool owned_finalized_ = false;
     std::uint64_t owned_rows_seen_ = 0;
     /// Set once `try_discover_partitioned` has run; see the gate there for why

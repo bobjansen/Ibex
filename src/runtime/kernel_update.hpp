@@ -49,6 +49,8 @@ struct StringInterpolationOperand {
             return (*dictionary)[static_cast<std::size_t>(codes[row])];
         }
     } categorical;
+    const Date* dates = nullptr;
+    const Timestamp* timestamps = nullptr;
     std::string_view literal;
 };
 

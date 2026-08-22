@@ -4,6 +4,7 @@
 #include "kernel_update.hpp"
 
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/table_format.hpp>
 
 #include <cmath>
 #include <limits>
@@ -234,10 +235,10 @@ auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>
 
 /// A template string is the first computed variable-width update that can use
 /// the same presized offsets/chars shape as string gather.  Keep the accepted
-/// leaves deliberately narrow: string columns, string scalars, and literal
-/// segments need no per-row formatting or allocation.  Other interpolation
-/// arguments retain the reference evaluator below (notably numeric display
-/// formatting and date/time formatting).
+/// leaves deliberately narrow: string/categorical/temporal columns, string
+/// scalars, and literal segments. Numeric display formatting remains with the
+/// reference evaluator; temporal formatting calls the same canonical runtime
+/// formatters in both passes.
 auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateInput& input,
                                           const ScalarRegistry* scalars)
     -> std::optional<StringInterpolationOperand> {
@@ -260,6 +261,8 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
                                          .chars = values->chars_data(),
                                          .rows = values->size()},
                     .categorical = {},
+                    .dates = nullptr,
+                    .timestamps = nullptr,
                     .literal = {}};
             }
             if (const auto* values = std::get_if<Column<Categorical>>(entry->column.get())) {
@@ -268,7 +271,23 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
                     .categorical = {.codes = values->codes_data(),
                                     .dictionary = &values->dictionary(),
                                     .rows = values->size()},
+                    .dates = nullptr,
+                    .timestamps = nullptr,
                     .literal = {}};
+            }
+            if (const auto* values = std::get_if<Column<Date>>(entry->column.get())) {
+                return StringInterpolationOperand{.column = std::nullopt,
+                                                  .categorical = {},
+                                                  .dates = values->data(),
+                                                  .timestamps = nullptr,
+                                                  .literal = {}};
+            }
+            if (const auto* values = std::get_if<Column<Timestamp>>(entry->column.get())) {
+                return StringInterpolationOperand{.column = std::nullopt,
+                                                  .categorical = {},
+                                                  .dates = nullptr,
+                                                  .timestamps = values->data(),
+                                                  .literal = {}};
             }
             return std::nullopt;
         }
@@ -904,10 +923,17 @@ auto string_interpolation_bytes(const StringInterpolationPlan& plan,
         const std::size_t row = range.begin + offset;
         std::size_t row_bytes = 0;
         for (const auto& operand : plan.operands) {
-            row_bytes += operand.column.has_value() ? operand.column->row_len(row)
-                         : operand.categorical.dictionary != nullptr
-                             ? operand.categorical.value(row).size()
-                             : operand.literal.size();
+            if (operand.column.has_value()) {
+                row_bytes += operand.column->row_len(row);
+            } else if (operand.categorical.dictionary != nullptr) {
+                row_bytes += operand.categorical.value(row).size();
+            } else if (operand.dates != nullptr) {
+                row_bytes += format_date(operand.dates[row]).size();
+            } else if (operand.timestamps != nullptr) {
+                row_bytes += format_timestamp(operand.timestamps[row]).size();
+            } else {
+                row_bytes += operand.literal.size();
+            }
         }
         if (row_bytes > std::numeric_limits<std::uint32_t>::max() - total) {
             return std::nullopt;
@@ -941,6 +967,24 @@ auto write_string_interpolation(const StringInterpolationPlan& plan,
                 const auto value = operand.categorical.value(row);
                 source_chars = value.data();
                 length = value.size();
+            } else if (operand.dates != nullptr) {
+                const auto value = format_date(operand.dates[row]);
+                source_chars = value.data();
+                length = value.size();
+                if (length != 0) {
+                    std::memcpy(output.chars + cursor, source_chars, length);
+                }
+                cursor += static_cast<std::uint32_t>(length);
+                continue;
+            } else if (operand.timestamps != nullptr) {
+                const auto value = format_timestamp(operand.timestamps[row]);
+                source_chars = value.data();
+                length = value.size();
+                if (length != 0) {
+                    std::memcpy(output.chars + cursor, source_chars, length);
+                }
+                cursor += static_cast<std::uint32_t>(length);
+                continue;
             }
             if (length != 0) {
                 std::memcpy(output.chars + cursor, source_chars, length);

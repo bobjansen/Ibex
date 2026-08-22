@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <type_traits>
 
 namespace ibex::runtime {
 
@@ -40,6 +41,28 @@ auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKe
         }
     }
     return std::nullopt;
+}
+
+auto column_kernel_signature(const ColumnValue& column,
+                             const std::optional<ValidityBitmap>& validity) noexcept
+    -> ColumnKernelSignature {
+    const auto representation = std::visit(
+        [](const auto& value) -> ColumnRepresentation {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, Column<bool>>) {
+                return ColumnRepresentation::PackedBool;
+            } else if constexpr (std::is_same_v<T, Column<std::string>>) {
+                return ColumnRepresentation::StringSlabs;
+            } else if constexpr (std::is_same_v<T, Column<Categorical>>) {
+                return ColumnRepresentation::CategoricalCodes;
+            } else {
+                return ColumnRepresentation::FixedWidth;
+            }
+        },
+        column);
+    return {.representation = representation,
+            .null_policy =
+                validity.has_value() ? KernelNullPolicy::Nullable : KernelNullPolicy::AllValid};
 }
 
 auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {

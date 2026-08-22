@@ -518,6 +518,12 @@ struct ParallelIslandStats {
     /// without a counter a regression to serial would leave every test green
     /// and only show up as a slow benchmark.
     std::atomic<std::uint64_t> parallel_fields{0};
+    /// Parallel update fields whose arithmetic kernel wrote directly into the
+    /// field splitter's preallocated output windows.  This is distinct from
+    /// `parallel_fields`: both answers are identical, but a regression to
+    /// per-morsel temporary columns silently restores an allocation and copy
+    /// per window.
+    std::atomic<std::uint64_t> parallel_direct_numeric_fields{0};
     /// Islands run as a two-phase filter — output presized from per-morsel
     /// popcounts, then gathered into disjoint slices — instead of through the
     /// ordered merger. Same reason as `range_heads`: both produce identical

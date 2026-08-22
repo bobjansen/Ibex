@@ -359,10 +359,28 @@ flat int32 array with no `Column<uint32_t>`, and that gather IS the
 fixed-width kernel over codes. Gates: ctest 1657/1657, answers 22/22
 both `IBEX_PARALLEL` settings, and the MEASURING.md interleaved A/B
 (88 cases) read **-4.71% total / 1.055× geomean, every case `noise`** —
-neutral, as a port of the identical loop must be. Next: the bool and
-string gather representations, then validity, then the project/rename
-maps — at which point the dispatch table (item 3) has a full family to
-table-ize.
+neutral, as a port of the identical loop must be.
+
+**Bool and string representations landed (2026-08-22, `29d6759c`).**
+The bit-packing helpers moved verbatim from filter.cpp's anonymous
+namespace into `kernel_gather.hpp` (one definition, shared with the
+two-phase filter — the I4 lesson applied at extraction time).
+`BoolView` hides the internal-words/external-bytes split behind
+`source_word(start_row)`; `BoolOutputSpan` is a zero-filled pre-sized
+bit window under the shared-word atomic-OR rule. `StringView`/
+`StringOutputSpan` carry offsets+chars with `char_base` for the
+prefix-summed parallel window; the kernel writes only each row's END
+offset, the contract both the serial presize and the window chain rely
+on. The filter's string and bool arms now call the kernels — **every
+representation of the filter gather is on the kernel vocabulary**.
+Gates: ctest 1661/1661, answers 22/22 both settings, A/B −2.33% total /
+1.013× geomean with the one non-noise case an improvement
+(sort_symbol_price −4.06%) and zero regressions. One build lesson: the
+kernel header includes `<immintrin.h>` for `_pext_u64` — the dev build
+dirs don't define `__BMI2__`, the A/B's release config does, so a
+guarded intrinsic that compiles at home can still break the A/B build.
+Next: the validity gather (skip-false monotonic writes), then the
+project/rename maps onto `ChunkView`, then the item-3 dispatch table.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

@@ -525,6 +525,16 @@ established evaluator.  The kernel test pins nullable division, and full debug
 ctest passes 1671/1671.  Next: capture the combined computed-update A/B, then
 consider scalar operands or checked integer division as separate contracts.
 
+**Int64 literal update port (2026-08-22, pending performance gate).**
+The fixed-width kernel now also handles a single Int64 column with an Int64
+literal for add/subtract/multiply, including either operand order.  This covers
+the common `price * 2` shape while propagating a nullable source bitmap into
+owned output validity.  Checked division/modulo, non-Int literals, mixed
+types, and multi-field snapshots remain on `update_table`.  Focused kernel
+coverage pins nullable multiplication; full debug ctest passes 1672/1672.
+Next: run one combined A/B for the computed-update ports, then decide whether
+the checked-arithmetic contract is worth extracting.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

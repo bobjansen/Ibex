@@ -220,7 +220,45 @@ to make every node universally streaming:
 
 ### Phase 0 — freeze contracts and gain observability
 
-No performance claim.
+**Status: resolved by disposition (2026-08-22), not by execution.** Phase 1
+was started directly; this records, item by item, what that skipped, what
+already existed, and where the remainder lives — so the phase gate reads as
+a decision rather than an accident.
+
+1. **Contract documentation — deferred, now Phase 2's first deliverable.**
+   The knowledge exists (parallelism-overview Part 1, chunked-execution-plan,
+   the `operator.hpp`/`morsel.hpp` doc comments) but not in one place.
+   Writing it down is the input to Phase 2's first step (extracting the
+   `ChunkView`/selection/validity/output-writer APIs *is* stating the
+   contracts), so it lands there as a commit, not here as a promise.
+2. **Structured comparator — the artifact already existed.**
+   `runtime::compare_tables` (`table_compare.hpp`) is the authoritative
+   predicate for schema, metadata, values, validity, and categorical
+   code/dictionary backing, and the structured parity gate runs it in CI.
+   This also retires [serial-parity-comparator-plan.md](serial-parity-comparator-plan.md)'s
+   deliverable — its README status was stale. Still missing, and folded into
+   Phase 2's per-representation gates: a named serial-vs-chunked *runner*
+   (same query under `IBEX_PARALLEL=0`/`1`, compared structurally rather
+   than by stdout diff — the byte-diff practice stays, but a disagreement
+   should print a `TableMismatch`, not a wall of rendered text).
+3. **Physical-plan debug dump — landed inside Phase 1** as
+   `physical::explain_physical`, including fallback reasons; the test
+   formatter is exactly the "changes no runtime behavior" prototype this
+   item asked for.
+4. **Corpus — covered de facto, not formally.** The 1651-test suite spans
+   row-local maps, every column representation, the empty-schema carrier,
+   multi-chunk grains, joins, aggregates, and order;
+   `tests/test_physical_plan.cpp` added the fallback-node cases and the
+   plan-shape/counter assertions that distinguish "unsupported physical
+   shape" (a recorded `MaterializedCall` reason) from "incorrect result"
+   (a failing byte-identity check). Organizing a named corpus remains
+   optional until Phase 2's kernel ports need a fixed regression set.
+
+Exit criterion, honestly assessed: plan capture exists for Phase 1 shapes
+(`explain_physical`); a properties baseline does not, and becomes part of
+Phase 2's kernel-capability declarations. No performance claim.
+
+Original items, for the record:
 
 1. Document `Chunk`, `Morsel`, `Operator::next()`, materialization, source
    selection/index space, and `TableProperties` contracts in one place.
@@ -231,9 +269,6 @@ No performance claim.
 4. Establish a corpus spanning row-local maps, all column representations,
    empty input/schema carrier, multi-chunk source grains, joins, aggregates,
    order, window, and a fallback node.
-
-Exit: the current path has a captured baseline plan/properties and the corpus
-can distinguish an unsupported physical shape from an incorrect result.
 
 ### Phase 1 — introduce logical-to-physical planning beside `build_operator`
 

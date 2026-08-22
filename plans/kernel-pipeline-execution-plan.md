@@ -535,6 +535,12 @@ coverage pins nullable multiplication; full debug ctest passes 1672/1672.
 Next: run one combined A/B for the computed-update ports, then decide whether
 the checked-arithmetic contract is worth extracting.
 
+**Double literal update port (2026-08-22, pending performance gate).**
+Double columns now accept Int64 or Double literals for add/subtract/multiply/divide
+through the view kernel, covering `price * 2`. Computed view kernels are serial-only
+for now: parallel updates retain the established evaluator's field scheduling and
+accounting contract. Full debug ctest 1673/1673 passes.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

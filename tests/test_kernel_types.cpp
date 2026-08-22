@@ -471,6 +471,27 @@ TEST_CASE("Row-local double binary update preserves nullable division", "[kernel
     REQUIRE_FALSE((*updated->columns[2].validity)[1]);
 }
 
+TEST_CASE("Row-local unary Double update writes a nullable whole column", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<double>{1.0, 4.0, 9.0},
+                     runtime::ValidityBitmap{true, false, true});
+    ir::CallExpr sqrt_call{.callee = "sqrt", .args = {}, .named_args = {}};
+    sqrt_call.args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "root", .expr = ir::Expr{.node = std::move(sqrt_call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& root = std::get<Column<double>>(*updated->columns[1].column);
+    REQUIRE(root[0] == 1.0);
+    REQUIRE(root[2] == 3.0);
+    REQUIRE(updated->columns[1].validity.has_value());
+    REQUIRE((*updated->columns[1].validity)[0]);
+    REQUIRE_FALSE((*updated->columns[1].validity)[1]);
+    REQUIRE((*updated->columns[1].validity)[2]);
+}
+
 TEST_CASE("Row-local Int64 division writes Double and preserves IEEE/null semantics",
           "[kernel][update]") {
     runtime::Chunk chunk;

@@ -254,11 +254,17 @@ auto filter_chunk_range_native(Chunk input, const ir::Expr& predicate,
 
 }  // namespace
 
-auto filter_chunk(Chunk input, const ir::Expr& predicate, const ScalarRegistry* scalars)
-    -> std::expected<Chunk, std::string> {
+auto supports_native_chunk_predicate(const ir::Expr& predicate) -> bool {
+    return is_chunk_predicate_native(predicate);
+}
+
+auto filter_chunk(Chunk input, const ir::Expr& predicate, const ScalarRegistry* scalars,
+                  FilterChunkRoute route) -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
-    if (is_chunk_predicate_native(predicate)) {
+    if ((route == FilterChunkRoute::NativePredicate &&
+         supports_native_chunk_predicate(predicate)) ||
+        is_chunk_predicate_native(predicate)) {
         return filter_chunk_range_native(std::move(input), predicate, nullptr, 0, scalars);
     }
     return chunk_from_filtered(filter_table(chunk_to_table(std::move(input)), predicate, scalars),
@@ -266,11 +272,13 @@ auto filter_chunk(Chunk input, const ir::Expr& predicate, const ScalarRegistry* 
 }
 
 auto filter_project_chunk(Chunk input, const ir::Expr& predicate,
-                          const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars)
-    -> std::expected<Chunk, std::string> {
+                          const std::vector<ir::ColumnRef>& columns, const ScalarRegistry* scalars,
+                          FilterChunkRoute route) -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
-    if (is_chunk_predicate_native(predicate)) {
+    if ((route == FilterChunkRoute::NativePredicate &&
+         supports_native_chunk_predicate(predicate)) ||
+        is_chunk_predicate_native(predicate)) {
         return filter_chunk_range_native(std::move(input), predicate, &columns, 0, scalars);
     }
     return chunk_from_filtered(
@@ -329,9 +337,10 @@ auto filter_update_project_chunk(Chunk input, const ir::Expr& predicate,
                                  const std::vector<ir::ColumnRef>& project_columns,
                                  const std::vector<ir::ColumnRef>& gather_columns,
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
-                                 const ExecutionContext& exec)
+                                 const ExecutionContext& exec, FilterChunkRoute route)
     -> std::expected<Chunk, std::string> {
-    auto filtered = filter_project_chunk(std::move(input), predicate, gather_columns, scalars);
+    auto filtered =
+        filter_project_chunk(std::move(input), predicate, gather_columns, scalars, route);
     if (!filtered.has_value())
         return std::unexpected(std::move(filtered.error()));
     auto updated =

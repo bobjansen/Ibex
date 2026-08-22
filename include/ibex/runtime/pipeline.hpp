@@ -35,14 +35,18 @@ enum class MapKernelCapability : std::uint8_t {
     FilterUpdateProjectGather,
 };
 
+struct ColumnKernelSignature;
+
 /// The construction function selected for one physical map step.  The
 /// physical planner stores this pointer after proving the node's capability,
 /// so its executor need not redispatch on the capability for every step.
-using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(const ir::Node&, OperatorPtr,
-                                                                     const ScalarRegistry*,
-                                                                     const ExternRegistry*,
-                                                                     const ExecutionContext&,
-                                                                     bool preserve_empty_morsels);
+/// `source_signature` is null only for compatibility callers outside a
+/// physical plan (parallel islands); a physical map pipeline passes its
+/// resolved source representations so construction can select a route once.
+using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(
+    const ir::Node&, OperatorPtr, const ScalarRegistry*, const ExternRegistry*,
+    const ExecutionContext&, const std::vector<ColumnKernelSignature>*,
+    bool preserve_empty_morsels);
 
 struct MapKernelDispatch {
     MapKernelCapability capability = MapKernelCapability::FilterGather;

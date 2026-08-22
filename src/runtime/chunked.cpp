@@ -10333,21 +10333,29 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   const ExecutionContext& exec, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    switch (node.kind()) {
-        case ir::NodeKind::Filter: {
+    // The physical planner and the parallel-island builder meet here.  Both
+    // consume the same closed construction-time capability rather than each
+    // keeping a node-kind admission switch that can drift from the plan.
+    const auto capability = map_kernel_capability(node);
+    if (!capability.has_value()) {
+        return std::unexpected("row-local map factory: unsupported kernel capability");
+    }
+    switch (*capability) {
+        case MapKernelCapability::FilterGather: {
             const auto& filter = static_cast<const ir::FilterNode&>(node);
             return std::make_unique<ChunkedFilterOperator>(std::move(child), &filter.predicate(),
                                                            scalars, preserve_empty_morsels);
         }
-        case ir::NodeKind::Project: {
-            const auto& project = static_cast<const ir::ProjectNode&>(node);
-            return std::make_unique<ChunkedProjectOperator>(std::move(child), &project.columns());
-        }
-        case ir::NodeKind::Rename: {
+        case MapKernelCapability::MetadataMap: {
+            if (node.kind() == ir::NodeKind::Project) {
+                const auto& project = static_cast<const ir::ProjectNode&>(node);
+                return std::make_unique<ChunkedProjectOperator>(std::move(child),
+                                                                &project.columns());
+            }
             const auto& rename = static_cast<const ir::RenameNode&>(node);
             return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
         }
-        case ir::NodeKind::Update: {
+        case MapKernelCapability::RowLocalUpdate: {
             // Only reachable for an update `execution_capability(const Node&)`
             // proved row-local: unguarded, ungrouped, scalar-only fields, no
             // tuple assignment. An update never drops rows, so it needs no
@@ -10356,12 +10364,12 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
             return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(),
                                                            scalars, externs, exec);
         }
-        case ir::NodeKind::FilterProject: {
+        case MapKernelCapability::FilterProjectGather: {
             const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
             return std::make_unique<ChunkedFilterProjectOperator>(
                 std::move(child), &fp.predicate(), &fp.columns(), scalars, preserve_empty_morsels);
         }
-        case ir::NodeKind::FilterUpdateProject: {
+        case MapKernelCapability::FilterUpdateProjectGather: {
             const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
             robin_hood::unordered_set<std::string> update_outputs;
             robin_hood::unordered_set<std::string> needed;
@@ -10383,9 +10391,8 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
                 std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
                 std::move(gather_columns), scalars, externs, exec, preserve_empty_morsels);
         }
-        default:
-            return std::unexpected("row-local map factory: unsupported operator kind");
     }
+    return std::unexpected("row-local map factory: unknown kernel capability");
 }
 
 // The base of one worker's island chain: a source the worker points at the

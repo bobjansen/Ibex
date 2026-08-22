@@ -497,6 +497,17 @@ Gates: focused kernel-update tests and full debug ctest 1668/1668.  Next: take
 a fixed-width computed-field evaluator
 path onto views, then run one interleaved A/B.
 
+**All-valid Int64 binary update port (2026-08-22, pending performance gate).**
+`kernel::update_row_local_chunk` now evaluates one all-valid Int64
+column-pair add/subtract/multiply field directly from `ColumnView`s into a
+pre-sized output column.  The fixed shape is intentional: nullable inputs,
+mixed types, scalar operands, division/modulo's checked arithmetic, and
+multi-field snapshots remain with `update_table`.  The output replaces or
+appends the alias and derives properties exactly as an update does.  Unit
+coverage pins a multiply result; focused kernel-update tests and full debug
+ctest 1669/1669 pass.  Next: verify this first computed fast path, then extend
+to nullable fixed-width inputs rather than broadening its semantics blindly.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

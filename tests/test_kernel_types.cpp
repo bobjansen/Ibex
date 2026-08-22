@@ -158,6 +158,29 @@ TEST_CASE("Row-local alias update keeps the time-index write guard", "[kernel][u
     REQUIRE(updated.error() == "cannot update time index column: time");
 }
 
+TEST_CASE("Row-local fixed-width binary update uses all-valid column views", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("left", Column<std::int64_t>{2, 3, 4});
+    chunk.add_column("right", Column<std::int64_t>{5, 7, 11});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "product",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mul,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "left"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "right"}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->columns.size() == 3);
+    const auto& product = std::get<Column<std::int64_t>>(*updated->columns[2].column);
+    REQUIRE(product[0] == 10);
+    REQUIRE(product[1] == 21);
+    REQUIRE(product[2] == 44);
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

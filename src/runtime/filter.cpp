@@ -173,7 +173,7 @@ auto pack_mask_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
 
 // Collect the merged validity bitmap for all column refs in an ir::Expr.
 // Returns nullopt if no referenced column has a validity bitmap.
-auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange rows)
+auto collect_expr_validity(const ir::Expr& expr, const PredicateInput& input, RowRange rows)
     -> std::optional<ValidityBitmap> {
     std::optional<ValidityBitmap> result;
     // `result` is already dense (offset 0); each newly merged table bitmap is
@@ -191,11 +191,9 @@ auto collect_expr_validity(const ir::Expr& expr, const Table& table, RowRange ro
                     if (node.lexical) {
                         return;  // `^name`: a scalar binding, never null
                     }
-                    auto it = table.index.find(node.name);
-                    if (it != table.index.end()) {
-                        const auto& entry = table.columns[it->second];
-                        if (entry.validity.has_value())
-                            merge_in(&*entry.validity);
+                    if (const auto* entry = input.find(node.name);
+                        entry != nullptr && entry->validity.has_value()) {
+                        merge_in(&*entry->validity);
                     }
                 } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
                     walk(*node.left);
@@ -1011,8 +1009,8 @@ struct NumericCmpSpec {
 
 // `begin` is the evaluated range's first row: the captured data pointers are
 // advanced past it so the kernels stay 0-based.
-auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table, std::size_t begin)
-    -> std::optional<NumericCmpSpec> {
+auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const PredicateInput& input,
+                                  std::size_t begin) -> std::optional<NumericCmpSpec> {
     const auto* cmp = std::get_if<ir::CompareExpr>(&expr.node);
     if (cmp == nullptr) {
         return std::nullopt;
@@ -1042,21 +1040,20 @@ auto try_extract_numeric_cmp_spec(const ir::Expr& expr, const Table& table, std:
         return std::nullopt;
     }
 
-    auto it = table.index.find(col_node->name);
-    if (it == table.index.end()) {
+    const auto* entry = input.find(col_node->name);
+    if (entry == nullptr) {
         return std::nullopt;
     }
-    const auto& entry = table.columns[it->second];
-    if (entry.validity.has_value()) {
+    if (entry->validity.has_value()) {
         return std::nullopt;  // 3VL path handles null semantics
     }
 
     NumericCmpSpec spec{};
     spec.op = op;
-    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry->column.get())) {
         spec.kind = NumericSpecKind::Int64;
         spec.i64 = int_column->data() + begin;
-    } else if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
+    } else if (const auto* double_column = std::get_if<Column<double>>(entry->column.get())) {
         spec.kind = NumericSpecKind::Double;
         spec.dbl = double_column->data() + begin;
     } else {
@@ -1096,8 +1093,8 @@ struct NumericArithCmpSpec {
     double lit_dbl = 0.0;
 };
 
-auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table, std::size_t begin)
-    -> std::optional<NumericOperandSpec> {
+auto try_extract_numeric_operand_spec(const ir::Expr& expr, const PredicateInput& input,
+                                      std::size_t begin) -> std::optional<NumericOperandSpec> {
     NumericOperandSpec spec{};
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         spec.is_lit = true;
@@ -1119,20 +1116,19 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table, 
     if (col_node == nullptr || col_node->lexical) {
         return std::nullopt;
     }
-    auto it = table.index.find(col_node->name);
-    if (it == table.index.end()) {
+    const auto* entry = input.find(col_node->name);
+    if (entry == nullptr) {
         return std::nullopt;
     }
-    const auto& entry = table.columns[it->second];
-    if (entry.validity.has_value()) {
+    if (entry->validity.has_value()) {
         return std::nullopt;
     }
-    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry.column.get())) {
+    if (const auto* int_column = std::get_if<Column<std::int64_t>>(entry->column.get())) {
         spec.kind = NumericSpecKind::Int64;
         spec.i64 = int_column->data() + begin;
         return spec;
     }
-    if (const auto* double_column = std::get_if<Column<double>>(entry.column.get())) {
+    if (const auto* double_column = std::get_if<Column<double>>(entry->column.get())) {
         spec.kind = NumericSpecKind::Double;
         spec.dbl = double_column->data() + begin;
         return spec;
@@ -1140,7 +1136,7 @@ auto try_extract_numeric_operand_spec(const ir::Expr& expr, const Table& table, 
     return std::nullopt;
 }
 
-auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table& table,
+auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const PredicateInput& input,
                                         std::size_t begin) -> std::optional<NumericArithCmpSpec> {
     const ir::BinaryExpr* bin = nullptr;
     const ir::Literal* lit = nullptr;
@@ -1165,8 +1161,8 @@ auto try_extract_numeric_arith_cmp_spec(const ir::CompareExpr& cmp, const Table&
         return std::nullopt;
     }
 
-    auto lhs = try_extract_numeric_operand_spec(*bin->left, table, begin);
-    auto rhs = try_extract_numeric_operand_spec(*bin->right, table, begin);
+    auto lhs = try_extract_numeric_operand_spec(*bin->left, input, begin);
+    auto rhs = try_extract_numeric_operand_spec(*bin->right, input, begin);
     if (!lhs || !rhs) {
         return std::nullopt;
     }
@@ -1563,8 +1559,9 @@ inline auto mask_to_bool_result(Mask m, std::size_t n) -> ColResult {
 // Evaluate a value sub-expression over all n rows, returning a column.
 // Returns a pointer into the table for simple column references (zero-copy),
 // or an owned ColumnValue for computed intermediates.
-auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
-                    RowRange rows, std::optional<ir::Duration> window, bool window_aligned)
+auto eval_value_vec(const ir::Expr& expr, const PredicateInput& input,
+                    const ScalarRegistry* scalars, RowRange rows,
+                    std::optional<ir::Duration> window, bool window_aligned)
     -> std::expected<ColResult, std::string> {
     const std::size_t n = rows.count;
     return std::visit(
@@ -1573,18 +1570,14 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
             if constexpr (std::is_same_v<T, ir::ColumnRef>) {
                 // `^name` skips column scope: it resolves in the scalar
                 // registry below even when a column shares its name.
-                if (const auto* col = node.lexical ? nullptr : table.find(node.name)) {
+                if (const auto* entry = node.lexical ? nullptr : input.find(node.name)) {
                     // The only borrowed leaf: the whole table column is handed
                     // back with the range's start as its offset, so no slice is
                     // materialized. Everything computed from it is dense.
-                    ColResult r{col};
+                    ColResult r{entry->column.get()};
                     r.offset = rows.begin;
-                    auto idx_it = table.index.find(node.name);
-                    if (idx_it != table.index.end()) {
-                        const auto& entry = table.columns[idx_it->second];
-                        if (entry.validity.has_value())
-                            r.validity = &*entry.validity;
-                    }
+                    if (entry->validity.has_value())
+                        r.validity = &*entry->validity;
                     return r;
                 }
                 if (scalars != nullptr) {
@@ -1619,11 +1612,11 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                     node.value);
                 return ColResult{std::move(cv)};
             } else if constexpr (std::is_same_v<T, ir::BinaryExpr>) {
-                auto lhs = eval_value_vec(*node.left, table, scalars, rows, window, window_aligned);
+                auto lhs = eval_value_vec(*node.left, input, scalars, rows, window, window_aligned);
                 if (!lhs)
                     return std::unexpected(lhs.error());
                 auto rhs =
-                    eval_value_vec(*node.right, table, scalars, rows, window, window_aligned);
+                    eval_value_vec(*node.right, input, scalars, rows, window, window_aligned);
                 if (!rhs)
                     return std::unexpected(rhs.error());
                 auto result = arith_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
@@ -1651,9 +1644,14 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                                             .window_aligned = window_aligned};
                     // Not row-local: evaluated over the whole table and sliced,
                     // never over the range alone (see slice_computed).
-                    const std::size_t kernel_rows = table.rows();
+                    const Table* table = input.table();
+                    if (table == nullptr) {
+                        return std::unexpected(node.callee +
+                                               ": requires whole-table predicate evaluation");
+                    }
+                    const std::size_t kernel_rows = table->rows();
                     const ir::CallExpr* kernel_call = &node;
-                    const Table* kernel_input = &table;
+                    const Table* kernel_input = table;
                     ir::CallExpr rewritten_call;
                     Table materialized_input;
                     if (ir::is_rolling_func(node.callee) && !node.args.empty() &&
@@ -1663,7 +1661,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                         // aggregate expressions can compose without a separate
                         // user-visible update step.
                         auto arg =
-                            eval_value_vec(*node.args.front(), table, scalars,
+                            eval_value_vec(*node.args.front(), input, scalars,
                                            RowRange::whole(kernel_rows), window, window_aligned);
                         if (!arg) {
                             return std::unexpected(arg.error());
@@ -1671,7 +1669,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                         ColumnValue argument = std::holds_alternative<ColumnValue>(arg->data)
                                                    ? std::move(std::get<ColumnValue>(arg->data))
                                                    : *std::get<const ColumnValue*>(arg->data);
-                        materialized_input = table;
+                        materialized_input = *table;
                         std::string name = "__ibex_rolling_arg__";
                         while (materialized_input.find(name) != nullptr) {
                             name += '_';
@@ -1713,15 +1711,25 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 const bool args_need_vec = std::ranges::any_of(
                     node.args, [](const auto& a) { return field_uses_vectorized_eval(*a); });
                 if (args_need_vec) {
-                    return eval_scalar_over_columns(node, table, scalars, rows);
+                    const Table* table = input.table();
+                    if (table == nullptr) {
+                        return std::unexpected(node.callee +
+                                               ": requires whole-table predicate evaluation");
+                    }
+                    return eval_scalar_over_columns(node, *table, scalars, rows);
                 }
                 // Otherwise delegate to the shared field evaluator, which
                 // dispatches through the registry (per-row, incl. the
                 // null-handling scalars) and carries validity. Extern scalar
                 // functions are not available in predicate position (externs
                 // are not threaded into this vectorized evaluator).
+                const Table* table = input.table();
+                if (table == nullptr) {
+                    return std::unexpected(node.callee +
+                                           ": requires whole-table predicate evaluation");
+                }
                 auto col = evaluate_field(
-                    expr, table, rows,
+                    expr, *table, rows,
                     ColumnEvalCtx{.scalars = scalars, .externs = nullptr, .window = std::nullopt});
                 if (!col) {
                     return std::unexpected(col.error());
@@ -1733,7 +1741,7 @@ auto eval_value_vec(const ir::Expr& expr, const Table& table, const ScalarRegist
                 // Boolean-producing nodes used in value position: evaluate the
                 // predicate to a Mask and return it as a Column<Bool> (3VL nulls
                 // become column validity).
-                auto m = compute_mask(expr, table, scalars, rows);
+                auto m = compute_mask(expr, input, scalars, rows);
                 if (!m) {
                     return std::unexpected(m.error());
                 }
@@ -1963,19 +1971,18 @@ auto try_extract_in_list(const ir::Expr& expr)
 /// per-row cost is one indexed load regardless of how long the list is. The
 /// generic OR path instead builds a full-width mask per arm and combines them,
 /// which is what a SQL `IN` degrades into once it is spelled as an OR-chain.
-auto try_in_list_mask(const ir::Expr& expr, const Table& table, RowRange rows)
+auto try_in_list_mask(const ir::Expr& expr, const PredicateInput& input, RowRange rows)
     -> std::optional<Mask> {
     auto in_list = try_extract_in_list(expr);
     if (!in_list.has_value()) {
         return std::nullopt;
     }
     const auto& [column, values] = *in_list;
-    auto index = table.index.find(column->name);
-    if (index == table.index.end()) {
+    const auto* entry = input.find(column->name);
+    if (entry == nullptr) {
         return std::nullopt;
     }
-    const auto& entry = table.columns[index->second];
-    const auto* cat = std::get_if<Column<Categorical>>(entry.column.get());
+    const auto* cat = std::get_if<Column<Categorical>>(entry->column.get());
     if (cat == nullptr) {
         return std::nullopt;  // plain string columns keep the generic path
     }
@@ -1993,7 +2000,7 @@ auto try_in_list_mask(const ir::Expr& expr, const Table& table, RowRange rows)
     for (std::size_t row = 0; row < rows.count; ++row) {
         mask.value[row] = code_ok[static_cast<std::size_t>(codes[row])];
     }
-    mask.apply_validity(entry.validity.has_value() ? &*entry.validity : nullptr, rows.begin,
+    mask.apply_validity(entry->validity.has_value() ? &*entry->validity : nullptr, rows.begin,
                         rows.count);
     return mask;
 }
@@ -2002,7 +2009,7 @@ auto try_in_list_mask(const ir::Expr& expr, const Table& table, RowRange rows)
 
 // Compute a boolean Mask for all n rows, with 3-valued logic (3VL) for nulls.
 // valid==nullopt means all rows are valid (common non-null path, zero overhead).
-auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
+auto compute_mask(const ir::Expr& expr, const PredicateInput& input, const ScalarRegistry* scalars,
                   RowRange rows) -> std::expected<Mask, std::string> {
     const std::size_t n = rows.count;
     return std::visit(
@@ -2012,7 +2019,7 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // Fast path: row-local numeric arithmetic compared to a literal.
                 // This avoids materializing expressions such as `price * qty`
                 // when the filter only needs the final keep/drop mask.
-                if (auto spec = try_extract_numeric_arith_cmp_spec(node, table, rows.begin);
+                if (auto spec = try_extract_numeric_arith_cmp_spec(node, input, rows.begin);
                     spec.has_value()) {
                     Mask fused;
                     fused.value.resize(n);
@@ -2021,7 +2028,7 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 }
                 // Fast path: column/expr op literal (no broadcast needed).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.right->node)) {
-                    auto lhs = eval_value_vec(*node.left, table, scalars, rows);
+                    auto lhs = eval_value_vec(*node.left, input, scalars, rows);
                     if (!lhs)
                         return std::unexpected(lhs.error());
                     return compare_col_scalar(node.op, deref_col(*lhs), lhs->offset, lit->value, n,
@@ -2029,17 +2036,17 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 }
                 // Fast path: literal op column/expr (flip the operator).
                 if (const auto* lit = std::get_if<ir::Literal>(&node.left->node)) {
-                    auto rhs = eval_value_vec(*node.right, table, scalars, rows);
+                    auto rhs = eval_value_vec(*node.right, input, scalars, rows);
                     if (!rhs)
                         return std::unexpected(rhs.error());
                     return compare_col_scalar(flip_cmp(node.op), deref_col(*rhs), rhs->offset,
                                               lit->value, n, rhs->get_validity());
                 }
                 // General: both sides are column expressions.
-                auto lhs = eval_value_vec(*node.left, table, scalars, rows);
+                auto lhs = eval_value_vec(*node.left, input, scalars, rows);
                 if (!lhs)
                     return std::unexpected(lhs.error());
-                auto rhs = eval_value_vec(*node.right, table, scalars, rows);
+                auto rhs = eval_value_vec(*node.right, input, scalars, rows);
                 if (!rhs)
                     return std::unexpected(rhs.error());
                 auto res = compare_vec(node.op, deref_col(*lhs), lhs->offset, deref_col(*rhs),
@@ -2048,7 +2055,7 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
             } else if constexpr (std::is_same_v<T, ir::LogicalExpr>) {
                 if (node.op == ir::LogicalOp::Not) {
                     // NOT null = null; NOT true = false; NOT false = true
-                    auto mask = compute_mask(*node.left, table, scalars, rows);
+                    auto mask = compute_mask(*node.left, input, scalars, rows);
                     if (!mask)
                         return std::unexpected(mask.error());
                     for (auto& v : mask->value)
@@ -2061,15 +2068,15 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // categorical column) is a membership test, not a chain of
                 // independent ORs — one pass, no mask per arm.
                 if (!is_and) {
-                    if (auto in_mask = try_in_list_mask(expr, table, rows); in_mask.has_value()) {
+                    if (auto in_mask = try_in_list_mask(expr, input, rows); in_mask.has_value()) {
                         return std::move(*in_mask);
                     }
                 }
                 // Fast path: two numeric (column cmp literal) terms without nulls.
                 // Evaluate both comparisons and combine in a single pass.
-                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, table, rows.begin);
+                if (auto lspec = try_extract_numeric_cmp_spec(*node.left, input, rows.begin);
                     lspec.has_value()) {
-                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, table, rows.begin);
+                    if (auto rspec = try_extract_numeric_cmp_spec(*node.right, input, rows.begin);
                         rspec.has_value()) {
                         Mask fused;
                         fused.value.resize(n);
@@ -2086,10 +2093,10 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // 3VL AND/OR (see truth tables): combine values, then recompute
                 // validity so a known-false (AND) / known-true (OR) on either
                 // side makes the row definitively valid.
-                auto left = compute_mask(*node.left, table, scalars, rows);
+                auto left = compute_mask(*node.left, input, scalars, rows);
                 if (!left)
                     return std::unexpected(left.error());
-                auto right = compute_mask(*node.right, table, scalars, rows);
+                auto right = compute_mask(*node.right, input, scalars, rows);
                 if (!right)
                     return std::unexpected(right.error());
                 const uint8_t* lp = left->value.data();
@@ -2124,13 +2131,10 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 const bool want_null = !node.negated;
                 if (const auto* col_node = std::get_if<ir::ColumnRef>(&node.operand->node)) {
                     const ValidityBitmap* bm = nullptr;
-                    auto it =
-                        col_node->lexical ? table.index.end() : table.index.find(col_node->name);
-                    if (it != table.index.end()) {
-                        const auto& entry = table.columns[it->second];
-                        if (entry.validity.has_value()) {
-                            bm = &*entry.validity;
-                        }
+                    if (const auto* entry =
+                            col_node->lexical ? nullptr : input.find(col_node->name);
+                        entry != nullptr && entry->validity.has_value()) {
+                        bm = &*entry->validity;
                     }
                     Mask m;
                     m.value.resize(n);
@@ -2171,7 +2175,7 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
                 // reference (`filter is_manual`) or a Bool-returning scalar
                 // builtin (`filter is_nan(x)`). Evaluate and check the result
                 // type before giving up.
-                auto val = eval_value_vec(expr, table, scalars, rows);
+                auto val = eval_value_vec(expr, input, scalars, rows);
                 if (!val)
                     return std::unexpected(val.error());
                 const auto* bcol = std::get_if<Column<bool>>(&deref_col(*val));
@@ -2186,6 +2190,11 @@ auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry
             }
         },
         expr.node);
+}
+
+auto compute_mask(const ir::Expr& expr, const Table& table, const ScalarRegistry* scalars,
+                  RowRange rows) -> std::expected<Mask, std::string> {
+    return compute_mask(expr, PredicateInput{table}, scalars, rows);
 }
 
 namespace {
@@ -2207,7 +2216,7 @@ void for_each_selected_row(const FilterSelection& sel, RowRange rows, const Fn& 
 
 }  // namespace
 
-auto compute_filter_selection(const Table& input, const ir::Expr& predicate,
+auto compute_filter_selection(const PredicateInput& input, const ir::Expr& predicate,
                               const ScalarRegistry* scalars, RowRange rows, std::size_t row_limit)
     -> std::expected<FilterSelection, std::string> {
     // `n` and every index below are range-relative: the mask and the keep-word
@@ -2260,6 +2269,12 @@ auto compute_filter_selection(const Table& input, const ir::Expr& predicate,
         sel.kept += block_kept;
     }
     return sel;
+}
+
+auto compute_filter_selection(const Table& input, const ir::Expr& predicate,
+                              const ScalarRegistry* scalars, RowRange rows, std::size_t row_limit)
+    -> std::expected<FilterSelection, std::string> {
+    return compute_filter_selection(PredicateInput{input}, predicate, scalars, rows, row_limit);
 }
 
 auto build_filter_output_layout(const Table& input, const std::vector<ir::ColumnRef>* project)
@@ -2458,16 +2473,9 @@ auto filter_gather_is_thread_safe(const Table& input, const std::vector<std::siz
     });
 }
 
-namespace {
-
-auto filter_table_impl(const Table& input, const ir::Expr& predicate,
-                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
-                       const ScalarRegistry* scalars, RowRange rows)
+auto filter_table_selection(const Table& input, const FilterSelection& selection,
+                            const std::vector<ir::ColumnRef>* project, RowRange rows)
     -> std::expected<Table, std::string> {
-    auto sel = compute_filter_selection(input, predicate, scalars, rows, row_limit);
-    if (!sel) {
-        return std::unexpected(std::move(sel.error()));
-    }
     auto layout = build_filter_output_layout(input, project);
     if (!layout) {
         return std::unexpected(std::move(layout.error()));
@@ -2478,9 +2486,9 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
     // filter runs the same three steps, but sizes once for every morsel and
     // hands each a different destination.
     std::vector<std::size_t> chars(layout->output.columns.size(), 0);
-    count_selected_chars(input, layout->src_of_dst, *sel, rows, chars);
-    presize_filter_output(layout->output, input, layout->src_of_dst, sel->kept, chars);
-    gather_selection_into(layout->output, input, layout->src_of_dst, *sel, rows, GatherDest{});
+    count_selected_chars(input, layout->src_of_dst, selection, rows, chars);
+    presize_filter_output(layout->output, input, layout->src_of_dst, selection.kept, chars);
+    gather_selection_into(layout->output, input, layout->src_of_dst, selection, rows, GatherDest{});
 
     // A row-local filter preserves order and time index; a fused projection
     // keeps each only when its column survives the selection.
@@ -2494,6 +2502,19 @@ auto filter_table_impl(const Table& input, const ir::Expr& predicate,
                             },
                             RowTransform::Subset));
     return std::move(layout->output);
+}
+
+namespace {
+
+auto filter_table_impl(const Table& input, const ir::Expr& predicate,
+                       const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
+                       const ScalarRegistry* scalars, RowRange rows)
+    -> std::expected<Table, std::string> {
+    auto selection = compute_filter_selection(input, predicate, scalars, rows, row_limit);
+    if (!selection) {
+        return std::unexpected(std::move(selection.error()));
+    }
+    return filter_table_selection(input, *selection, project, rows);
 }
 
 }  // namespace

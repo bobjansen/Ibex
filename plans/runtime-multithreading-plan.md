@@ -173,7 +173,7 @@ than promote that disconnected segmenter onto the hot path, `build_operator()`
 authoritative and gains one eligibility pass it consults at each `Passthrough`
 chain to choose a parallel-island operator or the existing serial chain. This
 decision fork, and the prerequisite work of establishing that single seam before
-any parallel code lands, is [execution-plan-seam-plan.md](done/execution-plan-seam-plan.md);
+any parallel code lands, is execution-plan-seam-plan.md (removed from the tree; in git history);
 Option B is the chosen branch.
 
 Logical planning and optimization remain responsible for plan shape, predicate

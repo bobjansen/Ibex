@@ -180,6 +180,129 @@ auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fi
     return result;
 }
 
+/// Whole-column unary Double transforms are a useful next step beyond binary
+/// arithmetic: they are common in row-local map pipelines and have the same
+/// simple null contract as their source.  Keep the accepted shape deliberately
+/// narrow.  In particular, the type-preserving Int forms (abs/floor/ceil/trunc)
+/// remain with the evaluator, whose overflow and inferred-type rules are the
+/// authority for those calls.
+auto try_unary_double_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto* source_ref = std::get_if<ir::ColumnRef>(&call->args.front()->node);
+    if (source_ref == nullptr || source_ref->lexical) {
+        return std::nullopt;
+    }
+    const auto unary = [&]() -> double (*)(double) {
+        if (call->callee == "sqrt")
+            return [](double value) { return std::sqrt(value); };
+        if (call->callee == "log")
+            return [](double value) { return std::log(value); };
+        if (call->callee == "exp")
+            return [](double value) { return std::exp(value); };
+        if (call->callee == "log2")
+            return [](double value) { return std::log2(value); };
+        if (call->callee == "log10")
+            return [](double value) { return std::log10(value); };
+        if (call->callee == "sin")
+            return [](double value) { return std::sin(value); };
+        if (call->callee == "cos")
+            return [](double value) { return std::cos(value); };
+        if (call->callee == "tan")
+            return [](double value) { return std::tan(value); };
+        if (call->callee == "asin")
+            return [](double value) { return std::asin(value); };
+        if (call->callee == "acos")
+            return [](double value) { return std::acos(value); };
+        if (call->callee == "atan")
+            return [](double value) { return std::atan(value); };
+        if (call->callee == "sinh")
+            return [](double value) { return std::sinh(value); };
+        if (call->callee == "cosh")
+            return [](double value) { return std::cosh(value); };
+        if (call->callee == "tanh")
+            return [](double value) { return std::tanh(value); };
+        if (call->callee == "abs")
+            return [](double value) { return std::fabs(value); };
+        if (call->callee == "floor")
+            return [](double value) { return std::floor(value); };
+        if (call->callee == "ceil")
+            return [](double value) { return std::ceil(value); };
+        if (call->callee == "trunc")
+            return [](double value) { return std::trunc(value); };
+        return nullptr;
+    }();
+    if (unary == nullptr) {
+        return std::nullopt;
+    }
+
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    const auto source_position = view.find_column(source_ref->name);
+    if (!source_position.has_value()) {
+        return std::nullopt;
+    }
+
+    std::optional<Chunk> result;
+    std::visit(
+        [&](const auto& source_values) {
+            using T = typename std::decay_t<decltype(source_values)>::value_type;
+            if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+                // These four calls preserve an Int argument's Int result in
+                // the language.  Restrict this writer to Double input so it
+                // never silently changes that type contract.
+                if constexpr (std::is_same_v<T, std::int64_t>) {
+                    if (call->callee == "abs" || call->callee == "floor" ||
+                        call->callee == "ceil" || call->callee == "trunc") {
+                        return;
+                    }
+                }
+                const ColumnView<T> source(source_values,
+                                           view.validity(*source_position).has_value()
+                                               ? &*view.validity(*source_position)
+                                               : nullptr);
+                Column<double> values;
+                values.resize_for_overwrite(view.rows());
+                for (std::size_t row = 0; row < view.rows(); ++row) {
+                    values.data()[row] = unary(static_cast<double>(source.value(row)));
+                }
+                std::optional<ValidityBitmap> validity;
+                if (view.validity(*source_position).has_value()) {
+                    validity = *view.validity(*source_position);
+                }
+                Chunk output = input;
+                const auto existing = view.find_column(fields.front().alias);
+                const ColumnEntry entry{.name = fields.front().alias,
+                                        .column = std::make_shared<ColumnValue>(std::move(values)),
+                                        .validity = std::move(validity)};
+                if (existing.has_value()) {
+                    output.columns[*existing] = entry;
+                } else {
+                    output.columns.push_back(entry);
+                }
+                output.set_properties(TableProperties::derive(
+                    view.properties(),
+                    [&](const std::string& name) -> KeyFate {
+                        return name == fields.front().alias ? KeyFate::overwritten()
+                                                            : KeyFate::kept(name);
+                    },
+                    RowTransform::Preserve));
+                result = std::move(output);
+            }
+        },
+        view.column(*source_position));
+    return result;
+}
+
 auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
                             const ScalarRegistry* scalars) -> std::optional<Chunk> {
     if (fields.size() != 1 || !supports_native_chunk_predicate(fields.front().expr)) {
@@ -1163,6 +1286,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
                 next = try_literal_update(current, one_field);
             }
             if (!next.has_value()) {
+                next = try_unary_double_update(current, one_field);
+            }
+            if (!next.has_value()) {
                 next = try_native_bool_update(current, one_field, scalars);
             }
             if (!next.has_value()) {
@@ -1198,6 +1324,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     }
     if (!exec.parallel) {
         if (auto output = try_literal_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_unary_double_update(input, fields); output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {

@@ -6865,6 +6865,60 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         auto result = runtime::interpret(*ir, registry);
         CHECK_FALSE(result.has_value());
     }
+
+    // A string target takes the packed guarded writer: matching rows receive
+    // a newly sized slab, non-matching rows retain both their old payload and
+    // validity, and a newly fixed null becomes valid.
+    {
+        runtime::Table t;
+        t.add_column("label", Column<std::string>{"old", "", "keep", ""},
+                     runtime::ValidityBitmap{true, false, true, false});
+        t.add_column("g", Column<std::string>{"x", "x", "y", "y"});
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        auto ir = require_ir(R"(t[where g == "x" update { label = "new" }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("label");
+        REQUIRE(entry != nullptr);
+        const auto& label = std::get<Column<std::string>>(*entry->column);
+        CHECK(label[0] == "new");
+        CHECK(label[1] == "new");
+        CHECK(label[2] == "keep");
+        CHECK(label[3].empty());
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0]);
+        CHECK((*entry->validity)[1]);
+        CHECK((*entry->validity)[2]);
+        CHECK_FALSE((*entry->validity)[3]);
+        CHECK(label.offsets_data()[4] == 10);
+    }
+
+    // The same packed writer also creates a nullable String column from a
+    // subset-evaluable interpolation. Rows outside the guard own empty slabs.
+    {
+        runtime::Table t;
+        t.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+        t.add_column("g", Column<std::string>{"x", "y", "x", "y"});
+        runtime::TableRegistry registry;
+        registry.emplace("t", t);
+        auto ir = require_ir(R"(t[where g == "x" update { label = `id=${id}` }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        const auto* entry = result->find_entry("label");
+        REQUIRE(entry != nullptr);
+        const auto& label = std::get<Column<std::string>>(*entry->column);
+        CHECK(label[0] == "id=1");
+        CHECK(label[1].empty());
+        CHECK(label[2] == "id=3");
+        CHECK(label[3].empty());
+        REQUIRE(entry->validity.has_value());
+        CHECK((*entry->validity)[0]);
+        CHECK_FALSE((*entry->validity)[1]);
+        CHECK((*entry->validity)[2]);
+        CHECK_FALSE((*entry->validity)[3]);
+        CHECK(label.offsets_data()[4] == 8);
+    }
 }
 
 // Skew and kurtosis keep their higher moments in the operator's per-group

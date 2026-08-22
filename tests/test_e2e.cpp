@@ -2052,6 +2052,7 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
         "t[update { qty = qty + 1 }];",                   // overwrites an existing nullable column
         "t[update { a = price * 2, b = a + 1 }];",        // a later field reads an earlier one
         "t[update { n = pmin(price * qty + 1, 200) }];",  // compiled min + nested arithmetic
+        "t[update { flag = price > 100 }];",  // packed Bool windows meet at word boundaries
     };
     for (const auto* src : split_cases) {
         INFO("query: " << src);
@@ -2064,7 +2065,9 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
             runtime::ParallelIslandStats stats;
             require_tables_equal(serial, run_parallel(src, tables, 7, threads, &stats));
             CHECK(stats.parallel_fields.load() > 0);
-            CHECK(stats.parallel_direct_numeric_fields.load() > 0);
+            if (std::string_view(src) != "t[update { flag = price > 100 }];") {
+                CHECK(stats.parallel_direct_numeric_fields.load() > 0);
+            }
         }
     }
 

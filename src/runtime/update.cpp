@@ -40,6 +40,8 @@
 #include <vector>
 
 #include "ibex/runtime/table_properties.hpp"
+#include "kernel_filter.hpp"
+#include "kernel_gather.hpp"
 #include "kernel_update.hpp"
 #include "zorro.hpp"
 
@@ -2809,7 +2811,9 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     }
     auto inferred = infer_expr_type(expr, table, ctx.scalars, ctx.externs);
     if (!inferred.has_value() ||
-        (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double)) {
+        (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double &&
+         inferred.value() != ExprType::Bool) ||
+        (inferred.value() == ExprType::Bool && !kernel::supports_native_chunk_predicate(expr))) {
         return whole();
     }
 
@@ -2837,17 +2841,22 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     // merge cost what the threads saved and then some (measured: 8.8ms
     // parallel vs 5.8ms serial). Copying inside the task does it while the
     // piece is still hot in that worker's cache, and does it in parallel.
-    ColumnValue out = inferred.value() == ExprType::Int ? ColumnValue{Column<std::int64_t>{}}
-                                                        : ColumnValue{Column<double>{}};
+    ColumnValue out = inferred.value() == ExprType::Int      ? ColumnValue{Column<std::int64_t>{}}
+                      : inferred.value() == ExprType::Double ? ColumnValue{Column<double>{}}
+                                                             : ColumnValue{Column<bool>{}};
     std::int64_t* dst_int = nullptr;
     double* dst_double = nullptr;
+    std::uint64_t* dst_bool_words = nullptr;
     if (auto* ints = std::get_if<Column<std::int64_t>>(&out)) {
         ints->resize_for_overwrite(rows);
         dst_int = ints->data();
+    } else if (auto* doubles = std::get_if<Column<double>>(&out)) {
+        doubles->resize_for_overwrite(rows);
+        dst_double = doubles->data();
     } else {
-        auto& doubles = std::get<Column<double>>(out);
-        doubles.resize_for_overwrite(rows);
-        dst_double = doubles.data();
+        auto& bools = std::get<Column<bool>>(out);
+        bools.resize(rows);
+        dst_bool_words = bools.words_data();
     }
 
     // One slot per morsel, each written by exactly one worker — no lock, and
@@ -2865,6 +2874,31 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
             const std::size_t begin = index * grain;
             const std::size_t count = std::min(grain, rows - begin);
             const RowRange range{.begin = begin, .count = count};
+            if (dst_bool_words != nullptr) {
+                auto mask = compute_mask(expr, table, ctx.scalars, range);
+                if (!mask.has_value()) {
+                    pieces[index] = std::unexpected(std::move(mask.error()));
+                    continue;
+                }
+                const auto shared = kernel::SharedBitWords::of_run(begin, count);
+                for (std::size_t offset = 0; offset < count; ++offset) {
+                    if (mask->value[offset] != 0) {
+                        kernel::or_bits_into_word(dst_bool_words, (begin + offset) / 64,
+                                                  std::uint64_t{1} << ((begin + offset) % 64),
+                                                  shared);
+                    }
+                }
+                if (mask->valid.has_value()) {
+                    ValidityBitmap validity(count, false);
+                    for (std::size_t offset = 0; offset < count; ++offset) {
+                        validity.set(offset, (*mask->valid)[offset] != 0);
+                    }
+                    pieces[index] = std::move(validity);
+                } else {
+                    pieces[index] = std::optional<ValidityBitmap>{};
+                }
+                continue;
+            }
             if (try_write_fast_update_binary(
                     expr, table, range, inferred.value(), ctx.scalars,
                     dst_int != nullptr ? dst_int + begin : nullptr,

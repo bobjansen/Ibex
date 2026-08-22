@@ -3489,6 +3489,65 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                     }
                 }
 
+                if constexpr (std::is_same_v<Col, Column<std::string>>) {
+                    // Strings cannot be scattered through a flat value buffer,
+                    // but their final source is known for every output row.
+                    // Count the selected slabs first, then write the one
+                    // pre-sized packed column. This retains the guarded
+                    // snapshot rule while avoiding one allocation per row.
+                    std::size_t total_chars = 0;
+                    std::size_t source_row = 0;
+                    bool fits_offsets = true;
+                    for (std::size_t i = 0; i < n; ++i) {
+                        std::string_view value;
+                        if (matched_bytes[i] != 0) {
+                            const std::size_t si = subset ? source_row++ : i;
+                            value = src[si];
+                        } else if (oldc != nullptr) {
+                            value = (*oldc)[i];
+                        }
+                        if (value.size() >
+                            std::numeric_limits<std::uint32_t>::max() - total_chars) {
+                            fits_offsets = false;
+                            break;
+                        }
+                        total_chars += value.size();
+                    }
+                    if (fits_offsets) {
+                        Col out;
+                        out.resize_for_gather(n, total_chars);
+                        auto* offsets = out.offsets_data();
+                        char* chars = out.chars_data();
+                        offsets[0] = 0;
+                        std::uint32_t cursor = 0;
+                        source_row = 0;
+                        ValidityBitmap valid(n, true);
+                        bool any_invalid = false;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            std::string_view value;
+                            bool is_valid = false;
+                            if (matched_bytes[i] != 0) {
+                                const std::size_t si = subset ? source_row++ : i;
+                                value = src[si];
+                                is_valid = !new_valid.has_value() || (*new_valid)[si];
+                            } else if (oldc != nullptr) {
+                                value = (*oldc)[i];
+                                is_valid = old_valid == nullptr || (*old_valid)[i];
+                            }
+                            if (!value.empty()) {
+                                std::memcpy(chars + cursor, value.data(), value.size());
+                            }
+                            cursor += static_cast<std::uint32_t>(value.size());
+                            offsets[i + 1] = cursor;
+                            valid.set(i, is_valid);
+                            any_invalid = any_invalid || !is_valid;
+                        }
+                        return {ColumnValue{std::move(out)},
+                                any_invalid ? std::optional<ValidityBitmap>{std::move(valid)}
+                                            : std::nullopt};
+                    }
+                }
+
                 Col out;
                 ColumnAppender<Col> appender(out, n);
                 ValidityBitmap valid(n, true);

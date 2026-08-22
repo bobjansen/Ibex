@@ -243,7 +243,8 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     -> std::optional<StringInterpolationOperand> {
     if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
         if (const auto* value = std::get_if<std::string>(&literal->value)) {
-            return StringInterpolationOperand{.column = std::nullopt, .literal = *value};
+            return StringInterpolationOperand{
+                .column = std::nullopt, .categorical = {}, .literal = *value};
         }
         return std::nullopt;
     }
@@ -258,6 +259,15 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
                     .column = StringView{.offsets = values->offsets_data(),
                                          .chars = values->chars_data(),
                                          .rows = values->size()},
+                    .categorical = {},
+                    .literal = {}};
+            }
+            if (const auto* values = std::get_if<Column<Categorical>>(entry->column.get())) {
+                return StringInterpolationOperand{
+                    .column = std::nullopt,
+                    .categorical = {.codes = values->codes_data(),
+                                    .dictionary = &values->dictionary(),
+                                    .rows = values->size()},
                     .literal = {}};
             }
             return std::nullopt;
@@ -266,7 +276,8 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     if (scalars != nullptr) {
         if (const auto it = scalars->find(ref->name); it != scalars->end()) {
             if (const auto* value = std::get_if<std::string>(&it->second)) {
-                return StringInterpolationOperand{.column = std::nullopt, .literal = *value};
+                return StringInterpolationOperand{
+                    .column = std::nullopt, .categorical = {}, .literal = *value};
             }
         }
     }
@@ -893,8 +904,10 @@ auto string_interpolation_bytes(const StringInterpolationPlan& plan,
         const std::size_t row = range.begin + offset;
         std::size_t row_bytes = 0;
         for (const auto& operand : plan.operands) {
-            row_bytes +=
-                operand.column.has_value() ? operand.column->row_len(row) : operand.literal.size();
+            row_bytes += operand.column.has_value() ? operand.column->row_len(row)
+                         : operand.categorical.dictionary != nullptr
+                             ? operand.categorical.value(row).size()
+                             : operand.literal.size();
         }
         if (row_bytes > std::numeric_limits<std::uint32_t>::max() - total) {
             return std::nullopt;
@@ -924,6 +937,10 @@ auto write_string_interpolation(const StringInterpolationPlan& plan,
                 const auto start = operand.column->offsets[row];
                 source_chars = operand.column->chars + start;
                 length = operand.column->row_len(row);
+            } else if (operand.categorical.dictionary != nullptr) {
+                const auto value = operand.categorical.value(row);
+                source_chars = value.data();
+                length = value.size();
             }
             if (length != 0) {
                 std::memcpy(output.chars + cursor, source_chars, length);

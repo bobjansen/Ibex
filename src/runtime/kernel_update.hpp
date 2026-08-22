@@ -37,6 +37,18 @@ enum class FixedWidthNumericKind : std::uint8_t { Int, Double };
 /// contracts cannot drift.
 struct StringInterpolationOperand {
     std::optional<StringView> column;
+    /// Categorical values stay dictionary-coded until the interpolation writer
+    /// needs their byte slab; resolving the code directly avoids a per-row
+    /// Column variant visit and makes the dictionary ownership explicit.
+    struct CategoricalView {
+        const Column<Categorical>::code_type* codes = nullptr;
+        const std::vector<std::string>* dictionary = nullptr;
+        std::size_t rows = 0;
+
+        [[nodiscard]] auto value(std::size_t row) const noexcept -> std::string_view {
+            return (*dictionary)[static_cast<std::size_t>(codes[row])];
+        }
+    } categorical;
     std::string_view literal;
 };
 

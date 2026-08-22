@@ -205,6 +205,29 @@ TEST_CASE("Row-local fixed-width binary update ANDs nullable input validity", "[
     REQUIRE_FALSE((*updated->columns[2].validity)[2]);
 }
 
+TEST_CASE("Row-local double binary update preserves nullable division", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("numerator", Column<double>{6.0, 9.0}, runtime::ValidityBitmap{true, false});
+    chunk.add_column("denominator", Column<double>{2.0, 3.0});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "quotient",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Div,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "numerator"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "denominator"}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& quotient = std::get<Column<double>>(*updated->columns[2].column);
+    REQUIRE(quotient[0] == 3.0);
+    REQUIRE(updated->columns[2].validity.has_value());
+    REQUIRE_FALSE((*updated->columns[2].validity)[1]);
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

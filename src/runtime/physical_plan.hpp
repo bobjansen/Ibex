@@ -6,6 +6,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/pipeline.hpp>
 
 #include <cstdint>
 #include <string>
@@ -54,6 +55,7 @@ struct Plan {
     SourceKind source = SourceKind::TableScan;
     const ir::Node* source_node = nullptr;
     std::vector<const ir::Node*> steps;
+    std::vector<MapKernelCapability> kernel_capabilities;
     const ir::Node* root = nullptr;
 };
 

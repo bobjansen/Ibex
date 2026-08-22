@@ -6,6 +6,7 @@
 #include <ibex/ir/node.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace ibex::runtime {
@@ -19,6 +20,24 @@ enum class ExecutionCapability : std::uint8_t {
     Barrier,
     ParallelBarrier,
 };
+
+/// Closed construction-time vocabulary for the row-local kernel family.  This
+/// is intentionally narrower than `ExecutionCapability`: it says which
+/// already-ported kernel composition constructs an operator, while the latter
+/// describes scheduling/barrier behaviour for every logical node.
+enum class MapKernelCapability : std::uint8_t {
+    FilterGather,
+    MetadataMap,
+    RowLocalUpdate,
+    FilterProjectGather,
+    FilterUpdateProjectGather,
+};
+
+/// The row-local kernel family a node can construct, or nullopt when the node
+/// must remain outside this closed dispatch table.  A row-local Update is the
+/// only conditional member; guarded/grouped/tuple/non-row-local forms decline.
+[[nodiscard]] auto map_kernel_capability(const ir::Node& node) noexcept
+    -> std::optional<MapKernelCapability>;
 
 /// Classify a node kind's execution capability — the *most* a node of this kind
 /// may be. Expression-level constraints are checked by

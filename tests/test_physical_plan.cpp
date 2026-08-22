@@ -62,6 +62,8 @@ TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical
     REQUIRE(plan.migrated);
     REQUIRE(plan.steps.size() == 1);
     REQUIRE(plan.steps.front()->kind() == ir::NodeKind::FilterProject);
+    REQUIRE(plan.kernel_capabilities ==
+            std::vector{runtime::MapKernelCapability::FilterProjectGather});
     REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
     REQUIRE(plan.source_node != nullptr);
     REQUIRE(plan.source_node->kind() == ir::NodeKind::Scan);
@@ -72,11 +74,14 @@ TEST_CASE("Physical plan lowers select-only and row-local update chains", "[phys
     REQUIRE(project.migrated);
     REQUIRE(project.steps.size() == 1);
     REQUIRE(project.steps.front()->kind() == ir::NodeKind::Project);
+    REQUIRE(project.kernel_capabilities == std::vector{runtime::MapKernelCapability::MetadataMap});
 
     const auto [update_tree, update] = serial_plan("trades[update { doubled = price * 2 }];");
     REQUIRE(update.migrated);
     REQUIRE(update.steps.size() == 1);
     REQUIRE(update.steps.front()->kind() == ir::NodeKind::Update);
+    REQUIRE(update.kernel_capabilities ==
+            std::vector{runtime::MapKernelCapability::RowLocalUpdate});
 }
 
 TEST_CASE("Physical plan classifies an unregistered scan as LazyScan", "[physical][plan]") {

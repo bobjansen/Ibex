@@ -121,6 +121,43 @@ TEST_CASE("Row-local update kernel preserves chunk identity", "[kernel][update]"
     REQUIRE(updated->columns[1].column == input_column);
 }
 
+TEST_CASE("Row-local alias update overwrites keys without copying its source", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20});
+    chunk.add_column("replacement", Column<std::int64_t>{30, 40},
+                     runtime::ValidityBitmap{true, false});
+    chunk.set_properties(runtime::TableProperties::sorted_by({{.name = "price"}}));
+    const auto replacement = chunk.columns[1].column;
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "price", .expr = ir::Expr{.node = ir::ColumnRef{.name = "replacement"}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->columns.size() == 2);
+    REQUIRE(updated->columns[0].name == "price");
+    REQUIRE(updated->columns[0].column == replacement);
+    REQUIRE(updated->columns[0].validity.has_value());
+    REQUIRE_FALSE((*updated->columns[0].validity)[1]);
+    REQUIRE_FALSE(updated->ordering().has_value());
+}
+
+TEST_CASE("Row-local alias update keeps the time-index write guard", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("time", Column<std::int64_t>{10, 20});
+    chunk.add_column("replacement", Column<std::int64_t>{30, 40});
+    chunk.set_properties(runtime::TableProperties::time_frame("time"));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "time", .expr = ir::Expr{.node = ir::ColumnRef{.name = "replacement"}}}};
+    const runtime::ExecutionContext exec{};
+
+    const auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE_FALSE(updated.has_value());
+    REQUIRE(updated.error() == "cannot update time index column: time");
+}
+
 TEST_CASE("Selection shapes answer their survivor counts", "[kernel][view]") {
     const RowRange range{.begin = 4, .end = 9};
     REQUIRE(selection_rows(Selection{range}, 100) == 5);

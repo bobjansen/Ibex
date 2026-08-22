@@ -483,6 +483,20 @@ work; retain that small subset as a watch item rather than infer causality.
 Next: port the metadata-only `alias = existing_column` update fast path onto
 `ChunkView`, then take the first representation-specific evaluator path.
 
+**Row-local alias update port (2026-08-22, pending performance gate).**
+The single-field, non-lexical `alias = existing_column` form now stays in
+`kernel::update_row_local_chunk`: it resolves the source position once through
+`ChunkView`, maps shared `ColumnEntry` handles into an appended or replaced
+output column, and derives update properties before returning.  It therefore
+bypasses the Chunk→Table bridge for every representation while preserving the
+existing evaluator for scalar references, multi-field snapshot semantics, and
+all computed expressions.  It also declines a TimeFrame time-index write so
+the established evaluator keeps its error contract.  Tests pin append sharing,
+replacement validity sharing, ordered-key invalidation, and that decline.
+Gates: focused kernel-update tests and full debug ctest 1668/1668.  Next: take
+a fixed-width computed-field evaluator
+path onto views, then run one interleaved A/B.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

@@ -176,6 +176,48 @@ TEST_CASE("Filter chunk project and limit share direct predicate selection", "[k
     REQUIRE(price[1] == 30);
 }
 
+TEST_CASE("Native filter chunk gather preserves packed, variable, and nullable columns",
+          "[kernel][filter]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20, 30, 40});
+    chunk.add_column("enabled", Column<bool>{true, false, true, true});
+    chunk.add_column("symbol", Column<std::string>{"a", "bb", "ccc", "dddd"});
+    chunk.add_column("qty", Column<std::int64_t>{1, 2, 3, 4},
+                     runtime::ValidityBitmap{true, false, true, false});
+    const ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Ge,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{20}}})}};
+
+    auto filtered = runtime::kernel::filter_chunk(std::move(chunk), predicate, nullptr);
+    REQUIRE(filtered.has_value());
+    REQUIRE(filtered->rows() == 3);
+    const auto& enabled = std::get<Column<bool>>(*filtered->columns[1].column);
+    REQUIRE_FALSE(enabled[0]);
+    REQUIRE(enabled[1]);
+    REQUIRE(enabled[2]);
+    const auto& symbol = std::get<Column<std::string>>(*filtered->columns[2].column);
+    REQUIRE(symbol[0] == "bb");
+    REQUIRE(symbol[1] == "ccc");
+    REQUIRE(symbol[2] == "dddd");
+    REQUIRE_FALSE((*filtered->columns[3].validity)[0]);
+    REQUIRE((*filtered->columns[3].validity)[1]);
+    REQUIRE_FALSE((*filtered->columns[3].validity)[2]);
+}
+
+TEST_CASE("Native filter chunk preserves logical rows without columns", "[kernel][filter]") {
+    runtime::Chunk chunk;
+    chunk.logical_rows = 3;
+    const ir::Expr predicate{.node = ir::Literal{.value = true}};
+
+    auto filtered = runtime::kernel::filter_chunk(std::move(chunk), predicate, nullptr);
+    REQUIRE(filtered.has_value());
+    REQUIRE(filtered->columns.empty());
+    REQUIRE(filtered->logical_rows == 3);
+    REQUIRE(filtered->rows() == 3);
+}
+
 TEST_CASE("Row-local alias update overwrites keys without copying its source", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20});

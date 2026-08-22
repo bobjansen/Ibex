@@ -1116,8 +1116,12 @@ auto eval_numeric_int_node_block(const NumericUpdateNode& node, std::uint32_t id
     invariant_violation("eval_numeric_int_node_block: unknown node kind");
 }
 
-auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std::uint32_t root,
-                                std::size_t rows, ExprType output_kind) -> ColumnValue {
+/// Evaluate a compiled numeric tree into one caller-owned dense range.  The
+/// same block/scratch schedule serves both the ordinary materialising evaluator
+/// and parallel update windows; only ownership of the root column differs.
+auto eval_numeric_update_blocks_into(const std::vector<NumericUpdateNode>& nodes,
+                                     std::uint32_t root, std::size_t rows, ExprType output_kind,
+                                     std::int64_t* out_int, double* out_double) -> void {
     std::vector<std::uint8_t> modes(nodes.size(), 0U);
     if (output_kind == ExprType::Double) {
         mark_numeric_double_subtree(nodes, root, modes);
@@ -1135,32 +1139,34 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
     std::vector<NumericBlockValue<std::int64_t>> int_values(nodes.size());
 
     if (output_kind == ExprType::Double) {
-        Column<double> out;
-        out.resize_for_overwrite(rows);
+        if (out_double == nullptr) {
+            invariant_violation("eval_numeric_update_blocks_into: missing double output");
+        }
         for (std::size_t offset = 0; offset < rows; offset += kNumericUpdateBlockRows) {
             const std::size_t count = std::min(kNumericUpdateBlockRows, rows - offset);
             for (std::uint32_t idx = 0; idx <= root; ++idx) {
                 if ((modes[idx] & kNumericEvalDouble) == 0U) {
                     continue;
                 }
-                double* dst = idx == root ? out.data() + offset
+                double* dst = idx == root ? out_double + offset
                                           : double_scratch.data() + (static_cast<std::size_t>(idx) *
                                                                      kNumericUpdateBlockRows);
                 eval_numeric_double_node_block(nodes[idx], idx, double_values, dst, offset, count);
             }
             const auto root_value = double_values[root];
-            double* out_block = out.data() + offset;
+            double* out_block = out_double + offset;
             if (root_value.data == nullptr) {
                 std::fill_n(out_block, count, root_value.scalar);
             } else if (root_value.data != out_block) {
                 std::copy_n(root_value.data, count, out_block);
             }
         }
-        return ColumnValue{std::move(out)};
+        return;
     }
 
-    Column<std::int64_t> out;
-    out.resize_for_overwrite(rows);
+    if (out_int == nullptr) {
+        invariant_violation("eval_numeric_update_blocks_into: missing int output");
+    }
     for (std::size_t offset = 0; offset < rows; offset += kNumericUpdateBlockRows) {
         const std::size_t count = std::min(kNumericUpdateBlockRows, rows - offset);
         for (std::uint32_t idx = 0; idx <= root; ++idx) {
@@ -1171,7 +1177,7 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
             }
             if ((modes[idx] & kNumericEvalInt) != 0U) {
                 std::int64_t* dst =
-                    idx == root ? out.data() + offset
+                    idx == root ? out_int + offset
                                 : int_scratch.data() +
                                       (static_cast<std::size_t>(idx) * kNumericUpdateBlockRows);
                 eval_numeric_int_node_block(nodes[idx], idx, int_values, double_values, dst, offset,
@@ -1179,13 +1185,26 @@ auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std
             }
         }
         const auto root_value = int_values[root];
-        std::int64_t* out_block = out.data() + offset;
+        std::int64_t* out_block = out_int + offset;
         if (root_value.data == nullptr) {
             std::fill_n(out_block, count, root_value.scalar);
         } else if (root_value.data != out_block) {
             std::copy_n(root_value.data, count, out_block);
         }
     }
+}
+
+auto eval_numeric_update_blocks(const std::vector<NumericUpdateNode>& nodes, std::uint32_t root,
+                                std::size_t rows, ExprType output_kind) -> ColumnValue {
+    if (output_kind == ExprType::Double) {
+        Column<double> out;
+        out.resize_for_overwrite(rows);
+        eval_numeric_update_blocks_into(nodes, root, rows, output_kind, nullptr, out.data());
+        return ColumnValue{std::move(out)};
+    }
+    Column<std::int64_t> out;
+    out.resize_for_overwrite(rows);
+    eval_numeric_update_blocks_into(nodes, root, rows, output_kind, out.data(), nullptr);
     return ColumnValue{std::move(out)};
 }
 
@@ -1565,6 +1584,32 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, RowR
     }
 
     return eval_numeric_update_blocks(nodes, *root, rows, output_kind);
+}
+
+/// The parallel field splitter owns a full destination column before it starts
+/// its morsels.  Compile the same range-native numeric tree used by the serial
+/// evaluator, but let its root write straight into this morsel's disjoint
+/// output window.  A decline is intentional: callers keep the semantic
+/// fallback for any expression the numeric compiler does not own.
+auto try_write_compiled_numeric_update_expr(const ir::Expr& expr, const Table& input,
+                                            RowRange range, ExprType output_kind,
+                                            const ScalarRegistry* scalars, std::int64_t* dst_int,
+                                            double* dst_double) -> bool {
+    if ((output_kind != ExprType::Int && output_kind != ExprType::Double) ||
+        (output_kind == ExprType::Int && dst_int == nullptr) ||
+        (output_kind == ExprType::Double && dst_double == nullptr)) {
+        return false;
+    }
+    std::vector<NumericUpdateNode> nodes;
+    nodes.reserve(8);
+    std::vector<ColumnValue> temps;
+    temps.reserve(8);
+    const auto root = try_compile_numeric_update_expr(expr, input, scalars, nodes, temps, range);
+    if (!root.has_value() || nodes[*root].type != output_kind) {
+        return false;
+    }
+    eval_numeric_update_blocks_into(nodes, *root, range.count, output_kind, dst_int, dst_double);
+    return true;
 }
 
 namespace {
@@ -2814,6 +2859,14 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
             const std::size_t count = std::min(grain, rows - begin);
             const RowRange range{.begin = begin, .count = count};
             if (try_write_fast_update_binary(
+                    expr, table, range, inferred.value(), ctx.scalars,
+                    dst_int != nullptr ? dst_int + begin : nullptr,
+                    dst_double != nullptr ? dst_double + begin : nullptr)) {
+                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
+                used_direct_numeric_writer.store(true, std::memory_order_relaxed);
+                continue;
+            }
+            if (try_write_compiled_numeric_update_expr(
                     expr, table, range, inferred.value(), ctx.scalars,
                     dst_int != nullptr ? dst_int + begin : nullptr,
                     dst_double != nullptr ? dst_double + begin : nullptr)) {

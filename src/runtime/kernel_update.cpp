@@ -56,6 +56,41 @@ auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSp
     return map_chunk(view, map, properties);
 }
 
+auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* literal = std::get_if<ir::Literal>(&fields.front().expr.node);
+    if (literal == nullptr) {
+        return std::nullopt;
+    }
+
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+
+    Chunk result = input;
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(broadcast_scalar_column(
+                                scalar_from_literal(*literal), view.rows())),
+                            .validity = std::nullopt};
+    if (const auto existing = view.find_column(fields.front().alias); existing.has_value()) {
+        result.columns[*existing] = entry;
+    } else {
+        result.columns.push_back(entry);
+    }
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
 auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
     -> std::optional<Chunk> {
     if (fields.size() != 1) {
@@ -397,6 +432,9 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
         return std::move(*output);
     }
     if (!exec.parallel) {
+        if (auto output = try_literal_update(input, fields); output.has_value()) {
+            return std::move(*output);
+        }
         if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {
             return std::move(*output);
         }

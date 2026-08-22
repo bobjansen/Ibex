@@ -6,11 +6,13 @@
 #include <ibex/runtime/safe_arith.hpp>
 
 #include <cmath>
+#include <limits>
 #include <type_traits>
 
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "kernel_filter.hpp"
+#include "kernel_gather.hpp"
 #include "kernel_types.hpp"
 
 namespace ibex::runtime::kernel {
@@ -211,6 +213,157 @@ auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>
         }
         validity = std::move(bits);
     }
+    Chunk result = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{.name = fields.front().alias,
+                            .column = std::make_shared<ColumnValue>(std::move(values)),
+                            .validity = std::move(validity)};
+    if (existing.has_value()) {
+        result.columns[*existing] = entry;
+    } else {
+        result.columns.push_back(entry);
+    }
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
+/// A template string is the first computed variable-width update that can use
+/// the same presized offsets/chars shape as string gather.  Keep the accepted
+/// leaves deliberately narrow: string columns, string scalars, and literal
+/// segments need no per-row formatting or allocation.  Other interpolation
+/// arguments retain the reference evaluator below (notably numeric display
+/// formatting and date/time formatting).
+struct StringInterpolationOperand {
+    std::optional<StringView> column;
+    std::string_view literal;
+};
+
+auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateInput& input,
+                                          const ScalarRegistry* scalars)
+    -> std::optional<StringInterpolationOperand> {
+    if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+        if (const auto* value = std::get_if<std::string>(&literal->value)) {
+            return StringInterpolationOperand{.column = std::nullopt, .literal = *value};
+        }
+        return std::nullopt;
+    }
+    const auto* ref = std::get_if<ir::ColumnRef>(&expr.node);
+    if (ref == nullptr) {
+        return std::nullopt;
+    }
+    if (!ref->lexical) {
+        if (const auto* entry = input.find(ref->name); entry != nullptr) {
+            if (const auto* values = std::get_if<Column<std::string>>(entry->column.get())) {
+                return StringInterpolationOperand{
+                    .column = StringView{.offsets = values->offsets_data(),
+                                         .chars = values->chars_data(),
+                                         .rows = values->size()},
+                    .literal = {}};
+            }
+            return std::nullopt;
+        }
+    }
+    if (scalars != nullptr) {
+        if (const auto it = scalars->find(ref->name); it != scalars->end()) {
+            if (const auto* value = std::get_if<std::string>(&it->second)) {
+                return StringInterpolationOperand{.column = std::nullopt, .literal = *value};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+auto string_interpolation_operands(const ir::Expr& expr, const PredicateInput& input,
+                                   const ScalarRegistry* scalars)
+    -> std::optional<std::vector<StringInterpolationOperand>> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->callee != "__interp" || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    std::vector<StringInterpolationOperand> operands;
+    operands.reserve(call->args.size());
+    for (const auto& arg : call->args) {
+        auto operand = resolve_string_interpolation_operand(*arg, input, scalars);
+        if (!operand.has_value()) {
+            return std::nullopt;
+        }
+        operands.push_back(std::move(*operand));
+    }
+    return operands;
+}
+
+auto try_shared_string_interpolation_update(const Chunk& input,
+                                            const std::vector<ir::FieldSpec>& fields,
+                                            const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    const auto source = predicate_input(view);
+    auto operands = string_interpolation_operands(fields.front().expr, source, scalars);
+    if (!operands.has_value()) {
+        return std::nullopt;
+    }
+    auto validity = collect_expr_validity(fields.front().expr, source,
+                                          ::ibex::runtime::RowRange::whole(view.rows()));
+
+    // Pass one is precisely the string gather presize contract: establish the
+    // single character slab before handing its raw window to the writer.
+    std::size_t total_chars = 0;
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        if (validity.has_value() && !(*validity)[row]) {
+            continue;
+        }
+        std::size_t row_chars = 0;
+        for (const auto& operand : *operands) {
+            row_chars +=
+                operand.column.has_value() ? operand.column->row_len(row) : operand.literal.size();
+        }
+        if (row_chars > std::numeric_limits<std::uint32_t>::max() - total_chars) {
+            return std::nullopt;
+        }
+        total_chars += row_chars;
+    }
+
+    Column<std::string> values;
+    values.resize_for_gather(view.rows(), total_chars);
+    StringOutputSpan output{.offsets = values.offsets_data(),
+                            .chars = values.chars_data(),
+                            .begin = 0,
+                            .count = view.rows(),
+                            .char_base = 0};
+    output.offsets[0] = 0;
+    std::uint32_t cursor = output.char_base;
+    for (std::size_t row = 0; row < output.count; ++row) {
+        if (validity.has_value() && !(*validity)[row]) {
+            output.offsets[output.begin + row + 1] = cursor;
+            continue;
+        }
+        for (const auto& operand : *operands) {
+            const char* source_chars = operand.literal.data();
+            std::size_t length = operand.literal.size();
+            if (operand.column.has_value()) {
+                const auto start = operand.column->offsets[row];
+                source_chars = operand.column->chars + start;
+                length = operand.column->row_len(row);
+            }
+            if (length != 0) {
+                std::memcpy(output.chars + cursor, source_chars, length);
+            }
+            cursor += static_cast<std::uint32_t>(length);
+        }
+        output.offsets[output.begin + row + 1] = cursor;
+    }
+
     Chunk result = input;
     const auto existing = view.find_column(fields.front().alias);
     const ColumnEntry entry{.name = fields.front().alias,
@@ -921,6 +1074,10 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             return std::move(*output);
         }
         if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_shared_string_interpolation_update(input, fields, scalars);
+            output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_shared_fixed_width_numeric_binary_update(input, fields, scalars);

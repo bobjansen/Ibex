@@ -492,6 +492,41 @@ TEST_CASE("Row-local unary Double update writes a nullable whole column", "[kern
     REQUIRE((*updated->columns[1].validity)[2]);
 }
 
+TEST_CASE("Row-local numeric tree composes arithmetic clips and unary transforms",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<double>{4.0, 25.0, 16.0},
+                     runtime::ValidityBitmap{true, true, false});
+    chunk.add_column("cap", Column<double>{9.0, 9.0, 9.0});
+    const auto price = [] {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}});
+    };
+    const auto cap = [] {
+        return ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "cap"}});
+    };
+    auto twice =
+        ir::Expr{.node = ir::BinaryExpr{
+                     .op = ir::ArithmeticOp::Mul,
+                     .left = price(),
+                     .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.0}})}};
+    ir::CallExpr clipped{.callee = "pmin", .args = {}, .named_args = {}};
+    clipped.args.push_back(ir::make_expr_ptr(std::move(twice)));
+    clipped.args.push_back(cap());
+    ir::CallExpr root{.callee = "sqrt", .args = {}, .named_args = {}};
+    root.args.push_back(ir::make_expr_ptr(ir::Expr{.node = std::move(clipped)}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "root", .expr = ir::Expr{.node = std::move(root)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& values = std::get<Column<double>>(*updated->columns[2].column);
+    CHECK(values[0] == std::sqrt(8.0));
+    CHECK(values[1] == 3.0);
+    REQUIRE(updated->columns[2].validity.has_value());
+    CHECK_FALSE((*updated->columns[2].validity)[2]);
+}
+
 TEST_CASE("Row-local string length update reads slabs and categorical codes", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("text", Column<std::string>{"café", "日本語"},

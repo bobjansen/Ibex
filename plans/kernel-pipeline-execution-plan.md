@@ -326,6 +326,15 @@ source pushdowns, with no required performance win.
 
 ### Phase 2 — migrate row-local execution to reusable kernels
 
+**Open.** The opening deliverable — the contract documentation Phase 0's
+disposition promised — landed as `src/runtime/CONTRACTS.md` (2026-08-22):
+the one-place statement of the `Chunk`, `sequence`/`row_offset` index space,
+`next()` pull protocol, materialization, `TableProperties`, source/demand,
+and determinism contracts, each pointing at its owning header and naming the
+known hardening debt (extern-source dictionary sharing, sink validity
+widening). Next: item 1 below, extracting the kernel APIs — stating those
+contracts in code.
+
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a
    time, preserving the current fast kernels rather than rewriting them.

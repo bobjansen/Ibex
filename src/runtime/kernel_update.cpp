@@ -28,6 +28,77 @@ auto predicate_input(const ChunkView& view) -> PredicateInput {
         }};
 }
 
+struct NumericOperand {
+    bool is_column = false;
+    const ColumnValue* column = nullptr;
+    ScalarValue scalar;
+    ExprType kind = ExprType::Int;
+};
+
+auto resolve_numeric_operand(const ir::Expr& expr, const PredicateInput& input,
+                             const ScalarRegistry* scalars) -> std::optional<NumericOperand> {
+    if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
+        if (!ref->lexical) {
+            if (const auto* entry = input.find(ref->name); entry != nullptr) {
+                const ExprType kind = expr_type_for_column(*entry->column);
+                if (kind == ExprType::Int || kind == ExprType::Double) {
+                    return NumericOperand{.is_column = true,
+                                          .column = entry->column.get(),
+                                          .scalar = ScalarValue{},
+                                          .kind = kind};
+                }
+                return std::nullopt;
+            }
+        }
+        if (scalars != nullptr) {
+            if (const auto it = scalars->find(ref->name); it != scalars->end()) {
+                const ExprType kind = scalar_kind_from_value(it->second);
+                if (kind == ExprType::Int || kind == ExprType::Double) {
+                    return NumericOperand{
+                        .is_column = false, .column = nullptr, .scalar = it->second, .kind = kind};
+                }
+            }
+        }
+        return std::nullopt;
+    }
+    if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+        const ScalarValue scalar = scalar_from_literal(*literal);
+        const ExprType kind = scalar_kind_from_value(scalar);
+        if (kind == ExprType::Int || kind == ExprType::Double) {
+            return NumericOperand{
+                .is_column = false, .column = nullptr, .scalar = scalar, .kind = kind};
+        }
+    }
+    return std::nullopt;
+}
+
+auto numeric_binary_operands(const ir::Expr& expr, const PredicateInput& input,
+                             const ScalarRegistry* scalars)
+    -> std::optional<std::pair<NumericOperand, NumericOperand>> {
+    const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node);
+    if (binary == nullptr) {
+        return std::nullopt;
+    }
+    auto left = resolve_numeric_operand(*binary->left, input, scalars);
+    auto right = resolve_numeric_operand(*binary->right, input, scalars);
+    if (!left.has_value() || !right.has_value()) {
+        return std::nullopt;
+    }
+    return std::pair{std::move(*left), std::move(*right)};
+}
+
+auto numeric_int_value(const NumericOperand& operand) -> std::int64_t {
+    return operand.kind == ExprType::Int
+               ? std::get<std::int64_t>(operand.scalar)
+               : static_cast<std::int64_t>(std::get<double>(operand.scalar));
+}
+
+auto numeric_double_value(const NumericOperand& operand) -> double {
+    return operand.kind == ExprType::Int
+               ? static_cast<double>(std::get<std::int64_t>(operand.scalar))
+               : std::get<double>(operand.scalar);
+}
+
 auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
     -> std::optional<Chunk> {
     if (fields.size() != 1) {
@@ -145,6 +216,66 @@ auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>
     const ColumnEntry entry{.name = fields.front().alias,
                             .column = std::make_shared<ColumnValue>(std::move(values)),
                             .validity = std::move(validity)};
+    if (existing.has_value()) {
+        result.columns[*existing] = entry;
+    } else {
+        result.columns.push_back(entry);
+    }
+    result.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return result;
+}
+
+/// The shared Table/Chunk binary writer owns values only; this Chunk adapter
+/// supplies the transport-preserving result shape and the expression's merged
+/// validity.  It intentionally runs before the older representation-specific
+/// helpers below, which remain as a conservative fallback during the port.
+auto try_shared_fixed_width_numeric_binary_update(const Chunk& input,
+                                                  const std::vector<ir::FieldSpec>& fields,
+                                                  const ScalarRegistry* scalars)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() &&
+        fields.front().alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+    const auto source = predicate_input(view);
+    const auto kind = fixed_width_numeric_binary_kind(fields.front().expr, source, scalars);
+    if (!kind.has_value()) {
+        return std::nullopt;
+    }
+    ColumnValue values;
+    NumericOutputSpan output;
+    if (*kind == FixedWidthNumericKind::Int) {
+        Column<std::int64_t> ints;
+        ints.resize_for_overwrite(view.rows());
+        output.ints = ints.data();
+        values = std::move(ints);
+    } else {
+        Column<double> doubles;
+        doubles.resize_for_overwrite(view.rows());
+        output.doubles = doubles.data();
+        values = std::move(doubles);
+    }
+    if (!write_fixed_width_numeric_binary(fields.front().expr, source,
+                                          ::ibex::runtime::RowRange::whole(view.rows()), scalars,
+                                          *kind, output)) {
+        return std::nullopt;
+    }
+    Chunk result = input;
+    const auto existing = view.find_column(fields.front().alias);
+    const ColumnEntry entry{
+        .name = fields.front().alias,
+        .column = std::make_shared<ColumnValue>(std::move(values)),
+        .validity = collect_expr_validity(fields.front().expr, source,
+                                          ::ibex::runtime::RowRange::whole(view.rows()))};
     if (existing.has_value()) {
         result.columns[*existing] = entry;
     } else {
@@ -629,6 +760,156 @@ auto try_fixed_width_double_literal_update(const Chunk& input,
 
 }  // namespace
 
+auto fixed_width_numeric_binary_kind(const ir::Expr& expr, const PredicateInput& input,
+                                     const ScalarRegistry* scalars)
+    -> std::optional<FixedWidthNumericKind> {
+    const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node);
+    const auto operands = numeric_binary_operands(expr, input, scalars);
+    if (binary == nullptr || !operands.has_value()) {
+        return std::nullopt;
+    }
+    return binary->op == ir::ArithmeticOp::Div || operands->first.kind == ExprType::Double ||
+                   operands->second.kind == ExprType::Double
+               ? FixedWidthNumericKind::Double
+               : FixedWidthNumericKind::Int;
+}
+
+auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput& input,
+                                      ::ibex::runtime::RowRange range,
+                                      const ScalarRegistry* scalars,
+                                      FixedWidthNumericKind output_kind, NumericOutputSpan output)
+    -> bool {
+    const auto* binary = std::get_if<ir::BinaryExpr>(&expr.node);
+    const auto operands = numeric_binary_operands(expr, input, scalars);
+    if (binary == nullptr || !operands.has_value() ||
+        fixed_width_numeric_binary_kind(expr, input, scalars) != output_kind) {
+        return false;
+    }
+    const auto& left = operands->first;
+    const auto& right = operands->second;
+    const std::size_t rows = range.count;
+    const std::size_t begin = range.begin;
+    if (output_kind == FixedWidthNumericKind::Double && output.doubles != nullptr) {
+        const double* lp = left.is_column && left.kind == ExprType::Double
+                               ? std::get<Column<double>>(*left.column).data() + begin
+                               : nullptr;
+        const double* rp = right.is_column && right.kind == ExprType::Double
+                               ? std::get<Column<double>>(*right.column).data() + begin
+                               : nullptr;
+        auto write = [&](auto op) {
+            if (lp != nullptr && rp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.doubles[i] = op(lp[i], rp[i]);
+            } else if (lp != nullptr) {
+                const double scalar = numeric_double_value(right);
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.doubles[i] = op(lp[i], scalar);
+            } else if (rp != nullptr) {
+                const double scalar = numeric_double_value(left);
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.doubles[i] = op(scalar, rp[i]);
+            } else {
+                const double lhs = numeric_double_value(left);
+                const double rhs = numeric_double_value(right);
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.doubles[i] = op(lhs, rhs);
+            }
+        };
+        if ((!left.is_column || lp != nullptr) && (!right.is_column || rp != nullptr)) {
+            switch (binary->op) {
+                case ir::ArithmeticOp::Add:
+                    write([](double a, double b) { return a + b; });
+                    break;
+                case ir::ArithmeticOp::Sub:
+                    write([](double a, double b) { return a - b; });
+                    break;
+                case ir::ArithmeticOp::Mul:
+                    write([](double a, double b) { return a * b; });
+                    break;
+                case ir::ArithmeticOp::Div:
+                    write([](double a, double b) { return a / b; });
+                    break;
+                case ir::ArithmeticOp::Mod:
+                    write([](double a, double b) { return std::fmod(a, b); });
+                    break;
+            }
+            return true;
+        }
+        const auto read = [](const NumericOperand& operand, std::size_t row) {
+            if (!operand.is_column)
+                return numeric_double_value(operand);
+            if (operand.kind == ExprType::Int) {
+                return static_cast<double>(std::get<Column<std::int64_t>>(*operand.column)[row]);
+            }
+            return std::get<Column<double>>(*operand.column)[row];
+        };
+        for (std::size_t i = 0; i < rows; ++i) {
+            const double lhs = read(left, begin + i);
+            const double rhs = read(right, begin + i);
+            switch (binary->op) {
+                case ir::ArithmeticOp::Add:
+                    output.doubles[i] = lhs + rhs;
+                    break;
+                case ir::ArithmeticOp::Sub:
+                    output.doubles[i] = lhs - rhs;
+                    break;
+                case ir::ArithmeticOp::Mul:
+                    output.doubles[i] = lhs * rhs;
+                    break;
+                case ir::ArithmeticOp::Div:
+                    output.doubles[i] = lhs / rhs;
+                    break;
+                case ir::ArithmeticOp::Mod:
+                    output.doubles[i] = std::fmod(lhs, rhs);
+                    break;
+            }
+        }
+        return true;
+    }
+    if (output_kind == FixedWidthNumericKind::Int && output.ints != nullptr) {
+        const std::int64_t* lp =
+            left.is_column ? std::get<Column<std::int64_t>>(*left.column).data() + begin : nullptr;
+        const std::int64_t* rp = right.is_column
+                                     ? std::get<Column<std::int64_t>>(*right.column).data() + begin
+                                     : nullptr;
+        const std::int64_t ls = left.is_column ? 0 : numeric_int_value(left);
+        const std::int64_t rs = right.is_column ? 0 : numeric_int_value(right);
+        auto write = [&](auto op) {
+            if (lp != nullptr && rp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.ints[i] = op(lp[i], rp[i]);
+            } else if (lp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.ints[i] = op(lp[i], rs);
+            } else if (rp != nullptr) {
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.ints[i] = op(ls, rp[i]);
+            } else {
+                for (std::size_t i = 0; i < rows; ++i)
+                    output.ints[i] = op(ls, rs);
+            }
+        };
+        switch (binary->op) {
+            case ir::ArithmeticOp::Add:
+                write([](std::int64_t a, std::int64_t b) { return a + b; });
+                break;
+            case ir::ArithmeticOp::Sub:
+                write([](std::int64_t a, std::int64_t b) { return a - b; });
+                break;
+            case ir::ArithmeticOp::Mul:
+                write([](std::int64_t a, std::int64_t b) { return a * b; });
+                break;
+            case ir::ArithmeticOp::Div:
+                return false;
+            case ir::ArithmeticOp::Mod:
+                write([](std::int64_t a, std::int64_t b) { return safe_imod(a, b); });
+                break;
+        }
+        return true;
+    }
+    return false;
+}
+
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
                             const ScalarRegistry* scalars, const ExternRegistry* externs,
                             const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
@@ -640,6 +921,10 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             return std::move(*output);
         }
         if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
+            return std::move(*output);
+        }
+        if (auto output = try_shared_fixed_width_numeric_binary_update(input, fields, scalars);
+            output.has_value()) {
             return std::move(*output);
         }
         if (auto output = try_fixed_width_int_binary_update(input, fields); output.has_value()) {

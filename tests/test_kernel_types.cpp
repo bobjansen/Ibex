@@ -123,6 +123,34 @@ TEST_CASE("Row-local update kernel preserves chunk identity", "[kernel][update]"
     REQUIRE(updated->columns[1].column == input_column);
 }
 
+TEST_CASE("Row-local update shares the fixed-width numeric writer with scalar bindings",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{10, 20, 30},
+                     runtime::ValidityBitmap{true, false, true});
+    runtime::ScalarRegistry scalars;
+    scalars.emplace("delta", std::int64_t{7});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "adjusted",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Add,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right = ir::make_expr_ptr(
+                     ir::Expr{.node = ir::ColumnRef{.name = "delta", .lexical = true}})}}}};
+    const runtime::ExecutionContext exec{};
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, &scalars, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& adjusted = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    REQUIRE(adjusted[0] == 17);
+    REQUIRE(adjusted[1] == 27);
+    REQUIRE(adjusted[2] == 37);
+    REQUIRE(updated->columns[1].validity.has_value());
+    REQUIRE_FALSE((*updated->columns[1].validity)[1]);
+}
+
 TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20, 30});

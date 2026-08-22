@@ -78,7 +78,6 @@ auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir:
     const auto left_position = view.find_column(left->name);
     const auto right_position = view.find_column(right->name);
     if (!left_position.has_value() || !right_position.has_value() ||
-        view.validity(*left_position).has_value() || view.validity(*right_position).has_value() ||
         !std::holds_alternative<Column<std::int64_t>>(view.column(*left_position)) ||
         !std::holds_alternative<Column<std::int64_t>>(view.column(*right_position))) {
         return std::nullopt;
@@ -107,11 +106,25 @@ auto try_fixed_width_int_binary_update(const Chunk& input, const std::vector<ir:
             return std::nullopt;
     }
 
+    std::optional<ValidityBitmap> validity;
+    if (view.validity(*left_position).has_value() || view.validity(*right_position).has_value()) {
+        ValidityBitmap bits(view.rows(), true);
+        bool any_invalid = false;
+        for (std::size_t row = 0; row < view.rows(); ++row) {
+            const bool valid = lhs.is_valid(row) && rhs.is_valid(row);
+            bits.set(row, valid);
+            any_invalid = any_invalid || !valid;
+        }
+        if (any_invalid) {
+            validity = std::move(bits);
+        }
+    }
+
     Chunk result = input;
     const auto existing = view.find_column(fields.front().alias);
     const ColumnEntry entry{.name = fields.front().alias,
                             .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = std::nullopt};
+                            .validity = std::move(validity)};
     if (existing.has_value()) {
         result.columns[*existing] = entry;
     } else {

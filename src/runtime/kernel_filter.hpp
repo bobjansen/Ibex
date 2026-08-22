@@ -21,5 +21,18 @@ namespace ibex::runtime::kernel {
                                         const std::vector<ir::ColumnRef>& columns,
                                         const ScalarRegistry* scalars)
     -> std::expected<Chunk, std::string>;
+[[nodiscard]] auto filter_limit_chunk(Chunk input, const ir::Expr& predicate, std::size_t row_limit,
+                                      const ScalarRegistry* scalars)
+    -> std::expected<Chunk, std::string>;
+[[nodiscard]] auto project_chunk(Chunk input, const std::vector<ir::ColumnRef>& columns)
+    -> std::expected<Chunk, std::string>;
+[[nodiscard]] auto filter_update_project_chunk(Chunk input, const ir::Expr& predicate,
+                                               const std::vector<ir::FieldSpec>& fields,
+                                               const std::vector<ir::ColumnRef>& project_columns,
+                                               const std::vector<ir::ColumnRef>& gather_columns,
+                                               const ScalarRegistry* scalars,
+                                               const ExternRegistry* externs,
+                                               const ExecutionContext& exec)
+    -> std::expected<Chunk, std::string>;
 
 }  // namespace ibex::runtime::kernel

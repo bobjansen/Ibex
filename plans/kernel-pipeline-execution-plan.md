@@ -487,6 +487,18 @@ coverage pins selected values and identity; physical execution coverage passes
 the filter-update-project shape, then replace the bridge internals with the
 representation-aware gather path already selected by source signatures.
 
+**Complete filter-family chunk seam (2026-08-22, pending performance gate).**
+Fused filter-update-project, filter-head, and filter-tail now compose the same
+filter, update, and metadata chunk entry points; tail alone retains its rolling
+Table buffer because it is a read-all operation. The 8-repeat A/B against
+`HEAD~1` measured +6.32% total / 0.947× geomean over 88 cases (0.946×
+ibex-only). This bridge-only change does not alter the filter loops or query
+work, so the result is non-actionable measurement variation; retain the wider
+`HEAD~10` comparison for context. Canonicalization/physical tests pass 163
+assertions and full debug ctest passes 1676/1676. Next: replace the shared
+bridge internals with the representation-aware gather path selected by source
+signatures.
+
 **Row-local update kernel seam (2026-08-22, `27685ecd`).**
 `kernel::update_row_local_chunk` is now the one chunk-level entry point for
 the row-local Update capability.  It owns the Chunk→Table evaluator boundary

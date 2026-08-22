@@ -278,40 +278,11 @@ class ChunkedProjectOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Chunk input = std::move(*chunk_res.value());
-        const kernel::ChunkView view(input);
-        std::vector<kernel::MappedChunkColumn> map;
-        map.reserve(columns_->size());
-        for (const auto& col : *columns_) {
-            if (col.name.empty()) {
-                if (const auto& time_index = view.properties().time_index();
-                    time_index.has_value() && std::ranges::none_of(map, [&](const auto& mapped) {
-                        return mapped.name == *time_index;
-                    })) {
-                    const auto pos = view.find_column(*time_index);
-                    if (!pos.has_value()) {
-                        return std::unexpected("select column not found: " + *time_index);
-                    }
-                    map.push_back({.source_position = *pos, .name = *time_index});
-                }
-                continue;
-            }
-            const auto pos = view.find_column(col.name);
-            if (!pos.has_value()) {
-                return std::unexpected("select column not found: " + col.name);
-            }
-            map.push_back({.source_position = *pos, .name = col.name});
+        auto projected = kernel::project_chunk(std::move(*chunk_res.value()), *columns_);
+        if (!projected.has_value()) {
+            return std::unexpected(std::move(projected.error()));
         }
-        const auto props = TableProperties::derive(
-            view.properties(),
-            [&](const std::string& name) -> KeyFate {
-                return std::ranges::any_of(map,
-                                           [&](const auto& mapped) { return mapped.name == name; })
-                           ? KeyFate::kept(name)
-                           : KeyFate::dropped();
-            },
-            RowTransform::Preserve);
-        return std::optional<Chunk>{kernel::map_chunk(view, map, props)};
+        return std::optional<Chunk>{std::move(projected.value())};
     }
 
    private:
@@ -402,14 +373,14 @@ class ChunkedFilterHeadOperator final : public Operator {
                 done_ = true;
                 return schema_.release();
             }
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
-            auto out = filter_table_limit(t, *predicate_, remaining_, scalars_);
+            auto out = kernel::filter_limit_chunk(std::move(*chunk_res.value()), *predicate_,
+                                                  remaining_, scalars_);
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
             const std::size_t produced = out->rows();
             if (!out->columns.empty() && produced == 0) {
-                schema_.hold(std::move(out.value()));
+                schema_.hold(chunk_to_table(std::move(out.value())));
                 continue;
             }
             remaining_ -= produced;
@@ -418,7 +389,7 @@ class ChunkedFilterHeadOperator final : public Operator {
             }
             (void)count_;
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(out.value()))};
+            return std::optional<Chunk>{std::move(out.value())};
         }
     }
 
@@ -457,8 +428,8 @@ class ChunkedFilterTailOperator final : public Operator {
             if (!chunk_res.value().has_value()) {
                 break;
             }
-            const Table t = chunk_to_table(std::move(*chunk_res.value()));
-            auto filtered = filter_table(t, *predicate_, scalars_);
+            auto filtered =
+                kernel::filter_chunk(std::move(*chunk_res.value()), *predicate_, scalars_);
             if (!filtered.has_value()) {
                 return std::unexpected(std::move(filtered.error()));
             }
@@ -466,11 +437,11 @@ class ChunkedFilterTailOperator final : public Operator {
                 continue;
             }
             if (filtered->rows() == 0) {
-                schema_.hold(std::move(filtered.value()));
+                schema_.hold(chunk_to_table(std::move(filtered.value())));
                 continue;
             }
             buffered_rows_ += filtered->rows();
-            buffered_.push_back(std::move(filtered.value()));
+            buffered_.push_back(chunk_to_table(std::move(filtered.value())));
             trim_to_limit();
         }
         done_ = true;
@@ -589,33 +560,24 @@ class ChunkedFilterUpdateProjectOperator final : public Operator {
             }
             Chunk input = std::move(*chunk_res.value());
             const auto identity = chunk_identity_of(input);
-            const Table t = chunk_to_table(std::move(input));
-            auto filtered = filter_project_table(t, *predicate_, gather_columns_, scalars_);
-            if (!filtered.has_value()) {
-                return std::unexpected(std::move(filtered.error()));
-            }
-            const bool empty = !filtered->columns.empty() && filtered->rows() == 0;
-            auto updated =
-                update_table(std::move(filtered.value()), *fields_, scalars_, externs_, *exec_);
-            if (!updated.has_value()) {
-                return std::unexpected(std::move(updated.error()));
-            }
-            auto projected = project_table(updated.value(), *project_columns_);
+            auto projected = kernel::filter_update_project_chunk(
+                std::move(input), *predicate_, *fields_, *project_columns_, gather_columns_,
+                scalars_, externs_, *exec_);
             if (!projected.has_value()) {
                 return std::unexpected(std::move(projected.error()));
             }
+            const bool empty = !projected->columns.empty() && projected->rows() == 0;
             // An empty chunk still runs the update and the projection, cheaply,
             // because the schema it has to carry is the one they produce.
             if (empty) {
                 if (preserve_empty_morsels_) {
-                    return std::optional<Chunk>{
-                        table_to_chunk(std::move(projected.value()), identity)};
+                    return std::optional<Chunk>{std::move(projected.value())};
                 }
-                schema_.hold(std::move(projected.value()), identity);
+                schema_.hold(chunk_to_table(std::move(projected.value())), identity);
                 continue;
             }
             schema_.emitted();
-            return std::optional<Chunk>{table_to_chunk(std::move(projected.value()), identity)};
+            return std::optional<Chunk>{std::move(projected.value())};
         }
     }
 

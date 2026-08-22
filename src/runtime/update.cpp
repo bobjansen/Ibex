@@ -2789,9 +2789,9 @@ namespace {
 ///   - parallelism is off, the table is small, or the pool has one thread;
 ///   - the expression is not `is_range_native_expr` — evaluating it per range
 ///     would re-read the whole table per range (see that function);
-///   - the result is not Int64/Double. Other types are not harder in principle,
-///     but a Categorical result would need its per-piece dictionaries merged,
-///     and a wrong merge is silent. Numeric covers the case this exists for.
+///   - the result cannot be written into a fixed-width window or the supported
+///     string interpolation slab. Categorical results still need their
+///     per-piece dictionaries merged, and a wrong merge is silent.
 auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
                                    const ColumnEvalCtx& ctx, const ExecutionContext& exec)
     -> std::expected<ComputedColumn, std::string> {
@@ -2806,13 +2806,20 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     if (on_worker_pool_thread()) {
         return whole();
     }
-    if (!exec.parallel || rows < exec.parallel_min_rows || !is_range_native_expr(expr)) {
+    if (!exec.parallel || rows < exec.parallel_min_rows) {
         return whole();
     }
     auto inferred = infer_expr_type(expr, table, ctx.scalars, ctx.externs);
-    if (!inferred.has_value() ||
+    if (!inferred.has_value()) {
+        return whole();
+    }
+    const auto string_plan =
+        inferred.value() == ExprType::String
+            ? kernel::make_string_interpolation_plan(expr, PredicateInput(table), ctx.scalars)
+            : std::optional<kernel::StringInterpolationPlan>{};
+    if ((!is_range_native_expr(expr) && !string_plan.has_value()) ||
         (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double &&
-         inferred.value() != ExprType::Bool) ||
+         inferred.value() != ExprType::Bool && !string_plan.has_value()) ||
         (inferred.value() == ExprType::Bool && !kernel::supports_native_chunk_predicate(expr))) {
         return whole();
     }
@@ -2832,6 +2839,110 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
 
     if (exec.parallel_stats != nullptr) {
         exec.parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (string_plan.has_value()) {
+        // The count pass supplies both the byte prefix for each window and the
+        // dense validity each writer must honour.  Invalid rows deliberately
+        // contribute no bytes, matching the reference evaluator's empty
+        // payload and avoiding reads of their undefined source payloads.
+        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
+        std::vector<std::expected<std::uint32_t, std::string>> bytes(morsels);
+        std::atomic<std::size_t> cursor{0};
+        auto count_batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const std::size_t begin = index * grain;
+                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
+                auto validity = collect_expr_validity(expr, PredicateInput(table), range);
+                const auto count = kernel::string_interpolation_bytes(
+                    *string_plan, range, validity.has_value() ? &*validity : nullptr);
+                if (!count.has_value()) {
+                    pieces[index] = std::unexpected(
+                        "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
+                    bytes[index] = std::unexpected(
+                        "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
+                    continue;
+                }
+                pieces[index] = std::move(validity);
+                bytes[index] = *count;
+            }
+        });
+        count_batch.wait();
+        for (std::size_t index = 0; index < morsels; ++index) {
+            if (!pieces[index].has_value()) {
+                return std::unexpected(pieces[index].error());
+            }
+            if (!bytes[index].has_value()) {
+                return std::unexpected(bytes[index].error());
+            }
+        }
+
+        std::vector<std::uint32_t> char_prefix(morsels + 1, 0);
+        for (std::size_t index = 0; index < morsels; ++index) {
+            if (*bytes[index] > std::numeric_limits<std::uint32_t>::max() - char_prefix[index]) {
+                return std::unexpected(
+                    "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
+            }
+            char_prefix[index + 1] = char_prefix[index] + *bytes[index];
+        }
+        Column<std::string> strings;
+        strings.resize_for_gather(rows, char_prefix.back());
+        auto* offsets = strings.offsets_data();
+        for (std::size_t index = 0; index < morsels; ++index) {
+            offsets[index * grain] = char_prefix[index];
+        }
+        offsets[rows] = char_prefix.back();
+
+        std::atomic<bool> write_failed{false};
+        cursor.store(0, std::memory_order_relaxed);
+        auto write_batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const std::size_t begin = index * grain;
+                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
+                if (!kernel::write_string_interpolation(
+                        *string_plan, range,
+                        pieces[index]->has_value() ? &**pieces[index] : nullptr,
+                        kernel::StringOutputSpan{.offsets = offsets,
+                                                 .chars = strings.chars_data(),
+                                                 .begin = begin,
+                                                 .count = range.count,
+                                                 .char_base = char_prefix[index]})) {
+                    write_failed.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+        write_batch.wait();
+        if (write_failed.load(std::memory_order_relaxed)) {
+            return std::unexpected("evaluate_field_maybe_parallel: string window shape mismatch");
+        }
+
+        const bool any_validity =
+            std::ranges::any_of(pieces, [](const auto& piece) { return piece->has_value(); });
+        std::optional<ValidityBitmap> validity;
+        if (any_validity) {
+            ValidityBitmap merged(rows, true);
+            for (std::size_t index = 0; index < morsels; ++index) {
+                if (!pieces[index]->has_value()) {
+                    continue;
+                }
+                const std::size_t begin = index * grain;
+                const ValidityBitmap& source = **pieces[index];
+                for (std::size_t offset = 0; offset < source.size(); ++offset) {
+                    merged.set(begin + offset, source[offset]);
+                }
+            }
+            validity = std::move(merged);
+        }
+        return ComputedColumn{.column = ColumnValue{std::move(strings)},
+                              .validity = std::move(validity)};
     }
 
     // Allocate the destination up front and let each worker copy its own morsel

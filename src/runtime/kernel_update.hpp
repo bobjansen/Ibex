@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "kernel_gather.hpp"
+
 namespace ibex::runtime {
 class PredicateInput;
 struct RowRange;
@@ -29,6 +31,19 @@ struct NumericOutputSpan {
 
 enum class FixedWidthNumericKind : std::uint8_t { Int, Double };
 
+/// A resolved `__interp` expression whose leaves can be copied without
+/// formatting or allocation.  It is deliberately internal to the update
+/// kernels, but shared by chunk and table writers so their two-pass string
+/// contracts cannot drift.
+struct StringInterpolationOperand {
+    std::optional<StringView> column;
+    std::string_view literal;
+};
+
+struct StringInterpolationPlan {
+    std::vector<StringInterpolationOperand> operands;
+};
+
 /// Classify and write the simple binary numeric family shared by the ChunkView
 /// update kernel and table-level parallel field windows.  It declines anything
 /// outside column/scalar arithmetic so the caller's established evaluator
@@ -43,6 +58,21 @@ enum class FixedWidthNumericKind : std::uint8_t { Int, Double };
                                                     const ScalarRegistry* scalars,
                                                     FixedWidthNumericKind output_kind,
                                                     NumericOutputSpan output) -> bool;
+
+[[nodiscard]] auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
+                                                  const ScalarRegistry* scalars)
+    -> std::optional<StringInterpolationPlan>;
+/// Count the byte window and write it after the caller has assigned its
+/// prefix-summed `StringOutputSpan`. `validity`, when present, is dense in
+/// `range`; invalid rows remain empty and are never read.
+[[nodiscard]] auto string_interpolation_bytes(const StringInterpolationPlan& plan,
+                                              ::ibex::runtime::RowRange range,
+                                              const ValidityBitmap* validity)
+    -> std::optional<std::uint32_t>;
+[[nodiscard]] auto write_string_interpolation(const StringInterpolationPlan& plan,
+                                              ::ibex::runtime::RowRange range,
+                                              const ValidityBitmap* validity,
+                                              StringOutputSpan output) -> bool;
 
 /// Execute one row-local update over a chunk while retaining its transport
 /// identity.  The existing table-level field evaluator remains the semantic

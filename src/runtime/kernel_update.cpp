@@ -238,11 +238,6 @@ auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>
 /// segments need no per-row formatting or allocation.  Other interpolation
 /// arguments retain the reference evaluator below (notably numeric display
 /// formatting and date/time formatting).
-struct StringInterpolationOperand {
-    std::optional<StringView> column;
-    std::string_view literal;
-};
-
 auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateInput& input,
                                           const ScalarRegistry* scalars)
     -> std::optional<StringInterpolationOperand> {
@@ -278,25 +273,6 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     return std::nullopt;
 }
 
-auto string_interpolation_operands(const ir::Expr& expr, const PredicateInput& input,
-                                   const ScalarRegistry* scalars)
-    -> std::optional<std::vector<StringInterpolationOperand>> {
-    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
-    if (call == nullptr || call->callee != "__interp" || !call->named_args.empty()) {
-        return std::nullopt;
-    }
-    std::vector<StringInterpolationOperand> operands;
-    operands.reserve(call->args.size());
-    for (const auto& arg : call->args) {
-        auto operand = resolve_string_interpolation_operand(*arg, input, scalars);
-        if (!operand.has_value()) {
-            return std::nullopt;
-        }
-        operands.push_back(std::move(*operand));
-    }
-    return operands;
-}
-
 auto try_shared_string_interpolation_update(const Chunk& input,
                                             const std::vector<ir::FieldSpec>& fields,
                                             const ScalarRegistry* scalars) -> std::optional<Chunk> {
@@ -309,8 +285,8 @@ auto try_shared_string_interpolation_update(const Chunk& input,
         return std::nullopt;
     }
     const auto source = predicate_input(view);
-    auto operands = string_interpolation_operands(fields.front().expr, source, scalars);
-    if (!operands.has_value()) {
+    auto plan = make_string_interpolation_plan(fields.front().expr, source, scalars);
+    if (!plan.has_value()) {
         return std::nullopt;
     }
     auto validity = collect_expr_validity(fields.front().expr, source,
@@ -318,50 +294,24 @@ auto try_shared_string_interpolation_update(const Chunk& input,
 
     // Pass one is precisely the string gather presize contract: establish the
     // single character slab before handing its raw window to the writer.
-    std::size_t total_chars = 0;
-    for (std::size_t row = 0; row < view.rows(); ++row) {
-        if (validity.has_value() && !(*validity)[row]) {
-            continue;
-        }
-        std::size_t row_chars = 0;
-        for (const auto& operand : *operands) {
-            row_chars +=
-                operand.column.has_value() ? operand.column->row_len(row) : operand.literal.size();
-        }
-        if (row_chars > std::numeric_limits<std::uint32_t>::max() - total_chars) {
-            return std::nullopt;
-        }
-        total_chars += row_chars;
+    const auto total_chars =
+        string_interpolation_bytes(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
+                                   validity.has_value() ? &*validity : nullptr);
+    if (!total_chars.has_value()) {
+        return std::nullopt;
     }
 
     Column<std::string> values;
-    values.resize_for_gather(view.rows(), total_chars);
+    values.resize_for_gather(view.rows(), *total_chars);
     StringOutputSpan output{.offsets = values.offsets_data(),
                             .chars = values.chars_data(),
                             .begin = 0,
                             .count = view.rows(),
                             .char_base = 0};
     output.offsets[0] = 0;
-    std::uint32_t cursor = output.char_base;
-    for (std::size_t row = 0; row < output.count; ++row) {
-        if (validity.has_value() && !(*validity)[row]) {
-            output.offsets[output.begin + row + 1] = cursor;
-            continue;
-        }
-        for (const auto& operand : *operands) {
-            const char* source_chars = operand.literal.data();
-            std::size_t length = operand.literal.size();
-            if (operand.column.has_value()) {
-                const auto start = operand.column->offsets[row];
-                source_chars = operand.column->chars + start;
-                length = operand.column->row_len(row);
-            }
-            if (length != 0) {
-                std::memcpy(output.chars + cursor, source_chars, length);
-            }
-            cursor += static_cast<std::uint32_t>(length);
-        }
-        output.offsets[output.begin + row + 1] = cursor;
+    if (!write_string_interpolation(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
+                                    validity.has_value() ? &*validity : nullptr, output)) {
+        return std::nullopt;
     }
 
     Chunk result = input;
@@ -912,6 +862,78 @@ auto try_fixed_width_double_literal_update(const Chunk& input,
 }
 
 }  // namespace
+
+auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
+                                    const ScalarRegistry* scalars)
+    -> std::optional<StringInterpolationPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->callee != "__interp" || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    StringInterpolationPlan plan;
+    plan.operands.reserve(call->args.size());
+    for (const auto& arg : call->args) {
+        auto operand = resolve_string_interpolation_operand(*arg, input, scalars);
+        if (!operand.has_value()) {
+            return std::nullopt;
+        }
+        plan.operands.push_back(std::move(*operand));
+    }
+    return plan;
+}
+
+auto string_interpolation_bytes(const StringInterpolationPlan& plan,
+                                ::ibex::runtime::RowRange range, const ValidityBitmap* validity)
+    -> std::optional<std::uint32_t> {
+    std::size_t total = 0;
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        if (validity != nullptr && !(*validity)[offset]) {
+            continue;
+        }
+        const std::size_t row = range.begin + offset;
+        std::size_t row_bytes = 0;
+        for (const auto& operand : plan.operands) {
+            row_bytes +=
+                operand.column.has_value() ? operand.column->row_len(row) : operand.literal.size();
+        }
+        if (row_bytes > std::numeric_limits<std::uint32_t>::max() - total) {
+            return std::nullopt;
+        }
+        total += row_bytes;
+    }
+    return static_cast<std::uint32_t>(total);
+}
+
+auto write_string_interpolation(const StringInterpolationPlan& plan,
+                                ::ibex::runtime::RowRange range, const ValidityBitmap* validity,
+                                StringOutputSpan output) -> bool {
+    if (range.count != output.count) {
+        return false;
+    }
+    std::uint32_t cursor = output.char_base;
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        if (validity != nullptr && !(*validity)[offset]) {
+            output.offsets[output.begin + offset + 1] = cursor;
+            continue;
+        }
+        const std::size_t row = range.begin + offset;
+        for (const auto& operand : plan.operands) {
+            const char* source_chars = operand.literal.data();
+            std::size_t length = operand.literal.size();
+            if (operand.column.has_value()) {
+                const auto start = operand.column->offsets[row];
+                source_chars = operand.column->chars + start;
+                length = operand.column->row_len(row);
+            }
+            if (length != 0) {
+                std::memcpy(output.chars + cursor, source_chars, length);
+            }
+            cursor += static_cast<std::uint32_t>(length);
+        }
+        output.offsets[output.begin + offset + 1] = cursor;
+    }
+    return true;
+}
 
 auto fixed_width_numeric_binary_kind(const ir::Expr& expr, const PredicateInput& input,
                                      const ScalarRegistry* scalars)

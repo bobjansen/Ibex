@@ -5,6 +5,7 @@
 
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -32,6 +33,22 @@ enum class MapKernelCapability : std::uint8_t {
     RowLocalUpdate,
     FilterProjectGather,
     FilterUpdateProjectGather,
+};
+
+/// The construction function selected for one physical map step.  The
+/// physical planner stores this pointer after proving the node's capability,
+/// so its executor need not redispatch on the capability for every step.
+using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(const ir::Node&, OperatorPtr,
+                                                                     const ScalarRegistry*,
+                                                                     const ExternRegistry*,
+                                                                     const ExecutionContext&,
+                                                                     bool preserve_empty_morsels);
+
+struct MapKernelDispatch {
+    MapKernelCapability capability = MapKernelCapability::FilterGather;
+    MapKernelFactory factory = nullptr;
+
+    friend auto operator==(const MapKernelDispatch&, const MapKernelDispatch&) -> bool = default;
 };
 
 /// Storage shape selected once when a physical map pipeline is constructed.
@@ -64,6 +81,10 @@ struct ColumnKernelSignature {
 /// only conditional member; guarded/grouped/tuple/non-row-local forms decline.
 [[nodiscard]] auto map_kernel_capability(const ir::Node& node) noexcept
     -> std::optional<MapKernelCapability>;
+
+/// Return the static factory for a proven capability, or null when a caller
+/// passes a value outside the closed vocabulary.
+[[nodiscard]] auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory;
 
 /// Classify a node kind's execution capability — the *most* a node of this kind
 /// may be. Expression-level constraints are checked by

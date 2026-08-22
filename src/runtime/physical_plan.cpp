@@ -118,7 +118,16 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             return plan;
         }
         plan.steps.push_back(cur);
-        plan.kernel_capabilities.push_back(*map_kernel_capability(*cur));
+        const MapKernelCapability capability = *map_kernel_capability(*cur);
+        const MapKernelFactory factory = map_kernel_factory(capability);
+        if (factory == nullptr) {
+            // Keep a malformed internal dispatch table on the established
+            // executor instead of constructing an invalid physical plan.
+            plan.steps.clear();
+            plan.reason = FallbackReason::NonSourceInput;
+            return plan;
+        }
+        plan.kernel_dispatch.push_back({.capability = capability, .factory = factory});
         cur = children.front().get();
     }
 

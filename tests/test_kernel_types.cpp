@@ -209,6 +209,31 @@ TEST_CASE("Row-local interpolation reads categorical dictionary codes", "[kernel
     CHECK_FALSE((*updated->columns[1].validity)[1]);
 }
 
+TEST_CASE("Row-local interpolation formats date and timestamp columns", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("day", Column<Date>{Date{0}, Date{1}}, runtime::ValidityBitmap{true, false});
+    chunk.add_column("time", Column<Timestamp>{Timestamp{0}, Timestamp{1'000'000'000}});
+    ir::CallExpr interpolation{.callee = "__interp", .args = {}, .named_args = {}};
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"d="}}}));
+    interpolation.args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "day"}}));
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{" t="}}}));
+    interpolation.args.push_back(
+        ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "time"}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "label", .expr = ir::Expr{.node = std::move(interpolation)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& label = std::get<Column<std::string>>(*updated->columns[2].column);
+    CHECK(label[0] == "d=1970-01-01 t=1970-01-01 00:00:00.000000000");
+    CHECK(label[1].empty());
+    REQUIRE(updated->columns[2].validity.has_value());
+    CHECK_FALSE((*updated->columns[2].validity)[1]);
+}
+
 TEST_CASE("Filter chunk kernel preserves morsel identity", "[kernel][filter]") {
     runtime::Chunk chunk;
     chunk.add_column("price", Column<std::int64_t>{10, 20, 30});

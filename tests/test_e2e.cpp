@@ -2115,6 +2115,34 @@ TEST_CASE("E2E: categorical interpolation writes parallel string windows", "[e2e
     }
 }
 
+TEST_CASE("E2E: temporal interpolation writes parallel string windows", "[e2e][parallel]") {
+    constexpr std::size_t kRows = 1000;
+    Column<Date> days;
+    Column<Timestamp> times;
+    runtime::ValidityBitmap day_validity;
+    days.reserve(kRows);
+    times.reserve(kRows);
+    day_validity.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        days.push_back(Date{static_cast<std::int32_t>(row) - 500});
+        times.push_back(Timestamp{static_cast<std::int64_t>(row) * 1'000'000'000});
+        day_validity.push_back(row % 13 != 4);
+    }
+    runtime::Table table;
+    table.add_column("day", std::move(days), std::move(day_validity));
+    table.add_column("time", std::move(times));
+    runtime::TableRegistry tables;
+    tables.emplace("t", std::move(table));
+
+    const auto* source = "t[update { label = `d=${day} t=${time}` }];";
+    const auto serial = run(source, tables);
+    for (const std::size_t threads : {2U, 8U}) {
+        runtime::ParallelIslandStats stats;
+        require_tables_equal(serial, run_parallel(source, tables, 7, threads, &stats));
+        CHECK(stats.parallel_fields.load() > 0);
+    }
+}
+
 TEST_CASE("E2E: parallel island leaves a non-row-local update serial", "[e2e][parallel]") {
     auto tables = make_wide_island_table(1000);
     // Each of these would be silently wrong per morsel: the transform reads

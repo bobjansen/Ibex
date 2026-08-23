@@ -131,7 +131,7 @@ Two things to know when reading it:
 uv run --project . python benchmarking/tpch/bench_ibex.py --iters 5
 uv run --project . python benchmarking/tpch/check_answers.py    # NO arguments
 
-# 2. A/B two git states, builds both in temp worktrees
+# 2. A/B two git states (persistent build cache, incremental rebuilds)
 ./benchmarking/compare_ibex_git.sh --base HEAD --target WORKTREE \
     --interleave --repeats 15 --taskset 2
 
@@ -149,7 +149,11 @@ runs them for real, so the two are not symmetric.
 measures uncommitted changes with no arguments. Always pass `--interleave` on
 this box: serial blocks drift. `--replica-control` builds the base twice and
 runs it as a third side, which is how you tell a real regression from layout
-noise.
+noise. Each side's worktree and Release build dir are cached under
+`~/.cache/ibex/perfcmp` (`IBEX_PERFCMP_CACHE` to relocate): cmake configures
+once per side and later runs are incremental ninja builds with ccache hits on
+unchanged files. Delete the cache dir — or pass `--no-cache` — when a
+from-scratch build is required.
 
 The competitor harnesses need the project's **uv** environment, not system
 python or conda (those lack polars/pandas and fail in a way that looks like

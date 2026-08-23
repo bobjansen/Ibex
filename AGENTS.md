@@ -35,7 +35,7 @@ Language spec: `SPEC.md`. Uses `data.table`-inspired bracket syntax with named c
 
 ## Benchmarking Notes
 - **[Read MEASURING.md](MEASURING.md) before perf work** — covers: IBEX_PROFILE_OPERATORS, two-dimensional sweeps, mutation testing, byte-identity checks, A/B with Wilcoxon, post-commit hook waits
-- **Hot paths:** always measure before/after with `benchmarking/compare_ibex_git.sh`. Don't infer perf from output
+- **Hot paths:** always measure before/after with `benchmarking/compare_ibex_git.sh` (builds cached per side under `~/.cache/ibex/perfcmp`: configure once, incremental ninja after; `--no-cache` for throwaway builds). Don't infer perf from output
 - **Polars comparison:** use both `POLARS_MAX_THREADS=1` (apples-to-apples) and default (headroom). Keep README baseline in sync
 - **Mutating benches:** prepare copies outside timed section. Built-ins minimal; prefer `extern fn`
 - **String columns:** auto-detect categorical encoding. Run user-requested bench commands directly, report failures plainly

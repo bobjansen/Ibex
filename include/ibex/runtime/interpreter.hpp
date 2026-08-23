@@ -551,6 +551,13 @@ struct ParallelIslandStats {
     /// gate that quietly stopped matching (a smaller probe chunk, a budget
     /// change) would cost the parallelism with every test still green.
     std::atomic<std::uint64_t> parallel_probes{0};
+    /// Aggregates lifted out of a grouped update field's expression into a
+    /// broadcast staging column, letting the rest of the field run as an
+    /// ordinary row-local update. Counted because the alternative is silent:
+    /// a shape this gate stops matching (a new aggregate name, an argument
+    /// type outside the fixed-width contract) still answers correctly, on the
+    /// per-group gather-and-rebuild evaluator, at many times the cost.
+    std::atomic<std::uint64_t> grouped_lifted_aggregates{0};
 };
 
 struct ExecutionContext {

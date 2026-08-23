@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
@@ -1187,4 +1188,124 @@ TEST_CASE("String gather kernel: offset window continues a prior run", "[kernel]
                                                 .char_base = 4});
     REQUIRE(offsets[2] == 7);
     REQUIRE(std::string(chars.begin() + 4, chars.begin() + 7) == "zzz");
+}
+
+// A parallel row-local update used to reach its kernels only by converting the
+// chunk to a Table so `update_table` could split the field. The chunk kernel
+// now owns that split: the field is planned once and its ranges write disjoint
+// windows, with no bridge in between. `chunk_direct_updates` observes the seam
+// itself, since the bridge answers identically — just via a Table.
+TEST_CASE("Parallel row-local update splits inside the chunk kernel",
+          "[kernel][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<double> price;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<double>(r));
+    }
+    runtime::Chunk chunk;
+    chunk.add_column("price", std::move(price));
+    chunk.sequence = 7;
+    chunk.row_offset = 512;
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "doubled",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mul,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.0}})}}}};
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_grain = 4'096;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->sequence == 7);
+    REQUIRE(updated->row_offset == 512);
+    REQUIRE(updated->columns.size() == 2);
+    const auto& doubled = std::get<Column<double>>(*updated->columns[1].column);
+    REQUIRE(doubled.size() == kRows);
+    // Spot-check the first row of several windows, which is where a mis-sized
+    // window would land its first wrong value.
+    CHECK(doubled[0] == 0.0);
+    CHECK(doubled[4'096] == 8'192.0);
+    CHECK(doubled[20'001] == 40'002.0);
+    CHECK(doubled[kRows - 1] == static_cast<double>(2 * (kRows - 1)));
+    CHECK(stats.chunk_direct_updates.load() == 1);
+    // The kernel did split it, and reported the split under the same counters
+    // the table evaluator used when it owned this loop.
+    CHECK(stats.parallel_fields.load() == 1);
+    CHECK(stats.parallel_direct_numeric_fields.load() == 1);
+}
+
+// The same field below the size gates: the split is declined, and the chunk is
+// still written directly rather than handed to the table evaluator.
+TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][parallel]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<double>{1.0, 2.0, 3.0});
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "doubled",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mul,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.0}})}}}};
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& doubled = std::get<Column<double>>(*updated->columns[1].column);
+    CHECK(std::vector<double>(doubled.begin(), doubled.end()) ==
+          std::vector<double>{2.0, 4.0, 6.0});
+    CHECK(stats.chunk_direct_updates.load() == 1);
+    CHECK(stats.parallel_fields.load() == 0);
+}
+
+// An expression the direct route does not name keeps the bridge, deliberately:
+// the table evaluator can still split it through its own range writer, and
+// declining is how such a field keeps its parallelism rather than how it loses
+// it. `sqrt` is one — the compiled numeric tree owns it, and that tree has no
+// range-writing form on this side of the seam yet.
+TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<double> price;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<double>(r));
+    }
+    runtime::Chunk chunk;
+    chunk.add_column("price", std::move(price));
+    std::vector<ir::ExprPtr> args;
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "root",
+         .expr = ir::Expr{
+             .node = ir::CallExpr{.callee = "sqrt", .args = std::move(args), .named_args = {}}}}};
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_grain = 4'096;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& root = std::get<Column<double>>(*updated->columns[1].column);
+    CHECK(root[9] == Catch::Approx(3.0));
+    CHECK(stats.chunk_direct_updates.load() == 0);
 }

@@ -10210,12 +10210,13 @@ auto process_island_stats() -> ParallelIslandStats* {
                 "island stats: parallel={} serial={} morsels={} "
                 "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
                 "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
-                "grouped_lifted_group_state={}\n",
+                "grouped_lifted_group_state={} chunk_direct_updates={}\n",
                 stats.parallel_islands.load(), stats.serial_islands.load(), stats.morsels.load(),
                 stats.pipelined_scans.load(), stats.pipelined_stages.load(),
                 stats.range_heads.load(), stats.two_phase_filters.load(),
                 stats.parallel_fields.load(), stats.parallel_direct_numeric_fields.load(),
-                stats.parallel_probes.load(), stats.grouped_lifted_group_state.load());
+                stats.parallel_probes.load(), stats.grouped_lifted_group_state.load(),
+                stats.chunk_direct_updates.load());
         }
     };
     static const Reporter reporter;

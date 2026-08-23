@@ -1512,12 +1512,16 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           if (a.size() < 2) {
                               return std::unexpected("coalesce: expected at least 2 arguments");
                           }
+                          const bool categorical = std::ranges::any_of(
+                              a, [](ExprType type) { return type == ExprType::Categorical; });
                           for (const auto& t : a) {
-                              if (t != a[0]) {
+                              if (t != a[0] &&
+                                  !((t == ExprType::String && categorical) ||
+                                    (t == ExprType::Categorical && a[0] == ExprType::String))) {
                                   return std::unexpected("coalesce: arguments must share one type");
                               }
                           }
-                          return a[0];
+                          return categorical ? ExprType::Categorical : a[0];
                       },
                       .exec = ScalarExec{.eval = [](std::string_view,
                                                     const std::vector<ExprValue>& a) -> IV {
@@ -1793,7 +1797,8 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
         if (!right) {
             return right;
         }
-        if (left.value() == ExprType::String || right.value() == ExprType::String) {
+        if (left.value() == ExprType::String || right.value() == ExprType::String ||
+            left.value() == ExprType::Categorical || right.value() == ExprType::Categorical) {
             return std::unexpected("string arithmetic not supported");
         }
         if (left.value() == ExprType::Date || right.value() == ExprType::Date ||
@@ -1836,6 +1841,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 }
             }
             std::optional<ExprType> result;
+            bool categorical_result = false;
             for (std::size_t i = 1; i < call->args.size(); i += 2) {
                 const auto* null_arm = std::get_if<ir::CallExpr>(&call->args[i]->node);
                 if (null_arm != nullptr && null_arm->callee == "__null") {
@@ -1845,11 +1851,14 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 if (!type) {
                     return type;
                 }
+                categorical_result = categorical_result || *type == ExprType::Categorical;
                 if (!result.has_value()) {
                     result = *type;
                 } else if (*result == ExprType::Int && *type == ExprType::Double) {
                     result = ExprType::Double;
                 } else if (!(*result == ExprType::Double && *type == ExprType::Int) &&
+                           !((*result == ExprType::Categorical && *type == ExprType::String) ||
+                             (*result == ExprType::String && *type == ExprType::Categorical)) &&
                            *result != *type) {
                     return std::unexpected(
                         "case: all value arms must have the same type (or Int/Float)");
@@ -1858,7 +1867,7 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             if (!result.has_value()) {
                 return std::unexpected("case: at least one arm must provide a non-NULL value");
             }
-            return *result;
+            return categorical_result ? ExprType::Categorical : *result;
         }
         // Pure row-wise scalar builtins: single source of truth (see
         // builtins()). Both this pass and eval_expr dispatch here.
@@ -1875,7 +1884,12 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                 if (!t) {
                     return t;
                 }
-                arg_types.push_back(*t);
+                // Categorical is a physical String representation. Only
+                // CASE/coalesce preserve it; every other builtin keeps its
+                // established String-facing signature (length, like, etc.).
+                arg_types.push_back(call->callee == "coalesce" || *t != ExprType::Categorical
+                                        ? *t
+                                        : ExprType::String);
             }
             return fn.infer(call->callee, arg_types);
         }
@@ -2322,6 +2336,9 @@ auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
             break;
         case ExprType::String:
             new_column = Column<std::string>{};
+            break;
+        case ExprType::Categorical:
+            new_column = Column<Categorical>{};
             break;
         case ExprType::Date:
             new_column = Column<Date>{};

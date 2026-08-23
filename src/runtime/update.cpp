@@ -361,8 +361,11 @@ auto try_write_fast_update_binary(const ir::Expr& expr, const Table& input, RowR
                                   std::int64_t* dst_int, double* dst_double) -> bool {
     const auto kind = output_kind == ExprType::Int ? kernel::FixedWidthNumericKind::Int
                                                    : kernel::FixedWidthNumericKind::Double;
-    if (kernel::write_fixed_width_numeric_binary(expr, PredicateInput(input), range, scalars, kind,
-                                                 {.ints = dst_int, .doubles = dst_double})) {
+    const PredicateInput predicate_input(input);
+    const auto direct = kernel::try_plan_direct_numeric_field(expr, predicate_input, scalars);
+    if (direct.has_value() && direct->numeric_kind == kind &&
+        kernel::write_direct_field_range(*direct, predicate_input, range, scalars,
+                                         {.numeric = {.ints = dst_int, .doubles = dst_double}})) {
         return true;
     }
     const auto* bin = std::get_if<ir::BinaryExpr>(&expr.node);
@@ -2921,6 +2924,25 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     -> std::expected<ComputedColumn, std::string> {
     const std::size_t rows = table.rows();
     const auto whole = [&] { return evaluate_field(expr, table, RowRange::whole(rows), ctx); };
+    const PredicateInput direct_input(table);
+    const auto direct_categorical_plan =
+        kernel::try_plan_direct_categorical_field(expr, direct_input, ctx.scalars);
+    const auto whole_categorical = [&]() -> std::expected<ComputedColumn, std::string> {
+        if (!direct_categorical_plan.has_value()) {
+            return whole();
+        }
+        std::vector<Column<Categorical>::code_type> codes(rows, 0);
+        auto validity = kernel::write_direct_categorical_field_range(
+            *direct_categorical_plan, direct_input, RowRange::whole(rows), ctx.scalars,
+            {.codes = codes.data(), .begin = 0, .count = rows});
+        if (!validity.has_value()) {
+            return std::unexpected(std::move(validity.error()));
+        }
+        Column<Categorical> categorical(direct_categorical_plan->dictionary,
+                                        direct_categorical_plan->index, std::move(codes));
+        return ComputedColumn{.column = ColumnValue{std::move(categorical)},
+                              .validity = std::move(*validity)};
+    };
 
     // Reentrancy: the island's fused FilterUpdateProject operator calls
     // update_table from a worker thread, so this can be reached on one.
@@ -2928,10 +2950,10 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     // rather than let it happen), and the morsel is already one worker's share
     // of the table — splitting it again would only oversubscribe.
     if (on_worker_pool_thread()) {
-        return whole();
+        return whole_categorical();
     }
     if (!exec.parallel || rows < exec.parallel_min_rows) {
-        return whole();
+        return whole_categorical();
     }
     auto inferred = infer_expr_type(expr, table, ctx.scalars, ctx.externs);
     if (!inferred.has_value()) {
@@ -2941,10 +2963,19 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
         inferred.value() == ExprType::String
             ? kernel::make_string_interpolation_plan(expr, PredicateInput(table), ctx.scalars)
             : std::optional<kernel::StringInterpolationPlan>{};
-    if ((!is_range_native_expr(expr) && !string_plan.has_value()) ||
+    const auto direct_fixed_width_plan =
+        kernel::try_plan_direct_fixed_width_field(expr, direct_input, ctx.scalars);
+    const auto direct_predicate_plan = kernel::try_plan_direct_predicate_field(expr);
+    const auto direct_validity_plan =
+        kernel::try_plan_direct_validity_field(expr, direct_input, ctx.scalars);
+    if ((!is_range_native_expr(expr) && !string_plan.has_value() &&
+         !direct_fixed_width_plan.has_value() && !direct_predicate_plan.has_value() &&
+         !direct_validity_plan.has_value() && !direct_categorical_plan.has_value()) ||
         (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double &&
-         inferred.value() != ExprType::Bool && !string_plan.has_value()) ||
-        (inferred.value() == ExprType::Bool && !kernel::supports_native_chunk_predicate(expr))) {
+         inferred.value() != ExprType::Bool &&
+         (inferred.value() != ExprType::Categorical || !direct_categorical_plan.has_value()) &&
+         !string_plan.has_value()) ||
+        (inferred.value() == ExprType::Bool && !direct_predicate_plan.has_value())) {
         return whole();
     }
 
@@ -3069,6 +3100,58 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
                               .validity = std::move(validity)};
     }
 
+    if (direct_categorical_plan.has_value()) {
+        using Code = Column<Categorical>::code_type;
+        std::vector<Code> codes(rows, 0);
+        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const std::size_t begin = index * grain;
+                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
+                auto validity = kernel::write_direct_categorical_field_range(
+                    *direct_categorical_plan, direct_input, range, ctx.scalars,
+                    {.codes = codes.data() + begin, .begin = begin, .count = range.count});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
+                }
+                pieces[index] = std::move(*validity);
+            }
+        });
+        batch.wait();
+        for (auto& piece : pieces) {
+            if (!piece.has_value()) {
+                return std::unexpected(piece.error());
+            }
+        }
+        const bool any_validity =
+            std::ranges::any_of(pieces, [](const auto& piece) { return piece->has_value(); });
+        std::optional<ValidityBitmap> validity;
+        if (any_validity) {
+            ValidityBitmap merged(rows, true);
+            for (std::size_t index = 0; index < morsels; ++index) {
+                if (!pieces[index]->has_value()) {
+                    continue;
+                }
+                const std::size_t begin = index * grain;
+                const ValidityBitmap& source = **pieces[index];
+                for (std::size_t offset = 0; offset < source.size(); ++offset) {
+                    merged.set(begin + offset, source[offset]);
+                }
+            }
+            validity = std::move(merged);
+        }
+        Column<Categorical> categorical(direct_categorical_plan->dictionary,
+                                        direct_categorical_plan->index, std::move(codes));
+        return ComputedColumn{.column = ColumnValue{std::move(categorical)},
+                              .validity = std::move(validity)};
+    }
+
     // Allocate the destination up front and let each worker copy its own morsel
     // into it. Merging the pieces serially after the barrier was a second full
     // pass over the result — at 8M rows, 64MB read plus 64MB write — and a
@@ -3110,27 +3193,55 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
             const std::size_t count = std::min(grain, rows - begin);
             const RowRange range{.begin = begin, .count = count};
             if (dst_bool_words != nullptr) {
-                auto mask = compute_mask(expr, table, ctx.scalars, range);
-                if (!mask.has_value()) {
-                    pieces[index] = std::unexpected(std::move(mask.error()));
+                if (!direct_predicate_plan.has_value()) {
+                    pieces[index] = std::unexpected(
+                        "evaluate_field_maybe_parallel: missing native predicate plan");
                     continue;
                 }
-                const auto shared = kernel::SharedBitWords::of_run(begin, count);
-                for (std::size_t offset = 0; offset < count; ++offset) {
-                    if (mask->value[offset] != 0) {
-                        kernel::or_bits_into_word(dst_bool_words, (begin + offset) / 64,
-                                                  std::uint64_t{1} << ((begin + offset) % 64),
-                                                  shared);
-                    }
+                auto validity = kernel::write_direct_predicate_range(
+                    *direct_predicate_plan, direct_input, range, ctx.scalars,
+                    kernel::BoolOutputSpan{
+                        .words = dst_bool_words, .begin = begin, .count = count});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
                 }
-                if (mask->valid.has_value()) {
-                    ValidityBitmap validity(count, false);
-                    for (std::size_t offset = 0; offset < count; ++offset) {
-                        validity.set(offset, (*mask->valid)[offset] != 0);
-                    }
-                    pieces[index] = std::move(validity);
-                } else {
-                    pieces[index] = std::optional<ValidityBitmap>{};
+                pieces[index] = std::move(*validity);
+                continue;
+            }
+            const bool validity_destination =
+                direct_validity_plan.has_value() &&
+                ((direct_validity_plan->numeric_kind == kernel::FixedWidthNumericKind::Int &&
+                  dst_int != nullptr) ||
+                 (direct_validity_plan->numeric_kind == kernel::FixedWidthNumericKind::Double &&
+                  dst_double != nullptr));
+            if (validity_destination) {
+                auto validity = kernel::write_direct_validity_field_range(
+                    *direct_validity_plan, direct_input, range, ctx.scalars,
+                    {.numeric = {.ints = dst_int != nullptr ? dst_int + begin : nullptr,
+                                 .doubles = dst_double != nullptr ? dst_double + begin : nullptr}});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
+                }
+                pieces[index] = std::move(*validity);
+                continue;
+            }
+            const bool fixed_width_destination =
+                direct_fixed_width_plan.has_value() &&
+                ((direct_fixed_width_plan->numeric_kind == kernel::FixedWidthNumericKind::Int &&
+                  dst_int != nullptr) ||
+                 (direct_fixed_width_plan->numeric_kind == kernel::FixedWidthNumericKind::Double &&
+                  dst_double != nullptr));
+            if (fixed_width_destination &&
+                kernel::write_direct_field_range(
+                    *direct_fixed_width_plan, direct_input, range, ctx.scalars,
+                    {.numeric = {
+                         .ints = dst_int != nullptr ? dst_int + begin : nullptr,
+                         .doubles = dst_double != nullptr ? dst_double + begin : nullptr}})) {
+                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
+                if (direct_fixed_width_plan->kind == kernel::DirectFieldKind::NumericBinary) {
+                    used_direct_numeric_writer.store(true, std::memory_order_relaxed);
                 }
                 continue;
             }
@@ -3290,6 +3401,97 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+struct GuardedWriteTarget {
+    std::optional<std::size_t> existing;
+};
+
+/// Guarded writes retain the physical representation of their target: unmatched
+/// rows still come from that target.  Strings are the language-level value type
+/// of a categorical expression, so encode them before the representation check
+/// when they are being written into an existing categorical column.
+auto preserve_categorical_target(const ColumnEntry* target, std::shared_ptr<ColumnValue> values)
+    -> std::shared_ptr<ColumnValue> {
+    if (target == nullptr || !std::holds_alternative<Column<Categorical>>(*target->column) ||
+        !std::holds_alternative<Column<std::string>>(*values)) {
+        return values;
+    }
+
+    const auto& strings = std::get<Column<std::string>>(*values);
+    Column<Categorical> categorical;
+    categorical.reserve(strings.size());
+    for (std::size_t row = 0; row < strings.size(); ++row) {
+        categorical.push_back(strings[row]);
+    }
+    return std::make_shared<ColumnValue>(std::move(categorical));
+}
+
+/// The one numeric representation change permitted by a guarded write is the
+/// standard Int-to-Double promotion. It gives the matched floating values and
+/// untouched integer values the same representation as a mixed numeric CASE.
+auto promote_integer_target(const std::shared_ptr<ColumnValue>& target,
+                            const std::shared_ptr<ColumnValue>& values)
+    -> std::shared_ptr<ColumnValue> {
+    if (target == nullptr || !std::holds_alternative<Column<std::int64_t>>(*target) ||
+        !std::holds_alternative<Column<double>>(*values)) {
+        return target;
+    }
+
+    const auto& integers = std::get<Column<std::int64_t>>(*target);
+    Column<double> widened;
+    widened.resize_for_overwrite(integers.size());
+    for (std::size_t row = 0; row < integers.size(); ++row) {
+        widened[row] = static_cast<double>(integers[row]);
+    }
+    return std::make_shared<ColumnValue>(std::move(widened));
+}
+
+auto is_guarded_numeric_promotion(const ColumnValue& target, const ColumnValue& values) -> bool {
+    return std::holds_alternative<Column<std::int64_t>>(target) &&
+           std::holds_alternative<Column<double>>(values);
+}
+
+/// Validate the stable side of a guarded write before its variant-specific
+/// scatter starts. A guarded update interleaves new values with old ones, so an
+/// existing target cannot change representation except for the standard
+/// Int-to-Double promotion above. This also keeps the time-index write
+/// prohibition at the one point guarded fields land.
+auto prepare_guarded_write(const Table& output, const std::string& alias, const ColumnValue& values)
+    -> std::expected<GuardedWriteTarget, std::string> {
+    if (output.time_index().has_value() && alias == *output.time_index()) {
+        return std::unexpected("cannot update time index column: " + alias);
+    }
+    if (const auto it = output.index.find(alias); it != output.index.end()) {
+        if (output.columns[it->second].column->index() != values.index() &&
+            !is_guarded_numeric_promotion(*output.columns[it->second].column, values)) {
+            return std::unexpected("guarded update cannot change the type of existing column '" +
+                                   alias + "'");
+        }
+        return GuardedWriteTarget{.existing = it->second};
+    }
+    return GuardedWriteTarget{};
+}
+
+/// The sole metadata landing point for a guarded field. Its target was checked
+/// before the representation-specific merge, which guarantees that the mixed
+/// old/new column is type-stable when it reaches this writer.
+auto write_guarded_update(Table& output, const std::string& alias, GuardedWriteTarget target,
+                          ColumnValue values, std::optional<ValidityBitmap> validity) -> void {
+    if (target.existing.has_value()) {
+        output.replace_column(*target.existing, std::move(values), std::move(validity));
+    } else if (validity.has_value()) {
+        output.add_column(alias, std::move(values), std::move(*validity));
+    } else {
+        output.add_column(alias, std::move(values));
+    }
+    apply_table_properties(output, TableProperties::derive(
+                                       table_properties_of(output),
+                                       [&](const std::string& name) -> KeyFate {
+                                           return name == alias ? KeyFate::overwritten()
+                                                                : KeyFate::kept(name);
+                                       },
+                                       RowTransform::Preserve));
+}
+
 /// Execute a guarded update `where <predicate> update { ... }`: rows matching
 /// the predicate get the field assignments; non-matching rows keep their values
 /// (a new column is null off-mask). Each field is evaluated where it is needed —
@@ -3344,10 +3546,12 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         if (literal != nullptr && old_entry != nullptr) {
             ColumnValue replacement =
                 broadcast_scalar_column(scalar_from_literal(*literal), std::size_t{1});
-            if (old_entry->column->index() != replacement.index()) {
-                return std::unexpected(
-                    "guarded update cannot change the type of existing column '" + field.alias +
-                    "'");
+            auto replacement_values = preserve_categorical_target(
+                old_entry, std::make_shared<ColumnValue>(std::move(replacement)));
+            auto old_values = promote_integer_target(old_entry->column, replacement_values);
+            auto target = prepare_guarded_write(input, field.alias, *replacement_values);
+            if (!target.has_value()) {
+                return std::unexpected(std::move(target.error()));
             }
 
             using LiteralResult = std::pair<ColumnValue, std::optional<ValidityBitmap>>;
@@ -3363,7 +3567,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                         // categorical column. Keep their established path.
                         return std::nullopt;
                     } else {
-                        const auto& scalar_col = std::get<Col>(replacement);
+                        const auto& scalar_col = std::get<Col>(*replacement_values);
                         const auto value = scalar_col[0];
 
                         Col out;
@@ -3455,11 +3659,11 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
                                         : std::nullopt};
                     }
                 },
-                *old_entry->column);
+                *old_values);
             if (result.has_value()) {
-                const auto pos = input.index.at(field.alias);
                 Table output = std::move(input);
-                output.replace_column(pos, std::move(result->first), std::move(result->second));
+                write_guarded_update(output, field.alias, *target, std::move(result->first),
+                                     std::move(result->second));
                 return output;
             }
         }
@@ -3487,8 +3691,7 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
         // replace_column() reseats the output handle only after the result has
         // been built, so this remains a stable snapshot of the old values.
         const ColumnEntry* old_entry = output.find_entry(field.alias);
-        const std::shared_ptr<ColumnValue> old_col =
-            old_entry != nullptr ? old_entry->column : nullptr;
+        std::shared_ptr<ColumnValue> old_col = old_entry != nullptr ? old_entry->column : nullptr;
         const ValidityBitmap* old_valid = old_entry != nullptr && old_entry->validity.has_value()
                                               ? &*old_entry->validity
                                               : nullptr;
@@ -3526,11 +3729,12 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
             new_valid = e->validity;
         }
 
-        // A guarded assignment may not change the type of an existing column —
-        // non-matching rows must keep their old (same-type) values.
-        if (old_col != nullptr && old_col->index() != new_vals->index()) {
-            return std::unexpected("guarded update cannot change the type of existing column '" +
-                                   field.alias + "'");
+        new_vals = preserve_categorical_target(old_entry, std::move(new_vals));
+        old_col = promote_integer_target(old_col, new_vals);
+
+        auto target = prepare_guarded_write(output, field.alias, *new_vals);
+        if (!target.has_value()) {
+            return std::unexpected(std::move(target.error()));
         }
 
         // Build the result column by pushing per row: matched -> new value
@@ -3764,13 +3968,8 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
             },
             *new_vals);
 
-        if (auto it = output.index.find(field.alias); it != output.index.end()) {
-            output.replace_column(it->second, std::move(result_col), std::move(result_valid));
-        } else if (result_valid.has_value()) {
-            output.add_column(field.alias, std::move(result_col), std::move(*result_valid));
-        } else {
-            output.add_column(field.alias, std::move(result_col));
-        }
+        write_guarded_update(output, field.alias, *target, std::move(result_col),
+                             std::move(result_valid));
     }
     return output;
 }

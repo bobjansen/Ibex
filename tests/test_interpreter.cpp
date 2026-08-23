@@ -25,6 +25,8 @@
 #include <sstream>
 #include <thread>
 
+#include "interpreter_internal.hpp"
+
 namespace {
 
 using namespace ibex;
@@ -6964,6 +6966,36 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         CHECK_FALSE(result.has_value());
     }
 
+    // The guarded writer owns the same TimeFrame protection as direct
+    // updates, including the literal fast path.
+    {
+        runtime::Table t;
+        t.add_column("time", Column<std::int64_t>{10, 20});
+        t.add_column("g", Column<std::string>{"x", "y"});
+        t.set_properties(runtime::TableProperties::time_frame("time"));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto ir = require_ir(R"(t[where g == "x" update { time = 30 }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == "cannot update time index column: time");
+    }
+
+    // A guarded overwrite changes a key's values on only some rows, but it is
+    // still no longer a valid ordering key.
+    {
+        runtime::Table t;
+        t.add_column("price", Column<std::int64_t>{10, 20});
+        t.add_column("g", Column<std::string>{"x", "y"});
+        t.set_properties(runtime::TableProperties::sorted_by({{.name = "price"}}));
+        runtime::TableRegistry registry;
+        registry.emplace("t", std::move(t));
+        auto ir = require_ir(R"(t[where g == "x" update { price = 30 }];)");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        CHECK_FALSE(result->ordering().has_value());
+    }
+
     // A string target takes the packed guarded writer: matching rows receive
     // a newly sized slab, non-matching rows retain both their old payload and
     // validity, and a newly fixed null becomes valid.
@@ -7051,6 +7083,47 @@ TEST_CASE("guarded update: where C update keeps non-matching rows", "[guarded_up
         CHECK_FALSE((*entry->validity)[2]);
         CHECK_FALSE((*entry->validity)[3]);
     }
+}
+
+TEST_CASE("guarded update: CASE strings retain a categorical target", "[guarded_update][case]") {
+    runtime::Table t;
+    t.add_column("category",
+                 Column<Categorical>{std::vector<std::string>{"old", "keep"},
+                                     std::vector<Column<Categorical>::code_type>{0, 1, 0, 1}});
+    t.add_column("take", Column<bool>{true, false, true, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        R"(t[where take update { category = case { take => "new", else => "unused" } }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* category = std::get_if<Column<Categorical>>(result->find("category"));
+    REQUIRE(category != nullptr);
+    CHECK((*category)[0] == "new");
+    CHECK((*category)[1] == "keep");
+    CHECK((*category)[2] == "new");
+    CHECK((*category)[3] == "keep");
+}
+
+TEST_CASE("guarded update: mixed numeric CASE widens an Int target", "[guarded_update][case]") {
+    runtime::Table t;
+    t.add_column("value", Column<std::int64_t>{1, 2, 3, 4});
+    t.add_column("take", Column<bool>{true, false, true, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(R"(t[where take update { value = case { take => 2.5, else => 0 } }];)");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* value = std::get_if<Column<double>>(result->find("value"));
+    REQUIRE(value != nullptr);
+    CHECK((*value)[0] == 2.5);
+    CHECK((*value)[1] == 2.0);
+    CHECK((*value)[2] == 2.5);
+    CHECK((*value)[3] == 4.0);
 }
 
 // Skew and kurtosis keep their higher moments in the operator's per-group
@@ -7166,6 +7239,366 @@ TEST_CASE("round in an update is range-native under a split", "[update][parallel
 
         CHECK(run(true) == run(false));
     }
+}
+
+TEST_CASE("temporal parts write parallel fixed-width windows", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    constexpr std::int64_t kHourNanos = 60LL * 60 * 1'000'000'000;
+    constexpr std::int64_t kDayNanos = 24LL * kHourNanos;
+    Column<Timestamp> time;
+    time.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        time.push_back(Timestamp{static_cast<std::int64_t>(row % 7) * kDayNanos +
+                                 static_cast<std::int64_t>(row % 24) * kHourNanos});
+    }
+    runtime::Table t;
+    t.add_column("time", std::move(time), std::vector<bool>(kRows, true));
+    t.columns.front().validity->set(513, false);  // crosses a range boundary
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    auto ir = require_ir("t[update { h = hour(time) }];");
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_grain = 256;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* hours = std::get_if<Column<std::int64_t>>(out->find("h"));
+        REQUIRE(hours != nullptr);
+        const auto* entry = out->find_entry("h");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        return std::pair{std::vector<std::int64_t>{hours->begin(), hours->end()}, *entry->validity};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel.first == serial.first);
+    CHECK(parallel.second[513] == false);
+    CHECK(stats.parallel_fields.load() > 0);
+}
+
+TEST_CASE("categorical byte lengths write parallel fixed-width windows", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    const std::vector<std::string> dictionary{"é", "日本", "plain"};
+    Column<Categorical> category(dictionary);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        category.push_code(static_cast<Column<Categorical>::code_type>(row % dictionary.size()));
+    }
+    runtime::Table t;
+    t.add_column("category", std::move(category), std::vector<bool>(kRows, true));
+    t.columns.front().validity->set(513, false);
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+    ir::CallExpr call{
+        .callee = "byte_length",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "category"}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "bytes", .expr = ir::Expr{.node = std::move(call)}}};
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_grain = 256;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out =
+            runtime::update_table(runtime::Table{registry.at("t")}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* bytes = std::get_if<Column<std::int64_t>>(out->find("bytes"));
+        REQUIRE(bytes != nullptr);
+        const auto* bytes_entry = out->find_entry("bytes");
+        REQUIRE(bytes_entry != nullptr);
+        REQUIRE(bytes_entry->validity.has_value());
+        return std::pair{std::vector<std::int64_t>{bytes->begin(), bytes->end()},
+                         *bytes_entry->validity};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel.first == serial.first);
+    CHECK(parallel.second[513] == false);
+    CHECK(stats.parallel_fields.load() > 0);
+}
+
+TEST_CASE("native predicates write parallel packed bool windows", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<std::int64_t> price;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        price.push_back(static_cast<std::int64_t>(row));
+    }
+    runtime::Table input;
+    input.add_column("price", std::move(price), std::vector<bool>(kRows, true));
+    input.columns.front().validity->set(513, false);
+    ir::Expr predicate{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right =
+                ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2048}}})}};
+    const std::vector<ir::FieldSpec> fields{{.alias = "flag", .expr = std::move(predicate)}};
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        // 65 makes adjacent morsels share packed words, exercising the
+        // writer's atomic boundary OR contract.
+        exec.parallel_grain = 65;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* flags = std::get_if<Column<bool>>(out->find("flag"));
+        REQUIRE(flags != nullptr);
+        const auto* entry = out->find_entry("flag");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        std::vector<bool> values;
+        values.reserve(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            values.push_back((*flags)[row]);
+        }
+        return std::pair{std::move(values), *entry->validity};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel.first == serial.first);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        CHECK(parallel.second[row] == serial.second[row]);
+    }
+    CHECK(parallel.first[2048] == false);
+    CHECK(parallel.first[2049] == true);
+    CHECK(parallel.second[513] == false);
+    CHECK(stats.parallel_fields.load() > 0);
+}
+
+TEST_CASE("interpolation strings write parallel prefix-assigned slabs", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<std::string> name;
+    Column<Categorical> side({"bid", "ask"});
+    for (std::size_t row = 0; row < kRows; ++row) {
+        name.push_back(row % 3 == 0 ? "é" : row % 3 == 1 ? "日本" : "plain");
+        side.push_code(static_cast<Column<Categorical>::code_type>(row % 2));
+    }
+    runtime::Table input;
+    input.add_column("name", std::move(name), std::vector<bool>(kRows, true));
+    input.add_column("side", std::move(side));
+    // The count pass must omit this row and the write pass must leave its
+    // payload empty while preserving the range-local validity result.
+    input.columns.front().validity->set(513, false);
+    ir::CallExpr interpolation{
+        .callee = "__interp",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string("[")}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "side"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string("] ")}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "name"}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "label", .expr = ir::Expr{.node = std::move(interpolation)}}};
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_grain = 127;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* labels = std::get_if<Column<std::string>>(out->find("label"));
+        REQUIRE(labels != nullptr);
+        const auto* entry = out->find_entry("label");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        std::vector<std::string> values;
+        values.reserve(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            values.emplace_back((*labels)[row]);
+        }
+        return std::pair{std::move(values), *entry->validity};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel.first == serial.first);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        CHECK(parallel.second[row] == serial.second[row]);
+    }
+    CHECK(parallel.first[0] == "[bid] é");
+    CHECK(parallel.first[1] == "[ask] 日本");
+    CHECK(parallel.second[513] == false);
+    CHECK(parallel.first[513].empty());
+    CHECK(stats.parallel_fields.load() > 0);
+}
+
+TEST_CASE("nullable fixed-width writes return parallel range validity", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<std::int64_t> a;
+    Column<std::int64_t> b;
+    Column<std::int64_t> price;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        a.push_back(static_cast<std::int64_t>(row));
+        b.push_back(static_cast<std::int64_t>(10'000 + row));
+        price.push_back(static_cast<std::int64_t>(row));
+    }
+    runtime::Table input;
+    input.add_column("a", std::move(a), std::vector<bool>(kRows, true));
+    input.add_column("b", std::move(b), std::vector<bool>(kRows, true));
+    input.add_column("price", std::move(price));
+    input.columns[0].validity->set(513, false);
+    input.columns[0].validity->set(777, false);
+    input.columns[0].validity->set(3000, false);
+    input.columns[1].validity->set(777, false);
+
+    ir::CallExpr fill{
+        .callee = "fill_null",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "a"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{-1}}})},
+        .named_args = {}};
+    ir::CallExpr coalesce{.callee = "coalesce",
+                          .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "a"}}),
+                                   ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "b"}})},
+                          .named_args = {}};
+    ir::Expr condition{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right =
+                ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2048}}})}};
+    ir::CallExpr case_expr{
+        .callee = "__case",
+        .args = {ir::make_expr_ptr(std::move(condition)),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "a"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "b"}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "filled", .expr = ir::Expr{.node = std::move(fill)}},
+        {.alias = "merged", .expr = ir::Expr{.node = std::move(coalesce)}},
+        {.alias = "selected", .expr = ir::Expr{.node = std::move(case_expr)}}};
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_grain = 65;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto snapshot = [&](std::string_view name) {
+            const auto* values = std::get_if<Column<std::int64_t>>(out->find(std::string{name}));
+            REQUIRE(values != nullptr);
+            const auto* entry = out->find_entry(std::string{name});
+            REQUIRE(entry != nullptr);
+            std::vector<std::int64_t> result{values->begin(), values->end()};
+            std::vector<bool> validity(kRows, true);
+            if (entry->validity.has_value()) {
+                for (std::size_t row = 0; row < kRows; ++row) {
+                    validity[row] = (*entry->validity)[row];
+                }
+            }
+            return std::pair{std::move(result), std::move(validity)};
+        };
+        const auto filled_entry = out->find_entry("filled");
+        REQUIRE(filled_entry != nullptr);
+        REQUIRE_FALSE(filled_entry->validity.has_value());
+        return std::array{snapshot("filled"), snapshot("merged"), snapshot("selected")};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel == serial);
+    CHECK(parallel[0].first[513] == -1);
+    CHECK(parallel[0].second[513]);
+    CHECK_FALSE(parallel[1].second[777]);
+    CHECK(parallel[2].first[513] == 10'513);
+    CHECK_FALSE(parallel[2].second[3000]);
+    CHECK(stats.parallel_fields.load() >= 3);
+}
+
+TEST_CASE("categorical CASE and coalesce use planned dictionary remaps", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<Categorical> a({"B", "A"});
+    Column<Categorical> b({"C", "A"});
+    Column<std::int64_t> price;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        a.push_code(static_cast<Column<Categorical>::code_type>(row % 2));
+        b.push_code(static_cast<Column<Categorical>::code_type>(row % 2));
+        price.push_back(static_cast<std::int64_t>(row));
+    }
+    runtime::Table input;
+    input.add_column("a", std::move(a), std::vector<bool>(kRows, true));
+    input.add_column("b", std::move(b), std::vector<bool>(kRows, true));
+    input.add_column("price", std::move(price));
+    input.columns[0].validity->set(513, false);
+    input.columns[0].validity->set(777, false);
+    input.columns[0].validity->set(3000, false);
+    input.columns[1].validity->set(777, false);
+    runtime::TableRegistry registry;
+    registry.emplace("t", input);
+    auto program = require_ir(
+        R"(t[update { merged = coalesce(a, b, "fallback"), picked = case { price > 2048 => a, price > 1024 => "D", else => b } }];)");
+
+    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = 4;
+        exec.parallel_grain = 65;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::interpret(*program, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto snapshot = [&](std::string_view name) {
+            const auto* values = std::get_if<Column<Categorical>>(out->find(std::string{name}));
+            REQUIRE(values != nullptr);
+            const auto* entry = out->find_entry(std::string{name});
+            REQUIRE(entry != nullptr);
+            std::vector<std::string> labels;
+            labels.reserve(kRows);
+            for (std::size_t row = 0; row < kRows; ++row) {
+                labels.emplace_back((*values)[row]);
+            }
+            std::vector<bool> validity(kRows, true);
+            if (entry->validity.has_value()) {
+                for (std::size_t row = 0; row < kRows; ++row) {
+                    validity[row] = (*entry->validity)[row];
+                }
+            }
+            return std::tuple{values->dictionary(), std::move(labels), std::move(validity)};
+        };
+        return std::array{snapshot("merged"), snapshot("picked")};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelIslandStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel == serial);
+    CHECK(std::get<0>(parallel[0]) == std::vector<std::string>{"B", "A", "C", "fallback"});
+    CHECK(std::get<0>(parallel[1]) == std::vector<std::string>{"B", "A", "D", "C"});
+    CHECK(std::get<1>(parallel[0])[513] == "A");
+    CHECK(std::get<1>(parallel[0])[777] == "fallback");
+    CHECK(std::get<1>(parallel[1])[1500] == "D");
+    CHECK_FALSE(std::get<2>(parallel[1])[3000]);
+    CHECK(stats.parallel_fields.load() >= 2);
 }
 
 // `grouped_update_table` now shares the windowed path's grouping, which means

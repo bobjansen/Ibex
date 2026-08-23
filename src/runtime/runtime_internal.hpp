@@ -27,6 +27,7 @@ enum class ExprType : std::uint8_t {
     Double,
     Bool,
     String,
+    Categorical,
     Date,
     Timestamp,
 };

@@ -70,6 +70,11 @@ auto default_column_for(ExprType type, std::size_t rows) -> ColumnValue {
             }
             return ColumnValue{std::move(c)};
         }
+        case ExprType::Categorical: {
+            Column<Categorical> c;
+            c.resize(rows);
+            return ColumnValue{std::move(c)};
+        }
         case ExprType::Date: {
             Column<Date> c;
             c.resize(rows);

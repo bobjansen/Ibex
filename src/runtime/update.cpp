@@ -2518,10 +2518,178 @@ auto try_native_grouped_reductions(const Table& input, const std::vector<ir::Fie
     return std::optional<Table>{std::move(output)};
 }
 
-/// One aggregate call lifted out of a field expression. Its group value is
-/// broadcast into `column`, a staging column the rewritten row-local
-/// expression then reads like any other input.
-struct LiftedGroupAggregate {
+enum class NativeGroupedOrderedKind : std::uint8_t {
+    Lag,
+    Lead,
+    CumSum,
+    CumProd,
+    FillForward,
+    FillBackward,
+};
+
+/// The ordered group kernel a call names, with the row offset `lag`/`lead`
+/// carry. Call shape only — the caller resolves the source column, which is why
+/// the bare-field planner and the lifter can share this without agreeing on
+/// where that column comes from.
+struct NativeGroupedOrderedCall {
+    NativeGroupedOrderedKind kind = NativeGroupedOrderedKind::Lag;
+    std::size_t offset = 0;
+};
+
+auto classify_native_grouped_ordered(const ir::CallExpr& call)
+    -> std::optional<NativeGroupedOrderedCall> {
+    if (!call.named_args.empty() || call.args.empty() || call.args[0] == nullptr) {
+        return std::nullopt;
+    }
+    if (call.callee == "lag" || call.callee == "lead") {
+        if (call.args.size() != 2 || call.args[1] == nullptr) {
+            return std::nullopt;
+        }
+        const auto* literal = std::get_if<ir::Literal>(&call.args[1]->node);
+        const auto* value =
+            literal == nullptr ? nullptr : std::get_if<std::int64_t>(&literal->value);
+        if (value == nullptr || *value < 0) {
+            return std::nullopt;
+        }
+        return NativeGroupedOrderedCall{.kind = call.callee == "lag"
+                                                    ? NativeGroupedOrderedKind::Lag
+                                                    : NativeGroupedOrderedKind::Lead,
+                                        .offset = static_cast<std::size_t>(*value)};
+    }
+    if (call.args.size() != 1) {
+        return std::nullopt;
+    }
+    if (call.callee == "cumsum") {
+        return NativeGroupedOrderedCall{.kind = NativeGroupedOrderedKind::CumSum, .offset = 0};
+    }
+    if (call.callee == "cumprod") {
+        return NativeGroupedOrderedCall{.kind = NativeGroupedOrderedKind::CumProd, .offset = 0};
+    }
+    if (call.callee == "fill_forward") {
+        return NativeGroupedOrderedCall{.kind = NativeGroupedOrderedKind::FillForward, .offset = 0};
+    }
+    if (call.callee == "fill_backward") {
+        return NativeGroupedOrderedCall{.kind = NativeGroupedOrderedKind::FillBackward,
+                                        .offset = 0};
+    }
+    return std::nullopt;
+}
+
+/// True when the ordered kernels can read this column at all: they carry a
+/// state chain of the column's own type, which the fixed-width numerics are.
+auto ordered_source_supported(const ColumnEntry& source) -> bool {
+    return std::holds_alternative<Column<std::int64_t>>(*source.column) ||
+           std::holds_alternative<Column<double>>(*source.column);
+}
+
+/// Walk each CSR group in original row order and scatter to absolute output
+/// rows. A worker owns its group's complete state chain, so nothing crosses a
+/// group boundary; the byte validity staging avoids concurrent writes to packed
+/// bitmap words and is merged only after the worker barrier.
+auto compute_grouped_ordered_column(const NativeGroupedOrderedCall& ordered,
+                                    const ColumnEntry& source, const GroupedRows& group_rows,
+                                    std::size_t rows, std::size_t workers)
+    -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
+    const auto kind = ordered.kind;
+    const auto offset = ordered.offset;
+    std::vector<std::uint8_t> invalid(rows, 0U);
+    const auto write = [&]<typename T>(const Column<T>& values) -> ColumnValue {
+        Column<T> result;
+        result.resize(rows);
+        const auto* source_validity = source.validity ? &*source.validity : nullptr;
+        const auto run_group = [&](std::size_t group) noexcept {
+            const auto indices = group_rows[group];
+            if (kind == NativeGroupedOrderedKind::Lag || kind == NativeGroupedOrderedKind::Lead) {
+                for (std::size_t local = 0; local < indices.size(); ++local) {
+                    const bool in_bounds = kind == NativeGroupedOrderedKind::Lag
+                                               ? local >= offset
+                                               : local + offset < indices.size();
+                    const std::size_t row = indices[local];
+                    if (!in_bounds) {
+                        result[row] = T{};
+                        invalid[row] = 1U;
+                    } else {
+                        const std::size_t source_local =
+                            kind == NativeGroupedOrderedKind::Lag ? local - offset : local + offset;
+                        result[row] = values[indices[source_local]];
+                    }
+                }
+                return;
+            }
+            if (kind == NativeGroupedOrderedKind::CumSum ||
+                kind == NativeGroupedOrderedKind::CumProd) {
+                T accumulator = kind == NativeGroupedOrderedKind::CumProd ? T{1} : T{};
+                for (const auto row : indices) {
+                    if (kind == NativeGroupedOrderedKind::CumProd) {
+                        accumulator *= values[row];
+                    } else {
+                        accumulator += values[row];
+                    }
+                    result[row] = accumulator;
+                }
+                return;
+            }
+            const bool forward = kind == NativeGroupedOrderedKind::FillForward;
+            T carry{};
+            bool have_carry = false;
+            for (std::size_t pos = 0; pos < indices.size(); ++pos) {
+                const std::size_t local = forward ? pos : indices.size() - 1 - pos;
+                const std::size_t row = indices[local];
+                const bool valid = source_validity == nullptr || (*source_validity)[row];
+                if (valid) {
+                    result[row] = values[row];
+                    carry = values[row];
+                    have_carry = true;
+                } else if (have_carry) {
+                    result[row] = carry;
+                } else {
+                    result[row] = T{};
+                    invalid[row] = 1U;
+                }
+            }
+        };
+        if (workers < 2) {
+            for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+                run_group(group);
+            }
+        } else {
+            std::atomic<std::size_t> next_group{0};
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t) noexcept {
+                while (true) {
+                    const std::size_t group = next_group.fetch_add(1, std::memory_order_relaxed);
+                    if (group >= group_rows.group_count()) {
+                        return;
+                    }
+                    run_group(group);
+                }
+            });
+            batch.wait();
+        }
+        return ColumnValue{std::move(result)};
+    };
+
+    ColumnValue column =
+        std::holds_alternative<Column<std::int64_t>>(*source.column)
+            ? write.template operator()<std::int64_t>(
+                  std::get<Column<std::int64_t>>(*source.column))
+            : write.template operator()<double>(std::get<Column<double>>(*source.column));
+    std::optional<ValidityBitmap> validity;
+    if (std::ranges::any_of(invalid, [](auto value) { return value != 0U; })) {
+        validity = ValidityBitmap(rows, true);
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (invalid[row] != 0U) {
+                validity->set(row, false);
+            }
+        }
+    }
+    return {std::move(column), std::move(validity)};
+}
+
+/// One group-state call lifted out of a field expression -- an aggregate, or an
+/// ordered kernel like `lag`/`cumsum`. Its per-row result is written into
+/// `column`, a staging column the rewritten row-local expression then reads
+/// like any other input.
+struct LiftedGroupState {
     std::string column;
     std::string callee;
     /// The call as written, kept whole because an aggregate's later arguments
@@ -2534,6 +2702,10 @@ struct LiftedGroupAggregate {
     /// Set when the argument is an expression rather than a column reference:
     /// it is evaluated into `source_column` before the reduction runs.
     std::optional<ir::Expr> source_expr;
+    /// Set for an ordered group kernel; absent for an aggregate. The two differ
+    /// only in how `column` is filled: an aggregate broadcasts one value to the
+    /// group's rows, an ordered kernel writes a distinct value per row.
+    std::optional<NativeGroupedOrderedCall> ordered;
 };
 
 /// A staging column name that no column of `table` already holds. The prefix is
@@ -2549,18 +2721,23 @@ auto unique_staging_name(const Table& table, std::string_view prefix, std::size_
     }
 }
 
-/// Rewrite `expr` in place, replacing every aggregate call with a reference to
-/// the staging column that will hold its broadcast group value. Returns false
-/// when any aggregate is outside the native reduction contract, which leaves
-/// the whole field to the materialized evaluator.
+/// Rewrite `expr` in place, replacing every aggregate and ordered group call
+/// with a reference to the staging column that will hold its result. Returns
+/// false when one of them is outside what the native group protocols compute,
+/// which leaves the whole field to the materialized evaluator.
+///
+/// Ordered state is lifted for the same reason aggregates are: `lag(x, 1)` is a
+/// value per row that the CSR walk already produces, and once it is a column
+/// the expression around it -- `log(price / lag(price, 1))`, the log-return
+/// shape -- is ordinary row-local work.
 ///
 /// Aggregates over the same bare column collapse onto one staging column, so
 /// `x / sum(x) - sum(x)` reduces once. Aggregates over an expression do not:
 /// deciding that two argument trees are the same expression needs a structural
 /// comparison the IR does not offer, and computing one twice is a bounded cost
 /// against wrongly sharing two different reductions.
-auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& counter,
-                             std::vector<LiftedGroupAggregate>& lifted) -> bool {
+auto lift_group_state(ir::Expr& expr, const Table& input, std::size_t& counter,
+                      std::vector<LiftedGroupState>& lifted) -> bool {
     return std::visit(
         [&](auto& node) -> bool {
             using NodeT = std::decay_t<decltype(node)>;
@@ -2571,28 +2748,27 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                 return false;
             } else if constexpr (std::is_same_v<NodeT, ir::IsNullExpr>) {
                 return node.operand != nullptr &&
-                       lift_grouped_aggregates(*node.operand, input, counter, lifted);
+                       lift_group_state(*node.operand, input, counter, lifted);
             } else if constexpr (std::is_same_v<NodeT, ir::BinaryExpr> ||
                                  std::is_same_v<NodeT, ir::CompareExpr> ||
                                  std::is_same_v<NodeT, ir::LogicalExpr>) {
-                if (node.left == nullptr ||
-                    !lift_grouped_aggregates(*node.left, input, counter, lifted)) {
+                if (node.left == nullptr || !lift_group_state(*node.left, input, counter, lifted)) {
                     return false;
                 }
                 // `Not` is the one binary-shaped node with no right operand.
                 return node.right == nullptr ||
-                       lift_grouped_aggregates(*node.right, input, counter, lifted);
+                       lift_group_state(*node.right, input, counter, lifted);
             } else if constexpr (std::is_same_v<NodeT, ir::CallExpr>) {
-                if (!ir::is_aggregate_func(node.callee)) {
+                const auto ordered = classify_native_grouped_ordered(node);
+                if (!ordered.has_value() && !ir::is_aggregate_func(node.callee)) {
                     for (auto& arg : node.args) {
-                        if (arg == nullptr ||
-                            !lift_grouped_aggregates(*arg, input, counter, lifted)) {
+                        if (arg == nullptr || !lift_group_state(*arg, input, counter, lifted)) {
                             return false;
                         }
                     }
                     for (auto& named : node.named_args) {
                         if (named.value == nullptr ||
-                            !lift_grouped_aggregates(*named.value, input, counter, lifted)) {
+                            !lift_group_state(*named.value, input, counter, lifted)) {
                             return false;
                         }
                     }
@@ -2605,16 +2781,19 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                 // the fixed-width family reduces over the CSR rows, and the
                 // rest is one grouped aggregation broadcast back. `count()`
                 // names no column and so has no `AggSpec`, but it is the
-                // simplest CSR reduction there is.
+                // simplest CSR reduction there is. An ordered kernel was
+                // already classified above.
                 const bool bare_count = node.callee == "count" && node.args.empty();
-                if (!bare_count && !parse_aggregate_func(node.callee).has_value()) {
+                if (!ordered.has_value() && !bare_count &&
+                    !parse_aggregate_func(node.callee).has_value()) {
                     return false;
                 }
-                LiftedGroupAggregate item{.column = {},
-                                          .callee = node.callee,
-                                          .call = node,
-                                          .source_column = {},
-                                          .source_expr = {}};
+                LiftedGroupState item{.column = {},
+                                      .callee = node.callee,
+                                      .call = node,
+                                      .source_column = {},
+                                      .source_expr = {},
+                                      .ordered = ordered};
                 if (node.args.empty()) {
                     if (!bare_count) {
                         return false;
@@ -2632,7 +2811,9 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                         return false;
                     }
                     if (const auto* ref = ir::as_column_ref(argument); ref != nullptr) {
-                        if (input.find_entry(ref->name) == nullptr) {
+                        const auto* entry = input.find_entry(ref->name);
+                        if (entry == nullptr ||
+                            (ordered.has_value() && !ordered_source_supported(*entry))) {
                             return false;
                         }
                         item.source_column = ref->name;
@@ -2641,13 +2822,20 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                         item.source_column = unique_staging_name(input, "__grp_agg_arg_", counter);
                     }
                 }
-                // Only a one-argument aggregate is deduplicated: a second
-                // argument is a parameter, and two calls that share a column
-                // but not their parameter are two different reductions.
+                // Two calls collapse onto one staging column only when they
+                // agree on everything that makes them a different computation:
+                // the same kernel over the same column, and the same parameter
+                // -- `quantile`'s fraction, `lag`'s offset.
                 const auto same = std::ranges::find_if(lifted, [&](const auto& existing) {
-                    return !existing.source_expr.has_value() && existing.call.args.size() <= 1 &&
-                           node.args.size() <= 1 && existing.callee == item.callee &&
-                           existing.source_column == item.source_column;
+                    if (existing.source_expr.has_value() || existing.callee != item.callee ||
+                        existing.source_column != item.source_column ||
+                        existing.ordered.has_value() != item.ordered.has_value()) {
+                        return false;
+                    }
+                    if (item.ordered.has_value()) {
+                        return existing.ordered->offset == item.ordered->offset;
+                    }
+                    return existing.call.args.size() <= 1 && node.args.size() <= 1;
                 });
                 if (same != lifted.end()) {
                     expr.node = ir::ColumnRef{.name = same->column};
@@ -2662,6 +2850,21 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
             }
         },
         expr.node);
+}
+
+/// The admission test for the lifted group-state path, and the rewrite it
+/// implies. A field qualifies when every aggregate and ordered group call in it
+/// becomes a staging column AND what is left is an ordinary row-local
+/// expression -- which is the whole contract, asked of the rewritten
+/// expression rather than guessed at from the original. An extern, a rolling
+/// call, or a `rank` survives the rewrite and fails it here.
+auto plan_lifted_group_state(const ir::Expr& expr, const Table& input, ir::Expr& rewritten,
+                             std::size_t& counter, std::vector<LiftedGroupState>& lifted) -> bool {
+    rewritten = expr;
+    if (!lift_group_state(rewritten, input, counter, lifted) || lifted.empty()) {
+        return false;
+    }
+    return ir::is_row_local_update_expr(rewritten) && !expr_contains_aggregate_call(rewritten);
 }
 
 /// Return `table` without the staging columns named in `staged`. `Table` has no
@@ -2695,7 +2898,7 @@ auto without_staging_columns(Table table, const std::vector<std::string>& staged
 /// Declines (rather than fails) when the operator will not take the call: the
 /// materialized evaluator runs the identical aggregate and owns the diagnostic.
 auto broadcast_general_group_aggregates(const Table& staged,
-                                        std::span<const LiftedGroupAggregate* const> items,
+                                        std::span<const LiftedGroupState* const> items,
                                         std::span<const std::uint32_t> row_gid,
                                         std::size_t group_count, std::size_t& counter,
                                         const ExecutionContext& exec)
@@ -2799,21 +3002,10 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
                                        const GroupedRowPlan& grouped, const ScalarRegistry* scalars,
                                        const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<std::optional<Table>, std::string> {
-    if (!expr_contains_aggregate_call(field.expr)) {
-        return std::optional<Table>{};
-    }
-    // Rejects rank, rolling/transform calls, generators and externs — every
-    // shape whose value at a row depends on rows this rewrite would not feed
-    // it. Aggregates are row-local to this predicate, which is precisely why
-    // it can be asked before they are lifted.
-    if (!ir::is_row_local_update_expr(field.expr)) {
-        return std::optional<Table>{};
-    }
-
-    ir::Expr rewritten = field.expr;
+    ir::Expr rewritten;
     std::size_t counter = 0;
-    std::vector<LiftedGroupAggregate> lifted;
-    if (!lift_grouped_aggregates(rewritten, input, counter, lifted) || lifted.empty()) {
+    std::vector<LiftedGroupState> lifted;
+    if (!plan_lifted_group_state(field.expr, input, rewritten, counter, lifted)) {
         return std::optional<Table>{};
     }
 
@@ -2839,8 +3031,23 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
     const GroupedRows& group_rows = grouped.rows;
     const std::size_t workers =
         grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
-    std::vector<const LiftedGroupAggregate*> general;
+    std::vector<const LiftedGroupState*> general;
     for (const auto& item : lifted) {
+        if (item.ordered.has_value()) {
+            const auto* source = staged.find_entry(item.source_column);
+            if (source == nullptr || !ordered_source_supported(*source)) {
+                return std::optional<Table>{};
+            }
+            auto [column, validity] =
+                compute_grouped_ordered_column(*item.ordered, *source, group_rows, rows, workers);
+            staged_names.push_back(item.column);
+            if (validity.has_value()) {
+                staged.add_column(item.column, std::move(column), std::move(*validity));
+            } else {
+                staged.add_column(item.column, std::move(column));
+            }
+            continue;
+        }
         NativeGroupedReductionField plan{.alias = item.column};
         if (item.source_column.empty()) {
             plan.reduction = NativeGroupedReduction::CountRows;
@@ -2886,8 +3093,8 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
     }
 
     if (exec.parallel_stats != nullptr) {
-        exec.parallel_stats->grouped_lifted_aggregates.fetch_add(lifted.size(),
-                                                                 std::memory_order_relaxed);
+        exec.parallel_stats->grouped_lifted_group_state.fetch_add(lifted.size(),
+                                                                  std::memory_order_relaxed);
     }
     // A field that is nothing but one aggregate — `m = median(x)` — has already
     // been computed: its staging column IS the answer, addressed by absolute
@@ -2913,18 +3120,7 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
     return std::optional<Table>{std::move(output)};
 }
 
-enum class NativeGroupedOrderedKind : std::uint8_t {
-    Lag,
-    Lead,
-    CumSum,
-    CumProd,
-    FillForward,
-    FillBackward,
-};
-
-/// Fixed-width, bare ordered kernels over one CSR group. Group rows are in
-/// original order, so each worker owns the entire state chain for its group.
-/// The byte validity staging avoids concurrent writes to packed bitmap words.
+/// Fixed-width, bare ordered kernels over one CSR group.
 auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::FieldSpec>& fields,
                                       const GroupedRows& group_rows, const ExecutionContext& exec)
     -> std::expected<std::optional<Table>, std::string> {
@@ -2933,41 +3129,11 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     }
     const auto& field = fields.front();
     const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
-    if (call == nullptr || !call->named_args.empty()) {
+    if (call == nullptr) {
         return std::optional<Table>{};
     }
-    NativeGroupedOrderedKind kind;
-    std::size_t offset = 0;
-    if (call->callee == "lag" || call->callee == "lead") {
-        if (call->args.size() != 2) {
-            return std::optional<Table>{};
-        }
-        const auto* literal = std::get_if<ir::Literal>(&call->args[1]->node);
-        const auto* value =
-            literal == nullptr ? nullptr : std::get_if<std::int64_t>(&literal->value);
-        if (value == nullptr || *value < 0) {
-            return std::optional<Table>{};
-        }
-        offset = static_cast<std::size_t>(*value);
-        kind =
-            call->callee == "lag" ? NativeGroupedOrderedKind::Lag : NativeGroupedOrderedKind::Lead;
-    } else if (call->callee == "cumsum") {
-        if (call->args.size() != 1)
-            return std::optional<Table>{};
-        kind = NativeGroupedOrderedKind::CumSum;
-    } else if (call->callee == "cumprod") {
-        if (call->args.size() != 1)
-            return std::optional<Table>{};
-        kind = NativeGroupedOrderedKind::CumProd;
-    } else if (call->callee == "fill_forward") {
-        if (call->args.size() != 1)
-            return std::optional<Table>{};
-        kind = NativeGroupedOrderedKind::FillForward;
-    } else if (call->callee == "fill_backward") {
-        if (call->args.size() != 1)
-            return std::optional<Table>{};
-        kind = NativeGroupedOrderedKind::FillBackward;
-    } else {
+    const auto ordered = classify_native_grouped_ordered(*call);
+    if (!ordered.has_value()) {
         return std::optional<Table>{};
     }
     const auto* ref = ir::as_column_ref(*call->args[0]);
@@ -2975,109 +3141,22 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
         return std::optional<Table>{};
     }
     const auto* entry = input.find_entry(ref->name);
-    if (entry == nullptr || (!std::holds_alternative<Column<std::int64_t>>(*entry->column) &&
-                             !std::holds_alternative<Column<double>>(*entry->column))) {
+    if (entry == nullptr || !ordered_source_supported(*entry)) {
         return std::optional<Table>{};
     }
 
     const std::size_t rows = input.rows();
     const std::size_t workers =
         grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
-    std::vector<std::uint8_t> invalid(rows, 0U);
+    auto [column, validity] =
+        compute_grouped_ordered_column(*ordered, *entry, group_rows, rows, workers);
     Table output = input;
-    const auto write = [&]<typename T>(const Column<T>& source) {
-        Column<T> result;
-        result.resize(rows);
-        const auto* source_validity = entry->validity ? &*entry->validity : nullptr;
-        const auto run_group = [&](std::size_t group) noexcept {
-            const auto indices = group_rows[group];
-            if (kind == NativeGroupedOrderedKind::Lag || kind == NativeGroupedOrderedKind::Lead) {
-                for (std::size_t local = 0; local < indices.size(); ++local) {
-                    const bool in_bounds = kind == NativeGroupedOrderedKind::Lag
-                                               ? local >= offset
-                                               : local + offset < indices.size();
-                    const std::size_t row = indices[local];
-                    if (!in_bounds) {
-                        result[row] = T{};
-                        invalid[row] = 1U;
-                    } else {
-                        const std::size_t source_local =
-                            kind == NativeGroupedOrderedKind::Lag ? local - offset : local + offset;
-                        result[row] = source[indices[source_local]];
-                    }
-                }
-                return;
-            }
-            if (kind == NativeGroupedOrderedKind::CumSum ||
-                kind == NativeGroupedOrderedKind::CumProd) {
-                T accumulator = kind == NativeGroupedOrderedKind::CumProd ? T{1} : T{};
-                for (const auto row : indices) {
-                    if (kind == NativeGroupedOrderedKind::CumProd) {
-                        accumulator *= source[row];
-                    } else {
-                        accumulator += source[row];
-                    }
-                    result[row] = accumulator;
-                }
-                return;
-            }
-            const bool forward = kind == NativeGroupedOrderedKind::FillForward;
-            T carry{};
-            bool have_carry = false;
-            for (std::size_t pos = 0; pos < indices.size(); ++pos) {
-                const std::size_t local = forward ? pos : indices.size() - 1 - pos;
-                const std::size_t row = indices[local];
-                const bool valid = source_validity == nullptr || (*source_validity)[row];
-                if (valid) {
-                    result[row] = source[row];
-                    carry = source[row];
-                    have_carry = true;
-                } else if (have_carry) {
-                    result[row] = carry;
-                } else {
-                    result[row] = T{};
-                    invalid[row] = 1U;
-                }
-            }
-        };
-        if (workers < 2) {
-            for (std::size_t group = 0; group < group_rows.group_count(); ++group)
-                run_group(group);
-        } else {
-            std::atomic<std::size_t> next_group{0};
-            auto batch = process_worker_pool().submit(workers, [&](std::size_t) noexcept {
-                while (true) {
-                    const std::size_t group = next_group.fetch_add(1, std::memory_order_relaxed);
-                    if (group >= group_rows.group_count())
-                        return;
-                    run_group(group);
-                }
-            });
-            batch.wait();
-        }
-        if (std::ranges::any_of(invalid, [](auto value) { return value != 0U; })) {
-            ValidityBitmap validity(rows, true);
-            for (std::size_t row = 0; row < rows; ++row) {
-                if (invalid[row] != 0U)
-                    validity.set(row, false);
-            }
-            output.add_column(field.alias, std::move(result), std::move(validity));
-        } else {
-            output.add_column(field.alias, std::move(result));
-        }
-    };
-    if (const auto* source = std::get_if<Column<std::int64_t>>(entry->column.get())) {
-        write(*source);
+    if (validity.has_value()) {
+        output.add_column(field.alias, std::move(column), std::move(*validity));
     } else {
-        write(std::get<Column<double>>(*entry->column));
+        output.add_column(field.alias, std::move(column));
     }
-    apply_table_properties(output, TableProperties::derive(
-                                       table_properties_of(output),
-                                       [&](const std::string& name) -> KeyFate {
-                                           return name == field.alias ? KeyFate::overwritten()
-                                                                      : KeyFate::kept(name);
-                                       },
-                                       RowTransform::Preserve));
+    apply_table_properties(output, derive_grouped_update_properties(output, fields));
     return std::optional<Table>{std::move(output)};
 }
 
@@ -3089,16 +3168,18 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
     if (ir::is_row_local_update_expr(field.expr) && !expr_contains_aggregate_call(field.expr)) {
         return true;
     }
-    // A field mixing aggregates with row-local terms is admitted on exactly the
-    // test its executor uses -- a trial lift over a copy of the expression --
-    // rather than on a looser proxy. A clause of nothing but non-native
-    // aggregates must keep its single shared group pass instead of paying one
-    // group plan per staged field for nothing.
-    if (expr_contains_aggregate_call(field.expr) && ir::is_row_local_update_expr(field.expr)) {
-        ir::Expr probe = field.expr;
+    // A field mixing group state into row-local terms is admitted on exactly
+    // the test its executor uses -- a trial lift over a copy of the expression
+    // -- rather than on a looser proxy. A clause of nothing but fields the
+    // lifter declines must keep its single shared group pass instead of paying
+    // one group plan per staged field for nothing.
+    {
+        ir::Expr probe;
         std::size_t counter = 0;
-        std::vector<LiftedGroupAggregate> lifted;
-        return lift_grouped_aggregates(probe, input, counter, lifted) && !lifted.empty();
+        std::vector<LiftedGroupState> lifted;
+        if (plan_lifted_group_state(field.expr, input, probe, counter, lifted)) {
+            return true;
+        }
     }
     const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
     if (call == nullptr || !call->named_args.empty()) {

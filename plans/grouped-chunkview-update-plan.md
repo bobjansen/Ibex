@@ -105,7 +105,8 @@ each state shape is introduced.
    validity staging is merged only after the worker barrier. `rank` remains on
    the evaluator until its order-key, null placement, and tie-method contract
    is stated as a separate native plan; variable-width ordered state likewise
-   remains on the materialized path.
+   remains on the materialized path. Ordered state INSIDE an expression is
+   slice 9.
 6. **Windowed grouped updates.** **Completed.** *Time-index validation:* a
    grouped window now establishes, before any kernel relies on it, that each
    group's rows are time-ascending. A stated ordering proves it for free when it
@@ -209,6 +210,29 @@ each state shape is introduced.
    staged into one, and the whole field must be row-local once its aggregates
    are ignored. `rank`, ordered group state, and `window`-clause `lag`/`lead`
    remain where slices 5 and 6 left them.
+
+9. **Ordered group state inside expressions.** **Completed.** Slice 5 made
+   `lag`, `cumsum`, and the fills native, but only as a field's ENTIRE
+   expression. `log(price / lag(price, 1))` — the log-return shape, and the one
+   the `update_group_filter` and `log_return_momentum` benchmarks run — still
+   fell to the materialized evaluator because the `lag` sat inside an
+   expression. Ordered state now lifts exactly as an aggregate does: the CSR
+   walk already produces a value per row, so once it is a staging column the
+   expression around it is ordinary row-local work. The two lift modes differ
+   only in how the staging column is filled — an aggregate broadcasts one value
+   to the group's rows, an ordered kernel writes a distinct value per row.
+   *Admission stated once:* `plan_lifted_group_state` performs the rewrite and
+   then asks whether what is LEFT is row-local and aggregate-free. That is the
+   whole contract, asked of the rewritten expression rather than guessed at
+   from the original — an extern, a rolling call, or a `rank` survives the
+   rewrite and fails it. The candidate test the staging loop uses and the
+   executor now call the same function, so a field cannot be admitted to
+   staging on one test and then declined by another.
+   *Not covered:* `rank` still states no order-key, null-placement, or
+   tie-method contract to the native protocols and keeps its field on the
+   evaluator; an ordered kernel's argument must be aggregate-free (a staged
+   argument is evaluated before any reduction runs, so `cumsum(x - mean(x))`
+   would need the two staging passes interleaved).
 
 ## Initial acceptance tests
 

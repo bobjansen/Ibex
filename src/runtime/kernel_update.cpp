@@ -5,11 +5,14 @@
 
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -2045,6 +2048,352 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
         return true;
     }
     return false;
+}
+
+auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
+                       const ScalarRegistry* scalars) -> DirectFieldRoute {
+    DirectFieldRoute route;
+    route.string = make_string_interpolation_plan(expr, input, scalars);
+    if (route.string.has_value()) {
+        return route;
+    }
+    route.categorical = try_plan_direct_categorical_field(expr, input, scalars);
+    if (route.categorical.has_value()) {
+        return route;
+    }
+    route.predicate = try_plan_direct_predicate_field(expr);
+    if (route.predicate.has_value()) {
+        return route;
+    }
+    route.validity = try_plan_direct_validity_field(expr, input, scalars);
+    if (route.validity.has_value()) {
+        return route;
+    }
+    route.fixed_width = try_plan_direct_fixed_width_field(expr, input, scalars);
+    return route;
+}
+
+namespace {
+
+/// Merge the per-range validity bitmaps a split field produced. Each range owns
+/// a dense bitmap of its own rows, so this is positional and needs no lock; a
+/// range that produced none was wholly valid.
+auto merge_range_validity(
+    std::span<const std::expected<std::optional<ValidityBitmap>, std::string>> pieces,
+    std::size_t rows, std::size_t grain) -> std::optional<ValidityBitmap> {
+    if (!std::ranges::any_of(pieces, [](const auto& piece) { return piece->has_value(); })) {
+        return std::nullopt;
+    }
+    ValidityBitmap merged(rows, true);
+    for (std::size_t index = 0; index < pieces.size(); ++index) {
+        if (!pieces[index]->has_value()) {
+            continue;
+        }
+        const std::size_t begin = index * grain;
+        const ValidityBitmap& source = **pieces[index];
+        for (std::size_t offset = 0; offset < source.size(); ++offset) {
+            merged.set(begin + offset, source[offset]);
+        }
+    }
+    return merged;
+}
+
+}  // namespace
+
+auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
+                            const PredicateInput& input, std::optional<ExprType> inferred,
+                            const ScalarRegistry* scalars, const ExecutionContext& exec,
+                            const DirectFieldRangeWriter* fallback,
+                            std::atomic<bool>* direct_numeric_writer)
+    -> std::expected<std::optional<ComputedColumn>, std::string> {
+    if (!route.has_plan() && fallback == nullptr) {
+        return std::optional<ComputedColumn>{};
+    }
+    const std::size_t rows = input.rows();
+    // Same derivation as an island's, so the two parallel paths partition
+    // alike. Note a zero `parallel_grain` now means "derive", not "one row per
+    // morsel" — reading it directly here would have split a 20M-row update into
+    // 20M tasks.
+    const std::size_t grain = island_grain(exec, rows);
+    if (grain == 0) {
+        return std::optional<ComputedColumn>{};
+    }
+    const std::size_t morsels = (rows + grain - 1) / grain;
+    auto& pool = process_worker_pool();
+    const std::size_t threads =
+        std::min(morsels, exec.parallel_threads != 0 ? exec.parallel_threads : pool.size());
+    if (threads < 2 || morsels < 2) {
+        return std::optional<ComputedColumn>{};
+    }
+    const auto range_of = [&](std::size_t index) {
+        const std::size_t begin = index * grain;
+        return ::ibex::runtime::RowRange{.begin = begin, .count = std::min(grain, rows - begin)};
+    };
+
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (route.string.has_value()) {
+        // The count pass supplies both the byte prefix for each window and the
+        // dense validity each writer must honour.  Invalid rows deliberately
+        // contribute no bytes, matching the reference evaluator's empty
+        // payload and avoiding reads of their undefined source payloads.
+        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
+        std::vector<std::expected<std::uint32_t, std::string>> bytes(morsels);
+        std::atomic<std::size_t> cursor{0};
+        auto count_batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const auto range = range_of(index);
+                auto validity = collect_expr_validity(expr, input, range);
+                const auto count = string_interpolation_bytes(
+                    *route.string, range, validity.has_value() ? &*validity : nullptr);
+                if (!count.has_value()) {
+                    pieces[index] = std::unexpected(
+                        "evaluate_field_windows: string output exceeds uint32 offsets");
+                    bytes[index] = std::unexpected(
+                        "evaluate_field_windows: string output exceeds uint32 offsets");
+                    continue;
+                }
+                pieces[index] = std::move(validity);
+                bytes[index] = *count;
+            }
+        });
+        count_batch.wait();
+        for (std::size_t index = 0; index < morsels; ++index) {
+            if (!pieces[index].has_value()) {
+                return std::unexpected(pieces[index].error());
+            }
+            if (!bytes[index].has_value()) {
+                return std::unexpected(bytes[index].error());
+            }
+        }
+
+        std::vector<std::uint32_t> char_prefix(morsels + 1, 0);
+        for (std::size_t index = 0; index < morsels; ++index) {
+            if (*bytes[index] > std::numeric_limits<std::uint32_t>::max() - char_prefix[index]) {
+                return std::unexpected(
+                    "evaluate_field_windows: string output exceeds uint32 offsets");
+            }
+            char_prefix[index + 1] = char_prefix[index] + *bytes[index];
+        }
+        Column<std::string> strings;
+        strings.resize_for_gather(rows, char_prefix.back());
+        auto* offsets = strings.offsets_data();
+        for (std::size_t index = 0; index < morsels; ++index) {
+            offsets[index * grain] = char_prefix[index];
+        }
+        offsets[rows] = char_prefix.back();
+
+        std::atomic<bool> write_failed{false};
+        cursor.store(0, std::memory_order_relaxed);
+        auto write_batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const auto range = range_of(index);
+                if (!write_string_interpolation(
+                        *route.string, range,
+                        pieces[index]->has_value() ? &**pieces[index] : nullptr,
+                        StringOutputSpan{.offsets = offsets,
+                                         .chars = strings.chars_data(),
+                                         .begin = range.begin,
+                                         .count = range.count,
+                                         .char_base = char_prefix[index]})) {
+                    write_failed.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+        write_batch.wait();
+        if (write_failed.load(std::memory_order_relaxed)) {
+            return std::unexpected("evaluate_field_windows: string window shape mismatch");
+        }
+        return std::optional<ComputedColumn>{
+            ComputedColumn{.column = ColumnValue{std::move(strings)},
+                           .validity = merge_range_validity(pieces, rows, grain)}};
+    }
+
+    if (route.categorical.has_value()) {
+        using Code = Column<Categorical>::code_type;
+        std::vector<Code> codes(rows, 0);
+        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(threads, [&](std::size_t) {
+            while (true) {
+                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+                if (index >= morsels) {
+                    return;
+                }
+                const auto range = range_of(index);
+                auto validity =
+                    write_direct_categorical_field_range(*route.categorical, input, range, scalars,
+                                                         {.codes = codes.data() + range.begin,
+                                                          .begin = range.begin,
+                                                          .count = range.count});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
+                }
+                pieces[index] = std::move(*validity);
+            }
+        });
+        batch.wait();
+        for (auto& piece : pieces) {
+            if (!piece.has_value()) {
+                return std::unexpected(piece.error());
+            }
+        }
+        Column<Categorical> categorical(route.categorical->dictionary, route.categorical->index,
+                                        std::move(codes));
+        return std::optional<ComputedColumn>{
+            ComputedColumn{.column = ColumnValue{std::move(categorical)},
+                           .validity = merge_range_validity(pieces, rows, grain)}};
+    }
+
+    // The output representation: the update's inferred type when the caller has
+    // one, else the selected plan's own output kind. They agree wherever both
+    // exist — a plan is only selected for an expression whose result it can
+    // name — and the plan is the only answer a chunk caller has.
+    const auto plan_kind = [&]() -> std::optional<ExprType> {
+        if (route.predicate.has_value()) {
+            return ExprType::Bool;
+        }
+        if (route.validity.has_value()) {
+            return route.validity->numeric_kind == FixedWidthNumericKind::Int ? ExprType::Int
+                                                                              : ExprType::Double;
+        }
+        if (route.fixed_width.has_value()) {
+            return route.fixed_width->numeric_kind == FixedWidthNumericKind::Int ? ExprType::Int
+                                                                                 : ExprType::Double;
+        }
+        return std::nullopt;
+    }();
+    const auto destination = inferred.has_value() ? inferred : plan_kind;
+    if (!destination.has_value() ||
+        (*destination != ExprType::Int && *destination != ExprType::Double &&
+         *destination != ExprType::Bool)) {
+        return std::optional<ComputedColumn>{};
+    }
+
+    // Allocate the destination up front and let each worker copy its own morsel
+    // into it. Merging the pieces serially after the barrier was a second full
+    // pass over the result — at 8M rows, 64MB read plus 64MB write — and a
+    // memory-bound kernel like `abs(price)` only moves ~128MB in total, so the
+    // merge cost what the threads saved and then some (measured: 8.8ms
+    // parallel vs 5.8ms serial). Copying inside the task does it while the
+    // piece is still hot in that worker's cache, and does it in parallel.
+    ColumnValue out = *destination == ExprType::Int      ? ColumnValue{Column<std::int64_t>{}}
+                      : *destination == ExprType::Double ? ColumnValue{Column<double>{}}
+                                                         : ColumnValue{Column<bool>{}};
+    std::int64_t* dst_int = nullptr;
+    double* dst_double = nullptr;
+    std::uint64_t* dst_bool_words = nullptr;
+    if (auto* ints = std::get_if<Column<std::int64_t>>(&out)) {
+        ints->resize_for_overwrite(rows);
+        dst_int = ints->data();
+    } else if (auto* doubles = std::get_if<Column<double>>(&out)) {
+        doubles->resize_for_overwrite(rows);
+        dst_double = doubles->data();
+    } else {
+        auto& bools = std::get<Column<bool>>(out);
+        bools.resize(rows);
+        dst_bool_words = bools.words_data();
+    }
+
+    std::atomic<bool> local_direct_numeric{false};
+    std::atomic<bool>& used_direct_numeric =
+        direct_numeric_writer != nullptr ? *direct_numeric_writer : local_direct_numeric;
+
+    // One slot per morsel, each written by exactly one worker — no lock, and
+    // the result order is positional rather than dependent on completion order.
+    // Only the validity survives the task; the values are already in `out`.
+    std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
+    std::atomic<std::size_t> cursor{0};
+    auto batch = pool.submit(threads, [&](std::size_t) {
+        while (true) {
+            const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (index >= morsels) {
+                return;
+            }
+            const auto range = range_of(index);
+            const std::size_t begin = range.begin;
+            if (dst_bool_words != nullptr) {
+                if (!route.predicate.has_value()) {
+                    pieces[index] =
+                        std::unexpected("evaluate_field_windows: missing native predicate plan");
+                    continue;
+                }
+                auto validity = write_direct_predicate_range(
+                    *route.predicate, input, range, scalars,
+                    BoolOutputSpan{.words = dst_bool_words, .begin = begin, .count = range.count});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
+                }
+                pieces[index] = std::move(*validity);
+                continue;
+            }
+            const NumericOutputSpan window{
+                .ints = dst_int != nullptr ? dst_int + begin : nullptr,
+                .doubles = dst_double != nullptr ? dst_double + begin : nullptr};
+            const bool validity_destination =
+                route.validity.has_value() &&
+                ((route.validity->numeric_kind == FixedWidthNumericKind::Int &&
+                  dst_int != nullptr) ||
+                 (route.validity->numeric_kind == FixedWidthNumericKind::Double &&
+                  dst_double != nullptr));
+            if (validity_destination) {
+                auto validity = write_direct_validity_field_range(*route.validity, input, range,
+                                                                  scalars, {.numeric = window});
+                if (!validity.has_value()) {
+                    pieces[index] = std::unexpected(std::move(validity.error()));
+                    continue;
+                }
+                pieces[index] = std::move(*validity);
+                continue;
+            }
+            const bool fixed_width_destination =
+                route.fixed_width.has_value() &&
+                ((route.fixed_width->numeric_kind == FixedWidthNumericKind::Int &&
+                  dst_int != nullptr) ||
+                 (route.fixed_width->numeric_kind == FixedWidthNumericKind::Double &&
+                  dst_double != nullptr));
+            if (fixed_width_destination &&
+                write_direct_field_range(*route.fixed_width, input, range, scalars,
+                                         {.numeric = window})) {
+                pieces[index] = collect_expr_validity(expr, input, range);
+                if (route.fixed_width->kind == DirectFieldKind::NumericBinary) {
+                    used_direct_numeric.store(true, std::memory_order_relaxed);
+                }
+                continue;
+            }
+            if (fallback == nullptr) {
+                pieces[index] = std::unexpected(
+                    "evaluate_field_windows: no direct plan covers this range and the caller "
+                    "supplied no writer");
+                continue;
+            }
+            pieces[index] = (*fallback)(range, window);
+        }
+    });
+    batch.wait();
+
+    if (used_direct_numeric.load(std::memory_order_relaxed) && exec.parallel_stats != nullptr) {
+        exec.parallel_stats->parallel_direct_numeric_fields.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (auto& piece : pieces) {
+        if (!piece.has_value()) {
+            return std::unexpected(piece.error());
+        }
+    }
+    return std::optional<ComputedColumn>{ComputedColumn{
+        .column = std::move(out), .validity = merge_range_validity(pieces, rows, grain)}};
 }
 
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,

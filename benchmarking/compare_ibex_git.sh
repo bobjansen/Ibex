@@ -18,7 +18,13 @@
 #   ./benchmarking/compare_ibex_git.sh --base v0.3.0 --target HEAD
 #
 # Notes:
-#   - Uses Release builds in temporary per-state build directories
+#   - Release builds live in a persistent per-side cache (default
+#     ~/.cache/ibex/perfcmp, override with IBEX_PERFCMP_CACHE): each side's
+#     worktree and build tree are reused across runs, so cmake configures once
+#     per side and later runs pay only an incremental ninja build. Stable slot
+#     paths also keep the -ffile-prefix-map values stable, so ccache
+#     (auto-wired by the CMakeLists) hits on unchanged translation units.
+#     --no-cache falls back to throwaway temp builds.
 #   - Uses the same CSV inputs for both sides (from the current repo by default)
 
 set -euo pipefail
@@ -57,12 +63,19 @@ Options:
   --csv-events <path>       events.csv path
   --csv-lookup <path>       lookup.csv path
   --csv-users <path>        users.csv path
-  --keep-temp               Keep temporary worktrees/results directory
+  --keep-temp               Keep temporary per-run results directory
+  --no-cache                Build in throwaway temp dirs instead of the
+                            persistent worktree/build cache
   -h, --help                Show this help
 
 States:
   WORKTREE means the current checkout including local uncommitted changes.
   Any other value is resolved as a git revision.
+
+Environment:
+  IBEX_PERFCMP_CACHE   Persistent cache root (default ~/.cache/ibex/perfcmp).
+                       Delete it to force a full reconfigure/rebuild.
+  IBEX_PERFCMP_TMPDIR  Per-run results/logs location (default /tmp).
 EOF
 }
 
@@ -76,6 +89,7 @@ REPEATS=15
 INTERLEAVE=0
 REPLICA_CONTROL=0
 KEEP_TEMP=0
+USE_CACHE=1
 TASKSET_CPUSET=""
 NUMA_NODE=""
 IBEX_SUITE=""
@@ -112,6 +126,7 @@ while [[ $# -gt 0 ]]; do
         --csv-lookup) CSV_LOOKUP="$2"; shift 2 ;;
         --csv-users) CSV_USERS="$2"; shift 2 ;;
         --keep-temp) KEEP_TEMP=1; shift ;;
+        --no-cache) USE_CACHE=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -169,9 +184,9 @@ if [[ "$NEEDS_CSV" -eq 1 && ! -f "$CSV" ]]; then
     exit 1
 fi
 
-# IBEX_PERFCMP_TMPDIR relocates the (large) temp build trees off the default
-# /tmp — useful when /tmp is a small tmpfs (e.g. WSL2) or to land builds on a
-# roomier disk. Defaults to /tmp to preserve prior behaviour.
+# IBEX_PERFCMP_TMPDIR relocates the per-run results/logs directory (small) off
+# the default /tmp. The large trees (worktrees, build dirs) live in the
+# persistent cache below, not here.
 if [[ "$REPLICA_CONTROL" -eq 1 && "$BASE_STATE" == "WORKTREE" ]]; then
     echo "error: --replica-control requires --base <ref>; it rebuilds the base source" >&2
     echo "       at a second worktree path, which WORKTREE (uncommitted state) cannot do" >&2
@@ -191,9 +206,43 @@ case "$(basename "${IBEX_CXX:-clang++}")" in
 esac
 
 TMP_ROOT="$(mktemp -d "${IBEX_PERFCMP_TMPDIR:-/tmp}/ibex-perfcmp.XXXXXX")"
-BASE_WT=""
-TARGET_WT=""
-CTRL_WT=""
+
+# Persistent per-side slots: <slot>/wt is a detached worktree at the side's
+# commit, <slot>/build its Release build dir, <slot>/build-key a fingerprint
+# of the toolchain + configure flags (a mismatch wipes the build dir so cmake
+# starts clean). Reusing slots makes cmake configure a once-per-side cost and
+# every later build an incremental ninja build; stable paths also let ccache
+# hit across runs. WORKTREE sides build from the real checkout, so they use a
+# separate "<role>-worktree" slot — otherwise alternating a role between
+# WORKTREE and ref duty would re-key its slot and reconfigure every flip. A
+# lock serializes concurrent compare runs over the shared slots.
+CACHE_ROOT="${IBEX_PERFCMP_CACHE:-$HOME/.cache/ibex/perfcmp}"
+if [[ "$USE_CACHE" -eq 1 ]]; then
+    mkdir -p "$CACHE_ROOT"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$CACHE_ROOT/lock"
+        if ! flock -n 9; then
+            echo "Another compare run holds the cache lock; waiting ..." >&2
+            flock 9
+        fi
+    fi
+fi
+slot_root() {
+    if [[ "$USE_CACHE" -eq 1 ]]; then
+        printf '%s/%s\n' "$CACHE_ROOT" "$1"
+    else
+        printf '%s/slot-%s\n' "$TMP_ROOT" "$1"
+    fi
+}
+
+cleanup() {
+    if [[ "$KEEP_TEMP" -eq 0 ]]; then
+        rm -rf "$TMP_ROOT"
+    fi
+    # Persistent cache worktrees survive; prune only drops registrations of
+    # --no-cache temp worktrees whose directories were removed above.
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+}
 PIN_DESC="<none>"
 declare -a PIN_PREFIX=()
 if [[ -n "$NUMA_NODE" ]]; then
@@ -209,41 +258,54 @@ if [[ -n "$TASKSET_CPUSET" ]]; then
     fi
 fi
 
-cleanup() {
-    if [[ -n "$BASE_WT" ]]; then
-        git -C "$REPO_ROOT" worktree remove --force "$BASE_WT" >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$TARGET_WT" ]]; then
-        git -C "$REPO_ROOT" worktree remove --force "$TARGET_WT" >/dev/null 2>&1 || true
-    fi
-    if [[ -n "$CTRL_WT" ]]; then
-        git -C "$REPO_ROOT" worktree remove --force "$CTRL_WT" >/dev/null 2>&1 || true
-    fi
-    if [[ "$KEEP_TEMP" -eq 0 ]]; then
-        rm -rf "$TMP_ROOT"
-    fi
-}
 trap cleanup EXIT
 
+GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --git-common-dir)"
+if [[ "$GIT_COMMON_DIR" != /* ]]; then
+    GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR"
+fi
+
+# Make $wt a detached worktree of this repo at $sha, reusing the slot's
+# existing worktree with a force checkout when one is already present.
+ensure_worktree() {
+    local wt="$1" sha="$2"
+    if [[ -e "$wt/.git" ]]; then
+        local common
+        common="$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null || true)"
+        if [[ "$common" != /* ]]; then
+            common="$(cd "$wt" && cd "${common:-.}" 2>/dev/null && pwd || true)"
+        fi
+        if [[ "$common" != "$GIT_COMMON_DIR" ]]; then
+            # Slot holds a worktree from another checkout; start over.
+            rm -rf "$wt"
+            git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+        fi
+    fi
+    mkdir -p "$(dirname "$wt")"
+    if [[ -e "$wt/.git" ]]; then
+        git -C "$wt" checkout --force --detach "$sha" >/dev/null
+    else
+        rm -rf "$wt"
+        git -C "$REPO_ROOT" worktree add --detach "$wt" "$sha" >/dev/null
+    fi
+}
+
 resolve_state_dir() {
-    local state="$1"
-    local slot="$2"
+    local state="$1" role="$2"
     local -n result_dir="$3"
+    local -n result_slot="$4"
     if [[ "$state" == "WORKTREE" ]]; then
         result_dir="$REPO_ROOT"
+        result_slot="$(slot_root "$role-worktree")"
         return 0
     fi
-    git -C "$REPO_ROOT" rev-parse --verify "$state^{commit}" >/dev/null
-    local wt="$TMP_ROOT/wt-$slot"
-    if ! git -C "$REPO_ROOT" worktree add --detach "$wt" "$state" >/dev/null; then
-        return 1
-    fi
-    if [[ "$slot" == "base" ]]; then
-        BASE_WT="$wt"
-    else
-        TARGET_WT="$wt"
-    fi
+    local sha
+    sha="$(git -C "$REPO_ROOT" rev-parse --verify "$state^{commit}")"
+    local wt
+    wt="$(slot_root "$role")/wt"
+    ensure_worktree "$wt" "$sha"
     result_dir="$wt"
+    result_slot="$(slot_root "$role")"
 }
 
 state_label() {
@@ -264,10 +326,25 @@ state_label() {
     printf "%s@%s" "$state" "$short"
 }
 
-configure_and_build() {
-    local src_dir="$1"
-    local build_dir="$2"
-    local log_file="$3"
+# Fingerprint of everything a cached build dir depends on besides the sources
+# (ninja tracks those): toolchain identity and the fixed configure flags. A
+# key mismatch means the build dir was made by a different setup, so wipe it.
+build_key() {
+    local src_dir="$1" build_dir="$2"
+    local cc="${IBEX_CC:-clang}" cxx="${IBEX_CXX:-clang++}"
+    {
+        echo "repo=$GIT_COMMON_DIR"
+        echo "cc=$(command -v "$cc" || echo "$cc"): $("$cc" --version 2>/dev/null | head -1)"
+        echo "cxx=$(command -v "$cxx" || echo "$cxx"): $("$cxx" --version 2>/dev/null | head -1)"
+        echo "generator=Ninja type=Release march_native=ON lightgbm=OFF parquet=OFF python_bridge=OFF"
+        echo "prefix_map=$PREFIX_MAP_ENABLED"
+        echo "src=$src_dir"
+        echo "build=$build_dir"
+    } | sha256sum | cut -d' ' -f1
+}
+
+ensure_build() {
+    local label="$1" src_dir="$2" build_dir="$3" log_file="$4"
     local -a canonical_path_args=()
 
     if [[ "$PREFIX_MAP_ENABLED" -eq 1 ]]; then
@@ -280,24 +357,37 @@ configure_and_build() {
         )
     fi
 
-    # Compiler is overridable (IBEX_CC/IBEX_CXX) so callers on boxes without a
-    # bare `clang`/`clang++` on PATH can pass a versioned toolchain, e.g. the AWS
-    # runner passes clang-21/clang++-21. Both are set explicitly because the
-    # top-level CMakeLists only auto-derives CMAKE_C_COMPILER when CXX ends in
-    # exactly "clang++" (a versioned "clang++-21" wouldn't match).
-    if ! cmake -S "$src_dir" -B "$build_dir" \
-        -G Ninja \
-        -DCMAKE_C_COMPILER="${IBEX_CC:-clang}" \
-        -DCMAKE_CXX_COMPILER="${IBEX_CXX:-clang++}" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DIBEX_ENABLE_MARCH_NATIVE=ON \
-        -DIBEX_BUILD_LIGHTGBM=OFF \
-        -DIBEX_BUILD_PARQUET=OFF \
-        -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
-        "${canonical_path_args[@]}" >"$log_file" 2>&1; then
-        cat "$log_file" >&2
-        return 1
+    local slot_dir key
+    slot_dir="$(dirname "$build_dir")"
+    key="$(build_key "$src_dir" "$build_dir")"
+    if [[ -d "$build_dir" && "$(cat "$slot_dir/build-key" 2>/dev/null || true)" == "$key" ]]; then
+        echo "  $label: build dir cached, configure skipped" >&2
+    else
+        rm -rf "$build_dir"
+        mkdir -p "$slot_dir"
+        echo "  $label: configuring new build dir" >&2
+        # Compiler is overridable (IBEX_CC/IBEX_CXX) so callers on boxes without a
+        # bare `clang`/`clang++` on PATH can pass a versioned toolchain, e.g. the AWS
+        # runner passes clang-21/clang++-21. Both are set explicitly because the
+        # top-level CMakeLists only auto-derives CMAKE_C_COMPILER when CXX ends in
+        # exactly "clang++" (a versioned "clang++-21" wouldn't match).
+        if ! cmake -S "$src_dir" -B "$build_dir" \
+            -G Ninja \
+            -DCMAKE_C_COMPILER="${IBEX_CC:-clang}" \
+            -DCMAKE_CXX_COMPILER="${IBEX_CXX:-clang++}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DIBEX_ENABLE_MARCH_NATIVE=ON \
+            -DIBEX_BUILD_LIGHTGBM=OFF \
+            -DIBEX_BUILD_PARQUET=OFF \
+            -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+            "${canonical_path_args[@]}" >"$log_file" 2>&1; then
+            cat "$log_file" >&2
+            return 1
+        fi
+        printf '%s\n' "$key" >"$slot_dir/build-key"
     fi
+    # Skipping `cmake -S -B` on cache hits is deliberate: ninja re-runs cmake
+    # itself when a CMakeLists.txt changed, which is the only real dependency.
     if ! cmake --build "$build_dir" --parallel --target ibex_bench >>"$log_file" 2>&1; then
         cat "$log_file" >&2
         return 1
@@ -411,18 +501,20 @@ run_named_side_repeat() {
 
 BASE_DIR=""
 TARGET_DIR=""
-resolve_state_dir "$BASE_STATE" "base" BASE_DIR
-resolve_state_dir "$TARGET_STATE" "target" TARGET_DIR
+resolve_state_dir "$BASE_STATE" "base" BASE_DIR BASE_SLOT
+resolve_state_dir "$TARGET_STATE" "target" TARGET_DIR TARGET_SLOT
 BASE_LABEL="$(state_label "$BASE_STATE" "$BASE_DIR")"
 TARGET_LABEL="$(state_label "$TARGET_STATE" "$TARGET_DIR")"
 
 CTRL_DIR=""
 if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
-    # Same commit as base, second worktree. Prefix maps canonicalize compiler-
-    # generated paths; binary identity is checked after both builds.
-    CTRL_WT="$TMP_ROOT/wt-replica"
-    git -C "$REPO_ROOT" worktree add --detach "$CTRL_WT" "$BASE_STATE" >/dev/null
-    CTRL_DIR="$CTRL_WT"
+    # Same commit as base, second worktree at a different path (its
+    # prefix-map flag strings differ from base's, so ccache cannot serve
+    # base's objects and the ctrl build stays genuinely independent). Prefix
+    # maps canonicalize compiler-generated paths; binary identity is checked
+    # after both builds.
+    CTRL_DIR="$(slot_root ctrl)/wt"
+    ensure_worktree "$CTRL_DIR" "$(git -C "$REPO_ROOT" rev-parse --verify "$BASE_STATE^{commit}")"
 fi
 
 BASE_TSV="$TMP_ROOT/base.tsv"
@@ -431,9 +523,9 @@ CTRL_TSV="$TMP_ROOT/ctrl.tsv"
 CONTROL_METRICS_TSV="$TMP_ROOT/control-metrics.tsv"
 REPORT_TSV="$TMP_ROOT/report.tsv"
 SUMMARY_TSV="$TMP_ROOT/summary.tsv"
-BASE_BUILD_DIR="$TMP_ROOT/build-base"
-TARGET_BUILD_DIR="$TMP_ROOT/build-target"
-CTRL_BUILD_DIR="$TMP_ROOT/build-ctrl"
+BASE_BUILD_DIR="$BASE_SLOT/build"
+TARGET_BUILD_DIR="$TARGET_SLOT/build"
+CTRL_BUILD_DIR="$(slot_root ctrl)/build"
 BASE_LOG="$TMP_ROOT/log-base.txt"
 TARGET_LOG="$TMP_ROOT/log-target.txt"
 CTRL_LOG="$TMP_ROOT/log-ctrl.txt"
@@ -455,6 +547,7 @@ echo "Benchmarking base:   $BASE_LABEL" >&2
 echo "Benchmarking target: $TARGET_LABEL" >&2
 echo "Using warmup=$WARMUP, iters=$ITERS, repeats=$REPEATS, interleave=$([[ "$INTERLEAVE" -eq 1 ]] && echo on || echo off), replica-control=$([[ "$REPLICA_CONTROL" -eq 1 ]] && echo on || echo off)" >&2
 echo "Compiler path prefix map: $([[ "$PREFIX_MAP_ENABLED" -eq 1 ]] && echo on || echo off)" >&2
+echo "Build cache: $([[ "$USE_CACHE" -eq 1 ]] && echo "$CACHE_ROOT" || echo "disabled (--no-cache)")" >&2
 echo "Pinning: $PIN_DESC" >&2
 echo "Ibex suite: ${IBEX_SUITE:-all}" >&2
 if [[ -n "$MERGE_VALIDITY_ROWS" ]]; then
@@ -470,13 +563,13 @@ fi
 # Build all sides up front so --interleave can alternate their timed repeats
 # with no build in between.
 echo "Building base ..." >&2
-configure_and_build "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_LOG"
+ensure_build "base" "$BASE_DIR" "$BASE_BUILD_DIR" "$BASE_LOG"
 echo "Building target ..." >&2
-configure_and_build "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_LOG"
+ensure_build "target" "$TARGET_DIR" "$TARGET_BUILD_DIR" "$TARGET_LOG"
 CONTROL_BINARY_IDENTITY="not-requested"
 if [[ "$REPLICA_CONTROL" -eq 1 ]]; then
     echo "Building replica control (base source, second path) ..." >&2
-    configure_and_build "$CTRL_DIR" "$CTRL_BUILD_DIR" "$CTRL_LOG"
+    ensure_build "ctrl" "$CTRL_DIR" "$CTRL_BUILD_DIR" "$CTRL_LOG"
     if cmp -s "$BASE_BUILD_DIR/tools/ibex_bench" "$CTRL_BUILD_DIR/tools/ibex_bench"; then
         CONTROL_BINARY_IDENTITY="identical"
     else

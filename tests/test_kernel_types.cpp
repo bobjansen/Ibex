@@ -401,6 +401,226 @@ TEST_CASE("Row-local alias update keeps the time-index write guard", "[kernel][u
     REQUIRE(updated.error() == "cannot update time index column: time");
 }
 
+TEST_CASE("Row-local fill_null writes filled payloads and clears validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("value", Column<std::int64_t>{10, 0, 30},
+                     runtime::ValidityBitmap{true, false, true});
+    ir::CallExpr call{
+        .callee = "fill_null",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "value"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{99}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "value", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& value = std::get<Column<std::int64_t>>(*updated->columns[0].column);
+    CHECK(value[0] == 10);
+    CHECK(value[1] == 99);
+    CHECK(value[2] == 30);
+    CHECK_FALSE(updated->columns[0].validity.has_value());
+}
+
+TEST_CASE("Row-local fill_null validates its literal even when the source is all-valid",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("value", Column<std::int64_t>{10, 20});
+    ir::CallExpr call{
+        .callee = "fill_null",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "value"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"bad"}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "filled", .expr = ir::Expr{.node = std::move(call)}}};
+
+    const auto updated = runtime::kernel::update_row_local_chunk(
+        std::move(chunk), fields, nullptr, nullptr, runtime::ExecutionContext{});
+    REQUIRE_FALSE(updated.has_value());
+    CHECK(updated.error() == "fill_null: fill value type does not match column type for 'value'");
+}
+
+TEST_CASE("Row-local coalesce chooses the first valid source and retains all-null validity",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("left", Column<std::int64_t>{10, 0, 0, 0},
+                     runtime::ValidityBitmap{true, false, false, false});
+    chunk.add_column("right", Column<std::int64_t>{0, 20, 0, 0},
+                     runtime::ValidityBitmap{false, true, false, false});
+    ir::CallExpr call{.callee = "coalesce",
+                      .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "left"}}),
+                               ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "right"}})},
+                      .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "result", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& result = std::get<Column<std::int64_t>>(*updated->columns[2].column);
+    CHECK(result[0] == 10);
+    CHECK(result[1] == 20);
+    CHECK(result[2] == 0);
+    CHECK(result[3] == 0);
+    REQUIRE(updated->columns[2].validity.has_value());
+    CHECK_FALSE((*updated->columns[2].validity)[2]);
+    CHECK_FALSE((*updated->columns[2].validity)[3]);
+}
+
+TEST_CASE("Row-local coalesce literal fallback makes a nullable result all-valid",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("value", Column<double>{1.5, 0.0}, runtime::ValidityBitmap{true, false});
+    ir::CallExpr call{.callee = "coalesce",
+                      .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "value"}}),
+                               ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 7.0}})},
+                      .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "filled", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& filled = std::get<Column<double>>(*updated->columns[1].column);
+    CHECK(filled[0] == 1.5);
+    CHECK(filled[1] == 7.0);
+    CHECK_FALSE(updated->columns[1].validity.has_value());
+}
+
+TEST_CASE("Row-local CASE selects fixed-width literal arms with SQL null conditions",
+          "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{5, 0, -2},
+                     runtime::ValidityBitmap{true, false, true});
+    auto condition = ir::Expr{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    ir::CallExpr call{
+        .callee = "__case",
+        .args = {ir::make_expr_ptr(std::move(condition)),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "sign", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& sign = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    CHECK(sign[0] == 1);
+    CHECK(sign[1] == 0);  // null condition does not match; ELSE wins.
+    CHECK(sign[2] == 0);
+    CHECK_FALSE(updated->columns[1].validity.has_value());
+}
+
+TEST_CASE("Row-local CASE writes string slabs from literal arms", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{5, -2, 1});
+    auto condition = ir::Expr{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    ir::CallExpr call{
+        .callee = "__case",
+        .args = {ir::make_expr_ptr(std::move(condition)),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"up"}}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"down"}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "label", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& label = std::get<Column<std::string>>(*updated->columns[1].column);
+    CHECK(label[0] == "up");
+    CHECK(label[1] == "down");
+    CHECK(label[2] == "up");
+    CHECK_FALSE(updated->columns[1].validity.has_value());
+}
+
+TEST_CASE("Row-local CASE carries selected string-arm validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("price", Column<std::int64_t>{1, 2});
+    chunk.add_column("label", Column<std::string>{"yes", ""}, runtime::ValidityBitmap{true, false});
+    auto condition = ir::Expr{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{0}}})}};
+    ir::CallExpr call{
+        .callee = "__case",
+        .args = {ir::make_expr_ptr(std::move(condition)),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "label"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::string{"other"}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "result", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& result = std::get<Column<std::string>>(*updated->columns[2].column);
+    CHECK(result[0] == "yes");
+    CHECK(result[1] == "");
+    REQUIRE(updated->columns[2].validity.has_value());
+    CHECK_FALSE((*updated->columns[2].validity)[1]);
+}
+
+TEST_CASE("Row-local temporal parts preserve source validity", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column(
+        "time",
+        Column<Timestamp>{Timestamp{0}, Timestamp{3LL * 60 * 60 * 1'000'000'000}, Timestamp{0}},
+        runtime::ValidityBitmap{true, true, false});
+    ir::CallExpr call{.callee = "hour",
+                      .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "time"}})},
+                      .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "hour", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr,
+                                                           nullptr, runtime::ExecutionContext{});
+    REQUIRE(updated.has_value());
+    const auto& hour = std::get<Column<std::int64_t>>(*updated->columns[1].column);
+    CHECK(hour[0] == 0);
+    CHECK(hour[1] == 3);
+    REQUIRE(updated->columns[1].validity.has_value());
+    CHECK_FALSE((*updated->columns[1].validity)[2]);
+}
+
+TEST_CASE("Row-local CASE retains selected categorical labels", "[kernel][update]") {
+    runtime::Chunk chunk;
+    chunk.add_column("pick_left", Column<bool>{true, false, true});
+    chunk.add_column("left",
+                     Column<Categorical>{std::vector<std::string>{"A", "B"},
+                                         std::vector<Column<Categorical>::code_type>{0, 1, 0}});
+    chunk.add_column("right",
+                     Column<Categorical>{std::vector<std::string>{"B", "C"},
+                                         std::vector<Column<Categorical>::code_type>{1, 0, 1}});
+    ir::CallExpr call{
+        .callee = "__case",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "pick_left"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "left"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "right"}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "result", .expr = ir::Expr{.node = std::move(call)}}};
+
+    auto updated = runtime::kernel::update_row_local_chunk(
+        std::move(chunk), fields, nullptr, nullptr, runtime::ExecutionContext{.parallel = false});
+    REQUIRE(updated.has_value());
+    const auto& result = std::get<Column<Categorical>>(*updated->columns[3].column);
+    CHECK(result[0] == "A");
+    CHECK(result[1] == "B");
+    CHECK(result[2] == "A");
+}
+
 TEST_CASE("Row-local fixed-width binary update uses all-valid column views", "[kernel][update]") {
     runtime::Chunk chunk;
     chunk.add_column("left", Column<std::int64_t>{2, 3, 4});

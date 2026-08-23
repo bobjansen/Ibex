@@ -7,6 +7,7 @@
 #include <ibex/runtime/table_format.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <string_view>
@@ -31,6 +32,34 @@ auto predicate_input(const ChunkView& view) -> PredicateInput {
             const auto position = input.find_column(name);
             return position.has_value() ? &input.entry(*position) : nullptr;
         }};
+}
+
+/// Land a direct row-local write without letting representation-specific
+/// kernels make metadata claims.  In particular, an alias copy is allowed to
+/// share its source's ColumnValue, while every newly produced validity bitmap
+/// remains owned by the output ColumnEntry.
+auto write_direct_update(const Chunk& input, std::string alias, std::shared_ptr<ColumnValue> column,
+                         std::optional<ValidityBitmap> validity) -> std::optional<Chunk> {
+    const ChunkView view(input);
+    if (view.properties().time_index().has_value() && alias == *view.properties().time_index()) {
+        return std::nullopt;
+    }
+
+    Chunk output = input;
+    const ColumnEntry entry{
+        .name = std::move(alias), .column = std::move(column), .validity = std::move(validity)};
+    if (const auto existing = view.find_column(entry.name); existing.has_value()) {
+        output.columns[*existing] = entry;
+    } else {
+        output.columns.push_back(entry);
+    }
+    output.set_properties(TableProperties::derive(
+        view.properties(),
+        [&](const std::string& name) -> KeyFate {
+            return name == entry.name ? KeyFate::overwritten() : KeyFate::kept(name);
+        },
+        RowTransform::Preserve));
+    return output;
 }
 
 struct NumericOperand {
@@ -263,10 +292,6 @@ auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec
         return std::nullopt;
     }
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
-        return std::nullopt;
-    }
     const auto source = predicate_input(view);
     std::vector<NumericTreeNode> nodes;
     nodes.reserve(8);
@@ -362,25 +387,10 @@ auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec
         }
         values = std::move(output);
     }
-    Chunk output = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{
-        .name = fields.front().alias,
-        .column = std::make_shared<ColumnValue>(std::move(values)),
-        .validity = collect_expr_validity(fields.front().expr, source,
-                                          ::ibex::runtime::RowRange::whole(view.rows()))};
-    if (existing.has_value()) {
-        output.columns[*existing] = entry;
-    } else {
-        output.columns.push_back(entry);
-    }
-    output.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
-        },
-        RowTransform::Preserve));
-    return output;
+    return write_direct_update(
+        input, fields.front().alias, std::make_shared<ColumnValue>(std::move(values)),
+        collect_expr_validity(fields.front().expr, source,
+                              ::ibex::runtime::RowRange::whole(view.rows())));
 }
 
 auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
@@ -394,36 +404,13 @@ auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSp
     }
 
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
-        return std::nullopt;
-    }
     const auto source_position = view.find_column(source_ref->name);
     if (!source_position.has_value()) {
         return std::nullopt;
     }
 
-    std::vector<MappedChunkColumn> map;
-    map.reserve(view.columns() + 1);
-    bool replaced = false;
-    for (std::size_t position = 0; position < view.columns(); ++position) {
-        if (view.entry(position).name == fields.front().alias) {
-            map.push_back({.source_position = *source_position, .name = fields.front().alias});
-            replaced = true;
-        } else {
-            map.push_back({.source_position = position, .name = view.entry(position).name});
-        }
-    }
-    if (!replaced) {
-        map.push_back({.source_position = *source_position, .name = fields.front().alias});
-    }
-    const auto properties = TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
-        },
-        RowTransform::Preserve);
-    return map_chunk(view, map, properties);
+    const auto& source = view.entry(*source_position);
+    return write_direct_update(input, fields.front().alias, source.column, source.validity);
 }
 
 auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
@@ -437,28 +424,517 @@ auto try_literal_update(const Chunk& input, const std::vector<ir::FieldSpec>& fi
     }
 
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(broadcast_scalar_column(
+                                   scalar_from_literal(*literal), view.rows())),
+                               std::nullopt);
+}
+
+template <typename T>
+auto direct_literal_value(const ir::Literal& literal) -> std::optional<T> {
+    if constexpr (std::is_same_v<T, std::int64_t>) {
+        if (const auto* value = std::get_if<std::int64_t>(&literal.value))
+            return *value;
+        if (const auto* value = std::get_if<double>(&literal.value))
+            return static_cast<std::int64_t>(*value);
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (const auto* value = std::get_if<double>(&literal.value))
+            return *value;
+        if (const auto* value = std::get_if<std::int64_t>(&literal.value))
+            return static_cast<double>(*value);
+    } else if constexpr (std::is_same_v<T, bool>) {
+        if (const auto* value = std::get_if<bool>(&literal.value))
+            return *value;
+    } else if constexpr (std::is_same_v<T, std::string_view>) {
+        if (const auto* value = std::get_if<std::string>(&literal.value))
+            return std::string_view(*value);
+    } else if constexpr (std::is_same_v<T, Date>) {
+        if (const auto* value = std::get_if<Date>(&literal.value))
+            return *value;
+    } else if constexpr (std::is_same_v<T, Timestamp>) {
+        if (const auto* value = std::get_if<Timestamp>(&literal.value))
+            return *value;
+    }
+    return std::nullopt;
+}
+
+/// `fill_null` is deliberately a direct writer's first validity-changing
+/// family: it preserves every valid payload, replaces only null payloads, and
+/// clears validity because its literal fallback makes every result row valid.
+auto try_fill_null_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
+    if (call == nullptr || call->callee != "fill_null" || call->args.size() != 2 ||
+        !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto* source_ref = std::get_if<ir::ColumnRef>(&call->args[0]->node);
+    const auto* literal = std::get_if<ir::Literal>(&call->args[1]->node);
+    if (source_ref == nullptr || source_ref->lexical || literal == nullptr) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    const auto source_position = view.find_column(source_ref->name);
+    if (!source_position.has_value()) {
+        return std::nullopt;
+    }
+    const auto& source = view.entry(*source_position);
+
+    return std::visit(
+        [&](const auto& values) -> std::optional<Chunk> {
+            using Col = std::decay_t<decltype(values)>;
+            const auto fill = direct_literal_value<typename Col::value_type>(*literal);
+            if (!fill.has_value()) {
+                return std::nullopt;
+            }
+            if (!source.validity.has_value()) {
+                return write_direct_update(input, fields.front().alias, source.column,
+                                           std::nullopt);
+            }
+            Col output;
+            ColumnAppender<Col> writer(output, view.rows());
+            for (std::size_t row = 0; row < view.rows(); ++row) {
+                writer.push(source.validity->operator[](row) ? values[row] : *fill);
+            }
+            return write_direct_update(input, fields.front().alias,
+                                       std::make_shared<ColumnValue>(std::move(output)),
+                                       std::nullopt);
+        },
+        *source.column);
+}
+
+struct DirectCoalesceOperand {
+    const ColumnEntry* column = nullptr;
+    const ir::Literal* literal = nullptr;
+};
+
+/// Coalesce raw column and literal leaves without invoking the Table evaluator.
+/// More elaborate arguments retain the established evaluator, whose arbitrary
+/// expression support is the semantic authority for those shapes.
+auto try_coalesce_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
+    -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
+    if (call == nullptr || call->callee != "coalesce" || call->args.size() < 2 ||
+        !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    std::vector<DirectCoalesceOperand> operands;
+    operands.reserve(call->args.size());
+    const ColumnEntry* type_source = nullptr;
+    for (const auto& arg : call->args) {
+        if (const auto* ref = std::get_if<ir::ColumnRef>(&arg->node)) {
+            if (ref->lexical) {
+                return std::nullopt;
+            }
+            const auto position = view.find_column(ref->name);
+            if (!position.has_value()) {
+                return std::nullopt;
+            }
+            const auto& column = view.entry(*position);
+            if (type_source == nullptr) {
+                type_source = &column;
+            } else if (column.column->index() != type_source->column->index()) {
+                return std::nullopt;
+            }
+            operands.push_back({.column = &column, .literal = nullptr});
+        } else if (const auto* literal = std::get_if<ir::Literal>(&arg->node)) {
+            operands.push_back({.column = nullptr, .literal = literal});
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (type_source == nullptr) {
         return std::nullopt;
     }
 
-    Chunk result = input;
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(broadcast_scalar_column(
-                                scalar_from_literal(*literal), view.rows())),
-                            .validity = std::nullopt};
-    if (const auto existing = view.find_column(fields.front().alias); existing.has_value()) {
-        result.columns[*existing] = entry;
-    } else {
-        result.columns.push_back(entry);
-    }
-    result.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
+    return std::visit(
+        [&](const auto& first) -> std::optional<Chunk> {
+            using Col = std::decay_t<decltype(first)>;
+            using Value = typename Col::value_type;
+            std::vector<std::optional<Value>> literals;
+            literals.reserve(operands.size());
+            for (const auto& operand : operands) {
+                if (operand.literal != nullptr) {
+                    auto value = direct_literal_value<Value>(*operand.literal);
+                    if (!value.has_value()) {
+                        return std::nullopt;
+                    }
+                    literals.push_back(std::move(value));
+                } else {
+                    literals.push_back(std::nullopt);
+                }
+            }
+
+            Col output;
+            ColumnAppender<Col> writer(output, view.rows());
+            ValidityBitmap validity(view.rows(), true);
+            bool any_invalid = false;
+            for (std::size_t row = 0; row < view.rows(); ++row) {
+                bool found = false;
+                for (std::size_t index = 0; index < operands.size(); ++index) {
+                    const auto& operand = operands[index];
+                    if (operand.column == nullptr) {
+                        writer.push(*literals[index]);
+                        found = true;
+                        break;
+                    }
+                    if (operand.column->validity.has_value() && !(*operand.column->validity)[row]) {
+                        continue;
+                    }
+                    const auto* values = std::get_if<Col>(operand.column->column.get());
+                    if (values == nullptr) {
+                        return std::nullopt;
+                    }
+                    writer.push((*values)[row]);
+                    found = true;
+                    break;
+                }
+                if (!found) {
+                    if constexpr (std::is_same_v<Col, Column<Categorical>>) {
+                        writer.push(std::string_view{});
+                    } else {
+                        writer.push(Value{});
+                    }
+                    validity.set(row, false);
+                    any_invalid = true;
+                }
+            }
+            return write_direct_update(
+                input, fields.front().alias, std::make_shared<ColumnValue>(std::move(output)),
+                any_invalid ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt);
         },
-        RowTransform::Preserve));
-    return result;
+        *type_source->column);
+}
+
+struct DirectCaseValue {
+    const ColumnEntry* column = nullptr;
+    const ir::Literal* literal = nullptr;
+    bool null = false;
+};
+
+struct DirectCasePlan {
+    std::vector<Mask> conditions;
+    std::vector<DirectCaseValue> values;
+    const ColumnEntry* type_column = nullptr;
+    std::optional<ColumnValue> literal_type;
+
+    [[nodiscard]] auto type_source() const -> const ColumnValue& {
+        return type_column != nullptr ? *type_column->column : *literal_type;
+    }
+
+    [[nodiscard]] auto selected_arm(std::size_t row) const noexcept -> std::size_t {
+        for (std::size_t arm = 0; arm < conditions.size(); ++arm) {
+            const auto& condition = conditions[arm];
+            if (condition.value[row] != 0 &&
+                (!condition.valid.has_value() || (*condition.valid)[row] != 0)) {
+                return arm;
+            }
+        }
+        return conditions.size();  // else arm
+    }
+};
+
+/// Validate and prepare raw CASE arms once. Representation-specific writers
+/// share this 3VL selection plan but keep their own output ownership contract.
+auto make_direct_case_plan(const ChunkView& view, const ir::CallExpr& call,
+                           const ScalarRegistry* scalars) -> std::optional<DirectCasePlan> {
+    if (call.callee != "__case" || call.args.empty() || call.args.size() % 2 == 0 ||
+        !call.named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto source = predicate_input(view);
+    DirectCasePlan plan;
+    plan.conditions.reserve((call.args.size() - 1) / 2);
+    for (std::size_t index = 0; index + 1 < call.args.size(); index += 2) {
+        auto mask = compute_mask(*call.args[index], source, scalars,
+                                 ::ibex::runtime::RowRange::whole(view.rows()));
+        if (!mask.has_value()) {
+            return std::nullopt;
+        }
+        plan.conditions.push_back(std::move(*mask));
+    }
+
+    plan.values.reserve(plan.conditions.size() + 1);
+    const auto add_value = [&](const ir::Expr& expr) -> bool {
+        if (const auto* ref = std::get_if<ir::ColumnRef>(&expr.node)) {
+            if (ref->lexical) {
+                return false;
+            }
+            const auto position = view.find_column(ref->name);
+            if (!position.has_value()) {
+                return false;
+            }
+            const auto& column = view.entry(*position);
+            if (plan.type_column == nullptr && !plan.literal_type.has_value()) {
+                plan.type_column = &column;
+            } else if (column.column->index() != plan.type_source().index()) {
+                return false;
+            }
+            plan.values.push_back({.column = &column, .literal = nullptr, .null = false});
+            return true;
+        }
+        if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
+            if (plan.type_column == nullptr && !plan.literal_type.has_value()) {
+                plan.literal_type = broadcast_scalar_column(scalar_from_literal(*literal), 1);
+            }
+            plan.values.push_back({.column = nullptr, .literal = literal, .null = false});
+            return true;
+        }
+        if (const auto* null_call = std::get_if<ir::CallExpr>(&expr.node);
+            null_call != nullptr && null_call->callee == "__null" && null_call->args.empty()) {
+            plan.values.push_back({.column = nullptr, .literal = nullptr, .null = true});
+            return true;
+        }
+        return false;
+    };
+    for (std::size_t index = 1; index < call.args.size(); index += 2) {
+        if (!add_value(*call.args[index])) {
+            return std::nullopt;
+        }
+    }
+    if (!add_value(*call.args.back()) ||
+        (plan.type_column == nullptr && !plan.literal_type.has_value())) {
+        return std::nullopt;
+    }
+    return plan;
+}
+
+auto write_fixed_width_case(const Chunk& input, const ir::FieldSpec& field,
+                            const DirectCasePlan& plan) -> std::optional<Chunk> {
+    const ChunkView view(input);
+
+    return std::visit(
+        [&](const auto& type_values) -> std::optional<Chunk> {
+            using Col = std::decay_t<decltype(type_values)>;
+            using Value = typename Col::value_type;
+            if constexpr (std::is_same_v<Col, Column<std::string>> ||
+                          std::is_same_v<Col, Column<Categorical>>) {
+                return std::nullopt;
+            } else {
+                std::vector<std::optional<Value>> literals;
+                literals.reserve(plan.values.size());
+                for (const auto& value : plan.values) {
+                    if (value.literal != nullptr) {
+                        auto literal = direct_literal_value<Value>(*value.literal);
+                        if (!literal.has_value()) {
+                            return std::nullopt;
+                        }
+                        literals.push_back(std::move(literal));
+                    } else {
+                        literals.push_back(std::nullopt);
+                    }
+                }
+
+                Col output;
+                ColumnAppender<Col> writer(output, view.rows());
+                ValidityBitmap validity(view.rows(), true);
+                bool any_invalid = false;
+                for (std::size_t row = 0; row < view.rows(); ++row) {
+                    const std::size_t selected = plan.selected_arm(row);
+                    const auto& value = plan.values[selected];
+                    bool valid = !value.null;
+                    if (value.column != nullptr) {
+                        const auto* column = std::get_if<Col>(value.column->column.get());
+                        if (column == nullptr) {
+                            return std::nullopt;
+                        }
+                        writer.push((*column)[row]);
+                        valid =
+                            !value.column->validity.has_value() || (*value.column->validity)[row];
+                    } else if (value.literal != nullptr) {
+                        writer.push(*literals[selected]);
+                    } else {
+                        writer.push(Value{});
+                    }
+                    validity.set(row, valid);
+                    any_invalid = any_invalid || !valid;
+                }
+                return write_direct_update(
+                    input, field.alias, std::make_shared<ColumnValue>(std::move(output)),
+                    any_invalid ? std::optional<ValidityBitmap>{std::move(validity)}
+                                : std::nullopt);
+            }
+        },
+        plan.type_source());
+}
+
+auto write_string_case(const Chunk& input, const ir::FieldSpec& field, const DirectCasePlan& plan)
+    -> std::optional<Chunk> {
+    const ChunkView view(input);
+    if (!std::holds_alternative<Column<std::string>>(plan.type_source())) {
+        return std::nullopt;
+    }
+
+    std::vector<std::optional<std::string_view>> literals;
+    literals.reserve(plan.values.size());
+    for (const auto& value : plan.values) {
+        if (value.literal != nullptr) {
+            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            if (!literal.has_value()) {
+                return std::nullopt;
+            }
+            literals.push_back(std::move(literal));
+        } else {
+            literals.push_back(std::nullopt);
+        }
+    }
+    const auto selected_value = [&](std::size_t row) -> std::optional<std::string_view> {
+        const std::size_t selected = plan.selected_arm(row);
+        const auto& value = plan.values[selected];
+        if (value.null) {
+            return std::nullopt;
+        }
+        if (value.literal != nullptr) {
+            return *literals[selected];
+        }
+        const auto* column = std::get_if<Column<std::string>>(value.column->column.get());
+        if (column == nullptr ||
+            (value.column->validity.has_value() && !(*value.column->validity)[row])) {
+            return std::nullopt;
+        }
+        return (*column)[row];
+    };
+
+    std::size_t total_chars = 0;
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        const auto value = selected_value(row);
+        if (value.has_value()) {
+            if (value->size() > std::numeric_limits<std::uint32_t>::max() - total_chars) {
+                return std::nullopt;
+            }
+            total_chars += value->size();
+        }
+    }
+    Column<std::string> output;
+    output.resize_for_gather(view.rows(), static_cast<std::uint32_t>(total_chars));
+    auto* offsets = output.offsets_data();
+    auto* chars = output.chars_data();
+    offsets[0] = 0;
+    std::uint32_t cursor = 0;
+    ValidityBitmap validity(view.rows(), true);
+    bool any_invalid = false;
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        const auto value = selected_value(row);
+        if (value.has_value()) {
+            if (!value->empty()) {
+                std::memcpy(chars + cursor, value->data(), value->size());
+            }
+            cursor += static_cast<std::uint32_t>(value->size());
+        } else {
+            validity.set(row, false);
+            any_invalid = true;
+        }
+        offsets[row + 1] = cursor;
+    }
+    return write_direct_update(
+        input, field.alias, std::make_shared<ColumnValue>(std::move(output)),
+        any_invalid ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt);
+}
+
+auto write_categorical_case(const Chunk& input, const ir::FieldSpec& field,
+                            const DirectCasePlan& plan) -> std::optional<Chunk> {
+    const ChunkView view(input);
+    if (!std::holds_alternative<Column<Categorical>>(plan.type_source())) {
+        return std::nullopt;
+    }
+    std::vector<std::optional<std::string_view>> literals;
+    literals.reserve(plan.values.size());
+    for (const auto& value : plan.values) {
+        if (value.literal != nullptr) {
+            auto literal = direct_literal_value<std::string_view>(*value.literal);
+            if (!literal.has_value()) {
+                return std::nullopt;
+            }
+            literals.push_back(std::move(literal));
+        } else {
+            literals.push_back(std::nullopt);
+        }
+        if (value.column != nullptr) {
+            const auto* column = std::get_if<Column<Categorical>>(value.column->column.get());
+            if (column == nullptr) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    const auto selected_value = [&](std::size_t row) -> std::optional<std::string_view> {
+        const std::size_t selected = plan.selected_arm(row);
+        const auto& value = plan.values[selected];
+        if (value.null) {
+            return std::nullopt;
+        }
+        if (value.literal != nullptr) {
+            return *literals[selected];
+        }
+        const auto& source = std::get<Column<Categorical>>(*value.column->column);
+        if (value.column->validity.has_value() && !(*value.column->validity)[row]) {
+            return std::nullopt;
+        }
+        return source[row];
+    };
+
+    std::size_t total_chars = 0;
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        if (const auto value = selected_value(row); value.has_value()) {
+            if (value->size() > std::numeric_limits<std::uint32_t>::max() - total_chars) {
+                return std::nullopt;
+            }
+            total_chars += value->size();
+        }
+    }
+    Column<std::string> output;
+    output.resize_for_gather(view.rows(), static_cast<std::uint32_t>(total_chars));
+    auto* offsets = output.offsets_data();
+    auto* chars = output.chars_data();
+    offsets[0] = 0;
+    std::uint32_t cursor = 0;
+    ValidityBitmap validity(view.rows(), true);
+    bool any_invalid = false;
+    for (std::size_t row = 0; row < view.rows(); ++row) {
+        if (const auto value = selected_value(row); value.has_value()) {
+            if (!value->empty()) {
+                std::memcpy(chars + cursor, value->data(), value->size());
+            }
+            cursor += static_cast<std::uint32_t>(value->size());
+        } else {
+            validity.set(row, false);
+            any_invalid = true;
+        }
+        offsets[row + 1] = cursor;
+    }
+    return write_direct_update(
+        input, field.alias, std::make_shared<ColumnValue>(std::move(output)),
+        any_invalid ? std::optional<ValidityBitmap>{std::move(validity)} : std::nullopt);
+}
+
+auto try_case_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                     const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
+    if (call == nullptr) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    auto plan = make_direct_case_plan(view, *call, scalars);
+    if (!plan.has_value()) {
+        return std::nullopt;
+    }
+    if (std::holds_alternative<Column<std::string>>(plan->type_source())) {
+        return write_string_case(input, fields.front(), *plan);
+    }
+    if (std::holds_alternative<Column<Categorical>>(plan->type_source())) {
+        return write_categorical_case(input, fields.front(), *plan);
+    }
+    return write_fixed_width_case(input, fields.front(), *plan);
 }
 
 /// Whole-column unary Double transforms are a useful next step beyond binary
@@ -485,138 +961,27 @@ auto utf8_codepoint_count(std::string_view text) noexcept -> std::int64_t {
     return count;
 }
 
-/// `length` and `byte_length` are the string representation's equivalent of
-/// a fixed-width whole-column transform.  Categorical inputs count each
-/// dictionary value once before reading its flat code stream; slab strings
-/// read their offsets directly.  The evaluator remains responsible for
-/// literals and computed-string arguments.
-auto try_string_length_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
-    -> std::optional<Chunk> {
+auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                            const ScalarRegistry* scalars) -> std::optional<Chunk> {
     if (fields.size() != 1) {
         return std::nullopt;
     }
-    const auto* call = std::get_if<ir::CallExpr>(&fields.front().expr.node);
-    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty() ||
-        (call->callee != "length" && call->callee != "byte_length")) {
-        return std::nullopt;
-    }
-    const auto* source_ref = std::get_if<ir::ColumnRef>(&call->args.front()->node);
-    if (source_ref == nullptr || source_ref->lexical) {
+    const auto plan = try_plan_direct_predicate_field(fields.front().expr);
+    if (!plan.has_value()) {
         return std::nullopt;
     }
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
-        return std::nullopt;
-    }
-    const auto source_position = view.find_column(source_ref->name);
-    if (!source_position.has_value()) {
-        return std::nullopt;
-    }
-    const bool bytes = call->callee == "byte_length";
-    const auto measure = [bytes](std::string_view text) -> std::int64_t {
-        return bytes ? static_cast<std::int64_t>(text.size()) : utf8_codepoint_count(text);
-    };
-
-    Column<std::int64_t> values;
-    values.resize_for_overwrite(view.rows());
-    bool handled = false;
-    if (const auto* strings = std::get_if<Column<std::string>>(&view.column(*source_position))) {
-        const StringView source{.offsets = strings->offsets_data(),
-                                .chars = strings->chars_data(),
-                                .rows = strings->size()};
-        for (std::size_t row = 0; row < source.rows; ++row) {
-            values.data()[row] =
-                measure(std::string_view{source.chars + source.offsets[row], source.row_len(row)});
-        }
-        handled = true;
-    } else if (const auto* categorical =
-                   std::get_if<Column<Categorical>>(&view.column(*source_position))) {
-        const auto& dictionary = categorical->dictionary();
-        std::vector<std::int64_t> dictionary_lengths(dictionary.size());
-        for (std::size_t code = 0; code < dictionary.size(); ++code) {
-            dictionary_lengths[code] = measure(dictionary[code]);
-        }
-        const auto* codes = categorical->codes_data();
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            values.data()[row] = dictionary_lengths[static_cast<std::size_t>(codes[row])];
-        }
-        handled = true;
-    }
-    if (!handled) {
-        return std::nullopt;
-    }
-
-    Chunk output = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = view.validity(*source_position)};
-    if (existing.has_value()) {
-        output.columns[*existing] = entry;
-    } else {
-        output.columns.push_back(entry);
-    }
-    output.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
-        },
-        RowTransform::Preserve));
-    return output;
-}
-
-auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
-                            const ScalarRegistry* scalars) -> std::optional<Chunk> {
-    if (fields.size() != 1 || !supports_native_chunk_predicate(fields.front().expr)) {
-        return std::nullopt;
-    }
-    const bool is_boolean = std::holds_alternative<ir::CompareExpr>(fields.front().expr.node) ||
-                            std::holds_alternative<ir::LogicalExpr>(fields.front().expr.node) ||
-                            std::holds_alternative<ir::IsNullExpr>(fields.front().expr.node);
-    if (!is_boolean) {
-        return std::nullopt;
-    }
-    const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
-        return std::nullopt;
-    }
-    auto mask = compute_mask(fields.front().expr, predicate_input(view), scalars,
-                             ::ibex::runtime::RowRange::whole(view.rows()));
-    if (!mask.has_value()) {
-        return std::nullopt;
-    }
     Column<bool> values;
     values.resize(view.rows());
-    for (std::size_t row = 0; row < view.rows(); ++row) {
-        values.set(row, mask->value[row] != 0);
+    auto validity = write_direct_predicate_range(
+        *plan, predicate_input(view), ::ibex::runtime::RowRange::whole(view.rows()), scalars,
+        BoolOutputSpan{.words = values.words_data(), .begin = 0, .count = view.rows()});
+    if (!validity.has_value()) {
+        return std::nullopt;
     }
-    std::optional<ValidityBitmap> validity;
-    if (mask->valid.has_value()) {
-        ValidityBitmap bits(view.rows(), false);
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            bits.set(row, (*mask->valid)[row] != 0);
-        }
-        validity = std::move(bits);
-    }
-    Chunk result = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = std::move(validity)};
-    if (existing.has_value()) {
-        result.columns[*existing] = entry;
-    } else {
-        result.columns.push_back(entry);
-    }
-    result.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
-        },
-        RowTransform::Preserve));
-    return result;
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               std::move(*validity));
 }
 
 /// A template string is the first computed variable-width update that can use
@@ -696,10 +1061,6 @@ auto try_shared_string_interpolation_update(const Chunk& input,
         return std::nullopt;
     }
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() &&
-        fields.front().alias == *view.properties().time_index()) {
-        return std::nullopt;
-    }
     const auto source = predicate_input(view);
     auto plan = make_string_interpolation_plan(fields.front().expr, source, scalars);
     if (!plan.has_value()) {
@@ -730,23 +1091,112 @@ auto try_shared_string_interpolation_update(const Chunk& input,
         return std::nullopt;
     }
 
-    Chunk result = input;
-    const auto existing = view.find_column(fields.front().alias);
-    const ColumnEntry entry{.name = fields.front().alias,
-                            .column = std::make_shared<ColumnValue>(std::move(values)),
-                            .validity = std::move(validity)};
-    if (existing.has_value()) {
-        result.columns[*existing] = entry;
-    } else {
-        result.columns.push_back(entry);
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               std::move(validity));
+}
+
+/// Serial ChunkView execution uses the same caller-owned output window as the
+/// table splitter, just for one whole-range assignment. This makes the
+/// plan/write boundary real before parallel dispatch starts selecting it.
+auto try_planned_fixed_width_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                                    const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
     }
-    result.set_properties(TableProperties::derive(
-        view.properties(),
-        [&](const std::string& name) -> KeyFate {
-            return name == fields.front().alias ? KeyFate::overwritten() : KeyFate::kept(name);
-        },
-        RowTransform::Preserve));
-    return result;
+    const ChunkView view(input);
+    const auto source = predicate_input(view);
+    const auto plan = try_plan_direct_fixed_width_field(fields.front().expr, source, scalars);
+    if (!plan.has_value()) {
+        return std::nullopt;
+    }
+    const auto range = ::ibex::runtime::RowRange::whole(view.rows());
+    auto validity = collect_expr_validity(fields.front().expr, source, range);
+    if (plan->numeric_kind == FixedWidthNumericKind::Int) {
+        Column<std::int64_t> values;
+        values.resize_for_overwrite(view.rows());
+        if (!write_direct_field_range(*plan, source, range, scalars,
+                                      {.numeric = {.ints = values.data(), .doubles = nullptr}})) {
+            return std::nullopt;
+        }
+        return write_direct_update(input, fields.front().alias,
+                                   std::make_shared<ColumnValue>(std::move(values)),
+                                   std::move(validity));
+    }
+
+    Column<double> values;
+    values.resize_for_overwrite(view.rows());
+    if (!write_direct_field_range(*plan, source, range, scalars,
+                                  {.numeric = {.ints = nullptr, .doubles = values.data()}})) {
+        return std::nullopt;
+    }
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               std::move(validity));
+}
+
+/// Nullable numeric direct families use the same output ownership contract as
+/// the table splitter: the writer fills values and returns a fresh validity
+/// bitmap, while this wrapper alone installs the resulting ColumnEntry.
+auto try_planned_validity_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                                 const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    const auto source = predicate_input(view);
+    const auto plan = try_plan_direct_validity_field(fields.front().expr, source, scalars);
+    if (!plan.has_value()) {
+        return std::nullopt;
+    }
+    const auto range = ::ibex::runtime::RowRange::whole(view.rows());
+    if (plan->numeric_kind == FixedWidthNumericKind::Int) {
+        Column<std::int64_t> values;
+        values.resize_for_overwrite(view.rows());
+        auto validity = write_direct_validity_field_range(
+            *plan, source, range, scalars,
+            {.numeric = {.ints = values.data(), .doubles = nullptr}});
+        if (!validity.has_value()) {
+            return std::nullopt;
+        }
+        return write_direct_update(input, fields.front().alias,
+                                   std::make_shared<ColumnValue>(std::move(values)),
+                                   std::move(*validity));
+    }
+    Column<double> values;
+    values.resize_for_overwrite(view.rows());
+    auto validity = write_direct_validity_field_range(
+        *plan, source, range, scalars, {.numeric = {.ints = nullptr, .doubles = values.data()}});
+    if (!validity.has_value()) {
+        return std::nullopt;
+    }
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               std::move(*validity));
+}
+
+auto try_planned_categorical_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                                    const ScalarRegistry* scalars) -> std::optional<Chunk> {
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    const ChunkView view(input);
+    const auto source = predicate_input(view);
+    const auto plan = try_plan_direct_categorical_field(fields.front().expr, source, scalars);
+    if (!plan.has_value()) {
+        return std::nullopt;
+    }
+    std::vector<Column<Categorical>::code_type> codes(view.rows(), 0);
+    auto validity = write_direct_categorical_field_range(
+        *plan, source, ::ibex::runtime::RowRange::whole(view.rows()), scalars,
+        {.codes = codes.data(), .begin = 0, .count = view.rows()});
+    if (!validity.has_value()) {
+        return std::nullopt;
+    }
+    Column<Categorical> values(plan->dictionary, plan->index, std::move(codes));
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               std::move(*validity));
 }
 
 /// Try exactly one field on every direct ChunkView family.  Multi-field
@@ -760,10 +1210,25 @@ auto try_direct_update_field(const Chunk& input, const std::vector<ir::FieldSpec
     if (auto output = try_literal_update(input, fields); output.has_value()) {
         return output;
     }
-    if (auto output = try_numeric_tree_update(input, fields, scalars); output.has_value()) {
+    if (auto output = try_planned_categorical_update(input, fields, scalars); output.has_value()) {
         return output;
     }
-    if (auto output = try_string_length_update(input, fields); output.has_value()) {
+    if (auto output = try_planned_validity_update(input, fields, scalars); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_fill_null_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_coalesce_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_case_update(input, fields, scalars); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_planned_fixed_width_update(input, fields, scalars); output.has_value()) {
+        return output;
+    }
+    if (auto output = try_numeric_tree_update(input, fields, scalars); output.has_value()) {
         return output;
     }
     if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
@@ -889,6 +1354,561 @@ auto fixed_width_numeric_binary_kind(const ir::Expr& expr, const PredicateInput&
                    operands->second.kind == ExprType::Double
                ? FixedWidthNumericKind::Double
                : FixedWidthNumericKind::Int;
+}
+
+auto try_plan_direct_numeric_field(const ir::Expr& expr, const PredicateInput& input,
+                                   const ScalarRegistry* scalars)
+    -> std::optional<DirectFieldPlan> {
+    const auto kind = fixed_width_numeric_binary_kind(expr, input, scalars);
+    if (!kind.has_value()) {
+        return std::nullopt;
+    }
+    return DirectFieldPlan{.kind = DirectFieldKind::NumericBinary,
+                           .expression = &expr,
+                           .numeric_kind = *kind,
+                           .categorical_lengths = nullptr};
+}
+
+auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& input)
+    -> std::optional<DirectFieldPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    const auto* source = std::get_if<ir::ColumnRef>(&call->args.front()->node);
+    if (source == nullptr || source->lexical) {
+        return std::nullopt;
+    }
+    const auto part = call->callee == "year"     ? std::optional{TemporalPart::Year}
+                      : call->callee == "month"  ? std::optional{TemporalPart::Month}
+                      : call->callee == "day"    ? std::optional{TemporalPart::Day}
+                      : call->callee == "hour"   ? std::optional{TemporalPart::Hour}
+                      : call->callee == "minute" ? std::optional{TemporalPart::Minute}
+                      : call->callee == "second" ? std::optional{TemporalPart::Second}
+                                                 : std::nullopt;
+    if (!part.has_value()) {
+        return std::nullopt;
+    }
+    const auto* entry = input.find(source->name);
+    if (entry == nullptr) {
+        return std::nullopt;
+    }
+    if (const auto* dates = std::get_if<Column<Date>>(entry->column.get())) {
+        if (*part == TemporalPart::Hour || *part == TemporalPart::Minute ||
+            *part == TemporalPart::Second) {
+            return std::nullopt;
+        }
+        return DirectFieldPlan{.kind = DirectFieldKind::TemporalPart,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .temporal_part = *part,
+                               .dates = dates->data(),
+                               .categorical_lengths = nullptr};
+    }
+    if (const auto* timestamps = std::get_if<Column<Timestamp>>(entry->column.get())) {
+        return DirectFieldPlan{.kind = DirectFieldKind::TemporalPart,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .temporal_part = *part,
+                               .timestamps = timestamps->data(),
+                               .categorical_lengths = nullptr};
+    }
+    return std::nullopt;
+}
+
+auto try_plan_direct_string_length_field(const ir::Expr& expr, const PredicateInput& input)
+    -> std::optional<DirectFieldPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty() ||
+        (call->callee != "length" && call->callee != "byte_length")) {
+        return std::nullopt;
+    }
+    const auto* source = std::get_if<ir::ColumnRef>(&call->args.front()->node);
+    if (source == nullptr || source->lexical) {
+        return std::nullopt;
+    }
+    const auto* entry = input.find(source->name);
+    if (entry == nullptr) {
+        return std::nullopt;
+    }
+    const bool bytes = call->callee == "byte_length";
+    if (const auto* strings = std::get_if<Column<std::string>>(entry->column.get())) {
+        return DirectFieldPlan{.kind = DirectFieldKind::StringLength,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .byte_length = bytes,
+                               .strings = strings,
+                               .categorical_lengths = nullptr};
+    }
+    if (const auto* categorical = std::get_if<Column<Categorical>>(entry->column.get())) {
+        auto lengths = std::make_shared<std::vector<std::int64_t>>();
+        lengths->reserve(categorical->dictionary_size());
+        for (const auto& label : categorical->dictionary()) {
+            lengths->push_back(bytes ? static_cast<std::int64_t>(label.size())
+                                     : utf8_codepoint_count(label));
+        }
+        return DirectFieldPlan{.kind = DirectFieldKind::StringLength,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .byte_length = bytes,
+                               .categoricals = categorical,
+                               .categorical_lengths = std::move(lengths)};
+    }
+    return std::nullopt;
+}
+
+auto try_plan_direct_fixed_width_field(const ir::Expr& expr, const PredicateInput& input,
+                                       const ScalarRegistry* scalars)
+    -> std::optional<DirectFieldPlan> {
+    if (auto plan = try_plan_direct_numeric_field(expr, input, scalars); plan.has_value()) {
+        return plan;
+    }
+    if (auto plan = try_plan_direct_temporal_field(expr, input); plan.has_value()) {
+        return plan;
+    }
+    return try_plan_direct_string_length_field(expr, input);
+}
+
+auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput& input,
+                              ::ibex::runtime::RowRange range, const ScalarRegistry* scalars,
+                              DirectOutputWindow output) -> bool {
+    if (plan.kind == DirectFieldKind::NumericBinary) {
+        return plan.expression != nullptr &&
+               write_fixed_width_numeric_binary(*plan.expression, input, range, scalars,
+                                                plan.numeric_kind, output.numeric);
+    }
+    if (plan.kind == DirectFieldKind::StringLength) {
+        if (output.numeric.ints == nullptr ||
+            (plan.strings == nullptr && plan.categoricals == nullptr)) {
+            return false;
+        }
+        for (std::size_t offset = 0; offset < range.count; ++offset) {
+            const std::size_t row = range.begin + offset;
+            if (plan.strings != nullptr) {
+                const auto value = (*plan.strings)[row];
+                output.numeric.ints[offset] = plan.byte_length
+                                                  ? static_cast<std::int64_t>(value.size())
+                                                  : utf8_codepoint_count(value);
+            } else {
+                const auto code = static_cast<std::size_t>(plan.categoricals->code_at(row));
+                output.numeric.ints[offset] = (*plan.categorical_lengths)[code];
+            }
+        }
+        return true;
+    }
+    if (output.numeric.ints == nullptr || (plan.dates == nullptr && plan.timestamps == nullptr)) {
+        return false;
+    }
+    using namespace std::chrono;
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        const std::size_t row = range.begin + offset;
+        if (plan.dates != nullptr) {
+            const year_month_day ymd{sys_days{days{plan.dates[row].days}}};
+            output.numeric.ints[offset] =
+                plan.temporal_part == TemporalPart::Year    ? static_cast<int>(ymd.year())
+                : plan.temporal_part == TemporalPart::Month ? static_cast<unsigned>(ymd.month())
+                                                            : static_cast<unsigned>(ymd.day());
+            continue;
+        }
+        const sys_time<nanoseconds> time{nanoseconds{plan.timestamps[row].nanos}};
+        const auto day_point = floor<days>(time);
+        const year_month_day ymd{day_point};
+        const hh_mm_ss<nanoseconds> hms{time - day_point};
+        output.numeric.ints[offset] =
+            plan.temporal_part == TemporalPart::Year     ? static_cast<int>(ymd.year())
+            : plan.temporal_part == TemporalPart::Month  ? static_cast<unsigned>(ymd.month())
+            : plan.temporal_part == TemporalPart::Day    ? static_cast<unsigned>(ymd.day())
+            : plan.temporal_part == TemporalPart::Hour   ? hms.hours().count()
+            : plan.temporal_part == TemporalPart::Minute ? hms.minutes().count()
+                                                         : hms.seconds().count();
+    }
+    return true;
+}
+
+auto try_plan_direct_predicate_field(const ir::Expr& expr) -> std::optional<DirectPredicatePlan> {
+    if (!supports_native_chunk_predicate(expr)) {
+        return std::nullopt;
+    }
+    const bool is_boolean = std::holds_alternative<ir::CompareExpr>(expr.node) ||
+                            std::holds_alternative<ir::LogicalExpr>(expr.node) ||
+                            std::holds_alternative<ir::IsNullExpr>(expr.node);
+    return is_boolean ? std::optional<DirectPredicatePlan>{{.expression = &expr}} : std::nullopt;
+}
+
+auto write_direct_predicate_range(const DirectPredicatePlan& plan, const PredicateInput& input,
+                                  ::ibex::runtime::RowRange range, const ScalarRegistry* scalars,
+                                  BoolOutputSpan output)
+    -> std::expected<std::optional<ValidityBitmap>, std::string> {
+    if (plan.expression == nullptr || output.words == nullptr || output.begin != range.begin ||
+        output.count != range.count) {
+        return std::unexpected("write_direct_predicate_range: output window shape mismatch");
+    }
+    auto mask = compute_mask(*plan.expression, input, scalars, range);
+    if (!mask.has_value()) {
+        return std::unexpected(std::move(mask.error()));
+    }
+    const SharedBitWords shared = SharedBitWords::of_run(output.begin, output.count);
+    for (std::size_t offset = 0; offset < output.count; ++offset) {
+        if (mask->value[offset] != 0) {
+            const std::size_t row = output.begin + offset;
+            or_bits_into_word(output.words, row / 64, std::uint64_t{1} << (row % 64), shared);
+        }
+    }
+    if (!mask->valid.has_value()) {
+        return std::optional<ValidityBitmap>{};
+    }
+    ValidityBitmap validity(output.count, false);
+    for (std::size_t offset = 0; offset < output.count; ++offset) {
+        validity.set(offset, (*mask->valid)[offset] != 0);
+    }
+    return std::optional<ValidityBitmap>{std::move(validity)};
+}
+
+auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& input,
+                                    const ScalarRegistry* /*scalars*/)
+    -> std::optional<DirectValidityPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+
+    DirectValidityPlan plan;
+    if (call->callee == "fill_null" && call->args.size() == 2) {
+        plan.kind = DirectValidityKind::FillNull;
+    } else if (call->callee == "coalesce" && call->args.size() >= 2) {
+        plan.kind = DirectValidityKind::Coalesce;
+    } else if (call->callee == "__case" && !call->args.empty() && call->args.size() % 2 == 1) {
+        plan.kind = DirectValidityKind::Case;
+        plan.conditions.reserve((call->args.size() - 1) / 2);
+        for (std::size_t index = 0; index + 1 < call->args.size(); index += 2) {
+            if (!supports_native_chunk_predicate(*call->args[index])) {
+                return std::nullopt;
+            }
+            plan.conditions.push_back(call->args[index].get());
+        }
+    } else {
+        return std::nullopt;
+    }
+
+    std::optional<FixedWidthNumericKind> kind;
+    const auto add_value = [&](const ir::Expr& value) -> bool {
+        if (const auto* ref = std::get_if<ir::ColumnRef>(&value.node)) {
+            if (ref->lexical) {
+                return false;
+            }
+            const auto* entry = input.find(ref->name);
+            if (entry == nullptr) {
+                return false;
+            }
+            const auto source_kind = std::holds_alternative<Column<std::int64_t>>(*entry->column)
+                                         ? std::optional{FixedWidthNumericKind::Int}
+                                     : std::holds_alternative<Column<double>>(*entry->column)
+                                         ? std::optional{FixedWidthNumericKind::Double}
+                                         : std::nullopt;
+            if (!source_kind.has_value() || (kind.has_value() && *kind != *source_kind)) {
+                return false;
+            }
+            kind = *source_kind;
+            plan.values.push_back(
+                {.column = entry, .literal = {}, .is_literal = false, .is_null = false});
+            return true;
+        }
+        if (const auto* literal = std::get_if<ir::Literal>(&value.node)) {
+            const auto literal_kind = std::holds_alternative<std::int64_t>(literal->value)
+                                          ? std::optional{FixedWidthNumericKind::Int}
+                                      : std::holds_alternative<double>(literal->value)
+                                          ? std::optional{FixedWidthNumericKind::Double}
+                                          : std::nullopt;
+            if (!literal_kind.has_value() || (kind.has_value() && *kind != *literal_kind)) {
+                return false;
+            }
+            kind = *literal_kind;
+            plan.values.push_back({.column = nullptr,
+                                   .literal = scalar_from_literal(*literal),
+                                   .is_literal = true,
+                                   .is_null = false});
+            return true;
+        }
+        if (const auto* null_call = std::get_if<ir::CallExpr>(&value.node);
+            null_call != nullptr && null_call->callee == "__null" && null_call->args.empty() &&
+            null_call->named_args.empty()) {
+            plan.values.push_back(
+                {.column = nullptr, .literal = {}, .is_literal = false, .is_null = true});
+            return true;
+        }
+        return false;
+    };
+
+    if (plan.kind == DirectValidityKind::Case) {
+        for (std::size_t index = 1; index + 1 < call->args.size(); index += 2) {
+            if (!add_value(*call->args[index])) {
+                return std::nullopt;
+            }
+        }
+        if (!add_value(*call->args.back())) {
+            return std::nullopt;
+        }
+    } else {
+        for (const auto& arg : call->args) {
+            if (!add_value(*arg)) {
+                return std::nullopt;
+            }
+        }
+    }
+    if (!kind.has_value() || plan.values.empty()) {
+        return std::nullopt;
+    }
+    plan.numeric_kind = *kind;
+    return plan;
+}
+
+auto write_direct_validity_field_range(const DirectValidityPlan& plan, const PredicateInput& input,
+                                       ::ibex::runtime::RowRange range,
+                                       const ScalarRegistry* scalars, DirectOutputWindow output)
+    -> std::expected<std::optional<ValidityBitmap>, std::string> {
+    if ((plan.numeric_kind == FixedWidthNumericKind::Int && output.numeric.ints == nullptr) ||
+        (plan.numeric_kind == FixedWidthNumericKind::Double && output.numeric.doubles == nullptr)) {
+        return std::unexpected("write_direct_validity_field_range: output window shape mismatch");
+    }
+    std::vector<Mask> conditions;
+    conditions.reserve(plan.conditions.size());
+    for (const ir::Expr* condition : plan.conditions) {
+        if (condition == nullptr) {
+            return std::unexpected("write_direct_validity_field_range: missing CASE condition");
+        }
+        auto mask = compute_mask(*condition, input, scalars, range);
+        if (!mask.has_value()) {
+            return std::unexpected(std::move(mask.error()));
+        }
+        conditions.push_back(std::move(*mask));
+    }
+
+    const auto available = [](const DirectValidityValue& value, std::size_t row) {
+        return !value.is_null && (value.is_literal || !value.column->validity.has_value() ||
+                                  (*value.column->validity)[row]);
+    };
+    ValidityBitmap validity(range.count, true);
+    bool any_invalid = false;
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        const std::size_t row = range.begin + offset;
+        const DirectValidityValue* selected = nullptr;
+        if (plan.kind == DirectValidityKind::FillNull) {
+            if (plan.values.size() != 2) {
+                return std::unexpected(
+                    "write_direct_validity_field_range: malformed fill_null plan");
+            }
+            selected = available(plan.values[0], row) ? &plan.values[0] : &plan.values[1];
+        } else if (plan.kind == DirectValidityKind::Coalesce) {
+            for (const auto& value : plan.values) {
+                if (available(value, row)) {
+                    selected = &value;
+                    break;
+                }
+            }
+        } else {
+            std::size_t arm = conditions.size();
+            for (std::size_t index = 0; index < conditions.size(); ++index) {
+                if (conditions[index].value[offset] != 0 &&
+                    (!conditions[index].valid.has_value() || (*conditions[index].valid)[offset])) {
+                    arm = index;
+                    break;
+                }
+            }
+            if (arm >= plan.values.size()) {
+                return std::unexpected("write_direct_validity_field_range: malformed CASE plan");
+            }
+            selected = &plan.values[arm];
+        }
+
+        const bool is_valid = selected != nullptr && available(*selected, row);
+        if (!is_valid) {
+            validity.set(offset, false);
+            any_invalid = true;
+        }
+        if (plan.numeric_kind == FixedWidthNumericKind::Int) {
+            output.numeric.ints[offset] =
+                is_valid ? selected->is_literal
+                               ? std::get<std::int64_t>(selected->literal)
+                               : std::get<Column<std::int64_t>>(*selected->column->column)[row]
+                         : 0;
+        } else {
+            output.numeric.doubles[offset] =
+                is_valid ? selected->is_literal
+                               ? std::get<double>(selected->literal)
+                               : std::get<Column<double>>(*selected->column->column)[row]
+                         : 0.0;
+        }
+    }
+    return any_invalid ? std::optional<ValidityBitmap>{std::move(validity)}
+                       : std::optional<ValidityBitmap>{};
+}
+
+auto try_plan_direct_categorical_field(const ir::Expr& expr, const PredicateInput& input,
+                                       const ScalarRegistry* /*scalars*/)
+    -> std::optional<DirectCategoricalPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return std::nullopt;
+    }
+    DirectCategoricalPlan plan;
+    bool has_categorical_source = false;
+    if (call->callee == "coalesce" && call->args.size() >= 2) {
+        plan.kind = DirectValidityKind::Coalesce;
+    } else if (call->callee == "__case" && !call->args.empty() && call->args.size() % 2 == 1) {
+        plan.kind = DirectValidityKind::Case;
+        for (std::size_t index = 0; index + 1 < call->args.size(); index += 2) {
+            if (!supports_native_chunk_predicate(*call->args[index])) {
+                return std::nullopt;
+            }
+            plan.conditions.push_back(call->args[index].get());
+        }
+    } else {
+        return std::nullopt;
+    }
+
+    const auto add_value = [&](const ir::Expr& value) -> bool {
+        if (const auto* ref = std::get_if<ir::ColumnRef>(&value.node)) {
+            if (ref->lexical) {
+                return false;
+            }
+            const auto* entry = input.find(ref->name);
+            if (entry == nullptr || !std::holds_alternative<Column<Categorical>>(*entry->column)) {
+                return false;
+            }
+            has_categorical_source = true;
+            plan.values.push_back(
+                {.column = entry, .literal = {}, .is_literal = false, .is_null = false});
+            return true;
+        }
+        if (const auto* literal = std::get_if<ir::Literal>(&value.node)) {
+            const auto* label = std::get_if<std::string>(&literal->value);
+            if (label == nullptr) {
+                return false;
+            }
+            plan.values.push_back({.column = nullptr,
+                                   .literal = scalar_from_literal(*literal),
+                                   .is_literal = true,
+                                   .is_null = false});
+            return true;
+        }
+        if (const auto* null_call = std::get_if<ir::CallExpr>(&value.node);
+            null_call != nullptr && null_call->callee == "__null" && null_call->args.empty() &&
+            null_call->named_args.empty()) {
+            plan.values.push_back(
+                {.column = nullptr, .literal = {}, .is_literal = false, .is_null = true});
+            return true;
+        }
+        return false;
+    };
+    if (plan.kind == DirectValidityKind::Case) {
+        for (std::size_t index = 1; index + 1 < call->args.size(); index += 2) {
+            if (!add_value(*call->args[index])) {
+                return std::nullopt;
+            }
+        }
+        if (!add_value(*call->args.back())) {
+            return std::nullopt;
+        }
+    } else {
+        for (const auto& arg : call->args) {
+            if (!add_value(*arg)) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    if (!has_categorical_source) {
+        return std::nullopt;
+    }
+    plan.dictionary = std::make_shared<std::vector<std::string>>();
+    plan.index = std::make_shared<Column<Categorical>::index_map>();
+    const auto intern = [&](std::string_view label) {
+        if (const auto it = plan.index->find(label); it != plan.index->end()) {
+            return it->second;
+        }
+        const auto code = static_cast<Column<Categorical>::code_type>(plan.dictionary->size());
+        plan.dictionary->emplace_back(label);
+        plan.index->emplace(plan.dictionary->back(), code);
+        return code;
+    };
+    plan.remaps.resize(plan.values.size());
+    plan.literal_codes.assign(plan.values.size(), 0);
+    for (std::size_t index = 0; index < plan.values.size(); ++index) {
+        const auto& value = plan.values[index];
+        if (value.column != nullptr) {
+            const auto& source = std::get<Column<Categorical>>(*value.column->column);
+            auto& remap = plan.remaps[index];
+            remap.reserve(source.dictionary_size());
+            for (const auto& label : source.dictionary()) {
+                remap.push_back(intern(label));
+            }
+        } else if (value.is_literal) {
+            plan.literal_codes[index] = intern(std::get<std::string>(value.literal));
+        }
+    }
+    return plan;
+}
+
+auto write_direct_categorical_field_range(const DirectCategoricalPlan& plan,
+                                          const PredicateInput& input,
+                                          ::ibex::runtime::RowRange range,
+                                          const ScalarRegistry* scalars,
+                                          CategoricalOutputSpan output)
+    -> std::expected<std::optional<ValidityBitmap>, std::string> {
+    if (output.codes == nullptr || output.begin != range.begin || output.count != range.count) {
+        return std::unexpected(
+            "write_direct_categorical_field_range: output window shape mismatch");
+    }
+    std::vector<Mask> conditions;
+    for (const ir::Expr* condition : plan.conditions) {
+        auto mask = compute_mask(*condition, input, scalars, range);
+        if (!mask.has_value()) {
+            return std::unexpected(std::move(mask.error()));
+        }
+        conditions.push_back(std::move(*mask));
+    }
+    ValidityBitmap validity(range.count, true);
+    bool any_invalid = false;
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        const std::size_t row = range.begin + offset;
+        std::size_t selected = plan.values.size();
+        if (plan.kind == DirectValidityKind::Coalesce) {
+            for (std::size_t index = 0; index < plan.values.size(); ++index) {
+                const auto& value = plan.values[index];
+                if (!value.is_null && (value.is_literal || !value.column->validity.has_value() ||
+                                       (*value.column->validity)[row])) {
+                    selected = index;
+                    break;
+                }
+            }
+        } else {
+            selected = conditions.size();
+            for (std::size_t index = 0; index < conditions.size(); ++index) {
+                if (conditions[index].value[offset] != 0 &&
+                    (!conditions[index].valid.has_value() || (*conditions[index].valid)[offset])) {
+                    selected = index;
+                    break;
+                }
+            }
+        }
+        if (selected >= plan.values.size() || plan.values[selected].is_null ||
+            (!plan.values[selected].is_literal &&
+             plan.values[selected].column->validity.has_value() &&
+             !(*plan.values[selected].column->validity)[row])) {
+            output.codes[offset] = 0;
+            validity.set(offset, false);
+            any_invalid = true;
+            continue;
+        }
+        const auto& value = plan.values[selected];
+        output.codes[offset] =
+            value.is_literal
+                ? plan.literal_codes[selected]
+                : plan.remaps[selected][static_cast<std::size_t>(
+                      std::get<Column<Categorical>>(*value.column->column).code_at(row))];
+    }
+    return any_invalid ? std::optional<ValidityBitmap>{std::move(validity)}
+                       : std::optional<ValidityBitmap>{};
 }
 
 auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput& input,

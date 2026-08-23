@@ -356,6 +356,8 @@ auto format_expr_type(ExprType kind) -> std::string {
             return "Timestamp";
         case ExprType::String:
             return "String";
+        case ExprType::Categorical:
+            return "Categorical";
     }
     return "?";
 }

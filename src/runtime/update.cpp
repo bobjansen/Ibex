@@ -2270,12 +2270,14 @@ struct NativeGroupedReductionField {
 /// column came from.
 auto native_reduction_for(std::string_view callee, const ColumnEntry& source)
     -> std::optional<NativeGroupedReduction> {
+    // Counting non-null values reads the validity bitmap and never a value, so
+    // it is fixed-width whatever the column holds.
+    if (callee == "count") {
+        return NativeGroupedReduction::CountNonNull;
+    }
     const bool is_int = std::holds_alternative<Column<std::int64_t>>(*source.column);
     if (!is_int && !std::holds_alternative<Column<double>>(*source.column)) {
         return std::nullopt;
-    }
-    if (callee == "count") {
-        return NativeGroupedReduction::CountNonNull;
     }
     if (callee == "mean") {
         return NativeGroupedReduction::Mean;
@@ -2522,6 +2524,10 @@ auto try_native_grouped_reductions(const Table& input, const std::vector<ir::Fie
 struct LiftedGroupAggregate {
     std::string column;
     std::string callee;
+    /// The call as written, kept whole because an aggregate's later arguments
+    /// are parameters rather than data — `quantile(x, 0.9)`'s 0.9. Its first
+    /// argument is replaced by `source_column` when the spec is built.
+    ir::CallExpr call;
     /// The column the reduction reads. Empty only for bare `count()`, which
     /// reads no column at all.
     std::string source_column;
@@ -2595,18 +2601,26 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                 if (!node.named_args.empty()) {
                     return false;
                 }
-                if (node.callee != "sum" && node.callee != "mean" && node.callee != "min" &&
-                    node.callee != "max" && node.callee != "count") {
+                // Every aggregate the group-by operator can name is liftable:
+                // the fixed-width family reduces over the CSR rows, and the
+                // rest is one grouped aggregation broadcast back. `count()`
+                // names no column and so has no `AggSpec`, but it is the
+                // simplest CSR reduction there is.
+                const bool bare_count = node.callee == "count" && node.args.empty();
+                if (!bare_count && !parse_aggregate_func(node.callee).has_value()) {
                     return false;
                 }
-                LiftedGroupAggregate item{
-                    .column = {}, .callee = node.callee, .source_column = {}, .source_expr = {}};
+                LiftedGroupAggregate item{.column = {},
+                                          .callee = node.callee,
+                                          .call = node,
+                                          .source_column = {},
+                                          .source_expr = {}};
                 if (node.args.empty()) {
-                    if (node.callee != "count") {
+                    if (!bare_count) {
                         return false;
                     }
                 } else {
-                    if (node.args.size() != 1 || node.args[0] == nullptr) {
+                    if (node.args[0] == nullptr) {
                         return false;
                     }
                     const ir::Expr& argument = *node.args[0];
@@ -2618,9 +2632,7 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                         return false;
                     }
                     if (const auto* ref = ir::as_column_ref(argument); ref != nullptr) {
-                        const auto* entry = input.find_entry(ref->name);
-                        if (entry == nullptr ||
-                            !native_reduction_for(node.callee, *entry).has_value()) {
+                        if (input.find_entry(ref->name) == nullptr) {
                             return false;
                         }
                         item.source_column = ref->name;
@@ -2629,8 +2641,12 @@ auto lift_grouped_aggregates(ir::Expr& expr, const Table& input, std::size_t& co
                         item.source_column = unique_staging_name(input, "__grp_agg_arg_", counter);
                     }
                 }
+                // Only a one-argument aggregate is deduplicated: a second
+                // argument is a parameter, and two calls that share a column
+                // but not their parameter are two different reductions.
                 const auto same = std::ranges::find_if(lifted, [&](const auto& existing) {
-                    return !existing.source_expr.has_value() && existing.callee == item.callee &&
+                    return !existing.source_expr.has_value() && existing.call.args.size() <= 1 &&
+                           node.args.size() <= 1 && existing.callee == item.callee &&
                            existing.source_column == item.source_column;
                 });
                 if (same != lifted.end()) {
@@ -2664,22 +2680,123 @@ auto without_staging_columns(Table table, const std::vector<std::string>& staged
     return result;
 }
 
+/// Broadcast the aggregates that are not in the fixed-width CSR family —
+/// `median`, `std`, `quantile`, `first`, `last`, a string `min` — by running
+/// the grouped aggregate operator itself once and gathering its per-group
+/// result back onto the rows.
+///
+/// The key it aggregates by is the group id, not the user's `by` columns. That
+/// is what makes this general: the operator never sees a multi-key, string, or
+/// null-bearing key tuple, only one dense Int64, and the answer comes back
+/// already addressed by the same ids the CSR rows use. It also means the
+/// aggregate semantics here are not a reimplementation — they are the same
+/// kernels `select ..., by ...` runs, so the two cannot answer differently.
+///
+/// Declines (rather than fails) when the operator will not take the call: the
+/// materialized evaluator runs the identical aggregate and owns the diagnostic.
+auto broadcast_general_group_aggregates(const Table& staged,
+                                        std::span<const LiftedGroupAggregate* const> items,
+                                        std::span<const std::uint32_t> row_gid,
+                                        std::size_t group_count, std::size_t& counter,
+                                        const ExecutionContext& exec)
+    -> std::expected<std::optional<std::vector<ColumnEntry>>, std::string> {
+    const std::size_t rows = row_gid.size();
+    Table keyed;
+    const std::string key = unique_staging_name(staged, "__grp_key_", counter);
+    Column<std::int64_t> gid;
+    gid.resize(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        gid[r] = static_cast<std::int64_t>(row_gid[r]);
+    }
+    keyed.add_column(key, std::move(gid));
+
+    std::vector<ir::AggSpec> specs;
+    specs.reserve(items.size());
+    for (const auto* item : items) {
+        const auto* source = staged.find_entry(item->source_column);
+        if (source == nullptr) {
+            return std::optional<std::vector<ColumnEntry>>{};
+        }
+        keyed.add_column_from(item->source_column, *source);
+        ir::CallExpr call = item->call;
+        if (call.args.empty()) {
+            return std::optional<std::vector<ColumnEntry>>{};  // only bare count(), never general
+        }
+        call.args[0] = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = item->source_column}});
+        auto spec = aggregate_call_to_spec(call, item->column);
+        if (!spec.has_value() || !spec->has_value()) {
+            return std::optional<std::vector<ColumnEntry>>{};
+        }
+        specs.push_back(std::move(**spec));
+    }
+
+    auto aggregated = aggregate_table(keyed, {ir::ColumnRef{.name = key}}, specs, &exec);
+    if (!aggregated.has_value() || aggregated->rows() != group_count) {
+        return std::optional<std::vector<ColumnEntry>>{};
+    }
+    const auto* key_column = aggregated->find(key);
+    if (key_column == nullptr) {
+        return std::optional<std::vector<ColumnEntry>>{};
+    }
+    const auto* key_values = std::get_if<Column<std::int64_t>>(key_column);
+    if (key_values == nullptr) {
+        return std::optional<std::vector<ColumnEntry>>{};
+    }
+    // The operator is free to emit its groups in any order, so the ids come
+    // back as data and are read, never assumed.
+    std::vector<std::size_t> position(group_count, 0);
+    for (std::size_t i = 0; i < group_count; ++i) {
+        const auto id = (*key_values)[i];
+        if (id < 0 || static_cast<std::size_t>(id) >= group_count) {
+            return std::optional<std::vector<ColumnEntry>>{};
+        }
+        position[static_cast<std::size_t>(id)] = i;
+    }
+    std::vector<std::size_t> indices(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        indices[r] = position[row_gid[r]];
+    }
+
+    std::vector<ColumnEntry> broadcast;
+    broadcast.reserve(items.size());
+    for (const auto* item : items) {
+        const auto* result = aggregated->find_entry(item->column);
+        if (result == nullptr) {
+            return std::optional<std::vector<ColumnEntry>>{};
+        }
+        ColumnEntry entry{.name = item->column,
+                          .column = std::make_shared<ColumnValue>(
+                              gather_column(*result->column, indices.data(), rows, &exec)),
+                          .validity = std::nullopt};
+        if (result->validity.has_value()) {
+            ValidityBitmap validity(rows, true);
+            for (std::size_t r = 0; r < rows; ++r) {
+                validity.set(r, (*result->validity)[indices[r]]);
+            }
+            entry.validity = std::move(validity);
+        }
+        broadcast.push_back(std::move(entry));
+    }
+    return std::optional<std::vector<ColumnEntry>>{std::move(broadcast)};
+}
+
 /// A field that MIXES an aggregate with row-local terms — `x - mean(x)`,
 /// `x / sum(x)`, `sum(a * b)` — is the canonical grouped update, and until now
 /// no native gate matched it: its root is not a bare aggregate call, so the
 /// whole clause fell to the per-group gather-and-rebuild evaluator.
 ///
-/// Nothing here needs a new kernel. Each aggregate subterm is a group reduction
-/// the CSR path already owns, and once its broadcast value is a column, what
-/// remains of the expression is row-local by construction and belongs to
-/// `update_table`'s direct ChunkView output protocols. So the field is executed
-/// as: stage any aggregate arguments, reduce and broadcast, then evaluate the
-/// residual expression over original-order rows.
+/// Nothing here needs a new aggregate kernel. Each aggregate subterm is a group
+/// reduction that either the CSR path or the grouped aggregate operator already
+/// owns, and once its broadcast value is a column, what remains of the
+/// expression is row-local by construction and belongs to `update_table`'s
+/// direct ChunkView output protocols. So the field is executed as: stage any
+/// aggregate arguments, reduce and broadcast, then evaluate the residual
+/// expression over original-order rows.
 ///
 /// The staging columns live only on a local table that shares the input's
 /// column storage; the caller's table never sees them.
 auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& field,
-                                       const GroupedRows& group_rows, const ScalarRegistry* scalars,
+                                       const GroupedRowPlan& grouped, const ScalarRegistry* scalars,
                                        const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<std::optional<Table>, std::string> {
     if (!expr_contains_aggregate_call(field.expr)) {
@@ -2719,8 +2836,10 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
     }
 
     const std::size_t rows = input.rows();
+    const GroupedRows& group_rows = grouped.rows;
     const std::size_t workers =
         grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
+    std::vector<const LiftedGroupAggregate*> general;
     for (const auto& item : lifted) {
         NativeGroupedReductionField plan{.alias = item.column};
         if (item.source_column.empty()) {
@@ -2731,11 +2850,13 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
                 return std::optional<Table>{};
             }
             // A staged argument's type is only known once it has been
-            // evaluated: a reduction over, say, a string concatenation is
-            // outside the fixed-width contract and returns to the evaluator.
+            // evaluated, so the fixed-width question is asked here rather than
+            // when the aggregate was lifted. Anything outside that family is
+            // still native — it goes to the grouped aggregate operator below.
             const auto reduction = native_reduction_for(item.callee, *plan.source);
             if (!reduction.has_value()) {
-                return std::optional<Table>{};
+                general.push_back(&item);
+                continue;
             }
             plan.reduction = *reduction;
         }
@@ -2748,16 +2869,44 @@ auto try_native_grouped_aggregate_expr(const Table& input, const ir::FieldSpec& 
             staged.add_column(item.column, std::move(column));
         }
     }
+    if (!general.empty()) {
+        auto broadcast = broadcast_general_group_aggregates(
+            staged, general, grouped.row_gid(rows), group_rows.group_count(), counter, exec);
+        if (!broadcast.has_value()) {
+            return std::unexpected(std::move(broadcast.error()));
+        }
+        if (!broadcast->has_value()) {
+            return std::optional<Table>{};
+        }
+        for (auto& entry : **broadcast) {
+            staged_names.push_back(entry.name);
+            staged.add_column_shared(entry.name, std::move(entry.column),
+                                     std::move(entry.validity));
+        }
+    }
+
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->grouped_lifted_aggregates.fetch_add(lifted.size(),
+                                                                 std::memory_order_relaxed);
+    }
+    // A field that is nothing but one aggregate — `m = median(x)` — has already
+    // been computed: its staging column IS the answer, addressed by absolute
+    // row. Landing it directly hands the caller that column instead of
+    // evaluating a whole-column copy of it.
+    if (const auto* ref = ir::as_column_ref(rewritten);
+        ref != nullptr && std::ranges::find(staged_names, ref->name) != staged_names.end()) {
+        ColumnEntry landed = *staged.find_entry(ref->name);
+        Table output = without_staging_columns(std::move(staged), staged_names);
+        output.add_column_shared(field.alias, std::move(landed.column), std::move(landed.validity));
+        apply_table_properties(output, derive_grouped_update_properties(output, {field}));
+        return std::optional<Table>{std::move(output)};
+    }
 
     auto evaluated =
         update_table(std::move(staged), {ir::FieldSpec{.alias = field.alias, .expr = rewritten}},
                      scalars, externs, exec);
     if (!evaluated.has_value()) {
         return std::unexpected(std::move(evaluated.error()));
-    }
-    if (exec.parallel_stats != nullptr) {
-        exec.parallel_stats->grouped_lifted_aggregates.fetch_add(lifted.size(),
-                                                                 std::memory_order_relaxed);
     }
     Table output = without_staging_columns(std::move(*evaluated), staged_names);
     apply_table_properties(output, derive_grouped_update_properties(output, {field}));
@@ -5120,8 +5269,8 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     if (fields.size() == 1) {
         // Aggregates mixed into a row-local expression: lift each reduction to
         // a broadcast staging column and evaluate the remainder directly.
-        if (auto lifted = try_native_grouped_aggregate_expr(input, fields.front(), group_rows,
-                                                            scalars, externs, exec);
+        if (auto lifted = try_native_grouped_aggregate_expr(input, fields.front(), grouped, scalars,
+                                                            externs, exec);
             !lifted) {
             return std::unexpected(lifted.error());
         } else if (lifted->has_value()) {

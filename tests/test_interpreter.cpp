@@ -8160,26 +8160,121 @@ TEST_CASE("lifted grouped aggregates are deterministic across thread counts",
     }
 }
 
-// An aggregate outside the fixed-width contract keeps the whole field on the
-// materialized evaluator. The answer is what matters here: the gate declining
-// must change the path, not the result.
-TEST_CASE("grouped update falls back when a lifted aggregate is not fixed-width",
+// An order-dependent call around an aggregate keeps the whole field on the
+// materialized evaluator: `lag` reads a neighbouring row, which is not
+// something a broadcast column can feed a row-local expression. The answer is
+// what matters here — the gate declining must change the path, not the result.
+TEST_CASE("grouped update falls back when a field is not row-local around its aggregate",
           "[update][groupby][reduction]") {
     runtime::Table t;
     t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
-    t.add_column("s", Column<std::string>{"a", "b", "c", "d"});
+    t.add_column("x", Column<double>{1.0, 3.0, 10.0, 20.0});
     runtime::TableRegistry registry;
     registry.emplace("t", std::move(t));
 
-    auto ir = require_ir("t[update { n = count(s) + 1 }, by g];");
+    auto ir = require_ir("t[update { y = lag(x, 1) + mean(x) }, by g];");
     runtime::ParallelIslandStats stats;
     runtime::ExecutionContext exec;
     exec.parallel_stats = &stats;
     auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
-    const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
-    CHECK(std::vector<std::int64_t>(n.begin(), n.end()) == std::vector<std::int64_t>{3, 3, 3, 3});
+    const auto* y = out->find_entry("y");
+    REQUIRE(y != nullptr);
+    REQUIRE(y->validity.has_value());
+    CHECK_FALSE((*y->validity)[0]);
+    CHECK_FALSE((*y->validity)[2]);
+    const auto& values = std::get<Column<double>>(*y->column);
+    CHECK(values[1] == Catch::Approx(3.0));
+    CHECK(values[3] == Catch::Approx(25.0));
     CHECK(stats.grouped_lifted_aggregates.load() == 0);
+}
+
+TEST_CASE("grouped update broadcasts general aggregates as select computes them",
+          "[update][groupby][reduction]") {
+    constexpr std::size_t kRows = 40;
+    Column<std::int64_t> g;
+    Column<double> x;
+    Column<std::string> s;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        g.push_back(static_cast<std::int64_t>((r * 5) % 4));
+        x.push_back(static_cast<double>((r * 37) % 23) + 0.5);
+        s.push_back("v" + std::to_string(r % 7));
+    }
+    runtime::Table t;
+    t.add_column("g", std::move(g));
+    t.add_column("x", std::move(x));
+    t.add_column("s", std::move(s));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    const std::string fields =
+        "{ m = median(x), sd = std(x), q = quantile(x, 0.25), f = first(x), l = last(x), "
+        "fs = first(s), n = count(s) }";
+    const std::string select_source = "t[select " + fields + ", by g];";
+    const std::string update_source = "t[update " + fields + ", by g];";
+    auto grouped_ir = require_ir(select_source.c_str());
+    auto updated_ir = require_ir(update_source.c_str());
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_stats = &stats;
+    auto reference = runtime::interpret(*grouped_ir, registry);
+    auto out = runtime::interpret(*updated_ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(reference.has_value());
+    REQUIRE(out.has_value());
+    REQUIRE(out->rows() == kRows);
+
+    // Where each group's single reference row landed.
+    const auto& reference_key = std::get<Column<std::int64_t>>(*reference->find("g"));
+    robin_hood::unordered_map<std::int64_t, std::size_t> reference_row;
+    for (std::size_t i = 0; i < reference->rows(); ++i) {
+        reference_row[reference_key[i]] = i;
+    }
+    const auto& key = std::get<Column<std::int64_t>>(*out->find("g"));
+    for (const char* name : {"m", "sd", "q", "f", "l", "fs", "n"}) {
+        CAPTURE(name);
+        const auto* landed = out->find_entry(name);
+        const auto* expected = reference->find_entry(name);
+        REQUIRE(landed != nullptr);
+        REQUIRE(expected != nullptr);
+        for (std::size_t r = 0; r < kRows; ++r) {
+            const std::size_t source = reference_row.at(key[r]);
+            CAPTURE(r);
+            CHECK(runtime::is_null(*landed, r) == runtime::is_null(*expected, source));
+            if (!runtime::is_null(*landed, r)) {
+                CHECK(runtime::scalar_from_column(*landed->column, r) ==
+                      runtime::scalar_from_column(*expected->column, source));
+            }
+        }
+    }
+    // `count(col)` is lowered to a sum over a derived 0/1 column, which is a
+    // bare fixed-width reduction and never reaches the lifter; the other six
+    // are one grouped aggregation between them.
+    CHECK(stats.grouped_lifted_aggregates.load() == 6);
+}
+
+// A general aggregate mixed into an expression must reach the row-local
+// evaluator as a column like any other, including its nulls: `std` of a
+// one-row group has no value, and every row of that group inherits it.
+TEST_CASE("grouped update mixes a general aggregate into a row-local expression",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 2});
+    t.add_column("x", Column<double>{2.0, 4.0, 6.0, 9.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { z = (x - median(x)) / std(x) }, by g];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto* z = out->find_entry("z");
+    REQUIRE(z != nullptr);
+    const auto& values = std::get<Column<double>>(*z->column);
+    CHECK(values[0] == Catch::Approx(-1.0));
+    CHECK(values[1] == Catch::Approx(0.0));
+    CHECK(values[2] == Catch::Approx(1.0));
+    REQUIRE(z->validity.has_value());
+    CHECK_FALSE((*z->validity)[3]);
+    CHECK(out->columns.size() == 3);
 }
 
 TEST_CASE("grouped update mixes native reductions and materialized fields in declaration order",

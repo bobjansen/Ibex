@@ -2109,7 +2109,17 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     if (!route.has_plan() && fallback == nullptr) {
         return std::optional<ComputedColumn>{};
     }
+    // Reentrancy: a fused island operator calls its update from a worker
+    // thread. Submitting from there deadlocks the pool (WorkerPool::submit
+    // aborts rather than let it happen), and that morsel is already one
+    // worker's share -- splitting it again would only oversubscribe.
+    if (!exec.parallel || on_worker_pool_thread()) {
+        return std::optional<ComputedColumn>{};
+    }
     const std::size_t rows = input.rows();
+    if (rows < exec.parallel_min_rows) {
+        return std::optional<ComputedColumn>{};
+    }
     // Same derivation as an island's, so the two parallel paths partition
     // alike. Note a zero `parallel_grain` now means "derive", not "one row per
     // morsel" — reading it directly here would have split a 20M-row update into
@@ -2396,6 +2406,56 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
         .column = std::move(out), .validity = merge_range_validity(pieces, rows, grain)}};
 }
 
+namespace {
+
+/// One field through the direct vocabulary in parallel mode: split across
+/// worker ranges when `evaluate_field_windows` accepts the split, else the same
+/// whole-chunk write the serial route uses. Declines by returning nullopt,
+/// which leaves the original update to the table evaluator.
+///
+/// The route is required rather than optional here, unlike in serial mode. A
+/// field the route does not name (a compiled numeric tree, the legacy
+/// null-handling arms) has no range writer on this side of the seam, and the
+/// table evaluator can still split it through its own fallback hook -- so
+/// declining is how such a field keeps its parallelism, not how it loses it.
+auto try_direct_update_field_parallel(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                                      const ScalarRegistry* scalars, const ExecutionContext& exec)
+    -> std::optional<Chunk> {
+    if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
+        return output;
+    }
+    if (fields.size() != 1) {
+        return std::nullopt;
+    }
+    if (auto output = try_literal_update(input, fields); output.has_value()) {
+        return output;  // a broadcast has no ranges worth splitting
+    }
+    const ChunkView view(input);
+    const auto source = predicate_input(view);
+    const auto& expr = fields.front().expr;
+    const auto route = plan_direct_field(expr, source, scalars);
+    if (!route.has_plan()) {
+        return std::nullopt;
+    }
+    auto windows =
+        evaluate_field_windows(expr, route, source, std::nullopt, scalars, exec, nullptr);
+    if (!windows.has_value()) {
+        // The established evaluator owns this diagnostic: it reaches the same
+        // expression and has the error contract the tests pin.
+        return std::nullopt;
+    }
+    if (!windows->has_value()) {
+        // The split was declined (too few rows, one morsel, a worker thread),
+        // not attempted. The chunk is still ours to write directly.
+        return try_direct_update_field(input, fields, scalars);
+    }
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move((*windows)->column)),
+                               std::move((*windows)->validity));
+}
+
+}  // namespace
+
 auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& fields,
                             const ScalarRegistry* scalars, const ExternRegistry* externs,
                             const ExecutionContext& exec) -> std::expected<Chunk, std::string> {
@@ -2403,6 +2463,15 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     // every earlier one.  Keep the direct route all-or-nothing, though.  If a
     // field is outside its narrow vocabulary, discard this tentative chunk and
     // let update_table evaluate the original complete update.
+    // Counted where the chunk kernel keeps the work, so the bridge below is
+    // observable by its absence -- see `chunk_direct_updates`.
+    const auto direct = [&](Chunk output, std::size_t field_count) {
+        if (exec.parallel_stats != nullptr) {
+            exec.parallel_stats->chunk_direct_updates.fetch_add(field_count,
+                                                                std::memory_order_relaxed);
+        }
+        return output;
+    };
     if (!exec.parallel && fields.size() > 1) {
         Chunk current = input;
         bool all_direct = true;
@@ -2416,15 +2485,16 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             current = std::move(*next);
         }
         if (all_direct) {
-            return current;
+            return direct(std::move(current), fields.size());
         }
     }
     if (!exec.parallel) {
         if (auto output = try_direct_update_field(input, fields, scalars); output.has_value()) {
-            return std::move(*output);
+            return direct(std::move(*output), 1);
         }
-    } else if (auto output = try_metadata_alias_update(input, fields); output.has_value()) {
-        return std::move(*output);
+    } else if (auto output = try_direct_update_field_parallel(input, fields, scalars, exec);
+               output.has_value()) {
+        return direct(std::move(*output), 1);
     }
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;

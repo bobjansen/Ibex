@@ -551,6 +551,14 @@ struct ParallelIslandStats {
     /// gate that quietly stopped matching (a smaller probe chunk, a budget
     /// change) would cost the parallelism with every test still green.
     std::atomic<std::uint64_t> parallel_probes{0};
+    /// Row-local update fields a chunk executed through the direct kernel
+    /// vocabulary, rather than converting to a Table so the established
+    /// evaluator could run them. Counted per chunk and field, and counted for
+    /// both execution shapes -- a split field and a whole-chunk write -- since
+    /// what it observes is the seam, not the parallelism. Without it, a plan
+    /// that silently stopped matching would still answer correctly, through the
+    /// bridge, with every test green.
+    std::atomic<std::uint64_t> chunk_direct_updates{0};
     /// Group state -- an aggregate, or an ordered kernel like `lag`/`cumsum` --
     /// lifted out of a grouped update field's expression into a staging column,
     /// letting the rest of the field run as an ordinary row-local update.

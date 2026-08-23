@@ -8030,6 +8030,158 @@ TEST_CASE("grouped update natively broadcasts fixed-width sum and count",
     CHECK_FALSE((*lo_entry->validity)[4]);
 }
 
+// A field that mixes an aggregate with row-local terms — `x - mean(x)` — is the
+// canonical grouped update, and it used to fall to the per-group
+// gather-and-rebuild evaluator because its root is not a bare aggregate call.
+// It now lifts each aggregate to a broadcast staging column and evaluates the
+// rest directly. The answers below are the point; the staging columns not
+// appearing in the output is the other half of the contract.
+TEST_CASE("grouped update lifts aggregates out of a row-local expression",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2, 3, 3});
+    t.add_column("x", Column<double>{1.0, 3.0, 10.0, 20.0, 5.0, 5.0});
+    t.add_column("y", Column<std::int64_t>{2, 4, 6, 8, 10, 12});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    SECTION("aggregates mixed with row-local terms, and reused within one field") {
+        auto ir = require_ir(
+            "t[update { d = x - mean(x), s = x / sum(x), r = sum(x) - sum(x) / 2.0 }, by g];");
+        runtime::ParallelIslandStats stats;
+        runtime::ExecutionContext exec;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto& d = std::get<Column<double>>(*out->find("d"));
+        const auto& s = std::get<Column<double>>(*out->find("s"));
+        const auto& r = std::get<Column<double>>(*out->find("r"));
+        CHECK(std::vector<double>(d.begin(), d.end()) ==
+              std::vector<double>{-1.0, 1.0, -5.0, 5.0, 0.0, 0.0});
+        CHECK(s[0] == Catch::Approx(0.25));
+        CHECK(s[2] == Catch::Approx(10.0 / 30.0));
+        CHECK(s[5] == Catch::Approx(0.5));
+        CHECK(std::vector<double>(r.begin(), r.end()) ==
+              std::vector<double>{2.0, 2.0, 15.0, 15.0, 5.0, 5.0});
+        // Two reductions per field would be three staging columns; `sum(x)`
+        // appearing twice in one field must collapse onto one.
+        CHECK(stats.grouped_lifted_aggregates.load() == 3);
+        // The staging columns live on a local table only.
+        CHECK(out->columns.size() == 6);
+        for (const auto& entry : out->columns) {
+            CHECK(entry.name.rfind("__grp_agg", 0) != 0);
+        }
+    }
+
+    SECTION("an aggregate over an expression stages its argument first") {
+        auto ir = require_ir("t[update { p = sum(x * Float64(y)) / count() }, by g];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& p = std::get<Column<double>>(*out->find("p"));
+        CHECK(std::vector<double>(p.begin(), p.end()) ==
+              std::vector<double>{7.0, 7.0, 110.0, 110.0, 55.0, 55.0});
+        CHECK(out->columns.size() == 4);
+    }
+
+    SECTION("a field may overwrite the column its own aggregate reads") {
+        auto ir = require_ir("t[update { x = x - min(x) }, by g];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& x = std::get<Column<double>>(*out->find("x"));
+        CHECK(std::vector<double>(x.begin(), x.end()) ==
+              std::vector<double>{0.0, 2.0, 0.0, 10.0, 0.0, 0.0});
+        CHECK(out->columns.size() == 3);
+    }
+}
+
+// An all-null group has no aggregate value, and the lifted path must carry that
+// through the row-local expression rather than reducing over undefined payloads
+// — the same contract the bare reductions own.
+TEST_CASE("grouped update propagates null aggregates through a lifted expression",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("x", Column<double>{1.0, 3.0, 7.0, 9.0},
+                 std::vector<bool>{true, true, false, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { d = x - mean(x) }, by g];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto* d = out->find_entry("d");
+    REQUIRE(d != nullptr);
+    REQUIRE(d->validity.has_value());
+    CHECK((*d->validity)[0]);
+    CHECK((*d->validity)[1]);
+    CHECK_FALSE((*d->validity)[2]);
+    CHECK_FALSE((*d->validity)[3]);
+    const auto& values = std::get<Column<double>>(*d->column);
+    CHECK(values[0] == Catch::Approx(-1.0));
+    CHECK(values[1] == Catch::Approx(1.0));
+}
+
+// The lifted path reduces over CSR groups on worker threads. Group ids are
+// handed out by first appearance, so a numbering that shifted with the pool
+// size would silently move rows between groups while every value still looked
+// plausible.
+TEST_CASE("lifted grouped aggregates are deterministic across thread counts",
+          "[update][groupby][parallel][reduction]") {
+    constexpr std::size_t kRows = 200'000;
+    Column<std::int64_t> g;
+    Column<double> v;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        g.push_back(static_cast<std::int64_t>((r * 7) % 97));
+        v.push_back(1.0 + static_cast<double>(r % 1013));
+    }
+    runtime::Table t;
+    t.add_column("g", std::move(g));
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { z = (v - mean(v)) / Float64(count()) }, by g];");
+    const auto run = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        exec.parallel_threads = threads;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto& z = std::get<Column<double>>(*out->find("z"));
+        return std::vector<double>(z.begin(), z.end());
+    };
+    const auto serial = run(false, 0);
+    REQUIRE(serial.size() == kRows);
+    for (const std::size_t threads : {2U, 3U, 5U, 8U}) {
+        CAPTURE(threads);
+        CHECK(run(true, threads) == serial);
+    }
+}
+
+// An aggregate outside the fixed-width contract keeps the whole field on the
+// materialized evaluator. The answer is what matters here: the gate declining
+// must change the path, not the result.
+TEST_CASE("grouped update falls back when a lifted aggregate is not fixed-width",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("s", Column<std::string>{"a", "b", "c", "d"});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { n = count(s) + 1 }, by g];");
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel_stats = &stats;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    const auto& n = std::get<Column<std::int64_t>>(*out->find("n"));
+    CHECK(std::vector<std::int64_t>(n.begin(), n.end()) == std::vector<std::int64_t>{3, 3, 3, 3});
+    CHECK(stats.grouped_lifted_aggregates.load() == 0);
+}
+
 TEST_CASE("grouped update mixes native reductions and materialized fields in declaration order",
           "[update][groupby][reduction]") {
     runtime::Table t;

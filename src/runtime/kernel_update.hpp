@@ -7,13 +7,16 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "interpreter_internal.hpp"
 #include "kernel_gather.hpp"
 
 namespace ibex::runtime {
@@ -204,6 +207,61 @@ struct StringInterpolationPlan {
                                               ::ibex::runtime::RowRange range,
                                               const ValidityBitmap* validity,
                                               StringOutputSpan output) -> bool;
+
+/// The direct-plan vocabulary for one field, resolved once. At most one member
+/// is engaged; `plan_direct_field` picks in the order the writers below
+/// dispatch in, so a caller cannot select a different one than the executor
+/// would. Planning is not free (the categorical arm builds an output dictionary
+/// and per-source code remaps), which is why callers pass a resolved route
+/// around instead of re-planning per execution mode.
+struct DirectFieldRoute {
+    std::optional<StringInterpolationPlan> string;
+    std::optional<DirectCategoricalPlan> categorical;
+    std::optional<DirectPredicatePlan> predicate;
+    std::optional<DirectValidityPlan> validity;
+    std::optional<DirectFieldPlan> fixed_width;
+
+    [[nodiscard]] auto has_plan() const noexcept -> bool {
+        return string.has_value() || categorical.has_value() || predicate.has_value() ||
+               validity.has_value() || fixed_width.has_value();
+    }
+};
+
+[[nodiscard]] auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
+                                     const ScalarRegistry* scalars) -> DirectFieldRoute;
+
+/// A caller's own writer for one range of an expression the direct vocabulary
+/// does not cover. It fills the numeric window and returns that range's
+/// validity. A caller that has no such writer -- one holding a chunk rather
+/// than a table, whose evaluator is the table path it is trying not to enter --
+/// passes none, and `evaluate_field_windows` then requires a direct plan.
+using DirectFieldRangeWriter =
+    std::function<std::expected<std::optional<ValidityBitmap>, std::string>(
+        ::ibex::runtime::RowRange, NumericOutputSpan)>;
+
+/// Evaluate one update field by splitting its rows across worker ranges, each
+/// writing its own disjoint window of one pre-sized output column, then merging
+/// the per-range validity.
+///
+/// Returns nullopt -- "not this shape" -- when the field has neither a direct
+/// plan nor a `fallback`, or when the size gates make one whole-range
+/// evaluation the better shape. The caller keeps its own serial route for both,
+/// so this never has to invent one.
+///
+/// `inferred` is the update's authority on the output type when the caller has
+/// one; pass nullopt to let the selected plan's own output kind decide, which
+/// is what a caller without a table to infer from does.
+///
+/// `direct_numeric_writer` is a scratch flag shared with `fallback`: either may
+/// set it to say a range was written by a direct numeric kernel, and this
+/// reports it to `parallel_direct_numeric_fields` once, after the barrier. It
+/// is one cell rather than two counters so a field whose ranges split between
+/// the two writers is still counted exactly once.
+[[nodiscard]] auto evaluate_field_windows(
+    const ir::Expr& expr, const DirectFieldRoute& route, const PredicateInput& input,
+    std::optional<ExprType> inferred, const ScalarRegistry* scalars, const ExecutionContext& exec,
+    const DirectFieldRangeWriter* fallback, std::atomic<bool>* direct_numeric_writer = nullptr)
+    -> std::expected<std::optional<ComputedColumn>, std::string>;
 
 /// Execute one row-local update over a chunk while retaining its transport
 /// identity.  The existing table-level field evaluator remains the semantic

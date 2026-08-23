@@ -4249,21 +4249,26 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     const std::size_t rows = table.rows();
     const auto whole = [&] { return evaluate_field(expr, table, RowRange::whole(rows), ctx); };
     const PredicateInput direct_input(table);
-    const auto direct_categorical_plan =
-        kernel::try_plan_direct_categorical_field(expr, direct_input, ctx.scalars);
+    // The categorical arm is planned before the size gates because the
+    // whole-range route below needs the same output dictionary the split route
+    // would build, and building that twice is the one part of planning that is
+    // not free. The other arms are planned only if this field is actually going
+    // to be split.
+    kernel::DirectFieldRoute route;
+    route.categorical = kernel::try_plan_direct_categorical_field(expr, direct_input, ctx.scalars);
     const auto whole_categorical = [&]() -> std::expected<ComputedColumn, std::string> {
-        if (!direct_categorical_plan.has_value()) {
+        if (!route.categorical.has_value()) {
             return whole();
         }
         std::vector<Column<Categorical>::code_type> codes(rows, 0);
         auto validity = kernel::write_direct_categorical_field_range(
-            *direct_categorical_plan, direct_input, RowRange::whole(rows), ctx.scalars,
+            *route.categorical, direct_input, RowRange::whole(rows), ctx.scalars,
             {.codes = codes.data(), .begin = 0, .count = rows});
         if (!validity.has_value()) {
             return std::unexpected(std::move(validity.error()));
         }
-        Column<Categorical> categorical(direct_categorical_plan->dictionary,
-                                        direct_categorical_plan->index, std::move(codes));
+        Column<Categorical> categorical(route.categorical->dictionary, route.categorical->index,
+                                        std::move(codes));
         return ComputedColumn{.column = ColumnValue{std::move(categorical)},
                               .validity = std::move(*validity)};
     };
@@ -4283,369 +4288,72 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     if (!inferred.has_value()) {
         return whole();
     }
-    const auto string_plan =
-        inferred.value() == ExprType::String
-            ? kernel::make_string_interpolation_plan(expr, PredicateInput(table), ctx.scalars)
-            : std::optional<kernel::StringInterpolationPlan>{};
-    const auto direct_fixed_width_plan =
-        kernel::try_plan_direct_fixed_width_field(expr, direct_input, ctx.scalars);
-    const auto direct_predicate_plan = kernel::try_plan_direct_predicate_field(expr);
-    const auto direct_validity_plan =
-        kernel::try_plan_direct_validity_field(expr, direct_input, ctx.scalars);
-    if ((!is_range_native_expr(expr) && !string_plan.has_value() &&
-         !direct_fixed_width_plan.has_value() && !direct_predicate_plan.has_value() &&
-         !direct_validity_plan.has_value() && !direct_categorical_plan.has_value()) ||
+    if (!route.categorical.has_value()) {
+        route = kernel::plan_direct_field(expr, direct_input, ctx.scalars);
+    }
+    // The fallback below evaluates one range at a time, so an expression that
+    // is not range-native would re-read the whole table per range; and a result
+    // this splitter cannot pre-size a destination for has no window to write.
+    if ((!is_range_native_expr(expr) && !route.has_plan()) ||
         (inferred.value() != ExprType::Int && inferred.value() != ExprType::Double &&
          inferred.value() != ExprType::Bool &&
-         (inferred.value() != ExprType::Categorical || !direct_categorical_plan.has_value()) &&
-         !string_plan.has_value()) ||
-        (inferred.value() == ExprType::Bool && !direct_predicate_plan.has_value())) {
+         (inferred.value() != ExprType::Categorical || !route.categorical.has_value()) &&
+         !route.string.has_value()) ||
+        (inferred.value() == ExprType::Bool && !route.predicate.has_value())) {
         return whole();
     }
 
-    // Same derivation as an island's, so the two parallel paths partition
-    // alike. Note a zero `parallel_grain` now means "derive", not "one row per
-    // morsel" — reading it directly here would have split a 20M-row update into
-    // 20M tasks.
-    const std::size_t grain = island_grain(exec, rows);
-    const std::size_t morsels = (rows + grain - 1) / grain;
-    auto& pool = process_worker_pool();
-    const std::size_t threads =
-        std::min(morsels, exec.parallel_threads != 0 ? exec.parallel_threads : pool.size());
-    if (threads < 2 || morsels < 2) {
-        return whole();
-    }
-
-    if (exec.parallel_stats != nullptr) {
-        exec.parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    if (string_plan.has_value()) {
-        // The count pass supplies both the byte prefix for each window and the
-        // dense validity each writer must honour.  Invalid rows deliberately
-        // contribute no bytes, matching the reference evaluator's empty
-        // payload and avoiding reads of their undefined source payloads.
-        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
-        std::vector<std::expected<std::uint32_t, std::string>> bytes(morsels);
-        std::atomic<std::size_t> cursor{0};
-        auto count_batch = pool.submit(threads, [&](std::size_t) {
-            while (true) {
-                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (index >= morsels) {
-                    return;
-                }
-                const std::size_t begin = index * grain;
-                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
-                auto validity = collect_expr_validity(expr, PredicateInput(table), range);
-                const auto count = kernel::string_interpolation_bytes(
-                    *string_plan, range, validity.has_value() ? &*validity : nullptr);
-                if (!count.has_value()) {
-                    pieces[index] = std::unexpected(
-                        "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
-                    bytes[index] = std::unexpected(
-                        "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
-                    continue;
-                }
-                pieces[index] = std::move(validity);
-                bytes[index] = *count;
-            }
-        });
-        count_batch.wait();
-        for (std::size_t index = 0; index < morsels; ++index) {
-            if (!pieces[index].has_value()) {
-                return std::unexpected(pieces[index].error());
-            }
-            if (!bytes[index].has_value()) {
-                return std::unexpected(bytes[index].error());
-            }
+    // Everything the direct vocabulary does not cover: the compiled numeric
+    // writers first, then the general evaluator with a copy into the window.
+    // This is the one part of a split field that needs the Table itself, which
+    // is why it is the caller's to supply.
+    std::atomic<bool> direct_numeric_writer{false};
+    const kernel::DirectFieldRangeWriter fallback = [&](RowRange range,
+                                                        kernel::NumericOutputSpan window)
+        -> std::expected<std::optional<ValidityBitmap>, std::string> {
+        if (try_write_fast_update_binary(expr, table, range, inferred.value(), ctx.scalars,
+                                         window.ints, window.doubles) ||
+            try_write_compiled_numeric_update_expr(expr, table, range, inferred.value(),
+                                                   ctx.scalars, window.ints, window.doubles)) {
+            direct_numeric_writer.store(true, std::memory_order_relaxed);
+            return collect_expr_validity(expr, PredicateInput(table), range);
         }
-
-        std::vector<std::uint32_t> char_prefix(morsels + 1, 0);
-        for (std::size_t index = 0; index < morsels; ++index) {
-            if (*bytes[index] > std::numeric_limits<std::uint32_t>::max() - char_prefix[index]) {
-                return std::unexpected(
-                    "evaluate_field_maybe_parallel: string output exceeds uint32 offsets");
-            }
-            char_prefix[index + 1] = char_prefix[index] + *bytes[index];
-        }
-        Column<std::string> strings;
-        strings.resize_for_gather(rows, char_prefix.back());
-        auto* offsets = strings.offsets_data();
-        for (std::size_t index = 0; index < morsels; ++index) {
-            offsets[index * grain] = char_prefix[index];
-        }
-        offsets[rows] = char_prefix.back();
-
-        std::atomic<bool> write_failed{false};
-        cursor.store(0, std::memory_order_relaxed);
-        auto write_batch = pool.submit(threads, [&](std::size_t) {
-            while (true) {
-                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (index >= morsels) {
-                    return;
-                }
-                const std::size_t begin = index * grain;
-                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
-                if (!kernel::write_string_interpolation(
-                        *string_plan, range,
-                        pieces[index]->has_value() ? &**pieces[index] : nullptr,
-                        kernel::StringOutputSpan{.offsets = offsets,
-                                                 .chars = strings.chars_data(),
-                                                 .begin = begin,
-                                                 .count = range.count,
-                                                 .char_base = char_prefix[index]})) {
-                    write_failed.store(true, std::memory_order_relaxed);
-                }
-            }
-        });
-        write_batch.wait();
-        if (write_failed.load(std::memory_order_relaxed)) {
-            return std::unexpected("evaluate_field_maybe_parallel: string window shape mismatch");
-        }
-
-        const bool any_validity =
-            std::ranges::any_of(pieces, [](const auto& piece) { return piece->has_value(); });
-        std::optional<ValidityBitmap> validity;
-        if (any_validity) {
-            ValidityBitmap merged(rows, true);
-            for (std::size_t index = 0; index < morsels; ++index) {
-                if (!pieces[index]->has_value()) {
-                    continue;
-                }
-                const std::size_t begin = index * grain;
-                const ValidityBitmap& source = **pieces[index];
-                for (std::size_t offset = 0; offset < source.size(); ++offset) {
-                    merged.set(begin + offset, source[offset]);
-                }
-            }
-            validity = std::move(merged);
-        }
-        return ComputedColumn{.column = ColumnValue{std::move(strings)},
-                              .validity = std::move(validity)};
-    }
-
-    if (direct_categorical_plan.has_value()) {
-        using Code = Column<Categorical>::code_type;
-        std::vector<Code> codes(rows, 0);
-        std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
-        std::atomic<std::size_t> cursor{0};
-        auto batch = pool.submit(threads, [&](std::size_t) {
-            while (true) {
-                const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (index >= morsels) {
-                    return;
-                }
-                const std::size_t begin = index * grain;
-                const RowRange range{.begin = begin, .count = std::min(grain, rows - begin)};
-                auto validity = kernel::write_direct_categorical_field_range(
-                    *direct_categorical_plan, direct_input, range, ctx.scalars,
-                    {.codes = codes.data() + begin, .begin = begin, .count = range.count});
-                if (!validity.has_value()) {
-                    pieces[index] = std::unexpected(std::move(validity.error()));
-                    continue;
-                }
-                pieces[index] = std::move(*validity);
-            }
-        });
-        batch.wait();
-        for (auto& piece : pieces) {
-            if (!piece.has_value()) {
-                return std::unexpected(piece.error());
-            }
-        }
-        const bool any_validity =
-            std::ranges::any_of(pieces, [](const auto& piece) { return piece->has_value(); });
-        std::optional<ValidityBitmap> validity;
-        if (any_validity) {
-            ValidityBitmap merged(rows, true);
-            for (std::size_t index = 0; index < morsels; ++index) {
-                if (!pieces[index]->has_value()) {
-                    continue;
-                }
-                const std::size_t begin = index * grain;
-                const ValidityBitmap& source = **pieces[index];
-                for (std::size_t offset = 0; offset < source.size(); ++offset) {
-                    merged.set(begin + offset, source[offset]);
-                }
-            }
-            validity = std::move(merged);
-        }
-        Column<Categorical> categorical(direct_categorical_plan->dictionary,
-                                        direct_categorical_plan->index, std::move(codes));
-        return ComputedColumn{.column = ColumnValue{std::move(categorical)},
-                              .validity = std::move(validity)};
-    }
-
-    // Allocate the destination up front and let each worker copy its own morsel
-    // into it. Merging the pieces serially after the barrier was a second full
-    // pass over the result — at 8M rows, 64MB read plus 64MB write — and a
-    // memory-bound kernel like `abs(price)` only moves ~128MB in total, so the
-    // merge cost what the threads saved and then some (measured: 8.8ms
-    // parallel vs 5.8ms serial). Copying inside the task does it while the
-    // piece is still hot in that worker's cache, and does it in parallel.
-    ColumnValue out = inferred.value() == ExprType::Int      ? ColumnValue{Column<std::int64_t>{}}
-                      : inferred.value() == ExprType::Double ? ColumnValue{Column<double>{}}
-                                                             : ColumnValue{Column<bool>{}};
-    std::int64_t* dst_int = nullptr;
-    double* dst_double = nullptr;
-    std::uint64_t* dst_bool_words = nullptr;
-    if (auto* ints = std::get_if<Column<std::int64_t>>(&out)) {
-        ints->resize_for_overwrite(rows);
-        dst_int = ints->data();
-    } else if (auto* doubles = std::get_if<Column<double>>(&out)) {
-        doubles->resize_for_overwrite(rows);
-        dst_double = doubles->data();
-    } else {
-        auto& bools = std::get<Column<bool>>(out);
-        bools.resize(rows);
-        dst_bool_words = bools.words_data();
-    }
-
-    // One slot per morsel, each written by exactly one worker — no lock, and
-    // the result order is positional rather than dependent on completion order.
-    // Only the validity survives the task; the values are already in `out`.
-    std::vector<std::expected<std::optional<ValidityBitmap>, std::string>> pieces(morsels);
-    std::atomic<std::size_t> cursor{0};
-    std::atomic<bool> used_direct_numeric_writer{false};
-    auto batch = pool.submit(threads, [&](std::size_t) {
-        while (true) {
-            const std::size_t index = cursor.fetch_add(1, std::memory_order_relaxed);
-            if (index >= morsels) {
-                return;
-            }
-            const std::size_t begin = index * grain;
-            const std::size_t count = std::min(grain, rows - begin);
-            const RowRange range{.begin = begin, .count = count};
-            if (dst_bool_words != nullptr) {
-                if (!direct_predicate_plan.has_value()) {
-                    pieces[index] = std::unexpected(
-                        "evaluate_field_maybe_parallel: missing native predicate plan");
-                    continue;
-                }
-                auto validity = kernel::write_direct_predicate_range(
-                    *direct_predicate_plan, direct_input, range, ctx.scalars,
-                    kernel::BoolOutputSpan{
-                        .words = dst_bool_words, .begin = begin, .count = count});
-                if (!validity.has_value()) {
-                    pieces[index] = std::unexpected(std::move(validity.error()));
-                    continue;
-                }
-                pieces[index] = std::move(*validity);
-                continue;
-            }
-            const bool validity_destination =
-                direct_validity_plan.has_value() &&
-                ((direct_validity_plan->numeric_kind == kernel::FixedWidthNumericKind::Int &&
-                  dst_int != nullptr) ||
-                 (direct_validity_plan->numeric_kind == kernel::FixedWidthNumericKind::Double &&
-                  dst_double != nullptr));
-            if (validity_destination) {
-                auto validity = kernel::write_direct_validity_field_range(
-                    *direct_validity_plan, direct_input, range, ctx.scalars,
-                    {.numeric = {.ints = dst_int != nullptr ? dst_int + begin : nullptr,
-                                 .doubles = dst_double != nullptr ? dst_double + begin : nullptr}});
-                if (!validity.has_value()) {
-                    pieces[index] = std::unexpected(std::move(validity.error()));
-                    continue;
-                }
-                pieces[index] = std::move(*validity);
-                continue;
-            }
-            const bool fixed_width_destination =
-                direct_fixed_width_plan.has_value() &&
-                ((direct_fixed_width_plan->numeric_kind == kernel::FixedWidthNumericKind::Int &&
-                  dst_int != nullptr) ||
-                 (direct_fixed_width_plan->numeric_kind == kernel::FixedWidthNumericKind::Double &&
-                  dst_double != nullptr));
-            if (fixed_width_destination &&
-                kernel::write_direct_field_range(
-                    *direct_fixed_width_plan, direct_input, range, ctx.scalars,
-                    {.numeric = {
-                         .ints = dst_int != nullptr ? dst_int + begin : nullptr,
-                         .doubles = dst_double != nullptr ? dst_double + begin : nullptr}})) {
-                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
-                if (direct_fixed_width_plan->kind == kernel::DirectFieldKind::NumericBinary) {
-                    used_direct_numeric_writer.store(true, std::memory_order_relaxed);
-                }
-                continue;
-            }
-            if (try_write_fast_update_binary(
-                    expr, table, range, inferred.value(), ctx.scalars,
-                    dst_int != nullptr ? dst_int + begin : nullptr,
-                    dst_double != nullptr ? dst_double + begin : nullptr)) {
-                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
-                used_direct_numeric_writer.store(true, std::memory_order_relaxed);
-                continue;
-            }
-            if (try_write_compiled_numeric_update_expr(
-                    expr, table, range, inferred.value(), ctx.scalars,
-                    dst_int != nullptr ? dst_int + begin : nullptr,
-                    dst_double != nullptr ? dst_double + begin : nullptr)) {
-                pieces[index] = collect_expr_validity(expr, PredicateInput(table), range);
-                used_direct_numeric_writer.store(true, std::memory_order_relaxed);
-                continue;
-            }
-            auto piece = evaluate_field(expr, table, range, ctx);
-            if (!piece.has_value()) {
-                pieces[index] = std::unexpected(std::move(piece.error()));
-                continue;
-            }
-            // `infer_expr_type` chose the destination, so a morsel of another
-            // type means the two disagree. Report it rather than throwing out
-            // of a worker.
-            const void* src = nullptr;
-            if (dst_int != nullptr) {
-                if (const auto* ints = std::get_if<Column<std::int64_t>>(&piece->column)) {
-                    src = ints->data();
-                }
-            } else if (const auto* doubles = std::get_if<Column<double>>(&piece->column)) {
-                src = doubles->data();
-            }
-            if (src == nullptr) {
-                pieces[index] = std::unexpected(
-                    std::string("evaluate_field_maybe_parallel: morsel column type does not "
-                                "match the inferred result type"));
-                continue;
-            }
-            void* at = dst_int != nullptr ? static_cast<void*>(dst_int + begin)
-                                          : static_cast<void*>(dst_double + begin);
-            std::memcpy(at, src, count * sizeof(std::int64_t));
-            pieces[index] = std::move(piece->validity);
-        }
-    });
-    batch.wait();
-
-    if (used_direct_numeric_writer.load(std::memory_order_relaxed) &&
-        exec.parallel_stats != nullptr) {
-        exec.parallel_stats->parallel_direct_numeric_fields.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // Lowest failing morsel wins, so the reported error does not depend on
-    // thread timing — the same rule the island merger uses.
-    for (auto& piece : pieces) {
+        auto piece = evaluate_field(expr, table, range, ctx);
         if (!piece.has_value()) {
-            return std::unexpected(piece.error());
+            return std::unexpected(std::move(piece.error()));
         }
-    }
+        // `infer_expr_type` chose the destination, so a morsel of another type
+        // means the two disagree. Report it rather than throwing out of a
+        // worker.
+        const void* src = nullptr;
+        if (window.ints != nullptr) {
+            if (const auto* ints = std::get_if<Column<std::int64_t>>(&piece->column)) {
+                src = ints->data();
+            }
+        } else if (const auto* doubles = std::get_if<Column<double>>(&piece->column)) {
+            src = doubles->data();
+        }
+        if (src == nullptr) {
+            return std::unexpected(
+                std::string("evaluate_field_maybe_parallel: morsel column type does not match "
+                            "the inferred result type"));
+        }
+        void* at = window.ints != nullptr ? static_cast<void*>(window.ints)
+                                          : static_cast<void*>(window.doubles);
+        std::memcpy(at, src, range.count * sizeof(std::int64_t));
+        return std::move(piece->validity);
+    };
 
-    const bool any_validity =
-        std::ranges::any_of(pieces, [](const auto& p) { return p->has_value(); });
-    std::optional<ValidityBitmap> validity;
-    if (any_validity) {
-        ValidityBitmap merged(rows, true);
-        for (std::size_t index = 0; index < morsels; ++index) {
-            if (!pieces[index]->has_value()) {
-                continue;
-            }
-            const std::size_t begin = index * grain;
-            const ValidityBitmap& src = **pieces[index];
-            for (std::size_t i = 0; i < src.size(); ++i) {
-                merged.set(begin + i, src[i]);
-            }
-        }
-        validity = std::move(merged);
+    auto windows =
+        kernel::evaluate_field_windows(expr, route, direct_input, inferred.value(), ctx.scalars,
+                                       exec, &fallback, &direct_numeric_writer);
+    if (!windows.has_value()) {
+        return std::unexpected(std::move(windows.error()));
     }
-    return ComputedColumn{.column = std::move(out), .validity = std::move(validity)};
+    if (!windows->has_value()) {
+        return whole_categorical();  // the split was declined, not attempted
+    }
+    return std::move(**windows);
 }
 
 }  // namespace

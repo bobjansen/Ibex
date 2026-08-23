@@ -145,6 +145,37 @@ struct BuiltinFunctionInfo {
 /// straddles any boundary we might pick.
 [[nodiscard]] auto is_bucket_local_window_expr(const Expr& expr) -> bool;
 
+/// How far back a windowed expression can reach from any one row.
+///
+/// The two limits are independent because the two window kinds are: a duration
+/// window reaches `nanos` back in TIME, a count window reaches `rows` back in
+/// ROWS, and an expression carrying both must satisfy each. Zero on both means
+/// row-local.
+struct WindowLookback {
+    std::int64_t nanos = 0;
+    std::size_t rows = 0;
+};
+
+/// The furthest back `expr` can read under a `window <clause_nanos>` clause, or
+/// `nullopt` when some call inside it can read arbitrarily far back.
+///
+/// This is the halo contract for cutting one group into independently evaluated
+/// pieces: give a piece every row within this bound before its first row, and
+/// its results are identical to the whole group's. It is the general form of
+/// `is_bucket_local_window_expr`, which is the same admission set specialised to
+/// the case where an aligned cut makes the bound zero.
+///
+/// The admitted set is deliberately the same one: Scalar calls and
+/// `window_start`/`window_end` (lookback zero), and the rolling family (bounded
+/// by its own `__window_n`/`__window_ns`, else by the clause). `cumsum`, a bare
+/// Aggregate, and an unknown extern reach back to the group's first row and are
+/// refused. `lag`/`lead`/`diff` are refused too, though a backward-only `lag`
+/// has an obvious row bound — `lead` reads FORWARD, which this halo, being a
+/// prefix, does not supply, and admitting one of the pair without the other buys
+/// little for the confusion it costs.
+[[nodiscard]] auto expr_window_lookback(const Expr& expr, std::int64_t clause_nanos)
+    -> std::optional<WindowLookback>;
+
 /// Collects the set of column names referenced anywhere inside `expr` into `out`.
 void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out);
 

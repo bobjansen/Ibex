@@ -537,6 +537,14 @@ struct ParallelIslandStats {
     /// field, an extern call added to a query — would cost the parallelism with
     /// every test still green.
     std::atomic<std::uint64_t> parallel_group_windows{0};
+    /// Grouped-window pieces that carried a halo — i.e. cuts made INSIDE a group
+    /// under a trailing window, each re-evaluating the rows within the window's
+    /// reach before it. Counted for the same reason as the others, and for one
+    /// more: unlike them the halo is real duplicated work, so a gate that
+    /// silently stopped matching would be invisible while a halo that silently
+    /// grew would be a slow query with no explanation. Zero means every task was
+    /// a whole group or an aligned bucket-boundary cut.
+    std::atomic<std::uint64_t> window_halo_pieces{0};
     /// Inner-join probe scans fanned out across worker ranges instead of run
     /// as one serial walk. Same reason as the counters above: the concatenated
     /// range outputs are byte-identical to the serial probe, so without this a

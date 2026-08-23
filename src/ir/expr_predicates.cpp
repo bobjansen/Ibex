@@ -281,6 +281,57 @@ auto is_bucket_local_window_expr(const Expr& expr) -> bool {
     });
 }
 
+auto expr_window_lookback(const Expr& expr, std::int64_t clause_nanos)
+    -> std::optional<WindowLookback> {
+    WindowLookback bound;
+    // `every_call` short-circuits on the first refusal, which is exactly the
+    // behaviour wanted: one unbounded call makes the whole expression unbounded,
+    // and the accumulated maxima are then discarded.
+    const bool ok = every_call(expr, [&](const CallExpr& call) {
+        const auto kind = fn_kind(call.callee);
+        if (!kind.has_value()) {
+            return false;  // extern or plugin: unclassifiable, hence unprovable
+        }
+        if (*kind == FnKind::Scalar || call.callee == "window_start" ||
+            call.callee == "window_end") {
+            return true;  // a pure function of its own row
+        }
+        if (!is_rolling_func(call.callee)) {
+            return false;  // cumulative, lag/lead, or a whole-slice aggregate
+        }
+        // A per-call window overrides the clause, and the two kinds bound
+        // different things — see `WindowLookback`.
+        for (const auto& na : call.named_args) {
+            const bool is_n = na.name == "__window_n";
+            const bool is_ns = na.name == "__window_ns";
+            if (!is_n && !is_ns) {
+                continue;
+            }
+            const auto* lit = na.value == nullptr ? nullptr : std::get_if<Literal>(&na.value->node);
+            const auto* value = lit == nullptr ? nullptr : std::get_if<std::int64_t>(&lit->value);
+            if (value == nullptr || *value <= 0) {
+                return false;  // malformed; the evaluator will report it
+            }
+            if (is_n) {
+                // A window of n rows spans the current row and n-1 before it.
+                bound.rows = std::max(bound.rows, static_cast<std::size_t>(*value) - 1);
+            } else {
+                bound.nanos = std::max(bound.nanos, *value);
+            }
+            return true;
+        }
+        if (clause_nanos <= 0) {
+            return false;  // no clause to fall back on, so no bound to state
+        }
+        bound.nanos = std::max(bound.nanos, clause_nanos);
+        return true;
+    });
+    if (!ok) {
+        return std::nullopt;
+    }
+    return bound;
+}
+
 void collect_expr_column_refs(const Expr& expr, robin_hood::unordered_set<std::string>& out) {
     std::visit(
         [&](const auto& n) {

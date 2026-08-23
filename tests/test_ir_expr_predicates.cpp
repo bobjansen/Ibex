@@ -98,3 +98,80 @@ TEST_CASE("bucket-local classification gates the aligned window split", "[ir][fu
     CHECK(ir::is_bucket_local_window_expr(binary(call("rolling_max"), call("abs"))));
     CHECK_FALSE(ir::is_bucket_local_window_expr(binary(call("rolling_max"), call("lag"))));
 }
+
+// The halo contract for cutting a group under a TRAILING window. Where
+// bucket-locality asks "can this reach across the cut at all", this asks "how
+// far", and a bound that is too small is a wrong answer rather than a slow one.
+TEST_CASE("window lookback bounds the halo a split piece needs", "[ir][functions]") {
+    auto col = [](std::string name) {
+        return ir::ExprPtr{ir::Expr{.node = ir::ColumnRef{.name = std::move(name)}}};
+    };
+    auto call = [&](std::string callee, std::vector<ir::NamedArg> named = {}) {
+        std::vector<ir::ExprPtr> args;
+        args.push_back(col("v"));
+        return ir::Expr{.node = ir::CallExpr{.callee = std::move(callee),
+                                             .args = std::move(args),
+                                             .named_args = std::move(named)}};
+    };
+    auto named_window = [](const char* name, std::int64_t value) {
+        std::vector<ir::NamedArg> args;
+        args.push_back(
+            ir::NamedArg{.name = name, .value = ir::ExprPtr{ir::Expr{.node = ir::Literal{value}}}});
+        return args;
+    };
+    constexpr std::int64_t kClause = 1000;
+
+    // A rolling call with no override is bounded by the clause.
+    auto rolling = ir::expr_window_lookback(call("rolling_mean"), kClause);
+    REQUIRE(rolling.has_value());
+    CHECK(rolling->nanos == kClause);
+    CHECK(rolling->rows == 0);
+
+    // Row-local expressions need no halo at all.
+    auto scalar = ir::expr_window_lookback(call("abs"), kClause);
+    REQUIRE(scalar.has_value());
+    CHECK(scalar->nanos == 0);
+    CHECK(scalar->rows == 0);
+
+    // A count window is bounded in ROWS, and spans the current row plus the 19
+    // before it — not in time, which it knows nothing about.
+    auto counted =
+        ir::expr_window_lookback(call("rolling_max", named_window("__window_n", 20)), kClause);
+    REQUIRE(counted.has_value());
+    CHECK(counted->rows == 19);
+    CHECK(counted->nanos == 0);
+
+    // A per-call duration overrides the clause in both directions.
+    auto shorter =
+        ir::expr_window_lookback(call("rolling_max", named_window("__window_ns", 5)), kClause);
+    REQUIRE(shorter.has_value());
+    CHECK(shorter->nanos == 5);
+    auto longer =
+        ir::expr_window_lookback(call("rolling_max", named_window("__window_ns", 9000)), kClause);
+    REQUIRE(longer.has_value());
+    CHECK(longer->nanos == 9000);
+
+    // Reaches back to the group's first row: no finite halo suffices.
+    CHECK_FALSE(ir::expr_window_lookback(call("cumsum"), kClause).has_value());
+    CHECK_FALSE(ir::expr_window_lookback(call("lag"), kClause).has_value());
+    CHECK_FALSE(ir::expr_window_lookback(call("quantile"), kClause).has_value());
+    // Unclassifiable, so unbounded by default.
+    CHECK_FALSE(ir::expr_window_lookback(call("plugin_smooth"), kClause).has_value());
+    // No clause and no per-call window: nothing to state a bound from.
+    CHECK_FALSE(ir::expr_window_lookback(call("rolling_mean"), 0).has_value());
+
+    // Composition takes the maximum of each bound independently, and one
+    // unbounded leaf anywhere disqualifies the whole expression.
+    auto binary = [&](ir::Expr lhs, ir::Expr rhs) {
+        return ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Add,
+                                               .left = ir::ExprPtr{std::move(lhs)},
+                                               .right = ir::ExprPtr{std::move(rhs)}}};
+    };
+    auto mixed = ir::expr_window_lookback(
+        binary(call("rolling_max", named_window("__window_n", 20)), call("rolling_mean")), kClause);
+    REQUIRE(mixed.has_value());
+    CHECK(mixed->rows == 19);
+    CHECK(mixed->nanos == kClause);
+    CHECK_FALSE(
+        ir::expr_window_lookback(binary(call("rolling_max"), call("cumsum")), kClause).has_value());
+}

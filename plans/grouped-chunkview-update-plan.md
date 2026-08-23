@@ -179,6 +179,37 @@ each state shape is introduced.
    identical for every stage. This is what makes admitting more fields to
    staging free rather than a per-field group-discovery tax.
 
+8. **The rest of the aggregate family.** **Completed.** The fixed-width CSR
+   reductions cover five functions over two types; `median`, `std`, `quantile`,
+   `first`, `last`, `skew`, `kurtosis`, `ewma`, and anything over a string or
+   categorical column were still a per-group gather-and-rebuild. None of them
+   needs a new kernel either: `update f(x), by k` is a grouped aggregation
+   broadcast back onto the rows, so the grouped aggregate operator runs once
+   and its per-group result is gathered onto the absolute rows.
+   *Keyed by group id, not by the user's keys.* The operator never sees a
+   multi-key, string, or null-bearing key tuple — only one dense Int64 column
+   built from `GroupedRowPlan`'s row ids — so every key shape is already
+   handled by the time it is asked, and the answer comes back addressed by the
+   same ids the CSR rows use. The ids are read back out of the result rather
+   than assumed, since the operator is free to emit its groups in any order.
+   This also settles the semantics question by construction: these are the same
+   kernels `select ..., by ...` runs, so a grouped update and a grouped select
+   cannot answer differently. The acceptance test states exactly that, rather
+   than restating expected numbers.
+   *Also widened:* `count(col)` reads the validity bitmap and never a value, so
+   it is a fixed-width CSR reduction over a column of ANY type, not just a
+   numeric one.
+   *Landing:* a field that is nothing but one aggregate (`m = median(x)`) has
+   its answer already addressed by absolute row, so the staging column is landed
+   directly instead of being copied through a whole-column evaluation.
+   *Cost:* the broadcast gather materializes one row-indexed index vector, which
+   the fixed-width family does not need — that family therefore keeps its direct
+   scatter and is tried first.
+   *Not covered:* the argument must still be a column or a row-local expression
+   staged into one, and the whole field must be row-local once its aggregates
+   are ignored. `rank`, ordered group state, and `window`-clause `lag`/`lead`
+   remain where slices 5 and 6 left them.
+
 ## Initial acceptance tests
 
 - groups span at least three chunks, including a null-key group;

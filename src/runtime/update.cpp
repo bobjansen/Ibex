@@ -1856,6 +1856,23 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     return workers < 2 ? 0 : workers;
 }
 
+/// Native reductions have no cross-group state: each worker can reduce and
+/// scatter a complete CSR group independently. Validity lands later, after
+/// workers have published which groups were all-null, so packed bitmap bytes
+/// are never concurrently modified.
+[[nodiscard]] auto grouped_reduction_worker_count(const ExecutionContext& exec,
+                                                  std::size_t group_count, std::size_t rows)
+    -> std::size_t {
+    if (on_worker_pool_thread() || !exec.parallel || group_count < 2 ||
+        rows < exec.parallel_min_rows) {
+        return 0;
+    }
+    const std::size_t pool_size = process_worker_pool().size();
+    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t workers = std::min({budget, pool_size, group_count});
+    return workers < 2 ? 0 : workers;
+}
+
 /// Row indices bucketed by group, in CSR form.
 ///
 /// CSR — "compressed sparse row", the sparse-matrix layout the name is
@@ -2182,6 +2199,500 @@ struct GroupedRows {
         batch.wait();
     }
     return out;
+}
+
+/// Immutable, table-global grouping state shared by grouped update stages.
+/// `row_gid_storage` owns one deterministic id per absolute input row; `rows`
+/// owns the CSR inverse mapping used by every later group-local reader and
+/// scatter.
+struct GroupedRowPlan {
+    std::unique_ptr<std::uint32_t[]> row_gid_storage;
+    GroupedRows rows;
+
+    [[nodiscard]] auto row_gid(std::size_t count) const noexcept -> std::span<const std::uint32_t> {
+        return {row_gid_storage.get(), count};
+    }
+};
+
+/// Resolve group keys once and make their global row ownership explicit. No
+/// grouped kernel may assign ids independently per chunk: equal keys can recur
+/// in later chunks and must retain this same id.
+auto make_grouped_row_plan(const Table& input, const std::vector<ir::ColumnRef>& group_by,
+                           const ExecutionContext& exec)
+    -> std::expected<GroupedRowPlan, std::string> {
+    std::vector<const ColumnValue*> group_columns;
+    group_columns.reserve(group_by.size());
+    for (const auto& key : group_by) {
+        const auto* column = input.find(key.name);
+        if (column == nullptr) {
+            return std::unexpected("update + by: unknown group key '" + key.name +
+                                   "' (available: " + format_columns(input) + ")");
+        }
+        group_columns.push_back(column);
+    }
+    const std::size_t row_count = input.rows();
+    GroupedRowPlan plan;
+    plan.row_gid_storage = std::make_unique_for_overwrite<std::uint32_t[]>(row_count);
+    const auto validity = collect_key_validity(input, group_by);
+    const std::size_t group_count =
+        assign_group_ids(group_columns, validity, row_count, exec,
+                         std::span<std::uint32_t>{plan.row_gid_storage.get(), row_count});
+    plan.rows = build_grouped_rows(plan.row_gid(row_count), group_count, exec);
+    return plan;
+}
+
+/// The first grouped-native reduction slice.  It deliberately accepts only
+/// independent, bare numeric reductions: once a field can observe a preceding
+/// field (or carries a scalar expression around an aggregate), the established
+/// per-group table evaluator remains the semantic owner.
+enum class NativeGroupedReduction : std::uint8_t {
+    SumInt,
+    SumDouble,
+    Mean,
+    MinInt,
+    MinDouble,
+    MaxInt,
+    MaxDouble,
+    CountRows,
+    CountNonNull,
+};
+
+struct NativeGroupedReductionField {
+    std::string alias;
+    NativeGroupedReduction reduction = NativeGroupedReduction::CountRows;
+    const ColumnEntry* source = nullptr;
+};
+
+/// Return a fully scattered update result when every field belongs to the
+/// fixed-width native reduction contract. A null-producing numeric reduction
+/// owns one output validity bitmap; count is never nullable. The group CSR
+/// rows are read directly, and every group writes disjoint absolute output
+/// rows.
+auto try_native_grouped_reductions(const Table& input, const std::vector<ir::FieldSpec>& fields,
+                                   const GroupedRows& group_rows, const ExecutionContext& exec)
+    -> std::expected<std::optional<Table>, std::string> {
+    std::vector<NativeGroupedReductionField> plan;
+    plan.reserve(fields.size());
+    for (const auto& field : fields) {
+        const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+        if (call == nullptr || !call->named_args.empty()) {
+            return std::optional<Table>{};
+        }
+        if (call->callee != "sum" && call->callee != "mean" && call->callee != "min" &&
+            call->callee != "max" && call->callee != "count") {
+            return std::optional<Table>{};
+        }
+        if (std::ranges::any_of(plan,
+                                [&](const auto& item) { return item.alias == field.alias; })) {
+            return std::optional<Table>{};
+        }
+
+        NativeGroupedReductionField item{.alias = field.alias};
+        if (call->callee == "count" && call->args.empty()) {
+            item.reduction = NativeGroupedReduction::CountRows;
+        } else {
+            if (call->args.size() != 1) {
+                return std::optional<Table>{};
+            }
+            const auto* ref = ir::as_column_ref(*call->args[0]);
+            if (ref == nullptr) {
+                return std::optional<Table>{};
+            }
+            // A source that is also an output alias relies on update's
+            // declaration-order visibility.  Keep that contract on the
+            // materialized evaluator until this protocol has dependencies.
+            if (std::ranges::any_of(
+                    fields, [&](const auto& candidate) { return candidate.alias == ref->name; })) {
+                return std::optional<Table>{};
+            }
+            item.source = input.find_entry(ref->name);
+            if (item.source == nullptr) {
+                return std::optional<Table>{};
+            }
+            if (std::holds_alternative<Column<std::int64_t>>(*item.source->column)) {
+                if (call->callee == "sum") {
+                    item.reduction = NativeGroupedReduction::SumInt;
+                } else if (call->callee == "mean") {
+                    item.reduction = NativeGroupedReduction::Mean;
+                } else if (call->callee == "min") {
+                    item.reduction = NativeGroupedReduction::MinInt;
+                } else if (call->callee == "max") {
+                    item.reduction = NativeGroupedReduction::MaxInt;
+                } else {
+                    item.reduction = NativeGroupedReduction::CountNonNull;
+                }
+            } else if (std::holds_alternative<Column<double>>(*item.source->column)) {
+                if (call->callee == "sum") {
+                    item.reduction = NativeGroupedReduction::SumDouble;
+                } else if (call->callee == "mean") {
+                    item.reduction = NativeGroupedReduction::Mean;
+                } else if (call->callee == "min") {
+                    item.reduction = NativeGroupedReduction::MinDouble;
+                } else if (call->callee == "max") {
+                    item.reduction = NativeGroupedReduction::MaxDouble;
+                } else {
+                    item.reduction = NativeGroupedReduction::CountNonNull;
+                }
+            } else {
+                return std::optional<Table>{};
+            }
+        }
+        plan.push_back(std::move(item));
+    }
+    if (plan.empty()) {
+        return std::optional<Table>{};
+    }
+
+    const std::size_t rows = input.rows();
+    const std::size_t workers =
+        grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
+    Table output = input;
+    for (const auto& item : plan) {
+        const auto write_numeric = [&]<typename Source, typename Result>(
+                                       const Column<Source>& source,
+                                       NativeGroupedReduction reduction) {
+            const auto* validity = item.source->validity ? &*item.source->validity : nullptr;
+            Column<Result> result;
+            result.resize(rows);
+            std::vector<std::uint8_t> all_null(group_rows.group_count(), 0U);
+            const auto reduce_group = [&](std::size_t group) noexcept {
+                Result value{};
+                std::size_t count = 0;
+                for (const auto row : group_rows[group]) {
+                    if (validity != nullptr && !(*validity)[row]) {
+                        continue;
+                    }
+                    const Result next = static_cast<Result>(source[row]);
+                    if (reduction == NativeGroupedReduction::MinInt ||
+                        reduction == NativeGroupedReduction::MinDouble) {
+                        value = count == 0 ? next : std::min(value, next);
+                    } else if (reduction == NativeGroupedReduction::MaxInt ||
+                               reduction == NativeGroupedReduction::MaxDouble) {
+                        value = count == 0 ? next : std::max(value, next);
+                    } else {
+                        value += next;
+                    }
+                    ++count;
+                }
+                if (reduction == NativeGroupedReduction::Mean && count != 0) {
+                    value /= static_cast<Result>(count);
+                }
+                all_null[group] = count == 0 ? 1U : 0U;
+                for (const auto row : group_rows[group]) {
+                    result[row] = value;
+                }
+            };
+            if (workers < 2) {
+                for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+                    reduce_group(group);
+                }
+            } else {
+                std::atomic<std::size_t> next_group{0};
+                auto batch = process_worker_pool().submit(workers, [&](std::size_t) noexcept {
+                    while (true) {
+                        const std::size_t group =
+                            next_group.fetch_add(1, std::memory_order_relaxed);
+                        if (group >= group_rows.group_count()) {
+                            return;
+                        }
+                        reduce_group(group);
+                    }
+                });
+                batch.wait();
+            }
+            std::optional<ValidityBitmap> output_validity;
+            for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+                if (all_null[group] == 0U) {
+                    continue;
+                }
+                if (!output_validity.has_value()) {
+                    output_validity = ValidityBitmap(rows, true);
+                }
+                for (const auto row : group_rows[group]) {
+                    output_validity->set(row, false);
+                }
+            }
+            if (output_validity.has_value()) {
+                output.add_column(item.alias, std::move(result), std::move(*output_validity));
+            } else {
+                output.add_column(item.alias, std::move(result));
+            }
+        };
+        if (item.reduction == NativeGroupedReduction::SumInt ||
+            item.reduction == NativeGroupedReduction::MinInt ||
+            item.reduction == NativeGroupedReduction::MaxInt) {
+            write_numeric.operator()<std::int64_t, std::int64_t>(
+                std::get<Column<std::int64_t>>(*item.source->column), item.reduction);
+            continue;
+        }
+        if (item.reduction == NativeGroupedReduction::SumDouble ||
+            item.reduction == NativeGroupedReduction::MinDouble ||
+            item.reduction == NativeGroupedReduction::MaxDouble) {
+            write_numeric.operator()<double, double>(std::get<Column<double>>(*item.source->column),
+                                                     item.reduction);
+            continue;
+        }
+        if (item.reduction == NativeGroupedReduction::Mean) {
+            if (const auto* source = std::get_if<Column<std::int64_t>>(&*item.source->column)) {
+                write_numeric.operator()<std::int64_t, double>(*source, item.reduction);
+            } else {
+                write_numeric.operator()<double, double>(
+                    std::get<Column<double>>(*item.source->column), item.reduction);
+            }
+            continue;
+        }
+
+        Column<std::int64_t> result;
+        result.resize(rows);
+        const auto* validity =
+            item.source != nullptr && item.source->validity ? &*item.source->validity : nullptr;
+        const auto count_group = [&](std::size_t group) noexcept {
+            std::int64_t count = 0;
+            for (const auto row : group_rows[group]) {
+                if (item.reduction == NativeGroupedReduction::CountRows || validity == nullptr ||
+                    (*validity)[row]) {
+                    ++count;
+                }
+            }
+            for (const auto row : group_rows[group]) {
+                result[row] = count;
+            }
+        };
+        if (workers < 2) {
+            for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+                count_group(group);
+            }
+        } else {
+            std::atomic<std::size_t> next_group{0};
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t) noexcept {
+                while (true) {
+                    const std::size_t group = next_group.fetch_add(1, std::memory_order_relaxed);
+                    if (group >= group_rows.group_count()) {
+                        return;
+                    }
+                    count_group(group);
+                }
+            });
+            batch.wait();
+        }
+        output.add_column(item.alias, std::move(result));
+    }
+    apply_table_properties(
+        output, TableProperties::derive(
+                    table_properties_of(output),
+                    [&](const std::string& name) -> KeyFate {
+                        const bool overwritten = std::ranges::any_of(
+                            fields,
+                            [&](const ir::FieldSpec& field) { return field.alias == name; });
+                        return overwritten ? KeyFate::overwritten() : KeyFate::kept(name);
+                    },
+                    RowTransform::Preserve));
+    return std::optional<Table>{std::move(output)};
+}
+
+enum class NativeGroupedOrderedKind : std::uint8_t {
+    Lag,
+    Lead,
+    CumSum,
+    CumProd,
+    FillForward,
+    FillBackward,
+};
+
+/// Fixed-width, bare ordered kernels over one CSR group. Group rows are in
+/// original order, so each worker owns the entire state chain for its group.
+/// The byte validity staging avoids concurrent writes to packed bitmap words.
+auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::FieldSpec>& fields,
+                                      const GroupedRows& group_rows, const ExecutionContext& exec)
+    -> std::expected<std::optional<Table>, std::string> {
+    if (fields.size() != 1) {
+        return std::optional<Table>{};
+    }
+    const auto& field = fields.front();
+    const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return std::optional<Table>{};
+    }
+    NativeGroupedOrderedKind kind;
+    std::size_t offset = 0;
+    if (call->callee == "lag" || call->callee == "lead") {
+        if (call->args.size() != 2) {
+            return std::optional<Table>{};
+        }
+        const auto* literal = std::get_if<ir::Literal>(&call->args[1]->node);
+        const auto* value =
+            literal == nullptr ? nullptr : std::get_if<std::int64_t>(&literal->value);
+        if (value == nullptr || *value < 0) {
+            return std::optional<Table>{};
+        }
+        offset = static_cast<std::size_t>(*value);
+        kind =
+            call->callee == "lag" ? NativeGroupedOrderedKind::Lag : NativeGroupedOrderedKind::Lead;
+    } else if (call->callee == "cumsum") {
+        if (call->args.size() != 1)
+            return std::optional<Table>{};
+        kind = NativeGroupedOrderedKind::CumSum;
+    } else if (call->callee == "cumprod") {
+        if (call->args.size() != 1)
+            return std::optional<Table>{};
+        kind = NativeGroupedOrderedKind::CumProd;
+    } else if (call->callee == "fill_forward") {
+        if (call->args.size() != 1)
+            return std::optional<Table>{};
+        kind = NativeGroupedOrderedKind::FillForward;
+    } else if (call->callee == "fill_backward") {
+        if (call->args.size() != 1)
+            return std::optional<Table>{};
+        kind = NativeGroupedOrderedKind::FillBackward;
+    } else {
+        return std::optional<Table>{};
+    }
+    const auto* ref = ir::as_column_ref(*call->args[0]);
+    if (ref == nullptr) {
+        return std::optional<Table>{};
+    }
+    const auto* entry = input.find_entry(ref->name);
+    if (entry == nullptr || (!std::holds_alternative<Column<std::int64_t>>(*entry->column) &&
+                             !std::holds_alternative<Column<double>>(*entry->column))) {
+        return std::optional<Table>{};
+    }
+
+    const std::size_t rows = input.rows();
+    const std::size_t workers =
+        grouped_reduction_worker_count(exec, group_rows.group_count(), rows);
+    std::vector<std::uint8_t> invalid(rows, 0U);
+    Table output = input;
+    const auto write = [&]<typename T>(const Column<T>& source) {
+        Column<T> result;
+        result.resize(rows);
+        const auto* source_validity = entry->validity ? &*entry->validity : nullptr;
+        const auto run_group = [&](std::size_t group) noexcept {
+            const auto indices = group_rows[group];
+            if (kind == NativeGroupedOrderedKind::Lag || kind == NativeGroupedOrderedKind::Lead) {
+                for (std::size_t local = 0; local < indices.size(); ++local) {
+                    const bool in_bounds = kind == NativeGroupedOrderedKind::Lag
+                                               ? local >= offset
+                                               : local + offset < indices.size();
+                    const std::size_t row = indices[local];
+                    if (!in_bounds) {
+                        result[row] = T{};
+                        invalid[row] = 1U;
+                    } else {
+                        const std::size_t source_local =
+                            kind == NativeGroupedOrderedKind::Lag ? local - offset : local + offset;
+                        result[row] = source[indices[source_local]];
+                    }
+                }
+                return;
+            }
+            if (kind == NativeGroupedOrderedKind::CumSum ||
+                kind == NativeGroupedOrderedKind::CumProd) {
+                T accumulator = kind == NativeGroupedOrderedKind::CumProd ? T{1} : T{};
+                for (const auto row : indices) {
+                    if (kind == NativeGroupedOrderedKind::CumProd) {
+                        accumulator *= source[row];
+                    } else {
+                        accumulator += source[row];
+                    }
+                    result[row] = accumulator;
+                }
+                return;
+            }
+            const bool forward = kind == NativeGroupedOrderedKind::FillForward;
+            T carry{};
+            bool have_carry = false;
+            for (std::size_t pos = 0; pos < indices.size(); ++pos) {
+                const std::size_t local = forward ? pos : indices.size() - 1 - pos;
+                const std::size_t row = indices[local];
+                const bool valid = source_validity == nullptr || (*source_validity)[row];
+                if (valid) {
+                    result[row] = source[row];
+                    carry = source[row];
+                    have_carry = true;
+                } else if (have_carry) {
+                    result[row] = carry;
+                } else {
+                    result[row] = T{};
+                    invalid[row] = 1U;
+                }
+            }
+        };
+        if (workers < 2) {
+            for (std::size_t group = 0; group < group_rows.group_count(); ++group)
+                run_group(group);
+        } else {
+            std::atomic<std::size_t> next_group{0};
+            auto batch = process_worker_pool().submit(workers, [&](std::size_t) noexcept {
+                while (true) {
+                    const std::size_t group = next_group.fetch_add(1, std::memory_order_relaxed);
+                    if (group >= group_rows.group_count())
+                        return;
+                    run_group(group);
+                }
+            });
+            batch.wait();
+        }
+        if (std::ranges::any_of(invalid, [](auto value) { return value != 0U; })) {
+            ValidityBitmap validity(rows, true);
+            for (std::size_t row = 0; row < rows; ++row) {
+                if (invalid[row] != 0U)
+                    validity.set(row, false);
+            }
+            output.add_column(field.alias, std::move(result), std::move(validity));
+        } else {
+            output.add_column(field.alias, std::move(result));
+        }
+    };
+    if (const auto* source = std::get_if<Column<std::int64_t>>(entry->column.get())) {
+        write(*source);
+    } else {
+        write(std::get<Column<double>>(*entry->column));
+    }
+    apply_table_properties(output, TableProperties::derive(
+                                       table_properties_of(output),
+                                       [&](const std::string& name) -> KeyFate {
+                                           return name == field.alias ? KeyFate::overwritten()
+                                                                      : KeyFate::kept(name);
+                                       },
+                                       RowTransform::Preserve));
+    return std::optional<Table>{std::move(output)};
+}
+
+/// A cheap admission check for the ordered mixed-field dispatcher below. The
+/// full planner remains authoritative; this merely avoids splitting a wholly
+/// materialized update into one group pass per field.
+[[nodiscard]] auto is_grouped_direct_field_candidate(const Table& input, const ir::FieldSpec& field)
+    -> bool {
+    if (ir::is_row_local_update_expr(field.expr) && !expr_contains_aggregate_call(field.expr)) {
+        return true;
+    }
+    const auto* call = std::get_if<ir::CallExpr>(&field.expr.node);
+    if (call == nullptr || !call->named_args.empty()) {
+        return false;
+    }
+    if (call->callee == "lag" || call->callee == "lead" || call->callee == "cumsum" ||
+        call->callee == "cumprod" || call->callee == "fill_forward" ||
+        call->callee == "fill_backward") {
+        return true;
+    }
+    if (call->callee == "count" && call->args.empty()) {
+        return true;
+    }
+    if ((call->callee != "sum" && call->callee != "mean" && call->callee != "min" &&
+         call->callee != "max" && call->callee != "count") ||
+        call->args.size() != 1) {
+        return false;
+    }
+    const auto* ref = ir::as_column_ref(*call->args[0]);
+    if (ref == nullptr || ref->name == field.alias) {
+        return false;
+    }
+    const auto* source = input.find(ref->name);
+    // A preceding materialized field may create this source. Treat that as a
+    // candidate so the ordered dispatcher gets a chance to land it first; the
+    // single-field native planner remains the type/error authority afterwards.
+    return source == nullptr || std::holds_alternative<Column<std::int64_t>>(*source) ||
+           std::holds_alternative<Column<double>>(*source);
 }
 
 /// Cut one group's row list into pieces of at least `target` rows, each ending
@@ -3994,35 +4505,63 @@ auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
         }
     }
 
-    std::vector<const ColumnValue*> group_columns;
-    group_columns.reserve(group_by.size());
-    for (const auto& key : group_by) {
-        const auto* col = input.find(key.name);
-        if (col == nullptr) {
-            return std::unexpected("update + by: unknown group key '" + key.name +
-                                   "' (available: " + format_columns(input) + ")");
-        }
-        group_columns.push_back(col);
-    }
-    // Nulls in a group key form their own group; without this a null key would
-    // merge into the genuine zero/empty group.
-    const auto group_validity = collect_key_validity(input, group_by);
-
     const std::size_t rows = input.rows();
     if (rows == 0) {
         return update_table(std::move(input), fields, scalars, externs, exec);
     }
+    // A `by` clause is semantically inert for a wholly row-local update: every
+    // field reads only its own absolute row, and `update_table` already owns
+    // the direct ChunkView output protocols (numeric windows, predicates,
+    // strings, categoricals, temporal parts, and validity). Bypassing group
+    // discovery here is stronger than gathering CSR windows only to evaluate
+    // the same rows again, and retains the normal ordered field writer.
+    if (std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
+            return ir::is_row_local_update_expr(field.expr) &&
+                   !expr_contains_aggregate_call(field.expr);
+        })) {
+        return update_table(std::move(input), fields, scalars, externs, exec);
+    }
+    auto grouped = make_grouped_row_plan(input, group_by, exec);
+    if (!grouped.has_value()) {
+        return std::unexpected(std::move(grouped.error()));
+    }
+    const std::size_t group_count = grouped->rows.group_count();
+    const GroupedRows& group_rows = grouped->rows;
+    const auto row_gid = grouped->row_gid(rows);
 
-    // Same grouping the windowed path uses: a key built once per group rather
-    // than boxed per row, and one flat CSR buffer rather than a vector per
-    // group. Both halves showed up in the profile of `rank/lag/cumsum by
-    // symbol` — the boxed key hashing a Categorical's dictionary string per
-    // row, and 252 vectors growing by push_back across 8M rows.
-    auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
-    const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
-    const std::size_t group_count =
-        assign_group_ids(group_columns, group_validity, rows, exec, row_gid);
-    const GroupedRows group_rows = build_grouped_rows(row_gid, group_count, exec);
+    if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, exec);
+        !ordered) {
+        return std::unexpected(ordered.error());
+    } else if (ordered->has_value()) {
+        return std::move(**ordered);
+    }
+    if (auto native = try_native_grouped_reductions(input, fields, group_rows, exec); !native) {
+        return std::unexpected(native.error());
+    } else if (native->has_value()) {
+        return std::move(**native);
+    }
+
+    // A mixed clause must retain update's declaration-order visibility: a
+    // materialized field can feed a following native reduction, and a native
+    // reduction can feed a following row-local field. Execute it as ordered
+    // single-field stages, so each stage sees exactly its predecessors' landed
+    // columns. Single supported reductions still take the CSR-native branch
+    // above; fields without a native candidate stay together on the established
+    // materialized path.
+    if (fields.size() > 1 && std::ranges::any_of(fields, [&](const auto& field) {
+            return is_grouped_direct_field_candidate(input, field);
+        })) {
+        Table output = std::move(input);
+        for (const auto& field : fields) {
+            auto staged =
+                grouped_update_table(std::move(output), {field}, group_by, scalars, externs, exec);
+            if (!staged) {
+                return std::unexpected(staged.error());
+            }
+            output = std::move(*staged);
+        }
+        return output;
+    }
 
     auto run_group =
         [&](std::span<const std::size_t> row_idx) -> std::expected<Table, std::string> {

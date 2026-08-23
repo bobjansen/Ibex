@@ -352,9 +352,6 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     if (std::holds_alternative<Column<Timestamp>>(column)) {
         return ExprType::Timestamp;
     }
-    if (std::holds_alternative<Column<Categorical>>(column)) {
-        return ExprType::Categorical;
-    }
     return ExprType::String;
 }
 

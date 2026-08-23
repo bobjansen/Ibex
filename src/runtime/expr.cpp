@@ -1759,7 +1759,11 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
             return std::unexpected("unknown column in expression: " + col->name +
                                    " (available: " + format_columns(input) + ")");
         }
-        return expr_type_for_column(*source);
+        // Most physical consumers intentionally see a categorical as String.
+        // Expression inference retains the representation so CASE/coalesce can
+        // plan a categorical result without changing aggregate signatures.
+        return std::holds_alternative<Column<Categorical>>(*source) ? ExprType::Categorical
+                                                                    : expr_type_for_column(*source);
     }
     if (const auto* lit = std::get_if<ir::Literal>(&expr.node)) {
         // Visited rather than tested alternative by alternative: a literal

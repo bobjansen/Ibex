@@ -7655,6 +7655,223 @@ TEST_CASE("grouped update is deterministic across thread counts", "[update][para
     }
 }
 
+TEST_CASE("grouped update natively broadcasts fixed-width sum and count",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2, 3, 3});
+    t.add_column("i", Column<std::int64_t>{4, 99, 3, 5, 7, 11},
+                 std::vector<bool>{true, false, true, true, false, false});
+    t.add_column("d", Column<double>{1.5, 2.5, 9.0, 4.0, 6.0, 8.0},
+                 std::vector<bool>{true, true, false, true, false, false});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        "t[update { si = sum(i), sd = sum(d), mi = mean(i), md = mean(d), lo = min(i), hi = "
+        "max(d), rows = count(), vals = count(i) }, by g];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto& si = std::get<Column<std::int64_t>>(*out->find("si"));
+    const auto& sd = std::get<Column<double>>(*out->find("sd"));
+    const auto& mi = std::get<Column<double>>(*out->find("mi"));
+    const auto& md = std::get<Column<double>>(*out->find("md"));
+    const auto& lo = std::get<Column<std::int64_t>>(*out->find("lo"));
+    const auto& hi = std::get<Column<double>>(*out->find("hi"));
+    const auto& rows = std::get<Column<std::int64_t>>(*out->find("rows"));
+    const auto& vals = std::get<Column<std::int64_t>>(*out->find("vals"));
+    CHECK(std::vector<std::int64_t>(si.begin(), si.end()) ==
+          std::vector<std::int64_t>{4, 4, 8, 8, 0, 0});
+    CHECK(std::vector<double>(sd.begin(), sd.end()) ==
+          std::vector<double>{4.0, 4.0, 4.0, 4.0, 0.0, 0.0});
+    CHECK(std::vector<double>(mi.begin(), mi.end()) ==
+          std::vector<double>{4.0, 4.0, 4.0, 4.0, 0.0, 0.0});
+    CHECK(std::vector<double>(md.begin(), md.end()) ==
+          std::vector<double>{2.0, 2.0, 4.0, 4.0, 0.0, 0.0});
+    CHECK(std::vector<std::int64_t>(lo.begin(), lo.end()) ==
+          std::vector<std::int64_t>{4, 4, 3, 3, 0, 0});
+    CHECK(std::vector<double>(hi.begin(), hi.end()) ==
+          std::vector<double>{2.5, 2.5, 4.0, 4.0, 0.0, 0.0});
+    CHECK(std::vector<std::int64_t>(rows.begin(), rows.end()) ==
+          std::vector<std::int64_t>{2, 2, 2, 2, 2, 2});
+    CHECK(std::vector<std::int64_t>(vals.begin(), vals.end()) ==
+          std::vector<std::int64_t>{1, 1, 2, 2, 0, 0});
+    const auto* si_entry = out->find_entry("si");
+    const auto* sd_entry = out->find_entry("sd");
+    const auto* mi_entry = out->find_entry("mi");
+    const auto* lo_entry = out->find_entry("lo");
+    REQUIRE(si_entry != nullptr);
+    REQUIRE(sd_entry != nullptr);
+    REQUIRE(mi_entry != nullptr);
+    REQUIRE(lo_entry != nullptr);
+    REQUIRE(si_entry->validity.has_value());
+    REQUIRE(sd_entry->validity.has_value());
+    REQUIRE(mi_entry->validity.has_value());
+    REQUIRE(lo_entry->validity.has_value());
+    CHECK((*si_entry->validity)[0]);
+    CHECK_FALSE((*si_entry->validity)[4]);
+    CHECK((*sd_entry->validity)[0]);
+    CHECK_FALSE((*sd_entry->validity)[4]);
+    CHECK_FALSE((*mi_entry->validity)[4]);
+    CHECK_FALSE((*lo_entry->validity)[4]);
+}
+
+TEST_CASE("grouped update mixes native reductions and materialized fields in declaration order",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("v", Column<std::int64_t>{1, 3, 2, 4});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    SECTION("a materialized field can read a preceding native reduction") {
+        auto ir = require_ir("t[update { s = sum(v), prev = lag(v, 1), delta = s - v }, by g];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& s = std::get<Column<std::int64_t>>(*out->find("s"));
+        const auto& delta = std::get<Column<std::int64_t>>(*out->find("delta"));
+        const auto* prev = out->find_entry("prev");
+        CHECK(std::vector<std::int64_t>(s.begin(), s.end()) ==
+              std::vector<std::int64_t>{4, 4, 6, 6});
+        CHECK(std::vector<std::int64_t>(delta.begin(), delta.end()) ==
+              std::vector<std::int64_t>{3, 1, 4, 2});
+        REQUIRE(prev != nullptr);
+        REQUIRE(prev->validity.has_value());
+        CHECK_FALSE((*prev->validity)[0]);
+        CHECK((*prev->validity)[1]);
+        CHECK_FALSE((*prev->validity)[2]);
+        CHECK((*prev->validity)[3]);
+    }
+
+    SECTION("a native reduction can read a preceding materialized field") {
+        auto ir = require_ir("t[update { doubled = v * 2, s = sum(doubled) }, by g];");
+        auto out = runtime::interpret(*ir, registry);
+        REQUIRE(out.has_value());
+        const auto& doubled = std::get<Column<std::int64_t>>(*out->find("doubled"));
+        const auto& s = std::get<Column<std::int64_t>>(*out->find("s"));
+        CHECK(std::vector<std::int64_t>(doubled.begin(), doubled.end()) ==
+              std::vector<std::int64_t>{2, 6, 4, 8});
+        CHECK(std::vector<std::int64_t>(s.begin(), s.end()) ==
+              std::vector<std::int64_t>{8, 8, 12, 12});
+    }
+}
+
+TEST_CASE("grouped row-local update bypasses group materialization",
+          "[update][groupby][row_local]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("v", Column<std::int64_t>{1, 3, 2, 4});
+    t.add_column("name", Column<std::string>{"a", "bee", "", "four"},
+                 std::vector<bool>{true, true, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        "t[update { doubled = v * 2, large = v > 2, bytes = byte_length(name) }, by g];");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto& doubled = std::get<Column<std::int64_t>>(*out->find("doubled"));
+    const auto& large = std::get<Column<bool>>(*out->find("large"));
+    const auto& bytes = std::get<Column<std::int64_t>>(*out->find("bytes"));
+    CHECK(std::vector<std::int64_t>(doubled.begin(), doubled.end()) ==
+          std::vector<std::int64_t>{2, 6, 4, 8});
+    CHECK(std::vector<bool>{large[0], large[1], large[2], large[3]} ==
+          std::vector<bool>{false, true, false, true});
+    CHECK(std::vector<std::int64_t>(bytes.begin(), bytes.end()) ==
+          std::vector<std::int64_t>{1, 3, 0, 4});
+    const auto* bytes_entry = out->find_entry("bytes");
+    REQUIRE(bytes_entry != nullptr);
+    REQUIRE(bytes_entry->validity.has_value());
+    CHECK((*bytes_entry->validity)[0]);
+    CHECK_FALSE((*bytes_entry->validity)[2]);
+}
+
+TEST_CASE("grouped direct strings and categoricals stage around group state",
+          "[update][groupby][variable]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("id", Column<std::int64_t>{1, 2, 3, 4});
+    t.add_column("v", Column<std::int64_t>{10, 20, 30, 40});
+    Column<Categorical> a({"B", "A"});
+    a.push_code(0);
+    a.push_code(1);
+    a.push_code(0);
+    a.push_code(1);
+    Column<Categorical> b({"C", "A"});
+    b.push_code(0);
+    b.push_code(0);
+    b.push_code(0);
+    b.push_code(1);
+    t.add_column("a", std::move(a), std::vector<bool>{true, false, true, true});
+    t.add_column("b", std::move(b));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        R"(t[update { label = `id=${id}`, tag = coalesce(a, b, "fallback"), prev = lag(v, 1) }, by g];)");
+    auto out = runtime::interpret(*ir, registry);
+    REQUIRE(out.has_value());
+    const auto& label = std::get<Column<std::string>>(*out->find("label"));
+    const auto& tag = std::get<Column<Categorical>>(*out->find("tag"));
+    const auto* prev_entry = out->find_entry("prev");
+    CHECK(std::vector<std::string>{std::string{label[0]}, std::string{label[1]},
+                                   std::string{label[2]}, std::string{label[3]}} ==
+          std::vector<std::string>{"id=1", "id=2", "id=3", "id=4"});
+    CHECK(tag.dictionary() == std::vector<std::string>{"B", "A", "C", "fallback"});
+    CHECK(std::vector<std::string>{std::string{tag[0]}, std::string{tag[1]}, std::string{tag[2]},
+                                   std::string{tag[3]}} ==
+          std::vector<std::string>{"B", "C", "B", "A"});
+    REQUIRE(prev_entry != nullptr);
+    REQUIRE(prev_entry->validity.has_value());
+    CHECK_FALSE((*prev_entry->validity)[0]);
+    CHECK((*prev_entry->validity)[1]);
+    CHECK_FALSE((*prev_entry->validity)[2]);
+    CHECK((*prev_entry->validity)[3]);
+}
+
+TEST_CASE("grouped ordered fixed-width kernels own state per CSR group",
+          "[update][groupby][ordered]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 1, 2, 2});
+    t.add_column("v", Column<std::int64_t>{1, 0, 3, 0, 5},
+                 std::vector<bool>{true, false, true, false, true});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir(
+        "t[update { l = lag(v, 1), n = lead(v, 1), cs = cumsum(v), cp = cumprod(v), "
+        "ff = fill_forward(v), fb = fill_backward(v) }, by g];");
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 3;
+    exec.parallel_min_rows = 0;
+    auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    const auto values = [&](std::string_view name) {
+        const auto& column = std::get<Column<std::int64_t>>(*out->find(std::string{name}));
+        return std::vector<std::int64_t>(column.begin(), column.end());
+    };
+    CHECK(values("l") == std::vector<std::int64_t>{0, 1, 0, 0, 0});
+    CHECK(values("n") == std::vector<std::int64_t>{0, 3, 0, 5, 0});
+    CHECK(values("cs") == std::vector<std::int64_t>{1, 1, 4, 0, 5});
+    CHECK(values("cp") == std::vector<std::int64_t>{1, 0, 0, 0, 0});
+    CHECK(values("ff") == std::vector<std::int64_t>{1, 1, 3, 0, 5});
+    CHECK(values("fb") == std::vector<std::int64_t>{1, 3, 3, 5, 5});
+    const auto* lag = out->find_entry("l");
+    const auto* lead = out->find_entry("n");
+    const auto* forward = out->find_entry("ff");
+    REQUIRE(lag != nullptr);
+    REQUIRE(lead != nullptr);
+    REQUIRE(forward != nullptr);
+    REQUIRE(lag->validity.has_value());
+    REQUIRE(lead->validity.has_value());
+    REQUIRE(forward->validity.has_value());
+    CHECK_FALSE((*lag->validity)[0]);
+    CHECK_FALSE((*lag->validity)[3]);
+    CHECK_FALSE((*lead->validity)[2]);
+    CHECK_FALSE((*lead->validity)[4]);
+    CHECK_FALSE((*forward->validity)[3]);
+}
+
 // A single Categorical group key skips hashing entirely: its codes are dense,
 // so each CODE resolves to a group id once. Two things that path must not get
 // wrong, neither of which the happy case exercises.

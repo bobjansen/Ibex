@@ -669,13 +669,45 @@ A wholly row-local `by` clause bypasses grouping entirely. What remains
 materialized is now a stated list — `rank`, variable-width ordered state,
 `window`-clause `lag`/`lead` — not "everything that is not a bare aggregate".
 
+**Parallel chunk updates on the direct plans (2026-08-23, `edd8f9b9`,
+`9474fcb4`).** The gap the status table below named first is closed for every
+shape the direct vocabulary covers. `evaluate_field_maybe_parallel` owned the
+only implementation of "split one field across worker ranges, each writing its
+own window", and all of it took a `Table` -- so a caller holding a `Chunk`
+reached it only by converting. That loop is now `kernel::evaluate_field_windows`
+over a `PredicateInput`, with `kernel::DirectFieldRoute` as the resolved plan
+vocabulary (string / categorical / predicate / validity / fixed-width) so a
+caller selects an arm once and cannot pick a different one than the executor
+runs. Expressions outside that vocabulary stay with the caller through a
+`DirectFieldRangeWriter` hook, because the compiled numeric writers and the
+general evaluator genuinely need the table; the hook is invoked at exactly the
+point in the per-range order those arms held before.
+
+The chunk kernel then calls it directly: the split runs on the chunk, a declined
+split (too few rows, one morsel, a worker thread that must not submit to the
+pool) takes the same whole-chunk write the serial route uses, and an error falls
+through to the established evaluator, which owns that diagnostic. Fused island
+updates run on a worker thread and therefore lose the bridge as well. A field
+the route does not name -- a compiled numeric tree, the legacy null-handling
+arms -- keeps the bridge deliberately: the table evaluator can still split those
+through its own range writer, so declining is how such a field keeps its
+parallelism rather than how it loses it. Making the numeric tree range-writable
+is what would close the rest.
+
+`chunk_direct_updates` in `IBEX_PARALLEL_STATS` counts the fields the chunk
+kernel kept, which is the only thing that distinguishes the two paths: the
+bridge answers identically, just via a `Table`. Gates: debug ctest 1738/1738
+including the interpreter-vs-transpiled parity case, and `check_answers.py`
+22/22 under both `IBEX_PARALLEL` settings. No performance claim -- this removes
+a per-chunk metadata bridge, not a row loop.
+
 **Where Phase 2 stands (2026-08-23).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
 | Item | State |
 |---|---|
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
-| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering. **Gap: on the chunk side only the metadata-alias form runs the kernel when `parallel` is on** — every other parallel update still routes through `update_table`, which then does its own window splitting. That is a real seam, not a finished port. |
+| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. **Remaining gap: an expression the direct route does not name — a compiled numeric tree, the legacy null-handling arms — still converts to a `Table` in parallel mode**, because only the table evaluator has a range writer for it. Multi-field clauses also keep the bridge in parallel mode. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
 | 4. Run the physical map pipeline serially, then on the morsel executor | Serial only. The morsel executor is still reached through the island seam, not through the physical plan. **Untouched.** |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
@@ -685,11 +717,12 @@ Current gates on the tree: full debug `ctest` 1735/1735, and PDS-H
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) make parallel chunk updates use the direct
-plans instead of delegating to `update_table` — the plans are already
-window-oriented and destination-free, which is the whole prerequisite; (b) item
-4, so the physical plan owns morsel execution rather than the island seam;
-(c) `KernelContext`, once (a) needs one shared scratch/cancellation owner.
+Resume point, in priority order: (a) give the compiled numeric tree a
+range-writing form so it joins `DirectFieldRoute`, which is what still sends a
+parallel chunk update through the table bridge (multi-field clauses in parallel
+mode are the same shape of gap); (b) item 4, so the physical plan owns morsel
+execution rather than the island seam; (c) `KernelContext`, once the writers
+above need one shared scratch/cancellation owner.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

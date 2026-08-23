@@ -13,6 +13,7 @@
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/table_format.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -2695,6 +2696,163 @@ auto try_native_grouped_ordered_field(const Table& input, const std::vector<ir::
            std::holds_alternative<Column<double>>(*source);
 }
 
+/// A TimeFrame's index read as plain integer ticks: nanos for a Timestamp
+/// column, days for a Date one. Both are single-field structs over their
+/// integer, so this is a view rather than a copy — the whole point, since the
+/// alternative at 5M rows is a 40MB widening pass to compare two numbers.
+///
+/// The two widths stay separate rather than being normalised to nanos: a Date
+/// is int32 days, and the multiply would be a per-access cost paid for nothing.
+/// Only ordering is ever asked of it, and ordering is the same either way.
+class TimeIndexTicks {
+   public:
+    /// Absent when the table has no time index, or when its index is not one of
+    /// the two integer-backed temporal types — a case the callers read as
+    /// "cannot reason about this" rather than as a failure.
+    [[nodiscard]] static auto of(const Table& table) -> std::optional<TimeIndexTicks> {
+        if (!table.time_index().has_value()) {
+            return std::nullopt;
+        }
+        const auto* column = table.find(*table.time_index());
+        if (column == nullptr) {
+            return std::nullopt;
+        }
+        TimeIndexTicks ticks;
+        if (const auto* ts = std::get_if<Column<Timestamp>>(column)) {
+            static_assert(sizeof(Timestamp) == sizeof(std::int64_t));
+            ticks.nanos_ = reinterpret_cast<const std::int64_t*>(ts->data());
+            return ticks;
+        }
+        if (const auto* date = std::get_if<Column<Date>>(column)) {
+            static_assert(sizeof(Date) == sizeof(std::int32_t));
+            ticks.days_ = reinterpret_cast<const std::int32_t*>(date->data());
+            return ticks;
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] auto operator[](std::size_t row) const noexcept -> std::int64_t {
+        return nanos_ != nullptr ? nanos_[row] : std::int64_t{days_[row]};
+    }
+
+    [[nodiscard]] auto is_sorted(std::size_t rows) const noexcept -> bool {
+        return nanos_ != nullptr ? std::is_sorted(nanos_, nanos_ + rows)
+                                 : std::is_sorted(days_, days_ + rows);
+    }
+
+    /// A nanosecond span expressed in this index's own ticks, rounded UP. Every
+    /// caller is sizing a lookback, where too long costs work and too short
+    /// costs correctness.
+    [[nodiscard]] auto ticks_from_nanos_ceil(std::int64_t nanos) const noexcept -> std::int64_t {
+        if (nanos_ != nullptr) {
+            return nanos;
+        }
+        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+        return (nanos + kNsPerDay - 1) / kNsPerDay;
+    }
+
+   private:
+    const std::int64_t* nanos_ = nullptr;
+    const std::int32_t* days_ = nullptr;
+};
+
+/// Does the table's stated ordering already prove that each group's rows are
+/// time-ascending?
+///
+/// The exact rule: the ordering must reach the time index ascending after
+/// nothing but grouping keys. Rows ordered by (k, ts) sit in one time-ascending
+/// run per `k`; rows ordered by (ts) are time-ascending in every subset at all,
+/// group or not. The direction of the *preceding* keys is irrelevant — they only
+/// have to be keys this call also partitions by, so that a change in one of them
+/// is a change of group rather than a jump backwards inside one.
+///
+/// Anything else — a key that is not grouped by here, a descending time index,
+/// no ordering claim at all — is not a proof, and the caller falls back to
+/// reading the data.
+[[nodiscard]] auto ordering_proves_group_time_order(const Table& input,
+                                                    const std::vector<ir::ColumnRef>& group_by)
+    -> bool {
+    const auto& ordering = input.ordering();
+    if (!ordering.has_value() || !input.time_index().has_value()) {
+        return false;
+    }
+    for (const auto& key : *ordering) {
+        if (key.name == *input.time_index()) {
+            return key.ascending;
+        }
+        if (std::ranges::none_of(group_by, [&](const ir::ColumnRef& group_key) {
+                return group_key.name == key.name;
+            })) {
+            return false;
+        }
+    }
+    return false;  // the ordering ran out before it reached the time index
+}
+
+/// A duration window over a group whose rows are NOT time-ascending reads a
+/// later row into an earlier row's window and drops a row that belongs there.
+/// It does so silently, which is the whole reason this check exists: the answer
+/// is wrong, not absent.
+///
+/// The hazard is not hypothetical, and it is not user error either. This very
+/// operator emits its rows GROUP-MAJOR while keeping the time index, so a second
+/// grouped window over a *different* key sees a table that is a valid TimeFrame,
+/// is genuinely ordered, and is still time-scrambled within the new groups.
+///
+/// Cost is paid only when it must be: a stated ordering proves the property for
+/// free, and a globally ascending index proves it with one sequential pass —
+/// far cheaper than the strided per-group walk, and the common case by a wide
+/// margin. The per-group walk is the last resort, and is serial so that the
+/// group it names never depends on thread timing.
+[[nodiscard]] auto check_grouped_time_order(const Table& input,
+                                            const std::vector<ir::ColumnRef>& group_by,
+                                            const GroupedRows& group_rows)
+    -> std::expected<void, std::string> {
+    const std::size_t rows = input.rows();
+    if (rows < 2 || ordering_proves_group_time_order(input, group_by)) {
+        return {};
+    }
+    const auto ticks = TimeIndexTicks::of(input);
+    if (!ticks.has_value()) {
+        return {};  // not an integer-backed index; nothing to compare
+    }
+    if (ticks->is_sorted(rows)) {
+        return {};
+    }
+    for (std::size_t group = 0; group < group_rows.group_count(); ++group) {
+        const auto indices = group_rows[group];
+        for (std::size_t local = 1; local < indices.size(); ++local) {
+            if ((*ticks)[indices[local]] >= (*ticks)[indices[local - 1]]) {
+                continue;
+            }
+            std::string keys;
+            std::string values;
+            for (const auto& key : group_by) {
+                if (!keys.empty()) {
+                    keys += ", ";
+                    values += ", ";
+                }
+                keys += key.name;
+                const auto* entry = input.find_entry(key.name);
+                values +=
+                    key.name + "=" +
+                    (entry == nullptr ? std::string("?") : format_cell(*entry, indices[local]));
+            }
+            return std::unexpected(
+                "window + by: rows are not time-ascending within group (" + values + "): row " +
+                std::to_string(indices[local]) + " is earlier in time than row " +
+                std::to_string(indices[local - 1]) +
+                ", which precedes it in this group — a duration window over them would read a "
+                "later row into an earlier row's window"
+                "\n  hint: `order { " +
+                keys + ", " + *input.time_index() +
+                " }` first. An upstream grouped `window`/`resample` leaves its rows group-major, "
+                "so they are time-ascending only within ITS keys, not within these.");
+        }
+    }
+    return {};
+}
+
 /// Cut one group's row list into pieces of at least `target` rows, each ending
 /// on a window-bucket boundary. `bucket_of(row)` gives the bucket index of a
 /// row; it is non-decreasing along `idx` because rows arrive time-sorted, which
@@ -2729,8 +2887,24 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
     }
 }
 
+/// One unit of grouped-window work: the rows it is responsible for, plus the
+/// rows immediately before them it must evaluate anyway to arrive at the right
+/// state — the halo.
+///
+/// Halo rows are evaluated and then DISCARDED. They belong to the preceding
+/// piece of the same group, which emits them itself, so every output row still
+/// has exactly one writer. A whole group (or a cut on an aligned bucket
+/// boundary) needs no halo and carries `halo == 0`.
+struct WindowTask {
+    /// The rows this task emits results for.
+    std::span<const std::size_t> rows;
+    /// How many rows immediately before `rows`, within the same group, must be
+    /// evaluated to reach the correct state at the first emitted row.
+    std::size_t halo = 0;
+};
+
 /// Build the work list for a grouped windowed update: normally one item per
-/// group, but under an aligned window a group may be cut into several.
+/// group, but a group may be cut into several pieces.
 ///
 /// Parallelism across groups caps the speedup at the group count — three
 /// symbols leave thirteen of sixteen cores idle, which is exactly the shape a
@@ -2740,6 +2914,24 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
 /// independently: no halo, no overlap, and each piece's rolling state starts
 /// where the bucket would have reset it anyway.
 ///
+/// A *trailing* window spans `(t - dur, t]` and straddles any boundary we might
+/// pick, so its pieces cannot be independent for free. They can still be
+/// independent for a KNOWN PRICE: every field's reach behind a row is bounded by
+/// `expr_window_lookback`, so handing a piece the rows within that bound before
+/// its first row — its halo — makes its results identical to the whole group's.
+/// The halo rows are evaluated for their state and then dropped, since the
+/// preceding piece emits them.
+///
+/// "Identical" there is mathematical, not bitwise, and the same caveat already
+/// applies to the aligned cut below. The rolling kernels carry a running
+/// accumulator that is never reset — values are added on entry and subtracted on
+/// exit — so a piece reaches a row by a different sequence of additions than the
+/// whole group does. Floating-point addition is not associative, so a float
+/// aggregate can differ in its last bits. Measured on a deliberately awkward
+/// input, the halo cut diverges by ~2e-11 relative and the aligned cut, shipped
+/// long before it, by ~1e-10. Neither reorders, drops, or recomputes a window's
+/// CONTENTS, which is the property the halo actually has to guarantee.
+///
 /// Splitting is skipped entirely once there are already at least `budget`
 /// groups, so the high-cardinality case is untouched *by construction* rather
 /// than by tuning. It is also skipped when no cut lands inside the group — a
@@ -2748,14 +2940,14 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
                                       ir::Duration duration, bool aligned,
                                       const std::vector<ir::FieldSpec>& fields,
                                       const ExecutionContext& exec, std::size_t rows)
-    -> std::vector<std::span<const std::size_t>> {
-    std::vector<std::span<const std::size_t>> tasks;
+    -> std::vector<WindowTask> {
+    std::vector<WindowTask> tasks;
     tasks.reserve(group_rows.group_count());
     for (std::size_t g = 0; g < group_rows.group_count(); ++g) {
-        tasks.push_back(group_rows[g]);
+        tasks.push_back(WindowTask{.rows = group_rows[g], .halo = 0});
     }
 
-    if (!aligned || on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
         return tasks;
     }
     const std::size_t pool_size = process_worker_pool().size();
@@ -2764,11 +2956,6 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
     if (workers < 2 || group_rows.group_count() >= workers) {
         return tasks;  // enough groups to keep the pool busy already
     }
-    for (const auto& field : fields) {
-        if (!ir::is_bucket_local_window_expr(field.expr)) {
-            return tasks;
-        }
-    }
 
     // Aim past the worker count so a group whose buckets divide unevenly can
     // still be balanced by work stealing, but keep each piece large enough that
@@ -2776,35 +2963,125 @@ void split_at_bucket_bounds(std::span<const std::size_t> idx, std::size_t target
     constexpr std::size_t kMinSplitRows = 32768;
     const std::size_t target = std::max(rows / (workers * 4), kMinSplitRows);
 
-    const auto* tcv = input.find(*input.time_index());
-    std::vector<std::span<const std::size_t>> split;
-    // Each piece holds at least `target` rows, so this bound is never exceeded.
-    split.reserve((rows / target) + tasks.size());
-    if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
-        const std::int64_t unit = duration.count();
-        if (unit <= 0) {
-            return tasks;
+    // An aligned clause whose every field is bucket-local is the better cut when
+    // it is available: the boundary itself resets the rolling state, so the
+    // pieces need no halo at all.
+    const bool bucket_local =
+        aligned && std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
+            return ir::is_bucket_local_window_expr(field.expr);
+        });
+    if (bucket_local) {
+        const auto* tcv = input.find(*input.time_index());
+        std::vector<std::span<const std::size_t>> split;
+        // Each piece holds at least `target` rows, so this bound is never exceeded.
+        split.reserve((rows / target) + tasks.size());
+        bool cut = false;
+        if (const auto* ts = std::get_if<Column<Timestamp>>(tcv)) {
+            const std::int64_t unit = duration.count();
+            if (unit > 0) {
+                auto bucket_of = [&](std::size_t r) {
+                    return window_bucket_index((*ts)[r].nanos, unit);
+                };
+                for (const auto& task : tasks) {
+                    split_at_bucket_bounds(task.rows, target, bucket_of, split);
+                }
+                cut = true;
+            }
+        } else if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
+            static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
+            const std::int64_t unit = duration.count() / kNsPerDay;
+            if (unit > 0) {
+                auto bucket_of = [&](std::size_t r) {
+                    return window_bucket_index((*dt)[r].days, unit);
+                };
+                for (const auto& task : tasks) {
+                    split_at_bucket_bounds(task.rows, target, bucket_of, split);
+                }
+                cut = true;
+            }
         }
-        auto bucket_of = [&](std::size_t r) { return window_bucket_index((*ts)[r].nanos, unit); };
-        for (const auto& task : tasks) {
-            split_at_bucket_bounds(task, target, bucket_of, split);
+        if (cut && split.size() > tasks.size()) {
+            std::vector<WindowTask> out;
+            out.reserve(split.size());
+            for (const auto& piece : split) {
+                out.push_back(WindowTask{.rows = piece, .halo = 0});
+            }
+            return out;
         }
-    } else if (const auto* dt = std::get_if<Column<Date>>(tcv)) {
-        static constexpr std::int64_t kNsPerDay = 86'400'000'000'000LL;
-        const std::int64_t unit = duration.count() / kNsPerDay;
-        if (unit <= 0) {
-            return tasks;
-        }
-        auto bucket_of = [&](std::size_t r) { return window_bucket_index((*dt)[r].days, unit); };
-        for (const auto& task : tasks) {
-            split_at_bucket_bounds(task, target, bucket_of, split);
-        }
-    } else {
-        return tasks;
+        return tasks;  // nothing divided; keep the plainer work list
     }
 
+    // Otherwise: cut anywhere, and pay a halo. Every field must state a bound.
+    std::optional<ir::WindowLookback> lookback = ir::WindowLookback{};
+    for (const auto& field : fields) {
+        const auto field_bound = ir::expr_window_lookback(field.expr, duration.count());
+        if (!field_bound.has_value()) {
+            return tasks;  // reads arbitrarily far back; only a whole group is safe
+        }
+        lookback->nanos = std::max(lookback->nanos, field_bound->nanos);
+        lookback->rows = std::max(lookback->rows, field_bound->rows);
+    }
+    const auto ticks = TimeIndexTicks::of(input);
+    if (!ticks.has_value()) {
+        return tasks;
+    }
+    // The lookback is stated in nanoseconds; a Date index counts days. Round the
+    // conversion UP — a halo one tick too long is merely wasted work, one tick
+    // too short is a wrong answer.
+    const std::int64_t tick_lookback = ticks->ticks_from_nanos_ceil(lookback->nanos);
+
+    std::vector<WindowTask> split;
+    split.reserve((rows / target) + tasks.size());
+    std::size_t halo_rows = 0;
+    for (const auto& task : tasks) {
+        const auto idx = task.rows;
+        for (std::size_t begin = 0; begin < idx.size();) {
+            const std::size_t remaining = idx.size() - begin;
+            // Absorb a short tail rather than leaving a piece that cannot repay
+            // its own halo.
+            const std::size_t len = remaining <= target + (target / 2) ? remaining : target;
+            std::size_t halo = 0;
+            if (begin > 0) {
+                // How far back the piece must reach, in rows: the count window's
+                // bound directly, and for the duration bound the first row whose
+                // tick still falls inside it. The group's rows are
+                // time-ascending (established before this runs), so that row is
+                // a binary search rather than a scan.
+                halo = std::min(lookback->rows, begin);
+                if (tick_lookback > 0) {
+                    const std::int64_t first = (*ticks)[idx[begin]];
+                    std::size_t lo = 0;
+                    std::size_t hi = begin;
+                    while (lo < hi) {
+                        const std::size_t mid = lo + ((hi - lo) / 2);
+                        if ((*ticks)[idx[mid]] <= first - tick_lookback) {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    halo = std::max(halo, begin - lo);
+                }
+            }
+            halo_rows += halo;
+            split.push_back(WindowTask{.rows = idx.subspan(begin, len), .halo = halo});
+            begin += len;
+        }
+    }
     if (split.size() <= tasks.size()) {
-        return tasks;  // nothing divided; keep the plainer work list
+        return tasks;  // nothing divided
+    }
+    // A window long enough — or ticks dense enough — that the halos rival the
+    // data itself turns the split into a loss: the same rows would be gathered
+    // and evaluated several times over. One quarter is the point past which the
+    // extra evaluation outweighs the cores it buys, and refusing here is what
+    // keeps the decision honest for shapes this cannot help.
+    if (halo_rows > rows / 4) {
+        return tasks;
+    }
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->window_halo_pieces.fetch_add(split.size() - tasks.size(),
+                                                          std::memory_order_relaxed);
     }
     return split;
 }
@@ -2864,11 +3141,18 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         assign_group_ids(group_columns, group_validity, rows, exec, row_gid);
     const GroupedRows group_rows = build_grouped_rows(row_gid, group_count, exec);
 
-    // The unit of work is a span of row indices, not necessarily a whole group:
-    // under an aligned window `build_window_tasks` may cut one group into
-    // several pieces. Everything below treats a piece exactly as it treats a
-    // group, and for the same reason — disjoint rows, and no expression that
-    // reads across the cut.
+    // Every window kernel below — and the halo boundaries `build_window_tasks`
+    // computes by binary search — reads each group's rows as a time-ascending
+    // sequence. Establish that before anything relies on it.
+    if (auto ordered = check_grouped_time_order(input, group_by, group_rows); !ordered) {
+        return std::unexpected(std::move(ordered.error()));
+    }
+
+    // The unit of work is a piece of a group, not necessarily a whole one:
+    // `build_window_tasks` may cut a group into several. Everything below treats
+    // a piece exactly as it treats a group — the rows it EMITS are disjoint from
+    // every other task's, which is all that independence requires. What a piece
+    // additionally READS is its halo, and only the gather widens for it.
     const auto tasks = build_window_tasks(group_rows, input, duration, aligned, fields, exec, rows);
 
     // ── output row order ─────────────────────────────────────────────────
@@ -2900,8 +3184,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     std::vector<std::size_t> task_offset(tasks.size() + 1, 0);
     perm.reserve(rows);
     for (std::size_t g = 0; g < tasks.size(); ++g) {
-        task_offset[g + 1] = task_offset[g] + tasks[g].size();
-        perm.insert(perm.end(), tasks[g].begin(), tasks[g].end());
+        task_offset[g + 1] = task_offset[g] + tasks[g].rows.size();
+        perm.insert(perm.end(), tasks[g].rows.begin(), tasks[g].rows.end());
     }
     // `perm` is a permutation of [0, rows), so it is the identity exactly when
     // it is ascending -- i.e. the input is ALREADY group-major. That is the
@@ -2931,7 +3215,15 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         out_positions[i] = i;
     }
     auto out_slot = [&](std::size_t g) -> std::span<const std::size_t> {
-        return {out_positions.data() + task_offset[g], tasks[g].size()};
+        return {out_positions.data() + task_offset[g], tasks[g].rows.size()};
+    };
+    // What the task must READ: its own rows preceded by its halo. The halo rows
+    // are the tail of the preceding piece of the same group, and `perm` lays the
+    // pieces of a group down in order, so they sit immediately before this
+    // task's run — the read slot is simply the write slot extended backwards.
+    auto eval_slot = [&](std::size_t g) -> std::span<const std::size_t> {
+        return {out_positions.data() + task_offset[g] - tasks[g].halo,
+                tasks[g].rows.size() + tasks[g].halo};
     };
 
     // Only the columns the window expressions actually read need to be gathered
@@ -3002,7 +3294,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     };
 
     // Run the first group to learn the new field column types/names.
-    auto first = run_group(out_slot(0));
+    auto first = run_group(eval_slot(0));
     if (!first.has_value()) {
         return std::unexpected(first.error());
     }
@@ -3080,8 +3372,12 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         output.add_column(written_field_names[f], std::move(full.value()));
     }
 
+    // `skip` is the task's halo: rows the sub-result computed for their state
+    // and which the preceding piece owns. Everything downstream of the window
+    // itself reads the sub-result from there.
     auto scatter_into = [](ColumnValue& dst, const ColumnValue& src,
-                           std::span<const std::size_t> indices) -> std::optional<std::string> {
+                           std::span<const std::size_t> indices,
+                           std::size_t skip) -> std::optional<std::string> {
         return std::visit(
             [&](auto& dcol) -> std::optional<std::string> {
                 using DT = std::decay_t<decltype(dcol)>;
@@ -3094,11 +3390,11 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                     return "window: variable-width scatter reached fixed-width path";
                 } else if constexpr (std::is_same_v<DT, Column<bool>>) {
                     for (std::size_t i = 0; i < indices.size(); ++i) {
-                        dcol.set(indices[i], (*scol)[i]);
+                        dcol.set(indices[i], (*scol)[skip + i]);
                     }
                 } else {
                     auto* dp = dcol.data();
-                    const auto* sp = scol->data();
+                    const auto* sp = scol->data() + skip;
                     for (std::size_t i = 0; i < indices.size(); ++i) {
                         dp[indices[i]] = sp[i];
                     }
@@ -3129,7 +3425,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     };
 
     auto scatter_validity = [&](std::size_t f_idx, const Table& sub_table,
-                                std::span<const std::size_t> indices) {
+                                std::span<const std::size_t> indices, std::size_t skip) {
         const auto* sub_entry = sub_table.find_entry(written_field_names[f_idx]);
         if (sub_entry == nullptr || !sub_entry->validity.has_value()) {
             return;
@@ -3138,7 +3434,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
         const auto& sub_bm = *sub_entry->validity;
         auto* words = out_bm->words_data();
         const auto* validity_bytes = sub_bm.buffer_data();
-        const std::size_t validity_offset = sub_bm.buffer_offset();
+        const std::size_t validity_offset = sub_bm.buffer_offset() + skip;
         for (std::size_t i = 0; i < indices.size(); ++i) {
             const std::size_t bit = validity_offset + i;
             if (((validity_bytes[bit / 8] >> (bit % 8)) & 0x01U) == 0U) {
@@ -3161,6 +3457,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // rows, which is exactly what makes them independent of each other.
     auto scatter_group = [&](std::size_t task, const Table& sub,
                              std::span<const std::size_t> indices) -> std::optional<std::string> {
+        const std::size_t skip = tasks[task].halo;
         for (std::size_t f = 0; f < written_field_names.size(); ++f) {
             const auto* src = sub.find_entry(written_field_names[f]);
             if (src == nullptr) {
@@ -3171,10 +3468,10 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                 variable_pieces[task].fields[f] = *src;
                 continue;
             }
-            if (auto err = scatter_into(*dst_columns[f], *src->column, indices)) {
+            if (auto err = scatter_into(*dst_columns[f], *src->column, indices, skip)) {
                 return err;
             }
-            scatter_validity(f, sub, indices);
+            scatter_validity(f, sub, indices, skip);
         }
         return std::nullopt;
     };
@@ -3187,7 +3484,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                                                             written_field_names, fields);
     if (workers < 2) {
         for (std::size_t g = 1; g < tasks.size(); ++g) {
-            auto sub = run_group(out_slot(g));
+            auto sub = run_group(eval_slot(g));
             if (!sub.has_value()) {
                 return std::unexpected(sub.error());
             }
@@ -3224,7 +3521,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
                     }
                     std::optional<std::string> err;
                     try {
-                        auto sub = run_group(out_slot(g));
+                        auto sub = run_group(eval_slot(g));
                         if (!sub.has_value()) {
                             err = std::move(sub.error());
                         } else {
@@ -3277,7 +3574,9 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             for (std::size_t task = 0; task < tasks.size(); ++task) {
                 const auto& source =
                     std::get<Column<std::string>>(*variable_pieces[task].fields[f]->column);
-                for (std::size_t local = 0; local < source.size(); ++local) {
+                // From the halo, not from zero: the leading rows of this
+                // sub-result belong to the preceding piece, which emits them.
+                for (std::size_t local = tasks[task].halo; local < source.size(); ++local) {
                     const std::size_t count =
                         source.offsets_data()[local + 1] - source.offsets_data()[local];
                     if (count > std::numeric_limits<std::uint32_t>::max() - total_chars) {
@@ -3300,7 +3599,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             for (std::size_t task = 0; task < tasks.size(); ++task) {
                 const auto& entry = *variable_pieces[task].fields[f];
                 const auto& source = std::get<Column<std::string>>(*entry.column);
-                for (std::size_t local = 0; local < source.size(); ++local, ++row) {
+                for (std::size_t local = tasks[task].halo; local < source.size(); ++local, ++row) {
                     const auto begin = source.offsets_data()[local];
                     const auto end = source.offsets_data()[local + 1];
                     if (end != begin) {
@@ -3342,7 +3641,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
             const auto& entry = *variable_pieces[task].fields[f];
             const auto& source = std::get<CategoricalColumn>(*entry.column);
             auto& remap = remaps[task];
-            for (std::size_t local = 0; local < source.size(); ++local, ++row) {
+            for (std::size_t local = tasks[task].halo; local < source.size(); ++local, ++row) {
                 const Code input_code = source.code_at(local);
                 if (input_code >= 0 && static_cast<std::size_t>(input_code) < remap.size() &&
                     remap[static_cast<std::size_t>(input_code)] != kUnmapped) {

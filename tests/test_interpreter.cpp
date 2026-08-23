@@ -3400,6 +3400,321 @@ TEST_CASE("a row-local field over a group-major TimeFrame is unaffected",
     REQUIRE(result.has_value());
 }
 
+// A genuinely time-sorted TimeFrame — as `as_timeframe` would leave it — whose
+// two key columns cut the rows crosswise: each `ts` carries one row of each
+// `sym`, and the `ex` of those two rows alternates. Laying the rows out by
+// `sym` therefore scrambles time within every `ex` group, which is what the
+// tests below are about. Rows are (ts, sym, ex, val).
+auto crosswise_keys_timeframe() -> runtime::Table {
+    runtime::Table table;
+    table.add_column("ts", Column<Timestamp>{ts_from_nanos(1), ts_from_nanos(1), ts_from_nanos(2),
+                                             ts_from_nanos(2), ts_from_nanos(3), ts_from_nanos(3)});
+    table.add_column("sym", Column<std::string>{"A", "B", "A", "B", "A", "B"});
+    table.add_column("ex", Column<std::string>{"X", "Y", "Y", "X", "X", "Y"});
+    table.add_column("val", Column<double>{10.0, 100.0, 20.0, 200.0, 30.0, 300.0});
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+    return table;
+}
+
+TEST_CASE("a grouped window rejects groups whose rows are not time-ascending",
+          "[interpreter][roworder][window]") {
+    // The first window lays the rows out group-major by `sym` while keeping the
+    // time index, so the second one's `ex` groups arrive time-scrambled: within
+    // ex=X the rows run ts = 1, 3, 2. A duration window over that reads a later
+    // row into an earlier row's window and silently returns a wrong number,
+    // which is precisely what this rejects.
+    runtime::TableRegistry registry;
+    registry.emplace("data", crosswise_keys_timeframe());
+
+    auto ir = require_ir(
+        "data[window 2ns, by sym, update { z = val * 1.0 }]"
+        "[window 2ns, by ex, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("not time-ascending within group") != std::string::npos);
+    CHECK(result.error().find("ex=\"X\"") != std::string::npos);
+    CHECK(result.error().find("order { ex, ts }") != std::string::npos);
+}
+
+TEST_CASE("the grouped window's own hint restores per-group time order",
+          "[interpreter][roworder][window]") {
+    // The remedy the diagnostic names has to actually work, and the ordering it
+    // leaves behind — (ex, ts) — is exactly what proves the property for free
+    // the second time around.
+    runtime::TableRegistry registry;
+    registry.emplace("data", crosswise_keys_timeframe());
+
+    auto ir = require_ir(
+        "data[window 2ns, by sym, update { z = val * 1.0 }]"
+        "[order { ex, ts }]"
+        "[window 2ns, by ex, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+
+    const auto* ex = std::get_if<Column<std::string>>(result->find("ex"));
+    const auto* ts = std::get_if<Column<Timestamp>>(result->find("ts"));
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(ex != nullptr);
+    REQUIRE(ts != nullptr);
+    REQUIRE(m != nullptr);
+    // ex=X holds (ts=1, 10), (ts=2, 200), (ts=3, 30); ex=Y (ts=1, 100),
+    // (ts=2, 20), (ts=3, 300). Each 2ns window is (t-2, t].
+    const std::map<std::pair<std::string, std::int64_t>, double> expected = {
+        {{"X", 1}, 10.0},  {{"X", 2}, 105.0}, {{"X", 3}, 115.0},
+        {{"Y", 1}, 100.0}, {{"Y", 2}, 60.0},  {{"Y", 3}, 160.0},
+    };
+    REQUIRE(m->size() == 6);
+    for (std::size_t r = 0; r < m->size(); ++r) {
+        CHECK((*m)[r] == Catch::Approx(expected.at({std::string{(*ex)[r]}, (*ts)[r].nanos})));
+    }
+}
+
+TEST_CASE("a grouped window accepts a globally time-sorted input with crosswise keys",
+          "[interpreter][roworder][window]") {
+    // The guard must not tax the ordinary case: an untouched TimeFrame is
+    // time-ascending in EVERY subset, so any grouping of it is admissible.
+    runtime::TableRegistry registry;
+    registry.emplace("data", crosswise_keys_timeframe());
+
+    auto ir = require_ir("data[window 2ns, by ex, update { m = rolling_mean(val) }];");
+    auto result = runtime::interpret(*ir, registry);
+    REQUIRE(result.has_value());
+    const auto* m = std::get_if<Column<double>>(result->find("m"));
+    REQUIRE(m != nullptr);
+    REQUIRE(m->size() == 6);
+}
+
+// A time-sorted TimeFrame of `rows` rows over `groups` interleaved keys, one
+// row per nanosecond. Large enough to clear the minimum piece size, which is
+// what the halo split needs before it will cut a group at all.
+auto halo_split_timeframe(std::size_t rows, std::int64_t groups) -> runtime::Table {
+    Column<Timestamp> ts;
+    Column<std::int64_t> sym;
+    Column<double> val;
+    ts.reserve(rows);
+    sym.reserve(rows);
+    val.reserve(rows);
+    for (std::size_t r = 0; r < rows; ++r) {
+        const auto i = static_cast<std::int64_t>(r);
+        ts.push_back(ts_from_nanos(i));
+        sym.push_back(i % groups);
+        // Deterministic, non-monotonic, and not periodic in the window length,
+        // so a halo one row short would show up as a differing value.
+        val.push_back(static_cast<double>((i * 7919) % 1000) / 8.0);
+    }
+    runtime::Table table;
+    table.add_column("ts", std::move(ts));
+    table.add_column("sym", std::move(sym));
+    table.add_column("val", std::move(val));
+    table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+    return table;
+}
+
+TEST_CASE("a halo-split grouped window agrees with the unsplit one",
+          "[interpreter][window][halo]") {
+    // Two groups on four workers is the shape the split exists for: without it,
+    // half the pool idles for the whole window. Each piece is handed the rows
+    // within the clause duration before it and drops their results, so the
+    // answer must be identical to running each group whole.
+    runtime::TableRegistry registry;
+    registry.emplace("data", halo_split_timeframe(100000, 2));
+
+    auto ir = require_ir(
+        "data[window 40ns, by sym, update { m = rolling_mean(val), "
+        "s = rolling_sum(val), n = rolling_count(), x = rolling_max(val) }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(whole.has_value());
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext split;
+    split.parallel = true;
+    split.parallel_threads = 4;
+    split.parallel_min_rows = 0;
+    split.parallel_stats = &stats;
+    auto pieces = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, split);
+    REQUIRE(pieces.has_value());
+    // The equivalence would hold trivially if nothing had been cut.
+    CHECK(stats.window_halo_pieces.load() > 0);
+
+    auto mismatch = runtime::compare_tables(*whole, *pieces);
+    CHECK(!mismatch.has_value());
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("a halo split reassociates a float accumulator but does not move the answer",
+          "[interpreter][window][halo]") {
+    // The rolling kernels carry a RUNNING accumulator: a value is added when it
+    // enters the window and subtracted when it leaves, and the accumulator is
+    // never reset. A piece that starts mid-group therefore reaches a given row
+    // by a different sequence of additions than the whole group does, and
+    // floating-point addition is not associative — so the two agree
+    // mathematically but need not agree bit for bit.
+    //
+    // This is not something the halo introduces. The aligned bucket-boundary
+    // split, which needs no halo at all, has exactly the same property and has
+    // had it all along: the accumulator does not reset at a bucket edge either,
+    // it just drops the stale values one at a time. Measured here, the halo
+    // split is the tighter of the two.
+    //
+    // What IS asserted is the size of the divergence: last-bits, not answers.
+    // The other tests in this group use values that are exact in binary, so
+    // their equality checks stay exact.
+    runtime::TableRegistry registry;
+    {
+        Column<Timestamp> ts;
+        Column<std::int64_t> sym;
+        Column<double> val;
+        for (std::size_t r = 0; r < 100000; ++r) {
+            const auto i = static_cast<std::int64_t>(r);
+            ts.push_back(ts_from_nanos(i));
+            sym.push_back(i % 2);
+            // Deliberately not representable in binary, and spanning six orders
+            // of magnitude so cancellation has something to work with.
+            val.push_back(std::sin(static_cast<double>(i)) * 1.0e6);
+        }
+        runtime::Table table;
+        table.add_column("ts", std::move(ts));
+        table.add_column("sym", std::move(sym));
+        table.add_column("val", std::move(val));
+        table.set_properties(ibex::runtime::TableProperties::time_frame("ts"));
+        registry.emplace("data", table);
+    }
+
+    auto ir = require_ir("data[window 40ns, by sym, update { m = rolling_mean(val) }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(whole.has_value());
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext split;
+    split.parallel = true;
+    split.parallel_threads = 4;
+    split.parallel_min_rows = 0;
+    split.parallel_stats = &stats;
+    auto pieces = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, split);
+    REQUIRE(pieces.has_value());
+    CHECK(stats.window_halo_pieces.load() > 0);
+
+    const auto* a = std::get_if<Column<double>>(whole->find("m"));
+    const auto* b = std::get_if<Column<double>>(pieces->find("m"));
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    REQUIRE(a->size() == b->size());
+    double worst = 0.0;
+    for (std::size_t r = 0; r < a->size(); ++r) {
+        worst = std::max(worst, std::abs((*a)[r] - (*b)[r]) / std::max(1.0e-9, std::abs((*a)[r])));
+    }
+    // Roughly three orders of magnitude of headroom over what this shape
+    // actually produces (~2e-11), so the check fails on a wrong halo rather
+    // than on a different compiler's rounding.
+    CHECK(worst < 1.0e-8);
+}
+
+TEST_CASE("a halo split declines for an expression that reads past the window",
+          "[interpreter][window][halo]") {
+    // `cumsum` reaches back to the group's first row, so no finite halo makes a
+    // piece independent. The work list must stay one item per group — which
+    // shows up as the answer still being the whole group's running total.
+    runtime::TableRegistry registry;
+    registry.emplace("data", halo_split_timeframe(100000, 2));
+
+    auto ir = require_ir("data[window 40ns, by sym, update { c = cumsum(val) }];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext split;
+    split.parallel = true;
+    split.parallel_threads = 4;
+    split.parallel_min_rows = 0;
+    split.parallel_stats = &stats;
+    auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, split);
+    REQUIRE(result.has_value());
+    CHECK(stats.window_halo_pieces.load() == 0);
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(whole.has_value());
+    auto mismatch = runtime::compare_tables(*whole, *result);
+    CHECK(!mismatch.has_value());
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("a halo split honours a per-call count window", "[interpreter][window][halo]") {
+    // A count window knows nothing about the clause duration or the time grid:
+    // its halo is a row count, and getting it from the wrong bound would leave
+    // the first rows of every piece short of history.
+    runtime::TableRegistry registry;
+    registry.emplace("data", halo_split_timeframe(100000, 2));
+
+    auto ir = require_ir("data[window 40ns, by sym, update { m = rolling_mean(val, 500) }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(whole.has_value());
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext split;
+    split.parallel = true;
+    split.parallel_threads = 4;
+    split.parallel_min_rows = 0;
+    split.parallel_stats = &stats;
+    auto pieces = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, split);
+    REQUIRE(pieces.has_value());
+    // The equivalence would hold trivially if nothing had been cut.
+    CHECK(stats.window_halo_pieces.load() > 0);
+
+    auto mismatch = runtime::compare_tables(*whole, *pieces);
+    CHECK(!mismatch.has_value());
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("a halo-split grouped window agrees at several worker counts",
+          "[interpreter][window][halo]") {
+    // The cut depends on the worker count, so the pieces — and every halo with
+    // them — differ run to run. None of that may reach the answer.
+    runtime::TableRegistry registry;
+    registry.emplace("data", halo_split_timeframe(150000, 3));
+
+    auto ir = require_ir(
+        "data[window 25ns, by sym, update { m = rolling_mean(val), n = rolling_count() }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    REQUIRE(whole.has_value());
+
+    for (const std::size_t threads : {2U, 4U, 8U}) {
+        runtime::ParallelIslandStats stats;
+        runtime::ExecutionContext split;
+        split.parallel = true;
+        split.parallel_threads = threads;
+        split.parallel_min_rows = 0;
+        split.parallel_stats = &stats;
+        auto pieces = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, split);
+        REQUIRE(pieces.has_value());
+        // Three groups already saturate two workers, so nothing is cut there;
+        // above that the cut appears, and neither case may move the answer.
+        CHECK(stats.window_halo_pieces.load() == (threads > 3 ? 1 : 0) * 3);
+        auto mismatch = runtime::compare_tables(*whole, *pieces);
+        CHECK(!mismatch.has_value());
+        if (mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+    }
+}
+
 // --- rolling aggregate tests --------------------------------------------------
 // Timestamps: 0ns, 1ns, 2ns  Values: 10, 20, 30
 // Window 2ns: (t-2, t]

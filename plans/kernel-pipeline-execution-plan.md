@@ -1,8 +1,13 @@
 # Kernel-oriented pipeline execution
 
-Status: **proposed architecture plan.** This is a deliberate replacement for
-the current execution architecture over several migrations, not a promise to
-rewrite the runtime in one change. It borrows Umbra's useful separation of
+Status: **in migration** (was: proposed architecture plan). Phase 0 resolved
+by disposition, Phase 1 landed 2026-08-22, Phase 2 in progress — its
+"Where Phase 2 stands" table is the current, item-by-item state. Phases 3-5
+not started. The goal is FEATURE PARITY on this architecture: every shape the
+old execution seams supported reaches either a kernel or an explicit,
+inspectable fallback. This is a deliberate replacement for the current
+execution architecture over several migrations, not a promise to rewrite the
+runtime in one change. It borrows Umbra's useful separation of
 logical planning, physical pipelines, and morsel execution, while explicitly
 rejecting query JIT/code generation. Ibex's execution backend remains compiled
 C++ with a broad library of specialized, template-instantiated vector kernels.
@@ -326,7 +331,9 @@ source pushdowns, with no required performance win.
 
 ### Phase 2 — migrate row-local execution to reusable kernels
 
-**Open.** The opening deliverable — the contract documentation Phase 0's
+**Open; items 1–3 are substantially landed for the filter/map/update families,
+items 4–5 are untouched. See "Where Phase 2 stands" below for the item-by-item
+state and the gaps that assessment does NOT claim.** The opening deliverable — the contract documentation Phase 0's
 disposition promised — landed as `src/runtime/CONTRACTS.md` (2026-08-22):
 the one-place statement of the `Chunk`, `sequence`/`row_offset` index space,
 `next()` pull protocol, materialization, `TableProperties`, source/demand,
@@ -603,6 +610,86 @@ the established evaluator so its scheduling and accounting contract stays
 intact. Focused kernel coverage pins replacement of a nullable Int64 column;
 full debug ctest passes 1675/1675. Next: consolidate capability selection into
 a construction-time dispatch descriptor rather than add more one-off probes.
+
+**Ordered multi-field chunk updates (2026-08-22, `018822da`).** An update's
+fields are ordered — a later field reads the chunk every earlier one produced —
+so the chunk kernel now folds them one at a time. The direct route stays
+all-or-nothing: if any field falls outside the kernel vocabulary, the tentative
+chunk is discarded and `update_table` evaluates the ORIGINAL complete update,
+so a partially-ported clause can never land half its fields through one
+contract and half through another.
+
+**Guarded and variable-width update output (2026-08-22, `31f9d64f`,
+`73671829`, `572b48f9`, `55b63c70`).** The output side of the update family
+reached the representations the first ports had deferred: guarded (`where …
+update`) string writes pack through the count → prefix-sum → scatter contract,
+guarded categorical writes go through a planned dictionary with per-source code
+remaps, and grouped update/window results scatter variable-width output by
+absolute row instead of rebuilding a per-group table. These are the
+representation contracts the plan's §5 names, applied to the writer side rather
+than the reader side.
+
+**Unary, string-length, and compiled numeric trees (2026-08-22, `859e2153`,
+`80543e6a`, `8b2d910f`, `bbc61514`).** The one-off computed-field probes the
+earlier entries kept adding (all-valid Int64 pair, nullable pair, Double pair,
+Int64 literal, Double literal, checked modulo) were the wrong shape to keep
+extending: each was a new admission test for one expression form. They are
+replaced by a compiled numeric expression TREE evaluated over `ChunkView`s,
+which subsumes them; the superseded helpers were deleted rather than left as a
+second route to the same answer.
+
+**One direct-update dispatch, shared by both executors (2026-08-22,
+`f6250f21`, `8ae777c2`).** This is the structural result of Phase 2 item 2 for
+the update family. The direct-field vocabulary is now stated once, in
+`kernel_update.hpp`, as plan/write pairs: `DirectFieldPlan` (numeric tree,
+temporal part, string length), `DirectPredicatePlan` (packed bool),
+`DirectValidityPlan` (fill_null/coalesce/CASE), `DirectCategoricalPlan`
+(dictionary + remaps), and `StringInterpolationPlan` (count/prefix/write). A
+plan borrows the IR and owns no destination, so the same plan serves a serial
+chunk write and a parallel table-level window write. `try_direct_update_field`
+is the single ordered dispatch on the chunk side; `evaluate_field_maybe_parallel`
+consumes the identical plans on the table side. The two executors can no longer
+disagree about which expressions have a fast path, because there is one place
+that decides.
+
+**Grouped update off the per-group Table (2026-08-23, `376ef3e1` … `f4cc2a7d`).**
+Tracked in full in [grouped-chunkview-update-plan.md](grouped-chunkview-update-plan.md);
+recorded here because it removes one of the update family's two remaining
+whole-operator materializations. `update …, by k` used to gather each group into
+its own `Table`, run the ordinary evaluator on it, and scatter the result back —
+O(groups) table constructions, and the reason high-cardinality grouped updates
+scaled badly. It now runs an immutable `GroupedRowPlan` (global row ids + CSR
+group rows) with: fixed-width reductions and ordered kernels (`lag`, `cumsum`,
+fills) reducing over CSR rows and scattering to absolute rows; every other
+aggregate (`median`, `std`, `quantile`, `first`/`last`, string/categorical
+aggregates) broadcast from ONE grouped aggregation keyed by group id; and
+group state lifted out of surrounding expressions into staging columns so the
+residual expression is ordinary row-local work on the direct protocols above.
+A wholly row-local `by` clause bypasses grouping entirely. What remains
+materialized is now a stated list — `rank`, variable-width ordered state,
+`window`-clause `lag`/`lead` — not "everything that is not a bare aggregate".
+
+**Where Phase 2 stands (2026-08-23).** Written from the tree, not from a
+per-commit A/B log; the entries above are the itemized history.
+
+| Item | State |
+|---|---|
+| 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
+| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering. **Gap: on the chunk side only the metadata-alias form runs the kernel when `parallel` is on** — every other parallel update still routes through `update_table`, which then does its own window splitting. That is a real seam, not a finished port. |
+| 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
+| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only. The morsel executor is still reached through the island seam, not through the physical plan. **Untouched.** |
+| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
+
+Current gates on the tree: full debug `ctest` 1735/1735, and PDS-H
+`check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
+performance claim is made for this block: the entries it summarizes were
+gated individually when they landed, and it is not a fresh A/B.
+
+Resume point, in priority order: (a) make parallel chunk updates use the direct
+plans instead of delegating to `update_table` — the plans are already
+window-oriented and destination-free, which is the whole prerequisite; (b) item
+4, so the physical plan owns morsel execution rather than the island seam;
+(c) `KernelContext`, once (a) needs one shared scratch/cancellation owner.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

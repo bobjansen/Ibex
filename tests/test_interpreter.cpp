@@ -8065,7 +8065,7 @@ TEST_CASE("grouped update lifts aggregates out of a row-local expression",
               std::vector<double>{2.0, 2.0, 15.0, 15.0, 5.0, 5.0});
         // Two reductions per field would be three staging columns; `sum(x)`
         // appearing twice in one field must collapse onto one.
-        CHECK(stats.grouped_lifted_aggregates.load() == 3);
+        CHECK(stats.grouped_lifted_group_state.load() == 3);
         // The staging columns live on a local table only.
         CHECK(out->columns.size() == 6);
         for (const auto& entry : out->columns) {
@@ -8160,11 +8160,10 @@ TEST_CASE("lifted grouped aggregates are deterministic across thread counts",
     }
 }
 
-// An order-dependent call around an aggregate keeps the whole field on the
-// materialized evaluator: `lag` reads a neighbouring row, which is not
-// something a broadcast column can feed a row-local expression. The answer is
-// what matters here — the gate declining must change the path, not the result.
-TEST_CASE("grouped update falls back when a field is not row-local around its aggregate",
+// Ordered group state lifts exactly like an aggregate does: `lag(x, 1)` is a
+// value per row the CSR walk already produces, so the log-return shape becomes
+// ordinary row-local arithmetic over a staging column.
+TEST_CASE("grouped update lifts ordered group state into row-local expressions",
           "[update][groupby][reduction]") {
     runtime::Table t;
     t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
@@ -8172,21 +8171,69 @@ TEST_CASE("grouped update falls back when a field is not row-local around its ag
     runtime::TableRegistry registry;
     registry.emplace("t", std::move(t));
 
-    auto ir = require_ir("t[update { y = lag(x, 1) + mean(x) }, by g];");
+    SECTION("an ordered kernel mixed with row-local terms") {
+        auto ir = require_ir("t[update { lr = x / lag(x, 1) - 1.0 }, by g];");
+        runtime::ParallelIslandStats stats;
+        runtime::ExecutionContext exec;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* lr = out->find_entry("lr");
+        REQUIRE(lr != nullptr);
+        REQUIRE(lr->validity.has_value());
+        // The first row of each group has no predecessor to divide by.
+        CHECK_FALSE((*lr->validity)[0]);
+        CHECK_FALSE((*lr->validity)[2]);
+        const auto& values = std::get<Column<double>>(*lr->column);
+        CHECK(values[1] == Catch::Approx(2.0));
+        CHECK(values[3] == Catch::Approx(1.0));
+        CHECK(stats.grouped_lifted_group_state.load() == 1);
+        CHECK(out->columns.size() == 3);
+    }
+
+    SECTION("ordered state and an aggregate in one field") {
+        auto ir =
+            require_ir("t[update { c = cumsum(x) / sum(x), y = lag(x, 1) + mean(x) }, by g];");
+        runtime::ParallelIslandStats stats;
+        runtime::ExecutionContext exec;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto& c = std::get<Column<double>>(*out->find("c"));
+        CHECK(c[0] == Catch::Approx(0.25));
+        CHECK(c[1] == Catch::Approx(1.0));
+        CHECK(c[2] == Catch::Approx(10.0 / 30.0));
+        CHECK(c[3] == Catch::Approx(1.0));
+        const auto* y = out->find_entry("y");
+        REQUIRE(y != nullptr);
+        REQUIRE(y->validity.has_value());
+        CHECK_FALSE((*y->validity)[0]);
+        CHECK(std::get<Column<double>>(*y->column)[1] == Catch::Approx(3.0));
+        CHECK(stats.grouped_lifted_group_state.load() == 4);
+    }
+}
+
+// `rank` states no order-key, null-placement, or tie-method contract to the
+// native protocols, so it keeps its whole field on the materialized evaluator.
+// The answer is what matters here — the gate declining must change the path,
+// not the result.
+TEST_CASE("grouped update falls back for a field the lifter declines",
+          "[update][groupby][reduction]") {
+    runtime::Table t;
+    t.add_column("g", Column<std::int64_t>{1, 1, 2, 2});
+    t.add_column("x", Column<double>{1.0, 3.0, 10.0, 20.0});
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(t));
+
+    auto ir = require_ir("t[update { r = rank(x, method = dense) }, by g];");
     runtime::ParallelIslandStats stats;
     runtime::ExecutionContext exec;
     exec.parallel_stats = &stats;
     auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
-    const auto* y = out->find_entry("y");
-    REQUIRE(y != nullptr);
-    REQUIRE(y->validity.has_value());
-    CHECK_FALSE((*y->validity)[0]);
-    CHECK_FALSE((*y->validity)[2]);
-    const auto& values = std::get<Column<double>>(*y->column);
-    CHECK(values[1] == Catch::Approx(3.0));
-    CHECK(values[3] == Catch::Approx(25.0));
-    CHECK(stats.grouped_lifted_aggregates.load() == 0);
+    const auto& r = std::get<Column<std::int64_t>>(*out->find("r"));
+    CHECK(std::vector<std::int64_t>(r.begin(), r.end()) == std::vector<std::int64_t>{1, 2, 1, 2});
+    CHECK(stats.grouped_lifted_group_state.load() == 0);
 }
 
 TEST_CASE("grouped update broadcasts general aggregates as select computes them",
@@ -8249,7 +8296,7 @@ TEST_CASE("grouped update broadcasts general aggregates as select computes them"
     // `count(col)` is lowered to a sum over a derived 0/1 column, which is a
     // bare fixed-width reduction and never reaches the lifter; the other six
     // are one grouped aggregation between them.
-    CHECK(stats.grouped_lifted_aggregates.load() == 6);
+    CHECK(stats.grouped_lifted_group_state.load() == 6);
 }
 
 // A general aggregate mixed into an expression must reach the row-local

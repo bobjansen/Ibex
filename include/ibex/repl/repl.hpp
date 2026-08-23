@@ -47,6 +47,9 @@ struct ReplConfig {
 struct ExecutionResult {
     bool ok = false;
     std::optional<runtime::Table> table;
+    /// Every table rendered by this execution, in statement order. `table`
+    /// remains the last table for compatibility with existing callers.
+    std::vector<runtime::Table> tables;
     std::optional<runtime::ScalarValue> scalar;
     std::string error;
     std::optional<std::size_t> error_line;

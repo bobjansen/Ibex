@@ -951,9 +951,11 @@ void render_eval_value(const EvalValue& value) {
         } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
             runtime::Table temp;
             temp.add_column("column", *col);
-            active_execution_result->table = std::move(temp);
+            active_execution_result->table = temp;
+            active_execution_result->tables.push_back(std::move(temp));
         } else {
             active_execution_result->table = std::get<runtime::Table>(value);
+            active_execution_result->tables.push_back(*active_execution_result->table);
         }
     }
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {

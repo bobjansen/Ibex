@@ -125,13 +125,26 @@ TEST_CASE("REPL session preserves bindings and returns structured results", "[re
     REQUIRE(result.ok);
     REQUIRE(result.table.has_value());
     REQUIRE(result.table->rows() == 2);
+    REQUIRE(result.tables.size() == 1);
 
     const auto environment = session.environment();
-    REQUIRE(std::ranges::any_of(environment, [](const auto& entry) {
-        return entry.name == "numbers" && entry.rows == 3;
-    }));
+    REQUIRE(std::ranges::any_of(
+        environment, [](const auto& entry) { return entry.name == "numbers" && entry.rows == 3; }));
     REQUIRE(session.erase("numbers"));
     REQUIRE_FALSE(session.erase("numbers"));
+}
+
+TEST_CASE("REPL session collects every rendered table", "[repl][session]") {
+    ibex::runtime::ExternRegistry registry;
+    ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
+
+    const auto result = session.execute("trades[select { price }]; trades[select { symbol }];");
+    REQUIRE(result.ok);
+    REQUIRE(result.tables.size() == 2);
+    REQUIRE(result.tables[0].columns[0].name == "price");
+    REQUIRE(result.tables[1].columns[0].name == "symbol");
+    REQUIRE(result.table.has_value());
+    REQUIRE(result.table->columns[0].name == "symbol");
 }
 
 TEST_CASE("REPL session returns parser locations and runtime diagnostics", "[repl][session]") {

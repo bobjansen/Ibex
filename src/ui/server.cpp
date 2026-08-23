@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -216,25 +217,43 @@ auto new_session_id() -> std::string {
     return out.str();
 }
 
+auto print_performance_environment() -> void {
+    constexpr std::array<std::string_view, 13> variables = {"IBEX_CORES",
+                                                            "IBEX_DECODE_THREADS",
+                                                            "IBEX_DECODE_SATURATION",
+                                                            "IBEX_PARALLEL",
+                                                            "IBEX_CHUNK_ROWS",
+                                                            "IBEX_MORSEL_ROWS",
+                                                            "IBEX_STREAM_SCAN",
+                                                            "IBEX_JOIN_PROBE",
+                                                            "IBEX_NO_MALLOC_TUNING",
+                                                            "IBEX_PROFILE_OPERATORS",
+                                                            "IBEX_PARALLEL_STATS",
+                                                            "IBEX_UNIQUE_KEY_STATS",
+                                                            "IBEX_THREADS (deprecated)"};
+    std::cout << "Ibex UI performance environment:\n";
+    for (const auto variable : variables) {
+        const auto name = variable.substr(0, variable.find(' '));
+        const char* value = std::getenv(std::string(name).c_str());
+        std::cout << "  " << variable << '='
+                  << (value != nullptr && value[0] != '\0' ? value : "<unset>") << '\n';
+    }
+}
+
 auto column_type(const runtime::ColumnValue& value) -> std::string {
-    return std::visit(
-        [](const auto& column) -> std::string {
-            using T = typename std::decay_t<decltype(column)>::value_type;
-            if constexpr (std::same_as<T, std::int64_t>)
-                return "Int64";
-            if constexpr (std::same_as<T, double>)
-                return "Float64";
-            if constexpr (std::same_as<T, std::string>)
-                return "String";
-            if constexpr (std::same_as<T, Categorical>)
-                return "Categorical";
-            if constexpr (std::same_as<T, Date>)
-                return "Date";
-            if constexpr (std::same_as<T, Timestamp>)
-                return "Timestamp";
-            return "Bool";
-        },
-        value);
+    if (std::holds_alternative<Column<std::int64_t>>(value))
+        return "Int64";
+    if (std::holds_alternative<Column<double>>(value))
+        return "Float64";
+    if (std::holds_alternative<Column<std::string>>(value))
+        return "String";
+    if (std::holds_alternative<Column<Categorical>>(value))
+        return "Categorical";
+    if (std::holds_alternative<Column<Date>>(value))
+        return "Date";
+    if (std::holds_alternative<Column<Timestamp>>(value))
+        return "Timestamp";
+    return "Bool";
 }
 
 auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
@@ -621,6 +640,7 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
         close_socket(listener);
         return 1;
     }
+    print_performance_environment();
     std::cout << "Ibex UI: http://127.0.0.1:" << config.port << "\n";
     std::cout << "Press Ctrl+C to stop.\n";
 
@@ -658,8 +678,14 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                 }
             } else if (request->method == "POST" && request->target == "/api/v1/execute") {
                 const json body = json::parse(request->body);
-                const auto execution = session.repl.execute(body.value("source", ""));
-                json response = {{"ok", execution.ok}, {"environment", environment_json(session)}};
+                const auto started_at = std::chrono::steady_clock::now();
+                auto execution = session.repl.execute(body.value("source", ""));
+                const auto elapsed = std::chrono::steady_clock::now() - started_at;
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(elapsed).count();
+                json response = {{"ok", execution.ok},
+                                 {"elapsed_ms", elapsed_ms},
+                                 {"environment", environment_json(session)}};
                 if (!execution.ok) {
                     response["error"] = {{"message", execution.error}};
                     if (execution.error_line.has_value()) {
@@ -668,11 +694,23 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                     if (execution.error_column.has_value()) {
                         response["error"]["column"] = *execution.error_column;
                     }
+                } else if (!execution.tables.empty()) {
+                    json results = json::array();
+                    for (auto& table : execution.tables) {
+                        const std::string result_id = std::to_string(session.next_result_id++);
+                        session.results.insert_or_assign(result_id, std::move(table));
+                        while (session.results.size() > 16)
+                            session.results.erase(session.results.begin());
+                        results.push_back({{"result_id", result_id},
+                                           {"result", table_page(session.results.at(result_id), 0,
+                                                                 bounded_limit(body))}});
+                    }
+                    response["results"] = std::move(results);
+                    response["result_id"] = response["results"][0]["result_id"];
+                    response["result"] = response["results"][0]["result"];
                 } else if (execution.table.has_value()) {
                     const std::string result_id = std::to_string(session.next_result_id++);
                     session.results.insert_or_assign(result_id, std::move(*execution.table));
-                    while (session.results.size() > 16)
-                        session.results.erase(session.results.begin());
                     response["result_id"] = result_id;
                     response["result"] =
                         table_page(session.results.at(result_id), 0, bounded_limit(body));

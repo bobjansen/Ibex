@@ -14515,6 +14515,53 @@ TEST_CASE("Scan pipeline decodes source units through row-local maps without mat
     CHECK((*x)[x->size() - 1] == 3999);
 }
 
+// A run with a serial step above it can stream its source too. The pipelined
+// scan used to be chosen at the construction seam, which could only offer it to
+// a chain that was parallel end to end; it is now the run's own source strategy,
+// so `df[filter ...][update ...]` -- filter run, update composed above it --
+// streams the scan instead of decoding it whole and morselizing.
+TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
+          "[runtime][parallel][pipeline]") {
+    auto state = std::make_shared<PipelineReaderState>();
+    auto deferred = make_pipeline_deferred(state);
+    const runtime::TableRegistry empty;
+    auto ir = require_ir("df[filter x > 500][update { y = x * 2 }];");
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_stats = &stats;
+
+    auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
+    REQUIRE(out.has_value());
+    CHECK(stats.pipelined_scans.load() == 1);
+
+    const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
+    const auto* y = std::get_if<Column<std::int64_t>>(out->find("y"));
+    REQUIRE(x != nullptr);
+    REQUIRE(y != nullptr);
+    REQUIRE(x->size() == 3499);
+    REQUIRE(y->size() == 3499);
+    // The update ran over the streamed, reassembled output — in order.
+    CHECK((*x)[0] == 501);
+    CHECK((*y)[0] == 1002);
+    CHECK((*x)[x->size() - 1] == 3999);
+    CHECK((*y)[y->size() - 1] == 7998);
+
+    // Same answer as the serial path, which decodes the whole source.
+    runtime::ExecutionContext serial{.deferred_scans = &deferred, .execution_profile = nullptr};
+    serial.parallel = false;
+    auto reference = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, serial);
+    REQUIRE(reference.has_value());
+    const auto* reference_y = std::get_if<Column<std::int64_t>>(reference->find("y"));
+    REQUIRE(reference_y != nullptr);
+    CHECK(std::vector<std::int64_t>(y->begin(), y->end()) ==
+          std::vector<std::int64_t>(reference_y->begin(), reference_y->end()));
+}
+
 TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",
           "[runtime][parallel][pipeline]") {
     auto state = std::make_shared<PipelineReaderState>();

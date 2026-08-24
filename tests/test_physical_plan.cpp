@@ -609,6 +609,74 @@ TEST_CASE("Migrated filter keeps the empty input's schema carrier", "[physical][
     REQUIRE(result->find("price") != nullptr);
 }
 
+TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]") {
+    // Phase 4 item 1, step 1. The plan classifies joins before it runs them, so
+    // the description can be proven equal to the builder's own branch while
+    // being wrong is still free. A temporary assertion at the seam compared the
+    // two on all 1754 tests and all 22 PDS-H queries (59 joins) with zero
+    // disagreements; these cases are the readable subset that survives it.
+    using runtime::physical::JoinDeclineReason;
+    using runtime::physical::JoinStrategy;
+
+    const auto plan_of = [](const char* src) {
+        auto ir = require_ir(src);
+        REQUIRE(ir->kind() == ir::NodeKind::Join);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        return runtime::physical::plan_join(static_cast<const ir::JoinNode&>(*ir));
+    };
+
+    SECTION("a single-key inner join streams, right side builds") {
+        auto ir = require_ir("(a join b on k);");
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto plan = runtime::physical::plan_join(static_cast<const ir::JoinNode&>(*ir));
+        CHECK(plan.describes);
+        CHECK(plan.strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan.decline == JoinDeclineReason::None);
+        CHECK(plan.key_count == 1);
+        // Which side *should* build is a cost question the plan deliberately
+        // does not answer yet, so this pins what happens today rather than what
+        // ought to: textual left probes, textual right is hashed. Compared
+        // against this node's own children -- a second `require_ir` would build
+        // a different tree whose pointers could never match.
+        REQUIRE(ir->children().size() == 2);
+        CHECK(plan.probe_side == ir->children()[0].get());
+        CHECK(plan.build_side == ir->children()[1].get());
+    }
+
+    SECTION("semi and anti stream on the same terms") {
+        CHECK(plan_of("(a semi join b on k);").strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan_of("(a anti join b on k);").strategy == JoinStrategy::StreamingProbe);
+    }
+
+    SECTION("every decline is named, not a bare conjunction") {
+        CHECK(plan_of("(a left join b on k);").decline == JoinDeclineReason::UnsupportedKind);
+        CHECK(plan_of("(a join b on x < y);").decline == JoinDeclineReason::HasPredicate);
+        CHECK(plan_of("(a join b on { k1, k2 });").decline == JoinDeclineReason::MultipleKeys);
+        CHECK(plan_of("(a join b on k nulls equal);").decline == JoinDeclineReason::NullsEqual);
+        for (const char* src : {"(a left join b on k);", "(a join b on x < y);",
+                                "(a join b on { k1, k2 });", "(a join b on k nulls equal);"}) {
+            CAPTURE(src);
+            const auto plan = plan_of(src);
+            CHECK(plan.strategy == JoinStrategy::MaterializeBoth);
+            // A declined join names no sides: claiming one would suggest a
+            // choice the materializing path never makes.
+            CHECK(plan.build_side == nullptr);
+            CHECK(plan.probe_side == nullptr);
+        }
+    }
+
+    SECTION("explain prints the description under the fallback line") {
+        auto ir = require_ir("(a join b on k);");
+        const runtime::TableRegistry empty;
+        const auto plan = runtime::physical::plan_physical(*ir, empty, nullptr);
+        CHECK_FALSE(plan.migrated);  // still executed by the per-kind switch
+        CHECK(plan.join.describes);
+        const std::string text = runtime::physical::explain_physical(plan);
+        CHECK(text.find("MaterializedCall") != std::string::npos);
+        CHECK(text.find("Join(StreamingProbe keys=1") != std::string::npos);
+    }
+}
+
 TEST_CASE("The fallback backlog is counted by kind, in every mode", "[physical][execute]") {
     // The backlog is what orders Phase 4, so it has to be trustworthy in two
     // ways this pins down.

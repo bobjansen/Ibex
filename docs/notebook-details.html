@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Language Reference</title>
+  <meta name="description" content="A detailed Ibex language reference and tour covering table pipelines, I/O, notebook integration, TimeFrames, joins, functions, and benchmarks." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+
+  <!-- Nav -->
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link active" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="section">
+    <p class="section-label">Notebook integration</p>
+    <h2>Run Ibex inside Python or R notebook workflows</h2>
+    <p class="section-sub">Quickly switch between Python and Ibex cells in a
+    notebook. The results from Ibex can seamlessly be used by later cells in
+    the notebook.</p>
+
+    <div class="tour">
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Python Bridge</span>
+          <h3>Use Ibex as a DSL inside a real notebook workflow</h3>
+          <p>
+            The <code>ibex_pyarrow</code> bridge evaluates Ibex code and returns
+            a <code>pyarrow.Table</code>. The <code>ibex_ipython</code> extension
+            adds <code>%%ibex</code>, <code>%ibexfile</code>, and
+            <code>%ibexreset</code>, so notebooks can bind pandas or Arrow
+            tables and ordinary Python scalars into Ibex, keep expensive table
+            loads alive across cells, and keep plotting in Python.
+          </p>
+          <p>
+            Scalar bindings currently support Python <code>int</code>,
+            <code>float</code>, <code>bool</code>, <code>str</code>,
+            <code>datetime.date</code>, and <code>datetime.datetime</code>,
+            with the last two mapped to Ibex <code>Date</code> and
+            <code>Timestamp</code>.
+          </p>
+          <p>
+            This keeps Ibex focused on joins, aggregations, reshaping, and
+            time-series work, while reusing pandas, matplotlib, and the rest of
+            the notebook ecosystem for presentation.
+          </p>
+          <p>
+            Build the bridge with
+            <code>cmake --build build-release --parallel --target ibex_pyarrow</code>,
+            then start IPython from the repository root and load the extension.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm"># IPython / Jupyter</span>
+%load_ext ibex_ipython
+
+<span class="kw">import</span> pandas <span class="kw">as</span> pd
+
+trades = pd.DataFrame({
+    <span class="str">"symbol"</span>: [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"MSFT"</span>],
+    <span class="str">"qty"</span>: [<span class="num">10</span>, <span class="num">15</span>, <span class="num">7</span>],
+    <span class="str">"px"</span>: [<span class="num">101.2</span>, <span class="num">101.5</span>, <span class="num">299.8</span>],
+})
+offset = <span class="num">10</span>
+
+%%ibex --bind trades=trades --bind offset=offset --as pandas --out grouped
+trades[
+    <span class="kw">select</span> { total_qty = <span class="fn-name">sum</span>(qty + offset), avg_px = <span class="fn-name">mean</span>(px) },
+    <span class="kw">by</span> symbol,
+    <span class="kw">order</span> symbol
+];
+
+grouped.plot(kind=<span class="str">"bar"</span>, x=<span class="str">"symbol"</span>, y=<span class="str">"total_qty"</span>);</code></pre>
+        </div>
+      </div>
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Persistent Session</span>
+          <h3>Load once, reuse across notebook cells</h3>
+          <p>
+            <code>%%ibex</code> keeps table-valued <code>let</code> bindings in
+            a hidden Ibex session. Large CSV or parquet loads do not need to be
+            repeated in every cell.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code>%%ibex --quiet
+import "csv";
+let train = read_csv(<span class="str">"../../kaggle/data/train.csv"</span>, <span class="str">"&lt;empty&gt;"</span>);
+
+%%ibex --as pandas --out bucket_summary
+train[<span class="kw">select</span> { rows = <span class="fn-name">count</span>() }, <span class="kw">by</span> seconds_in_bucket, <span class="kw">order</span> seconds_in_bucket];
+
+%ibexreset  <span class="cm"># clear the hidden session</span></code></pre>
+        </div>
+      </div>
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">R Package</span>
+          <h3>Use Ibex through native source or a lazy dplyr plan</h3>
+          <p>
+            The in-repo <code>ibex</code> package evaluates inline Ibex queries
+            or <code>.ibex</code> files from R. Results come back as a
+            <code>data.frame</code> by default, so the common
+            <code>ggplot2</code> path is immediate. For lower-level interop,
+            <code>format = "nanoarrow"</code> returns the Arrow-backed result.
+          </p>
+          <p>
+            <code>ibex_tbl()</code> also records a supported subset of dplyr as
+            an immutable native plan. <code>show_query()</code> reveals the
+            generated Ibex, while <code>collect()</code> returns a tibble.
+            Unsupported R calls cross one explicit fallback boundary and then
+            remain in local dplyr; R closures never execute on Ibex workers.
+          </p>
+          <p>
+            Like the Python notebook path, <code>ibex</code> supports a
+            persistent Ibex session, so large CSV or parquet loads can happen
+            once and then be reused across later calls.
+          </p>
+          <p>
+            For literate reports, <code>ibex</code> can also register a real
+            <code>{ibex}</code> knitr engine inside R Markdown, so Ibex chunks
+            and ordinary R / <code>ggplot2</code> chunks can share one named
+            session.
+          </p>
+          <p>
+            R input bindings are available by copy for named
+            <code>data.frame</code> tables and named scalar lists. Scalars
+            currently support R <code>integer</code>, <code>double</code>,
+            <code>logical</code>, <code>character</code>, <code>Date</code>,
+            and <code>POSIXct</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm"># R</span>
+library(ibex)
+library(ggplot2)
+
+ibex::register_knitr_engines()
+
+sess &lt;- create_session(
+  plugin_paths = c(<span class="str">"build-release/tools"</span>)
+)
+
+session_eval(
+  sess,
+  <span class="str">'
+  import "csv";
+  let iris = read_csv("data/iris.csv", "");
+  '</span>
+)
+
+summary &lt;- session_eval(
+  sess,
+  <span class="str">'
+  iris[
+      select { mean_sl = mean(Sepal_Length), n = count() },
+      by Species,
+      order Species
+  ];
+  '</span>
+)
+
+ggplot(summary, aes(Species, mean_sl)) +
+  geom_col()
+
+query &lt;- ibex_tbl(trades, fallback = <span class="str">"error"</span>) |&gt;
+  filter(price &gt; <span class="num">10</span>) |&gt;
+  group_by(symbol) |&gt;
+  summarise(total = sum(price), .groups = <span class="str">"drop"</span>)
+
+show_query(query)
+result &lt;- collect(query)</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">CSV Options</span>
+          <h3>Read delimited files with or without headers</h3>
+          <p>
+            The bundled CSV plugin supports custom delimiters and headerless
+            files. When <code>has_header</code> is <code>false</code>, Ibex
+            synthesizes column names <code>col1</code>, <code>col2</code>, and so on.
+          </p>
+          <p>
+            SQLite is also available through the optional ADBC plugin, so the
+            same pipeline can start from a SQL query instead of a flat file
+            when you want database-side staging first.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code>import "csv";
+
+let raw = read_csv("examples/measurements.txt", "", ";", false)
+    [select { station = col1, temp = col2 }];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Compile-Time Map</span>
+          <h3>Generate feature families without leaving Ibex</h3>
+          <p>
+            Braced <code>select</code> and <code>update</code> blocks support a
+            compile-time <code>map</code> form. It expands from earlier string-list
+            <code>let</code> bindings into ordinary named fields before lowering,
+            so runtime execution stays unchanged.
+          </p>
+          <p>
+            Use backtick aliases with <code>${name}</code> interpolation and
+            <code>get(name)</code> inside the map body to turn compile-time names
+            into column references.
+          </p>
+          <p>
+            <code>columns(table_expr)</code> returns a one-column metadata table
+            named <code>name</code>, so generated schemas can stay in Ibex
+            instead of being rebuilt in notebook host code.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> trades = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>],
+    price  = [<span class="num">150.0</span>, <span class="num">155.0</span>, <span class="num">140.0</span>],
+    fee    = [<span class="num">1.0</span>, <span class="num">1.5</span>, <span class="num">2.0</span>]
+};
+<span class="kw">let</span> measures = [<span class="str">"price"</span>, <span class="str">"fee"</span>];
+
+trades[<span class="kw">select</span> {
+    symbol,
+    <span class="kw">map</span> m <span class="kw">in</span> measures =&gt; <span class="id">`avg_${m}`</span> = <span class="fn-name">mean</span>(<span class="fn-name">get</span>(m))
+}, <span class="kw">by</span> symbol];
+
+<span class="kw">let</span> price_cols = [<span class="str">"ask_price"</span>, <span class="str">"bid_price"</span>, <span class="str">"wap"</span>];
+<span class="kw">let</span> book = Table {
+    ask_price = [<span class="num">101.0</span>, <span class="num">103.0</span>],
+    bid_price = [<span class="num">99.0</span>, <span class="num">100.0</span>],
+    wap       = [<span class="num">100.0</span>, <span class="num">101.5</span>]
+};
+
+book[<span class="kw">update</span> {
+    <span class="kw">map</span> (i, a) <span class="kw">in</span> price_cols, (j, b) <span class="kw">in</span> price_cols
+        <span class="kw">where</span> i &gt; j
+        =&gt; <span class="id">`${a}_${b}_imb`</span> = (<span class="fn-name">get</span>(a) - <span class="fn-name">get</span>(b)) / (<span class="fn-name">get</span>(a) + <span class="fn-name">get</span>(b))
+}];
+
+<span class="kw">let</span> generated = columns(book);
+generated[<span class="kw">filter</span> name != <span class="str">"row_id"</span>];</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>Ibex &mdash; typed DataFrame pipelines</span>
+    <a href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">
+      github.com/bobjansen/Ibex &#8599;
+    </a>
+  </footer>
+
+</main>
+</body>
+</html>

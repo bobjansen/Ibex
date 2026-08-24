@@ -7,6 +7,7 @@
 
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,6 +43,23 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
     ir::NullMatch null_match = ir::NullMatch::Never, const ir::JoinExpect& expect = {},
     ir::MatchSelection take = ir::MatchSelection::All, const ExecutionContext* exec = nullptr)
     -> std::expected<Table, std::string>;
+
+/// Which column the fused left-join aggregate should read, given the `Update`
+/// nodes between the aggregate and the join, ordered aggregate-first. Returns
+/// nullopt when the rewrite must decline.
+///
+/// The rewrite aggregates the JOIN's output directly and never builds the
+/// nodes between, so an update that *computes* a value the aggregate reads
+/// cannot be waved through: its column does not exist down there, and the
+/// column it was derived from holds different values. Exactly one update shape
+/// is safe, and it is the one this fast path exists for -- `count(col)` lowers
+/// to `Update{alias = Int64(col is not null)} + sum(alias)`, a 0/1 flag whose
+/// grouped sum is what `left_join_count_table` computes from the join
+/// structure itself. Anything else declines, and the ordinary path runs the
+/// whole chain.
+[[nodiscard]] auto fused_left_join_counted_column(
+    const ir::AggregateNode& aggregate, std::span<const ir::UpdateNode* const> skipped_updates)
+    -> std::optional<std::string>;
 
 /// Physical rewrite for a unique-left-key left join followed by
 /// count(right_column) grouped by that key. Returns nullopt when the shape or

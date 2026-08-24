@@ -577,22 +577,27 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             // See the same walk in chunked.cpp: only nodes this rewrite can
             // account for may be skipped, since it aggregates the join output
             // directly. A skipped FilterProject dropped its predicate.
+            std::vector<const ir::UpdateNode*> skipped_updates;
             while (aggregate_child != nullptr &&
                    (aggregate_child->kind() == ir::NodeKind::Project ||
                     aggregate_child->kind() == ir::NodeKind::Update) &&
                    !aggregate_child->children().empty()) {
+                if (aggregate_child->kind() == ir::NodeKind::Update) {
+                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+                    skipped_updates.push_back(static_cast<const ir::UpdateNode*>(aggregate_child));
+                }
                 aggregate_child = aggregate_child->children().front().get();
             }
             if (aggregate_child != nullptr && aggregate_child->kind() == ir::NodeKind::Join) {
                 const auto& join = static_cast<const ir::JoinNode&>(*aggregate_child);
-                const bool candidate = join.kind() == ir::JoinKind::Left &&
-                                       join.keys().size() == 1 && !join.predicate().has_value() &&
-                                       agg.group_by().size() == 1 &&
-                                       agg.aggregations().size() == 1 &&
-                                       (agg.aggregations().front().func == ir::AggFunc::Count ||
-                                        agg.aggregations().front().func == ir::AggFunc::Sum) &&
-                                       !agg.aggregations().front().column.name.empty() &&
-                                       agg.group_by().front().name == join.keys().front().left;
+                auto counted = fused_left_join_counted_column(agg, skipped_updates);
+                const bool candidate =
+                    join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
+                    !join.predicate().has_value() && agg.group_by().size() == 1 &&
+                    agg.aggregations().size() == 1 &&
+                    (agg.aggregations().front().func == ir::AggFunc::Count ||
+                     agg.aggregations().front().func == ir::AggFunc::Sum) &&
+                    counted.has_value() && agg.group_by().front().name == join.keys().front().left;
                 if (candidate) {
                     auto left =
                         interpret_node(*join.children()[0], registry, scalars, externs, exec);
@@ -604,20 +609,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     if (!right.has_value()) {
                         return std::unexpected(std::move(right.error()));
                     }
-                    std::string counted_column = agg.aggregations().front().column.name;
-                    if (child_node.kind() == ir::NodeKind::Update) {
-                        const auto& update = static_cast<const ir::UpdateNode&>(child_node);
-                        for (const auto& field : update.fields()) {
-                            if (field.alias != counted_column) {
-                                continue;
-                            }
-                            robin_hood::unordered_set<std::string> refs;
-                            collect_expr_column_refs(field.expr, refs);
-                            if (refs.size() == 1) {
-                                counted_column = *refs.begin();
-                            }
-                        }
-                    }
+                    const std::string counted_column = std::move(*counted);
                     if (auto fused =
                             left_join_count_table(join, agg, *left, *right, counted_column);
                         fused.has_value()) {

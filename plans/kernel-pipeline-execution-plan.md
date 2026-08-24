@@ -932,6 +932,36 @@ against **itself** was measured: total -1.29% at geomean 0.993. That is what the
 harness does with identical binaries, and this change is not distinguishable
 from it.
 
+**Phase 3 opening — the plan owns the run's position (2026-08-24, `bc8025b9`).**
+Item 4 left one crutch, documented at the time: `parallel_steps` measured a run
+starting at the root, so a chain whose root was not parallel-eligible was
+declared serial and the per-kind recursion re-planned node by node until it
+stumbled on the eligible sub-chain. `df[filter ...][update ...]` is the shape.
+
+The plan now records `parallel_begin`/`parallel_end`. One plan describes the
+whole chain: the run, whatever runs serially above it, and the input beneath it.
+`resolve_pipeline_mode` searches top-down for the outermost such run — the
+existing policy, not a new one, since the recursion took the first island it
+found on the way down.
+
+The seam's special case goes with it. Every migrated plan now reaches the
+composer, which hands the run off at its boundary and composes the rest above
+it; there is no longer an arrangement of map nodes that only one of the two
+paths can express.
+
+**A bug the answer gate caught and the suite did not.** The handoff first tested
+only `plan.mode`, so a *serial* execution of a plan whose mode is
+`MorselParallel` built the morsel pipeline anyway. All 1752 tests passed; q19
+died under `IBEX_PARALLEL=0` on `eval_numeric_update_blocks_into: missing double
+output`. The mode says what a pipeline *may* do and `exec.parallel` says what
+this run does — the condition needs both. Worth remembering as a shape of
+mistake: a plan field that reads like a decision is only a capability until an
+executor consults its own context.
+
+Gates: debug ctest 1752/1752, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings, interleaved A/B over `core,filter,null,groupagg` at 9
+repeats: total -1.86%, geomean 1.011, every query `noise`.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -948,17 +978,18 @@ Current gates on the tree: full debug `ctest` 1749/1749, and PDS-H
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Phase 2 is now complete except `KernelContext`, which is **not** started
+Phase 2 is complete except `KernelContext`, which is **not** started
 deliberately: its stated
 trigger (one shared scratch/cancellation owner) is not met. Cancellation
 already has an owner in `interrupt.hpp`, and the map kernels share no scratch —
 the ad-hoc scratch that exists belongs to breaker operators, which is Phase 4.
 Building it before a caller needs it is the ceremony this plan's own risk table
-warns about. Phase 3 then
-picks up the two things item 4 deliberately left: a plan that can model a
-serial tail over a parallel prefix (so the per-kind recursion is no longer what
-finds an inner pipeline), and `build_pipelined_scan` as a source mode of the
-same pipeline rather than a special case at the seam. The row-local update family's
+warns about. Phase 3 has started: the
+serial-tail-over-parallel-run modelling landed in `bc8025b9`. What remains
+there is `build_pipelined_scan` as a source mode of the same pipeline rather
+than a special case at the seam — it is now gated on the run covering the whole
+chain (`parallel_begin == 0 && parallel_end == steps.size()`), because the
+composer's serial tail is something that builder does not model. The row-local update family's
 remaining bridge users are the legacy null-handling arms and anything only the
 general evaluator reaches, both of which are shape gaps rather than mode gaps
 now.

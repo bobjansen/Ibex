@@ -730,6 +730,71 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
     }
 }
 
+TEST_CASE("The plan classifies an aggregate by relaying the builder's predicates",
+          "[physical][aggregate]") {
+    // Phase 4 item 2, step 2. Every field is relayed from
+    // `plan_fused_left_join_count` and `aggregate_is_streamable` -- the same
+    // calls the builder makes -- so there is no independent judgement here to
+    // be wrong. A temporary assertion at the seam compared all three outcomes,
+    // the fused join identity, and the negative case across the full suite and
+    // all 22 PDS-H queries with zero disagreements.
+    using runtime::physical::AggregateStrategy;
+
+    const auto plan_of = [](const char* src) {
+        auto ir = require_ir(src);
+        REQUIRE(ir->kind() == ir::NodeKind::Aggregate);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        return runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*ir));
+    };
+
+    SECTION("incremental aggregations stream") {
+        for (const char* src :
+             {"t[select { n = count() }, by k];", "t[select { s = sum(v) }, by k];",
+              "t[select { a = mean(v), d = std(v) }, by k];",
+              "t[select { f = first(v), l = last(v) }, by k];"}) {
+            CAPTURE(src);
+            CHECK(plan_of(src).strategy == AggregateStrategy::StreamingSorted);
+        }
+    }
+
+    SECTION("aggregations needing every value materialize") {
+        // Median and quantile cannot be combined from partials; ewma is
+        // row-order coupled.
+        for (const char* src :
+             {"t[select { m = median(v) }, by k];", "t[select { q = quantile(v, 0.9) }, by k];"}) {
+            CAPTURE(src);
+            CHECK(plan_of(src).strategy == AggregateStrategy::MaterializeAll);
+        }
+    }
+
+    SECTION("one unstreamable aggregation makes the whole node materialize") {
+        // The predicate is all-of, not any-of: partials for the streamable
+        // columns would not help if one column still needs every value.
+        CHECK(plan_of("t[select { s = sum(v), m = median(v) }, by k];").strategy ==
+              AggregateStrategy::MaterializeAll);
+    }
+
+    SECTION("the join+aggregate fusion names the join it consumes") {
+        // Two logical nodes, one physical step. `fused_join` is what makes that
+        // a property of the plan rather than a walk each builder repeats.
+        auto ir = require_ir("(l left join r on k)[select { n = count(v) }, by k];");
+        REQUIRE(ir->kind() == ir::NodeKind::Aggregate);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto plan =
+            runtime::physical::plan_aggregate(static_cast<const ir::AggregateNode&>(*ir));
+        CHECK(plan.strategy == AggregateStrategy::FusedLeftJoinCount);
+        REQUIRE(plan.fused_join != nullptr);
+        CHECK(plan.fused_join->kind() == ir::NodeKind::Join);
+        CHECK_FALSE(plan.counted_column.empty());
+    }
+
+    SECTION("an aggregate over a plain child names no fused join") {
+        const auto plan = plan_of("t[select { s = sum(v) }, by k];");
+        CHECK(plan.fused_join == nullptr);
+        CHECK(plan.counted_column.empty());
+    }
+}
+
 TEST_CASE("The fallback backlog is counted by kind, in every mode", "[physical][execute]") {
     // The backlog is what orders Phase 4, so it has to be trustworthy in two
     // ways this pins down.

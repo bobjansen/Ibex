@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "join_internal.hpp"
 
 namespace ibex::runtime::physical {
 
@@ -39,6 +40,18 @@ auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
             return "StreamingProbe";
         case JoinStrategy::MaterializeBoth:
             return "MaterializeBoth";
+    }
+    return "?";
+}
+
+auto aggregate_strategy_name(AggregateStrategy strategy) -> std::string_view {
+    switch (strategy) {
+        case AggregateStrategy::FusedLeftJoinCount:
+            return "FusedLeftJoinCount";
+        case AggregateStrategy::StreamingSorted:
+            return "StreamingSorted";
+        case AggregateStrategy::MaterializeAll:
+            return "MaterializeAll";
     }
     return "?";
 }
@@ -344,6 +357,13 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     // stay silent about 51% of the backlog until the day execution moves would
     // mean the description and the executor land together, untested against
     // each other.
+    if (root.kind() == ir::NodeKind::Aggregate) {
+        // Described, not executed: `migrated` stays false and the per-kind
+        // switch still builds every aggregate. The description is proven equal
+        // to the builder's branches first, exactly as the join's was.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        plan.aggregate = plan_aggregate(static_cast<const ir::AggregateNode&>(root));
+    }
     if (root.kind() == ir::NodeKind::Join) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         plan.join = plan_join(static_cast<const ir::JoinNode&>(root));
@@ -494,6 +514,9 @@ auto explain_physical(const Plan& plan) -> std::string {
         if (plan.join.describes) {
             out += "  " + explain_join(plan.join) + "\n";
         }
+        if (plan.aggregate.describes) {
+            out += "  " + explain_aggregate(plan.aggregate) + "\n";
+        }
         return out;
     }
     out += "MapPipeline\n";
@@ -568,6 +591,38 @@ auto explain_physical(const Plan& plan) -> std::string {
         }
         out += "\n";
     }
+    return out;
+}
+
+auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan {
+    AggregatePlan out;
+    out.describes = true;
+    // Relayed, in the builder's own order: the fusion is tested first because
+    // it consumes the join below rather than reading its output, so it is not a
+    // refinement of the streaming choice but an alternative to it.
+    if (auto fusion = plan_fused_left_join_count(agg); fusion.has_value()) {
+        out.strategy = AggregateStrategy::FusedLeftJoinCount;
+        out.fused_join = fusion->join;
+        out.counted_column = std::move(fusion->counted_column);
+        return out;
+    }
+    out.strategy = aggregate_is_streamable(agg) ? AggregateStrategy::StreamingSorted
+                                                : AggregateStrategy::MaterializeAll;
+    return out;
+}
+
+auto explain_aggregate(const AggregatePlan& plan) -> std::string {
+    if (!plan.describes) {
+        return "";
+    }
+    std::string out = "Aggregate(";
+    out += aggregate_strategy_name(plan.strategy);
+    if (plan.fused_join != nullptr) {
+        out += " fused=";
+        out += node_kind_name_impl(plan.fused_join->kind());
+        out += " counted=" + plan.counted_column;
+    }
+    out += ")";
     return out;
 }
 

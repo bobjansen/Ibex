@@ -1234,6 +1234,10 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// equivalence probe -- written from the same reading -- agreed with it.
 [[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool;
 
+/// Whether every aggregation can be computed incrementally, and so streamed
+/// rather than materialized. Shared so the physical planner relays it.
+[[nodiscard]] auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool;
+
 /// Two Int64 keys on both sides, schema-provable. Not a property of the node
 /// alone: it calls `infer_schema` on both children.
 [[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;

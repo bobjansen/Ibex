@@ -178,6 +178,45 @@ struct JoinPlan {
 /// `explain physical`.
 [[nodiscard]] auto explain_join(const JoinPlan& plan) -> std::string;
 
+/// How an aggregate executes.
+enum class AggregateStrategy : std::uint8_t {
+    /// Fused with the join beneath it: two logical nodes, one physical step.
+    /// Checked first, because it consumes the join rather than reading its
+    /// output.
+    FusedLeftJoinCount,
+    /// Streamed group-at-a-time; falls back to hashing internally when the
+    /// child's chunks do not arrive sorted on the group keys.
+    StreamingSorted,
+    /// Median and Quantile need every value at once, Ewma is row-order
+    /// coupled: the whole input is materialized.
+    MaterializeAll,
+};
+
+/// What the plan knows about an `Aggregate` node.
+///
+/// Every field is RELAYED from the predicates the builder itself calls --
+/// `plan_fused_left_join_count` and `aggregate_is_streamable` -- rather than
+/// restated here. Restating is what made `plan_join` disagree with the builder
+/// about two-key joins, and the probe written from the same reading agreed with
+/// the mistake.
+struct AggregatePlan {
+    /// False unless the planned node is an `Aggregate`.
+    bool describes = false;
+    AggregateStrategy strategy = AggregateStrategy::MaterializeAll;
+    /// The `Join` this aggregate fuses with, or null. Naming it is what makes
+    /// the fusion a property of the plan rather than a walk the builder redoes.
+    const ir::Node* fused_join = nullptr;
+    /// The column the fused count/sum reads, resolved back through any updates
+    /// between the aggregate and the join. Empty unless fused.
+    std::string counted_column;
+};
+
+/// Classify an aggregate. Pure, and decided entirely by relayed predicates.
+[[nodiscard]] auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan;
+
+/// `strategy=... fused=Join counted=<col>` for tests and `explain physical`.
+[[nodiscard]] auto explain_aggregate(const AggregatePlan& plan) -> std::string;
+
 struct Plan {
     bool migrated = false;
     FallbackReason reason = FallbackReason::NotMapChain;
@@ -218,6 +257,8 @@ struct Plan {
     /// than it runs, which is what makes the backlog shrinkable one kind at a
     /// time instead of in one jump.
     JoinPlan join;
+    /// Set when `root` is an `Aggregate`.
+    AggregatePlan aggregate;
 };
 
 /// Lower `root` into a Phase 1 plan. Read-only over the IR, the registry, and

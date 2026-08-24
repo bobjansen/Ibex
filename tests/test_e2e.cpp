@@ -124,6 +124,7 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     exec.parallel_min_cells = threads > 1 ? 0 : exec.parallel_min_cells;
     exec.parallel_stats = stats;
     auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
+    INFO((result.has_value() ? std::string{} : result.error()));
     REQUIRE(result.has_value());
     return std::move(*result);
 }

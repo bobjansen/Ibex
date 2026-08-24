@@ -853,61 +853,16 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     return {.changed = true, .node = std::move(agg_owned)};
 }
 
-// R5: Project(Filter(x)) → FilterProject(x).
-auto try_fuse_filter_project(NodePtr node) -> TryResult {
-    if (node->kind() != NodeKind::Project || node->children().empty() ||
-        node->children().front()->kind() != NodeKind::Filter) {
-        return {.changed = false, .node = std::move(node)};
-    }
-    auto& proj = static_cast<ProjectNode&>(*node);
-    std::vector<ColumnRef> cols = proj.columns();
-    NodePtr project_owned = std::move(node);
-    NodePtr filter_owned = take_unique_child(*project_owned);
-    auto& filter = static_cast<FilterNode&>(*filter_owned);
-    if (filter.children().empty()) {
-        project_owned->add_child(std::move(filter_owned));
-        return {.changed = false, .node = std::move(project_owned)};
-    }
-    NodePtr x = take_unique_child(filter);
-    Expr pred = filter.take_predicate();
-    auto fused =
-        std::make_unique<FilterProjectNode>(project_owned->id(), std::move(pred), std::move(cols));
-    fused->add_child(std::move(x));
-    return {.changed = true, .node = std::move(fused)};
-}
-
-// R6: Project(Update(Filter(x))) → FilterUpdateProject(x) when update is row-local.
-auto try_fuse_filter_update_project(NodePtr node) -> TryResult {
-    if (node->kind() != NodeKind::Project || node->children().empty() ||
-        node->children().front()->kind() != NodeKind::Update) {
-        return {.changed = false, .node = std::move(node)};
-    }
-    auto& proj = static_cast<ProjectNode&>(*node);
-    auto& upd = static_cast<UpdateNode&>(*node->children().front());
-    const bool update_eligible =
-        !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
-        std::all_of(upd.fields().begin(), upd.fields().end(),
-                    [](const FieldSpec& f) { return is_row_local_update_expr(f.expr); });
-    if (!update_eligible || upd.children().front()->kind() != NodeKind::Filter) {
-        return {.changed = false, .node = std::move(node)};
-    }
-    auto& filter = static_cast<FilterNode&>(*upd.children().front());
-    if (filter.children().empty()) {
-        return {.changed = false, .node = std::move(node)};
-    }
-    std::vector<ColumnRef> proj_cols = proj.columns();
-    std::vector<FieldSpec> fields = upd.fields();
-    NodePtr project_owned = std::move(node);
-    NodePtr update_owned = take_unique_child(*project_owned);
-    NodePtr filter_owned = take_unique_child(*update_owned);
-    auto& filter_ref = static_cast<FilterNode&>(*filter_owned);
-    NodePtr x = take_unique_child(filter_ref);
-    Expr pred = filter_ref.take_predicate();
-    auto fused = std::make_unique<FilterUpdateProjectNode>(project_owned->id(), std::move(pred),
-                                                           std::move(fields), std::move(proj_cols));
-    fused->add_child(std::move(x));
-    return {.changed = true, .node = std::move(fused)};
-}
+// R5 (Project(Filter(x)) → FilterProject) and R6 (Project(Update(Filter(x)))
+// → FilterUpdateProject) used to live here. They are gone: fusion is an
+// execution choice, and the physical planner now makes it — `plan_physical`
+// emits one MapStep naming the Filter and the Project (and Update) above it,
+// resolving the same fused kernel. Keeping them here would have meant two
+// places deciding the same thing, with the IR carrying the answer.
+//
+// The fused node kinds themselves remain, constructible and handled
+// everywhere they were, because tools and serialized trees still name them —
+// see plans/kernel-pipeline-execution-plan.md Phase 5.
 
 // R7/R8: Head(Filter(x)) → FilterHead(x), Tail(Filter(x)) → FilterTail(x)
 // when the limit has no group_by.
@@ -1035,7 +990,7 @@ using RuleFn = TryResult (*)(NodePtr);
 // Ordered list of rules. The driver tries each in turn; on any fire, it
 // restarts from the top, so earlier rules are re-tried against shapes exposed
 // by later ones. Rule names mirror the Rx labels in canonicalize.hpp.
-constexpr std::array<std::pair<std::string_view, RuleFn>, 19> kRules{{
+constexpr std::array<std::pair<std::string_view, RuleFn>, 17> kRules{{
     {"R19:filter-merge", try_filter_merge},
     {"R17:simplify-predicate", try_simplify_predicate},
     {"R1:filter-past-order", try_filter_past_order},
@@ -1050,8 +1005,6 @@ constexpr std::array<std::pair<std::string_view, RuleFn>, 19> kRules{{
     {"R18:filter-past-aggregate", try_filter_past_aggregate},
     {"R20:project-prune-above-aggregate", try_project_prune_above_aggregate},
     {"R21:project-collapse", try_project_collapse},
-    {"R5:fuse-filter-project", try_fuse_filter_project},
-    {"R6:fuse-filter-update-project", try_fuse_filter_update_project},
     {"R7-8:fuse-filter-limit", try_fuse_filter_limit},
     {"R16:fuse-topk", try_fuse_topk},
     {"R4:limit-past-metadata", try_limit_past_metadata},

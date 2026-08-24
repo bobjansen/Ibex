@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/ir/builder.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -57,13 +58,14 @@ auto serial_plan(const char* source) -> std::pair<ir::NodePtr, runtime::physical
 }  // namespace
 
 TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical][plan]") {
-    // Canonicalize R5 fuses Project(Filter(x)) into FilterProject before the
-    // planner ever runs, so the plan's step vocabulary has to know the fused
-    // kinds — the plan describes the tree that exists, not the one written.
+    // Canonicalize leaves Project(Filter(x)) alone; the planner fuses it into
+    // one step, so the plan's step vocabulary still resolves the fused kernel —
+    // the plan describes execution, not the shape of the tree.
     const auto [plan_tree, plan] = serial_plan("trades[filter price > 15, select { price }];");
     REQUIRE(plan.migrated);
     REQUIRE(plan.steps.size() == 1);
-    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::FilterProject);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.steps.front().fused_project != nullptr);
     REQUIRE(plan.steps.front().capability == runtime::MapKernelCapability::FilterProjectGather);
     REQUIRE(plan.steps.front().factory != nullptr);
     REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
@@ -214,7 +216,18 @@ TEST_CASE("A fused step executes like the fused node", "[physical][execute][fusi
     project->add_child(std::move(filter));
     const ir::NodePtr unfused = std::move(project);
 
-    const auto canonical = require_ir("trades[filter price > 15, select { price }];");
+    // The reference is the fused IR node itself, built directly: canonicalize
+    // no longer produces one, and comparing against it is exactly the
+    // equivalence claim -- planner fusion computes what the fused kind did.
+    ir::Builder builder;
+    auto canonical = builder.filter_project(
+        ir::Expr{.node = ir::CompareExpr{.op = ir::CompareOp::Gt,
+                                         .left = ir::make_expr_ptr(
+                                             ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                                         .right = ir::make_expr_ptr(ir::Expr{
+                                             .node = ir::Literal{.value = std::int64_t{15}}})}},
+        std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "price"}});
+    canonical->add_child(builder.scan("trades"));
     REQUIRE(canonical->kind() == ir::NodeKind::FilterProject);
 
     for (const bool parallel : {false, true}) {
@@ -285,9 +298,28 @@ TEST_CASE("The planner fuses a project over an update over a filter", "[physical
     REQUIRE(runtime::physical::explain_physical(plan).find("Filter+Update+Project(fused)") !=
             std::string::npos);
 
-    // And it computes what the canonicalized node computes.
-    const auto canonical = require_ir(
-        "trades[filter price > 15][update { doubled = price * 2 }][select { doubled }];");
+    // And it computes what the fused IR node computes. That node is built
+    // directly: canonicalize no longer produces one, and this comparison is
+    // exactly the equivalence claim -- planner fusion computes what the fused
+    // kind did.
+    ir::Builder builder;
+    std::vector<ir::FieldSpec> reference_fields;
+    reference_fields.push_back(
+        {.alias = "doubled",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Mul,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                 .right =
+                     ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2}}})}}});
+    auto canonical = builder.filter_update_project(
+        ir::Expr{.node = ir::CompareExpr{.op = ir::CompareOp::Gt,
+                                         .left = ir::make_expr_ptr(
+                                             ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                                         .right = ir::make_expr_ptr(ir::Expr{
+                                             .node = ir::Literal{.value = std::int64_t{15}}})}},
+        std::move(reference_fields), std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "doubled"}});
+    canonical->add_child(builder.scan("trades"));
     REQUIRE(canonical->kind() == ir::NodeKind::FilterUpdateProject);
     for (const bool parallel : {false, true}) {
         INFO("parallel: " << parallel);
@@ -451,7 +483,7 @@ TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical]
         serial_plan("trades[filter price > 15, select { price }];");
     const std::string text = runtime::physical::explain_physical(migrated);
     REQUIRE(text.find("MapPipeline") != std::string::npos);
-    REQUIRE(text.find("  FilterProject\n") != std::string::npos);
+    REQUIRE(text.find("  Filter+Project(fused)\n") != std::string::npos);
     REQUIRE(text.find("source: TableScan(trades)") != std::string::npos);
     REQUIRE(text.find("  source signature: fixed-width/all-valid string-slabs/all-valid "
                       "packed-bool/all-valid\n") != std::string::npos);

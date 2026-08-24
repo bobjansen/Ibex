@@ -1154,19 +1154,28 @@ plan stats: plans=233 pipelines=70 fallbacks=163
 no map work to migrate). So the physical plan describes **70 of the 186 nodes
 that carry real work, 38%**, and the backlog is **116 breakers**:
 
-| kind | count | share of backlog |
+| kind | count (2026-08-24, first reading) | after item 1 |
 |---|---|---|
-| Join | 59 | 51% |
-| Aggregate | 30 | 26% |
-| Order | 18 | 16% |
-| Head | 5 | 4% |
-| Distinct | 4 | 3% |
+| Join | 59 | **6** |
+| Aggregate | 30 | 30 |
+| Order | 18 | 18 |
+| Head | 5 | 5 |
+| Distinct | 4 | 4 |
 
-Join and Aggregate are 77% of it, so the a-priori ordering below survives
-contact with measurement — it is now evidence rather than assertion. Re-run the
-numbers before starting each item rather than trusting this table: a finished
-port shows up as its kind going to zero, which is also the cheapest proof the
-port is complete.
+Join and Aggregate were 77% of the first reading, so the a-priori ordering below
+survived contact with measurement — evidence rather than assertion.
+
+**Item 1 landed (`f5610646`) and the column moved: Join 59 -> 6.** Plans 233,
+pipelines 70 -> 123, fallbacks 163 -> 110, so the plan now describes 123 of the
+186 nodes carrying real work (66%, up from 38%). The backlog is 63 breakers, and
+**Aggregate is now the largest at 48%**.
+
+The 6 remaining joins are the materializing ones: they still fall back and still
+count. A test asserts that asymmetry -- a streaming join must be `migrated`, a
+materializing one must not -- because a count that went to zero would mean the
+metric was measuring the label rather than the port.
+
+Re-run the numbers before starting each item rather than trusting this table.
 
 Order is driven by measured serial time and semantic completeness, not by
 operator count.

@@ -581,20 +581,6 @@ struct ExecutionContext {
     /// prints it when the query's last execution context/operator releases it.
     std::shared_ptr<ExecutionProfileState> execution_profile{};
 
-    /// Runtime-multithreading Phase 1. When set, `build_operator()` plans a
-    /// physical pipeline at its seam and, for one whose mode is
-    /// `MorselParallel`, executes its parallel prefix over morsels of the
-    /// materialized pipeline input instead of a single whole-table chunk.
-    /// Whether those morsels run
-    /// on worker threads or serially is decided per pipeline by the size
-    /// thresholds below; either way an ordered merger emits results in morsel
-    /// `sequence` order, so output is byte-identical to the plain serial path.
-    /// **On by default.** A 24-configuration sweep from 131k to 20M rows, at 2
-    /// and 6 columns and both selectivities, measured 20 wins, 4 parity and 0
-    /// regressions; the size gates below are what keep the small end at parity.
-    /// `IBEX_PARALLEL=0` turns it off.
-    bool parallel = true;
-
     /// Morsel row-grain for the pipeline source when `parallel` is set. The input
     /// is partitioned into contiguous ranges of at most this many rows, and one
     /// range is one parallel task. Ignored when `parallel` is false.
@@ -634,6 +620,20 @@ struct ExecutionContext {
     /// where the decode side differs: `scan_pipeline_worker_count` draws on the
     /// whole pool on purpose and must not use this.
     [[nodiscard]] auto compute_budget() const -> std::size_t;
+
+    /// Whether this query may use more than one compute thread at all.
+    ///
+    /// Derived, not stored. A `parallel` boolean sat next to
+    /// `parallel_threads` until 2026-08-24 and the two could disagree: "off"
+    /// with a budget of eight, or "on" with a budget of one. They are the same
+    /// statement, and saying it twice is what let `IBEX_PARALLEL=0` and
+    /// `IBEX_CORES=1` drift into meaning different things.
+    ///
+    /// This says only that fanning out is permitted. Whether it is *worthwhile*
+    /// is each caller's own gate (row and cell floors, morsel counts, merge
+    /// costs), and whether it is *possible* here also depends on
+    /// `on_worker_pool_thread()`, since a pool worker cannot submit.
+    [[nodiscard]] auto can_fan_out() const -> bool;
 
     /// The plan's grain-size serial threshold: an pipeline input smaller than
     /// this stays on the serial morsel chain rather than paying task,

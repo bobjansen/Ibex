@@ -2833,14 +2833,13 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     [[nodiscard]] auto scan_shard_target(const ibex::runtime::SourceUnit* unit,
                                          const ibex::runtime::ExecutionContext& exec) const
         -> std::size_t {
-        if (unit != nullptr || factory_ == nullptr || !exec.parallel ||
+        if (unit != nullptr || factory_ == nullptr || !exec.can_fan_out() ||
             rows_ < std::max(exec.parallel_min_rows, kParallelDecodeMinRows) ||
             ibex::runtime::on_worker_pool_thread()) {
             return 1;
         }
         const auto& pool = ibex::runtime::process_worker_pool();
-        return std::min(exec.parallel_threads != 0 ? exec.parallel_threads : pool.size(),
-                        pool.size());
+        return std::min(exec.compute_budget(), pool.size());
     }
 
     /// Readers to spread `units` independent pieces of decode work over: this
@@ -2867,11 +2866,10 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         -> std::vector<parquet::arrow::FileReader*> {
         auto& pool = ibex::runtime::process_worker_pool();
         std::size_t want = 1;
-        if (factory_ != nullptr && units > 1 && exec.parallel &&
+        if (factory_ != nullptr && units > 1 && exec.can_fan_out() &&
             rows_ >= std::max(exec.parallel_min_rows, kParallelDecodeMinRows) &&
             !ibex::runtime::on_worker_pool_thread()) {
-            const std::size_t budget =
-                exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+            const std::size_t budget = exec.compute_budget();
             want = std::min({units, budget, pool.size()});
         }
 

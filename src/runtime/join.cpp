@@ -1236,7 +1236,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
         // Below this the fan-out and the concatenation cost more than the
         // probes they spread; the same threshold the chunked probe uses.
         constexpr std::size_t kMinProbeRows = 1U << 14U;
-        if (exec == nullptr || !exec->parallel || !exec->parallel_join_probe ||
+        if (exec == nullptr || !exec->can_fan_out() || !exec->parallel_join_probe ||
             on_worker_pool_thread() || n < kMinProbeRows) {
             return 0;
         }

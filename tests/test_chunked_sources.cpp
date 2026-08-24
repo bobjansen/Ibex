@@ -296,7 +296,7 @@ TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
         runtime::ExecutionContext exec;
-        exec.parallel = parallel;
+        exec.parallel_threads = (parallel) ? 0 : 1;
         auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);
@@ -375,7 +375,7 @@ TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",
         auto ir = parser::lower(program.value());
         REQUIRE(ir.has_value());
         runtime::ExecutionContext exec;
-        exec.parallel = parallel;
+        exec.parallel_threads = (parallel) ? 0 : 1;
         auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
         return std::move(*result);

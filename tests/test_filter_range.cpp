@@ -438,7 +438,6 @@ TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filte
 // ---------------------------------------------------------------------------
 TEST_CASE("morsel_grain derives a grain instead of asking for one", "[runtime][parallel]") {
     ibex::runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 8;
 
     SECTION("an explicit grain is honoured exactly") {

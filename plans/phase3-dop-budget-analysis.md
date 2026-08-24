@@ -452,3 +452,49 @@ the same kind of change as declining to partition.
 
 **Do not re-attempt "the DOP=1 aggregate fan-out is wasteful".** It is, in
 wall-clock terms, and it is required anyway.
+
+## 11. `IBEX_PARALLEL` removed (2026-08-24) — §10's recommendation is superseded
+
+§10 concluded "do not remove it", because the flag chose between two
+arithmetics: morselized partials (`IBEX_CORES=1`) and one serial running total
+(`IBEX_PARALLEL=0`), which the tests deliberately allowed to differ in low
+bits. That was a true statement about the implementation and a false one about
+the flag. Asked whether the serial running total was worth keeping, the answer
+was no — better that every core count agrees and no low-bit difference is
+possible at all.
+
+So the fix inverted. Instead of making DOP=1 serialize (§10, reverted), make
+the serial path morselize: `e07445ca` cut aggregate morsels on the data alone
+and let anyone execute them. Partitioning depends on row count, combinability,
+value kinds and the memory budget; execution decides only whether to fan out or
+run the identical loop inline. Serial, one core, eight cores and a nested run
+then produce the same bits, and the determinism test says so with exact
+equality where it previously permitted an epsilon.
+
+With one arithmetic, the flag was genuinely redundant and is gone:
+
+* `ExecutionContext::parallel` deleted; 30 gate sites now ask
+  `can_fan_out()`, which is `compute_budget() >= 2`. A budget of one *is*
+  parallelism off, and a boolean beside the budget was the thing that let the
+  two disagree.
+* `parallel_enabled_from_env()` and its test deleted; `IBEX_PARALLEL` is no
+  longer read anywhere.
+* 62 test sites converted from a boolean to a budget (`parallel = false` ->
+  `parallel_threads = 1`).
+* `MEASURING.md`, `ibex-e2e.sh`, `run_bench.sh`, `run_scale_suite.sh`,
+  `bench_ibex.sh`, `gen_website.py`, `window_ohlc/{run.py,README.md}` now use
+  `IBEX_CORES=1`. Historical plan entries are left alone: "22/22 under both
+  `IBEX_PARALLEL` settings" was true when written.
+
+**Found on the way**, and the reason to grep the whole tree rather than the
+directories you expect: the parquet plugin had two open-coded compute budgets
+(`parallel_threads != 0 ? ... : pool.size()`) that §2a's conversion missed
+because that commit searched only `src/` and `include/`. The trap 2a existed to
+close was still live in the decode plugin, which is where it mattered most.
+
+Removing a member from `ExecutionContext` is an **ABI change**: plugins must be
+rebuilt.
+
+Gates: debug ctest 1753/1753 (one fewer — the deleted flag's own test); all 22
+PDS-H queries byte-identical between `IBEX_CORES=1` and `IBEX_CORES=8`;
+`check_answers.py` 22/22 at both; and `IBEX_PARALLEL=0` verified inert.

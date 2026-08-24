@@ -613,8 +613,9 @@ TEST_CASE("Row-local CASE retains selected categorical labels", "[kernel][update
     const std::vector<ir::FieldSpec> fields{
         {.alias = "result", .expr = ir::Expr{.node = std::move(call)}}};
 
-    auto updated = runtime::kernel::update_row_local_chunk(
-        std::move(chunk), fields, nullptr, nullptr, runtime::ExecutionContext{.parallel = false});
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr,
+                                                runtime::ExecutionContext{.parallel_threads = 1});
     REQUIRE(updated.has_value());
     const auto& result = std::get<Column<Categorical>>(*updated->columns[3].column);
     CHECK(result[0] == "A");
@@ -1216,7 +1217,6 @@ TEST_CASE("Parallel row-local update splits inside the chunk kernel",
 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;
@@ -1259,7 +1259,6 @@ TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][pa
 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 4;
     exec.parallel_stats = &stats;
 
@@ -1293,7 +1292,6 @@ TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][up
 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;
@@ -1345,7 +1343,6 @@ TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;
@@ -1392,7 +1389,6 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
 
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;

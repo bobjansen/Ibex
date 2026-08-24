@@ -162,7 +162,25 @@ struct Plan {
 /// pipeline, which is the same pipeline's parallel mode).
 void note_map_pipeline_executed();
 
-/// Record a fallback with its reason.
-void note_materialized_call(FallbackReason reason);
+/// Record a fallback: one logical node the physical plan does not describe, so
+/// `build_operator`'s per-kind switch decides it instead.
+///
+/// `kind` is what makes this a migration backlog rather than a bare total. The
+/// port order for Phase 4 was written a priori ("hash join, then hash
+/// aggregate, then distinct"); counting which kinds real queries actually fall
+/// back on is how that guess gets replaced by evidence, and how a finished port
+/// proves itself -- a migrated kind's count goes to zero and stays there.
+void note_materialized_call(FallbackReason reason, ir::NodeKind kind);
+
+/// Fallbacks recorded for one node kind, for tests that want to assert a port
+/// removed them.
+[[nodiscard]] auto physical_fallbacks_for(ir::NodeKind kind) -> std::uint64_t;
+
+/// Printable name for any node kind, including the ones that are not map steps.
+[[nodiscard]] auto node_kind_name(ir::NodeKind kind) -> std::string_view;
+
+/// One `plan fallback:` line per node kind that fell back, descending by count.
+/// Empty when nothing did. Printed at exit under `IBEX_PLAN_STATS`.
+[[nodiscard]] auto physical_fallback_report() -> std::string;
 
 }  // namespace ibex::runtime::physical

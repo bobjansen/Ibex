@@ -248,9 +248,11 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
 
 **Next, in the order I would take them.**
 
-1. **Phase 4 decomposition — the actual item 1-2.** Split the join into
-   `HashBuild` + `HashProbe` across a barrier, and the aggregate into
-   discovery / per-partition slots / final ordering / emission. This is the
+1. **Phase 4 decomposition — the actual item 1-2.** The join's build and probe
+   are now separate types with an immutable index between them (`8a644381`,
+   `f6a1a632`); splitting them into separately scheduled OPERATORS is blocked
+   on the run-time build-side choice, see item 1 below. Next in this line is
+   the aggregate: discovery / per-partition slots / final ordering / emission. This is the
    half that changes operators rather than their constructors, and the only
    one that unlocks a probe fusing into a map pipeline, one build feeding
    several probes, or per-phase scheduling. Everything below is smaller.
@@ -1286,8 +1288,22 @@ risk table warns about.
 
 1. **Hash join:** ~~migrate the supported single-key/two-Int64-key streaming
    paths~~ (construction: DONE, `f5610646`) — express them as `HashBuild +
-   HashProbe` across a barrier: NOT STARTED. All other join semantics remain
-   behind `MaterializedCall`, which is the intended end state for them.
+   HashProbe` across a barrier: **data side DONE (`5918b5cc`, `8a644381`,
+   `f6a1a632`), operator side blocked on a cost model.** The build is a phase
+   that returns an immutable `JoinHashIndex` (`build_join_hash_index` /
+   `build_join_pair_index`), and `JoinProbe` is the type that consumes one:
+   index, key list, output-name plans, per-worker scratch, probe-chunk
+   validity and dictionary. The probe reads the build through
+   `shared_ptr<const>`, so writing to build state during a probe is a compile
+   error, and a probe can be constructed next to a build it did not run.
+   What is NOT done is two scheduled operators, and the reason is not
+   refactoring debt: `ChunkedInnerJoinOperator` picks its build side at RUN
+   time (`n_right <= kStreamRightThreshold`, else materialize left and
+   compare, possibly swapping roles). A static `HashBuild + HashProbe` pair
+   needs that decision at plan time, which needs the cardinality estimates
+   [[project_deferred_probe_selectivity_scoping]] scopes and this plan
+   deliberately does not own. All other join semantics remain behind
+   `MaterializedCall`, which is the intended end state for them.
 2. **Hash aggregate:** ~~migrate the current paths~~ (construction: DONE,
    `902d6941`) — express discovery, per-partition slots, final ordering and
    emission as distinct physical phases: NOT STARTED. Median/quantile/EWMA

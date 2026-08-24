@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include "interpreter_internal.hpp"
+
 namespace ibex::runtime::physical {
 
 namespace {
@@ -546,46 +548,27 @@ auto explain_physical(const Plan& plan) -> std::string {
     return out;
 }
 
-namespace {
-
-/// Both keys Int64 on both sides, with schemas known well enough to prove it --
-/// the gate `is_streamable_pair_int_join` applies in chunked.cpp.
-///
-/// This is the one part of a join's classification that is not a property of
-/// the node alone, which is why the first version of `plan_join` got it wrong:
-/// it declined every two-key join as `MultipleKeys` while the builder streamed
-/// the Int64 pair, so the plan said `MaterializeBoth` for a join that streams.
-/// Consuming that description would have rerouted q09's two-key joins.
-auto pair_int_keys_streamable(const ir::JoinNode& join) -> bool {
-    if (join.kind() != ir::JoinKind::Inner || join.children().size() != 2) {
-        return false;
-    }
-    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
-    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
-    if (!left_schema.is_known() || !right_schema.is_known()) {
-        return false;
-    }
-    return std::ranges::all_of(join.keys(), [&](const ir::JoinKey& key) {
-        const ir::SchemaField* lf = left_schema.find(key.left);
-        const ir::SchemaField* rf = right_schema.find(key.right);
-        return lf != nullptr && rf != nullptr && lf->type.has_value() && rf->type.has_value() &&
-               *lf->type == ir::ColumnType::Int64 && *rf->type == ir::ColumnType::Int64;
-    });
-}
-
-}  // namespace
-
 auto plan_join(const ir::JoinNode& join) -> JoinPlan {
     JoinPlan out;
     out.describes = true;
     out.kind = join.kind();
     out.key_count = join.keys().size();
 
-    // The clauses below mirror `is_streamable_inner_join` and the semi/anti
-    // gate in chunked.cpp, in the same order, one `decline` value each. They
-    // are duplicated rather than shared for exactly as long as this plan only
-    // describes: a temporary assertion at the seam compares the two on every
-    // query built, and the duplicate goes when execution moves here.
+    // The DECISION is relayed, not restated: these are the same three functions
+    // the builder branches on. Reimplementing them is what made the first
+    // version of this planner wrong about two-key Int64 joins, and
+    // `interpreter_internal.hpp` had already written down why -- "a six-clause
+    // predicate duplicated across two files, where a later clause added to one
+    // copy silently routes a join the operator cannot handle".
+    out.strategy = (is_streamable_semi_anti_join(join) || is_streamable_inner_join(join) ||
+                    is_streamable_pair_int_join(join))
+                       ? JoinStrategy::StreamingProbe
+                       : JoinStrategy::MaterializeBoth;
+
+    // The clause walk below only EXPLAINS a decline. It is deliberately not the
+    // decision, so it cannot route anything; if it ever disagrees with the
+    // relay above, that is a bug in the explanation and the assert says so
+    // rather than letting a plan claim a reason it did not act on.
     const bool kind_ok = join.kind() == ir::JoinKind::Inner || join.kind() == ir::JoinKind::Semi ||
                          join.kind() == ir::JoinKind::Anti;
     if (!kind_ok) {
@@ -594,7 +577,7 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.decline = JoinDeclineReason::HasPredicate;
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
-    } else if (join.keys().size() == 2 && !pair_int_keys_streamable(join)) {
+    } else if (join.keys().size() == 2 && !is_streamable_pair_int_join(join)) {
         // Two keys stream only as the all-Int64 pair shape, and only the
         // semi/anti and single-key gates admit one key. A two-key semi join is
         // therefore not streamable even though each half of that sentence
@@ -611,10 +594,19 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.decline = JoinDeclineReason::TakeSelection;
     }
 
-    if (out.decline != JoinDeclineReason::None || join.children().size() != 2) {
+    if (out.strategy == JoinStrategy::MaterializeBoth) {
+        if (out.decline == JoinDeclineReason::None) {
+            // Declined for a reason the clause walk does not model. Better to
+            // say so than to print `decline=None` beside `MaterializeBoth`.
+            out.decline = JoinDeclineReason::KeyTypesUnsupported;
+        }
         return out;
     }
-    out.strategy = JoinStrategy::StreamingProbe;
+    out.decline = JoinDeclineReason::None;
+    if (join.children().size() != 2) {
+        out.strategy = JoinStrategy::MaterializeBoth;
+        return out;
+    }
     // Textual left streams, textual right is hashed. Which side *should* build
     // is a cost question this plan deliberately does not answer yet -- it is
     // the open item in plans/phase3-dop-budget-analysis.md and the root cause

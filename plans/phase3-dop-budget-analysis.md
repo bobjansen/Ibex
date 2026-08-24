@@ -400,3 +400,55 @@ not to delete the flag.
 * `tests/test_interpreter.cpp` — the regression test, both arms.
 * Gates: debug ctest **1754/1754**; `check_answers.py` **22/22** under
   `IBEX_PARALLEL=1`, `IBEX_PARALLEL=0`, and `IBEX_CORES=1`.
+
+## 10. Retiring `IBEX_PARALLEL`: attempted, and why it stopped (2026-08-24)
+
+After §9.4 the flag looked like cruft: at `IBEX_CORES=1`, 19 of 22 PDS-H
+queries were byte- *and* stats-identical to `IBEX_PARALLEL=0`. The three that
+differed (q01, q09, q13) differed on one counter, `parallel_fields`, traced to
+three aggregate fan-out sites (`chunked.cpp:8002`, `:8372`, `:8648`) that gate
+on `morsels < 2` — the work divides — but never on having two *workers*. At one
+core each allocated the full per-morsel partial arrays, submitted a
+single-worker batch (`pool_tasks=6` on q01), and had that thread merge the
+partials into itself.
+
+Gating them on `threads < 2` **failed two tests, and the tests are right**:
+
+* `global aggregate is deterministic across thread counts`
+* `parallel categorical group-by keeps first-occurrence order`
+
+`tests/test_interpreter.cpp:8784-8805` states the contract. Serial, then
+parallel at threads {1, 2, 3, 5, 8}; parallel must be **bit-identical at every
+thread count including 1**; exact aggregates must match serial exactly; and
+float reductions **may re-associate against serial, "but only in the low
+bits"**. With the gate, `threads=1` took the serial running total and `std(v)`
+came out `35.96771761108217902` against the parallel `35.96771760364259762`.
+
+**So the DOP=1 morselization at these sites is load-bearing, not waste.**
+Morsels are cut by ROW COUNT, not worker count, so one worker and eight fill
+the same partial slots and merge them in the same ascending morsel order.
+That is the whole mechanism by which thread count is invisible in the output.
+Reverted.
+
+**What this means for the flag — it is not cruft.** The two settings select
+between two arithmetics the codebase deliberately allows to differ:
+
+| | reduction order | agrees bit-for-bit with |
+|---|---|---|
+| `IBEX_CORES=1` | morselized partials, one worker | `IBEX_CORES=8` |
+| `IBEX_PARALLEL=0` | one serial running total | nothing else |
+
+Retiring the flag is therefore not a cleanup but a choice to delete one of
+them. Keeping morselization at DOP=1 means `IBEX_CORES=1` stops reproducing
+today's `IBEX_PARALLEL=0` bits — the basis of the published `ibex-st` numbers
+and of `ibex-e2e.sh`'s byte-identity checks. Serializing at DOP=1 means giving
+up thread-count determinism, which these tests enforce on purpose.
+
+**Recommendation: do not remove it** unless the serial reduction path is being
+retired deliberately, with the `ibex-st` baseline re-established. What survives
+from this line of work is the DOP=1 *pipeline* gate (`27457f8d`), which is a
+real win and does not touch reduction order — declining to materialize is not
+the same kind of change as declining to partition.
+
+**Do not re-attempt "the DOP=1 aggregate fan-out is wasteful".** It is, in
+wall-clock terms, and it is required anyway.

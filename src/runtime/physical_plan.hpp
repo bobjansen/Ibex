@@ -129,6 +129,25 @@ enum class JoinDeclineReason : std::uint8_t {
     TakeSelection,
 };
 
+/// Which streaming operator runs a join, when one does.
+///
+/// Named rather than inferred. The seam used to pick between the two inner
+/// branches by testing `key_count == 1` vs `== 2`, which is only sound while
+/// `StreamingProbe` implies a full gate passed -- an invisible coupling, and a
+/// gate that later admitted a one-key shape the single-key operator cannot run
+/// would have routed wrong in silence. The planner knows which predicate said
+/// yes; saying so costs nothing.
+enum class JoinBranch : std::uint8_t {
+    /// Not streaming: both sides materialize.
+    None,
+    /// `is_streamable_semi_anti_join`.
+    SemiAnti,
+    /// `is_streamable_inner_join` -- one key.
+    SingleKeyInner,
+    /// `is_streamable_pair_int_join` -- two provably-Int64 keys.
+    PairIntInner,
+};
+
 /// What the plan knows about a `Join` node.
 ///
 /// Describes only. Execution still goes through `build_operator`'s per-kind
@@ -141,6 +160,9 @@ struct JoinPlan {
     bool describes = false;
     ir::JoinKind kind{};
     JoinStrategy strategy = JoinStrategy::MaterializeBoth;
+    /// Which operator runs it. `None` exactly when `strategy` is
+    /// `MaterializeBoth`.
+    JoinBranch branch = JoinBranch::None;
     JoinDeclineReason decline = JoinDeclineReason::None;
     /// The side hashed into a table, and the side that streams through it.
     /// Both null unless `strategy` is `StreamingProbe`.

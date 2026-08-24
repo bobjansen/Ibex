@@ -668,6 +668,93 @@ table.bench {
   margin: 0 0 0.35rem;
 }
 
+/* ── Home REPL demo ─────────────────────────────────────────────────────── */
+
+.repl-showcase {
+  display: grid;
+  grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr);
+  gap: 1.6rem;
+  align-items: center;
+}
+
+.repl-copy .section-sub { margin-bottom: 0; }
+
+.repl-caption {
+  margin: 1rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.repl-terminal {
+  overflow: hidden;
+  height: 21rem;
+  border: 1px solid #334044;
+  border-radius: 13px;
+  background: #192022;
+  box-shadow: 0 14px 30px rgba(30, 34, 36, 0.16);
+  color: #e8e1d7;
+}
+
+.terminal-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-height: 2.35rem;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid rgba(232, 225, 215, 0.12);
+  color: #afbab7;
+  font: 600 0.7rem/1 "JetBrains Mono", "Cascadia Code", monospace;
+}
+
+.terminal-replay {
+  margin-left: auto;
+  border: 1px solid rgba(134, 206, 201, 0.38);
+  border-radius: 5px;
+  padding: 0.22rem 0.4rem;
+  background: transparent;
+  color: #86cec9;
+  cursor: pointer;
+  font: inherit;
+}
+
+.terminal-replay:hover:not(:disabled),
+.terminal-replay:focus-visible { background: rgba(134, 206, 201, 0.13); }
+.terminal-replay:disabled { opacity: 0.55; cursor: default; }
+
+.terminal-output {
+  display: block;
+  height: calc(100% - 2.35rem);
+  min-height: 0;
+  margin: 0;
+  padding: 0.9rem 1rem 1.15rem;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
+  font: 0.72rem/1.52 "JetBrains Mono", "Cascadia Code", monospace;
+  white-space: pre;
+}
+
+.terminal-line { display: block; min-height: 1.52em; }
+.terminal-command {
+  overflow-wrap: anywhere;
+  color: #f4eee4;
+  white-space: pre-wrap;
+}
+.terminal-response { color: #b9c6c2; }
+.terminal-typing::after,
+.terminal-waiting::after {
+  content: "";
+  display: inline-block;
+  width: 0.48em;
+  height: 1.05em;
+  margin-left: 0.14em;
+  vertical-align: -0.2em;
+  background: #86cec9;
+  animation: terminal-caret 0.85s steps(1) infinite;
+}
+
+@keyframes terminal-caret { 50% { opacity: 0; } }
+
 /* ── REPL commands table ─────────────────────────────────────────────────── */
 
 .repl-table {
@@ -738,6 +825,10 @@ table.bench {
   }
 
   .bench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .repl-showcase {
     grid-template-columns: 1fr;
   }
 

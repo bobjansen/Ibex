@@ -132,7 +132,7 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
     constexpr std::size_t kMaxRanges = 64;
     constexpr std::size_t kAlign = 64;
     std::size_t ranges = 1;
-    if (exec != nullptr && exec->parallel && n >= exec->parallel_min_rows &&
+    if (exec != nullptr && exec->can_fan_out() && n >= exec->parallel_min_rows &&
         !on_worker_pool_thread()) {
         const std::size_t min_rows = std::max<std::size_t>(exec->parallel_min_rows, 1);
         auto& pool = process_worker_pool();
@@ -514,7 +514,7 @@ template <typename GatherWhole>
     const std::size_t budget = exec != nullptr ? exec->compute_budget() : pool_size;
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
-        exec != nullptr && exec->parallel && !on_worker_pool_thread() && threads >= 2 &&
+        exec != nullptr && exec->can_fan_out() && !on_worker_pool_thread() && threads >= 2 &&
         !jobs.empty() && total >= exec->parallel_min_rows &&
         (exec->parallel_min_cells == 0 || total * jobs.size() >= exec->parallel_min_cells);
 

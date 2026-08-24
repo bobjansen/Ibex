@@ -106,7 +106,7 @@ mkdir -p "$(dirname "$OUT")"
 #   pure execution only. queries[2,3] (parse_*) always include parse regardless.
 case "$MODE" in
     # IBEX_FW_SUFFIX tags a variant run of the SAME code — currently "-st" for
-    # the IBEX_PARALLEL=0 single-thread pass. Same convention as
+    # the IBEX_CORES=1 single-thread pass. Same convention as
     # bench_python.py / bench_clickhouse.py, so the suite can label a
     # thread-count variant without a second harness.
     memory) MODE_ARGS=(--no-include-parse); FW_TAG="ibex${IBEX_FW_SUFFIX:-}" ;;

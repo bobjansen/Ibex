@@ -43,7 +43,7 @@ auto trades_registry() -> runtime::TableRegistry {
 
 auto serial_exec() -> runtime::ExecutionContext {
     runtime::ExecutionContext exec;
-    exec.parallel = false;
+    exec.parallel_threads = 1;
     return exec;
 }
 
@@ -233,7 +233,7 @@ TEST_CASE("A fused step executes like the fused node", "[physical][execute][fusi
     for (const bool parallel : {false, true}) {
         INFO("parallel: " << parallel);
         runtime::ExecutionContext exec;
-        exec.parallel = parallel;
+        exec.parallel_threads = (parallel) ? 0 : 1;
 
         const auto fused = runtime::interpret(*unfused, registry, nullptr, nullptr, nullptr, exec);
         const auto reference =
@@ -324,7 +324,7 @@ TEST_CASE("The planner fuses a project over an update over a filter", "[physical
     for (const bool parallel : {false, true}) {
         INFO("parallel: " << parallel);
         runtime::ExecutionContext exec;
-        exec.parallel = parallel;
+        exec.parallel_threads = (parallel) ? 0 : 1;
         const auto fused = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, exec);
         const auto reference =
             runtime::interpret(*canonical, registry, nullptr, nullptr, nullptr, exec);
@@ -366,10 +366,9 @@ TEST_CASE("A parallel run below a serial step still reaches the workers",
     REQUIRE(plan.parallel_begin == 1);
 
     runtime::ExecutionContext serial;
-    serial.parallel = false;
+    serial.parallel_threads = 1;
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
-    parallel.parallel = true;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
     parallel.parallel_min_cells = 0;
@@ -429,10 +428,9 @@ TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][paralle
     const ir::NodePtr tree = build();
 
     runtime::ExecutionContext serial;
-    serial.parallel = false;
+    serial.parallel_threads = 1;
     runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
-    parallel.parallel = true;
     parallel.parallel_threads = 4;
     parallel.parallel_min_rows = 0;
     parallel.parallel_min_cells = 0;
@@ -574,7 +572,6 @@ TEST_CASE("Migrated pipelines produce identical results in serial and parallel",
 
     runtime::ExecutionContext serial = serial_exec();
     runtime::ExecutionContext parallel;  // defaults: parallel on
-    parallel.parallel = true;
 
     const auto serial_result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     const auto parallel_result =

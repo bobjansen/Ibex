@@ -494,6 +494,10 @@ void WorkerPool::Batch::wait() {
     }
 }
 
+auto ExecutionContext::can_fan_out() const -> bool {
+    return compute_budget() >= 2;
+}
+
 auto ExecutionContext::compute_budget() const -> std::size_t {
     // Defined here rather than in the header because this is where the two
     // thread budgets are decided: `compute_thread_count` next to it, and
@@ -666,10 +670,6 @@ namespace {
 }
 
 }  // namespace
-
-auto parallel_enabled_from_env() -> std::optional<bool> {
-    return env_flag("IBEX_PARALLEL");
-}
 
 auto stream_scans_from_env() -> std::optional<bool> {
     return env_flag("IBEX_STREAM_SCAN");

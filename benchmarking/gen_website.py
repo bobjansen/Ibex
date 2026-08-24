@@ -307,7 +307,7 @@ __BENCHMARK_NAV__
       <strong>Threads.</strong> Every engine gets the same 8 vCPU. Ibex
       parallelises some operators by default, so <code>ibex</code> is not a
       single-core number; <code>ibex-st</code> is the same build run with
-      <code>IBEX_PARALLEL=0</code>, which makes <code>ibex</code> vs
+      <code>IBEX_CORES=1</code>, which makes <code>ibex</code> vs
       <code>ibex-st</code> Ibex's own threading gain. <code>polars-st</code>,
       <code>duckdb-st</code>, <code>datafusion-st</code> and
       <code>clickhouse-st</code> are the equivalent single-thread runs of their
@@ -601,7 +601,7 @@ python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
       time-window comparison is auditable. <code>polars-st</code> runs identical
       code to Polars with <code>POLARS_MAX_THREADS=1</code>, and
       <code>ibex-st</code> identical code to Ibex with
-      <code>IBEX_PARALLEL=0</code>; <code>ibex+parse</code>
+      <code>IBEX_CORES=1</code>; <code>ibex+parse</code>
       is the same Ibex query timed with parsing included.
     </p>
     <div class="codewrap">

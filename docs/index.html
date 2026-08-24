@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ibex | Fast Typed DataFrame Pipelines</title>
-  <meta name="description" content="Ibex is a fast typed language for columnar DataFrame and time-series pipelines. See the benchmarks, then learn the core syntax and run your first script." />
+  <title>Ibex | Fast, Concise DataFrame Pipelines</title>
+  <meta name="description" content="Ibex is a fast typed language for columnar DataFrame and time-series pipelines, with interactive workflows and C++ deployment." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -33,7 +33,7 @@
     <p class="eyebrow">Ibex</p>
     <h1>Fast, concise table pipelines</h1>
     <p class="lead"> Ibex gives DataFrame pipelines their own compact language.
-    Explore in a notebook (a Jupyter notebook, R dplyr or Ibex's own web UI)
+    Explore in a notebook (Jupyter, R/dplyr, or Ibex's own web UI)
     and compile it to <span class="nowrap">C++</span> when the pipeline needs
     to ship.
     </p>
@@ -70,8 +70,8 @@
       <article class="card">
         <span class="tour-tag">Deployment</span>
         <h3>One pipeline, many interfaces</h3>
-        <p>Use notebooks, the web UI or a REPL for exploration, analyisis and
-        modelling, and C++23 codegen for native binaries. Type errors are
+        <p>Use Python or R notebooks, the web UI, or a REPL for exploration and
+        modelling, then use C++23 codegen for native binaries. Type errors are
         caught before the pipeline runs.</p>
       </article>
     </div>
@@ -122,184 +122,21 @@
     </p>
   </section>
 
-  <!-- Pipelines -->
-  <section class="section" id="pipelines">
-    <p class="section-label">How a program is shaped</p>
-    <h2>Everything is a table flowing through a pipeline</h2>
-    <p class="section-sub">
-      An Ibex program is a handful of <code>let</code> bindings. Each one names a
-      table and the steps applied to it. There are no loops or mutable
-      variables &mdash; you describe the transformation you want and Ibex runs it.
-    </p>
-
-    <div class="tour">
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Pipelines</span>
-          <h3>A table, followed by the steps to apply to it</h3>
-          <p>
-            Write a table name, then square brackets containing a
-            comma-separated list of <strong>clauses</strong>. The clauses run
-            in the order you read them, each taking the whole table and
-            producing a new one.
-          </p>
-          <p>
-            Tables are values: a pipeline returns a new table and keeps the
-            input unchanged. You can name the result with <code>let</code>, or
-            chain it into the next step.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="cm">// Keep the busy rows, then three columns</span>
-prices[
-    <span class="kw">filter</span> volume &gt; <span class="num">1000</span>,
-    <span class="kw">select</span> { symbol, price, volume }
-];
-
-<span class="cm">// Name a result and reuse it</span>
-<span class="kw">let</span> active = prices[<span class="kw">filter</span> volume &gt; <span class="num">1000</span>];
-active[<span class="kw">select</span> { symbol, price }];</code></pre>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Syntax -->
-  <section class="section">
-    <p class="section-label">Reading the syntax</p>
-    <h2>Three kinds of bracket, one job each</h2>
-    <p class="section-sub">
-      Ibex uses square brackets, braces, and parentheses for three distinct
-      things.
-    </p>
-    <div class="grid-3">
-      <article class="card">
-        <h3><code>[ ]</code> &mdash; a pipeline</h3>
-        <p>
-          Square brackets attach to a table and hold a list of clauses to apply:
-          <code>prices[filter &hellip;, select &hellip;]</code>. Chaining
-          <code>[&hellip;][&hellip;]</code> just chains one result into the next.
-        </p>
-      </article>
-      <article class="card">
-        <h3><code>{ }</code> &mdash; a list of fields</h3>
-        <p>
-          Braces hold the named members a clause works on: the output columns
-          of <code>select</code>, the sort keys of <code>order</code>, the
-          columns of a schema. Think struct fields, not a code block:
-          <code>{ avg = mean(px), n = count() }</code>.
-        </p>
-      </article>
-      <article class="card">
-        <h3><code>( )</code> &mdash; calls and grouping</h3>
-        <p>
-          Parentheses are the familiar kind: calling a function and grouping
-          arithmetic. <code>mean(price)</code>,
-          <code>(close - open) / open</code>. The expressions inside clauses are
-          the function calls you expect.
-        </p>
-      </article>
-    </div>
-    <p class="section-sub">Comma-separated lists may end with a trailing comma, so multi-line calls and field lists stay easy to edit: <code>select {symbol, price, }</code>.</p>
-  </section>
-
-  <!-- Worked example -->
-  <section class="section">
-    <p class="section-label">A worked example</p>
-    <h2>One pipeline, start to finish</h2>
-    <p class="section-sub">
-      A common task &mdash; collapse tick data into daily bars per symbol &mdash;
-      shows how the pieces fit together.
-    </p>
-
-    <div class="tour">
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Step by step</span>
-          <h3>Group by symbol, reduce each group to one row</h3>
-          <p>
-            <code><span class="kw">select</span></code> chooses the output
-            columns. Each entry is <code>name = expression</code>; a bare name
-            passes a column through unchanged.
-          </p>
-          <p>
-            <code><span class="kw">by</span> symbol</code> groups the rows, so
-            the aggregates in <code>select</code> &mdash; <code>first</code>,
-            <code>max</code>, <code>min</code>, <code>last</code> &mdash; run once
-            per symbol. Drop the <code>by</code> and they would collapse the whole
-            table to a single row instead.
-          </p>
-          <p>
-            <code><span class="kw">order</span></code> then sorts the result. The
-            whole thing is one expression, bound to <code>bars</code>.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">let</span> bars = ticks[
-    <span class="kw">select</span> {
-        open  = <span class="fn-name">first</span>(price),
-        high  = <span class="fn-name">max</span>(price),
-        low   = <span class="fn-name">min</span>(price),
-        close = <span class="fn-name">last</span>(price),
-        vol   = <span class="fn-name">sum</span>(size)
-    },
-    <span class="kw">by</span> symbol,
-    <span class="kw">order</span> symbol
-];</code></pre>
-        </div>
-      </div>
-    </div>
-  </section>
-
   <!-- Vocabulary -->
   <section class="section">
     <p class="section-label">The vocabulary</p>
-    <h2>The core clauses</h2>
+    <h2>A small vocabulary for table work</h2>
     <p class="section-sub">
-      These drop inside <code>[ ]</code> and compose in any sensible order. The
-      <a href="./functions.html">function reference</a> and
-      <a href="./cheatsheet.html">cheat sheet</a> have the rest.
+      Clauses compose inside a pipeline. Start with these common operations,
+      then see the <a href="./getting-started.html#transform">tutorial</a> or
+      <a href="./reference.html">reference</a> for the full syntax.
     </p>
-    <div class="card">
-      <table class="repl-table">
-        <tbody>
-          <tr><td><code>filter <em>predicate</em></code></td><td>Keep rows where the predicate is true</td></tr>
-          <tr><td><code>select { <em>fields</em> }</code></td><td>Choose or compute output columns; aggregates when paired with <code>by</code></td></tr>
-          <tr><td><code>update { <em>fields</em> }</code></td><td>Add or replace columns, keeping all existing ones</td></tr>
-          <tr><td><code>where <em>predicate</em> update { <em>fields</em> }</code></td><td>Replace columns in selected rows</td></tr>
-          <tr><td><code>by <em>key</em></code></td><td>Group for <code>select</code> / <code>update</code> (like SQL <code>GROUP BY</code> / <code>PARTITION BY</code>)</td></tr>
-          <tr><td><code>order { <em>keys</em> }</code></td><td>Sort, with per-key <code>asc</code> / <code>desc</code></td></tr>
-          <tr><td><code>rename { <em>map</em> }</code></td><td>Relabel columns without touching data</td></tr>
-          <tr><td><code>distinct { <em>keys</em> }</code></td><td>Deduplicate on one or more columns</td></tr>
-          <tr><td><code>head <em>n</em></code> / <code>tail <em>n</em></code></td><td>Keep the first / last n rows (per group with <code>by</code>)</td></tr>
-          <tr><td><code><em>a</em> join <em>b</em> on <em>key</em></code></td><td>Inner / left / right / outer / semi / anti / cross / as-of joins; pair different names with <code>on { left_id = right_id }</code>. Semi and anti joins return the left columns only; other kinds append the right columns. A name held by both inputs is an error unless the join carries <code><em>suffix</em> { "_left", "_right" }</code>, which renames both sides of each clash; an empty string leaves that side alone. Same-name keys fold into one column and never clash. A null key matches nothing by default, not even another null, matching the three-valued rule <code>filter</code> uses; <code><em>nulls equal</em></code> after the keys makes nulls match nulls and only nulls. <code><em>expect</em> n:1</code> declares how the rows line up (many left rows per right row, one right row per left row) and fails the run when the data disagrees. <code><em>take</em> first</code> / <code>last</code> / <code>any</code> keeps one of a row's matches, the first two reading the right value's stated order</td></tr>
-          <tr><td><code>window <em>duration</em></code></td><td>Lookback window for rolling aggregates on a <code>TimeFrame</code> (e.g. <code>window 5m</code>); aggregate expressions compose, so <code>sum(price * volume) / sum(volume)</code> is a rolling VWAP</td></tr>
-          <tr><td><code>resample <em>duration</em></code></td><td>Bucket a <code>TimeFrame</code> into fixed time intervals, then aggregate per bucket (e.g. 1m OHLC); aggregate expressions compose, so <code>sum(price * volume) / sum(volume)</code> is a bucketed VWAP</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p style="margin-top: 0.9rem; color: var(--muted); font-size: 0.91rem;">
-      Outside the pipelines are a few top-level forms: <code>let</code> bindings,
-      <code>import</code> to load a plugin, <code>fn</code> /
-      <code>extern fn</code> for reusable functions and data sources, and
-      <code>Table { &hellip; }</code> to build a table from literals.
-    </p>
-  </section>
-
-  <section class="section">
-    <p class="section-label">Conditional values</p>
-    <h2>First-match <code>case</code></h2>
-    <p class="section-sub">
-      Use <code>case</code> in any expression position. Conditions are considered
-      in order; the selector form is shorthand for equality checks, and
-      <code>else</code> is required.
-    </p>
-    <div class="tour-code">
-<pre><code><span class="kw">let</span> direction = <span class="kw">case</span> side {
-    "BUY"  =&gt; 1,
-    "SELL" =&gt; -1,
-    <span class="kw">else</span>   =&gt; <span class="kw">NULL</span>
-};</code></pre>
+    <div class="home-highlights" aria-label="Common Ibex clauses">
+      <span><code>filter</code></span>
+      <span><code>select</code></span>
+      <span><code>update</code></span>
+      <span><code>by</code></span>
+      <span><code>order</code></span>
     </div>
   </section>
 
@@ -308,8 +145,7 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
     <p class="section-label">Install &amp; run</p>
     <h2>Get Ibex on your machine</h2>
     <p class="section-sub">
-      A prebuilt release is the quickest start. Build from source if you want the
-      latest commits or a binary for your own platform.
+      Download a prebuilt release and start exploring immediately.
     </p>
 
     <div class="steps">
@@ -323,95 +159,22 @@ active[<span class="kw">select</span> { symbol, price }];</code></pre>
         <p style="margin: 0 0 0.9rem;">
           <a class="button primary" href="https://github.com/bobjansen/Ibex/releases" target="_blank" rel="noopener">github.com/bobjansen/Ibex/releases &#8599;</a>
         </p>
-<pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
-./ibex --plugin-path ./plugins</code></pre>
-      </div>
-
-      <div>
-        <p class="step-label">Option B &mdash; build from source</p>
-        <p style="margin: 0 0 0.7rem; color: var(--muted); font-size: 0.93rem;">
-          Requirements: CMake 3.26+ and a C++23 compiler such as Clang 17+,
-          GCC 13+, AppleClang, or MSVC 2022. Ninja is recommended on Linux and
-          macOS; CMake's Visual Studio generator works on Windows.
-        </p>
-<pre><code><span class="cm"># Linux/macOS with Clang or GCC</span>
-cmake -B build-release -G Ninja \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release
-
-<span class="cm"># Windows, from a Developer PowerShell</span>
-cmake -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release --config Release</code></pre>
       </div>
 
       <div>
         <p class="step-label">Run your first pipeline</p>
-<pre><code>./ibex --plugin-path ./plugins   <span class="cm"># from source: ./build-release/tools/ibex --plugin-path ./build-release/tools</span></code></pre>
-        <div class="card" style="margin-top: 0.7rem;">
-<pre><code><span class="kw">import</span> <span class="str">"csv"</span>;
-<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+<pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
+./ibex --plugin-path ./plugins</code></pre>
+<pre><code><span class="kw">import</span> <span class="str">"data_gen"</span>;
+<span class="kw">let</span> ticks = <span class="fn-name">data_gen</span>(<span class="num">100</span>);
 
-<span class="cm">// Five most-traded symbols by total volume</span>
-prices[
-    <span class="kw">select</span> { traded = <span class="fn-name">sum</span>(volume) }, <span class="kw">by</span> symbol,
+<span class="cm">// Order symbols by total volume</span>
+ticks[
+    <span class="kw">select</span> { traded = <span class="fn-name">sum</span>(volume) },
+    <span class="kw">by</span> symbol,
     <span class="kw">order</span> { traded <span class="kw">desc</span> },
-    <span class="kw">head</span> <span class="num">5</span>
 ];</code></pre>
-          <p style="margin-top: 0.7rem; color: var(--muted); font-size: 0.91rem;">
-            Handy REPL commands: <code>:load &lt;file.ibex&gt;</code>,
-            <code>:schema &lt;table&gt;</code>, <code>:head &lt;table&gt; [n]</code>,
-            <code>:doc &lt;name&gt;</code>, <code>:help</code>.
-          </p>
         </div>
-      </div>
-
-    </div>
-  </section>
-
-  <!-- R / dplyr -->
-  <section class="section" id="dplyr">
-    <p class="section-label">R integration</p>
-    <h2>Keep dplyr syntax; execute supported work in Ibex</h2>
-    <p class="section-sub">
-      The <code>ibex</code> package provides a lazy <code>ibex_tbl</code>.
-      Supported verbs build an immutable Ibex plan, <code>show_query()</code>
-      reveals the generated source, and <code>collect()</code> returns a tibble
-      through Arrow C Data.
-    </p>
-    <div class="tour">
-      <div class="tour-item">
-        <div class="tour-text">
-          <span class="tour-tag">Lazy dplyr backend</span>
-          <h3>One native segment, with an explicit fallback policy</h3>
-          <p>
-            Captured R scalars cross as typed bindings rather than source text.
-            Translation recognizes registered function identities, so masked or
-            unknown R calls are never guessed to be Ibex externs.
-          </p>
-          <p>
-            Choose <code>fallback = "error"</code> to require an all-native
-            query, <code>"warn"</code> for a visible one-time collection into
-            local dplyr, or <code>"collect"</code> for the same boundary without
-            a warning. Once local, the pipeline stays local.
-          </p>
-        </div>
-        <div class="tour-code">
-<pre><code><span class="kw">library</span>(dplyr)
-<span class="kw">library</span>(ibex)
-
-query &lt;- ibex_tbl(trades, fallback = <span class="str">"error"</span>) |&gt;
-  filter(price &gt; <span class="num">10</span>) |&gt;
-  mutate(notional = price * size) |&gt;
-  group_by(symbol) |&gt;
-  summarise(total = sum(notional), .groups = <span class="str">"drop"</span>) |&gt;
-  arrange(desc(total))
-
-show_query(query)
-result &lt;- collect(query)</code></pre>
-        </div>
-      </div>
     </div>
   </section>
 

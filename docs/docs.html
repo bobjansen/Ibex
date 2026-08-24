@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Documentation</title>
+  <meta name="description" content="Ibex documentation: get started, learn the language, work with data, and integrate with native applications." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="page">
+  <nav class="nav">
+    <a class="nav-logo" href="./index.html">Ibex</a>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link active" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <div class="docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <a class="docs-overview" href="#top">Documentation</a>
+      <nav class="docs-tree">
+        <p>Getting Started</p>
+        <a href="#installation">Installation</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#repl">REPL</a>
+        <p>Language</p>
+        <a href="#pipelines">Pipelines</a>
+        <a href="#expressions">Expressions</a>
+        <a href="#types">Types</a>
+        <a href="#functions">Functions</a>
+        <a href="#control-flow">Control flow</a>
+        <p>Data</p>
+        <a href="#io">Reading &amp; writing</a>
+        <a href="#joins">Joins</a>
+        <a href="#aggregation">Aggregation</a>
+        <a href="#windows">Window operations</a>
+        <p>Integration</p>
+        <a href="#python">Python</a>
+        <a href="#r">R</a>
+        <a href="#native">C++ / native compilation</a>
+        <p>Reference</p>
+        <a href="#syntax">Syntax</a>
+        <a href="#builtins">Built-ins</a>
+        <a href="#cli">CLI</a>
+        <a href="#configuration">Configuration</a>
+      </nav>
+    </aside>
+
+    <article class="docs-content" id="top">
+      <header class="docs-header">
+        <p class="eyebrow">Documentation</p>
+        <h1>Build typed table pipelines.</h1>
+        <p class="lead">Start with the essentials, then use the topics below as a compact map of the language and runtime.</p>
+      </header>
+
+      <section id="installation"><h2>Installation</h2><p>Download a release or build Ibex from source. The <a href="./getting-started.html#install">installation guide</a> includes both paths.</p></section>
+      <section id="quickstart"><h2>Quickstart</h2><p>Read a table, transform it, and print a result in the <a href="./getting-started.html">first pipeline guide</a>.</p></section>
+      <section id="repl"><h2>REPL</h2><p>Use the REPL to inspect tables, run expressions, and load scripts. See the <a href="./getting-started.html#repl">REPL walkthrough</a>.</p></section>
+
+      <section id="pipelines"><h2>Language</h2><h3>Pipelines</h3><p>Tables flow through bracketed clauses such as <code>filter</code>, <code>select</code>, and <code>update</code>.</p></section>
+      <section id="expressions"><h3>Expressions</h3><p>Expressions combine columns, literals, operators, and calls. They are checked before execution.</p></section>
+      <section id="types"><h3>Types</h3><p>Ibex has static scalar, series, table, and time-frame types. See the <a href="./reference.html">language reference</a> for details.</p></section>
+      <section id="functions"><h3>Functions</h3><p>Use built-ins for common data work and typed <code>fn</code> declarations for reusable code. Browse the <a href="./functions.html">function reference</a>.</p></section>
+      <section id="control-flow"><h3>Control flow</h3><p>Use expressions and functions to define transformations; pipelines keep data work declarative.</p></section>
+
+      <section id="io"><h2>Data</h2><h3>Reading &amp; writing</h3><p>CSV, JSON, Parquet, and other data sources are provided through plugins. Read the <a href="./io.html">I/O guide</a>.</p></section>
+      <section id="joins"><h3>Joins</h3><p>Combine tables by matching key columns; choose the join that preserves the rows you need.</p></section>
+      <section id="aggregation"><h3>Aggregation</h3><p>Use <code>by</code> with <code>select</code> or <code>update</code> to reduce or transform groups.</p></section>
+      <section id="windows"><h3>Window operations</h3><p>TimeFrames support ordered, rolling operations. See the <a href="./window-ohlc.html">OHLC window example</a>.</p></section>
+
+      <section id="python"><h2>Integration</h2><h3>Python</h3><p>Use Ibex from notebook workflows while keeping tables and scalar bindings typed. Details live in the <a href="./reference.html">integration reference</a>.</p></section>
+      <section id="r"><h3>R</h3><p>The R package offers a lazy dplyr backend with an explicit fallback boundary.</p></section>
+      <section id="native"><h3>C++ / native compilation</h3><p>Compile an Ibex program to C++23 for native deployment, or connect a custom source through an extern function.</p></section>
+
+      <section id="syntax"><h2>Reference</h2><h3>Syntax</h3><p>Use the <a href="./reference.html">full language reference</a> for grammar and semantics.</p></section>
+      <section id="builtins"><h3>Built-ins</h3><p>Browse available functions in the <a href="./functions.html">built-ins reference</a>.</p></section>
+      <section id="cli"><h3>CLI</h3><p>Run scripts or start the interactive REPL with the <code>ibex</code> executable.</p></section>
+      <section id="configuration"><h3>Configuration</h3><p>Configure plugin paths and runtime options when starting Ibex.</p></section>
+    </article>
+  </div>
+</main>
+</body>
+</html>

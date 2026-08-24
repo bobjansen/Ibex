@@ -825,6 +825,39 @@ island analysis" keeps a readable subset.
 Gates: debug ctest 1744/1744, `check_answers.py` 22/22 under both
 `IBEX_PARALLEL` settings. No performance claim -- no execution path changed.
 
+**Item 4, step 3 — the island is gone (2026-08-24, `8e31700a`).**
+`build_operator_impl` had two analyses at one seam: `analyze_parallel_island`
+decided parallel execution by walking the IR itself, `plan_physical` decided
+serial execution. There is now one plan per node, consulted in both modes, and
+its `PipelineMode` is the whole decision. `build_parallel_island` became
+`build_map_pipeline_parallel` and takes the `Plan` -- reading
+`parallel_input_node` for what to materialize and reversing
+`steps[0, parallel_steps)` for the operators. Its internals are unchanged, which
+is the point: morsel execution was always a way to run a map pipeline, not a
+separate kind of plan. `analyze_parallel_island`, `ParallelIslandCandidate`, and
+`ParallelEligibilityReason` are deleted.
+
+**Known limitation, deliberate and documented at the seam.** In parallel mode a
+migrated pipeline whose own mode is `Serial` does not take the serial physical
+composer. Such a chain can still contain a parallel pipeline *below* the step
+that bounds it -- `df[filter ...][update ...]`, where the root Update is not a
+parallel step but the Filter under it is -- and the per-kind recursion finds it
+by re-planning at each node. Consuming the whole chain there would swallow that
+inner pipeline. `parallel_steps` models a leading run from the root only;
+modelling a serial tail over a parallel prefix inside one plan is Phase 3 work,
+and is the remaining reason the recursion still matters.
+
+Naming debt: the operator classes and counters are still called islands
+(`ParallelIslandOperator`, `IslandWorkerChain`, `island_grain`,
+`parallel_islands`/`serial_islands` in `IBEX_PARALLEL_STATS`). The abstraction
+is gone; the identifiers are Phase 5's file-ownership split, and the stats line
+is read by tooling, so neither was renamed here.
+
+Gates: debug ctest 1744/1744, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings, and an interleaved A/B over `core,filter,null,groupagg`
+at 9 repeats -- this reroutes construction for every query in parallel mode --
+at geomean 1.006, total -0.25%, every query `noise`.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -833,7 +866,7 @@ per-commit A/B log; the entries above are the itemized history.
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
 | 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
-| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. Step 2 landed (`0b4150d6`): the plan decides its own `PipelineMode`, proven equal to the island's verdict across the suite and PDS-H. **Step 3 (the island deleted, `build_parallel_island` taking the Plan) not started.** |
+| 4. Run the physical map pipeline serially, then on the morsel executor | **DONE** (`32f62261`, `0b4150d6`, `8e31700a`): one plan per node decides both modes, and the island analysis is deleted. Earlier state, kept for context: | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. Step 2 (`0b4150d6`) gave the plan its own `PipelineMode`; step 3 (`8e31700a`) deleted the island analysis and handed `build_map_pipeline_parallel` the plan. |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
 
 Current gates on the tree: full debug `ctest` 1744/1744, and PDS-H
@@ -841,9 +874,13 @@ Current gates on the tree: full debug `ctest` 1744/1744, and PDS-H
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) item 4, so the physical plan owns morsel
-execution rather than the island seam; (b) `KernelContext`, once the writers
-above need one shared scratch/cancellation owner. The row-local update family's
+Resume point, in priority order: (a) `KernelContext`, once the writers above
+need one shared scratch/cancellation owner; (b) item 5, retiring
+`FilterProject`/`FilterUpdateProject` as execution node kinds. Phase 3 then
+picks up the two things item 4 deliberately left: a plan that can model a
+serial tail over a parallel prefix (so the per-kind recursion is no longer what
+finds an inner pipeline), and `build_pipelined_scan` as a source mode of the
+same pipeline rather than a special case at the seam. The row-local update family's
 remaining bridge users are the legacy null-handling arms and anything only the
 general evaluator reaches, both of which are shape gaps rather than mode gaps
 now.

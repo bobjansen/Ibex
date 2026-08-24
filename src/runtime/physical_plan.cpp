@@ -5,6 +5,7 @@
 
 #include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
@@ -545,6 +546,35 @@ auto explain_physical(const Plan& plan) -> std::string {
     return out;
 }
 
+namespace {
+
+/// Both keys Int64 on both sides, with schemas known well enough to prove it --
+/// the gate `is_streamable_pair_int_join` applies in chunked.cpp.
+///
+/// This is the one part of a join's classification that is not a property of
+/// the node alone, which is why the first version of `plan_join` got it wrong:
+/// it declined every two-key join as `MultipleKeys` while the builder streamed
+/// the Int64 pair, so the plan said `MaterializeBoth` for a join that streams.
+/// Consuming that description would have rerouted q09's two-key joins.
+auto pair_int_keys_streamable(const ir::JoinNode& join) -> bool {
+    if (join.kind() != ir::JoinKind::Inner || join.children().size() != 2) {
+        return false;
+    }
+    const ir::SchemaInfo left_schema = ir::infer_schema(*join.children()[0]);
+    const ir::SchemaInfo right_schema = ir::infer_schema(*join.children()[1]);
+    if (!left_schema.is_known() || !right_schema.is_known()) {
+        return false;
+    }
+    return std::ranges::all_of(join.keys(), [&](const ir::JoinKey& key) {
+        const ir::SchemaField* lf = left_schema.find(key.left);
+        const ir::SchemaField* rf = right_schema.find(key.right);
+        return lf != nullptr && rf != nullptr && lf->type.has_value() && rf->type.has_value() &&
+               *lf->type == ir::ColumnType::Int64 && *rf->type == ir::ColumnType::Int64;
+    });
+}
+
+}  // namespace
+
 auto plan_join(const ir::JoinNode& join) -> JoinPlan {
     JoinPlan out;
     out.describes = true;
@@ -562,7 +592,16 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.decline = JoinDeclineReason::UnsupportedKind;
     } else if (join.predicate().has_value()) {
         out.decline = JoinDeclineReason::HasPredicate;
-    } else if (join.keys().size() != 1) {
+    } else if (join.keys().size() > 2) {
+        out.decline = JoinDeclineReason::MultipleKeys;
+    } else if (join.keys().size() == 2 && !pair_int_keys_streamable(join)) {
+        // Two keys stream only as the all-Int64 pair shape, and only the
+        // semi/anti and single-key gates admit one key. A two-key semi join is
+        // therefore not streamable even though each half of that sentence
+        // sounds like it should be.
+        out.decline = join.kind() == ir::JoinKind::Inner ? JoinDeclineReason::KeyTypesUnsupported
+                                                         : JoinDeclineReason::MultipleKeys;
+    } else if (join.keys().size() == 2 && join.kind() != ir::JoinKind::Inner) {
         out.decline = JoinDeclineReason::MultipleKeys;
     } else if (join.null_match() != ir::NullMatch::Never) {
         out.decline = JoinDeclineReason::NullsEqual;

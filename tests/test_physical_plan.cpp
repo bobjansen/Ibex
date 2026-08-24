@@ -643,6 +643,21 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
         CHECK(plan.build_side == ir->children()[1].get());
     }
 
+    SECTION("two Int64 keys stream as the pair shape when the schema proves it") {
+        // The classification that the first version of this planner got wrong.
+        // It declined every two-key join, while the builder streams the Int64
+        // pair through `is_streamable_pair_int_join` -- so the plan claimed
+        // `MaterializeBoth` for a join that streams, and consuming that would
+        // have rerouted q09. Ascriptions make the key types provable; without
+        // them the same query declines, which the section above pins.
+        const auto plan = plan_of(
+            "(a as DataFrame<{ k1: Int64, k2: Int64 }> "
+            " join b as DataFrame<{ k1: Int64, k2: Int64 }> on { k1, k2 });");
+        CHECK(plan.strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan.decline == JoinDeclineReason::None);
+        CHECK(plan.key_count == 2);
+    }
+
     SECTION("semi and anti stream on the same terms") {
         CHECK(plan_of("(a semi join b on k);").strategy == JoinStrategy::StreamingProbe);
         CHECK(plan_of("(a anti join b on k);").strategy == JoinStrategy::StreamingProbe);
@@ -651,10 +666,16 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
     SECTION("every decline is named, not a bare conjunction") {
         CHECK(plan_of("(a left join b on k);").decline == JoinDeclineReason::UnsupportedKind);
         CHECK(plan_of("(a join b on x < y);").decline == JoinDeclineReason::HasPredicate);
-        CHECK(plan_of("(a join b on { k1, k2 });").decline == JoinDeclineReason::MultipleKeys);
+        // Two keys decline for a schema reason, not a count one: the pair path
+        // takes exactly two keys, but only when both are provably Int64 on both
+        // sides. With no schema here, they are not provable.
+        CHECK(plan_of("(a join b on { k1, k2 });").decline ==
+              JoinDeclineReason::KeyTypesUnsupported);
+        CHECK(plan_of("(a join b on { k1, k2, k3 });").decline == JoinDeclineReason::MultipleKeys);
         CHECK(plan_of("(a join b on k nulls equal);").decline == JoinDeclineReason::NullsEqual);
-        for (const char* src : {"(a left join b on k);", "(a join b on x < y);",
-                                "(a join b on { k1, k2 });", "(a join b on k nulls equal);"}) {
+        for (const char* src :
+             {"(a left join b on k);", "(a join b on x < y);", "(a join b on { k1, k2 });",
+              "(a join b on { k1, k2, k3 });", "(a join b on k nulls equal);"}) {
             CAPTURE(src);
             const auto plan = plan_of(src);
             CHECK(plan.strategy == JoinStrategy::MaterializeBoth);

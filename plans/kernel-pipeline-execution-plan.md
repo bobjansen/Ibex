@@ -736,27 +736,47 @@ Gates: debug ctest 1739/1739, `check_answers.py` 22/22 under both
 it was 0. No performance claim -- a per-chunk metadata bridge removed, not a row
 loop.
 
+**Multi-field clauses in parallel mode (2026-08-24, `63d7f8a1`).** Only the
+serial path folded a clause's fields, so a two-field update in parallel mode
+converted to a `Table` per chunk and let `update_table` perform the same fold
+there. `fold_fields` now takes the per-field route as a parameter: serial and
+parallel differ only in which route they fold with, and the two rules that
+matter -- each field planned against the chunk the previous one produced, and
+all-or-nothing so a clause cannot land half its fields in the kernel and half
+over the bridge -- are one implementation rather than two.
+
+Each field remains its own parallel batch, as it was under the table evaluator;
+the barrier between fields is what the ordering requires. What the fold removes
+is the per-chunk `Table` conversion around it.
+
+Gates: `IBEX_PARALLEL_STATS=1` on a 5M-row two-field update reports
+`chunk_direct_updates=2` where it was 0, with `parallel_fields=3` unchanged
+either way -- the fields were already being split, just over the bridge. Debug
+ctest 1740/1740, `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings.
+No performance claim.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
 | Item | State |
 |---|---|
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
-| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses also keep the bridge in parallel mode. |
+| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
 | 4. Run the physical map pipeline serially, then on the morsel executor | Serial only. The morsel executor is still reached through the island seam, not through the physical plan. **Untouched.** |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
 
-Current gates on the tree: full debug `ctest` 1739/1739, and PDS-H
+Current gates on the tree: full debug `ctest` 1740/1740, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) multi-field clauses in parallel mode, which
-now that every single-field shape but the legacy null-handling arms has a range
-writer are the largest remaining user of the table bridge; (b) item 4, so the physical plan owns morsel
-execution rather than the island seam; (c) `KernelContext`, once the writers
-above need one shared scratch/cancellation owner.
+Resume point, in priority order: (a) item 4, so the physical plan owns morsel
+execution rather than the island seam; (b) `KernelContext`, once the writers
+above need one shared scratch/cancellation owner. The row-local update family's
+remaining bridge users are the legacy null-handling arms and anything only the
+general evaluator reaches, both of which are shape gaps rather than mode gaps
+now.
 
 1. Extract `ChunkView`, selection, validity, output-writer, and scratch APIs.
 2. Port filter/project/rename/row-local update kernels one representation at a

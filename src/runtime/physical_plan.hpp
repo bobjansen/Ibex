@@ -113,9 +113,13 @@ enum class JoinDeclineReason : std::uint8_t {
     UnsupportedKind,
     /// A non-equi predicate: the streaming operators probe on keys only.
     HasPredicate,
-    /// More than one key. The two-key streaming path is a separate operator and
-    /// is not described here yet.
+    /// More keys than any streaming path takes (the operators handle one, or a
+    /// pair of Int64s).
     MultipleKeys,
+    /// Exactly two keys, but not the all-Int64 shape the pair path requires --
+    /// or a schema too unknown to prove they are. Schema-dependent, so this is
+    /// the one decline that is not a property of the node alone.
+    KeyTypesUnsupported,
     /// `nulls equal`: the materialized join is the one implementation that
     /// tags nulls, and keeping it single is deliberate.
     NullsEqual,

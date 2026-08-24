@@ -1142,6 +1142,32 @@ physical map pipeline, not a second executor.
 
 ### Phase 4 — migrate the high-value breakers
 
+**The backlog, measured (2026-08-24, `15db9f6d`).** `IBEX_PLAN_STATS=1` prints
+it; this is PDS-H SF-1 at 8 cores, summed over the 22 queries:
+
+```
+plan stats: plans=233 pipelines=70 fallbacks=163
+            not_map_chain=116 empty_chain=47 malformed=0
+```
+
+47 of the 163 are a bare `Scan` (`EmptyChain` — the root is a source, there is
+no map work to migrate). So the physical plan describes **70 of the 186 nodes
+that carry real work, 38%**, and the backlog is **116 breakers**:
+
+| kind | count | share of backlog |
+|---|---|---|
+| Join | 59 | 51% |
+| Aggregate | 30 | 26% |
+| Order | 18 | 16% |
+| Head | 5 | 4% |
+| Distinct | 4 | 3% |
+
+Join and Aggregate are 77% of it, so the a-priori ordering below survives
+contact with measurement — it is now evidence rather than assertion. Re-run the
+numbers before starting each item rather than trusting this table: a finished
+port shows up as its kind going to zero, which is also the cheapest proof the
+port is complete.
+
 Order is driven by measured serial time and semantic completeness, not by
 operator count.
 

@@ -7954,8 +7954,13 @@ class ChunkedAggregateOperator final : public Operator {
     auto try_accumulate_parallel(const std::uint32_t* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
                                  std::size_t rows) -> bool {
-        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows ||
-            n_groups_ == 0 || n_aggs_ == 0) {
+        // Partition on the data alone -- not `exec_->parallel`, the thread
+        // budget, or whether this runs on a pool thread. Those choose who
+        // executes the morsels; the cut decides the arithmetic, and a cut that
+        // varied with the schedule would let the same query answer differently
+        // on two machines. Morsels run inline below when fan-out is not
+        // available.
+        if (n_groups_ == 0 || n_aggs_ == 0) {
             return false;
         }
         for (std::size_t a = 0; a < n_aggs_; ++a) {
@@ -7996,25 +8001,35 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<AggSlotCore> partials(morsels * stride);
         std::vector<double> partial_scratch(morsels * scratch_span, 0.0);
 
-        auto& pool = process_worker_pool();
-        const std::size_t threads = std::min(morsels, exec_->compute_budget());
-        std::atomic<std::size_t> cursor{0};
-        auto batch = pool.submit(threads, [&](std::size_t) {
-            while (true) {
-                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (m >= morsels) {
-                    return;
-                }
-                const std::size_t begin = m * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                if (begin >= end) {
-                    continue;
-                }
+        const auto run_morsel = [&](std::size_t m) {
+            const std::size_t begin = m * grain;
+            const std::size_t end = std::min(rows, begin + grain);
+            if (begin < end) {
                 accumulate_columns_into(gids, agg_entries, begin, end, &partials[m * stride],
                                         partial_scratch.data() + (m * scratch_span));
             }
-        });
-        batch.wait();
+        };
+        const std::size_t threads =
+            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+        const bool fanned_out = threads >= 2 && !on_worker_pool_thread();
+        if (fanned_out) {
+            auto& pool = process_worker_pool();
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(threads, [&](std::size_t) {
+                while (true) {
+                    const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (m >= morsels) {
+                        return;
+                    }
+                    run_morsel(m);
+                }
+            });
+            batch.wait();
+        } else {
+            for (std::size_t m = 0; m < morsels; ++m) {
+                run_morsel(m);
+            }
+        }
 
         for (std::size_t m = 0; m < morsels; ++m) {
             const AggSlotCore* src = &partials[m * stride];
@@ -8029,7 +8044,10 @@ class ChunkedAggregateOperator final : public Operator {
                 }
             }
         }
-        if (exec_->parallel_stats != nullptr) {
+        if (fanned_out && exec_ != nullptr && exec_->parallel_stats != nullptr) {
+            // Counts a fan-out, not a partition. The morsels are cut the same
+            // way either way, so counting them when they ran inline would
+            // report parallelism that never happened.
             exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
@@ -8312,9 +8330,12 @@ class ChunkedAggregateOperator final : public Operator {
     auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
                                        const std::vector<const ColumnEntry*>& agg_entries,
                                        std::size_t rows) -> bool {
-        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows) {
-            return false;
-        }
+        // Partition on the data alone -- not `exec_->parallel`, the thread
+        // budget, or whether this runs on a pool thread. Those choose who
+        // executes the morsels; the cut decides the arithmetic, and a cut that
+        // varied with the schedule would let the same query answer differently
+        // on two machines. Morsels run inline below when fan-out is not
+        // available.
         for (std::size_t a = 0; a < n_aggs_; ++a) {
             if (!agg_is_combinable(plan_[a].func)) {
                 return false;
@@ -8366,36 +8387,48 @@ class ChunkedAggregateOperator final : public Operator {
         // Per morsel, the codes it saw in first-occurrence order.
         std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
 
-        auto& pool = process_worker_pool();
-        const std::size_t threads = std::min(morsels, exec_->compute_budget());
-        std::atomic<std::size_t> cursor{0};
-        auto batch = pool.submit(threads, [&](std::size_t) {
-            std::vector<std::uint8_t> local_seen(dict_size, 0);
-            while (true) {
-                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (m >= morsels) {
-                    return;
-                }
-                const std::size_t begin = m * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                if (begin >= end) {
-                    continue;
-                }
-                std::ranges::fill(local_seen, std::uint8_t{0});
-                auto& order = seen[m];
-                for (std::size_t row = begin; row < end; ++row) {
-                    const auto code = codes[row];
-                    if (local_seen[static_cast<std::size_t>(code)] == 0) {
-                        local_seen[static_cast<std::size_t>(code)] = 1;
-                        order.push_back(code);
-                    }
-                }
-                accumulate_columns_into(
-                    codes, agg_entries, begin, end, &partials[m * dict_size * n_aggs_],
-                    cat_partial_scratch.data() + (m * dict_size * scratch_stride_));
+        const auto run_morsel = [&](std::size_t m, std::vector<std::uint8_t>& local_seen) {
+            const std::size_t begin = m * grain;
+            const std::size_t end = std::min(rows, begin + grain);
+            if (begin >= end) {
+                return;
             }
-        });
-        batch.wait();
+            std::ranges::fill(local_seen, std::uint8_t{0});
+            auto& order = seen[m];
+            for (std::size_t row = begin; row < end; ++row) {
+                const auto code = codes[row];
+                if (local_seen[static_cast<std::size_t>(code)] == 0) {
+                    local_seen[static_cast<std::size_t>(code)] = 1;
+                    order.push_back(code);
+                }
+            }
+            accumulate_columns_into(codes, agg_entries, begin, end,
+                                    &partials[m * dict_size * n_aggs_],
+                                    cat_partial_scratch.data() + (m * dict_size * scratch_stride_));
+        };
+        const std::size_t threads =
+            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+        const bool fanned_out = threads >= 2 && !on_worker_pool_thread();
+        if (fanned_out) {
+            auto& pool = process_worker_pool();
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(threads, [&](std::size_t) {
+                std::vector<std::uint8_t> local_seen(dict_size, 0);
+                while (true) {
+                    const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (m >= morsels) {
+                        return;
+                    }
+                    run_morsel(m, local_seen);
+                }
+            });
+            batch.wait();
+        } else {
+            std::vector<std::uint8_t> local_seen(dict_size, 0);
+            for (std::size_t m = 0; m < morsels; ++m) {
+                run_morsel(m, local_seen);
+            }
+        }
 
         if (cat_dense_gid_.size() < dict_size) {
             cat_dense_gid_.resize(dict_size, kNoGid);
@@ -8422,7 +8455,10 @@ class ChunkedAggregateOperator final : public Operator {
                 }
             }
         }
-        if (exec_->parallel_stats != nullptr) {
+        if (fanned_out && exec_ != nullptr && exec_->parallel_stats != nullptr) {
+            // Counts a fan-out, not a partition. The morsels are cut the same
+            // way either way, so counting them when they ran inline would
+            // report parallelism that never happened.
             exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
         }
         return true;
@@ -8642,28 +8678,42 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<AggSlotCore> partials(morsels * n_aggs_);
         std::vector<double> ung_scratch(morsels * scratch_stride_, 0.0);
 
-        auto& pool = process_worker_pool();
-        const std::size_t threads = std::min(morsels, exec_->compute_budget());
-        std::atomic<std::size_t> cursor{0};
-        auto batch = pool.submit(threads, [&](std::size_t) {
-            while (true) {
-                const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
-                if (m >= morsels) {
-                    return;
-                }
-                const std::size_t begin = m * grain;
-                const std::size_t end = std::min(rows, begin + grain);
-                if (begin < end) {
-                    accumulate_ungrouped_range_impl(agg_entries, begin, end,
-                                                    &partials[(m * n_aggs_)],
-                                                    ung_scratch.data() + (m * scratch_stride_));
-                }
+        // One morsel's work, identical whoever runs it -- which is the point:
+        // the partial it writes and the slot it lands in depend on `m` alone.
+        const auto run_morsel = [&](std::size_t m) {
+            const std::size_t begin = m * grain;
+            const std::size_t end = std::min(rows, begin + grain);
+            if (begin < end) {
+                accumulate_ungrouped_range_impl(agg_entries, begin, end, &partials[(m * n_aggs_)],
+                                                ung_scratch.data() + (m * scratch_stride_));
             }
-        });
-        batch.wait();
-
-        if (exec_->parallel_stats != nullptr) {
-            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        };
+        const std::size_t threads =
+            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+        // Submitting from a pool thread would deadlock (`WorkerPool::submit`
+        // aborts rather than allow it), and one worker gains nothing from a
+        // round trip, so both run the morsels here. The arithmetic is unchanged
+        // either way.
+        if (threads >= 2 && !on_worker_pool_thread()) {
+            auto& pool = process_worker_pool();
+            std::atomic<std::size_t> cursor{0};
+            auto batch = pool.submit(threads, [&](std::size_t) {
+                while (true) {
+                    const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (m >= morsels) {
+                        return;
+                    }
+                    run_morsel(m);
+                }
+            });
+            batch.wait();
+            if (exec_ != nullptr && exec_->parallel_stats != nullptr) {
+                exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            for (std::size_t m = 0; m < morsels; ++m) {
+                run_morsel(m);
+            }
         }
         for (std::size_t m = 0; m < morsels; ++m) {
             for (std::size_t a = 0; a < n_aggs_; ++a) {
@@ -8679,12 +8729,13 @@ class ChunkedAggregateOperator final : public Operator {
 
     /// How many row-morsels to split a global aggregate into; 1 = stay serial.
     [[nodiscard]] auto ungrouped_morsels(std::size_t rows) const -> std::size_t {
-        // Submitting from a pool thread would deadlock (WorkerPool::submit
-        // aborts rather than allow it), and a morsel is already one worker's
-        // share.
-        if (on_worker_pool_thread() || !exec_->parallel || rows < exec_->parallel_min_rows) {
-            return 1;
-        }
+        // Deliberately NOT gated on `exec_->parallel`, the thread budget, or
+        // whether this runs on a pool thread. Those decide who EXECUTES the
+        // morsels, not how the range is cut, and a float reduction's result
+        // depends on where it is cut. Keeping the cut a function of the data
+        // alone is what makes one worker, eight workers, a serial run and a
+        // nested run agree bit for bit. The caller runs the morsels inline
+        // when it cannot fan out.
         for (std::size_t a = 0; a < n_aggs_; ++a) {
             if (!agg_is_combinable(plan_[a].func)) {
                 return 1;  // Skew/Kurtosis: no partial merge, stay serial.

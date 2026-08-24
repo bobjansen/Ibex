@@ -958,8 +958,9 @@ void render_eval_value(const EvalValue& value) {
             active_execution_result()->table = temp;
             active_execution_result()->tables.push_back(std::move(temp));
         } else {
-            active_execution_result()->table = std::get<runtime::Table>(value);
-            active_execution_result()->tables.push_back(*active_execution_result()->table);
+            const auto& table = std::get<runtime::Table>(value);
+            active_execution_result()->table = table;
+            active_execution_result()->tables.push_back(table);
         }
     }
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
@@ -5660,7 +5661,7 @@ class StdoutCapture {
         }
 #else
         original_fd_ = dup(fileno(stdout));
-        if (original_fd_ >= 0 && dup2(fileno(file_), fileno(stdout)) == 0) {
+        if (original_fd_ >= 0 && dup2(fileno(file_), fileno(stdout)) >= 0) {
             active_ = true;
         }
 #endif
@@ -5736,7 +5737,9 @@ auto error_from_output(std::string output) -> std::string {
 class ReplSession::Impl {
    public:
     Impl(ReplConfig session_config, runtime::ExternRegistry& extern_registry)
-        : config(std::move(session_config)), registry(&extern_registry), tables(build_builtin_tables()) {}
+        : config(std::move(session_config)),
+          registry(&extern_registry),
+          tables(build_builtin_tables()) {}
 
     ReplConfig config;
     runtime::ExternRegistry* registry;

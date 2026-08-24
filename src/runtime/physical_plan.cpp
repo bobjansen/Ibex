@@ -363,6 +363,14 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         // to the builder's branches first, exactly as the join's was.
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         plan.aggregate = plan_aggregate(static_cast<const ir::AggregateNode&>(root));
+        // Streaming and fused aggregates are executed by the plan now.
+        // `MaterializeAll` is not: it still falls back and still counts, which
+        // is what keeps the backlog measuring the port rather than the label.
+        if (plan.aggregate.strategy != AggregateStrategy::MaterializeAll) {
+            plan.migrated = true;
+            plan.source_node = &root;
+            return plan;
+        }
     }
     if (root.kind() == ir::NodeKind::Join) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)

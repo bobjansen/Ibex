@@ -986,6 +986,41 @@ barely touch this path, and PDS-H did not move because those queries were
 already parallel end to end — the removed gate rarely bound them. The result
 here is a capability and a simplification, not a speedup.
 
+**Phase 3 item 1 — one owner of the ordered handoff (2026-08-24, `89a40abf`,
+`2b960a21`).** Two implementations of the same shape existed: the morsel
+executor's ordered merge ring and the scan pipeline's unit ring — same window,
+same two condition variables, same `sequence % window` slots, same backpressure
+rule, two sets of bugs to keep in sync. `OrderedChunkRing` is that shape once:
+producers `acquire` a sequence, `publish` into its slot, and `producer_exited`
+on the way out; the consumer `take`s the sequence it needs next; both waits keep
+their `RingWaitScope`, without which produced-ahead reads as work and occupancy
+overstates the machine.
+
+The two failure models were **not** equivalent, so the stronger one is now
+shared. The morsel executor ordered failures by sequence deliberately, with an
+allocation-free `record_fault` for when allocation is what failed; the scan
+pipeline's exception path was first-writer-wins, so two failing units reported
+whichever message won the race. It is sequence-ordered now, and its workers
+track liveness through the same exit guard, which turns "a worker died" into an
+error rather than a hang there too.
+
+Then the naming followed the structure (`2b960a21`): `ParallelIslandOperator` →
+`MorselPipelineOperator`, `ParallelIslandStats` → `ParallelPipelineStats`,
+`parallel_islands`/`serial_islands` → `parallel_pipelines`/`serial_pipelines`,
+error messages and the `IBEX_PARALLEL_STATS` prefix with them (nothing outside
+the repo parses that line — checked before changing it; its keys are untouched).
+**Zero occurrences of "island" remain in `src/`, `include/`, or `tests/`,
+comments included** — a name that survives only in prose teaches the next reader
+the wrong model. What was ever specific to an island was never the parallelism,
+only the handoff; with that extracted, the class is a pipeline executed over
+morsels and is now called one.
+
+Remaining under item 1: `PipelinedStageOperator` still owns a raw thread and a
+plain bounded FIFO (`std::deque`, capacity 2, single producer). It is
+deliberately not merged into `OrderedChunkRing` — it has no sequence ordering to
+maintain, and merging two things because both have two condition variables is
+how the duplication above was created in the first place.
+
 **Concurrency-ownership inventory (2026-08-24).** Taken from the tree before
 starting Phase 3 items 1-4, since those items are phrased as "the executor is
 the only thing allowed to X" and the first question is what does X today.

@@ -90,6 +90,68 @@ enum class SerialOnlyReason : std::uint8_t {
 /// plan records *shape*, the IR remains the program. Like
 /// every analysis over the IR, the plan **borrows** the IR it was lowered
 /// from and must not outlive it.
+/// How a join executes. Phase 4 item 1's vocabulary: the plan says which side
+/// builds the hash table and which side streams through it, so that decision
+/// stops being a branch inside `build_operator` and becomes something a test
+/// and `explain physical` can both read.
+enum class JoinStrategy : std::uint8_t {
+    /// The right side is materialized into a hash table and the left streams
+    /// through it -- `HashBuild` on the right, `HashProbe` on the left. This is
+    /// what `is_streamable_inner_join` and the semi/anti gate select today.
+    StreamingProbe,
+    /// Both sides are materialized before the join runs. Every semantics the
+    /// streaming operators do not implement lands here.
+    MaterializeBoth,
+};
+
+/// Why a join materializes both sides instead of streaming. `None` when it
+/// streams. Each value is one clause of the eligibility gates, named rather
+/// than left as a conjunction nobody can attribute a decision to.
+enum class JoinDeclineReason : std::uint8_t {
+    None,
+    /// Not one of the kinds a streaming operator implements.
+    UnsupportedKind,
+    /// A non-equi predicate: the streaming operators probe on keys only.
+    HasPredicate,
+    /// More than one key. The two-key streaming path is a separate operator and
+    /// is not described here yet.
+    MultipleKeys,
+    /// `nulls equal`: the materialized join is the one implementation that
+    /// tags nulls, and keeping it single is deliberate.
+    NullsEqual,
+    /// `expect` asserts a cardinality the streaming path does not check.
+    AssertsCardinality,
+    /// `take first/last/any` rather than all matches.
+    TakeSelection,
+};
+
+/// What the plan knows about a `Join` node.
+///
+/// Describes only. Execution still goes through `build_operator`'s per-kind
+/// switch, exactly as before -- this is the same order the island removal took
+/// (describe, prove the description equals what the builder does, then move
+/// execution), because a description that is wrong is much cheaper to find than
+/// an executor that is wrong.
+struct JoinPlan {
+    /// False unless the planned node is a `Join`.
+    bool describes = false;
+    ir::JoinKind kind{};
+    JoinStrategy strategy = JoinStrategy::MaterializeBoth;
+    JoinDeclineReason decline = JoinDeclineReason::None;
+    /// The side hashed into a table, and the side that streams through it.
+    /// Both null unless `strategy` is `StreamingProbe`.
+    const ir::Node* build_side = nullptr;
+    const ir::Node* probe_side = nullptr;
+    std::size_t key_count = 0;
+};
+
+/// Classify a join. Pure: it reads the node and nothing else.
+[[nodiscard]] auto plan_join(const ir::JoinNode& join) -> JoinPlan;
+
+/// `strategy=... decline=... keys=N build=<kind> probe=<kind>` for tests and
+/// `explain physical`.
+[[nodiscard]] auto explain_join(const JoinPlan& plan) -> std::string;
+
 struct Plan {
     bool migrated = false;
     FallbackReason reason = FallbackReason::NotMapChain;
@@ -125,6 +187,11 @@ struct Plan {
     }
     std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
+    /// Set when `root` is a `Join`. The plan does not execute it yet, so this
+    /// coexists with `migrated == false`: the plan describes more of the query
+    /// than it runs, which is what makes the backlog shrinkable one kind at a
+    /// time instead of in one jump.
+    JoinPlan join;
 };
 
 /// Lower `root` into a Phase 1 plan. Read-only over the IR, the registry, and

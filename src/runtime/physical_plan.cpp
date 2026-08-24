@@ -30,6 +30,36 @@ constexpr std::size_t kKindSlots = 256;
 std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_kind{};
 std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_reason{};
 
+auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
+    switch (strategy) {
+        case JoinStrategy::StreamingProbe:
+            return "StreamingProbe";
+        case JoinStrategy::MaterializeBoth:
+            return "MaterializeBoth";
+    }
+    return "?";
+}
+
+auto join_decline_name(JoinDeclineReason reason) -> std::string_view {
+    switch (reason) {
+        case JoinDeclineReason::None:
+            return "None";
+        case JoinDeclineReason::UnsupportedKind:
+            return "UnsupportedKind";
+        case JoinDeclineReason::HasPredicate:
+            return "HasPredicate";
+        case JoinDeclineReason::MultipleKeys:
+            return "MultipleKeys";
+        case JoinDeclineReason::NullsEqual:
+            return "NullsEqual";
+        case JoinDeclineReason::AssertsCardinality:
+            return "AssertsCardinality";
+        case JoinDeclineReason::TakeSelection:
+            return "TakeSelection";
+    }
+    return "?";
+}
+
 /// Printable name for a step kind. Only map kinds appear here — the planner
 /// never admits anything else into `steps`.
 auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
@@ -292,6 +322,16 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     plan.root = &root;
     g_plans_built.fetch_add(1, std::memory_order_relaxed);
 
+    // Describe a join even though the plan does not execute one yet. The plan
+    // is meant to be the single description of what a query does; letting it
+    // stay silent about 51% of the backlog until the day execution moves would
+    // mean the description and the executor land together, untested against
+    // each other.
+    if (root.kind() == ir::NodeKind::Join) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        plan.join = plan_join(static_cast<const ir::JoinNode&>(root));
+    }
+
     // Peel map kinds top-down. `is_map_step` mirrors the per-kind switch's
     // own routing decisions, so the plan can never admit a step the switch
     // would build differently.
@@ -422,6 +462,12 @@ auto explain_physical(const Plan& plan) -> std::string {
         out += "MaterializedCall(";
         out += fallback_reason_name(plan.reason);
         out += ")\n";
+        // A described-but-not-executed node still explains itself. Without
+        // this, `explain physical` would print the same opaque line for a join
+        // it fully understands and one it knows nothing about.
+        if (plan.join.describes) {
+            out += "  " + explain_join(plan.join) + "\n";
+        }
         return out;
     }
     out += "MapPipeline\n";
@@ -496,6 +542,68 @@ auto explain_physical(const Plan& plan) -> std::string {
         }
         out += "\n";
     }
+    return out;
+}
+
+auto plan_join(const ir::JoinNode& join) -> JoinPlan {
+    JoinPlan out;
+    out.describes = true;
+    out.kind = join.kind();
+    out.key_count = join.keys().size();
+
+    // The clauses below mirror `is_streamable_inner_join` and the semi/anti
+    // gate in chunked.cpp, in the same order, one `decline` value each. They
+    // are duplicated rather than shared for exactly as long as this plan only
+    // describes: a temporary assertion at the seam compares the two on every
+    // query built, and the duplicate goes when execution moves here.
+    const bool kind_ok = join.kind() == ir::JoinKind::Inner || join.kind() == ir::JoinKind::Semi ||
+                         join.kind() == ir::JoinKind::Anti;
+    if (!kind_ok) {
+        out.decline = JoinDeclineReason::UnsupportedKind;
+    } else if (join.predicate().has_value()) {
+        out.decline = JoinDeclineReason::HasPredicate;
+    } else if (join.keys().size() != 1) {
+        out.decline = JoinDeclineReason::MultipleKeys;
+    } else if (join.null_match() != ir::NullMatch::Never) {
+        out.decline = JoinDeclineReason::NullsEqual;
+    } else if (join.expect().asserts_anything()) {
+        out.decline = JoinDeclineReason::AssertsCardinality;
+    } else if (join.take() != ir::MatchSelection::All) {
+        out.decline = JoinDeclineReason::TakeSelection;
+    }
+
+    if (out.decline != JoinDeclineReason::None || join.children().size() != 2) {
+        return out;
+    }
+    out.strategy = JoinStrategy::StreamingProbe;
+    // Textual left streams, textual right is hashed. Which side *should* build
+    // is a cost question this plan deliberately does not answer yet -- it is
+    // the open item in plans/phase3-dop-budget-analysis.md and the root cause
+    // of q12's regression -- so recording today's choice is the honest first
+    // step, not a decision.
+    out.probe_side = join.children()[0].get();
+    out.build_side = join.children()[1].get();
+    return out;
+}
+
+auto explain_join(const JoinPlan& plan) -> std::string {
+    if (!plan.describes) {
+        return "";
+    }
+    std::string out = "Join(";
+    out += join_strategy_name(plan.strategy);
+    out += " keys=" + std::to_string(plan.key_count);
+    if (plan.decline != JoinDeclineReason::None) {
+        out += " decline=";
+        out += join_decline_name(plan.decline);
+    }
+    if (plan.build_side != nullptr) {
+        out += " build=";
+        out += node_kind_name_impl(plan.build_side->kind());
+        out += " probe=";
+        out += node_kind_name_impl(plan.probe_side->kind());
+    }
+    out += ")";
     return out;
 }
 

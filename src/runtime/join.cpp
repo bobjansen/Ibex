@@ -1241,8 +1241,7 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
             return 0;
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec->parallel_threads != 0 ? exec->parallel_threads : pool.size();
+        const std::size_t budget = exec->compute_budget();
         const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         return workers < 2 ? 0 : workers;
     };

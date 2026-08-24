@@ -293,7 +293,7 @@ auto membership_ranges(const ExecutionContext& exec, std::size_t n) -> std::size
     }
     const std::size_t min_rows = std::max<std::size_t>(exec.parallel_min_rows, 1);
     auto& pool = process_worker_pool();
-    const std::size_t budget = exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+    const std::size_t budget = exec.compute_budget();
     return std::min({std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges), budget, pool.size()});
 }
 

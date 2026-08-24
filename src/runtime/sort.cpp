@@ -144,7 +144,7 @@ auto group_barrier_worker_count(const ExecutionContext& exec, std::size_t rows) 
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t workers = std::min(budget, pool_size);
     return workers < 2 ? 0 : workers;
 }
@@ -288,7 +288,7 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
     const std::size_t n_cols = input.columns.size();
 
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
         exec.parallel && !on_worker_pool_thread() && threads >= 2 && n_cols != 0 &&

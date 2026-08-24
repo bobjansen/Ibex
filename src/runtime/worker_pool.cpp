@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -491,6 +492,15 @@ void WorkerPool::Batch::wait() {
     if (error != nullptr) {
         std::rethrow_exception(error);
     }
+}
+
+auto ExecutionContext::compute_budget() const -> std::size_t {
+    // Defined here rather than in the header because this is where the two
+    // thread budgets are decided: `compute_thread_count` next to it, and
+    // `decode_thread_count` below with the table showing why they differ. One
+    // file owning both is what keeps a compute path from quietly acquiring the
+    // decode budget, which is exactly what the open-coded fallback did.
+    return parallel_threads != 0 ? parallel_threads : compute_thread_count();
 }
 
 auto compute_thread_count() -> std::size_t {

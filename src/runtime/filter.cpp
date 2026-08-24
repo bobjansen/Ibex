@@ -3154,8 +3154,7 @@ auto select_bounds_morsels(const ExecutionContext& exec, std::size_t rows) -> st
         return 1;
     }
     const std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
-    const std::size_t budget =
-        exec.parallel_threads != 0 ? exec.parallel_threads : process_worker_pool().size();
+    const std::size_t budget = exec.compute_budget();
     return std::min({morsels, budget, process_worker_pool().size()});
 }
 

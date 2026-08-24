@@ -3016,8 +3016,7 @@ class ChunkedDistinctOperator final : public Operator {
             // spawns its threads eagerly, and a `IBEX_PARALLEL=0` query must
             // not pay for them just to be told it is serial.
             const std::size_t pool_size = process_worker_pool().size();
-            const std::size_t budget =
-                exec_->parallel_threads != 0 ? exec_->parallel_threads : pool_size;
+            const std::size_t budget = exec_->compute_budget();
             const std::size_t workers = std::min({budget, pool_size, std::size_t{64}});
             if (workers < 2) {
                 return false;
@@ -3427,8 +3426,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return 0;
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        const std::size_t budget = exec_->compute_budget();
         std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         workers = std::min(workers, std::max<std::size_t>(kSlotBudgetBytes / slots, 1));
         return workers < 2 ? 0 : workers;
@@ -3688,8 +3686,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return serial_select();
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            (exec_->parallel_threads != 0) ? exec_->parallel_threads : pool.size();
+        const std::size_t budget = exec_->compute_budget();
         const std::size_t workers = std::min(budget, pool.size());
         // `submit` CLAMPS its worker count to the pool size, so a range count
         // above it would leave those ranges unvisited and silently drop rows.
@@ -5090,8 +5087,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return 0;
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        const std::size_t budget = exec_->compute_budget();
         const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         return workers < 2 ? 0 : workers;
     }
@@ -6513,16 +6509,14 @@ class ChunkedAggregateOperator final : public Operator {
                 return false;
             }
             auto& pool0 = process_worker_pool();
-            const std::size_t budget0 =
-                exec_->parallel_threads != 0 ? exec_->parallel_threads : pool0.size();
+            const std::size_t budget0 = exec_->compute_budget();
             if (std::min(budget0, pool0.size()) < 2) {
                 return false;
             }
         }
 
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        const std::size_t budget = exec_->compute_budget();
         const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         std::size_t part_count = 1;
         while (part_count * 2 <= workers) {
@@ -7141,8 +7135,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size();
+        const std::size_t budget = exec_->compute_budget();
         std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
         if (workers < 2) {
             return false;
@@ -7390,8 +7383,7 @@ class ChunkedAggregateOperator final : public Operator {
             return false;
         }
         auto& pool = process_worker_pool();
-        const std::size_t threads = std::min(
-            std::size_t{16}, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        const std::size_t threads = std::min(std::size_t{16}, exec_->compute_budget());
         if (threads < 2) {
             return false;
         }
@@ -8005,8 +7997,7 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<double> partial_scratch(morsels * scratch_span, 0.0);
 
         auto& pool = process_worker_pool();
-        const std::size_t threads =
-            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        const std::size_t threads = std::min(morsels, exec_->compute_budget());
         std::atomic<std::size_t> cursor{0};
         auto batch = pool.submit(threads, [&](std::size_t) {
             while (true) {
@@ -8376,8 +8367,7 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
 
         auto& pool = process_worker_pool();
-        const std::size_t threads =
-            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        const std::size_t threads = std::min(morsels, exec_->compute_budget());
         std::atomic<std::size_t> cursor{0};
         auto batch = pool.submit(threads, [&](std::size_t) {
             std::vector<std::uint8_t> local_seen(dict_size, 0);
@@ -8653,8 +8643,7 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<double> ung_scratch(morsels * scratch_stride_, 0.0);
 
         auto& pool = process_worker_pool();
-        const std::size_t threads =
-            std::min(morsels, exec_->parallel_threads != 0 ? exec_->parallel_threads : pool.size());
+        const std::size_t threads = std::min(morsels, exec_->compute_budget());
         std::atomic<std::size_t> cursor{0};
         auto batch = pool.submit(threads, [&](std::size_t) {
             while (true) {
@@ -8952,9 +8941,7 @@ class ChunkedAggregateOperator final : public Operator {
         // thread is about to do anyway, so it stays serial.
         auto& pool = process_worker_pool();
         const std::size_t threads =
-            std::min(n_out_columns, (exec_ != nullptr && exec_->parallel_threads != 0)
-                                        ? exec_->parallel_threads
-                                        : pool.size());
+            std::min(n_out_columns, exec_ != nullptr ? exec_->compute_budget() : pool.size());
         if (exec_ != nullptr && exec_->parallel && !on_worker_pool_thread() && threads > 1 &&
             n_groups_ >= exec_->parallel_min_rows) {
             std::atomic<std::size_t> cursor{0};
@@ -10185,7 +10172,7 @@ auto morsel_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t
     constexpr std::size_t kMaxGrain = 65536;
 
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t threads = std::max<std::size_t>(std::min(budget, pool_size), 1);
     return std::clamp(rows / (threads * kMorselsPerThread), kMinGrain, kMaxGrain);
 }
@@ -10258,8 +10245,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         // the environment rather than `process_worker_pool().size()`, so that
         // asking for a profile never constructs a pool a serial query would
         // otherwise never have built.
-        const std::size_t budget =
-            exec.parallel_threads != 0 ? exec.parallel_threads : compute_thread_count();
+        const std::size_t budget = exec.compute_budget();
         exec.execution_profile = std::make_shared<ExecutionProfileState>(budget);
     }
     if (const std::size_t grain = morsel_rows_from_env(); grain > 0) {
@@ -11407,7 +11393,7 @@ class TwoPhaseFilterOperator final : public Operator {
     // construct-before-declining hazard because a parallel query has already
     // built it (or is about to, on its first fan-out).
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t workers =
         std::min({budget, pool_size, static_cast<std::size_t>(morsel_count)});
     return workers < 2 ? 0 : workers;
@@ -11749,7 +11735,7 @@ class DeferredScanSourceOperator final : public Operator {
             return 1;
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget = exec.parallel_threads != 0 ? exec.parallel_threads : pool.size();
+        const std::size_t budget = exec.compute_budget();
         return std::max<std::size_t>(1, std::min(budget, pool.size()));
     }
 
@@ -12566,10 +12552,11 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // Deciding here, before the run is entered, is what skips it.
     //
     // The budget alone is consulted, never the pool: constructing it spawns
-    // threads a declining query would never use. `parallel_threads == 0` means
-    // an unconfigured caller-built context, which keeps today's behaviour
-    // rather than having a budget guessed for it.
-    const bool budget_can_fan_out = exec.parallel_threads != 1;
+    // threads a declining query would never use. `compute_budget()` answers
+    // without touching it, and answers for an unconfigured context too -- on a
+    // single-core box that is a budget of one just as surely as an explicit
+    // `IBEX_CORES=1` is.
+    const bool budget_can_fan_out = exec.compute_budget() >= 2;
     if (exec.parallel && budget_can_fan_out &&
         plan.mode == physical::PipelineMode::MorselParallel && index == plan.parallel_begin) {
         physical::note_map_pipeline_executed();

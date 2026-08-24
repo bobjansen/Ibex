@@ -612,6 +612,29 @@ struct ExecutionContext {
     /// count.
     std::size_t parallel_threads = 0;
 
+    /// How many compute threads this query may ask for. **Use this rather than
+    /// reading `parallel_threads` directly**; every compute fan-out went
+    /// through the same hand-spelled ternary before it existed, and they did
+    /// not all spell it the same way.
+    ///
+    /// `parallel_threads` when set, `compute_thread_count()` when it is 0. The
+    /// zero case is a caller-built context that never passed through
+    /// `configure_parallel_from_env`, and it is the reason this is a function:
+    /// the ~28 sites that open-coded it fell back to the process pool's size,
+    /// which is sized for DECODE and deliberately larger than the core count
+    /// (`decode_thread_count`). So an unconfigured context silently handed
+    /// every compute path the decode budget -- the oversubscription that same
+    /// function measures at q01 +4.6%, q17 +3.2% -- while the field's own
+    /// documentation said compute paths must not rely on that fallback. No
+    /// in-tree caller reaches it (all four run `configure_parallel_from_env`),
+    /// so this closes a trap rather than fixing a live bug.
+    ///
+    /// This answers only "how many compute threads may I ask for". Clamping to
+    /// what the pool can actually supply stays with the caller, which is also
+    /// where the decode side differs: `scan_pipeline_worker_count` draws on the
+    /// whole pool on purpose and must not use this.
+    [[nodiscard]] auto compute_budget() const -> std::size_t;
+
     /// The plan's grain-size serial threshold: an pipeline input smaller than
     /// this stays on the serial morsel chain rather than paying task,
     /// synchronization, and merge overhead to parallelize cache-resident work.

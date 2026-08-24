@@ -136,8 +136,7 @@ void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
         !on_worker_pool_thread()) {
         const std::size_t min_rows = std::max<std::size_t>(exec->parallel_min_rows, 1);
         auto& pool = process_worker_pool();
-        const std::size_t budget =
-            exec->parallel_threads != 0 ? exec->parallel_threads : pool.size();
+        const std::size_t budget = exec->compute_budget();
         ranges = std::clamp<std::size_t>(n / min_rows, 1, kMaxRanges);
         ranges = std::min({ranges, budget, pool.size()});
     }
@@ -509,8 +508,10 @@ template <typename GatherWhole>
     std::vector<GatheredColumn> out(jobs.size());
 
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget =
-        (exec != nullptr && exec->parallel_threads != 0) ? exec->parallel_threads : pool_size;
+    // `exec` is checked for null by `worth_it` below, so the budget must be
+    // null-safe rather than assume it: the value is unused when there is no
+    // context, but reading it is not.
+    const std::size_t budget = exec != nullptr ? exec->compute_budget() : pool_size;
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
         exec != nullptr && exec->parallel && !on_worker_pool_thread() && threads >= 2 &&

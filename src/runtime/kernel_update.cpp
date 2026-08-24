@@ -2154,8 +2154,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     }
     const std::size_t morsels = (rows + grain - 1) / grain;
     auto& pool = process_worker_pool();
-    const std::size_t threads =
-        std::min(morsels, exec.parallel_threads != 0 ? exec.parallel_threads : pool.size());
+    const std::size_t threads = std::min(morsels, exec.compute_budget());
     if (threads < 2 || morsels < 2) {
         return std::optional<ComputedColumn>{};
     }

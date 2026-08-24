@@ -43,8 +43,11 @@ struct ColumnKernelSignature;
 /// `source_signature` is null only for compatibility callers outside a
 /// physical plan (parallel islands); a physical map pipeline passes its
 /// resolved source representations so construction can select a route once.
+
+struct MapStep;
+
 using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(
-    const ir::Node&, OperatorPtr, const ScalarRegistry*, const ExternRegistry*,
+    const MapStep&, OperatorPtr, const ScalarRegistry*, const ExternRegistry*,
     const ExecutionContext&, const std::vector<ColumnKernelSignature>*,
     bool preserve_empty_morsels);
 
@@ -55,6 +58,11 @@ using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(
 /// alike.
 struct MapStep {
     const ir::Node* node = nullptr;
+    /// A second IR node this step executes in the same pass — the `Project`
+    /// above a `Filter`, fused by the planner rather than by canonicalize.
+    /// Null for an unfused step, including one whose node is already a fused
+    /// IR kind.
+    const ir::Node* fused = nullptr;
     MapKernelCapability capability = MapKernelCapability::FilterGather;
     MapKernelFactory factory = nullptr;
 

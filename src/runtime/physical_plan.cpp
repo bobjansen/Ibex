@@ -38,6 +38,54 @@ auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
     }
 }
 
+/// Printable name for the breaker feeding a `MaterializedInput` pipeline. The
+/// common breakers are named; anything else prints its numeric kind, which is
+/// enough to look up and better than claiming a name this table does not know.
+auto source_node_kind_name(ir::NodeKind kind) -> std::string_view {
+    switch (kind) {
+        case ir::NodeKind::Join:
+            return "Join";
+        case ir::NodeKind::Aggregate:
+            return "Aggregate";
+        case ir::NodeKind::Order:
+            return "Order";
+        case ir::NodeKind::Distinct:
+            return "Distinct";
+        case ir::NodeKind::TopK:
+            return "TopK";
+        case ir::NodeKind::Head:
+            return "Head";
+        case ir::NodeKind::Tail:
+            return "Tail";
+        case ir::NodeKind::FilterHead:
+            return "FilterHead";
+        case ir::NodeKind::FilterTail:
+            return "FilterTail";
+        case ir::NodeKind::Window:
+            return "Window";
+        case ir::NodeKind::Resample:
+            return "Resample";
+        case ir::NodeKind::Ascribe:
+            return "Ascribe";
+        case ir::NodeKind::Melt:
+            return "Melt";
+        case ir::NodeKind::Dcast:
+            return "Dcast";
+        case ir::NodeKind::Rbind:
+            return "Rbind";
+        case ir::NodeKind::Construct:
+            return "Construct";
+        case ir::NodeKind::Columns:
+            return "Columns";
+        case ir::NodeKind::Update:
+            return "Update";
+        case ir::NodeKind::Stream:
+            return "Stream";
+        default:
+            return "Other";
+    }
+}
+
 auto representation_name(ColumnRepresentation representation) -> std::string_view {
     switch (representation) {
         case ColumnRepresentation::FixedWidth:
@@ -74,9 +122,9 @@ auto is_map_step(const ir::Node& node) -> bool {
     return map_kernel_capability(node).has_value();
 }
 
-/// Whether `node` can serve as a pipeline source, and with which kind.
-/// Anything else ends the walk and the plan records `NonSourceInput` — the
-/// subtree keeps the existing executor, whatever it is.
+/// Whether `node` is a scan-like source, and with which kind. Anything else is
+/// a pipeline breaker: the walk still ends there, but the subtree becomes this
+/// pipeline's materialized input rather than a reason to decline.
 auto classify_source(const ir::Node& node, const TableRegistry& registry,
                      const ExternRegistry* externs, SourceKind& kind) -> bool {
     if (node.kind() == ir::NodeKind::Scan) {
@@ -114,7 +162,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (children.size() != 1 || children.front() == nullptr) {
             // Malformed map node: leave it to the existing executor, which
             // produces the structural error message.
-            plan.reason = FallbackReason::NonSourceInput;
+            plan.source_node = cur;
+            plan.reason = FallbackReason::MalformedMapNode;
             return plan;
         }
         plan.steps.push_back(cur);
@@ -124,18 +173,30 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             // Keep a malformed internal dispatch table on the established
             // executor instead of constructing an invalid physical plan.
             plan.steps.clear();
-            plan.reason = FallbackReason::NonSourceInput;
+            plan.source_node = cur;
+            plan.reason = FallbackReason::MalformedMapNode;
             return plan;
         }
         plan.kernel_dispatch.push_back({.capability = capability, .factory = factory});
         cur = children.front().get();
     }
 
+    plan.source_node = cur;
     SourceKind source = SourceKind::TableScan;
     if (!classify_source(*cur, registry, externs, source)) {
-        plan.reason =
-            plan.steps.empty() ? FallbackReason::NotMapChain : FallbackReason::NonSourceInput;
-        return plan;
+        if (plan.steps.empty()) {
+            // Not a map chain at all — a breaker at the root is the executor's
+            // to build, and there is no pipeline here to describe.
+            plan.source_node = nullptr;
+            plan.reason = FallbackReason::NotMapChain;
+            return plan;
+        }
+        // A map chain over a breaker. The chain is a pipeline; the breaker is
+        // its source, materialized by the existing executor. Constructing it is
+        // what the per-kind switch does for this subtree anyway -- the source
+        // goes through the public `build_operator` either way -- so this
+        // records the shape rather than changing it.
+        source = SourceKind::MaterializedInput;
     }
     if (plan.steps.empty()) {
         // A bare source: no map work to migrate, and the Scan/ExternCall
@@ -144,7 +205,6 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         return plan;
     }
     plan.source = source;
-    plan.source_node = cur;
     if (source == SourceKind::TableScan) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         const auto& scan = static_cast<const ir::ScanNode&>(*cur);
@@ -167,8 +227,8 @@ auto fallback_reason_name(FallbackReason reason) -> std::string_view {
             return "root is not a row-local map";
         case FallbackReason::EmptyChain:
             return "bare source, no map steps";
-        case FallbackReason::NonSourceInput:
-            return "map chain input is not a source";
+        case FallbackReason::MalformedMapNode:
+            return "map node is structurally malformed";
     }
     return "unknown";
 }
@@ -205,6 +265,14 @@ auto explain_physical(const Plan& plan) -> std::string {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
                 out += static_cast<const ir::ExternCallNode&>(*plan.source_node).callee();
             }
+            out += ")";
+            break;
+        case SourceKind::MaterializedInput:
+            // Naming the breaker's kind is what makes this plan inspectable:
+            // "which operator feeds this pipeline" is the question a reader has.
+            out += "MaterializedInput(";
+            out +=
+                plan.source_node != nullptr ? source_node_kind_name(plan.source_node->kind()) : "?";
             out += ")";
             break;
     }

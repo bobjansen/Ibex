@@ -2510,20 +2510,33 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
         }
         return output;
     };
-    if (!exec.parallel && fields.size() > 1) {
+    // Fold the fields one at a time, each planned against the chunk the
+    // previous one produced. `attempt` is the per-field route, so serial and
+    // parallel mode differ only in which one they fold with -- the ordering and
+    // the all-or-nothing rule are the same in both.
+    const auto fold_fields = [&](auto&& attempt) -> std::optional<Chunk> {
         Chunk current = input;
-        bool all_direct = true;
         for (const auto& field : fields) {
             const std::vector<ir::FieldSpec> one_field{field};
-            auto next = try_direct_update_field(current, one_field, scalars);
+            auto next = attempt(current, one_field);
             if (!next.has_value()) {
-                all_direct = false;
-                break;
+                return std::nullopt;
             }
             current = std::move(*next);
         }
-        if (all_direct) {
-            return direct(std::move(current), fields.size());
+        return current;
+    };
+    if (fields.size() > 1) {
+        auto folded =
+            exec.parallel
+                ? fold_fields([&](const Chunk& current, const std::vector<ir::FieldSpec>& one) {
+                      return try_direct_update_field_parallel(current, one, scalars, exec);
+                  })
+                : fold_fields([&](const Chunk& current, const std::vector<ir::FieldSpec>& one) {
+                      return try_direct_update_field(current, one, scalars);
+                  });
+        if (folded.has_value()) {
+            return direct(std::move(*folded), fields.size());
         }
     }
     if (!exec.parallel) {

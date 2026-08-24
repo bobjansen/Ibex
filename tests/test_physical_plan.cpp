@@ -46,8 +46,8 @@ auto serial_exec() -> runtime::ExecutionContext {
     return exec;
 }
 
-/// The plan borrows the IR it was lowered from (like
-/// ParallelIslandCandidate) — keep the tree alive alongside the plan.
+/// The plan borrows the IR it was lowered from — keep the tree alive
+/// alongside the plan.
 auto serial_plan(const char* source) -> std::pair<ir::NodePtr, runtime::physical::Plan> {
     auto ir = require_ir(source);
     auto plan = runtime::physical::plan_physical(*ir, trades_registry(), nullptr);
@@ -166,47 +166,55 @@ TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "
     REQUIRE(text.find("source: MaterializedInput(Distinct)") != std::string::npos);
 }
 
-// The plan's execution mode has to be the same verdict `analyze_parallel_island`
-// reaches by walking the IR itself — that equality is what lets the island
-// become a mode of a pipeline instead of a second analysis. Checked over the
-// shapes that exercise every rule: eligible chains, the Update boundary, the
-// metadata-only chain, an expression a morsel cannot evaluate, a chain over a
-// breaker, and a root that is no chain at all.
-TEST_CASE("Pipeline mode agrees with the island analysis", "[physical][plan][parallel]") {
-    const auto check = [](const char* source) {
-        const auto [tree, plan] = serial_plan(source);
-        const auto island = runtime::analyze_parallel_island(*tree);
-        INFO(source);
-        REQUIRE((plan.migrated && plan.mode == runtime::physical::PipelineMode::MorselParallel) ==
-                island.eligible());
-        if (!island.eligible()) {
-            return;
-        }
-        // `operators` is source-to-sink; the plan records steps sink-first.
-        REQUIRE(plan.parallel_steps == island.operators.size());
-        for (std::size_t i = 0; i < island.operators.size(); ++i) {
-            REQUIRE(plan.steps[plan.parallel_steps - 1 - i] == island.operators[i]);
-        }
-        REQUIRE(runtime::physical::parallel_input_node(plan) == island.input);
+// The rules the plan applies when it decides its own mode, over the shapes that
+// exercise each one. This case was written as a differential check against the
+// island analysis while both existed; with that analysis deleted it states
+// the expected verdicts directly, which is what it was proving all along.
+TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][parallel]") {
+    using runtime::physical::PipelineMode;
+    using runtime::physical::SerialOnlyReason;
+
+    struct Case {
+        const char* source;
+        bool parallel;
+        std::size_t parallel_steps;
+        SerialOnlyReason reason;
+    };
+    const Case cases[] = {
+        {"trades[filter price > 5];", true, 1, SerialOnlyReason::None},
+        {"trades[filter price > 15, select { price }];", true, 1, SerialOnlyReason::None},
+        {"trades[filter price > 5][rename { p = price }];", true, 2, SerialOnlyReason::None},
+        // Over a breaker: a pipeline since 32f62261, and one that may run over
+        // morsels — the breaker's output is materialized either way.
+        {"trades[distinct { symbol, price }][filter price > 5];", true, 1, SerialOnlyReason::None},
+        {"trades[select { total = sum(price) }, by { symbol }][filter total > 5];", true, 1,
+         SerialOnlyReason::None},
+        // Metadata-only: nothing per-row to spread.
+        {"trades[select { price }];", false, 0, SerialOnlyReason::NoRowWork},
+        {"trades[rename { p = price }];", false, 0, SerialOnlyReason::NoRowWork},
+        // A bare row-local update is a map step and deliberately not a parallel
+        // one, so it bounds the prefix instead of joining it.
+        {"trades[update { p2 = price * 2 }];", false, 0, SerialOnlyReason::NotParallelMap},
+        {"trades[update { p2 = price * 2 }][filter p2 > 5];", true, 1, SerialOnlyReason::None},
     };
 
-    check("trades[filter price > 5];");
-    check("trades[filter price > 15, select { price }];");
-    check("trades[filter price > 5][rename { p = price }];");
-    // Metadata-only: no per-row work to spread.
-    check("trades[select { price }];");
-    check("trades[rename { p = price }];");
-    // A bare row-local update is a map step and deliberately not a parallel
-    // one, so it bounds the prefix rather than joining it.
-    check("trades[update { p2 = price * 2 }];");
-    check("trades[update { p2 = price * 2 }][filter p2 > 5];");
-    // Over a breaker, which is a pipeline since 32f62261 and was always an
-    // eligible island.
-    check("trades[distinct { symbol, price }][filter price > 5];");
-    check("trades[select { total = sum(price) }, by { symbol }][filter total > 5];");
-    // Not a map chain at all.
-    check("trades[order { price }];");
-    check("trades;");
+    for (const auto& test : cases) {
+        INFO(test.source);
+        const auto [tree, plan] = serial_plan(test.source);
+        REQUIRE(plan.migrated);
+        REQUIRE((plan.mode == PipelineMode::MorselParallel) == test.parallel);
+        REQUIRE(plan.parallel_steps == test.parallel_steps);
+        REQUIRE(plan.serial_reason == test.reason);
+        REQUIRE((runtime::physical::parallel_input_node(plan) != nullptr) == test.parallel);
+    }
+
+    // Roots that are no pipeline at all never claim a mode.
+    for (const char* source : {"trades[order { price }];", "trades;"}) {
+        INFO(source);
+        const auto [tree, plan] = serial_plan(source);
+        REQUIRE_FALSE(plan.migrated);
+        REQUIRE(plan.mode == PipelineMode::Serial);
+    }
 }
 
 TEST_CASE("A pipeline's mode names the step that bounds it", "[physical][plan][parallel]") {

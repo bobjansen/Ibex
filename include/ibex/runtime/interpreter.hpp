@@ -581,10 +581,11 @@ struct ExecutionContext {
     /// prints it when the query's last execution context/operator releases it.
     std::shared_ptr<ExecutionProfileState> execution_profile{};
 
-    /// Runtime-multithreading Phase 1. When set, `build_operator()` consults
-    /// `analyze_parallel_island()` at its seam and, for an eligible row-local
-    /// parallel-map chain, executes it over morsels of the materialized island
-    /// input instead of a single whole-table chunk. Whether those morsels run
+    /// Runtime-multithreading Phase 1. When set, `build_operator()` plans a
+    /// physical pipeline at its seam and, for one whose mode is
+    /// `MorselParallel`, executes its parallel prefix over morsels of the
+    /// materialized pipeline input instead of a single whole-table chunk.
+    /// Whether those morsels run
     /// on worker threads or serially is decided per island by the size
     /// thresholds below; either way an ordered merger emits results in morsel
     /// `sequence` order, so output is byte-identical to the plain serial path.

@@ -5,7 +5,6 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
-#include <algorithm>
 #include <array>
 #include <type_traits>
 
@@ -140,53 +139,6 @@ auto execution_capability(const ir::Node& node) -> ExecutionCapability {
     // data-dependent, so they cannot presize an output, and the island's
     // ordered merger is what resolves that.
     return execution_capability(node.kind());
-}
-
-auto analyze_parallel_island(const ir::Node& root) -> ParallelIslandCandidate {
-    ParallelIslandCandidate candidate;
-    const ir::Node* current = &root;
-
-    while (execution_capability(*current) == ExecutionCapability::ParallelMap) {
-        if (!map_step_expressions_are_subset_evaluable(*current)) {
-            candidate.reason = ParallelEligibilityReason::UnsupportedExpression;
-            return candidate;
-        }
-        if (current->children().size() != 1 || current->children().front() == nullptr) {
-            candidate.reason = ParallelEligibilityReason::UnsupportedShape;
-            return candidate;
-        }
-        candidate.operators.push_back(current);
-        current = current->children().front().get();
-    }
-
-    if (candidate.operators.empty()) {
-        candidate.reason = ParallelEligibilityReason::NotParallelMap;
-        return candidate;
-    }
-
-    // A chain of nothing but Project/Rename has no per-row work in it, so an
-    // island would gather every morsel and concatenate the results — two whole
-    // table copies — in order to parallelize what is a pointer assignment per
-    // column. Measured on 20M rows across six columns, a bare `select` went
-    // from 0.65-0.83s serial to 1.20-1.36s as an island, and a bare `rename`
-    // from 0.68-0.72s to 1.31-1.45s.
-    //
-    // They stay ParallelMap rather than being demoted, because a `select` or
-    // `rename` sitting above a filter belongs in that filter's island: it is
-    // free there, and excluding it would split the chain and materialize
-    // between the two halves.
-    if (std::ranges::all_of(candidate.operators, [](const ir::Node* node) {
-            return is_metadata_only_node(node->kind());
-        })) {
-        candidate.operators.clear();
-        candidate.reason = ParallelEligibilityReason::NoRowWork;
-        return candidate;
-    }
-
-    std::reverse(candidate.operators.begin(), candidate.operators.end());
-    candidate.input = current;
-    candidate.reason = ParallelEligibilityReason::Eligible;
-    return candidate;
 }
 
 }  // namespace ibex::runtime

@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <string>
 
 #include "physical_plan.hpp"
@@ -135,19 +136,33 @@ TEST_CASE("Physical plan declines breakers and grouped updates with reasons", "[
     REQUIRE_FALSE(grouped.migrated);
     REQUIRE(grouped.reason == runtime::physical::FallbackReason::NotMapChain);
 
-    // A map chain whose input is another operator, not a source.
-    const auto [over_distinct_tree, over_distinct] = serial_plan(
-        "trades[distinct { symbol, price }]"
-        "[filter price > 5];");
-    REQUIRE(over_distinct.migrated == false);
-    REQUIRE(over_distinct.reason == runtime::physical::FallbackReason::NonSourceInput);
-    REQUIRE(over_distinct.steps.size() == 1);
-    REQUIRE(over_distinct.steps.front()->kind() == ir::NodeKind::Filter);
-
     // A bare source has no map work to migrate.
     const auto [bare_tree, bare] = serial_plan("trades;");
     REQUIRE_FALSE(bare.migrated);
     REQUIRE(bare.reason == runtime::physical::FallbackReason::EmptyChain);
+}
+
+// A map chain over a breaker is a pipeline whose source is that breaker's
+// materialized output -- the relationship a breaker has to the pipeline above
+// it -- rather than a reason to decline. The breaker itself keeps the existing
+// executor; the plan describes the chain over it.
+TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "[physical][plan]") {
+    const auto [tree, plan] = serial_plan(
+        "trades[distinct { symbol, price }]"
+        "[filter price > 5];");
+    REQUIRE(plan.migrated);
+    REQUIRE(plan.source == runtime::physical::SourceKind::MaterializedInput);
+    REQUIRE(plan.steps.size() == 1);
+    REQUIRE(plan.steps.front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.source_node != nullptr);
+    REQUIRE(plan.source_node->kind() == ir::NodeKind::Distinct);
+    // No registered-scan signature to prove a representation with, so the
+    // filter keeps the compatibility route exactly as it did when this shape
+    // was a fallback.
+    REQUIRE(plan.source_signature.empty());
+
+    const std::string text = runtime::physical::explain_physical(plan);
+    REQUIRE(text.find("source: MaterializedInput(Distinct)") != std::string::npos);
 }
 
 TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical][explain]") {
@@ -256,6 +271,26 @@ TEST_CASE("Fallback queries keep their existing executor under the planner",
     REQUIRE((*symbols)[1] == "B");
     REQUIRE((*totals)[0] == 40);
     REQUIRE((*totals)[1] == 20);
+}
+
+// The execution-level half of the materialized-input plan: the chain runs
+// through the physical planner, and the breaker below it is built by the
+// existing executor as it always was.
+TEST_CASE("A pipeline over a breaker executes through the physical planner",
+          "[physical][execute]") {
+    const auto registry = trades_registry();
+    auto ir = require_ir(
+        "trades[distinct { symbol, price }]"
+        "[filter price > 5];");
+    const runtime::ExecutionContext exec = serial_exec();
+
+    const auto before = runtime::physical::physical_map_pipelines();
+    const auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+    REQUIRE(result.has_value());
+    REQUIRE(runtime::physical::physical_map_pipelines() > before);
+    const auto* prices = std::get_if<Column<std::int64_t>>(result->find("price"));
+    REQUIRE(prices != nullptr);
+    REQUIRE(std::ranges::all_of(*prices, [](std::int64_t price) { return price > 5; }));
 }
 
 TEST_CASE("Migrated pipelines handle every column representation", "[physical][execute]") {

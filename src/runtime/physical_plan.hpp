@@ -24,13 +24,22 @@ namespace ibex::runtime::physical {
 /// Scope (deliberately tiny, per the plan's "first vocabulary"):
 /// a `MapPipeline` is a non-empty top-down chain of row-local map nodes
 /// (Filter, Project, Rename, row-local Update, and the fused FilterProject /
-/// FilterUpdateProject forms canonicalize produces) over a *source* — a Scan
-/// or a chunked extern call. Everything else is a `MaterializedCall`
-/// placeholder naming the logical subtree that keeps the existing executor.
+/// FilterUpdateProject forms canonicalize produces) over a source. A source is
+/// a Scan, a chunked extern call, or the materialized output of a subtree that
+/// keeps the existing executor — a pipeline breaker feeding this pipeline.
+/// Everything else is a `MaterializedCall` placeholder naming the logical
+/// subtree that keeps the existing executor.
 enum class SourceKind : std::uint8_t {
     TableScan,     ///< Scan of a table in the registry
     LazyScan,      ///< Scan resolved lazily (deferred/reader-backed)
     ExternSource,  ///< chunked extern call (read_csv, read_parquet, ...)
+    /// The materialized output of a pipeline breaker (a join, an aggregate, an
+    /// order — whatever the walk bottomed out in). The subtree keeps the
+    /// existing executor and this pipeline consumes what it produces, which is
+    /// exactly the relationship a breaker has to the pipeline above it. This is
+    /// what lets one plan describe every map chain, not only the chains that
+    /// happen to sit directly on a scan.
+    MaterializedInput,
 };
 
 enum class FallbackReason : std::uint8_t {
@@ -38,8 +47,10 @@ enum class FallbackReason : std::uint8_t {
     NotMapChain,
     /// The root is a bare source; there is no map work to migrate.
     EmptyChain,
-    /// The map chain bottoms out in something other than a source.
-    NonSourceInput,
+    /// A map node with no single child, or one whose proven capability has no
+    /// factory. Structurally broken rather than unsupported: the existing
+    /// executor owns the diagnostic.
+    MalformedMapNode,
 };
 
 /// One lowered pipeline. Immutable by convention: built by `plan_physical`,
@@ -53,6 +64,10 @@ struct Plan {
     bool migrated = false;
     FallbackReason reason = FallbackReason::NotMapChain;
     SourceKind source = SourceKind::TableScan;
+    /// The node this pipeline's input is built from: the scan or extern call
+    /// for the three scan-like kinds, and the breaker's root for
+    /// `MaterializedInput`. Recorded for every plan whose walk completed,
+    /// migrated or not.
     const ir::Node* source_node = nullptr;
     std::vector<const ir::Node*> steps;
     std::vector<MapKernelDispatch> kernel_dispatch;

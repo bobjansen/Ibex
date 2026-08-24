@@ -146,6 +146,21 @@ auto classify_source(const ir::Node& node, const TableRegistry& registry,
     return false;
 }
 
+/// The `Filter` a `Project` can be fused with: directly below it, single-child,
+/// and a plain Filter (a fused IR kind is already one step). Returns null when
+/// this node is not a fusible Project or its child is not a fusible Filter.
+auto fusible_filter_below(const ir::Node& node) -> const ir::Node* {
+    if (node.kind() != ir::NodeKind::Project || node.children().size() != 1) {
+        return nullptr;
+    }
+    const ir::Node* child = node.children().front().get();
+    if (child == nullptr || child->kind() != ir::NodeKind::Filter ||
+        child->children().size() != 1 || child->children().front() == nullptr) {
+        return nullptr;
+    }
+    return child;
+}
+
 /// Decide the pipeline's execution mode from its own steps. These are the
 /// rules the deleted island analysis applied while walking the IR itself;
 /// deciding them here means the chain is peeled once and its mode travels with
@@ -204,6 +219,24 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             plan.source_node = cur;
             plan.reason = FallbackReason::MalformedMapNode;
             return plan;
+        }
+        // Physical fusion: a Project directly over a Filter is one gather
+        // pass, not two. Canonicalize R5 already fuses this shape into a
+        // FilterProject *node*, so today this fires only on IR that reached the
+        // runtime unfused; expressing it here is what lets that logical
+        // rewrite be retired, since fusion becomes a property of the pipeline
+        // rather than of the tree (plan Phase 2 item 5).
+        if (const ir::Node* filter = fusible_filter_below(*cur); filter != nullptr) {
+            const MapKernelCapability fused_capability = MapKernelCapability::FilterProjectGather;
+            const MapKernelFactory fused_factory = map_kernel_factory(fused_capability);
+            if (fused_factory != nullptr) {
+                plan.steps.push_back({.node = filter,
+                                      .fused = cur,
+                                      .capability = fused_capability,
+                                      .factory = fused_factory});
+                cur = filter->children().front().get();
+                continue;
+            }
         }
         const MapKernelCapability capability = *map_kernel_capability(*cur);
         const MapKernelFactory factory = map_kernel_factory(capability);
@@ -306,6 +339,13 @@ auto explain_physical(const Plan& plan) -> std::string {
     for (const MapStep& step : plan.steps) {
         out += "  ";
         out += map_step_kind_name(step.node->kind());
+        if (step.fused != nullptr) {
+            // A fused step executes two IR nodes in one pass; printing only the
+            // first would make the plan look like it dropped one.
+            out += "+";
+            out += map_step_kind_name(step.fused->kind());
+            out += "(fused)";
+        }
         out += "\n";
     }
     out += "  source: ";

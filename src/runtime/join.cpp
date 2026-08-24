@@ -1990,6 +1990,47 @@ auto count_flag_source_column(const ir::Expr& expr) -> std::optional<std::string
 
 }  // namespace
 
+auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
+    -> std::optional<FusedLeftJoinCount> {
+    if (aggregate.children().empty()) {
+        return std::nullopt;
+    }
+    // Only nodes the rewrite can account for may be walked past, because it
+    // aggregates the JOIN's output directly and never builds the skipped ones.
+    // A Project selects columns the join output already has; an Update has to
+    // be vetted by `fused_left_join_counted_column`, which is why they are
+    // collected rather than counted. FilterProject and FilterUpdateProject are
+    // deliberately absent: skipping one silently dropped its predicate.
+    const ir::Node* child = aggregate.children().front().get();
+    std::vector<const ir::UpdateNode*> skipped_updates;
+    while (child != nullptr &&
+           (child->kind() == ir::NodeKind::Project || child->kind() == ir::NodeKind::Update) &&
+           !child->children().empty()) {
+        if (child->kind() == ir::NodeKind::Update) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+            skipped_updates.push_back(static_cast<const ir::UpdateNode*>(child));
+        }
+        child = child->children().front().get();
+    }
+    if (child == nullptr || child->kind() != ir::NodeKind::Join) {
+        return std::nullopt;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& join = static_cast<const ir::JoinNode&>(*child);
+    auto counted = fused_left_join_counted_column(aggregate, skipped_updates);
+    const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
+                           !join.predicate().has_value() && aggregate.group_by().size() == 1 &&
+                           aggregate.aggregations().size() == 1 &&
+                           (aggregate.aggregations().front().func == ir::AggFunc::Count ||
+                            aggregate.aggregations().front().func == ir::AggFunc::Sum) &&
+                           counted.has_value() &&
+                           aggregate.group_by().front().name == join.keys().front().left;
+    if (!candidate) {
+        return std::nullopt;
+    }
+    return FusedLeftJoinCount{.join = &join, .counted_column = std::move(*counted)};
+}
+
 auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
                                     std::span<const ir::UpdateNode* const> skipped_updates)
     -> std::optional<std::string> {

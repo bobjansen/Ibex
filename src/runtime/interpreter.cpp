@@ -573,48 +573,23 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 }
                 return aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec);
             }
-            const ir::Node* aggregate_child = &child_node;
-            // See the same walk in chunked.cpp: only nodes this rewrite can
-            // account for may be skipped, since it aggregates the join output
-            // directly. A skipped FilterProject dropped its predicate.
-            std::vector<const ir::UpdateNode*> skipped_updates;
-            while (aggregate_child != nullptr &&
-                   (aggregate_child->kind() == ir::NodeKind::Project ||
-                    aggregate_child->kind() == ir::NodeKind::Update) &&
-                   !aggregate_child->children().empty()) {
-                if (aggregate_child->kind() == ir::NodeKind::Update) {
-                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                    skipped_updates.push_back(static_cast<const ir::UpdateNode*>(aggregate_child));
+            // Same fusion the chunked path takes, from the same resolver: the
+            // skip-walk and its seven clauses were written out here and there,
+            // and the copies had already drifted.
+            if (const auto fusion = plan_fused_left_join_count(agg); fusion.has_value()) {
+                const ir::JoinNode& join = *fusion->join;
+                auto left = interpret_node(*join.children()[0], registry, scalars, externs, exec);
+                if (!left.has_value()) {
+                    return std::unexpected(std::move(left.error()));
                 }
-                aggregate_child = aggregate_child->children().front().get();
-            }
-            if (aggregate_child != nullptr && aggregate_child->kind() == ir::NodeKind::Join) {
-                const auto& join = static_cast<const ir::JoinNode&>(*aggregate_child);
-                auto counted = fused_left_join_counted_column(agg, skipped_updates);
-                const bool candidate =
-                    join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
-                    !join.predicate().has_value() && agg.group_by().size() == 1 &&
-                    agg.aggregations().size() == 1 &&
-                    (agg.aggregations().front().func == ir::AggFunc::Count ||
-                     agg.aggregations().front().func == ir::AggFunc::Sum) &&
-                    counted.has_value() && agg.group_by().front().name == join.keys().front().left;
-                if (candidate) {
-                    auto left =
-                        interpret_node(*join.children()[0], registry, scalars, externs, exec);
-                    if (!left.has_value()) {
-                        return std::unexpected(std::move(left.error()));
-                    }
-                    auto right =
-                        interpret_node(*join.children()[1], registry, scalars, externs, exec);
-                    if (!right.has_value()) {
-                        return std::unexpected(std::move(right.error()));
-                    }
-                    const std::string counted_column = std::move(*counted);
-                    if (auto fused =
-                            left_join_count_table(join, agg, *left, *right, counted_column);
-                        fused.has_value()) {
-                        return std::move(*fused);
-                    }
+                auto right = interpret_node(*join.children()[1], registry, scalars, externs, exec);
+                if (!right.has_value()) {
+                    return std::unexpected(std::move(right.error()));
+                }
+                if (auto fused =
+                        left_join_count_table(join, agg, *left, *right, fusion->counted_column);
+                    fused.has_value()) {
+                    return std::move(*fused);
                 }
             }
             auto child = interpret_node(child_node, registry, scalars, externs, exec);

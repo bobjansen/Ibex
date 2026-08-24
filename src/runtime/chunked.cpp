@@ -9951,6 +9951,40 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
 /// `ChunkedInnerJoinOperator::initialize_pair` re-checks the actual runtime
 /// column type regardless -- this is a routing optimization, not the sole
 /// guarantee of correctness.
+/// Whether every aggregation in `agg` can be computed incrementally, and so
+/// streamed rather than materialized.
+///
+/// Named and shared for the same reason the join gates were: the physical
+/// planner has to relay this rather than restate it. Reimplementing a
+/// multi-clause eligibility test in the planner is what made it wrong about
+/// two-key joins within an hour of being written.
+auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
+    return std::ranges::all_of(agg.aggregations(), [](const ir::AggSpec& spec) {
+        switch (spec.func) {
+            case ir::AggFunc::Count:
+            case ir::AggFunc::Sum:
+            case ir::AggFunc::Min:
+            case ir::AggFunc::Max:
+            case ir::AggFunc::Mean:
+            case ir::AggFunc::Stddev:
+            case ir::AggFunc::Skew:
+            case ir::AggFunc::Kurtosis:
+            case ir::AggFunc::First:
+            case ir::AggFunc::Last:
+                // First/Last: the operators themselves gate by column type
+                // (numeric, string, categorical stream; Date/Timestamp fall to
+                // the hash operator's error path -- unreachable in practice
+                // since aggregation on those types is rejected upstream of the
+                // chunked path entirely, same as every other agg func).
+                return true;
+            default:
+                // Median/Quantile need all values; Ewma is row-order coupled --
+                // these stay on the materializing path.
+                return false;
+        }
+    });
+}
+
 auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {
     return (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
            !join.predicate().has_value() && join.keys().size() == 1 &&
@@ -13024,100 +13058,39 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (agg.children().empty()) {
             return std::unexpected("aggregate node missing child");
         }
-        bool streamable = true;
-        for (const auto& spec : agg.aggregations()) {
-            switch (spec.func) {
-                case ir::AggFunc::Count:
-                case ir::AggFunc::Sum:
-                case ir::AggFunc::Min:
-                case ir::AggFunc::Max:
-                case ir::AggFunc::Mean:
-                case ir::AggFunc::Stddev:
-                case ir::AggFunc::Skew:
-                case ir::AggFunc::Kurtosis:
-                case ir::AggFunc::First:
-                case ir::AggFunc::Last:
-                    // First/Last: the operators themselves gate by column type
-                    // (numeric, string, categorical stream; Date/Timestamp fall
-                    // to the hash operator's error path — unreachable in
-                    // practice since aggregation on those types is rejected
-                    // upstream of the chunked path entirely, same as every
-                    // other agg func).
-                    break;
-                default:
-                    // Median/Quantile need all values; Ewma is row-order
-                    // coupled — these stay on the materializing path.
-                    streamable = false;
-                    break;
+        const bool streamable = aggregate_is_streamable(agg);
+        // The fusion is resolved once, by name: two logical nodes -- this
+        // aggregate and the join below it -- executed as one physical step.
+        // The skip-walk and the seven clauses used to be spelled out here and
+        // again in interpreter.cpp.
+        if (const auto fusion = plan_fused_left_join_count(agg); fusion.has_value()) {
+            const ir::JoinNode& join = *fusion->join;
+            const std::string& counted_column = fusion->counted_column;
+            auto left = materialize_row_local(*join.children()[0], registry, scalars, externs, exec,
+                                              model_out);
+            if (!left.has_value()) {
+                return std::unexpected(std::move(left.error()));
             }
-            if (!streamable) {
-                break;
+            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
+                                               exec, model_out);
+            if (!right.has_value()) {
+                return std::unexpected(std::move(right.error()));
             }
-        }
-        const ir::Node* aggregate_child = agg.children().front().get();
-        // Only nodes this rewrite can account for may be walked past, because
-        // what follows aggregates the JOIN's output directly and never builds
-        // the skipped nodes. A Project selects columns the join output already
-        // has; an Update has to be vetted by `fused_left_join_counted_column`,
-        // which is why they are collected rather than merely counted.
-        //
-        // FilterProject and FilterUpdateProject used to be skipped here too,
-        // and that silently dropped their predicate: `(l left join r on k)
-        // [filter v > k][select {k, v}][select {n = sum(k)}, by k]` returned a
-        // group per join key instead of a group per surviving row.
-        std::vector<const ir::UpdateNode*> skipped_updates;
-        while (aggregate_child != nullptr &&
-               (aggregate_child->kind() == ir::NodeKind::Project ||
-                aggregate_child->kind() == ir::NodeKind::Update) &&
-               !aggregate_child->children().empty()) {
-            if (aggregate_child->kind() == ir::NodeKind::Update) {
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                skipped_updates.push_back(static_cast<const ir::UpdateNode*>(aggregate_child));
+            if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
+                fused.has_value()) {
+                return make_table_source(std::move(*fused));
             }
-            aggregate_child = aggregate_child->children().front().get();
-        }
-        if (streamable && aggregate_child != nullptr &&
-            aggregate_child->kind() == ir::NodeKind::Join) {
-            const auto& join = static_cast<const ir::JoinNode&>(*aggregate_child);
-            // Null when an update between the aggregate and the join computes
-            // something this rewrite cannot reproduce from the join output.
-            auto counted = fused_left_join_counted_column(agg, skipped_updates);
-            const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
-                                   !join.predicate().has_value() && agg.group_by().size() == 1 &&
-                                   agg.aggregations().size() == 1 &&
-                                   (agg.aggregations().front().func == ir::AggFunc::Count ||
-                                    agg.aggregations().front().func == ir::AggFunc::Sum) &&
-                                   counted.has_value() &&
-                                   agg.group_by().front().name == join.keys().front().left;
-            if (candidate) {
-                auto left = materialize_row_local(*join.children()[0], registry, scalars, externs,
-                                                  exec, model_out);
-                if (!left.has_value()) {
-                    return std::unexpected(std::move(left.error()));
-                }
-                auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                                   exec, model_out);
-                if (!right.has_value()) {
-                    return std::unexpected(std::move(right.error()));
-                }
-                const std::string counted_column = std::move(*counted);
-                if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
-                    fused.has_value()) {
-                    return make_table_source(std::move(*fused));
-                }
-                auto joined =
-                    join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
-                                    compute_mask, join.suffix(), join.pending_order(),
-                                    join.null_match(), join.expect(), join.take(), &exec);
-                if (!joined.has_value()) {
-                    return std::unexpected(std::move(joined.error()));
-                }
-                auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
-                if (!result.has_value()) {
-                    return std::unexpected(std::move(result.error()));
-                }
-                return make_table_source(std::move(*result));
+            auto joined = join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
+                                          compute_mask, join.suffix(), join.pending_order(),
+                                          join.null_match(), join.expect(), join.take(), &exec);
+            if (!joined.has_value()) {
+                return std::unexpected(std::move(joined.error()));
             }
+            auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
+            if (!result.has_value()) {
+                return std::unexpected(std::move(result.error()));
+            }
+            return make_table_source(std::move(*result));
         }
         if (streamable) {
             auto child_op = build_operator(*agg.children().front(), registry, scalars, externs,

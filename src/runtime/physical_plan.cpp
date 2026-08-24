@@ -116,7 +116,7 @@ auto kernel_null_policy_name(KernelNullPolicy policy) -> std::string_view {
 /// switch's own gate says so — no guard, no `by`, no tuple assignment, every
 /// field row-local (`is_row_local_update_expr`). That gate, not
 /// `execution_capability()`, is the authority here: capability encoding also
-/// declines a bare row-local Update, but for *island copy-cost* reasons
+/// declines a bare row-local Update, but for *morsel copy-cost* reasons
 /// (updates parallelize inside the operator instead), which is an execution
 /// choice the physical plan must not inherit as a shape decision.
 auto is_map_step(const ir::Node& node) -> bool {
@@ -190,14 +190,14 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
 }
 
 /// Decide the pipeline's execution mode from its own steps. These are the
-/// rules the deleted island analysis applied while walking the IR itself;
+/// rules the deleted pipeline analysis applied while walking the IR itself;
 /// deciding them here means the chain is peeled once and its mode travels with
 /// it.
 void resolve_pipeline_mode(Plan& plan) {
     // Search top-down for the outermost run of steps that may run over morsels.
     // Outermost-first is the existing policy, not a new one: when a chain's root
     // was ineligible, the per-kind recursion re-planned one node lower and took
-    // the first island it found on the way down. This finds the same run without
+    // the first pipeline it found on the way down. This finds the same run without
     // re-planning anything.
     SerialOnlyReason reason = SerialOnlyReason::NotParallelMap;
     std::size_t index = 0;

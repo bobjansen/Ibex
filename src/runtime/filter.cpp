@@ -1517,11 +1517,11 @@ auto eval_scalar_over_columns(const ir::CallExpr& call, const Table& table,
 //
 // That drift is what this abort exists to catch. It is not a wrong answer: the
 // natural alternative, evaluating whole-table and slicing, is perfectly
-// correct. It is O(morsels x rows), and therefore silent — a filter island that
+// correct. It is O(morsels x rows), and therefore silent — a filter pipeline that
 // absorbed `abs(a) > 50` re-ran `abs` over the whole 20M-row input once per
 // morsel and measured 10x slower than the serial path, with every correctness
 // test still green. The previous version of this comment asserted these
-// branches were unreachable from an island and was simply wrong; an assert
+// branches were unreachable from a pipeline and was simply wrong; an assert
 // keeps the claim honest in a way a comment demonstrably did not.
 //
 // Widening `is_range_native_expr` ahead of the evaluators lands here. Widening

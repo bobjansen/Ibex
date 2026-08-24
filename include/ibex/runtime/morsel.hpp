@@ -94,7 +94,7 @@ struct TableRangeMorsel {
 /// morsel identity (`sequence`, and `row_offset = begin`).
 ///
 /// One construction point for every morsel, whatever pulls it: the serial
-/// `PartitionedTableSource` below and the parallel island's workers must
+/// `PartitionedTableSource` below and the morsel pipeline's workers must
 /// produce byte-identical chunks for the same range, so they must not each
 /// build one. A column-less frame (e.g. a `Table(n)` scaffold) carries only its
 /// `logical_rows`; `begin == end` yields the zero-row schema/metadata carrier.
@@ -135,10 +135,10 @@ struct TableRangeMorsel {
 /// up so it can be tested, ahead of anything being built on top.
 ///
 /// It differs from `PartitionedTableSource` in owning its table rather than
-/// borrowing one: an island's morsel sources sit under a table the island
+/// borrowing one: a pipeline's morsel sources sit under a table the pipeline
 /// materialized and holds, while a plain source has nowhere else to put it.
 /// Chunks are built by `make_morsel_chunk`, the same construction point, so a
-/// chunk from here is byte-identical to the island's for the same range.
+/// chunk from here is byte-identical to the pipeline's for the same range.
 class ChunkedTableSource final : public Operator {
    public:
     ChunkedTableSource(Table table, std::size_t grain)
@@ -182,7 +182,7 @@ class ChunkedTableSource final : public Operator {
     return std::make_unique<ChunkedTableSource>(std::move(table), grain);
 }
 
-/// Number of morsels `PartitionedTableSource` (or a parallel island over the
+/// Number of morsels `PartitionedTableSource` (or a morsel pipeline over the
 /// same table) produces for `input` at `grain`. A zero-row input still yields
 /// exactly one carrier morsel.
 [[nodiscard]] inline auto partitioned_morsel_count(const Table& input, std::size_t grain)

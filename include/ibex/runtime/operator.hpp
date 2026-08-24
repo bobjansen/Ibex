@@ -281,7 +281,7 @@ class MaterializeOperator {
         // every chunk reallocates and copies the whole accumulated column, and
         // the concat becomes quadratic in the chunk count. That is invisible
         // with one chunk and dominates everything at a few hundred (a 20M-row
-        // island at a 64k grain spent 93% of its runtime in `memmove`).
+        // pipeline at a 64k grain spent 93% of its runtime in `memmove`).
         std::vector<std::size_t> reserved(n_cols, 0);
         for (std::size_t i = 0; i < n_cols; ++i) {
             reserved[i] = column_size(*result.columns[i].column);

@@ -93,9 +93,9 @@ enum class RowTransform : std::uint8_t {
 /// a TimeFrame, its `time_index`. Split out from `Table` so it can be derived
 /// and reasoned about on its own — the runtime multithreading plan (Phase 0
 /// item 3) requires these to be a planner-derived property of a parallel
-/// *island*, not an accident of whichever morsel finishes first. Worker results
+/// *pipeline*, not an accident of whichever morsel finishes first. Worker results
 /// carry only sequence/rows/schema; the ordered merger derives one
-/// `TableProperties` for the island and attaches it once to the final table.
+/// `TableProperties` for the pipeline and attaches it once to the final table.
 ///
 /// Until that merger exists, this same type and the derivation below are what
 /// the serial operators use, so there is a single set of metadata rules rather

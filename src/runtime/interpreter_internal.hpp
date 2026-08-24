@@ -1275,7 +1275,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// branches still evaluate whole-table and slice (see `slice_column` in
 /// filter.cpp), and they do not produce a wrong answer — they produce a silent
 /// O(morsels x rows) blowup, because each morsel re-evaluates the fallback over
-/// the entire table. A parallel island that absorbed such a predicate measured
+/// the entire table. A morsel pipeline that absorbed such a predicate measured
 /// 10x *slower* than the serial path it replaced.
 ///
 /// This mirrors `eval_value_vec` / `compute_mask` and has to be kept in step
@@ -1301,7 +1301,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// gives 625k rows at 20M/8 threads, which the sweep measured as clearly worse
 /// than 64k. The formula may only shrink the grain below the plateau for small
 /// inputs, never grow it past.
-[[nodiscard]] auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t;
+[[nodiscard]] auto morsel_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t;
 
 /// Filter rows `[rows.begin, rows.end())` of `input` without gathering that
 /// slice first. For a partial range the predicate must satisfy
@@ -1411,7 +1411,7 @@ void gather_selection_into(Table& output, const Table& input,
 /// gates correctness, not speed — hence the safe default rather than an
 /// optimistic one.
 ///
-/// `ParallelIslandStats::two_phase_filters` is what makes such a fallback
+/// `ParallelPipelineStats::two_phase_filters` is what makes such a fallback
 /// visible; both paths produce identical output.
 [[nodiscard]] auto filter_gather_is_thread_safe(const Table& input,
                                                 const std::vector<std::size_t>& src_of_dst) -> bool;

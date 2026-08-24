@@ -189,8 +189,8 @@ TEST_CASE("The planner fuses a project over a filter", "[physical][plan][fusion]
     REQUIRE(plan.steps.size() == 1);
     REQUIRE(plan.steps.front().capability == runtime::MapKernelCapability::FilterProjectGather);
     REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
-    REQUIRE(plan.steps.front().fused != nullptr);
-    REQUIRE(plan.steps.front().fused->kind() == ir::NodeKind::Project);
+    REQUIRE(plan.steps.front().fused_project != nullptr);
+    REQUIRE(plan.steps.front().fused_project->kind() == ir::NodeKind::Project);
     REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
     REQUIRE(runtime::physical::explain_physical(plan).find("Filter+Project(fused)") !=
             std::string::npos);
@@ -237,6 +237,77 @@ TEST_CASE("A fused step executes like the fused node", "[physical][execute][fusi
               std::vector<std::int64_t>(reference_price->begin(), reference_price->end()));
         CHECK(std::vector<std::int64_t>(fused_price->begin(), fused_price->end()) ==
               std::vector<std::int64_t>{20, 30});
+    }
+}
+
+// The three-node shape canonicalize R6 rewrites: one gather pass that filters,
+// updates, and projects. Built by hand for the same reason as the two-node
+// case — canonicalize would fuse it into a node first.
+TEST_CASE("The planner fuses a project over an update over a filter", "[physical][plan][fusion]") {
+    const auto build = [] {
+        auto scan = std::make_unique<ir::ScanNode>(ir::NodeId{4}, "trades");
+        auto filter = std::make_unique<ir::FilterNode>(
+            ir::NodeId{3},
+            ir::Expr{
+                .node = ir::CompareExpr{
+                    .op = ir::CompareOp::Gt,
+                    .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                    .right = ir::make_expr_ptr(
+                        ir::Expr{.node = ir::Literal{.value = std::int64_t{15}}})}});
+        filter->add_child(std::move(scan));
+        std::vector<ir::FieldSpec> fields;
+        fields.push_back(
+            {.alias = "doubled",
+             .expr = ir::Expr{
+                 .node = ir::BinaryExpr{
+                     .op = ir::ArithmeticOp::Mul,
+                     .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                     .right = ir::make_expr_ptr(
+                         ir::Expr{.node = ir::Literal{.value = std::int64_t{2}}})}}});
+        auto update = std::make_unique<ir::UpdateNode>(ir::NodeId{2}, std::move(fields));
+        update->add_child(std::move(filter));
+        auto project = std::make_unique<ir::ProjectNode>(
+            ir::NodeId{1}, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "doubled"}});
+        project->add_child(std::move(update));
+        return ir::NodePtr{std::move(project)};
+    };
+    const ir::NodePtr tree = build();
+
+    const auto registry = trades_registry();
+    const auto plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+    REQUIRE(plan.migrated);
+    REQUIRE(plan.steps.size() == 1);
+    REQUIRE(plan.steps.front().capability ==
+            runtime::MapKernelCapability::FilterUpdateProjectGather);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.steps.front().fused_update != nullptr);
+    REQUIRE(plan.steps.front().fused_project != nullptr);
+    REQUIRE(runtime::physical::explain_physical(plan).find("Filter+Update+Project(fused)") !=
+            std::string::npos);
+
+    // And it computes what the canonicalized node computes.
+    const auto canonical = require_ir(
+        "trades[filter price > 15][update { doubled = price * 2 }][select { doubled }];");
+    REQUIRE(canonical->kind() == ir::NodeKind::FilterUpdateProject);
+    for (const bool parallel : {false, true}) {
+        INFO("parallel: " << parallel);
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+        const auto fused = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, exec);
+        const auto reference =
+            runtime::interpret(*canonical, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(fused.has_value());
+        REQUIRE(reference.has_value());
+        const auto* fused_doubled = std::get_if<Column<std::int64_t>>(fused->find("doubled"));
+        const auto* reference_doubled =
+            std::get_if<Column<std::int64_t>>(reference->find("doubled"));
+        REQUIRE(fused_doubled != nullptr);
+        REQUIRE(reference_doubled != nullptr);
+        CHECK(fused->columns.size() == reference->columns.size());
+        CHECK(std::vector<std::int64_t>(fused_doubled->begin(), fused_doubled->end()) ==
+              std::vector<std::int64_t>(reference_doubled->begin(), reference_doubled->end()));
+        CHECK(std::vector<std::int64_t>(fused_doubled->begin(), fused_doubled->end()) ==
+              std::vector<std::int64_t>{40, 60});
     }
 }
 

@@ -297,6 +297,15 @@ rows: 3
         </div>
       </div>
     </div>
+
+    <div class="card" style="margin-top:1.2rem;">
+      <h3>More REPL commands</h3>
+      <p>
+        Use <code>:load &lt;file.ibex&gt;</code> to run a script,
+        <code>:doc &lt;name&gt;</code> to look up a language item, and
+        <code>:help</code> to see the complete command list.
+      </p>
+    </div>
   </section>
 
   <section class="section" id="transform">
@@ -308,6 +317,21 @@ rows: 3
       adds or replaces columns while keeping the rest, and <code>filter</code>
       keeps rows.
     </p>
+
+    <div class="grid-3" style="margin-bottom:1.2rem;">
+      <article class="card">
+        <h3><code>[ ]</code> pipelines</h3>
+        <p>Attach square brackets to a table for a comma-separated sequence of clauses.</p>
+      </article>
+      <article class="card">
+        <h3><code>{ }</code> field lists</h3>
+        <p>Use braces for the named fields selected, updated, or used as sort keys.</p>
+      </article>
+      <article class="card">
+        <h3><code>( )</code> calls and grouping</h3>
+        <p>Use parentheses for function calls and arithmetic grouping, as in <code>mean(price)</code>.</p>
+      </article>
+    </div>
 
     <div class="tour">
       <div class="tour-item">
@@ -612,6 +636,10 @@ cars_with_makers;</code></pre>
       <article class="card">
         <h3><a href="./comparison.html">Comparison</a></h3>
         <p>See the same queries written in Ibex, Polars, pandas, and SQL.</p>
+      </article>
+      <article class="card">
+        <h3><a href="./integrations.html">Integration guides</a></h3>
+        <p>Use Ibex from R and other host environments.</p>
       </article>
     </div>
   </section>

@@ -147,8 +147,9 @@ auto classify_source(const ir::Node& node, const TableRegistry& registry,
 }
 
 /// Decide the pipeline's execution mode from its own steps. These are the
-/// rules `analyze_parallel_island` applies while walking the IR; deciding them
-/// here means the chain is peeled once and its mode travels with it.
+/// rules the deleted island analysis applied while walking the IR itself;
+/// deciding them here means the chain is peeled once and its mode travels with
+/// it.
 void resolve_pipeline_mode(Plan& plan) {
     std::size_t prefix = 0;
     for (const ir::Node* step : plan.steps) {

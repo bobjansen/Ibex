@@ -755,6 +755,52 @@ either way -- the fields were already being split, just over the bridge. Debug
 ctest 1740/1740, `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings.
 No performance claim.
 
+**Item 4, step 1 — a breaker is a source (2026-08-24, `32f62261`).** The
+physical plan and the parallel island have stayed two analyses because the plan
+could not describe what the island executes: `plan_physical` refused any chain
+that did not bottom out in a scan or chunked extern call, so
+`trades[distinct ...][filter ...]` was a `MaterializedCall` naming the whole
+subtree, while `analyze_parallel_island` happily held that chain and
+materialized its input.
+
+The gap was a missing source kind, not a missing capability. A subtree that is
+not scan-like is a pipeline breaker, and a map chain over its output is a
+pipeline whose source is that breaker -- the relationship a breaker has to the
+pipeline above it, and the one Phase 3 needs the plan to express before an
+island can become an execution *mode* rather than a second executor.
+`SourceKind::MaterializedInput` names it; `source_node` points at the breaker's
+root; `explain_physical` prints `MaterializedInput(Distinct)` so the feeding
+operator is inspectable.
+
+Execution is unchanged by construction: `build_physical_map_step` builds its
+source through the public `build_operator` -- the same call the per-kind switch
+makes for that subtree -- and the step factories are the ones the switch already
+uses. The source signature stays empty for a breaker, and `physical_filter_route`
+treats empty and null alike, so a filter over a breaker keeps the compatibility
+route it had as a fallback. `FallbackReason::NonSourceInput` is gone: with
+breakers admitted it could only have described a structurally malformed map
+node, which `MalformedMapNode` says directly.
+
+A design note worth keeping, because the first attempt at this item went the
+wrong way: the target is to *dissolve* the island, not to derive it. Deriving a
+`ParallelIslandCandidate` from the plan and feeding the existing island builder
+was tried and abandoned before it was committed -- it keeps the island as the
+unit of parallelism and makes the planner depend on it, which is the opposite of
+the Phase 3 exit criterion.
+
+Gates: debug ctest 1742/1742, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings, and an interleaved A/B against `HEAD~1`
+(`core,null,reshape,groupagg`, 9 repeats) at geomean 1.000, median -0.18%, every
+query `noise` -- the no-regression bar this phase sets for a construction-path
+change.
+
+Remaining for item 4: (2) move the eligibility rules (ParallelMap prefix,
+subset-evaluable expressions, the no-row-work metadata rule, the deliberate
+exclusion of bare `Update`) onto the plan as its execution mode, computed once
+during lowering; (3) give `build_parallel_island` the `Plan` and delete
+`analyze_parallel_island` / `ParallelIslandCandidate`. `build_pipelined_scan`
+stays a source-side streaming mode until Phase 3 item 3.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -763,10 +809,10 @@ per-commit A/B log; the entries above are the itemized history.
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
 | 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
-| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only. The morsel executor is still reached through the island seam, not through the physical plan. **Untouched.** |
+| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. **Steps 2-3 (execution mode on the plan, then the island deleted) not started.** |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
 
-Current gates on the tree: full debug `ctest` 1740/1740, and PDS-H
+Current gates on the tree: full debug `ctest` 1742/1742, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.

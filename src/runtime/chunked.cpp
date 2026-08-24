@@ -11514,13 +11514,36 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
     const std::size_t grain = morsel_grain(exec, owned->rows());
     const auto expected_morsels = partitioned_morsel_count(*owned, grain);
-    const bool morselize = is_worth_morselizing(exec, owned->rows(), owned->columns.size());
-    const std::size_t worker_count = morselize ? morsel_worker_count(exec, expected_morsels) : 0;
+    // Morselize only when the work would actually fan out. Splitting earns its
+    // cost by having several workers share it; with fewer than two the split,
+    // the per-morsel gather and the merge concat are all paid for parallelism
+    // that was already ruled out, so the whole-table chunk below is the right
+    // shape.
+    //
+    // No time claim is attached to this: measured on its own it moved nothing
+    // (`morsels` 92 -> 0 on q12/q14, wall time unchanged), because by the time
+    // this runs the input has already been materialized. The run's real cost at
+    // a budget of one is that materialize, and it is declined at the
+    // construction seam in `build_physical_map_step` instead. What this does
+    // earn is an honest counter -- see below -- and not doing work whose only
+    // consumer is a worker that will not exist.
+    const std::size_t worker_count =
+        is_worth_morselizing(exec, owned->rows(), owned->columns.size())
+            ? morsel_worker_count(exec, expected_morsels)
+            : 0;
+    const bool morselize = worker_count >= 2;
     if (exec.parallel_stats != nullptr) {
         auto& stats = *exec.parallel_stats;
-        (worker_count >= 2 ? stats.parallel_pipelines : stats.serial_pipelines)
+        (morselize ? stats.parallel_pipelines : stats.serial_pipelines)
             .fetch_add(1, std::memory_order_relaxed);
-        stats.morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
+        if (morselize) {
+            // Only count morsels that are actually formed. Reporting the
+            // would-be split for a run that takes the whole-table chunk is what
+            // made this cost invisible: `morsels=115` on a query with
+            // `parallel=0` reads as work done, not as work paid for and thrown
+            // away.
+            stats.morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
+        }
     }
 
     if (worker_count >= 2) {
@@ -12527,8 +12550,28 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // `exec.parallel` is part of the condition, not an assumption: the plan's
     // mode says what the pipeline *may* do, and a serial run of the same plan
     // must compose every step here instead.
-    if (exec.parallel && plan.mode == physical::PipelineMode::MorselParallel &&
-        index == plan.parallel_begin) {
+    //
+    // So is the compute budget, and for the same reason. "Materializes before
+    // fanning out" is a trade: the run pays for its whole input up front to buy
+    // several workers over it. With a budget of one there is no second worker
+    // to buy, and the payment is pure loss -- the serial composer streams the
+    // same steps chunk by chunk instead. Measured at one core on PDS-H SF-1
+    // against `IBEX_PARALLEL=0`, byte-identical output on all 22 queries:
+    // q14 +150%, q19 +110%, q12 +80%, q03/q10 +50%.
+    //
+    // It is the materialize that costs, not the split. Declining only the split
+    // (`morsel_worker_count` below) was tried first and moved nothing: it took
+    // `morsels` from 92 to 0 on q12/q14 and left the time where it was, because
+    // every branch of the run builder had already materialized its input.
+    // Deciding here, before the run is entered, is what skips it.
+    //
+    // The budget alone is consulted, never the pool: constructing it spawns
+    // threads a declining query would never use. `parallel_threads == 0` means
+    // an unconfigured caller-built context, which keeps today's behaviour
+    // rather than having a budget guessed for it.
+    const bool budget_can_fan_out = exec.parallel_threads != 1;
+    if (exec.parallel && budget_can_fan_out &&
+        plan.mode == physical::PipelineMode::MorselParallel && index == plan.parallel_begin) {
         physical::note_map_pipeline_executed();
         return build_map_pipeline_parallel(plan, registry, scalars, externs, exec, model_out);
     }

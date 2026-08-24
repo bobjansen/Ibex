@@ -10312,57 +10312,70 @@ auto physical_filter_route(const ir::Expr& predicate,
     return kernel::FilterChunkRoute::NativePredicate;
 }
 
-auto build_filter_gather_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry* scalars,
+auto build_filter_gather_map(const MapStep& step, OperatorPtr child, const ScalarRegistry* scalars,
                              const ExternRegistry*, const ExecutionContext&,
                              const std::vector<ColumnKernelSignature>* source_signature,
                              bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& filter = static_cast<const ir::FilterNode&>(node);
+    const auto& filter = static_cast<const ir::FilterNode&>(*step.node);
     return std::make_unique<ChunkedFilterOperator>(
         std::move(child), &filter.predicate(), scalars,
         physical_filter_route(filter.predicate(), source_signature), preserve_empty_morsels);
 }
 
-auto build_metadata_map(const ir::Node& node, OperatorPtr child, const ScalarRegistry*,
+auto build_metadata_map(const MapStep& step, OperatorPtr child, const ScalarRegistry*,
                         const ExternRegistry*, const ExecutionContext&,
                         const std::vector<ColumnKernelSignature>*, bool)
     -> std::expected<OperatorPtr, std::string> {
-    if (node.kind() == ir::NodeKind::Project) {
-        const auto& project = static_cast<const ir::ProjectNode&>(node);
+    if (step.node->kind() == ir::NodeKind::Project) {
+        const auto& project = static_cast<const ir::ProjectNode&>(*step.node);
         return std::make_unique<ChunkedProjectOperator>(std::move(child), &project.columns());
     }
-    const auto& rename = static_cast<const ir::RenameNode&>(node);
+    const auto& rename = static_cast<const ir::RenameNode&>(*step.node);
     return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
 }
 
-auto build_row_local_update_map(const ir::Node& node, OperatorPtr child,
+auto build_row_local_update_map(const MapStep& step, OperatorPtr child,
                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
                                 const ExecutionContext& exec,
                                 const std::vector<ColumnKernelSignature>*, bool)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& update = static_cast<const ir::UpdateNode&>(node);
+    const auto& update = static_cast<const ir::UpdateNode&>(*step.node);
     return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(), scalars,
                                                    externs, exec);
 }
 
-auto build_filter_project_gather_map(const ir::Node& node, OperatorPtr child,
+auto build_filter_project_gather_map(const MapStep& step, OperatorPtr child,
                                      const ScalarRegistry* scalars, const ExternRegistry*,
                                      const ExecutionContext&,
                                      const std::vector<ColumnKernelSignature>* source_signature,
                                      bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+    // Two shapes reach one kernel: canonicalize's fused node, and a Filter the
+    // planner fused with the Project above it. The operator only ever wanted a
+    // predicate and a column list, which is why physical fusion needs no new
+    // kernel -- only a step able to name both nodes.
+    const ir::Expr* predicate = nullptr;
+    const std::vector<ir::ColumnRef>* columns = nullptr;
+    if (step.fused != nullptr) {
+        predicate = &static_cast<const ir::FilterNode&>(*step.node).predicate();
+        columns = &static_cast<const ir::ProjectNode&>(*step.fused).columns();
+    } else {
+        const auto& fp = static_cast<const ir::FilterProjectNode&>(*step.node);
+        predicate = &fp.predicate();
+        columns = &fp.columns();
+    }
     return std::make_unique<ChunkedFilterProjectOperator>(
-        std::move(child), &fp.predicate(), &fp.columns(), scalars,
-        physical_filter_route(fp.predicate(), source_signature), preserve_empty_morsels);
+        std::move(child), predicate, columns, scalars,
+        physical_filter_route(*predicate, source_signature), preserve_empty_morsels);
 }
 
 auto build_filter_update_project_gather_map(
-    const ir::Node& node, OperatorPtr child, const ScalarRegistry* scalars,
+    const MapStep& step, OperatorPtr child, const ScalarRegistry* scalars,
     const ExternRegistry* externs, const ExecutionContext& exec,
     const std::vector<ColumnKernelSignature>* source_signature, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
+    const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*step.node);
     robin_hood::unordered_set<std::string> update_outputs;
     robin_hood::unordered_set<std::string> needed;
     for (const auto& field : fup.fields()) {
@@ -10397,18 +10410,20 @@ auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFac
     return index < factories.size() ? factories[index] : nullptr;
 }
 
-auto build_row_local_map_operator(MapKernelCapability capability, const ir::Node& node,
-                                  OperatorPtr child, const ScalarRegistry* scalars,
-                                  const ExternRegistry* externs, const ExecutionContext& exec,
-                                  bool preserve_empty_morsels)
+auto build_row_local_map_operator(const MapStep& step, OperatorPtr child,
+                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                  const ExecutionContext& exec, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const MapKernelFactory factory = map_kernel_factory(capability);
+    const MapKernelFactory factory =
+        step.factory != nullptr ? step.factory : map_kernel_factory(step.capability);
     if (factory == nullptr) {
         return std::unexpected("row-local map factory: unknown kernel capability");
     }
-    return factory(node, std::move(child), scalars, externs, exec, nullptr, preserve_empty_morsels);
+    return factory(step, std::move(child), scalars, externs, exec, nullptr, preserve_empty_morsels);
 }
 
+/// One unfused node as a step. The compatibility entry point for callers
+/// outside a physical plan, which have a node and no fusion to express.
 auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   const ExecutionContext& exec, bool preserve_empty_morsels)
@@ -10417,7 +10432,9 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
     if (!capability.has_value()) {
         return std::unexpected("row-local map factory: unsupported kernel capability");
     }
-    return build_row_local_map_operator(*capability, node, std::move(child), scalars, externs, exec,
+    const MapStep step{
+        .node = &node, .capability = *capability, .factory = map_kernel_factory(*capability)};
+    return build_row_local_map_operator(step, std::move(child), scalars, externs, exec,
                                         preserve_empty_morsels);
 }
 
@@ -10531,20 +10548,25 @@ struct RangeHead {
 ///   then runs over morsel-sized data.
 /// - A column-less table, whose row count lives in the chunk's `logical_rows`
 ///   rather than in any column; only the gathering source carries that over.
-[[nodiscard]] auto range_filter_head(const ir::Node& node, const Table& input)
+[[nodiscard]] auto range_filter_head(const MapStep& step, const Table& input)
     -> std::optional<RangeHead> {
     if (input.columns.empty()) {
         return std::nullopt;
     }
-    if (node.kind() == ir::NodeKind::Filter) {
-        const auto& predicate = static_cast<const ir::FilterNode&>(node).predicate();
+    if (step.node->kind() == ir::NodeKind::Filter) {
+        const auto& predicate = static_cast<const ir::FilterNode&>(*step.node).predicate();
         if (!is_range_native_expr(predicate)) {
             return std::nullopt;
         }
-        return RangeHead{.predicate = &predicate};
+        // A planner-fused Project rides along exactly as the fused IR kind's
+        // column list does below: same head, same absorbed projection.
+        const std::vector<ir::ColumnRef>* project =
+            step.fused != nullptr ? &static_cast<const ir::ProjectNode&>(*step.fused).columns()
+                                  : nullptr;
+        return RangeHead{.predicate = &predicate, .project = project};
     }
-    if (node.kind() == ir::NodeKind::FilterProject) {
-        const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
+    if (step.node->kind() == ir::NodeKind::FilterProject) {
+        const auto& fp = static_cast<const ir::FilterProjectNode&>(*step.node);
         if (!is_range_native_expr(fp.predicate())) {
             return std::nullopt;
         }
@@ -10562,7 +10584,7 @@ struct IslandWorkerChain {
     OperatorPtr chain;
 };
 
-[[nodiscard]] auto build_island_worker_chain(const std::vector<const ir::Node*>& operators,
+[[nodiscard]] auto build_island_worker_chain(const std::vector<MapStep>& operators,
                                              const Table& input, const ScalarRegistry* scalars,
                                              const ExternRegistry* externs,
                                              const ExecutionContext& exec)
@@ -10572,7 +10594,7 @@ struct IslandWorkerChain {
     std::size_t first_op = 0;
     std::unique_ptr<MorselSource> source;
     if (!operators.empty()) {
-        if (auto head = range_filter_head(*operators.front(), input); head.has_value()) {
+        if (auto head = range_filter_head(operators.front(), input); head.has_value()) {
             source = std::make_unique<RangeFilterMorselSource>(input, head->predicate,
                                                                head->project, scalars);
             first_op = 1;
@@ -10584,13 +10606,13 @@ struct IslandWorkerChain {
 
     IslandWorkerChain worker{.source = source.get(), .chain = std::move(source)};
     for (std::size_t i = first_op; i < operators.size(); ++i) {
-        const ir::Node* op_node = operators[i];
+        const MapStep& op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly
         // one identified output morsel — the merger indexes by sequence, so a
         // silently coalesced empty result would be a lost slot, not a smaller
         // answer.
-        auto next = build_row_local_map_operator(*op_node, std::move(worker.chain), scalars,
-                                                 externs, exec, true);
+        auto next = build_row_local_map_operator(op_node, std::move(worker.chain), scalars, externs,
+                                                 exec, true);
         if (!next.has_value()) {
             // The plan's step vocabulary only admits row-local map kinds.
             return std::unexpected("parallel island: " + next.error());
@@ -11346,11 +11368,11 @@ class TwoPhaseFilterOperator final : public Operator {
 // applies in full and eligibility has to be re-established.
 /// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
 /// records steps sink-first; every executor here composes bottom-up.
-auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<const ir::Node*> {
-    std::vector<const ir::Node*> operators;
+auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapStep> {
+    std::vector<MapStep> operators;
     operators.reserve(plan.parallel_steps);
     for (std::size_t i = plan.parallel_steps; i > 0; --i) {
-        operators.push_back(plan.steps[i - 1].node);
+        operators.push_back(plan.steps[i - 1]);
     }
     return operators;
 }
@@ -11367,7 +11389,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
                                  const ScalarRegistry* scalars, const ExternRegistry* externs,
                                  const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    const std::vector<const ir::Node*> operators = parallel_pipeline_operators(plan);
+    const std::vector<MapStep> operators = parallel_pipeline_operators(plan);
     const ir::Node* input_node = physical::parallel_input_node(plan);
     if (input_node == nullptr) {
         return std::unexpected("map pipeline: parallel mode without an input");
@@ -11394,7 +11416,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
 
     if (worker_count >= 2) {
         const auto head =
-            operators.empty() ? std::nullopt : range_filter_head(*operators.front(), *owned);
+            operators.empty() ? std::nullopt : range_filter_head(operators.front(), *owned);
         if (exec.parallel_stats != nullptr && head.has_value()) {
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
@@ -11405,8 +11427,8 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         // chunks the two-phase form does not produce, but Project and Rename
         // copy no rows and so are simply run once over the finished output.
         const auto tail = std::span{operators}.subspan(head.has_value() ? 1 : 0);
-        if (head.has_value() && std::ranges::all_of(tail, [](const ir::Node* node) {
-                return is_metadata_only_node(node->kind());
+        if (head.has_value() && std::ranges::all_of(tail, [](const MapStep& step) {
+                return is_metadata_only_node(step.node->kind());
             })) {
             auto layout = build_filter_output_layout(*owned, head->project);
             // A missing projected column is left to the ordered merger below,
@@ -11415,11 +11437,17 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
                 if (exec.parallel_stats != nullptr) {
                     exec.parallel_stats->two_phase_filters.fetch_add(1, std::memory_order_relaxed);
                 }
+                // The tail is metadata-only by the check above, so no step in
+                // it carries a fused partner; its nodes are the whole story.
+                std::vector<const ir::Node*> tail_nodes;
+                tail_nodes.reserve(tail.size());
+                for (const MapStep& step : tail) {
+                    tail_nodes.push_back(step.node);
+                }
                 return std::make_unique<TwoPhaseFilterOperator>(
                     std::move(owned), *head->predicate, head->project != nullptr,
-                    std::vector<const ir::Node*>(tail.begin(), tail.end()), scalars,
-                    std::move(layout.value()), grain, expected_morsels, worker_count,
-                    process_worker_pool());
+                    std::move(tail_nodes), scalars, std::move(layout.value()), grain,
+                    expected_morsels, worker_count, process_worker_pool());
             }
         }
 
@@ -11444,8 +11472,8 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
         OperatorPtr serial = make_table_source(std::move(*owned));
-        for (const ir::Node* op_node : operators) {
-            auto next = build_row_local_map_operator(*op_node, std::move(serial), scalars, externs,
+        for (const MapStep& op_node : operators) {
+            auto next = build_row_local_map_operator(op_node, std::move(serial), scalars, externs,
                                                      exec, false);
             if (!next.has_value()) {
                 return std::unexpected("parallel island: " + next.error());
@@ -11456,9 +11484,9 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     }
 
     OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, grain);
-    for (const ir::Node* op_node : operators) {
+    for (const MapStep& op_node : operators) {
         auto next =
-            build_row_local_map_operator(*op_node, std::move(chain), scalars, externs, exec, true);
+            build_row_local_map_operator(op_node, std::move(chain), scalars, externs, exec, true);
         if (!next.has_value()) {
             // The plan's step vocabulary only admits row-local map kinds.
             return std::unexpected("parallel island: " + next.error());
@@ -11812,16 +11840,16 @@ struct ScanPipelineWorker {
     OperatorPtr chain;
 };
 
-[[nodiscard]] auto build_scan_pipeline_worker(const std::vector<const ir::Node*>& operators,
+[[nodiscard]] auto build_scan_pipeline_worker(const std::vector<MapStep>& operators,
                                               const ScalarRegistry* scalars,
                                               const ExternRegistry* externs,
                                               const ExecutionContext& exec)
     -> std::expected<ScanPipelineWorker, std::string> {
     auto source = std::make_unique<ScanPipelineSource>();
     ScanPipelineWorker worker{.source = source.get(), .chain = std::move(source)};
-    for (const ir::Node* op_node : operators) {
-        auto next = build_row_local_map_operator(*op_node, std::move(worker.chain), scalars,
-                                                 externs, exec, true);
+    for (const MapStep& op_node : operators) {
+        auto next = build_row_local_map_operator(op_node, std::move(worker.chain), scalars, externs,
+                                                 exec, true);
         if (!next.has_value()) {
             return std::unexpected("scan pipeline: " + next.error());
         }
@@ -12347,9 +12375,8 @@ class PipelinedStageOperator final : public Operator {
     return workers;
 }
 
-[[nodiscard]] auto build_pipelined_scan(const std::vector<const ir::Node*>& operators,
-                                        bool count_as_island, const DeferredScan& scan,
-                                        std::vector<SourceUnit> units,
+[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators, bool count_as_island,
+                                        const DeferredScan& scan, std::vector<SourceUnit> units,
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string> {
@@ -12427,7 +12454,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         if (!child.has_value()) {
             return child;
         }
-        return step.factory(node, std::move(child.value()), scalars, externs, exec,
+        return step.factory(step, std::move(child.value()), scalars, externs, exec,
                             &plan.source_signature, false);
     }
     auto* entry = execution_profile_entry(exec.execution_profile, node);
@@ -12436,7 +12463,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
-            result = step.factory(node, std::move(result.value()), scalars, externs, exec,
+            result = step.factory(step, std::move(result.value()), scalars, externs, exec,
                                   &plan.source_signature, false);
         }
     }

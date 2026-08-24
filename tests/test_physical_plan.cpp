@@ -164,6 +164,148 @@ TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "
 // exercise each one. This case was written as a differential check against the
 // island analysis while both existed; with that analysis deleted it states
 // the expected verdicts directly, which is what it was proving all along.
+// Fusion as a physical choice: a Project directly over a Filter is one gather
+// pass whether or not canonicalize rewrote the tree into a FilterProject node.
+// The IR here is built by hand precisely because canonicalize R5 would fuse it
+// first — this is the shape that reaches the runtime when a caller lowers
+// without the full optimizer, and the shape that remains once R5 is retired.
+TEST_CASE("The planner fuses a project over a filter", "[physical][plan][fusion]") {
+    auto scan = std::make_unique<ir::ScanNode>(ir::NodeId{3}, "trades");
+    auto filter = std::make_unique<ir::FilterNode>(
+        ir::NodeId{2},
+        ir::Expr{.node = ir::CompareExpr{
+                     .op = ir::CompareOp::Gt,
+                     .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                     .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 0}})}});
+    filter->add_child(std::move(scan));
+    auto project = std::make_unique<ir::ProjectNode>(
+        ir::NodeId{1}, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "price"}});
+    project->add_child(std::move(filter));
+    const ir::NodePtr tree = std::move(project);
+
+    const auto plan = runtime::physical::plan_physical(*tree, trades_registry(), nullptr);
+    REQUIRE(plan.migrated);
+    // One step, not two: the filter is the step, the project rides on it.
+    REQUIRE(plan.steps.size() == 1);
+    REQUIRE(plan.steps.front().capability == runtime::MapKernelCapability::FilterProjectGather);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.steps.front().fused != nullptr);
+    REQUIRE(plan.steps.front().fused->kind() == ir::NodeKind::Project);
+    REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
+    REQUIRE(runtime::physical::explain_physical(plan).find("Filter+Project(fused)") !=
+            std::string::npos);
+}
+
+// The fused step has to execute, not merely plan: same rows, same columns as
+// the canonicalized FilterProject the optimizer would have produced.
+TEST_CASE("A fused step executes like the fused node", "[physical][execute][fusion]") {
+    const auto registry = trades_registry();
+
+    auto scan = std::make_unique<ir::ScanNode>(ir::NodeId{3}, "trades");
+    auto filter = std::make_unique<ir::FilterNode>(
+        ir::NodeId{2},
+        ir::Expr{.node = ir::CompareExpr{
+                     .op = ir::CompareOp::Gt,
+                     .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                     .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 15}})}});
+    filter->add_child(std::move(scan));
+    auto project = std::make_unique<ir::ProjectNode>(
+        ir::NodeId{1}, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "price"}});
+    project->add_child(std::move(filter));
+    const ir::NodePtr unfused = std::move(project);
+
+    const auto canonical = require_ir("trades[filter price > 15, select { price }];");
+    REQUIRE(canonical->kind() == ir::NodeKind::FilterProject);
+
+    for (const bool parallel : {false, true}) {
+        INFO("parallel: " << parallel);
+        runtime::ExecutionContext exec;
+        exec.parallel = parallel;
+
+        const auto fused = runtime::interpret(*unfused, registry, nullptr, nullptr, nullptr, exec);
+        const auto reference =
+            runtime::interpret(*canonical, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(fused.has_value());
+        REQUIRE(reference.has_value());
+        REQUIRE(fused->columns.size() == 1);
+        REQUIRE(fused->columns.front().name == "price");
+        const auto* fused_price = std::get_if<Column<std::int64_t>>(fused->find("price"));
+        const auto* reference_price = std::get_if<Column<std::int64_t>>(reference->find("price"));
+        REQUIRE(fused_price != nullptr);
+        REQUIRE(reference_price != nullptr);
+        CHECK(std::vector<std::int64_t>(fused_price->begin(), fused_price->end()) ==
+              std::vector<std::int64_t>(reference_price->begin(), reference_price->end()));
+        CHECK(std::vector<std::int64_t>(fused_price->begin(), fused_price->end()) ==
+              std::vector<std::int64_t>{20, 30});
+    }
+}
+
+// The fused step through real morsels, which is where fusion could go wrong
+// without the answer changing shape: `range_filter_head` absorbs a fused
+// project into the morsel source exactly as it absorbs a FilterProject node's
+// column list, and the ordered merger reassembles the pieces.
+TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<std::int64_t> price;
+    Column<std::string> symbol;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<std::int64_t>(r));
+        symbol.push_back(r % 2 == 0 ? "A" : "B");
+    }
+    runtime::Table table;
+    table.add_column("price", std::move(price));
+    table.add_column("symbol", std::move(symbol));
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    const auto build = []() {
+        auto scan = std::make_unique<ir::ScanNode>(ir::NodeId{3}, "trades");
+        auto filter = std::make_unique<ir::FilterNode>(
+            ir::NodeId{2},
+            ir::Expr{
+                .node = ir::CompareExpr{
+                    .op = ir::CompareOp::Gt,
+                    .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
+                    .right = ir::make_expr_ptr(
+                        ir::Expr{.node = ir::Literal{.value = std::int64_t{19'999}}})}});
+        filter->add_child(std::move(scan));
+        auto project = std::make_unique<ir::ProjectNode>(
+            ir::NodeId{1}, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "price"}});
+        project->add_child(std::move(filter));
+        return ir::NodePtr{std::move(project)};
+    };
+    const ir::NodePtr tree = build();
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel = true;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_min_cells = 0;
+    parallel.parallel_grain = 4'096;
+    parallel.parallel_stats = &stats;
+
+    const auto a = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, serial);
+    const auto b = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    // The projection really was applied per morsel, not forgotten by one of
+    // them: one column out, and the same rows either way.
+    REQUIRE(a->columns.size() == 1);
+    REQUIRE(b->columns.size() == 1);
+    REQUIRE(a->rows() == kRows - 20'000);
+    const auto* serial_price = std::get_if<Column<std::int64_t>>(a->find("price"));
+    const auto* parallel_price = std::get_if<Column<std::int64_t>>(b->find("price"));
+    REQUIRE(serial_price != nullptr);
+    REQUIRE(parallel_price != nullptr);
+    CHECK(std::vector<std::int64_t>(serial_price->begin(), serial_price->end()) ==
+          std::vector<std::int64_t>(parallel_price->begin(), parallel_price->end()));
+    // It took the parallel path rather than quietly falling back.
+    CHECK(stats.parallel_islands.load() == 1);
+}
+
 TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][parallel]") {
     using runtime::physical::PipelineMode;
     using runtime::physical::SerialOnlyReason;

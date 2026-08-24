@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Language Guide</title>
+  <meta name="description" content="Detailed guide to Ibex table expressions, grouping, joins, nulls, windows, reshaping, and advanced language features." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a><a class="nav-link active" href="./docs.html">Docs</a><a class="nav-link" href="./examples.html">Examples</a><a class="nav-link" href="./benchmarks.html">Benchmarks</a><a class="nav-link" href="./reference.html">Reference</a><a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Language guide</p>
+    <h1>Table expressions and analysis operations</h1>
+    <p class="lead">Detailed usage notes for the operations listed in the language reference. For exact grammar and edge-case semantics, use the specification.</p>
+    <div class="cta-row"><a class="button primary" href="./reference.html">Reference index</a><a class="button" href="https://github.com/bobjansen/Ibex/blob/main/SPEC.md" target="_blank" rel="noopener">Language specification &#8599;</a></div>
+  </section>
+
+  <section class="section" id="pipelines">
+    <p class="section-label">Pipelines</p><h2>Transform tables with ordered clauses</h2>
+    <p>Attach a comma-separated clause list to a table. Each clause receives the result of the previous clause. <code>select</code> projects fields or computes aggregations; <code>update</code> adds or replaces fields; <code>filter</code> retains rows; <code>by</code> changes the aggregation context; and <code>order</code> sorts the result.</p>
+<pre><code><span class="kw">let</span> totals = trades[
+  <span class="kw">update</span> { notional = price * size },
+  <span class="kw">filter</span> notional &gt; <span class="num">1000</span>,
+  <span class="kw">select</span> { total = <span class="fn-name">sum</span>(notional), n = <span class="fn-name">count</span>() },
+  <span class="kw">by</span> symbol,
+  <span class="kw">order</span> { total <span class="kw">desc</span> }
+];</code></pre>
+    <p>Use <code>rename</code>, <code>distinct</code>, <code>head</code>, and <code>tail</code> for common schema and row-shape operations. A conditional <code>where predicate update { ... }</code> replaces values only on matching rows.</p>
+  </section>
+
+  <section class="section" id="joins">
+    <p class="section-label">Combining tables</p><h2>Joins, binding, and reshaping</h2>
+    <div class="grid-3">
+      <article class="card"><h3>Joins</h3><p>Use inner, left, right, outer, semi, anti, cross, and as-of joins. Join on a shared key or map different key names with <code>on { left_key = right_key }</code>.</p></article>
+      <article class="card"><h3>Binding</h3><p>Append compatible tables with row binding, or combine columns with column binding when row alignment is intentional.</p></article>
+      <article class="card"><h3>Reshaping</h3><p>Use <code>melt</code> to convert wide data to long form and <code>dcast</code> to pivot long data back to a wide table.</p></article>
+    </div>
+<pre><code><span class="kw">let</span> enriched = (trades <span class="kw">left join</span> symbols <span class="kw">on</span> symbol)[
+  <span class="kw">select</span> { symbol, sector, price, size }
+];</code></pre>
+  </section>
+
+  <section class="section" id="analytics">
+    <p class="section-label">Analytics</p><h2>Aggregates, windows, and ordered calculations</h2>
+    <p>Aggregate expressions include count, sum, mean, min, max, first, last, median, quantiles, standard deviation, and correlation. With <code>by</code>, they run per group; without it, they reduce the whole table. Grouped <code>update</code> broadcasts a group result back to each row.</p>
+    <p>For ordered data, use <code>lag</code>, <code>lead</code>, rank functions, cumulative sums and products. Promote an ordered table with <code>as_timeframe</code>, then use <code>window duration</code> for rolling aggregates or <code>resample duration</code> for fixed time buckets.</p>
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
+  vwap = <span class="fn-name">sum</span>(price * size) / <span class="fn-name">sum</span>(size),
+  volume_5m = <span class="fn-name">rolling_sum</span>(size)
+}, <span class="kw">by</span> symbol];</code></pre>
+  </section>
+
+  <section class="section" id="values">
+    <p class="section-label">Values and expressions</p><h2>Types, nulls, and reusable logic</h2>
+    <div class="grid-3">
+      <article class="card"><h3>Types</h3><p>Ibex has static scalar, <code>Series</code>, <code>Table</code>, and <code>TimeFrame</code> types. Use explicit constructors such as <code>Int64(x)</code> and <code>Float64(x)</code> where conversion is required.</p></article>
+      <article class="card"><h3>Nulls</h3><p>Predicates use three-valued logic. Use <code>is_null</code>, <code>fill_null</code>, <code>fill_forward</code>, and <code>fill_backward</code> to inspect and repair missing values.</p></article>
+      <article class="card"><h3>Functions</h3><p>Declare typed <code>fn</code> functions for reusable expressions. <code>case</code> chooses the first matching branch; <code>map</code> expands repeated fields at compile time inside <code>select</code> and <code>update</code>.</p></article>
+    </div>
+  </section>
+
+  <section class="section">
+    <p class="section-label">More detail</p><h2>Related guides</h2>
+    <div class="grid-3"><article class="card"><h3><a href="./functions.html">Function reference</a></h3><p>Built-in signatures and examples.</p></article><article class="card"><h3><a href="./io.html">I/O guide</a></h3><p>CSV, Parquet, databases, and streams.</p></article><article class="card"><h3><a href="./getting-started.html">Getting Started</a></h3><p>A first end-to-end pipeline.</p></article></div>
+  </section>
+  <footer class="footer"><span>Ibex &mdash; typed DataFrame pipelines</span><a href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">github.com/bobjansen/Ibex &#8599;</a></footer>
+</main>
+</body>
+</html>

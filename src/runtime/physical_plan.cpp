@@ -146,19 +146,47 @@ auto classify_source(const ir::Node& node, const TableRegistry& registry,
     return false;
 }
 
-/// The `Filter` a `Project` can be fused with: directly below it, single-child,
-/// and a plain Filter (a fused IR kind is already one step). Returns null when
-/// this node is not a fusible Project or its child is not a fusible Filter.
-auto fusible_filter_below(const ir::Node& node) -> const ir::Node* {
-    if (node.kind() != ir::NodeKind::Project || node.children().size() != 1) {
+/// A node with exactly one child, and that child.
+auto single_child(const ir::Node& node, ir::NodeKind kind) -> const ir::Node* {
+    if (node.kind() != kind || node.children().size() != 1) {
         return nullptr;
     }
     const ir::Node* child = node.children().front().get();
-    if (child == nullptr || child->kind() != ir::NodeKind::Filter ||
-        child->children().size() != 1 || child->children().front() == nullptr) {
-        return nullptr;
+    return child != nullptr && !child->children().empty() ? child : nullptr;
+}
+
+/// What a `Project` at the top of the chain can absorb below it: a plain
+/// `Filter` (canonicalize R5's shape), or a row-local `Update` over a plain
+/// `Filter` (R6's). Returns the leading `Filter` and, for the three-node form,
+/// the `Update` between them. An already-fused IR kind is one step and is not
+/// re-fused here.
+struct FusibleChain {
+    const ir::Node* filter = nullptr;
+    const ir::Node* update = nullptr;
+};
+
+auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
+    const ir::Node* below = single_child(node, ir::NodeKind::Project);
+    if (below == nullptr) {
+        return {};
     }
-    return child;
+    if (below->kind() == ir::NodeKind::Filter && below->children().size() == 1 &&
+        below->children().front() != nullptr) {
+        return {.filter = below};
+    }
+    // The update must be one the row-local kernel owns; a guarded or grouped
+    // one is a different operator entirely and `map_kernel_capability` is the
+    // authority on which.
+    if (!map_kernel_capability(*below).has_value() ||
+        *map_kernel_capability(*below) != MapKernelCapability::RowLocalUpdate) {
+        return {};
+    }
+    const ir::Node* filter = single_child(*below, ir::NodeKind::Update);
+    if (filter == nullptr || filter->kind() != ir::NodeKind::Filter ||
+        filter->children().size() != 1 || filter->children().front() == nullptr) {
+        return {};
+    }
+    return {.filter = filter, .update = below};
 }
 
 /// Decide the pipeline's execution mode from its own steps. These are the
@@ -220,21 +248,25 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             plan.reason = FallbackReason::MalformedMapNode;
             return plan;
         }
-        // Physical fusion: a Project directly over a Filter is one gather
-        // pass, not two. Canonicalize R5 already fuses this shape into a
-        // FilterProject *node*, so today this fires only on IR that reached the
-        // runtime unfused; expressing it here is what lets that logical
-        // rewrite be retired, since fusion becomes a property of the pipeline
-        // rather than of the tree (plan Phase 2 item 5).
-        if (const ir::Node* filter = fusible_filter_below(*cur); filter != nullptr) {
-            const MapKernelCapability fused_capability = MapKernelCapability::FilterProjectGather;
+        // Physical fusion: a Project over a Filter, or over a row-local Update
+        // over a Filter, is one gather pass rather than two or three.
+        // Canonicalize R5/R6 already fuse these shapes into FilterProject and
+        // FilterUpdateProject *nodes*, so today this fires only on IR that
+        // reached the runtime unfused; expressing it here is what lets those
+        // logical rewrites be retired, since fusion becomes a property of the
+        // pipeline rather than of the tree (plan Phase 2 item 5).
+        if (const FusibleChain fusible = fusible_chain_below(*cur); fusible.filter != nullptr) {
+            const MapKernelCapability fused_capability =
+                fusible.update != nullptr ? MapKernelCapability::FilterUpdateProjectGather
+                                          : MapKernelCapability::FilterProjectGather;
             const MapKernelFactory fused_factory = map_kernel_factory(fused_capability);
             if (fused_factory != nullptr) {
-                plan.steps.push_back({.node = filter,
-                                      .fused = cur,
+                plan.steps.push_back({.node = fusible.filter,
+                                      .fused_update = fusible.update,
+                                      .fused_project = cur,
                                       .capability = fused_capability,
                                       .factory = fused_factory});
-                cur = filter->children().front().get();
+                cur = fusible.filter->children().front().get();
                 continue;
             }
         }
@@ -339,11 +371,15 @@ auto explain_physical(const Plan& plan) -> std::string {
     for (const MapStep& step : plan.steps) {
         out += "  ";
         out += map_step_kind_name(step.node->kind());
-        if (step.fused != nullptr) {
-            // A fused step executes two IR nodes in one pass; printing only the
-            // first would make the plan look like it dropped one.
-            out += "+";
-            out += map_step_kind_name(step.fused->kind());
+        // A fused step executes several IR nodes in one pass; printing only
+        // the first would make the plan look like it dropped the rest.
+        for (const ir::Node* fused : {step.fused_update, step.fused_project}) {
+            if (fused != nullptr) {
+                out += "+";
+                out += map_step_kind_name(fused->kind());
+            }
+        }
+        if (step.fused_update != nullptr || step.fused_project != nullptr) {
             out += "(fused)";
         }
         out += "\n";

@@ -30,6 +30,10 @@ body {
   line-height: 1.5;
 }
 
+code {
+  font-variant-ligatures: none;
+}
+
 .page {
   max-width: 980px;
   margin: 0 auto;
@@ -73,6 +77,10 @@ body {
 
 .nav-link:hover {
   color: var(--ink);
+}
+
+.nowrap {
+  white-space: nowrap;
 }
 
 /* ── Documentation layout ──────────────────────────────────────────────── */
@@ -285,10 +293,6 @@ h3 {
   color: var(--accent);
 }
 
-.home-next {
-  margin-top: 1.2rem;
-}
-
 .home-proof {
   background: rgba(255, 250, 240, 0.52);
   border: 1px solid rgba(216, 208, 196, 0.75);
@@ -379,6 +383,7 @@ h3 {
   border: 1px solid var(--line);
   border-radius: 16px;
   padding: 1.2rem;
+  margin: 0.8rem 0 0.8rem 0;
 }
 
 .card p {
@@ -399,7 +404,7 @@ h3 {
 /* ── Sections ────────────────────────────────────────────────────────────── */
 
 .section {
-  margin-top: 2.8rem;
+  margin-top: 2.0rem;
 }
 
 .section-label {

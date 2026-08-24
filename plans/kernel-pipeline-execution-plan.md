@@ -1089,6 +1089,16 @@ execution; no physical `next()` implementation duplicates its row loop.
 3. Migrate existing parallel islands and pipelined scan/stage mechanisms to
    the executor without changing their eligibility policy.
 4. Eliminate raw-thread construction from individual join/builder branches.
+   **CLOSED (2026-08-24) — already satisfied, by deletion rather than by
+   migration.** Both sites this names are gone: each overlapped a build with a
+   materialize on a raw `std::thread`, each measured worse (q09 +57%, then
+   +47.5% under a since-removed helper-thread budget; q10's ~-3% did not
+   survive widening), and each was reverted. `chunked.cpp:10002` and `:13066`
+   carry the measurements. The finding to keep is that branch concurrency needs
+   a cost-aware gate, not a thread-count one — so re-opening this item means
+   proposing such a gate, not removing threads. The only remaining non-pool
+   thread in the runtime belongs to `PipelinedStageOperator` and is item 1's
+   subject, not this one.
 5. Track per-pipeline runnable time, worker capacity, queue/backpressure time,
    and ordered-merge time. Keep the existing accounting closure invariant.
 

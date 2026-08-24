@@ -1790,7 +1790,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     // Enough rows per worker that the per-worker hash index is worth building.
     constexpr std::size_t kMinRowsPerWorker = 32768;
     const std::size_t workers =
@@ -1863,7 +1863,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
         }
     }
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t workers = std::min({budget, pool_size, remaining_groups});
     return workers < 2 ? 0 : workers;
 }
@@ -1880,7 +1880,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t workers = std::min({budget, pool_size, group_count});
     return workers < 2 ? 0 : workers;
 }
@@ -3476,7 +3476,7 @@ struct WindowTask {
         return tasks;
     }
     const std::size_t pool_size = process_worker_pool().size();
-    const std::size_t budget = exec.parallel_threads == 0 ? pool_size : exec.parallel_threads;
+    const std::size_t budget = exec.compute_budget();
     const std::size_t workers = std::min(budget, pool_size);
     if (workers < 2 || group_rows.group_count() >= workers) {
         return tasks;  // enough groups to keep the pool busy already

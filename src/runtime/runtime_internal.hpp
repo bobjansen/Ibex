@@ -501,7 +501,7 @@ struct ColumnGatherJob {
 ///
 /// The admission test consults `parallel_min_cells` as well as
 /// `parallel_min_rows`: the cost scales with output WIDTH as much as with rows,
-/// which is the same reason the island and the sort's gather both test it.
+/// which is the same reason the pipeline and the sort's gather both test it.
 template <typename GatherWhole>
 [[nodiscard]] auto gather_columns_batched(std::span<const ColumnGatherJob> jobs, std::size_t total,
                                           const ExecutionContext* exec, GatherWhole&& gather_whole)

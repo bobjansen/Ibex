@@ -100,14 +100,14 @@ auto make_trades() -> runtime::TableRegistry {
     return reg;
 }
 
-// Run a program with the Phase 1 island path enabled at a small morsel grain,
+// Run a program with the Phase 1 pipeline path enabled at a small morsel grain,
 // so an eligible chain is partitioned into several ranges.
 //
-// `threads == 1` keeps the island on its serial morsel chain; anything larger
+// `threads == 1` keeps the pipeline on its serial morsel chain; anything larger
 // drops the grain-size threshold to 0 so even a tiny test table fans out across
 // worker threads and comes back through the ordered merger.
 auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain,
-                  std::size_t threads = 1, runtime::ParallelIslandStats* stats = nullptr)
+                  std::size_t threads = 1, runtime::ParallelPipelineStats* stats = nullptr)
     -> runtime::Table {
     auto parsed = parser::parse(src);
     REQUIRE(parsed.has_value());
@@ -118,7 +118,7 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     exec.parallel_grain = grain;
     exec.parallel_threads = threads;
     exec.parallel_min_rows = threads > 1 ? 0 : exec.parallel_min_rows;
-    // The island's size gates are two: a row floor and a cell floor. A test
+    // The pipeline's size gates are two: a row floor and a cell floor. A test
     // table clears neither, so both have to be lifted or the worker path is
     // silently never taken.
     exec.parallel_min_cells = threads > 1 ? 0 : exec.parallel_min_cells;
@@ -129,19 +129,19 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     return std::move(*result);
 }
 
-// Run on worker threads and fail if the island quietly fell back to serial.
+// Run on worker threads and fail if the pipeline quietly fell back to serial.
 // Without this the whole worker-path suite could pass while testing nothing.
 auto run_on_workers(std::string_view src, const runtime::TableRegistry& tables, std::size_t grain,
                     std::size_t threads) -> runtime::Table {
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     auto table = run_parallel(src, tables, grain, threads, &stats);
-    REQUIRE(stats.parallel_islands.load() == 1);
-    REQUIRE(stats.serial_islands.load() == 0);
+    REQUIRE(stats.parallel_pipelines.load() == 1);
+    REQUIRE(stats.serial_pipelines.load() == 0);
     return table;
 }
 
 // Byte-for-byte table equality: schema, row count, values, validity, and
-// order-sensitive metadata. This is the serial-island parity contract: the
+// order-sensitive metadata. This is the serial-morsel parity contract: the
 // partitioned path must not let per-morsel handling change table properties.
 void require_tables_equal(const runtime::Table& a, const runtime::Table& b) {
     REQUIRE(a.columns.size() == b.columns.size());
@@ -1822,7 +1822,7 @@ days[update = gen_correlated_returns(symbols)];
     CHECK(pearson("MSFT", "GOOG") == Catch::Approx(0.60).epsilon(0.12));
 }
 
-// --- Phase 1 serial-island equivalence ---------------------------------------
+// --- Phase 1 serial-morsel equivalence ---------------------------------------
 //
 // With ExecutionContext.parallel set, an eligible row-local chain is executed
 // over a PartitionedTableSource in morsel grains. This slice runs the morsels
@@ -1834,7 +1834,7 @@ namespace {
 
 // 11-row table so grain=3 yields 4 morsels, with a partial last morsel and a
 // filter that keeps rows straddling every range boundary.
-auto make_island_table() -> runtime::TableRegistry {
+auto make_pipeline_table() -> runtime::TableRegistry {
     runtime::Table t;
     t.add_column("price", Column<std::int64_t>{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110});
     t.add_column("qty", Column<std::int64_t>{5, 3, 8, 2, 1, 7, 4, 6, 9, 2, 3});
@@ -1847,8 +1847,8 @@ auto make_island_table() -> runtime::TableRegistry {
 
 }  // namespace
 
-TEST_CASE("E2E: parallel serial-island matches serial output", "[e2e][parallel]") {
-    auto tables = make_island_table();
+TEST_CASE("E2E: parallel serial-morsel matches serial output", "[e2e][parallel]") {
+    auto tables = make_pipeline_table();
     const std::size_t grain = 3;  // 11 rows -> 4 morsels
 
     // Each case is an eligible parallel-map shape: bare filter, fused
@@ -1868,9 +1868,9 @@ TEST_CASE("E2E: parallel serial-island matches serial output", "[e2e][parallel]"
     }
 }
 
-TEST_CASE("E2E: parallel serial-island falls back to serial for ineligible shapes",
+TEST_CASE("E2E: parallel serial-morsel falls back to serial for ineligible shapes",
           "[e2e][parallel]") {
-    auto tables = make_island_table();
+    auto tables = make_pipeline_table();
     // lag() is not row-local: the pipeline is serial-only, so the seam
     // must leave the query on the untouched serial chain and still succeed.
     auto serial = run("t[select { price, prev = lag(price, 1) }];", tables);
@@ -1878,7 +1878,7 @@ TEST_CASE("E2E: parallel serial-island falls back to serial for ineligible shape
     require_tables_equal(serial, parallel);
 }
 
-TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered schema",
+TEST_CASE("E2E: parallel serial-morsel preserves metadata and an all-filtered schema",
           "[e2e][parallel]") {
     runtime::Table t;
     t.add_column("ts", Column<std::int64_t>{400, 100, 300, 200, 500});
@@ -1887,18 +1887,18 @@ TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered sc
     tables.emplace("t", std::move(t));
 
     // The Ascribe node is a serial boundary; filter + rename after it is the
-    // partitioned island. Renaming the time-index column exercises metadata
+    // partitioned pipeline. Renaming the time-index column exercises metadata
     // propagation through every morsel and the final materialization.
     constexpr auto metadata_query = R"(as_timeframe(t, "ts")[filter value > 1][rename time = ts];)";
     auto serial_metadata = run(metadata_query, tables);
-    auto island_metadata = run_parallel(metadata_query, tables, 2);
-    require_tables_equal(serial_metadata, island_metadata);
-    REQUIRE(island_metadata.time_index() == "time");
-    REQUIRE(island_metadata.ordering().has_value());
-    REQUIRE((*island_metadata.ordering())[0].name == "time");
+    auto pipeline_metadata = run_parallel(metadata_query, tables, 2);
+    require_tables_equal(serial_metadata, pipeline_metadata);
+    REQUIRE(pipeline_metadata.time_index() == "time");
+    REQUIRE(pipeline_metadata.ordering().has_value());
+    REQUIRE((*pipeline_metadata.ordering())[0].name == "time");
 
     // Grain 2 produces three input morsels. Every one is rejected. The
-    // serial-island validator requires one identified output morsel per input,
+    // serial-morsel validator requires one identified output morsel per input,
     // while final materialization must retain the serial schema and zero rows.
     const char* all_filtered_cases[] = {
         "t[filter value > 99];",
@@ -1908,16 +1908,16 @@ TEST_CASE("E2E: parallel serial-island preserves metadata and an all-filtered sc
     for (const auto* query : all_filtered_cases) {
         INFO("all-filtered query: " << query);
         auto serial_empty = run(query, tables);
-        auto island_empty = run_parallel(query, tables, 2);
-        require_tables_equal(serial_empty, island_empty);
-        REQUIRE(island_empty.columns.size() == 2);
-        REQUIRE(island_empty.rows() == 0);
+        auto pipeline_empty = run_parallel(query, tables, 2);
+        require_tables_equal(serial_empty, pipeline_empty);
+        REQUIRE(pipeline_empty.columns.size() == 2);
+        REQUIRE(pipeline_empty.rows() == 0);
     }
 }
 
-TEST_CASE("E2E: parallel serial-island handles a zero-row input", "[e2e][parallel]") {
+TEST_CASE("E2E: parallel serial-morsel handles a zero-row input", "[e2e][parallel]") {
     // A zero-row input still yields exactly one empty schema-carrier morsel
-    // (partitioned_morsel_count -> 1), which the SerialIslandOrderValidator must
+    // (partitioned_morsel_count -> 1), which the SerialMorselOrderValidator must
     // accept, and the result must keep the schema with zero rows.
     runtime::Table t;
     t.add_column("x", Column<std::int64_t>{});
@@ -1934,9 +1934,9 @@ TEST_CASE("E2E: parallel serial-island handles a zero-row input", "[e2e][paralle
     for (const auto* query : cases) {
         INFO("zero-row query: " << query);
         auto serial = run(query, tables);
-        auto island = run_parallel(query, tables, 4);
-        require_tables_equal(serial, island);
-        REQUIRE(island.rows() == 0);
+        auto pipeline = run_parallel(query, tables, 4);
+        require_tables_equal(serial, pipeline);
+        REQUIRE(pipeline.rows() == 0);
     }
 }
 
@@ -2061,9 +2061,9 @@ TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][p
     CHECK(col_i64(parallel, "c") == std::vector<std::int64_t>{1, 1, 1});
 }
 
-// --- Phase 1 worker-pool island equivalence ----------------------------------
+// --- Phase 1 worker-pool pipeline equivalence ----------------------------------
 //
-// Same island, now fanned out across worker threads and reassembled by the
+// Same pipeline, now fanned out across worker threads and reassembled by the
 // ordered merger. The contract is unchanged and absolute: byte-identical to the
 // serial result, for every worker count and every morsel grain. Anything else
 // would mean the merger, not the map, decides the answer.
@@ -2074,7 +2074,7 @@ namespace {
 // ring holds, so the merger's backpressure and slot reuse are actually
 // exercised rather than skipped by a one-pass fit. Nulls land at irregular
 // positions so they straddle range boundaries at every grain.
-auto make_wide_island_table(std::size_t rows) -> runtime::TableRegistry {
+auto make_wide_pipeline_table(std::size_t rows) -> runtime::TableRegistry {
     Column<std::int64_t> price;
     Column<std::int64_t> qty;
     Column<std::string> symbol;
@@ -2103,10 +2103,10 @@ auto make_wide_island_table(std::size_t rows) -> runtime::TableRegistry {
 
 }  // namespace
 
-TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e][parallel]") {
-    auto tables = make_wide_island_table(1000);
+TEST_CASE("E2E: morsel pipeline on worker threads matches serial output", "[e2e][parallel]") {
+    auto tables = make_wide_pipeline_table(1000);
 
-    // A select/rename above a filter rides in the filter's island, which is why
+    // A select/rename above a filter rides in the filter's pipeline, which is why
     // Project and Rename stay ParallelMap even though a chain of only those is
     // refused.
     const char* cases[] = {
@@ -2132,11 +2132,11 @@ TEST_CASE("E2E: parallel island on worker threads matches serial output", "[e2e]
 }
 
 TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][parallel]") {
-    auto tables = make_wide_island_table(1000);
+    auto tables = make_wide_pipeline_table(1000);
 
-    // An update is no longer an island (see execution_capability(const Node&)):
+    // An update is no longer a pipeline (see execution_capability(const Node&)):
     // `update_table` splits the field computation across threads itself, which
-    // costs no copies where a morsel island costs two whole-table ones. What
+    // costs no copies where a morsel pipeline costs two whole-table ones. What
     // has to hold either way is that the answer does not change — including for
     // the shapes that stress it: a field consumed by a later operator, an
     // overwrite of an existing nullable column, and a rename of a computed one.
@@ -2160,7 +2160,7 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
             // grain 7 over 1000 rows is ~143 morsels, so the field evaluation
             // really does fan out — asserted, because a silent fall back to one
             // whole-table evaluation would leave the equality check green.
-            runtime::ParallelIslandStats stats;
+            runtime::ParallelPipelineStats stats;
             require_tables_equal(serial, run_parallel(src, tables, 7, threads, &stats));
             CHECK(stats.parallel_fields.load() > 0);
             if (std::string_view(src) != "t[update { flag = price > 100 }];" &&
@@ -2172,7 +2172,7 @@ TEST_CASE("E2E: a row-local update is parallelized inside the operator", "[e2e][
 
     // `filter … update … select` canonicalizes to the fused FilterUpdateProject,
     // which is filter-shaped — its cardinality is data-dependent, so it stays an
-    // island and its update never reaches `update_table`. Equality is all that
+    // pipeline and its update never reaches `update_table`. Equality is all that
     // is claimed here.
     {
         const auto* src = "t[filter price > 100][update { n = price - qty }][select { price, n }];";
@@ -2206,7 +2206,7 @@ TEST_CASE("E2E: categorical interpolation writes parallel string windows", "[e2e
     const auto* source = "t[update { label = `sym=${symbol}` }];";
     const auto serial = run(source, tables);
     for (const std::size_t threads : {2U, 8U}) {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         require_tables_equal(serial, run_parallel(source, tables, 7, threads, &stats));
         CHECK(stats.parallel_fields.load() > 0);
     }
@@ -2234,17 +2234,17 @@ TEST_CASE("E2E: temporal interpolation writes parallel string windows", "[e2e][p
     const auto* source = "t[update { label = `d=${day} t=${time}` }];";
     const auto serial = run(source, tables);
     for (const std::size_t threads : {2U, 8U}) {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         require_tables_equal(serial, run_parallel(source, tables, 7, threads, &stats));
         CHECK(stats.parallel_fields.load() > 0);
     }
 }
 
-TEST_CASE("E2E: parallel island leaves a non-row-local update serial", "[e2e][parallel]") {
-    auto tables = make_wide_island_table(1000);
+TEST_CASE("E2E: morsel pipeline leaves a non-row-local update serial", "[e2e][parallel]") {
+    auto tables = make_wide_pipeline_table(1000);
     // Each of these would be silently wrong per morsel: the transform reads
     // neighbouring rows, and the grouped/guarded forms are not row-local at
-    // all. The result must match the serial answer, which means the island
+    // all. The result must match the serial answer, which means the pipeline
     // declined them. (An ungrouped aggregate in an update is rejected by
     // evaluation itself, so it is covered in the lowerer test instead.)
     const char* cases[] = {
@@ -2255,13 +2255,13 @@ TEST_CASE("E2E: parallel island leaves a non-row-local update serial", "[e2e][pa
     for (const auto* src : cases) {
         INFO("query: " << src);
         auto serial = run(src, tables);
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         auto parallel = run_parallel(src, tables, 7, 8, &stats);
         require_tables_equal(serial, parallel);
     }
 }
 
-TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empty result",
+TEST_CASE("E2E: morsel pipeline on worker threads preserves metadata and an empty result",
           "[e2e][parallel]") {
     runtime::Table t;
     Column<std::int64_t> ts;
@@ -2277,31 +2277,31 @@ TEST_CASE("E2E: parallel island on worker threads preserves metadata and an empt
     runtime::TableRegistry tables;
     tables.emplace("t", std::move(t));
 
-    // The island runs after the Ascribe barrier; time_index and ordering must
+    // The pipeline runs after the Ascribe barrier; time_index and ordering must
     // survive every morsel and the merge.
     constexpr auto metadata_query = R"(as_timeframe(t, "ts")[filter value > 1][rename time = ts];)";
     auto serial_metadata = run(metadata_query, tables);
-    auto island_metadata = run_on_workers(metadata_query, tables, 8, 4);
-    require_tables_equal(serial_metadata, island_metadata);
-    REQUIRE(island_metadata.time_index() == "time");
-    REQUIRE(island_metadata.ordering().has_value());
+    auto pipeline_metadata = run_on_workers(metadata_query, tables, 8, 4);
+    require_tables_equal(serial_metadata, pipeline_metadata);
+    REQUIRE(pipeline_metadata.time_index() == "time");
+    REQUIRE(pipeline_metadata.ordering().has_value());
 
     // Every morsel is empty: the merger must still see one output morsel per
     // input morsel and the result must keep the serial schema.
     auto serial_empty = run("t[filter value > 9999, select { ts, value }];", tables);
-    auto island_empty =
+    auto pipeline_empty =
         run_on_workers("t[filter value > 9999, select { ts, value }];", tables, 8, 4);
-    require_tables_equal(serial_empty, island_empty);
-    REQUIRE(island_empty.columns.size() == 2);
-    REQUIRE(island_empty.rows() == 0);
+    require_tables_equal(serial_empty, pipeline_empty);
+    REQUIRE(pipeline_empty.columns.size() == 2);
+    REQUIRE(pipeline_empty.rows() == 0);
 }
 
 namespace {
 
-// Run an island query that fails inside every morsel, optionally with an
+// Run a pipeline query that fails inside every morsel, optionally with an
 // interrupt pending or arriving mid-flight. Returns the reported error.
-auto run_failing_island(bool interrupt_before, bool interrupt_during) -> std::string {
-    auto tables = make_wide_island_table(200000);
+auto run_failing_pipeline(bool interrupt_before, bool interrupt_during) -> std::string {
+    auto tables = make_wide_pipeline_table(200000);
     // A string/number comparison is rejected by the filter at evaluation time,
     // so it is a genuine per-morsel worker failure rather than a build error.
     auto parsed = parser::parse(R"(t[filter price > "a"];)");
@@ -2335,33 +2335,33 @@ auto run_failing_island(bool interrupt_before, bool interrupt_during) -> std::st
 
 }  // namespace
 
-TEST_CASE("E2E: parallel island reports a worker failure", "[e2e][parallel]") {
-    // Every morsel fails. The island must surface the failure (not hang waiting
+TEST_CASE("E2E: morsel pipeline reports a worker failure", "[e2e][parallel]") {
+    // Every morsel fails. The pipeline must surface the failure (not hang waiting
     // for a morsel that will never arrive) and must report the same message the
     // serial path does, rather than a thread-timing-dependent one.
-    CHECK(run_failing_island(false, false) == "filter: cannot compare string and numeric");
+    CHECK(run_failing_pipeline(false, false) == "filter: cannot compare string and numeric");
 }
 
-TEST_CASE("E2E: parallel island reports interruption over a concurrent worker failure",
+TEST_CASE("E2E: morsel pipeline reports interruption over a concurrent worker failure",
           "[e2e][parallel]") {
     // Both conditions hold at once: a pending interrupt and a worker error
     // recorded by every morsel. Cancellation outranks the data error, or Ctrl+C
     // would surface as an arbitrary query error depending on which thread won.
-    CHECK(run_failing_island(true, false) == runtime::interrupt_message());
+    CHECK(run_failing_pipeline(true, false) == runtime::interrupt_message());
 
     // The same collision, now genuinely racing: whichever side wins, the query
     // must report one of the two defined answers and must terminate cleanly.
-    const std::string raced = run_failing_island(false, true);
+    const std::string raced = run_failing_pipeline(false, true);
     CHECK((raced == runtime::interrupt_message() ||
            raced == "filter: cannot compare string and numeric"));
 }
 
-TEST_CASE("E2E: parallel island cancels cleanly when interrupted", "[e2e][parallel]") {
-    // A pending interrupt must unwind the island through the usual error
+TEST_CASE("E2E: morsel pipeline cancels cleanly when interrupted", "[e2e][parallel]") {
+    // A pending interrupt must unwind the pipeline through the usual error
     // channel — cancelling in-flight workers and joining them before the
     // operator (which owns the table they read) is destroyed. The value of the
     // test is that it terminates and does not use freed memory.
-    auto tables = make_wide_island_table(1000);
+    auto tables = make_wide_pipeline_table(1000);
     auto parsed = parser::parse("t[filter price > 350, select { price, qty }];");
     REQUIRE(parsed.has_value());
     auto lowered = parser::lower(*parsed);
@@ -2382,30 +2382,30 @@ TEST_CASE("E2E: parallel island cancels cleanly when interrupted", "[e2e][parall
     CHECK(result.error() == runtime::interrupt_message());
 }
 
-TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source",
+TEST_CASE("E2E: a filter pipeline absorbs its head into a range-evaluating source",
           "[e2e][parallel]") {
     // The zero-copy path is a silent optimization: if `range_filter_head` ever
-    // stopped matching, every island would go back to gathering each morsel and
+    // stopped matching, every pipeline would go back to gathering each morsel and
     // the whole suite would still pass. These assertions are the only thing
     // that would notice.
-    auto tables = make_wide_island_table(1000);
+    auto tables = make_wide_pipeline_table(1000);
 
     SECTION("a filter head is absorbed") {
-        runtime::ParallelIslandStats stats;
-        auto island = run_parallel("t[filter price > 350];", tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        runtime::ParallelPipelineStats stats;
+        auto pipeline = run_parallel("t[filter price > 350];", tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.range_heads.load() == 1);
         // Absorbing the head must not change the answer.
-        require_tables_equal(run("t[filter price > 350];", tables), island);
+        require_tables_equal(run("t[filter price > 350];", tables), pipeline);
     }
 
     SECTION("a filter head still absorbed when operators follow it") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350, select { price, qty }];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.range_heads.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a scalar-call predicate is absorbed once evaluate_field is range-native") {
@@ -2413,21 +2413,21 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         // per-row loop are both range-aware. This was deliberately excluded
         // while only the per-row loop was threaded, because declining the fused
         // tree per morsel cost more than gathering.
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter abs(price) > 350];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.range_heads.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a scalar call in one arm of a conjunction is still absorbed") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350 && abs(qty) < 5];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.range_heads.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a whole-column builtin keeps the gathering source") {
@@ -2435,21 +2435,21 @@ TEST_CASE("E2E: a filter island absorbs its head into a range-evaluating source"
         // answer rather than just the cost. Permanently non-range-native — and
         // evaluate_field aborts rather than compute one, so if this ever
         // regressed the abort would fire instead of a wrong answer.
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter lag(price, 1) > 350];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.range_heads.load() == 0);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a project head keeps the gathering source") {
-        // Project is still a ParallelMap, so it forms an island — but it is not
+        // Project is still a ParallelMap, so it forms a pipeline — but it is not
         // a shape `range_filter_head` absorbs, so it gathers.
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 100][select { price, qty }];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() >= 1);
-        require_tables_equal(run(src, tables), island);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() >= 1);
+        require_tables_equal(run(src, tables), pipeline);
     }
 }
 
@@ -2484,7 +2484,7 @@ auto make_two_phase_table(std::size_t rows) -> runtime::TableRegistry {
 
 }  // namespace
 
-TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[e2e][parallel]") {
+TEST_CASE("E2E: a lone filter pipeline presizes its output instead of merging", "[e2e][parallel]") {
     // The two-phase filter is a silent optimization in the strongest sense: it
     // produces byte-identical output to the ordered merger, so nothing but a
     // counter can tell which one ran. Every section therefore asserts BOTH the
@@ -2494,37 +2494,37 @@ TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[
     auto tables = make_two_phase_table(1000);
 
     SECTION("a bare filter takes the two-phase path") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a fused projection takes it too") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350, select { symbol, weight }];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("an empty result presizes to zero rows") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 100000];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("keeping every row still lands each morsel at its own offset") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price >= 0];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a grain that does not divide the input") {
@@ -2532,54 +2532,54 @@ TEST_CASE("E2E: a lone filter island presizes its output instead of merging", "[
         // exposes an off-by-one in the row or byte accounting.
         for (const std::size_t grain : {std::size_t{1}, std::size_t{3}, std::size_t{64},
                                         std::size_t{65}, std::size_t{333}, std::size_t{999}}) {
-            runtime::ParallelIslandStats stats;
+            runtime::ParallelPipelineStats stats;
             const auto* src = "t[filter price > 200];";
-            auto island = run_parallel(src, tables, grain, 4, &stats);
+            auto pipeline = run_parallel(src, tables, grain, 4, &stats);
             CAPTURE(grain);
-            require_tables_equal(run(src, tables), island);
+            require_tables_equal(run(src, tables), pipeline);
         }
     }
 
     SECTION("a metadata-only operator above the filter keeps the fast path") {
         // Rename copies no rows, so it runs once over the finished output
         // rather than forcing the chain back onto the merger.
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350][rename px = price];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a chain of metadata-only operators above the filter") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src =
             "t[filter price > 350][rename px = price][select { px, symbol }][rename s = symbol];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
         // Ordering and time-index metadata has to survive the tail identically
         // to the serial path — which it does by construction, since these are
         // the same two functions the serial path calls.
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a row-touching operator above the filter keeps the ordered merger") {
         // An update computes per row, so it needs the per-morsel chunks the
         // two-phase form does not produce.
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350][select { doubled = price * 2 }];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.two_phase_filters.load() == 0);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a non-range-native predicate keeps the ordered merger") {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter lag(price, 1) > 350];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
         CHECK(stats.two_phase_filters.load() == 0);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 }
 
@@ -2657,7 +2657,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         "   by symbol, window 10s ];";
 
     auto run_grouped = [&](const runtime::TableRegistry& tables, std::size_t threads,
-                           runtime::ParallelIslandStats& stats) {
+                           runtime::ParallelPipelineStats& stats) {
         auto parsed = parser::parse(src);
         REQUIRE(parsed.has_value());
         auto lowered = parser::lower(*parsed);
@@ -2675,7 +2675,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
 
     SECTION("several groups fan out and match the serial answer") {
         auto tables = make_grouped_window_table(4000, 8);
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         auto parallel = run_grouped(tables, 4, stats);
         CHECK(stats.parallel_group_windows.load() == 1);
         require_tables_equal(run(src, tables), parallel);
@@ -2686,7 +2686,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         // because it is the reason this optimization does nothing for a
         // low-cardinality key however many cores are free.
         auto tables = make_grouped_window_table(4000, 1);
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         auto parallel = run_grouped(tables, 4, stats);
         CHECK(stats.parallel_group_windows.load() == 0);
         require_tables_equal(run(src, tables), parallel);
@@ -2694,7 +2694,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
 
     SECTION("one thread stays serial") {
         auto tables = make_grouped_window_table(4000, 8);
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         auto parallel = run_grouped(tables, 1, stats);
         CHECK(stats.parallel_group_windows.load() == 0);
         require_tables_equal(run(src, tables), parallel);
@@ -2763,7 +2763,7 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
         exec.parallel_min_cells = 0;
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         exec.parallel_stats = &stats;
         auto result = runtime::interpret(*lowered.value(), tables, nullptr, nullptr, nullptr, exec);
         REQUIRE(result.has_value());
@@ -2771,8 +2771,8 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
     }
 }
 
-TEST_CASE("E2E: the island size gate counts cells, not rows", "[e2e][parallel]") {
-    // An island copies rows out, so its cost scales with table WIDTH. Measured:
+TEST_CASE("E2E: the pipeline size gate counts cells, not rows", "[e2e][parallel]") {
+    // An pipeline copies rows out, so its cost scales with table WIDTH. Measured:
     // 131,072 rows won at 6 columns and lost at 2, on the same predicate --
     // both clear any sane row threshold, and only the cell count separates
     // them. A row-only gate cannot express that, which is why the narrow case
@@ -2781,10 +2781,10 @@ TEST_CASE("E2E: the island size gate counts cells, not rows", "[e2e][parallel]")
     // Asserted in both directions on the SAME table, varying only the
     // threshold: a gate that never fired and a gate that always fired would
     // each pass a one-sided test.
-    auto tables = make_wide_island_table(1000);  // 1000 rows x 3 columns
+    auto tables = make_wide_pipeline_table(1000);  // 1000 rows x 3 columns
     const auto* src = "t[filter price > 350];";
 
-    auto run_with_cell_gate = [&](std::size_t min_cells, runtime::ParallelIslandStats& stats) {
+    auto run_with_cell_gate = [&](std::size_t min_cells, runtime::ParallelPipelineStats& stats) {
         auto parsed = parser::parse(src);
         REQUIRE(parsed.has_value());
         auto lowered = parser::lower(*parsed);
@@ -2802,25 +2802,25 @@ TEST_CASE("E2E: the island size gate counts cells, not rows", "[e2e][parallel]")
     };
 
     SECTION("enough cells fans out") {
-        runtime::ParallelIslandStats stats;
-        auto island = run_with_cell_gate(1000, stats);  // 3000 cells >= 1000
-        CHECK(stats.parallel_islands.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        runtime::ParallelPipelineStats stats;
+        auto pipeline = run_with_cell_gate(1000, stats);  // 3000 cells >= 1000
+        CHECK(stats.parallel_pipelines.load() == 1);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("too few cells stays serial, and still answers identically") {
-        runtime::ParallelIslandStats stats;
-        auto island = run_with_cell_gate(10000, stats);  // 3000 cells < 10000
-        CHECK(stats.parallel_islands.load() == 0);
-        CHECK(stats.serial_islands.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        runtime::ParallelPipelineStats stats;
+        auto pipeline = run_with_cell_gate(10000, stats);  // 3000 cells < 10000
+        CHECK(stats.parallel_pipelines.load() == 0);
+        CHECK(stats.serial_pipelines.load() == 1);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("zero disables the gate") {
-        runtime::ParallelIslandStats stats;
-        auto island = run_with_cell_gate(0, stats);
-        CHECK(stats.parallel_islands.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        runtime::ParallelPipelineStats stats;
+        auto pipeline = run_with_cell_gate(0, stats);
+        CHECK(stats.parallel_pipelines.load() == 1);
+        require_tables_equal(run(src, tables), pipeline);
     }
 }
 
@@ -2832,23 +2832,23 @@ TEST_CASE("E2E: a bit-packed output column is gathered into concurrently", "[e2e
     // gather zero-fills the destination, only ever sets bits, and OR-s the (at
     // most two) words it can share with a neighbour in atomically.
     SECTION("a nullable column takes the two-phase path") {
-        auto tables = make_wide_island_table(1000);
-        runtime::ParallelIslandStats stats;
+        auto tables = make_wide_pipeline_table(1000);
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350];";  // keeps nullable `qty`
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("a bool column takes the two-phase path") {
         auto tables = make_bit_packed_table(1000);
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         const auto* src = "t[filter price > 350];";
-        auto island = run_parallel(src, tables, 7, 4, &stats);
-        REQUIRE(stats.parallel_islands.load() == 1);
+        auto pipeline = run_parallel(src, tables, 7, 4, &stats);
+        REQUIRE(stats.parallel_pipelines.load() == 1);
         CHECK(stats.two_phase_filters.load() == 1);
-        require_tables_equal(run(src, tables), island);
+        require_tables_equal(run(src, tables), pipeline);
     }
 
     SECTION("thousands of mid-word morsel boundaries under contention") {
@@ -2864,10 +2864,10 @@ TEST_CASE("E2E: a bit-packed output column is gathered into concurrently", "[e2e
         auto serial = run(src, tables);
         for (int attempt = 0; attempt < 3; ++attempt) {
             CAPTURE(attempt);
-            runtime::ParallelIslandStats stats;
-            auto island = run_parallel(src, tables, 37, 8, &stats);
+            runtime::ParallelPipelineStats stats;
+            auto pipeline = run_parallel(src, tables, 37, 8, &stats);
             REQUIRE(stats.two_phase_filters.load() == 1);
-            require_tables_equal(serial, island);
+            require_tables_equal(serial, pipeline);
         }
     }
 }

@@ -10115,13 +10115,13 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 // matches are the post-canonicalization shapes (e.g. Project(Filter(x))
 // for the fused operator, not Project(Filter(Order(x)))).
 
-// Runtime-multithreading Phase 1, serial-island slice. Owns the materialized
-// input `Table` that the island's `PartitionedTableSource` reads by pointer.
+// Runtime-multithreading Phase 1, serial morsel slice. Owns the materialized
+// input `Table` that the pipeline's `PartitionedTableSource` reads by pointer.
 // `input_` is declared before `chain_` so the chain — which holds a raw
 // pointer into `input_` — is destroyed first.
-class OwningIslandOperator final : public Operator {
+class OwningMorselPipelineOperator final : public Operator {
    public:
-    OwningIslandOperator(std::unique_ptr<Table> input, OperatorPtr chain)
+    OwningMorselPipelineOperator(std::unique_ptr<Table> input, OperatorPtr chain)
         : input_(std::move(input)), chain_(std::move(chain)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -10137,9 +10137,9 @@ class OwningIslandOperator final : public Operator {
 /// emits in sequence order, so validating the stream is enough to make a lost,
 /// duplicated, or provenance-stripped morsel an immediate error. A later
 /// concurrent merger replaces this with sequence-indexed buffering/release.
-class SerialIslandOrderValidator final : public Operator {
+class SerialMorselOrderValidator final : public Operator {
    public:
-    SerialIslandOrderValidator(OperatorPtr child, std::uint64_t expected_morsels, std::size_t grain)
+    SerialMorselOrderValidator(OperatorPtr child, std::uint64_t expected_morsels, std::size_t grain)
         : child_(std::move(child)),
           expected_morsels_(expected_morsels),
           grain_(grain == 0 ? 1 : grain) {}
@@ -10153,13 +10153,13 @@ class SerialIslandOrderValidator final : public Operator {
             const auto& chunk = result->value();
             const auto expected_offset = static_cast<std::size_t>(next_sequence_) * grain_;
             if (chunk.sequence != next_sequence_ || chunk.row_offset != expected_offset) {
-                return std::unexpected("parallel island: morsel identity gap or reordering");
+                return std::unexpected("morsel pipeline: morsel identity gap or reordering");
             }
             ++next_sequence_;
             return result;
         }
         if (next_sequence_ != expected_morsels_) {
-            return std::unexpected("parallel island: missing output morsel");
+            return std::unexpected("morsel pipeline: missing output morsel");
         }
         return result;
     }
@@ -10171,7 +10171,7 @@ class SerialIslandOrderValidator final : public Operator {
     std::size_t grain_ = 1;
 };
 
-auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
+auto morsel_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
     if (exec.parallel_grain != 0) {
         return exec.parallel_grain;  // explicit override, used as given
     }
@@ -10190,7 +10190,7 @@ auto island_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t
     return std::clamp(rows / (threads * kMorselsPerThread), kMinGrain, kMaxGrain);
 }
 
-auto process_island_stats() -> ParallelIslandStats* {
+auto process_pipeline_stats() -> ParallelPipelineStats* {
     // File-local, like the worker pool and the query lease: a bundled plugin
     // statically links runtime code, so an inline header variable would give
     // each plugin its own counter (the RTLD_LOCAL trap).
@@ -10199,7 +10199,7 @@ auto process_island_stats() -> ParallelIslandStats* {
     // no reference to the counters it prints beyond the function-local statics
     // above it, which outlive it by declaration order.
     static const bool enabled = std::getenv("IBEX_PARALLEL_STATS") != nullptr;
-    static ParallelIslandStats stats;
+    static ParallelPipelineStats stats;
     struct Reporter {
         ~Reporter() {
             if (!enabled) {
@@ -10207,12 +10207,12 @@ auto process_island_stats() -> ParallelIslandStats* {
             }
             ibex::formatting::print(
                 stderr,
-                "island stats: parallel={} serial={} morsels={} "
+                "pipeline stats: parallel={} serial={} morsels={} "
                 "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
                 "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
                 "grouped_lifted_group_state={} chunk_direct_updates={}\n",
-                stats.parallel_islands.load(), stats.serial_islands.load(), stats.morsels.load(),
-                stats.pipelined_scans.load(), stats.pipelined_stages.load(),
+                stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
+                stats.morsels.load(), stats.pipelined_scans.load(), stats.pipelined_stages.load(),
                 stats.range_heads.load(), stats.two_phase_filters.load(),
                 stats.parallel_fields.load(), stats.parallel_direct_numeric_fields.load(),
                 stats.parallel_probes.load(), stats.grouped_lifted_group_state.load(),
@@ -10251,7 +10251,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
         exec.parallel_threads = compute_thread_count();
     }
     if (exec.parallel_stats == nullptr) {
-        exec.parallel_stats = process_island_stats();
+        exec.parallel_stats = process_pipeline_stats();
     }
     if (exec.execution_profile == nullptr && execution_profile_requested()) {
         // The budget occupancy is measured against. Read from the context or
@@ -10275,7 +10275,7 @@ void configure_parallel_from_env(ExecutionContext& exec) {
 }
 
 // One construction point for every row-local map operator that can live in a
-// parallel island. The serial planner uses the same factory: only the island
+// morsel pipeline. The serial planner uses the same factory: only the pipeline
 // asks maps to retain zero-row morsels, because its ordered merger needs one
 // output identity for every input morsel. Keeping the construction (especially
 // FUP's gather set) here prevents the two planners from drifting as range-aware
@@ -10452,19 +10452,19 @@ auto build_row_local_map_operator(const ir::Node& node, OperatorPtr child,
                                         preserve_empty_morsels);
 }
 
-// The base of one worker's island chain: a source the worker points at the
+// The base of one worker's worker chain: a source the worker points at the
 // morsel it just claimed. Two implementations, differing only in whether the
 // morsel's rows are copied out of the shared input before the chain sees them.
 class MorselSource : public Operator {
    public:
-    /// Aim the source at rows [begin, end) of the island's input. The next
+    /// Aim the source at rows [begin, end) of the pipeline's input. The next
     /// `next()` produces exactly that morsel and then reports exhaustion, so
     /// one call feeds one turn of the worker loop.
     virtual void set_morsel(std::size_t begin, std::size_t end, std::uint64_t sequence) = 0;
 };
 
 // Gathering source: materializes the morsel, then the chain above runs over it
-// exactly as the serial path does. The fallback for any island whose head this
+// exactly as the serial path does. The fallback for any pipeline whose head this
 // file cannot evaluate by range.
 class GatherMorselSource final : public MorselSource {
    public:
@@ -10488,7 +10488,7 @@ class GatherMorselSource final : public MorselSource {
     std::optional<Chunk> pending_;
 };
 
-// Range-filtering source: absorbs the island's head `Filter` and evaluates its
+// Range-filtering source: absorbs the pipeline's head `Filter` and evaluates its
 // predicate directly over the input's rows [begin, end), so the morsel is never
 // materialized. Only surviving rows are ever copied — the gather the serial
 // path pays for every row is gone.
@@ -10554,7 +10554,7 @@ struct RangeHead {
 ///
 /// Two things disqualify a head:
 ///
-/// - A predicate that is not `is_range_native_expr`. Island eligibility admits
+/// - A predicate that is not `is_range_native_expr`. Pipeline eligibility admits
 ///   Scalar calls, but every call still evaluates whole-table-and-slice, so
 ///   absorbing `abs(a) > 50` would re-run `abs` over the entire input once per
 ///   morsel — measured at 10x slower than serial on 20M rows. Gathering is the
@@ -10598,20 +10598,20 @@ struct RangeHead {
     return std::nullopt;
 }
 
-// One worker's private copy of the island's map chain. The operators are
+// One worker's private copy of the pipeline's map chain. The operators are
 // per-worker (they carry mutable per-chunk state); the IR nodes, registries,
-// and the input table they read are shared and immutable for the island's
+// and the input table they read are shared and immutable for the pipeline's
 // lifetime.
-struct IslandWorkerChain {
+struct MorselWorkerChain {
     MorselSource* source = nullptr;  // owned by `chain`, re-aimed per morsel
     OperatorPtr chain;
 };
 
-[[nodiscard]] auto build_island_worker_chain(const std::vector<MapStep>& operators,
+[[nodiscard]] auto build_morsel_worker_chain(const std::vector<MapStep>& operators,
                                              const Table& input, const ScalarRegistry* scalars,
                                              const ExternRegistry* externs,
                                              const ExecutionContext& exec)
-    -> std::expected<IslandWorkerChain, std::string> {
+    -> std::expected<MorselWorkerChain, std::string> {
     // A qualifying head is absorbed into the source rather than built as an
     // operator above it — same output, without materializing the morsel first.
     std::size_t first_op = 0;
@@ -10627,7 +10627,7 @@ struct IslandWorkerChain {
         source = std::make_unique<GatherMorselSource>(input);
     }
 
-    IslandWorkerChain worker{.source = source.get(), .chain = std::move(source)};
+    MorselWorkerChain worker{.source = source.get(), .chain = std::move(source)};
     for (std::size_t i = first_op; i < operators.size(); ++i) {
         const MapStep& op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly
@@ -10638,7 +10638,7 @@ struct IslandWorkerChain {
                                                  exec, true);
         if (!next.has_value()) {
             // The plan's step vocabulary only admits row-local map kinds.
-            return std::unexpected("parallel island: " + next.error());
+            return std::unexpected("morsel pipeline: " + next.error());
         }
         worker.chain = std::move(next.value());
     }
@@ -10815,7 +10815,7 @@ class OrderedChunkRing {
     const char* error_fixed_ = nullptr;
 };
 
-// Runtime-multithreading Phase 1: the parallel island executor.
+// Runtime-multithreading Phase 1: the morsel pipeline executor.
 //
 // Workers pull numbered morsels from one shared cursor over the immutable
 // materialized input, run their own chain over each, and deposit the result in
@@ -10823,7 +10823,7 @@ class OrderedChunkRing {
 // releases results strictly in sequence order, so the operator's output is
 // byte-identical to the serial chain's regardless of completion order. The ring
 // is the plan's bounded in-flight queue — a worker that runs ahead of the
-// consumer by a full window blocks instead of buffering the whole island.
+// consumer by a full window blocks instead of buffering the whole pipeline.
 //
 // Output ownership (the plan's Phase-1 allocator variable): each task owns the
 // chunk it produces, and the merger's consumer moves it straight into the
@@ -10837,9 +10837,9 @@ class OrderedChunkRing {
 // the lock, keeping the *lowest* sequence, and workers abandon only morsels
 // above it — so every morsel below the reported failure is still produced, and
 // the error a query reports does not depend on thread timing.
-class ParallelIslandOperator final : public Operator {
+class MorselPipelineOperator final : public Operator {
    public:
-    ParallelIslandOperator(std::unique_ptr<Table> input, std::vector<IslandWorkerChain> workers,
+    MorselPipelineOperator(std::unique_ptr<Table> input, std::vector<MorselWorkerChain> workers,
                            std::size_t grain, std::uint64_t morsel_count, WorkerPool& pool)
         : input_(std::move(input)),
           workers_(std::move(workers)),
@@ -10848,12 +10848,12 @@ class ParallelIslandOperator final : public Operator {
           pool_(&pool),
           ring_(std::max<std::size_t>(workers_.size() * 2, 2), workers_.size()) {}
 
-    ~ParallelIslandOperator() override { cancel_and_join(); }
+    ~MorselPipelineOperator() override { cancel_and_join(); }
 
-    ParallelIslandOperator(const ParallelIslandOperator&) = delete;
-    auto operator=(const ParallelIslandOperator&) -> ParallelIslandOperator& = delete;
-    ParallelIslandOperator(ParallelIslandOperator&&) = delete;
-    auto operator=(ParallelIslandOperator&&) -> ParallelIslandOperator& = delete;
+    MorselPipelineOperator(const MorselPipelineOperator&) = delete;
+    auto operator=(const MorselPipelineOperator&) -> MorselPipelineOperator& = delete;
+    MorselPipelineOperator(MorselPipelineOperator&&) = delete;
+    auto operator=(MorselPipelineOperator&&) -> MorselPipelineOperator& = delete;
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (finished_) {
@@ -10876,7 +10876,7 @@ class ParallelIslandOperator final : public Operator {
             return std::optional<Chunk>{std::move(*chunk)};
         }
 
-        // No chunk: the island stopped early. Report why, deterministically.
+        // No chunk: the pipeline stopped early. Report why, deterministically.
         //
         // An interrupt outranks a recorded data error. A worker that fails at
         // the moment the user hits Ctrl+C is a race, and reporting its message
@@ -10889,7 +10889,7 @@ class ParallelIslandOperator final : public Operator {
         if (auto failure = ring_.failure(); failure.has_value()) {
             return fail(std::move(*failure));
         }
-        return fail("parallel island: missing output morsel");
+        return fail("morsel pipeline: missing output morsel");
     }
 
    private:
@@ -10903,7 +10903,7 @@ class ParallelIslandOperator final : public Operator {
         // Cleanup runs however this scope is left, so no path can leave the
         // consumer waiting on a worker that is gone.
         struct ExitGuard {
-            ParallelIslandOperator* self;
+            MorselPipelineOperator* self;
             ~ExitGuard() { self->worker_exited(); }
         } const guard{this};
 
@@ -10914,7 +10914,7 @@ class ParallelIslandOperator final : public Operator {
             // An exception is not part of the operator protocol (evaluation
             // reports failure through `expected`), so it is something
             // unplanned — an allocation failure while materializing a morsel,
-            // say. Convert it to a sequence-tagged island error so it obeys the
+            // say. Convert it to a sequence-tagged pipeline error so it obeys the
             // same lowest-sequence determinism as any other failure, rather
             // than unwinding through a pool thread.
             //
@@ -10926,13 +10926,13 @@ class ParallelIslandOperator final : public Operator {
             // pool. `what()` cannot be stored: it dies with the exception.
             try {
                 ring_.record_error(
-                    sequence, "parallel island: worker exception: " + std::string(error.what()));
+                    sequence, "morsel pipeline: worker exception: " + std::string(error.what()));
             } catch (...) {
                 ring_.record_fault(sequence,
-                                   "parallel island: worker exception (no memory to report it)");
+                                   "morsel pipeline: worker exception (no memory to report it)");
             }
         } catch (...) {
-            ring_.record_fault(sequence, "parallel island: worker threw a non-standard exception");
+            ring_.record_fault(sequence, "morsel pipeline: worker threw a non-standard exception");
         }
     }
 
@@ -10966,12 +10966,12 @@ class ParallelIslandOperator final : public Operator {
                 break;
             }
             if (!produced->has_value()) {
-                ring_.record_fault(sequence, "parallel island: worker produced no output morsel");
+                ring_.record_fault(sequence, "morsel pipeline: worker produced no output morsel");
                 break;
             }
             Chunk out = std::move(**produced);
             if (out.sequence != sequence || out.row_offset != begin) {
-                ring_.record_fault(sequence, "parallel island: morsel identity gap or reordering");
+                ring_.record_fault(sequence, "morsel pipeline: morsel identity gap or reordering");
                 break;
             }
             ring_.publish(sequence, std::move(out));
@@ -10980,7 +10980,7 @@ class ParallelIslandOperator final : public Operator {
 
     // Called from the destructor, so nothing here may throw: an escaping
     // exception during destruction terminates the process. Worker bodies are
-    // already noexcept and convert failures into island errors, so there is
+    // already noexcept and convert failures into pipeline errors, so there is
     // nothing for `wait()` to rethrow — this guards the path regardless.
     void cancel_and_join() noexcept {
         try {
@@ -10992,7 +10992,7 @@ class ParallelIslandOperator final : public Operator {
         }
     }
 
-    // Drain the island cleanly at EOF, then check the per-worker chains really
+    // Drain the pipeline cleanly at EOF, then check the per-worker chains really
     // are exhausted: a chain still holding a suppressed schema carrier would
     // mean a morsel was coalesced away rather than emitted.
     [[nodiscard]] auto finish() -> std::expected<std::optional<Chunk>, std::string> {
@@ -11012,7 +11012,7 @@ class ParallelIslandOperator final : public Operator {
                 return std::unexpected(std::move(trailing.error()));
             }
             if (trailing->has_value()) {
-                return std::unexpected("parallel island: unexpected trailing morsel");
+                return std::unexpected("morsel pipeline: unexpected trailing morsel");
             }
         }
         return std::optional<Chunk>{};
@@ -11029,7 +11029,7 @@ class ParallelIslandOperator final : public Operator {
     // through raw pointers, and the batch is joined before any member is
     // destroyed.
     std::unique_ptr<Table> input_;
-    std::vector<IslandWorkerChain> workers_;
+    std::vector<MorselWorkerChain> workers_;
     std::size_t grain_ = 1;
     std::uint64_t morsel_count_ = 0;
     WorkerPool* pool_;
@@ -11049,8 +11049,8 @@ class ParallelIslandOperator final : public Operator {
 //
 // What the ordered merger above cannot remove is the merge itself. Each worker
 // materializes its morsel's surviving rows, and `MaterializeOperator` then
-// copies all of them again into one table — so a filter island copies its
-// output twice where the serial path copies it once. That is why island wins
+// copies all of them again into one table — so a filter pipeline copies its
+// output twice where the serial path copies it once. That is why morsel parallelism wins
 // track OUTPUT size rather than input size: a selective predicate wins easily,
 // and a bulk one loses no matter how much input work is parallelized.
 //
@@ -11120,7 +11120,7 @@ class TwoPhaseFilterOperator final : public Operator {
         if (!table.has_value()) {
             return std::unexpected(std::move(table.error()));
         }
-        // Sequence 0 / row_offset 0: this operator emits the island's whole
+        // Sequence 0 / row_offset 0: this operator emits the pipeline's whole
         // output at once, so it is trivially the first and only morsel.
         return std::optional<Chunk>{table_to_chunk(std::move(table.value()), ChunkIdentity{})};
     }
@@ -11211,7 +11211,7 @@ class TwoPhaseFilterOperator final : public Operator {
             case ir::NodeKind::Rename:
                 return rename_table(input, static_cast<const ir::RenameNode&>(node).renames());
             default:
-                // The island builder only admits `is_metadata_only_node` kinds
+                // The pipeline builder only admits `is_metadata_only_node` kinds
                 // into `tail_`, so reaching this means the two have drifted.
                 invariant_violation("two-phase filter: non-metadata operator in the tail");
         }
@@ -11369,7 +11369,7 @@ class TwoPhaseFilterOperator final : public Operator {
     bool done_ = false;
 };
 
-// How many workers an island of `morsel_count` morsels over `rows` rows should
+// How many workers a pipeline of `morsel_count` morsels over `rows` rows should
 // run on: 0 means "stay on the serial morsel chain".
 //
 // This is the plan's grain-size serial threshold. Below it, task dispatch,
@@ -11379,18 +11379,18 @@ class TwoPhaseFilterOperator final : public Operator {
 /// Whether this input is worth morselizing at all — a *different* question from
 /// how many workers it deserves, and conflating the two is a trap worth naming.
 ///
-/// A "refused" island used to mean a serial sweep of morsels, which still pays
+/// A "refused" pipeline used to mean a serial sweep of morsels, which still pays
 /// per-morsel materialization and the merge concat. So refusing by dropping the
-/// worker count made a small query **slower than never forming an island**:
+/// worker count made a small query **slower than never forming a pipeline**:
 /// measured 100ms against 36ms for the plain serial path, and it got worse once
 /// the grain was derived, because that turned 2 morsels into 32. When the
 /// answer is no, the input has to run as ONE whole-table chunk.
 ///
-/// Two thresholds, because an island's cost has two dimensions. Rows alone
+/// Two thresholds, because a pipeline's cost has two dimensions. Rows alone
 /// cannot express it: 131,072 rows won at 6 columns and lost at 2 on the very
 /// same predicate, and every row threshold puts those on the same side.
-[[nodiscard]] auto island_is_worth_morselizing(const ExecutionContext& exec, std::size_t rows,
-                                               std::size_t columns) -> bool {
+[[nodiscard]] auto is_worth_morselizing(const ExecutionContext& exec, std::size_t rows,
+                                        std::size_t columns) -> bool {
     if (rows < exec.parallel_min_rows) {
         return false;
     }
@@ -11398,7 +11398,7 @@ class TwoPhaseFilterOperator final : public Operator {
            rows * columns >= exec.parallel_min_cells;
 }
 
-[[nodiscard]] auto island_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
+[[nodiscard]] auto morsel_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
     -> std::size_t {
     if (morsel_count < 2 || !exec.parallel) {
         return 0;
@@ -11413,12 +11413,12 @@ class TwoPhaseFilterOperator final : public Operator {
     return workers < 2 ? 0 : workers;
 }
 
-// Build one eligible row-local parallel-map chain as an island: materialize its
+// Build one eligible row-local parallel-map chain as a morsel pipeline: materialize its
 // input subtree once, then run the chain over morsels of that table instead of
 // one whole-table chunk. The operators are ordered source-to-sink.
 //
 // Two executors, one morsel model. A large input fans out across the worker
-// pool and is reassembled by `ParallelIslandOperator`'s ordered merger; a small
+// pool and is reassembled by `MorselPipelineOperator`'s ordered merger; a small
 // one (or a single-threaded budget) runs the same morsels serially through a
 // `PartitionedTableSource`, where `MaterializeOperator`'s in-order concat is
 // the trivially ordered merger. Both stamp and check the same morsel identity,
@@ -11428,10 +11428,10 @@ class TwoPhaseFilterOperator final : public Operator {
 // LOAD-BEARING INVARIANT — materialize before fan-out. The input subtree is
 // executed to a `Table` here, on this thread, and every morsel source below
 // takes that finished table by reference. That is what makes a deferred/lazy
-// source safe in an island: its decode runs exactly once, serially, before any
+// source safe in a pipeline: its decode runs exactly once, serially, before any
 // worker exists, so neither `LazyTable::cache_` nor a plugin's `decode_`
 // closure is ever touched concurrently. It is why `build_operator`'s seam no
-// longer screens islands for deferred sources.
+// longer screens pipelines for deferred sources.
 //
 // The morsel sources all take `const Table&`, so the invariant is enforced by
 // their signatures rather than by a check. Streaming a source's morsels
@@ -11445,8 +11445,9 @@ class TwoPhaseFilterOperator final : public Operator {
 /// Defined below; the run builder chooses between this streaming source and
 /// materialize-then-morselize, so the choice lives with the run rather than at
 /// the construction seam.
-[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators, bool count_as_island,
-                                        const DeferredScan& scan, std::vector<SourceUnit> units,
+[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators,
+                                        bool count_as_pipeline, const DeferredScan& scan,
+                                        std::vector<SourceUnit> units,
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string>;
@@ -11511,13 +11512,13 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         return std::unexpected(std::move(input_tbl.error()));
     }
     auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
-    const std::size_t grain = island_grain(exec, owned->rows());
+    const std::size_t grain = morsel_grain(exec, owned->rows());
     const auto expected_morsels = partitioned_morsel_count(*owned, grain);
-    const bool morselize = island_is_worth_morselizing(exec, owned->rows(), owned->columns.size());
-    const std::size_t worker_count = morselize ? island_worker_count(exec, expected_morsels) : 0;
+    const bool morselize = is_worth_morselizing(exec, owned->rows(), owned->columns.size());
+    const std::size_t worker_count = morselize ? morsel_worker_count(exec, expected_morsels) : 0;
     if (exec.parallel_stats != nullptr) {
         auto& stats = *exec.parallel_stats;
-        (worker_count >= 2 ? stats.parallel_islands : stats.serial_islands)
+        (worker_count >= 2 ? stats.parallel_pipelines : stats.serial_pipelines)
             .fetch_add(1, std::memory_order_relaxed);
         stats.morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
     }
@@ -11559,16 +11560,16 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
             }
         }
 
-        std::vector<IslandWorkerChain> workers;
+        std::vector<MorselWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            auto worker = build_island_worker_chain(operators, *owned, scalars, externs, exec);
+            auto worker = build_morsel_worker_chain(operators, *owned, scalars, externs, exec);
             if (!worker.has_value()) {
                 return std::unexpected(std::move(worker.error()));
             }
             workers.push_back(std::move(worker.value()));
         }
-        return std::make_unique<ParallelIslandOperator>(std::move(owned), std::move(workers), grain,
+        return std::make_unique<MorselPipelineOperator>(std::move(owned), std::move(workers), grain,
                                                         expected_morsels, process_worker_pool());
     }
 
@@ -11576,7 +11577,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         // Too little work to be worth splitting: run the chain over one
         // whole-table chunk. This is the plain serial path — same map
         // operators, same `preserve_empty_morsels = false`, one chunk in and
-        // one chunk out — so it costs exactly what not forming an island costs.
+        // one chunk out — so it costs exactly what not forming a pipeline costs.
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
         OperatorPtr serial = make_table_source(std::move(*owned));
@@ -11584,7 +11585,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
             auto next = build_row_local_map_operator(op_node, std::move(serial), scalars, externs,
                                                      exec, false);
             if (!next.has_value()) {
-                return std::unexpected("parallel island: " + next.error());
+                return std::unexpected("morsel pipeline: " + next.error());
             }
             serial = std::move(next.value());
         }
@@ -11597,13 +11598,13 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
             build_row_local_map_operator(op_node, std::move(chain), scalars, externs, exec, true);
         if (!next.has_value()) {
             // The plan's step vocabulary only admits row-local map kinds.
-            return std::unexpected("parallel island: " + next.error());
+            return std::unexpected("morsel pipeline: " + next.error());
         }
         chain = std::move(next.value());
     }
 
-    chain = std::make_unique<SerialIslandOrderValidator>(std::move(chain), expected_morsels, grain);
-    return std::make_unique<OwningIslandOperator>(std::move(owned), std::move(chain));
+    chain = std::make_unique<SerialMorselOrderValidator>(std::move(chain), expected_morsels, grain);
+    return std::make_unique<OwningMorselPipelineOperator>(std::move(owned), std::move(chain));
 }
 
 /// Streams a deferred lazy scan one source unit at a time instead of decoding
@@ -12451,8 +12452,9 @@ class PipelinedStageOperator final : public Operator {
     return workers;
 }
 
-[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators, bool count_as_island,
-                                        const DeferredScan& scan, std::vector<SourceUnit> units,
+[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators,
+                                        bool count_as_pipeline, const DeferredScan& scan,
+                                        std::vector<SourceUnit> units,
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string> {
@@ -12470,8 +12472,8 @@ class PipelinedStageOperator final : public Operator {
         workers.push_back(std::move(*worker));
     }
     if (exec.parallel_stats != nullptr) {
-        if (count_as_island) {
-            exec.parallel_stats->parallel_islands.fetch_add(1, std::memory_order_relaxed);
+        if (count_as_pipeline) {
+            exec.parallel_stats->parallel_pipelines.fetch_add(1, std::memory_order_relaxed);
         }
         exec.parallel_stats->morsels.fetch_add(units.size(), std::memory_order_relaxed);
         exec.parallel_stats->pipelined_scans.fetch_add(1, std::memory_order_relaxed);
@@ -12567,24 +12569,24 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // Runtime-multithreading Phase 1 seam. Only consult the island analysis
+    // Runtime-multithreading Phase 1 seam. Only consult the pipeline analysis
     // when a parallel executor is actually requested — build_operator() is a
     // hot query-construction path, so the serial default must not pay for
     // analysis it would discard. When eligible, the whole row-local chain is
-    // built as one island here and its inner nodes are not recursed into
-    // separately (only the island's input subtree is), so there is no
+    // built as one pipeline here and its inner nodes are not recursed into
+    // separately (only the pipeline's input subtree is), so there is no
     // re-analysis of the chain and no infinite recursion.
     //
-    // A lazy/deferred source in the island's input subtree used to disqualify
+    // A lazy/deferred source in the pipeline's input subtree used to disqualify
     // it, per the LazyTable synchronization contract's interim gate. That gate
-    // is LIFTED (Phase 3b): `build_parallel_island` materializes its input
+    // is LIFTED (Phase 3b): `build_morsel_pipeline` materializes its input
     // subtree into an owned Table *before* constructing any morsel source, so
     // every deferred decode happens on the single build thread and no worker
     // ever reaches a `LazyTable`. The contract's hazards — concurrent `cache_`
     // writes and concurrent `decode_` calls — need a worker to touch the source
     // to arise, and none does.
     //
-    // That is a claim about `build_parallel_island`'s structure, so it is
+    // That is a claim about `build_morsel_pipeline`'s structure, so it is
     // asserted there rather than restated here. A future slice that streams a
     // source's morsels straight into workers, instead of materializing first,
     // reintroduces both hazards and must re-establish eligibility (per-worker

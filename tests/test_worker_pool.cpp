@@ -4,7 +4,7 @@
 // Worker-pool unit tests (runtime multithreading, Phase 1).
 //
 // The pool is deliberately tiny, so what is worth testing is its contract with
-// the parallel island: every submitted worker body runs exactly once, `wait()`
+// the morsel pipeline: every submitted worker body runs exactly once, `wait()`
 // really waits, an escaping exception is reported deterministically rather than
 // terminating the process, and a Batch never outlives its bodies.
 
@@ -109,7 +109,7 @@ TEST_CASE("WorkerPool reuses its threads across batches", "[runtime][worker_pool
 TEST_CASE("WorkerPool::wait rethrows the lowest worker's exception", "[runtime][worker_pool]") {
     runtime::WorkerPool pool(4);
     // Several workers throw. The reported failure must be the lowest worker id,
-    // not whichever thread happened to finish first — the island depends on the
+    // not whichever thread happened to finish first — the pipeline depends on the
     // same rule (lowest morsel sequence) for a deterministic error.
     auto batch = pool.submit(4, [](std::size_t id) {
         if (id > 0) {
@@ -189,7 +189,7 @@ TEST_CASE("process worker pool can be shut down and recreated", "[runtime][worke
 TEST_CASE("on_worker_pool_thread distinguishes pool threads from the caller",
           "[runtime][worker_pool]") {
     // The guard against nested parallelism. Anything reachable from inside a
-    // parallel island — update_table's field split, today — checks this before
+    // morsel pipeline — update_table's field split, today — checks this before
     // submitting work of its own, because submitting from a worker deadlocks
     // the pool. A flag that is never observed to be true would silence that
     // check rather than enforce it.
@@ -283,12 +283,12 @@ TEST_CASE("a stage thread is distinguishable from a pool worker and the caller",
 
 // `IBEX_PARALLEL` has to answer both ways.
 //
-// Parallel islands are on by default, so a switch that could only turn them ON
+// Morsel pipelines are on by default, so a switch that could only turn them ON
 // would leave a user hitting a threading bug -- or an A/B measuring the feature
 // -- with no way to turn them off. That is exactly the kind of gap nothing else
 // would catch: the flag would look like it worked in every test that sets it to
 // "1", which is the only value the old one understood.
-TEST_CASE("IBEX_PARALLEL can turn parallel islands off as well as on",
+TEST_CASE("IBEX_PARALLEL can turn morsel pipelines off as well as on",
           "[runtime][parallel][worker_pool]") {
     const EnvGuard guard("IBEX_PARALLEL");
 

@@ -126,17 +126,17 @@ auto execution_capability(const ir::Node& node) -> ExecutionCapability {
     //
     // An update is 1:1, and `update_table` builds its output by moving the
     // input, so a passthrough column costs nothing. Running one through a
-    // morsel island therefore adds two whole-table copies (the per-morsel
+    // morsel pipeline therefore adds two whole-table copies (the per-morsel
     // gather and the merge concat) to buy parallelism over the computed column
     // alone — and `update_table` can now split that computation across threads
     // by itself, with no copies at all. Measured on 20M rows, net of
     // generation: a heavy update over six columns is 0.32s serial, 0.72s as an
-    // island, 0.08s split inside the operator; over two columns, 0.29s / 0.27s
-    // / 0.09s. The island loses on the wide table and wins nothing on the
+    // pipeline, 0.08s split inside the operator; over two columns, 0.29s / 0.27s
+    // / 0.09s. The pipeline loses on the wide table and wins nothing on the
     // narrow one.
     //
     // Filter-shaped nodes stay ParallelMap: their cardinality is
-    // data-dependent, so they cannot presize an output, and the island's
+    // data-dependent, so they cannot presize an output, and the pipeline's
     // ordered merger is what resolves that.
     return execution_capability(node.kind());
 }

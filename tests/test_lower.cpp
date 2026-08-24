@@ -124,7 +124,7 @@ TEST_CASE("Map pipeline mode follows lowered canonical IR", "[runtime][pipeline]
 TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
     // An `update` is row-local, and an earlier slice did admit it here. It is
     // excluded again on measurement: an update is 1:1 and `update_table` builds
-    // its output by moving the input, so a morsel island buys parallelism over
+    // its output by moving the input, so a morsel pipeline buys parallelism over
     // the computed column at the price of two whole-table copies, while
     // `update_table` now splits that computation across threads with none. See
     // execution_capability(const ir::Node&) for the numbers.
@@ -167,7 +167,7 @@ TEST_CASE("A parallel pipeline requires per-row work", "[runtime][pipeline]") {
     // pipeline of nothing but those would gather every morsel and concatenate the
     // results in order to parallelize a pointer assignment: measured on 20M
     // rows over six columns, a bare `select` went 0.65-0.83s serial to
-    // 1.20-1.36s as an island, a bare `rename` 0.68-0.72s to 1.31-1.45s.
+    // 1.20-1.36s as a pipeline, a bare `rename` 0.68-0.72s to 1.31-1.45s.
     {
         for (const auto* src : {"df[select { price, qty }];", "df[rename px = price];",
                                 "df[select { price, qty }][rename p = price];"}) {
@@ -208,7 +208,7 @@ TEST_CASE("A parallel pipeline rejects updates that are not row-local", "[runtim
     const char* cases[] = {
         // Aggregate over the whole table: per morsel this becomes a per-morsel
         // mean. `is_row_local_update_expr` (which routes the *serial* chunked
-        // update) accepts this, so the island must apply the stricter test.
+        // update) accepts this, so the pipeline must apply the stricter test.
         "df[update { d = price - mean(price) }];",
         "df[update { c = cumsum(price) }];",           // transform reads neighbours
         "df[update { r = rand_normal(0.0, 1.0) }];",   // generator

@@ -1826,7 +1826,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
                                                const std::vector<ir::FieldSpec>& fields)
     -> std::size_t {
     // `run_group` is reached from a worker only through this function, but the
-    // island executor can call the whole update from a pool thread; submitting
+    // pipeline executor can call the whole update from a pool thread; submitting
     // from there deadlocks the pool.
     if (on_worker_pool_thread() || !exec.parallel || remaining_groups < 2) {
         return 0;
@@ -4228,9 +4228,9 @@ namespace {
 /// not worthwhile or not safe.
 ///
 /// This is where a 1:1 operator wants its parallelism, rather than in a
-/// morsel island. `update_table` builds its output by *moving* the input
+/// morsel pipeline. `update_table` builds its output by *moving* the input
 /// (`Table output = std::move(input)`), so a passthrough column costs nothing —
-/// which means an island's per-morsel gather and its merge concat are not "one
+/// which means an pipeline's per-morsel gather and its merge concat are not "one
 /// copy too many" for this shape, they are pure overhead invented by
 /// morselization. Splitting only the field computation leaves the zero-copy
 /// passthrough intact and adds one copy of the computed column, instead of two
@@ -4273,7 +4273,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
                               .validity = std::move(*validity)};
     };
 
-    // Reentrancy: the island's fused FilterUpdateProject operator calls
+    // Reentrancy: the pipeline's fused FilterUpdateProject operator calls
     // update_table from a worker thread, so this can be reached on one.
     // Submitting from there deadlocks the pool (WorkerPool::submit aborts
     // rather than let it happen), and the morsel is already one worker's share

@@ -3528,7 +3528,7 @@ TEST_CASE("a halo-split grouped window agrees with the unsplit one",
     auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     REQUIRE(whole.has_value());
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext split;
     split.parallel = true;
     split.parallel_threads = 4;
@@ -3592,7 +3592,7 @@ TEST_CASE("a halo split reassociates a float accumulator but does not move the a
     auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     REQUIRE(whole.has_value());
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext split;
     split.parallel = true;
     split.parallel_threads = 4;
@@ -3627,7 +3627,7 @@ TEST_CASE("a halo split declines for an expression that reads past the window",
 
     auto ir = require_ir("data[window 40ns, by sym, update { c = cumsum(val) }];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext split;
     split.parallel = true;
     split.parallel_threads = 4;
@@ -3662,7 +3662,7 @@ TEST_CASE("a halo split honours a per-call count window", "[interpreter][window]
     auto whole = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     REQUIRE(whole.has_value());
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext split;
     split.parallel = true;
     split.parallel_threads = 4;
@@ -3696,7 +3696,7 @@ TEST_CASE("a halo-split grouped window agrees at several worker counts",
     REQUIRE(whole.has_value());
 
     for (const std::size_t threads : {2U, 4U, 8U}) {
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         runtime::ExecutionContext split;
         split.parallel = true;
         split.parallel_threads = threads;
@@ -7573,7 +7573,7 @@ TEST_CASE("temporal parts write parallel fixed-width windows", "[update][paralle
     registry.emplace("t", std::move(t));
     auto ir = require_ir("t[update { h = hour(time) }];");
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7592,7 +7592,7 @@ TEST_CASE("temporal parts write parallel fixed-width windows", "[update][paralle
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel.first == serial.first);
     CHECK(parallel.second[513] == false);
@@ -7618,7 +7618,7 @@ TEST_CASE("categorical byte lengths write parallel fixed-width windows", "[updat
     const std::vector<ir::FieldSpec> fields{
         {.alias = "bytes", .expr = ir::Expr{.node = std::move(call)}}};
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7639,7 +7639,7 @@ TEST_CASE("categorical byte lengths write parallel fixed-width windows", "[updat
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel.first == serial.first);
     CHECK(parallel.second[513] == false);
@@ -7663,7 +7663,7 @@ TEST_CASE("native predicates write parallel packed bool windows", "[update][para
                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{2048}}})}};
     const std::vector<ir::FieldSpec> fields{{.alias = "flag", .expr = std::move(predicate)}};
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7689,7 +7689,7 @@ TEST_CASE("native predicates write parallel packed bool windows", "[update][para
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel.first == serial.first);
     for (std::size_t row = 0; row < kRows; ++row) {
@@ -7725,7 +7725,7 @@ TEST_CASE("interpolation strings write parallel prefix-assigned slabs", "[update
     const std::vector<ir::FieldSpec> fields{
         {.alias = "label", .expr = ir::Expr{.node = std::move(interpolation)}}};
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7749,7 +7749,7 @@ TEST_CASE("interpolation strings write parallel prefix-assigned slabs", "[update
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel.first == serial.first);
     for (std::size_t row = 0; row < kRows; ++row) {
@@ -7807,7 +7807,7 @@ TEST_CASE("nullable fixed-width writes return parallel range validity", "[update
         {.alias = "merged", .expr = ir::Expr{.node = std::move(coalesce)}},
         {.alias = "selected", .expr = ir::Expr{.node = std::move(case_expr)}}};
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7838,7 +7838,7 @@ TEST_CASE("nullable fixed-width writes return parallel range validity", "[update
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel == serial);
     CHECK(parallel[0].first[513] == -1);
@@ -7872,7 +7872,7 @@ TEST_CASE("categorical CASE and coalesce use planned dictionary remaps", "[updat
     auto program = require_ir(
         R"(t[update { merged = coalesce(a, b, "fallback"), picked = case { price > 2048 => a, price > 1024 => "D", else => b } }];)");
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats* stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
         runtime::ExecutionContext exec;
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -7904,7 +7904,7 @@ TEST_CASE("categorical CASE and coalesce use planned dictionary remaps", "[updat
     };
 
     const auto serial = run(false, nullptr);
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     const auto parallel = run(true, &stats);
     CHECK(parallel == serial);
     CHECK(std::get<0>(parallel[0]) == std::vector<std::string>{"B", "A", "C", "fallback"});
@@ -8048,7 +8048,7 @@ TEST_CASE("grouped update lifts aggregates out of a row-local expression",
     SECTION("aggregates mixed with row-local terms, and reused within one field") {
         auto ir = require_ir(
             "t[update { d = x - mean(x), s = x / sum(x), r = sum(x) - sum(x) / 2.0 }, by g];");
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         runtime::ExecutionContext exec;
         exec.parallel_stats = &stats;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
@@ -8173,7 +8173,7 @@ TEST_CASE("grouped update lifts ordered group state into row-local expressions",
 
     SECTION("an ordered kernel mixed with row-local terms") {
         auto ir = require_ir("t[update { lr = x / lag(x, 1) - 1.0 }, by g];");
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         runtime::ExecutionContext exec;
         exec.parallel_stats = &stats;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
@@ -8194,7 +8194,7 @@ TEST_CASE("grouped update lifts ordered group state into row-local expressions",
     SECTION("ordered state and an aggregate in one field") {
         auto ir =
             require_ir("t[update { c = cumsum(x) / sum(x), y = lag(x, 1) + mean(x) }, by g];");
-        runtime::ParallelIslandStats stats;
+        runtime::ParallelPipelineStats stats;
         runtime::ExecutionContext exec;
         exec.parallel_stats = &stats;
         auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
@@ -8226,7 +8226,7 @@ TEST_CASE("grouped update falls back for a field the lifter declines",
     registry.emplace("t", std::move(t));
 
     auto ir = require_ir("t[update { r = rank(x, method = dense) }, by g];");
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel_stats = &stats;
     auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
@@ -8261,7 +8261,7 @@ TEST_CASE("grouped update broadcasts general aggregates as select computes them"
     const std::string update_source = "t[update " + fields + ", by g];";
     auto grouped_ir = require_ir(select_source.c_str());
     auto updated_ir = require_ir(update_source.c_str());
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel_stats = &stats;
     auto reference = runtime::interpret(*grouped_ir, registry);
@@ -14409,9 +14409,9 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
     REQUIRE_FALSE(out.ordering().has_value());
 }
 
-// A lazy/deferred source used to disqualify a query from the parallel island
+// A lazy/deferred source used to disqualify a query from the morsel pipeline
 // outright. Phase 3b lifted that gate, and this pins the reason it is safe:
-// `build_parallel_island` materializes its input subtree before it builds any
+// `build_morsel_pipeline` materializes its input subtree before it builds any
 // morsel source, so the source decodes exactly once, on the building thread,
 // and no worker ever reaches the `LazyTable`.
 //
@@ -14420,7 +14420,7 @@ TEST_CASE("Table properties: fused filter+update overwriting the sort key clears
 // workers and happened to agree" — a shared `ColumnDecodeFn` closure (this
 // fixture, and the pre-factory Parquet path) is exactly what the contract's
 // second hazard boundary is about.
-TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
+TEST_CASE("Parallel pipeline: a deferred source decodes once, before fan-out",
           "[runtime][parallel]") {
     constexpr std::size_t kRows = 4096;
 
@@ -14461,7 +14461,7 @@ TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
     const runtime::TableRegistry empty;
     auto ir = require_ir("df[filter x > 0];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_grain = 256;
@@ -14473,9 +14473,9 @@ TEST_CASE("Parallel island: a deferred source decodes once, before fan-out",
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
 
-    // The island really formed over the deferred source -- without this the
+    // The pipeline really formed over the deferred source -- without this the
     // decode assertion below would hold trivially on a serial fallback.
-    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(stats.parallel_pipelines.load() == 1);
     CHECK(decode_calls.load() == 1);
 
     const auto* x = std::get_if<Column<std::int64_t>>(out->find("x"));
@@ -14492,7 +14492,7 @@ TEST_CASE("Scan pipeline decodes source units through row-local maps without mat
     const runtime::TableRegistry empty;
     auto ir = require_ir("df[filter x > 500];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -14502,7 +14502,7 @@ TEST_CASE("Scan pipeline decodes source units through row-local maps without mat
 
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
-    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(stats.parallel_pipelines.load() == 1);
     CHECK(stats.pipelined_scans.load() == 1);
     CHECK(stats.morsels.load() == 4);
     CHECK(state->max_active.load() >= 2);
@@ -14527,7 +14527,7 @@ TEST_CASE("Scan pipeline feeds a run that has a serial step above it",
     const runtime::TableRegistry empty;
     auto ir = require_ir("df[filter x > 500][update { y = x * 2 }];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -14569,7 +14569,7 @@ TEST_CASE("Scan pipeline preserves the schema when every unit is filtered out",
     const runtime::TableRegistry empty;
     auto ir = require_ir("df[filter x > 5000];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -14595,7 +14595,7 @@ TEST_CASE("Scan pipeline feeds a blocking aggregate without a materialized scan 
     const runtime::TableRegistry empty;
     auto ir = require_ir("df[select { total = sum(x) }];");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -14603,7 +14603,7 @@ TEST_CASE("Scan pipeline feeds a blocking aggregate without a materialized scan 
 
     auto out = runtime::interpret(*ir, empty, nullptr, nullptr, nullptr, exec);
     REQUIRE(out.has_value());
-    CHECK(stats.parallel_islands.load() == 0);
+    CHECK(stats.parallel_pipelines.load() == 0);
     CHECK(stats.pipelined_scans.load() == 1);
     CHECK(stats.pipelined_stages.load() == 0);
     CHECK(stats.morsels.load() == 4);
@@ -14624,7 +14624,7 @@ TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
     registry.emplace("r", std::move(right));
     auto ir = require_ir("df join r on x;");
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -14682,7 +14682,7 @@ TEST_CASE("Inner join probe fans out across workers and matches the serial probe
     registry.emplace("build_t", std::move(build_side));
     auto ir = require_ir("probe_t join build_t on k;");
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats& stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats& stats) {
         runtime::ExecutionContext exec{.execution_profile = nullptr};
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -14692,11 +14692,11 @@ TEST_CASE("Inner join probe fans out across workers and matches the serial probe
         return std::move(*out);
     };
 
-    runtime::ParallelIslandStats serial_stats;
+    runtime::ParallelPipelineStats serial_stats;
     auto serial = run(false, serial_stats);
     CHECK(serial_stats.parallel_probes.load() == 0);
 
-    runtime::ParallelIslandStats parallel_stats;
+    runtime::ParallelPipelineStats parallel_stats;
     auto parallel = run(true, parallel_stats);
     // Both directions, per the range_heads pattern: the serial run must not
     // count, and the parallel run must — otherwise a silently narrowed gate
@@ -14771,7 +14771,7 @@ TEST_CASE("join_table_impl probe scan fans out and matches the serial scan",
     registry.emplace("small_r", std::move(right_side));
 
     const auto run = [&](const std::string& src, bool parallel,
-                         runtime::ParallelIslandStats& stats) {
+                         runtime::ParallelPipelineStats& stats) {
         auto ir = require_ir(src.c_str());
         runtime::ExecutionContext exec{.execution_profile = nullptr};
         exec.parallel = parallel;
@@ -14783,14 +14783,14 @@ TEST_CASE("join_table_impl probe scan fans out and matches the serial scan",
     };
 
     const auto check_same = [&](const std::string& src, const std::vector<const char*>& columns) {
-        runtime::ParallelIslandStats serial_stats;
+        runtime::ParallelPipelineStats serial_stats;
         auto serial = run(src, false, serial_stats);
         // Both directions, as in the stream-mode test: a silently narrowed
         // gate would leave the value comparison green while costing the
         // parallelism, so the serial run must not count and the parallel must.
         CHECK(serial_stats.parallel_probes.load() == 0);
 
-        runtime::ParallelIslandStats parallel_stats;
+        runtime::ParallelPipelineStats parallel_stats;
         auto parallel = run(src, true, parallel_stats);
         CHECK(parallel_stats.parallel_probes.load() >= 1);
 
@@ -14865,7 +14865,7 @@ TEST_CASE("Swapped-mode join probe fans out across workers and matches the seria
     registry.emplace("big_r", std::move(big_right));
     auto ir = require_ir("small_l join big_r on k;");
 
-    const auto run = [&](bool parallel, runtime::ParallelIslandStats& stats) {
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats& stats) {
         runtime::ExecutionContext exec{.execution_profile = nullptr};
         exec.parallel = parallel;
         exec.parallel_threads = 4;
@@ -14875,11 +14875,11 @@ TEST_CASE("Swapped-mode join probe fans out across workers and matches the seria
         return std::move(*out);
     };
 
-    runtime::ParallelIslandStats serial_stats;
+    runtime::ParallelPipelineStats serial_stats;
     auto serial = run(false, serial_stats);
     CHECK(serial_stats.parallel_probes.load() == 0);
 
-    runtime::ParallelIslandStats parallel_stats;
+    runtime::ParallelPipelineStats parallel_stats;
     auto parallel = run(true, parallel_stats);
     CHECK(parallel_stats.parallel_probes.load() >= 1);
 

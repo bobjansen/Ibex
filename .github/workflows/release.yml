@@ -123,6 +123,9 @@ jobs:
             find build-release/tools -maxdepth 1 \( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.ibex' \) -exec cp {} stage/plugins/ \;
           fi
 
+          test -f stage/bin/ibex
+          test -f stage/bin/ui/index.html
+
           cat > stage/README.txt <<EOF
           Ibex ${RELEASE_TAG}
 
@@ -131,9 +134,12 @@ jobs:
           - plugins/: bundled plugin libraries and import stubs
 
           Quick start:
-          - Run ./bin/ibex with IBEX_LIBRARY_PATH pointed at ./plugins
-          - Example (Linux/macOS): IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex
-          - Example (Windows PowerShell): \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe
+          - The browser workbench is bundled beside the executable at ./bin/ui.
+          - Linux/macOS REPL: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex
+          - Linux/macOS UI: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex ui --data-dir .
+          - Windows PowerShell REPL: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe
+          - Windows PowerShell UI: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe ui --data-dir .
+          - Open the printed http://127.0.0.1:8765 address in a browser.
 
           Notes:
           - These release bundles intentionally disable -march=native for portability.

@@ -17,6 +17,8 @@ project(Ibex
     LANGUAGES C CXX
 )
 
+include(GNUInstallDirs)
+
 # Prevent in-source builds
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "In-source builds are not allowed. Use a separate build directory.")
@@ -244,8 +246,6 @@ if(IBEX_BUILD_EXAMPLES)
 endif()
 
 # Install rules
-include(GNUInstallDirs)
-
 install(
     DIRECTORY include/ibex
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"

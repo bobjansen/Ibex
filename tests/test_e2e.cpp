@@ -1939,6 +1939,41 @@ TEST_CASE("E2E: parallel serial-island handles a zero-row input", "[e2e][paralle
     }
 }
 
+// A left join whose aggregate is a count or sum on the join key takes a fused
+// path that aggregates the join output directly, walking past the map nodes
+// between the two. It used to walk past FilterProject as well, which dropped
+// that node's predicate: the answer came back with a group per join key
+// instead of a group per surviving row, silently. The expected values here are
+// computed by hand rather than from a second query, because a second query
+// canonicalizes to the same shape and would take the same path.
+TEST_CASE("E2E: a filter between a left join and its aggregate is not dropped",
+          "[e2e][join][aggregate]") {
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2, 3});
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{1, 1, 2});
+    right.add_column("v", Column<std::int64_t>{100, 1, 100});
+    runtime::TableRegistry tables;
+    tables.emplace("l", std::move(left));
+    tables.emplace("r", std::move(right));
+
+    // Join rows: (1,100) (1,1) (2,100) (3,null). `v > k` keeps (1,100) and
+    // (2,100) — it reads both sides, so no pushdown can move it below the
+    // join. Grouping the survivors by k: k=1 sums to 1, k=2 sums to 2, and k=3
+    // is gone entirely.
+    const auto* src =
+        "(l left join r on k)[filter v > k][select { k, v }][select { n = sum(k) }, by k];";
+    auto out = run(src, tables);
+    REQUIRE(out.rows() == 2);
+    CHECK(col_i64(out, "k") == std::vector<std::int64_t>{1, 2});
+    CHECK(col_i64(out, "n") == std::vector<std::int64_t>{1, 2});
+
+    // The same, in parallel: the rewrite lives on both the chunked and the
+    // interpreter side and both walked the same way.
+    auto parallel = run_parallel(src, tables, 2);
+    require_tables_equal(out, parallel);
+}
+
 TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][parallel]") {
     // A `Table(n)` scaffold carries its row count in `logical_rows` with no
     // columns, which is the shape most likely to be dropped by a path that

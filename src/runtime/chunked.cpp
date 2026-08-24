@@ -4136,922 +4136,68 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
     }
     return index;
 }
-/// Inner hash join for single-key no-predicate joins.
+/// The probe half of a hash join: everything that consumes a `JoinHashIndex`
+/// and turns probe-side rows into join output rows. It owns no build, which is
+/// the point -- Phase 4's `HashProbe` has to be able to exist next to a build
+/// it did not run, and an operator class that also decides which side to index
+/// cannot be that.
 ///
-/// Two execution modes:
-/// - Stream: right is small (<= kStreamRightThreshold). Build a chained
-///   hash index on the materialized right, then probe each left chunk
-///   streamed from the child. Matches the classic star-join shape.
-/// - Swapped: right is large and n_left < n_right. Materialize left,
-///   build the hash index on left, iterate right rows once and emit output
-///   in that same right-scan (probe) order (baseline's
-///   `build_indices_from_right_scan` equivalent) — row order is outside the
-///   join contract (SPEC.md §5.6), and preserving the probe side's scan order
-///   instead of reassembling by left row keeps cache locality for any
-///   downstream join that probes this join's output. Much better cache
-///   behavior overall when the smaller side fits.
-///
-/// Name conflicts are resolved with the same `_right` suffix rule as
-/// `join_table_impl`.
-class ChunkedInnerJoinOperator final : public Operator {
-   public:
-    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-                             const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
-                             const std::vector<ir::OrderKey>* pending_order = nullptr)
-        : left_(std::move(left)),
-          right_(std::move(right)),
-          keys_(keys),
-          exec_(&exec),
-          suffix_(std::move(suffix)),
-          pending_order_(pending_order) {}
+/// Held by the operator today rather than scheduled on its own. What the
+/// extraction buys now is that the probe's state is enumerable: an index, the
+/// join's two output-name plans, the per-worker scratch, and the probe chunk's
+/// own validity/dictionary. Nothing else in the join can reach it, and it can
+/// reach nothing else in the join.
+struct JoinProbe {
+    const std::vector<ir::JoinKey>* keys_ = nullptr;
+    const ExecutionContext* exec_ = nullptr;
+    ir::JoinSuffixPolicy suffix_;
+    /// The join's right table, borrowed from the operator that owns it. Bound
+    /// once: the address is stable even where the operator move-assigns the
+    /// table itself (the deferred path does that after the scan resolves).
+    const Table* right_ = nullptr;
+    /// What the build phase produced. Immutable, and shareable: this is the
+    /// only thing the probe needs from a build.
+    std::shared_ptr<const JoinHashIndex> index_;
+    /// True when the join keys are the two-Int64 pair shape.
+    bool pair_mode_ = false;
 
-    /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
-    /// its Project/Rename wrappers), interpreted only after this join has
-    /// published build-side key bounds into the scan's filter slot. The
-    /// registry/scalars/externs pointers are the interpret context and outlive
-    /// the operator.
-    ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
-                             const TableRegistry* registry, const ScalarRegistry* scalars,
-                             const ExternRegistry* externs, const ExecutionContext& exec,
-                             const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
-                             std::string probe_name, ir::JoinSuffixPolicy suffix = {},
-                             const std::vector<ir::OrderKey>* pending_order = nullptr)
-        : left_(std::move(left)),
-          keys_(keys),
-          deferred_probe_(probe),
-          deferred_probe_name_(std::move(probe_name)),
-          deferred_right_node_(right_node),
-          deferred_registry_(registry),
-          deferred_scalars_(scalars),
-          deferred_externs_(externs),
-          deferred_exec_(&exec),
-          exec_(&exec),
-          suffix_(std::move(suffix)),
-          pending_order_(pending_order) {}
+    /// Reset per probe chunk.
+    const ValidityBitmap* probe_validity_ = nullptr;
+    /// Probe-side, not build-side: the probe chunk's dictionary code -> build
+    /// chain head (`kJoinNil` = no match), rebuilt per chunk by
+    /// `resolve_categorical_heads`.
+    std::vector<std::size_t> probe_code_heads_;
 
-    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        if (!initialized_) {
-            auto err = initialize();
-            if (err.has_value()) {
-                return std::unexpected(std::move(*err));
-            }
-            initialized_ = true;
-        }
+    /// One worker's slice of a parallel probe. Members so the vectors keep
+    /// their capacity across chunks instead of reallocating per probe.
+    struct ProbePart {
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+    };
+    /// One matching probe row in swapped mode: the right row and the head of
+    /// the left chain it hit. Phase 2 replays these instead of re-probing.
+    struct SwappedHit {
+        std::size_t rrow;
+        std::size_t head;  ///< first left row in the chain for this key
+    };
+    /// One worker's slice of a swapped-mode phase 1. A member for the same
+    /// reason as `ProbePart`: capacity survives across chunks.
+    struct SwappedPart {
+        std::vector<SwappedHit> hits;
+        std::size_t total = 0;  ///< output rows this part's chains expand to
+    };
+    std::vector<ProbePart> probe_parts_;
+    std::vector<SwappedPart> swapped_parts_;
+    std::vector<std::size_t> part_offsets_;
+    std::vector<std::size_t> right_emit_idx_;
+    std::vector<std::string> right_emit_names_;
+    std::vector<std::string> left_emit_names_;
+    bool right_emit_ready_ = false;
 
-        if (mode_ == Mode::Precomputed) {
-            if (swapped_emitted_) {
-                return std::optional<Chunk>{};
-            }
-            swapped_emitted_ = true;
-            if (precomputed_output_.rows() == 0) {
-                return std::optional<Chunk>{};
-            }
-            return std::optional<Chunk>{table_to_chunk(std::move(precomputed_output_))};
-        }
-
-        if (mode_ == Mode::Swapped) {
-            if (swapped_emitted_) {
-                return std::optional<Chunk>{};
-            }
-            swapped_emitted_ = true;
-            auto out = emit_swapped();
-            if (!out.has_value()) {
-                return std::unexpected(std::move(out.error()));
-            }
-            if (out->rows() == 0) {
-                return std::optional<Chunk>{};
-            }
-            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
-        }
-
-        while (true) {
-            Table left_chunk;
-            if (use_materialized_left_) {
-                if (left_materialized_drained_) {
-                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                        auto schema = std::move(*empty_schema_);
-                        empty_schema_.reset();
-                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                    }
-                    return std::optional<Chunk>{};
-                }
-                left_materialized_drained_ = true;
-                left_chunk = std::move(left_materialized_).value_or(Table{});
-                left_materialized_.reset();
-            } else {
-                auto chunk_res = left_->next();
-                if (!chunk_res.has_value()) {
-                    return std::unexpected(std::move(chunk_res.error()));
-                }
-                if (!chunk_res.value().has_value()) {
-                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                        auto schema = std::move(*empty_schema_);
-                        empty_schema_.reset();
-                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                    }
-                    return std::optional<Chunk>{};
-                }
-                left_chunk = chunk_to_table(std::move(*chunk_res.value()));
-            }
-            auto out = probe_chunk_against_right(std::move(left_chunk));
-            if (!out.has_value()) {
-                return std::unexpected(std::move(out.error()));
-            }
-            if (out->rows() == 0) {
-                // Keep the planned empty table as a schema carrier. A join
-                // with no matches still has its left and right output columns;
-                // without this, a materializing sink sees no chunks at all.
-                empty_schema_ = std::move(*out);
-                continue;
-            }
-            emitted_nonempty_ = true;
-            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
-        }
-    }
-
-   private:
-    enum class Mode : std::uint8_t { Stream, Swapped, Precomputed };
-
-    /// The chain terminator, shared with the index this operator probes.
     static constexpr std::size_t kNil = kJoinNil;
 
-    const ValidityBitmap* probe_validity_ = nullptr;  // reset per probe chunk
-    // Build-on-right is preferred when right is small enough that probing
-    // it from streaming left chunks is cache-friendly. Above this, we
-    // materialize left to pick the smaller build side.
-    static constexpr std::size_t kStreamRightThreshold = 65536;
-
-    auto initialize() -> std::optional<std::string> {
-        if (keys_->size() == 2) {
-            return initialize_pair();
-        }
-        if (keys_->size() != 1) {
-            return "ChunkedInnerJoinOperator only supports single-key or two-Int64-key joins";
-        }
-        if (deferred_probe_ != nullptr) {
-            if (auto err = resolve_deferred_probe()) {
-                return err;
-            }
-            if (mode_ == Mode::Precomputed) {
-                return std::nullopt;
-            }
-        }
-        const std::string& left_key_name = keys_->front().left;
-        const std::string& right_key_name = keys_->front().right;
-        const ColumnValue* rkey = right_.find(right_key_name);
-        if (rkey == nullptr) {
-            return "join key not found in right table: " + right_key_name;
-        }
-        ExprType key_kind = ExprType::Int;
-        if (auto err = detect_join_key_kind(*rkey, key_kind)) {
-            return err;
-        }
-
-        const std::size_t n_right = right_.rows();
-
-        if (n_right <= kStreamRightThreshold) {
-            if (auto err = build_index(right_, right_key_name, key_kind)) {
-                return err;
-            }
-            return std::nullopt;
-        }
-
-        Table left_table;
-        if (use_materialized_left_ && left_materialized_.has_value()) {
-            // The deferred-probe path already drained the left child.
-            left_table = std::move(*left_materialized_);
-            left_materialized_.reset();
-            use_materialized_left_ = false;
-        } else {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
-            if (!left_res.has_value()) {
-                return std::move(left_res.error());
-            }
-            left_table = std::move(*left_res);
-        }
-        const std::size_t n_left = left_table.rows();
-
-        // Swapping indexes the smaller (left) side and scans the right, which
-        // gives up left-row order. When an `order` above this join wants
-        // exactly the order the left already carries, declining to swap
-        // delivers it and that whole sort disappears -- worth a larger index,
-        // but only while "larger" stays modest, since the index is probed once
-        // per row of the other side. The same trade is made in join.cpp.
-        if (n_left < n_right && !order_preserving_pays(left_table, n_left, n_right)) {
-            left_table_ = std::move(left_table);
-            if (auto err = build_index(*left_table_, left_key_name, key_kind)) {
-                return err;
-            }
-            mode_ = Mode::Swapped;
-            return std::nullopt;
-        }
-
-        left_materialized_ = std::move(left_table);
-        use_materialized_left_ = true;
-        if (auto err = build_index(right_, right_key_name, key_kind)) {
-            return err;
-        }
-        return std::nullopt;
-    }
-
-    /// Two-fixed-width-int-key path: narrow first cut of the streaming
-    /// two-key join (plans/parallelism-overview.md's "stream multi-key
-    /// joins" item). Non-deferred case: `right_` is already a whole `Table`
-    /// by construction (the call site materializes it, same as the
-    /// single-key path), so the only real decision left is which side to
-    /// index: this materializes `left_` too and builds on whichever side is
-    /// smaller -- the same motivation as `initialize()`'s single-key swap
-    /// decision, and necessary here because the call site cannot know in
-    /// advance which side a two-key join chain puts on which name (TPC-H
-    /// q09's `lineitem` join has the multi-million-row side as `right_`;
-    /// indexing it unconditionally was measured a >2x regression before this
-    /// fix). Deferred case: see `resolve_deferred_probe_pair`.
-    auto initialize_pair() -> std::optional<std::string> {
-        if (deferred_probe_ != nullptr) {
-            return resolve_deferred_probe_pair();
-        }
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* rkey0 = right_.find(k0.right);
-        if (rkey0 == nullptr) {
-            return "join key not found in right table: " + k0.right;
-        }
-        const ColumnValue* rkey1 = right_.find(k1.right);
-        if (rkey1 == nullptr) {
-            return "join key not found in right table: " + k1.right;
-        }
-        const auto* rcol0 = std::get_if<Column<std::int64_t>>(rkey0);
-        const auto* rcol1 = std::get_if<Column<std::int64_t>>(rkey1);
-        if (rcol0 == nullptr || rcol1 == nullptr) {
-            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to be "
-                   "Int64";
-        }
-        Table left_table;
-        if (use_materialized_left_ && left_materialized_.has_value()) {
-            // `resolve_deferred_probe_pair` already drained the left child
-            // while deciding whether a scan filter was worth publishing.
-            left_table = std::move(*left_materialized_);
-            left_materialized_.reset();
-            use_materialized_left_ = false;
-        } else {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
-            if (!left_res.has_value()) {
-                return std::move(left_res.error());
-            }
-            left_table = std::move(*left_res);
-        }
-        const std::size_t n_left = left_table.rows();
-        const std::size_t n_right = right_.rows();
-        pair_mode_ = true;
-
-        if (n_left <= n_right) {
-            return build_left_pair_index_and_swap(std::move(left_table));
-        }
-
-        // Build on the (smaller) right; left is already fully materialized,
-        // so it is drained as a single chunk through the existing
-        // `use_materialized_left_` mechanism rather than re-wrapped in an
-        // operator.
-        const auto* re0 = right_.find_entry(k0.right);
-        const auto* re1 = right_.find_entry(k1.right);
-        const ValidityBitmap* rv0 =
-            re0 != nullptr && re0->validity.has_value() ? &*re0->validity : nullptr;
-        const ValidityBitmap* rv1 =
-            re1 != nullptr && re1->validity.has_value() ? &*re1->validity : nullptr;
-        build_pair_index(*rcol0, *rcol1, rv0, rv1);
-        left_materialized_ = std::move(left_table);
-        use_materialized_left_ = true;
-        return std::nullopt;
-    }
-
-    // Build on the (smaller) left, scan right row-by-row: same shape as
-    // single-key `Mode::Swapped` / `emit_swapped`. Factored out of
-    // `initialize_pair` so `resolve_deferred_probe_pair` (which always
-    // builds on left -- the deferred side is definitionally the one too
-    // large to materialize first) can reuse it.
-    auto build_left_pair_index_and_swap(Table left_table) -> std::optional<std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* lkey0 = left_table.find(k0.left);
-        if (lkey0 == nullptr) {
-            return "join key not found in left table: " + k0.left;
-        }
-        const ColumnValue* lkey1 = left_table.find(k1.left);
-        if (lkey1 == nullptr) {
-            return "join key not found in left table: " + k1.left;
-        }
-        const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
-        const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
-        if (lcol0 == nullptr || lcol1 == nullptr) {
-            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
-                   "be Int64";
-        }
-        const auto* le0 = left_table.find_entry(k0.left);
-        const auto* le1 = left_table.find_entry(k1.left);
-        const ValidityBitmap* lv0 =
-            le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
-        const ValidityBitmap* lv1 =
-            le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
-        build_pair_index(*lcol0, *lcol1, lv0, lv1);
-        left_table_ = std::move(left_table);
-        mode_ = Mode::Swapped;
-        return std::nullopt;
-    }
-
-    /// Deferred-probe POC for the two-key path (plans/parallelism-overview.md
-    /// "deferred scan filtering for two-key joins", TPC-H q09's `lineitem`
-    /// join). Reuses the existing single-key deferred-scan machinery
-    /// unchanged: builds the (small) left side first, publishes a
-    /// `DynamicScanFilter` over `keys_->at(0)` ONLY -- one component, not
-    /// both -- into the scan's filter slot, then lets the source's normal
-    /// decode-time pruning narrow the right side before it is ever
-    /// materialized. Membership in one component is necessary but not
-    /// sufficient for the pair match, so this can only produce harmless
-    /// false positives (rows sharing q09's l_partkey but not l_suppkey);
-    /// `build_left_pair_index_and_swap`'s exact pair probe afterward is what
-    /// actually enforces both keys, unchanged from the non-deferred path.
-    ///
-    /// Same `kStreamRightThreshold` gate as the single-key
-    /// `resolve_deferred_probe`: below it, publishing a filter (a Bloom plus
-    /// a sort/unique pass over the whole build side) can only add cost, not
-    /// recover it, since the deferred side was never going to be expensive to
-    /// decode in the first place. First cut of this POC always materialized
-    /// left and published a filter regardless of size -- measured a clean,
-    /// unanimous +8.4% regression on q05 (its `join supplier on
-    /// {l_suppkey=s_suppkey, n_nationkey=s_nationkey}` is exactly this
-    /// shape, `supplier` fitting in one row group with nothing to prune).
-    /// Below the threshold this falls through to `initialize_pair`'s
-    /// ordinary side-picking, reusing the already-drained left side via
-    /// `left_materialized_`/`use_materialized_left_` rather than draining it
-    /// twice.
-    ///
-    /// No two-phase probe (`try_two_phase_probe`'s candidate-selection
-    /// optimization) here -- that is a further, separable lever on top of
-    /// scan-altitude pruning, and this POC is scoped to answering whether
-    /// pruning the scan itself is worth it at all before adding more on top.
-    auto resolve_deferred_probe_pair() -> std::optional<std::string> {
-        DynamicScanFilter& slot = *deferred_probe_->filter;
-        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
-            if (!left_res.has_value()) {
-                return std::move(left_res.error());
-            }
-            publish_build_filter_column(*left_res, keys_->at(0).left, slot);
-            left_materialized_ = std::move(*left_res);
-            use_materialized_left_ = true;
-        }
-        slot.ready = true;
-        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
-        if (!right.has_value()) {
-            return std::move(right.error());
-        }
-        right_ = std::move(*right);
-        deferred_probe_ = nullptr;
-        if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
-            std::fprintf(stderr, "[pair_defer] filter_published=%d right_rows_after_filter=%zu\n",
-                         static_cast<int>(use_materialized_left_), right_.rows());
-        }
-        return initialize_pair();
-    }
-
-    // Swapped pair-mode counterpart of `emit_swapped`: the pair index is on
-    // `left_table_`, so `right_`'s rows are the probe side. Reuses
-    // `probe_swapped` unchanged -- it is already generic over a
-    // `head_of(row)` callback -- with the null check folded into `head_of`
-    // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
-    // member, since a row here is null when EITHER key is.
-    auto emit_swapped_pair() -> std::expected<Table, std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* rkey0 = right_.find(k0.right);
-        if (rkey0 == nullptr) {
-            return std::unexpected("join key not found in right table: " + k0.right);
-        }
-        const ColumnValue* rkey1 = right_.find(k1.right);
-        if (rkey1 == nullptr) {
-            return std::unexpected("join key not found in right table: " + k1.right);
-        }
-        const auto* col0 = std::get_if<Column<std::int64_t>>(rkey0);
-        const auto* col1 = std::get_if<Column<std::int64_t>>(rkey1);
-        if (col0 == nullptr || col1 == nullptr) {
-            return std::unexpected(
-                "inner join: right key type mismatch (two-key join expects Int64)");
-        }
-        if (!left_table_.has_value()) {
-            return std::unexpected(
-                "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
-        }
-        const auto* e0 = right_.find_entry(k0.right);
-        const auto* e1 = right_.find_entry(k1.right);
-        const ValidityBitmap* v0 =
-            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
-        const ValidityBitmap* v1 =
-            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
-        const auto* d0 = col0->data();
-        const auto* d1 = col1->data();
-        const std::size_t n_right = right_.rows();
-
-        const auto head_of = [&](std::size_t r) -> std::size_t {
-            if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
-                return kNil;
-            }
-            JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
-                                       static_cast<std::uint64_t>(d1[r])};
-            auto it = index().pair_heads.find(key);
-            return it == index().pair_heads.end() ? kNil : it->second;
-        };
-
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
-        probe_swapped(n_right, head_of, li, ri);
-
-        const Table& left_table = *left_table_;
-        Table left_copy;
-        left_copy.columns.reserve(left_table.columns.size());
-        for (const auto& c : left_table.columns) {
-            left_copy.add_column(c.name, *c.column);
-            left_copy.columns.back().validity = c.validity;
-        }
-        return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
-    }
-
-    // Same two shapes as `probe_scalar` (parallel fan-out via
-    // `probe_ranges_parallel`, then a unique-build fast path, then the
-    // general chained walk) but with an explicit null check instead of the
-    // single-bitmap `probe_is_null` member, since a probe row here is null
-    // when EITHER key is.
-    template <typename IsNull, typename GetKey>
-    auto probe_pair(std::size_t n, IsNull is_null, GetKey get_key, std::vector<std::size_t>& li,
-                    std::vector<std::size_t>& ri) -> bool {
-        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
-                              std::vector<std::size_t>& out_r) {
-            for (std::size_t l = begin; l < end; ++l) {
-                if (is_null(l)) {
-                    continue;
-                }
-                auto it = index().pair_heads.find(get_key(l));
-                if (it == index().pair_heads.end()) {
-                    continue;
-                }
-                for (std::size_t cur = it->second; cur != kNil; cur = index().chain_next[cur]) {
-                    out_l.push_back(l);
-                    out_r.push_back(cur);
-                }
-            }
-        };
-        if (probe_ranges_parallel(n, li, ri, scan)) {
-            return index().unique && li.size() == n;
-        }
-        if (index().unique) {
-            li.resize(n);
-            ri.resize(n);
-            std::size_t* lp = li.data();
-            std::size_t* rp = ri.data();
-            std::size_t out = 0;
-            for (std::size_t l = 0; l < n; ++l) {
-                if (is_null(l)) {
-                    continue;
-                }
-                auto it = index().pair_heads.find(get_key(l));
-                if (it == index().pair_heads.end()) {
-                    continue;
-                }
-                lp[out] = l;
-                rp[out] = it->second;
-                ++out;
-            }
-            li.resize(out);
-            ri.resize(out);
-            return out == n;
-        }
-        for (std::size_t l = 0; l < n; ++l) {
-            if (is_null(l)) {
-                continue;
-            }
-            auto it = index().pair_heads.find(get_key(l));
-            if (it == index().pair_heads.end()) {
-                continue;
-            }
-            std::size_t cur = it->second;
-            while (cur != kNil) {
-                li.push_back(l);
-                ri.push_back(cur);
-                cur = index().chain_next[cur];
-            }
-        }
-        return false;
-    }
-
-    auto probe_chunk_pair(Table left_chunk) -> std::expected<Table, std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* key0 = left_chunk.find(k0.left);
-        if (key0 == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + k0.left);
-        }
-        const ColumnValue* key1 = left_chunk.find(k1.left);
-        if (key1 == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + k1.left);
-        }
-        const auto* col0 = std::get_if<Column<std::int64_t>>(key0);
-        const auto* col1 = std::get_if<Column<std::int64_t>>(key1);
-        if (col0 == nullptr || col1 == nullptr) {
-            return std::unexpected(
-                "inner join: left key type mismatch (two-key join expects "
-                "Int64)");
-        }
-        const auto* e0 = left_chunk.find_entry(k0.left);
-        const auto* e1 = left_chunk.find_entry(k1.left);
-        const ValidityBitmap* v0 =
-            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
-        const ValidityBitmap* v1 =
-            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
-
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
-        const std::size_t n = left_chunk.rows();
-        li.reserve(n);
-        ri.reserve(n);
-
-        const auto* d0 = col0->data();
-        const auto* d1 = col1->data();
-        const auto is_null = [&](std::size_t r) {
-            return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
-        };
-        const auto get_key = [&](std::size_t r) {
-            return JoinHashIndex::PairKey{static_cast<std::uint64_t>(d0[r]),
-                                          static_cast<std::uint64_t>(d1[r])};
-        };
-        const bool li_identity = probe_pair(n, is_null, get_key, li, ri);
-
-        const std::size_t total = li_identity ? ri.size() : li.size();
-        return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
-    }
-
-    /// The probe side is an undecoded lazy scan. When it is worth it, drain
-    /// the build (left) side first and publish its key filter (membership +
-    /// bounds) into the scan's filter slot, so the scan skips materializing
-    /// rows that cannot match. Every path marks the slot ready before the
-    /// scan is interpreted; the filter is an optimization the slot may
-    /// simply not carry.
-    auto resolve_deferred_probe() -> std::optional<std::string> {
-        DynamicScanFilter& slot = *deferred_probe_->filter;
-        // Pre-filter row count: an upper bound on the decoded size, good
-        // enough to decide whether the probe side is large enough to bother.
-        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
-            if (!left_res.has_value()) {
-                return std::move(left_res.error());
-            }
-            publish_build_filter(*left_res, slot);
-            left_materialized_ = std::move(*left_res);
-            use_materialized_left_ = true;
-        }
-        slot.ready = true;
-        if (use_materialized_left_) {
-            TwoPhase outcome = TwoPhase::NotApplicable;
-            if (auto err = try_two_phase_probe(slot, outcome)) {
-                return err;
-            }
-            if (outcome == TwoPhase::Precomputed) {
-                deferred_probe_ = nullptr;
-                mode_ = Mode::Precomputed;
-                return std::nullopt;
-            }
-            if (outcome == TwoPhase::RightMaterialized) {
-                // Phase A ran but full two-phase declined; its selection was
-                // reused to materialize right_, so fall through to the
-                // ordinary side-picking in initialize().
-                deferred_probe_ = nullptr;
-                return std::nullopt;
-            }
-        }
-        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
-        if (!right.has_value()) {
-            return std::move(right.error());
-        }
-        right_ = std::move(right.value());
-        deferred_probe_ = nullptr;
-        return std::nullopt;
-    }
-
-    enum class TwoPhase : std::uint8_t { NotApplicable, RightMaterialized, Precomputed };
-
-    /// Interpret the Project/Rename/Update wrappers over an already
-    /// materialized scan table by shadowing the scan name in a registry
-    /// copy — the Scan case hits the registry before the deferred fallback.
-    auto interpret_wrapped_right(Table scan_table) -> std::optional<std::string> {
-        TableRegistry local = *deferred_registry_;
-        local.insert_or_assign(deferred_probe_name_, std::move(scan_table));
-        auto right = interpret_node(*deferred_right_node_, local, deferred_scalars_,
-                                    deferred_externs_, *deferred_exec_);
-        if (!right.has_value()) {
-            return std::move(right.error());
-        }
-        right_ = std::move(right.value());
-        return std::nullopt;
-    }
-
-    /// Late materialization across the join (decode-fusion stage 5): probe
-    /// with just the scan's key column, then decode the payload columns only
-    /// for the rows that actually matched. When every survivor matched
-    /// exactly one build row (unique build keys — the common star shape),
-    /// the probe-side columns pass into the output without a gather.
-    ///
-    /// NotApplicable (nothing ran — no membership filter, or phase A had no
-    /// selective answer): the caller interprets the subtree as before. When
-    /// phase A DID run but full two-phase declines — the build side is
-    /// larger than the candidate set (two-phase forces build-on-left; the
-    /// ordinary side-picking may do better) or a key type surprise — its
-    /// selection is reused to materialize `right_` (RightMaterialized)
-    /// rather than thrown away: recomputing it from scratch was measured at
-    /// +12% on q03.
-    auto try_two_phase_probe(const DynamicScanFilter& slot, TwoPhase& outcome)
-        -> std::optional<std::string> {
-        outcome = TwoPhase::NotApplicable;
-        if (!slot.has_membership() || !left_materialized_.has_value()) {
-            return std::nullopt;
-        }
-        const Table& build = *left_materialized_;
-        const auto* build_entry = build.find_entry(keys_->front().left);
-        if (build_entry == nullptr ||
-            !std::holds_alternative<Column<std::int64_t>>(*build_entry->column)) {
-            return std::nullopt;
-        }
-
-        auto phase = deferred_scan_key_selection(*deferred_probe_, *deferred_exec_);
-        if (!phase.has_value()) {
-            return std::move(phase.error());
-        }
-        if (!phase->has_value()) {
-            return std::nullopt;
-        }
-        auto sel = std::move(**phase);
-        const auto* keys_col = std::get_if<Column<std::int64_t>>(&*sel.keys.column);
-        if (build.rows() > sel.selected.size() || keys_col == nullptr) {
-            auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, sel.selected,
-                                                             *deferred_exec_, std::move(sel.keys));
-            if (!right_rows.has_value()) {
-                return std::move(right_rows.error());
-            }
-            if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
-                return err;
-            }
-            outcome = TwoPhase::RightMaterialized;
-            return std::nullopt;
-        }
-
-        if (auto err = build_index(build, keys_->front().left, ExprType::Int)) {
-            return err;
-        }
-
-        // Probe the candidate keys in scan order; record one hit per
-        // surviving row plus the expanded (build row, survivor) pairs — the
-        // same probe-order-major layout emit_swapped produces.
-        const auto* key_data = keys_col->data();
-        const ValidityBitmap* key_validity =
-            sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
-        const std::size_t n = keys_col->size();
-
-        // Same scan/replay shape as `probe_swapped`, with a twist: `ri` here
-        // indexes HITS (the survivor list), not probe rows, so each part
-        // needs two prefix offsets — its first hit index and its first output
-        // pair — before the replays can write disjoint slices. One part when
-        // the gate declines, so the serial path is the same code.
-        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<SwappedHit>& hits,
-                              std::size_t& total) {
-            for (std::size_t i = begin; i < end; ++i) {
-                if (key_validity != nullptr && !(*key_validity)[i]) {
-                    continue;
-                }
-                const auto it = index().i64_heads.find(key_data[i]);
-                if (it == index().i64_heads.end()) {
-                    continue;
-                }
-                hits.push_back(SwappedHit{.rrow = i, .head = it->second});
-                for (std::size_t cur = it->second; cur != kNil; cur = index().chain_next[cur]) {
-                    ++total;
-                }
-            }
-        };
-        const std::size_t workers = probe_parallel_workers(n);
-        if (workers == 0) {
-            swapped_parts_.resize(1);
-            swapped_parts_[0].hits.clear();
-            swapped_parts_[0].total = 0;
-            scan(0, n, swapped_parts_[0].hits, swapped_parts_[0].total);
-        } else {
-            auto& pool = process_worker_pool();
-            const std::size_t grain = (n + workers - 1) / workers;
-            swapped_parts_.resize(workers);
-            auto batch = pool.submit(workers, [&](std::size_t w) {
-                auto& part = swapped_parts_[w];
-                part.hits.clear();
-                part.total = 0;
-                const std::size_t begin = w * grain;
-                const std::size_t end = std::min(n, begin + grain);
-                if (begin < end) {
-                    scan(begin, end, part.hits, part.total);
-                }
-            });
-            batch.wait();
-        }
-        const std::size_t n_parts = swapped_parts_.size();
-        std::vector<std::size_t> hit_offsets(n_parts);
-        part_offsets_.resize(n_parts);
-        std::size_t n_hits = 0;
-        std::size_t total = 0;
-        for (std::size_t w = 0; w < n_parts; ++w) {
-            hit_offsets[w] = n_hits;
-            part_offsets_[w] = total;
-            n_hits += swapped_parts_[w].hits.size();
-            total += swapped_parts_[w].total;
-        }
-
-        Selection survivors(n_hits);
-        std::vector<std::size_t> li(total, 0);
-        std::vector<std::size_t> ri(total, 0);
-        Column<std::int64_t> gathered_keys;
-        const bool gather_keys = n_hits != n;
-        if (gather_keys) {
-            gathered_keys.resize_for_overwrite(n_hits);
-        }
-        // Detach once here, not per element inside the replay: the mutable
-        // `operator[]` pays a CoW check every call, and on a worker the
-        // detach itself would race.
-        std::int64_t* gathered_out = gather_keys ? gathered_keys.data() : nullptr;
-        const auto replay = [&](std::size_t w) {
-            const auto& part = swapped_parts_[w];
-            std::size_t h = hit_offsets[w];
-            std::size_t pos = part_offsets_[w];
-            for (const SwappedHit& hit : part.hits) {
-                survivors[h] = sel.selected[hit.rrow];
-                if (gathered_out != nullptr) {
-                    gathered_out[h] = key_data[hit.rrow];
-                }
-                for (std::size_t cur = hit.head; cur != kNil; cur = index().chain_next[cur]) {
-                    li[pos] = cur;
-                    ri[pos] = h;
-                    ++pos;
-                }
-                ++h;
-            }
-        };
-        if (workers == 0) {
-            replay(0);
-        } else {
-            auto batch = process_worker_pool().submit(n_parts, replay);
-            batch.wait();
-            if (deferred_exec_->parallel_stats != nullptr) {
-                deferred_exec_->parallel_stats->parallel_probes.fetch_add(
-                    1, std::memory_order_relaxed);
-            }
-        }
-        const bool ri_identity = total == n_hits;
-
-        // Survivors' key values, gathered in memory from phase A's keys.
-        ColumnEntry key_entry;
-        key_entry.name = sel.keys.name;
-        if (!gather_keys) {
-            key_entry.column = sel.keys.column;
-            key_entry.validity = sel.keys.validity;
-        } else {
-            key_entry.column = std::make_shared<ColumnValue>(std::move(gathered_keys));
-            // Null keys never match, so every survivor's key is valid.
-        }
-
-        auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, survivors,
-                                                         *deferred_exec_, std::move(key_entry));
-        if (!right_rows.has_value()) {
-            return std::move(right_rows.error());
-        }
-        if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
-            return err;
-        }
-
-        Table left_copy;
-        left_copy.columns.reserve(build.columns.size());
-        for (const auto& c : build.columns) {
-            left_copy.add_column(c.name, *c.column);
-            left_copy.columns.back().validity = c.validity;
-        }
-        auto out = assemble_output(std::move(left_copy), li.data(), ri.data(), total,
-                                   /*li_identity=*/false, ri_identity);
-        if (!out.has_value()) {
-            return std::move(out.error());
-        }
-        precomputed_output_ = std::move(*out);
-        outcome = TwoPhase::Precomputed;
-        return std::nullopt;
-    }
-
-    // Derive the probe scan's dynamic filter from the build side's valid key
-    // values (int keys only; other key types publish nothing). Sound for any
-    // inner join regardless of which side ends up as the build: a probe row
-    // whose key fails the filter cannot match.
-    //
-    // Everything here is published ungated — membership because a range
-    // estimate cannot predict set selectivity (the scan decides with a
-    // sampled pass rate), and min/max because the consumer owns the policy:
-    // materialize_deferred_scan gates conjunct synthesis on estimated
-    // pruning, the fused key scan uses the raw bounds for row-group
-    // skipping.
-    void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
-        publish_build_filter_column(build, keys_->front().left, slot);
-    }
-
-    // Component-selecting variant for the two-key deferred-probe POC
-    // (`resolve_deferred_probe_pair`): publishes a filter over exactly one
-    // named build-side column instead of always `keys_->front().left`, since
-    // the pair join's scan filter only ever covers one of the two keys.
-    void publish_build_filter_column(const Table& build, const std::string& key_name,
-                                     DynamicScanFilter& slot) const {
-        const auto* entry = build.find_entry(key_name);
-        if (entry == nullptr) {
-            return;
-        }
-        const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column);
-        if (col == nullptr || col->empty()) {
-            return;
-        }
-        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
-        const auto* data = col->data();
-        const std::size_t n = col->size();
-        std::int64_t mn = std::numeric_limits<std::int64_t>::max();
-        std::int64_t mx = std::numeric_limits<std::int64_t>::min();
-        std::size_t valid_rows = 0;
-        for (std::size_t r = 0; r < n; ++r) {
-            if (validity != nullptr && !(*validity)[r]) {
-                continue;
-            }
-            mn = std::min(mn, data[r]);
-            mx = std::max(mx, data[r]);
-            ++valid_rows;
-        }
-        if (valid_rows == 0) {
-            return;
-        }
-
-        // Every build side gets a Bloom — even alongside an exact list, the
-        // Bloom is the probe fast path (see DynamicScanFilter::passes).
-        // Duplicate inserts are harmless. A small build side (dimension
-        // chains: nation, region, filtered part) additionally dedups cheaply
-        // into an exact list, cancelling the Bloom's false positives.
-        constexpr std::size_t kInListBuildMax = 4096;
-        constexpr std::size_t kInListMax = 1024;
-        JoinBloomFilter bloom(valid_rows);
-        for (std::size_t r = 0; r < n; ++r) {
-            if (validity != nullptr && !(*validity)[r]) {
-                continue;
-            }
-            bloom.insert(data[r]);
-        }
-        slot.bloom = std::move(bloom);
-        if (valid_rows <= kInListBuildMax) {
-            std::vector<std::int64_t> keys;
-            keys.reserve(valid_rows);
-            for (std::size_t r = 0; r < n; ++r) {
-                if (validity != nullptr && !(*validity)[r]) {
-                    continue;
-                }
-                keys.push_back(data[r]);
-            }
-            std::sort(keys.begin(), keys.end());
-            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-            if (keys.size() <= kInListMax) {
-                slot.in_list = std::move(keys);
-            }
-        }
-        // Raw facts, not policy: whether these bounds are worth acting on is
-        // the consumer's call — materialize_deferred_scan gates synthesized
-        // conjuncts on estimated pruning, while the fused key scan uses them
-        // ungated to skip whole row groups (which has no gather downside).
-        slot.min = mn;
-        slot.max = mx;
-    }
-
-    /// Run the build phase and publish its result. Nothing else in this class
-    /// may write to the index: `index()` hands the probe a `const` reference,
-    /// so the barrier is a compile error to cross rather than a convention.
-    auto build_index(const Table& build_side, const std::string& key_name, ExprType key_kind)
-        -> std::optional<std::string> {
-        auto built = build_join_hash_index(build_side, key_name, key_kind);
-        if (!built.has_value()) {
-            return std::move(built.error());
-        }
-        index_ = std::make_shared<const JoinHashIndex>(std::move(*built));
-        return std::nullopt;
-    }
-
-    void build_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
-                          const ValidityBitmap* v0, const ValidityBitmap* v1) {
-        index_ = std::make_shared<const JoinHashIndex>(build_join_pair_index(col0, col1, v0, v1));
-    }
-
-    /// The build the probe reads. Never null once `initialize()` has chosen a
-    /// build side; the `Precomputed` mode returns before one exists.
+    /// The build this probe reads. Never null once a build side has been
+    /// chosen; the `Precomputed` mode returns before one exists.
     [[nodiscard]] auto index() const noexcept -> const JoinHashIndex& { return *index_; }
 
     [[nodiscard]] auto probe_is_null(std::size_t row) const noexcept -> bool {
@@ -5063,48 +4209,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     // on the same output schema as the materialized route and IR inference.
     // The left column names are identical for every chunk, so the plan is
     // computed once from the first assembled chunk.
-    /// Would indexing the right instead of the left buy the pending `order`,
-    /// and is the index small enough that it is worth buying?
-    ///
-    /// The pending keys are in the join's output names and the left's claim is
-    /// in the left's own, so the claim is restated through the output plan
-    /// before they are compared -- a suffixed key is renamed and a key the
-    /// output drops takes the claim with it.
-    auto order_preserving_pays(const Table& left_table, std::size_t n_left, std::size_t n_right)
-        -> bool {
-        constexpr std::size_t kMaxOrderPreservingBuildRatio = 4;
-        const auto& left_ordering = left_table.properties().ordering();
-        if (pending_order_ == nullptr || pending_order_->empty() || !left_ordering.has_value() ||
-            n_right > kMaxOrderPreservingBuildRatio * n_left) {
-            return false;
-        }
-        if (!right_emit_ready_) {
-            if (auto ready = setup_right_emit_schema(left_table); !ready.has_value()) {
-                return false;  // the join is about to fail on this anyway
-            }
-        }
-        std::vector<ir::OrderKey> carried;
-        for (const auto& key : *left_ordering) {
-            std::size_t idx = left_table.columns.size();
-            for (std::size_t i = 0; i < left_table.columns.size(); ++i) {
-                if (left_table.columns[i].name == key.name) {
-                    idx = i;
-                    break;
-                }
-            }
-            if (idx == left_table.columns.size() || idx >= left_emit_names_.size()) {
-                return false;
-            }
-            carried.push_back(
-                ir::OrderKey{.name = left_emit_names_[idx], .ascending = key.ascending});
-        }
-        return TableProperties::sorted_by(std::move(carried)).satisfies(*pending_order_);
-    }
 
     auto setup_right_emit_schema(const Table& left_side) -> std::expected<void, std::string> {
         auto planned =
             ir::plan_join_output(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
-                                 table_column_names(right_), suffix_);
+                                 table_column_names(*right_), suffix_);
         if (!planned.has_value()) {
             return std::unexpected(std::move(planned.error()));
         }
@@ -5237,19 +4346,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         return true;
     }
-
-    /// One matching probe row in swapped mode: the right row and the head of
-    /// the left chain it hit. Phase 2 replays these instead of re-probing.
-    struct SwappedHit {
-        std::size_t rrow;
-        std::size_t head;  ///< first left row in the chain for this key
-    };
-    /// One worker's slice of a swapped-mode phase 1. A member for the same
-    /// reason as `ProbePart`: capacity survives across chunks.
-    struct SwappedPart {
-        std::vector<SwappedHit> hits;
-        std::size_t total = 0;  ///< output rows this part's chains expand to
-    };
 
     /// Swapped-mode probe: phase 1 walks right rows `head_of` resolves against
     /// the left index, phase 2 expands the recorded chains into (li, ri).
@@ -5578,6 +4674,119 @@ class ChunkedInnerJoinOperator final : public Operator {
         return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
     }
 
+    auto probe_chunk_pair(Table left_chunk) -> std::expected<Table, std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* key0 = left_chunk.find(k0.left);
+        if (key0 == nullptr) {
+            return std::unexpected("join key not found in left chunk: " + k0.left);
+        }
+        const ColumnValue* key1 = left_chunk.find(k1.left);
+        if (key1 == nullptr) {
+            return std::unexpected("join key not found in left chunk: " + k1.left);
+        }
+        const auto* col0 = std::get_if<Column<std::int64_t>>(key0);
+        const auto* col1 = std::get_if<Column<std::int64_t>>(key1);
+        if (col0 == nullptr || col1 == nullptr) {
+            return std::unexpected(
+                "inner join: left key type mismatch (two-key join expects "
+                "Int64)");
+        }
+        const auto* e0 = left_chunk.find_entry(k0.left);
+        const auto* e1 = left_chunk.find_entry(k1.left);
+        const ValidityBitmap* v0 =
+            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
+        const ValidityBitmap* v1 =
+            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        const std::size_t n = left_chunk.rows();
+        li.reserve(n);
+        ri.reserve(n);
+
+        const auto* d0 = col0->data();
+        const auto* d1 = col1->data();
+        const auto is_null = [&](std::size_t r) {
+            return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
+        };
+        const auto get_key = [&](std::size_t r) {
+            return JoinHashIndex::PairKey{static_cast<std::uint64_t>(d0[r]),
+                                          static_cast<std::uint64_t>(d1[r])};
+        };
+        const bool li_identity = probe_pair(n, is_null, get_key, li, ri);
+
+        const std::size_t total = li_identity ? ri.size() : li.size();
+        return assemble_output(std::move(left_chunk), li.data(), ri.data(), total, li_identity);
+    }
+
+    // Same two shapes as `probe_scalar` (parallel fan-out via
+    // `probe_ranges_parallel`, then a unique-build fast path, then the
+    // general chained walk) but with an explicit null check instead of the
+    // single-bitmap `probe_is_null` member, since a probe row here is null
+    // when EITHER key is.
+    template <typename IsNull, typename GetKey>
+    auto probe_pair(std::size_t n, IsNull is_null, GetKey get_key, std::vector<std::size_t>& li,
+                    std::vector<std::size_t>& ri) -> bool {
+        const auto scan = [&](std::size_t begin, std::size_t end, std::vector<std::size_t>& out_l,
+                              std::vector<std::size_t>& out_r) {
+            for (std::size_t l = begin; l < end; ++l) {
+                if (is_null(l)) {
+                    continue;
+                }
+                auto it = index().pair_heads.find(get_key(l));
+                if (it == index().pair_heads.end()) {
+                    continue;
+                }
+                for (std::size_t cur = it->second; cur != kNil; cur = index().chain_next[cur]) {
+                    out_l.push_back(l);
+                    out_r.push_back(cur);
+                }
+            }
+        };
+        if (probe_ranges_parallel(n, li, ri, scan)) {
+            return index().unique && li.size() == n;
+        }
+        if (index().unique) {
+            li.resize(n);
+            ri.resize(n);
+            std::size_t* lp = li.data();
+            std::size_t* rp = ri.data();
+            std::size_t out = 0;
+            for (std::size_t l = 0; l < n; ++l) {
+                if (is_null(l)) {
+                    continue;
+                }
+                auto it = index().pair_heads.find(get_key(l));
+                if (it == index().pair_heads.end()) {
+                    continue;
+                }
+                lp[out] = l;
+                rp[out] = it->second;
+                ++out;
+            }
+            li.resize(out);
+            ri.resize(out);
+            return out == n;
+        }
+        for (std::size_t l = 0; l < n; ++l) {
+            if (is_null(l)) {
+                continue;
+            }
+            auto it = index().pair_heads.find(get_key(l));
+            if (it == index().pair_heads.end()) {
+                continue;
+            }
+            std::size_t cur = it->second;
+            while (cur != kNil) {
+                li.push_back(l);
+                ri.push_back(cur);
+                cur = index().chain_next[cur];
+            }
+        }
+        return false;
+    }
+
     // Swapped mode: the hash index is on the left table, so the right table
     // is the probe side, and output must still come out in left-row order.
     //
@@ -5588,24 +4797,19 @@ class ChunkedInnerJoinOperator final : public Operator {
     // 3.2M lineitems to emit ~30K rows) no longer pays for 3.2M redundant
     // cache-missing lookups. `hits` costs one entry per *matching* right row,
     // so it is bounded by the output row count.
-    auto emit_swapped() -> std::expected<Table, std::string> {
+    auto emit_swapped(const Table& left_table) -> std::expected<Table, std::string> {
         if (pair_mode_) {
-            return emit_swapped_pair();
+            return emit_swapped_pair(left_table);
         }
-        const ColumnValue* rkey = right_.find(keys_->front().right);
+        const ColumnValue* rkey = right_->find(keys_->front().right);
         if (rkey == nullptr) {
             return std::unexpected("join key not found in right table: " + keys_->front().right);
         }
-        if (!left_table_.has_value()) {
-            return std::unexpected(
-                "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
-        }
-        const Table& left_table = *left_table_;
-        const std::size_t n_right = right_.rows();
+        const std::size_t n_right = right_->rows();
 
         // In swapped mode the index is on the left, so the right table is the
         // probe side. Its null-keyed rows match nothing (see build_index).
-        const auto* right_entry = right_.find_entry(keys_->front().right);
+        const auto* right_entry = right_->find_entry(keys_->front().right);
         probe_validity_ = right_entry != nullptr && right_entry->validity.has_value()
                               ? &*right_entry->validity
                               : nullptr;
@@ -5698,6 +4902,63 @@ class ChunkedInnerJoinOperator final : public Operator {
         return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
     }
 
+    // Swapped pair-mode counterpart of `emit_swapped`: the pair index is on
+    // the build-side left table, so the right table's rows are the probe
+    // side. Reuses
+    // `probe_swapped` unchanged -- it is already generic over a
+    // `head_of(row)` callback -- with the null check folded into `head_of`
+    // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
+    // member, since a row here is null when EITHER key is.
+    auto emit_swapped_pair(const Table& left_table) -> std::expected<Table, std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* rkey0 = right_->find(k0.right);
+        if (rkey0 == nullptr) {
+            return std::unexpected("join key not found in right table: " + k0.right);
+        }
+        const ColumnValue* rkey1 = right_->find(k1.right);
+        if (rkey1 == nullptr) {
+            return std::unexpected("join key not found in right table: " + k1.right);
+        }
+        const auto* col0 = std::get_if<Column<std::int64_t>>(rkey0);
+        const auto* col1 = std::get_if<Column<std::int64_t>>(rkey1);
+        if (col0 == nullptr || col1 == nullptr) {
+            return std::unexpected(
+                "inner join: right key type mismatch (two-key join expects Int64)");
+        }
+        const auto* e0 = right_->find_entry(k0.right);
+        const auto* e1 = right_->find_entry(k1.right);
+        const ValidityBitmap* v0 =
+            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
+        const ValidityBitmap* v1 =
+            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+        const auto* d0 = col0->data();
+        const auto* d1 = col1->data();
+        const std::size_t n_right = right_->rows();
+
+        const auto head_of = [&](std::size_t r) -> std::size_t {
+            if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
+                return kNil;
+            }
+            JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
+                                       static_cast<std::uint64_t>(d1[r])};
+            auto it = index().pair_heads.find(key);
+            return it == index().pair_heads.end() ? kNil : it->second;
+        };
+
+        std::vector<std::size_t> li;
+        std::vector<std::size_t> ri;
+        probe_swapped(n_right, head_of, li, ri);
+
+        Table left_copy;
+        left_copy.columns.reserve(left_table.columns.size());
+        for (const auto& c : left_table.columns) {
+            left_copy.add_column(c.name, *c.column);
+            left_copy.columns.back().validity = c.validity;
+        }
+        return assemble_output(std::move(left_copy), li.data(), ri.data(), li.size());
+    }
+
     auto assemble_output(Table left_side, const std::size_t* li, const std::size_t* ri,
                          std::size_t total, bool li_identity = false, bool ri_identity = false)
         -> std::expected<Table, std::string> {
@@ -5720,7 +4981,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
             for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
                 output.add_column(std::string(right_emit_names_[e]),
-                                  make_empty_like(*right_.columns[right_emit_idx_[e]].column));
+                                  make_empty_like(*right_->columns[right_emit_idx_[e]].column));
             }
             return output;
         }
@@ -5821,17 +5082,17 @@ class ChunkedInnerJoinOperator final : public Operator {
         // exactly once (two-phase deferred probe with a unique build side),
         // so probe columns are shared rather than gathered — the same
         // reasoning as li_identity above.
-        const bool share_right = ri_identity && total == right_.rows();
+        const bool share_right = ri_identity && total == right_->rows();
         if (share_right) {
             for (std::size_t e = 0; e < right_emit_idx_.size(); ++e) {
                 output.add_column_from(std::string(right_emit_names_[e]),
-                                       right_.columns[right_emit_idx_[e]]);
+                                       right_->columns[right_emit_idx_[e]]);
             }
         } else {
             std::vector<ColumnGatherJob> jobs;
             jobs.reserve(right_emit_idx_.size());
             for (const auto index : right_emit_idx_) {
-                const auto& rc = right_.columns[index];
+                const auto& rc = right_->columns[index];
                 jobs.push_back({.column = rc.column.get(),
                                 .validity = rc.validity.has_value() ? &*rc.validity : nullptr,
                                 .idx = ri,
@@ -5853,10 +5114,809 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         return output;
     }
+};
+
+/// Inner hash join for single-key no-predicate joins.
+///
+/// Two execution modes:
+/// - Stream: right is small (<= kStreamRightThreshold). Build a chained
+///   hash index on the materialized right, then probe each left chunk
+///   streamed from the child. Matches the classic star-join shape.
+/// - Swapped: right is large and n_left < n_right. Materialize left,
+///   build the hash index on left, iterate right rows once and emit output
+///   in that same right-scan (probe) order (baseline's
+///   `build_indices_from_right_scan` equivalent) — row order is outside the
+///   join contract (SPEC.md §5.6), and preserving the probe side's scan order
+///   instead of reassembling by left row keeps cache locality for any
+///   downstream join that probes this join's output. Much better cache
+///   behavior overall when the smaller side fits.
+///
+/// Name conflicts are resolved with the same `_right` suffix rule as
+/// `join_table_impl`.
+class ChunkedInnerJoinOperator final : public Operator {
+   public:
+    ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
+                             const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
+                             const std::vector<ir::OrderKey>* pending_order = nullptr)
+        : left_(std::move(left)),
+          right_(std::move(right)),
+          keys_(keys),
+          pending_order_(pending_order) {
+        bind_probe(keys, std::move(suffix), exec);
+    }
+
+    /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
+    /// its Project/Rename wrappers), interpreted only after this join has
+    /// published build-side key bounds into the scan's filter slot. The
+    /// registry/scalars/externs pointers are the interpret context and outlive
+    /// the operator.
+    ChunkedInnerJoinOperator(OperatorPtr left, const ir::Node* right_node,
+                             const TableRegistry* registry, const ScalarRegistry* scalars,
+                             const ExternRegistry* externs, const ExecutionContext& exec,
+                             const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
+                             std::string probe_name, ir::JoinSuffixPolicy suffix = {},
+                             const std::vector<ir::OrderKey>* pending_order = nullptr)
+        : left_(std::move(left)),
+          keys_(keys),
+          deferred_probe_(probe),
+          deferred_probe_name_(std::move(probe_name)),
+          deferred_right_node_(right_node),
+          deferred_registry_(registry),
+          deferred_scalars_(scalars),
+          deferred_externs_(externs),
+          deferred_exec_(&exec),
+          pending_order_(pending_order) {
+        bind_probe(keys, std::move(suffix), exec);
+    }
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (!initialized_) {
+            auto err = initialize();
+            if (err.has_value()) {
+                return std::unexpected(std::move(*err));
+            }
+            initialized_ = true;
+        }
+
+        if (mode_ == Mode::Precomputed) {
+            if (swapped_emitted_) {
+                return std::optional<Chunk>{};
+            }
+            swapped_emitted_ = true;
+            if (precomputed_output_.rows() == 0) {
+                return std::optional<Chunk>{};
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(precomputed_output_))};
+        }
+
+        if (mode_ == Mode::Swapped) {
+            if (swapped_emitted_) {
+                return std::optional<Chunk>{};
+            }
+            swapped_emitted_ = true;
+            if (!left_table_.has_value()) {
+                return std::unexpected(
+                    "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
+            }
+            auto out = probe_.emit_swapped(*left_table_);
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (out->rows() == 0) {
+                return std::optional<Chunk>{};
+            }
+            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+        }
+
+        while (true) {
+            Table left_chunk;
+            if (use_materialized_left_) {
+                if (left_materialized_drained_) {
+                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                        auto schema = std::move(*empty_schema_);
+                        empty_schema_.reset();
+                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                    }
+                    return std::optional<Chunk>{};
+                }
+                left_materialized_drained_ = true;
+                left_chunk = std::move(left_materialized_).value_or(Table{});
+                left_materialized_.reset();
+            } else {
+                auto chunk_res = left_->next();
+                if (!chunk_res.has_value()) {
+                    return std::unexpected(std::move(chunk_res.error()));
+                }
+                if (!chunk_res.value().has_value()) {
+                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                        auto schema = std::move(*empty_schema_);
+                        empty_schema_.reset();
+                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                    }
+                    return std::optional<Chunk>{};
+                }
+                left_chunk = chunk_to_table(std::move(*chunk_res.value()));
+            }
+            auto out = probe_.probe_chunk_against_right(std::move(left_chunk));
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (out->rows() == 0) {
+                // Keep the planned empty table as a schema carrier. A join
+                // with no matches still has its left and right output columns;
+                // without this, a materializing sink sees no chunks at all.
+                empty_schema_ = std::move(*out);
+                continue;
+            }
+            emitted_nonempty_ = true;
+            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+        }
+    }
+
+   private:
+    enum class Mode : std::uint8_t { Stream, Swapped, Precomputed };
+
+    /// The chain terminator, shared with the index this operator probes.
+    static constexpr std::size_t kNil = kJoinNil;
+
+    // Build-on-right is preferred when right is small enough that probing
+    // it from streaming left chunks is cache-friendly. Above this, we
+    // materialize left to pick the smaller build side.
+    static constexpr std::size_t kStreamRightThreshold = 65536;
+
+    /// Hand the probe what it needs before anything runs. `&right_` is bound
+    /// once here: the table is move-assigned later on the deferred path, but
+    /// the member's address does not change.
+    void bind_probe(const std::vector<ir::JoinKey>* keys, ir::JoinSuffixPolicy suffix,
+                    const ExecutionContext& exec) {
+        probe_.keys_ = keys;
+        probe_.suffix_ = std::move(suffix);
+        probe_.exec_ = &exec;
+        probe_.right_ = &right_;
+    }
+
+    auto initialize() -> std::optional<std::string> {
+        if (keys_->size() == 2) {
+            return initialize_pair();
+        }
+        if (keys_->size() != 1) {
+            return "ChunkedInnerJoinOperator only supports single-key or two-Int64-key joins";
+        }
+        if (deferred_probe_ != nullptr) {
+            if (auto err = resolve_deferred_probe()) {
+                return err;
+            }
+            if (mode_ == Mode::Precomputed) {
+                return std::nullopt;
+            }
+        }
+        const std::string& left_key_name = keys_->front().left;
+        const std::string& right_key_name = keys_->front().right;
+        const ColumnValue* rkey = right_.find(right_key_name);
+        if (rkey == nullptr) {
+            return "join key not found in right table: " + right_key_name;
+        }
+        ExprType key_kind = ExprType::Int;
+        if (auto err = detect_join_key_kind(*rkey, key_kind)) {
+            return err;
+        }
+
+        const std::size_t n_right = right_.rows();
+
+        if (n_right <= kStreamRightThreshold) {
+            if (auto err = build_index(right_, right_key_name, key_kind)) {
+                return err;
+            }
+            return std::nullopt;
+        }
+
+        Table left_table;
+        if (use_materialized_left_ && left_materialized_.has_value()) {
+            // The deferred-probe path already drained the left child.
+            left_table = std::move(*left_materialized_);
+            left_materialized_.reset();
+            use_materialized_left_ = false;
+        } else {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            left_table = std::move(*left_res);
+        }
+        const std::size_t n_left = left_table.rows();
+
+        // Swapping indexes the smaller (left) side and scans the right, which
+        // gives up left-row order. When an `order` above this join wants
+        // exactly the order the left already carries, declining to swap
+        // delivers it and that whole sort disappears -- worth a larger index,
+        // but only while "larger" stays modest, since the index is probed once
+        // per row of the other side. The same trade is made in join.cpp.
+        if (n_left < n_right && !order_preserving_pays(left_table, n_left, n_right)) {
+            left_table_ = std::move(left_table);
+            if (auto err = build_index(*left_table_, left_key_name, key_kind)) {
+                return err;
+            }
+            mode_ = Mode::Swapped;
+            return std::nullopt;
+        }
+
+        left_materialized_ = std::move(left_table);
+        use_materialized_left_ = true;
+        if (auto err = build_index(right_, right_key_name, key_kind)) {
+            return err;
+        }
+        return std::nullopt;
+    }
+
+    /// Two-fixed-width-int-key path: narrow first cut of the streaming
+    /// two-key join (plans/parallelism-overview.md's "stream multi-key
+    /// joins" item). Non-deferred case: `right_` is already a whole `Table`
+    /// by construction (the call site materializes it, same as the
+    /// single-key path), so the only real decision left is which side to
+    /// index: this materializes `left_` too and builds on whichever side is
+    /// smaller -- the same motivation as `initialize()`'s single-key swap
+    /// decision, and necessary here because the call site cannot know in
+    /// advance which side a two-key join chain puts on which name (TPC-H
+    /// q09's `lineitem` join has the multi-million-row side as `right_`;
+    /// indexing it unconditionally was measured a >2x regression before this
+    /// fix). Deferred case: see `resolve_deferred_probe_pair`.
+    auto initialize_pair() -> std::optional<std::string> {
+        if (deferred_probe_ != nullptr) {
+            return resolve_deferred_probe_pair();
+        }
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* rkey0 = right_.find(k0.right);
+        if (rkey0 == nullptr) {
+            return "join key not found in right table: " + k0.right;
+        }
+        const ColumnValue* rkey1 = right_.find(k1.right);
+        if (rkey1 == nullptr) {
+            return "join key not found in right table: " + k1.right;
+        }
+        const auto* rcol0 = std::get_if<Column<std::int64_t>>(rkey0);
+        const auto* rcol1 = std::get_if<Column<std::int64_t>>(rkey1);
+        if (rcol0 == nullptr || rcol1 == nullptr) {
+            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to be "
+                   "Int64";
+        }
+        Table left_table;
+        if (use_materialized_left_ && left_materialized_.has_value()) {
+            // `resolve_deferred_probe_pair` already drained the left child
+            // while deciding whether a scan filter was worth publishing.
+            left_table = std::move(*left_materialized_);
+            left_materialized_.reset();
+            use_materialized_left_ = false;
+        } else {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            left_table = std::move(*left_res);
+        }
+        const std::size_t n_left = left_table.rows();
+        const std::size_t n_right = right_.rows();
+        probe_.pair_mode_ = true;
+
+        if (n_left <= n_right) {
+            return build_left_pair_index_and_swap(std::move(left_table));
+        }
+
+        // Build on the (smaller) right; left is already fully materialized,
+        // so it is drained as a single chunk through the existing
+        // `use_materialized_left_` mechanism rather than re-wrapped in an
+        // operator.
+        const auto* re0 = right_.find_entry(k0.right);
+        const auto* re1 = right_.find_entry(k1.right);
+        const ValidityBitmap* rv0 =
+            re0 != nullptr && re0->validity.has_value() ? &*re0->validity : nullptr;
+        const ValidityBitmap* rv1 =
+            re1 != nullptr && re1->validity.has_value() ? &*re1->validity : nullptr;
+        build_pair_index(*rcol0, *rcol1, rv0, rv1);
+        left_materialized_ = std::move(left_table);
+        use_materialized_left_ = true;
+        return std::nullopt;
+    }
+
+    // Build on the (smaller) left, scan right row-by-row: same shape as
+    // single-key `Mode::Swapped` / `emit_swapped`. Factored out of
+    // `initialize_pair` so `resolve_deferred_probe_pair` (which always
+    // builds on left -- the deferred side is definitionally the one too
+    // large to materialize first) can reuse it.
+    auto build_left_pair_index_and_swap(Table left_table) -> std::optional<std::string> {
+        const ir::JoinKey& k0 = keys_->at(0);
+        const ir::JoinKey& k1 = keys_->at(1);
+        const ColumnValue* lkey0 = left_table.find(k0.left);
+        if (lkey0 == nullptr) {
+            return "join key not found in left table: " + k0.left;
+        }
+        const ColumnValue* lkey1 = left_table.find(k1.left);
+        if (lkey1 == nullptr) {
+            return "join key not found in left table: " + k1.left;
+        }
+        const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
+        const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
+        if (lcol0 == nullptr || lcol1 == nullptr) {
+            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
+                   "be Int64";
+        }
+        const auto* le0 = left_table.find_entry(k0.left);
+        const auto* le1 = left_table.find_entry(k1.left);
+        const ValidityBitmap* lv0 =
+            le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
+        const ValidityBitmap* lv1 =
+            le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
+        build_pair_index(*lcol0, *lcol1, lv0, lv1);
+        left_table_ = std::move(left_table);
+        mode_ = Mode::Swapped;
+        return std::nullopt;
+    }
+
+    /// Deferred-probe POC for the two-key path (plans/parallelism-overview.md
+    /// "deferred scan filtering for two-key joins", TPC-H q09's `lineitem`
+    /// join). Reuses the existing single-key deferred-scan machinery
+    /// unchanged: builds the (small) left side first, publishes a
+    /// `DynamicScanFilter` over `keys_->at(0)` ONLY -- one component, not
+    /// both -- into the scan's filter slot, then lets the source's normal
+    /// decode-time pruning narrow the right side before it is ever
+    /// materialized. Membership in one component is necessary but not
+    /// sufficient for the pair match, so this can only produce harmless
+    /// false positives (rows sharing q09's l_partkey but not l_suppkey);
+    /// `build_left_pair_index_and_swap`'s exact pair probe afterward is what
+    /// actually enforces both keys, unchanged from the non-deferred path.
+    ///
+    /// Same `kStreamRightThreshold` gate as the single-key
+    /// `resolve_deferred_probe`: below it, publishing a filter (a Bloom plus
+    /// a sort/unique pass over the whole build side) can only add cost, not
+    /// recover it, since the deferred side was never going to be expensive to
+    /// decode in the first place. First cut of this POC always materialized
+    /// left and published a filter regardless of size -- measured a clean,
+    /// unanimous +8.4% regression on q05 (its `join supplier on
+    /// {l_suppkey=s_suppkey, n_nationkey=s_nationkey}` is exactly this
+    /// shape, `supplier` fitting in one row group with nothing to prune).
+    /// Below the threshold this falls through to `initialize_pair`'s
+    /// ordinary side-picking, reusing the already-drained left side via
+    /// `left_materialized_`/`use_materialized_left_` rather than draining it
+    /// twice.
+    ///
+    /// No two-phase probe (`try_two_phase_probe`'s candidate-selection
+    /// optimization) here -- that is a further, separable lever on top of
+    /// scan-altitude pruning, and this POC is scoped to answering whether
+    /// pruning the scan itself is worth it at all before adding more on top.
+    auto resolve_deferred_probe_pair() -> std::optional<std::string> {
+        DynamicScanFilter& slot = *deferred_probe_->filter;
+        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            publish_build_filter_column(*left_res, keys_->at(0).left, slot);
+            left_materialized_ = std::move(*left_res);
+            use_materialized_left_ = true;
+        }
+        slot.ready = true;
+        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                    deferred_externs_, *deferred_exec_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(*right);
+        deferred_probe_ = nullptr;
+        if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
+            std::fprintf(stderr, "[pair_defer] filter_published=%d right_rows_after_filter=%zu\n",
+                         static_cast<int>(use_materialized_left_), right_.rows());
+        }
+        return initialize_pair();
+    }
+
+    /// The probe side is an undecoded lazy scan. When it is worth it, drain
+    /// the build (left) side first and publish its key filter (membership +
+    /// bounds) into the scan's filter slot, so the scan skips materializing
+    /// rows that cannot match. Every path marks the slot ready before the
+    /// scan is interpreted; the filter is an optimization the slot may
+    /// simply not carry.
+    auto resolve_deferred_probe() -> std::optional<std::string> {
+        DynamicScanFilter& slot = *deferred_probe_->filter;
+        // Pre-filter row count: an upper bound on the decoded size, good
+        // enough to decide whether the probe side is large enough to bother.
+        if (deferred_probe_->lazy->rows() > kStreamRightThreshold) {
+            auto left_res = MaterializeOperator(std::move(left_)).run();
+            if (!left_res.has_value()) {
+                return std::move(left_res.error());
+            }
+            publish_build_filter(*left_res, slot);
+            left_materialized_ = std::move(*left_res);
+            use_materialized_left_ = true;
+        }
+        slot.ready = true;
+        if (use_materialized_left_) {
+            TwoPhase outcome = TwoPhase::NotApplicable;
+            if (auto err = try_two_phase_probe(slot, outcome)) {
+                return err;
+            }
+            if (outcome == TwoPhase::Precomputed) {
+                deferred_probe_ = nullptr;
+                mode_ = Mode::Precomputed;
+                return std::nullopt;
+            }
+            if (outcome == TwoPhase::RightMaterialized) {
+                // Phase A ran but full two-phase declined; its selection was
+                // reused to materialize right_, so fall through to the
+                // ordinary side-picking in initialize().
+                deferred_probe_ = nullptr;
+                return std::nullopt;
+            }
+        }
+        auto right = interpret_node(*deferred_right_node_, *deferred_registry_, deferred_scalars_,
+                                    deferred_externs_, *deferred_exec_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(right.value());
+        deferred_probe_ = nullptr;
+        return std::nullopt;
+    }
+
+    enum class TwoPhase : std::uint8_t { NotApplicable, RightMaterialized, Precomputed };
+
+    /// Interpret the Project/Rename/Update wrappers over an already
+    /// materialized scan table by shadowing the scan name in a registry
+    /// copy — the Scan case hits the registry before the deferred fallback.
+    auto interpret_wrapped_right(Table scan_table) -> std::optional<std::string> {
+        TableRegistry local = *deferred_registry_;
+        local.insert_or_assign(deferred_probe_name_, std::move(scan_table));
+        auto right = interpret_node(*deferred_right_node_, local, deferred_scalars_,
+                                    deferred_externs_, *deferred_exec_);
+        if (!right.has_value()) {
+            return std::move(right.error());
+        }
+        right_ = std::move(right.value());
+        return std::nullopt;
+    }
+
+    /// Late materialization across the join (decode-fusion stage 5): probe
+    /// with just the scan's key column, then decode the payload columns only
+    /// for the rows that actually matched. When every survivor matched
+    /// exactly one build row (unique build keys — the common star shape),
+    /// the probe-side columns pass into the output without a gather.
+    ///
+    /// NotApplicable (nothing ran — no membership filter, or phase A had no
+    /// selective answer): the caller interprets the subtree as before. When
+    /// phase A DID run but full two-phase declines — the build side is
+    /// larger than the candidate set (two-phase forces build-on-left; the
+    /// ordinary side-picking may do better) or a key type surprise — its
+    /// selection is reused to materialize `right_` (RightMaterialized)
+    /// rather than thrown away: recomputing it from scratch was measured at
+    /// +12% on q03.
+    auto try_two_phase_probe(const DynamicScanFilter& slot, TwoPhase& outcome)
+        -> std::optional<std::string> {
+        outcome = TwoPhase::NotApplicable;
+        if (!slot.has_membership() || !left_materialized_.has_value()) {
+            return std::nullopt;
+        }
+        const Table& build = *left_materialized_;
+        const auto* build_entry = build.find_entry(keys_->front().left);
+        if (build_entry == nullptr ||
+            !std::holds_alternative<Column<std::int64_t>>(*build_entry->column)) {
+            return std::nullopt;
+        }
+
+        auto phase = deferred_scan_key_selection(*deferred_probe_, *deferred_exec_);
+        if (!phase.has_value()) {
+            return std::move(phase.error());
+        }
+        if (!phase->has_value()) {
+            return std::nullopt;
+        }
+        auto sel = std::move(**phase);
+        const auto* keys_col = std::get_if<Column<std::int64_t>>(&*sel.keys.column);
+        if (build.rows() > sel.selected.size() || keys_col == nullptr) {
+            auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, sel.selected,
+                                                             *deferred_exec_, std::move(sel.keys));
+            if (!right_rows.has_value()) {
+                return std::move(right_rows.error());
+            }
+            if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
+                return err;
+            }
+            outcome = TwoPhase::RightMaterialized;
+            return std::nullopt;
+        }
+
+        if (auto err = build_index(build, keys_->front().left, ExprType::Int)) {
+            return err;
+        }
+
+        // Probe the candidate keys in scan order; record one hit per
+        // surviving row plus the expanded (build row, survivor) pairs — the
+        // same probe-order-major layout emit_swapped produces.
+        const auto* key_data = keys_col->data();
+        const ValidityBitmap* key_validity =
+            sel.keys.validity.has_value() ? &*sel.keys.validity : nullptr;
+        const std::size_t n = keys_col->size();
+
+        // Same scan/replay shape as `probe_swapped`, with a twist: `ri` here
+        // indexes HITS (the survivor list), not probe rows, so each part
+        // needs two prefix offsets — its first hit index and its first output
+        // pair — before the replays can write disjoint slices. One part when
+        // the gate declines, so the serial path is the same code.
+        const auto scan = [&](std::size_t begin, std::size_t end,
+                              std::vector<JoinProbe::SwappedHit>& hits, std::size_t& total) {
+            for (std::size_t i = begin; i < end; ++i) {
+                if (key_validity != nullptr && !(*key_validity)[i]) {
+                    continue;
+                }
+                const auto it = probe_.index().i64_heads.find(key_data[i]);
+                if (it == probe_.index().i64_heads.end()) {
+                    continue;
+                }
+                hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = it->second});
+                for (std::size_t cur = it->second; cur != kNil;
+                     cur = probe_.index().chain_next[cur]) {
+                    ++total;
+                }
+            }
+        };
+        const std::size_t workers = probe_.probe_parallel_workers(n);
+        if (workers == 0) {
+            probe_.swapped_parts_.resize(1);
+            probe_.swapped_parts_[0].hits.clear();
+            probe_.swapped_parts_[0].total = 0;
+            scan(0, n, probe_.swapped_parts_[0].hits, probe_.swapped_parts_[0].total);
+        } else {
+            auto& pool = process_worker_pool();
+            const std::size_t grain = (n + workers - 1) / workers;
+            probe_.swapped_parts_.resize(workers);
+            auto batch = pool.submit(workers, [&](std::size_t w) {
+                auto& part = probe_.swapped_parts_[w];
+                part.hits.clear();
+                part.total = 0;
+                const std::size_t begin = w * grain;
+                const std::size_t end = std::min(n, begin + grain);
+                if (begin < end) {
+                    scan(begin, end, part.hits, part.total);
+                }
+            });
+            batch.wait();
+        }
+        const std::size_t n_parts = probe_.swapped_parts_.size();
+        std::vector<std::size_t> hit_offsets(n_parts);
+        probe_.part_offsets_.resize(n_parts);
+        std::size_t n_hits = 0;
+        std::size_t total = 0;
+        for (std::size_t w = 0; w < n_parts; ++w) {
+            hit_offsets[w] = n_hits;
+            probe_.part_offsets_[w] = total;
+            n_hits += probe_.swapped_parts_[w].hits.size();
+            total += probe_.swapped_parts_[w].total;
+        }
+
+        Selection survivors(n_hits);
+        std::vector<std::size_t> li(total, 0);
+        std::vector<std::size_t> ri(total, 0);
+        Column<std::int64_t> gathered_keys;
+        const bool gather_keys = n_hits != n;
+        if (gather_keys) {
+            gathered_keys.resize_for_overwrite(n_hits);
+        }
+        // Detach once here, not per element inside the replay: the mutable
+        // `operator[]` pays a CoW check every call, and on a worker the
+        // detach itself would race.
+        std::int64_t* gathered_out = gather_keys ? gathered_keys.data() : nullptr;
+        const auto replay = [&](std::size_t w) {
+            const auto& part = probe_.swapped_parts_[w];
+            std::size_t h = hit_offsets[w];
+            std::size_t pos = probe_.part_offsets_[w];
+            for (const JoinProbe::SwappedHit& hit : part.hits) {
+                survivors[h] = sel.selected[hit.rrow];
+                if (gathered_out != nullptr) {
+                    gathered_out[h] = key_data[hit.rrow];
+                }
+                for (std::size_t cur = hit.head; cur != kNil;
+                     cur = probe_.index().chain_next[cur]) {
+                    li[pos] = cur;
+                    ri[pos] = h;
+                    ++pos;
+                }
+                ++h;
+            }
+        };
+        if (workers == 0) {
+            replay(0);
+        } else {
+            auto batch = process_worker_pool().submit(n_parts, replay);
+            batch.wait();
+            if (deferred_exec_->parallel_stats != nullptr) {
+                deferred_exec_->parallel_stats->parallel_probes.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        const bool ri_identity = total == n_hits;
+
+        // Survivors' key values, gathered in memory from phase A's keys.
+        ColumnEntry key_entry;
+        key_entry.name = sel.keys.name;
+        if (!gather_keys) {
+            key_entry.column = sel.keys.column;
+            key_entry.validity = sel.keys.validity;
+        } else {
+            key_entry.column = std::make_shared<ColumnValue>(std::move(gathered_keys));
+            // Null keys never match, so every survivor's key is valid.
+        }
+
+        auto right_rows = materialize_deferred_scan_rows(*deferred_probe_, survivors,
+                                                         *deferred_exec_, std::move(key_entry));
+        if (!right_rows.has_value()) {
+            return std::move(right_rows.error());
+        }
+        if (auto err = interpret_wrapped_right(std::move(*right_rows))) {
+            return err;
+        }
+
+        Table left_copy;
+        left_copy.columns.reserve(build.columns.size());
+        for (const auto& c : build.columns) {
+            left_copy.add_column(c.name, *c.column);
+            left_copy.columns.back().validity = c.validity;
+        }
+        auto out = probe_.assemble_output(std::move(left_copy), li.data(), ri.data(), total,
+                                          /*li_identity=*/false, ri_identity);
+        if (!out.has_value()) {
+            return std::move(out.error());
+        }
+        precomputed_output_ = std::move(*out);
+        outcome = TwoPhase::Precomputed;
+        return std::nullopt;
+    }
+
+    // Derive the probe scan's dynamic filter from the build side's valid key
+    // values (int keys only; other key types publish nothing). Sound for any
+    // inner join regardless of which side ends up as the build: a probe row
+    // whose key fails the filter cannot match.
+    //
+    // Everything here is published ungated — membership because a range
+    // estimate cannot predict set selectivity (the scan decides with a
+    // sampled pass rate), and min/max because the consumer owns the policy:
+    // materialize_deferred_scan gates conjunct synthesis on estimated
+    // pruning, the fused key scan uses the raw bounds for row-group
+    // skipping.
+    void publish_build_filter(const Table& build, DynamicScanFilter& slot) const {
+        publish_build_filter_column(build, keys_->front().left, slot);
+    }
+
+    // Component-selecting variant for the two-key deferred-probe POC
+    // (`resolve_deferred_probe_pair`): publishes a filter over exactly one
+    // named build-side column instead of always `keys_->front().left`, since
+    // the pair join's scan filter only ever covers one of the two keys.
+    void publish_build_filter_column(const Table& build, const std::string& key_name,
+                                     DynamicScanFilter& slot) const {
+        const auto* entry = build.find_entry(key_name);
+        if (entry == nullptr) {
+            return;
+        }
+        const auto* col = std::get_if<Column<std::int64_t>>(&*entry->column);
+        if (col == nullptr || col->empty()) {
+            return;
+        }
+        const ValidityBitmap* validity = entry->validity.has_value() ? &*entry->validity : nullptr;
+        const auto* data = col->data();
+        const std::size_t n = col->size();
+        std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+        std::int64_t mx = std::numeric_limits<std::int64_t>::min();
+        std::size_t valid_rows = 0;
+        for (std::size_t r = 0; r < n; ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            mn = std::min(mn, data[r]);
+            mx = std::max(mx, data[r]);
+            ++valid_rows;
+        }
+        if (valid_rows == 0) {
+            return;
+        }
+
+        // Every build side gets a Bloom — even alongside an exact list, the
+        // Bloom is the probe fast path (see DynamicScanFilter::passes).
+        // Duplicate inserts are harmless. A small build side (dimension
+        // chains: nation, region, filtered part) additionally dedups cheaply
+        // into an exact list, cancelling the Bloom's false positives.
+        constexpr std::size_t kInListBuildMax = 4096;
+        constexpr std::size_t kInListMax = 1024;
+        JoinBloomFilter bloom(valid_rows);
+        for (std::size_t r = 0; r < n; ++r) {
+            if (validity != nullptr && !(*validity)[r]) {
+                continue;
+            }
+            bloom.insert(data[r]);
+        }
+        slot.bloom = std::move(bloom);
+        if (valid_rows <= kInListBuildMax) {
+            std::vector<std::int64_t> keys;
+            keys.reserve(valid_rows);
+            for (std::size_t r = 0; r < n; ++r) {
+                if (validity != nullptr && !(*validity)[r]) {
+                    continue;
+                }
+                keys.push_back(data[r]);
+            }
+            std::sort(keys.begin(), keys.end());
+            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+            if (keys.size() <= kInListMax) {
+                slot.in_list = std::move(keys);
+            }
+        }
+        // Raw facts, not policy: whether these bounds are worth acting on is
+        // the consumer's call — materialize_deferred_scan gates synthesized
+        // conjuncts on estimated pruning, while the fused key scan uses them
+        // ungated to skip whole row groups (which has no gather downside).
+        slot.min = mn;
+        slot.max = mx;
+    }
+
+    /// Run the build phase and publish its result. Nothing else in this class
+    /// may write to the index: `probe_.index()` hands the probe a `const` reference,
+    /// so the barrier is a compile error to cross rather than a convention.
+    auto build_index(const Table& build_side, const std::string& key_name, ExprType key_kind)
+        -> std::optional<std::string> {
+        auto built = build_join_hash_index(build_side, key_name, key_kind);
+        if (!built.has_value()) {
+            return std::move(built.error());
+        }
+        probe_.index_ = std::make_shared<const JoinHashIndex>(std::move(*built));
+        return std::nullopt;
+    }
+
+    void build_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
+                          const ValidityBitmap* v0, const ValidityBitmap* v1) {
+        probe_.index_ =
+            std::make_shared<const JoinHashIndex>(build_join_pair_index(col0, col1, v0, v1));
+    }
+
+    /// Would indexing the right instead of the left buy the pending `order`,
+    /// and is the index small enough that it is worth buying?
+    ///
+    /// The pending keys are in the join's output names and the left's claim is
+    /// in the left's own, so the claim is restated through the output plan
+    /// before they are compared -- a suffixed key is renamed and a key the
+    /// output drops takes the claim with it.
+    auto order_preserving_pays(const Table& left_table, std::size_t n_left, std::size_t n_right)
+        -> bool {
+        constexpr std::size_t kMaxOrderPreservingBuildRatio = 4;
+        const auto& left_ordering = left_table.properties().ordering();
+        if (pending_order_ == nullptr || pending_order_->empty() || !left_ordering.has_value() ||
+            n_right > kMaxOrderPreservingBuildRatio * n_left) {
+            return false;
+        }
+        if (!probe_.right_emit_ready_) {
+            if (auto ready = probe_.setup_right_emit_schema(left_table); !ready.has_value()) {
+                return false;  // the join is about to fail on this anyway
+            }
+        }
+        std::vector<ir::OrderKey> carried;
+        for (const auto& key : *left_ordering) {
+            std::size_t idx = left_table.columns.size();
+            for (std::size_t i = 0; i < left_table.columns.size(); ++i) {
+                if (left_table.columns[i].name == key.name) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx == left_table.columns.size() || idx >= probe_.left_emit_names_.size()) {
+                return false;
+            }
+            carried.push_back(
+                ir::OrderKey{.name = probe_.left_emit_names_[idx], .ascending = key.ascending});
+        }
+        return TableProperties::sorted_by(std::move(carried)).satisfies(*pending_order_);
+    }
 
     OperatorPtr left_;
     Table right_;
     const std::vector<ir::JoinKey>* keys_;
+    /// The probe half. The operator runs the build and decides which side to
+    /// index; everything after that belongs here.
+    JoinProbe probe_;
 
     // Deferred-probe context (see the second constructor). `deferred_probe_`
     // doubles as the mode flag: non-null until the probe scan is resolved.
@@ -5867,37 +5927,9 @@ class ChunkedInnerJoinOperator final : public Operator {
     const ScalarRegistry* deferred_scalars_ = nullptr;
     const ExternRegistry* deferred_externs_ = nullptr;
     const ExecutionContext* deferred_exec_ = nullptr;
-    /// Set by both constructors; the deferred one aliases `deferred_exec_`.
-    const ExecutionContext* exec_ = nullptr;
-
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
 
-    /// What the build phase produced, shared and immutable (right in Stream,
-    /// left in Swapped). Held by pointer so a probe can only read it, and so a
-    /// build could later feed more than one probe.
-    std::shared_ptr<const JoinHashIndex> index_;
-
-    /// Probe-side state, not build-side: the probe chunk's dictionary code ->
-    /// build chain head (`kNil` = no match), rebuilt per chunk by
-    /// `resolve_categorical_heads`.
-    std::vector<std::size_t> probe_code_heads_;
-
-    bool pair_mode_ = false;
-    /// One worker's slice of a parallel probe. Members so the vectors keep
-    /// their capacity across chunks instead of reallocating per probe.
-    struct ProbePart {
-        std::vector<std::size_t> li;
-        std::vector<std::size_t> ri;
-    };
-    std::vector<ProbePart> probe_parts_;
-    std::vector<SwappedPart> swapped_parts_;
-    std::vector<std::size_t> part_offsets_;
-    std::vector<std::size_t> right_emit_idx_;
-    std::vector<std::string> right_emit_names_;
-    std::vector<std::string> left_emit_names_;
-    bool right_emit_ready_ = false;
-    ir::JoinSuffixPolicy suffix_;
     // What an `order` above this join will ask for, or null. Only ever shifts
     // which side is indexed; see `initialize`.
     const std::vector<ir::OrderKey>* pending_order_ = nullptr;

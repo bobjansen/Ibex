@@ -13058,14 +13058,19 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (agg.children().empty()) {
             return std::unexpected("aggregate node missing child");
         }
-        const bool streamable = aggregate_is_streamable(agg);
-        // The fusion is resolved once, by name: two logical nodes -- this
-        // aggregate and the join below it -- executed as one physical step.
-        // The skip-walk and the seven clauses used to be spelled out here and
-        // again in interpreter.cpp.
-        if (const auto fusion = plan_fused_left_join_count(agg); fusion.has_value()) {
-            const ir::JoinNode& join = *fusion->join;
-            const std::string& counted_column = fusion->counted_column;
+        // The plan decides; this reads its decision. `plan_aggregate` relays the
+        // same two predicates this code used to call, so the routing is
+        // identical by construction.
+        const physical::AggregatePlan& ap = plan.aggregate;
+        if (ap.strategy == physical::AggregateStrategy::FusedLeftJoinCount) {
+            // Two logical nodes, one physical step: the join named here is
+            // consumed, never handed to `build_operator`, so it is neither
+            // planned nor counted separately. The skip is a consequence of who
+            // calls whom -- the same way a fused `MapStep` partner is skipped
+            // by the plan's walk simply never descending to it.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+            const auto& join = static_cast<const ir::JoinNode&>(*ap.fused_join);
+            const std::string& counted_column = ap.counted_column;
             auto left = materialize_row_local(*join.children()[0], registry, scalars, externs, exec,
                                               model_out);
             if (!left.has_value()) {
@@ -13092,7 +13097,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             }
             return make_table_source(std::move(*result));
         }
-        if (streamable) {
+        if (ap.strategy == physical::AggregateStrategy::StreamingSorted) {
             auto child_op = build_operator(*agg.children().front(), registry, scalars, externs,
                                            exec, model_out);
             if (!child_op.has_value()) {

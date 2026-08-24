@@ -898,6 +898,40 @@ node kinds retired from the IR. That last step moves work off canonicalize's
 path for every query and touches ~25 files across `ir/`, `parser/`, `codegen/`,
 and `runtime/`, so it wants its own A/B rather than riding along here.
 
+**Item 5 — fusion leaves the tree (2026-08-24, `7c8936d5`).** With physical
+fusion in place for both shapes, canonicalize R5 and R6 are gone: the IR no
+longer encodes an execution decision, and the planner is the single place that
+decides a chain runs as one gather pass. The fused node kinds stay
+constructible and handled — nothing in the optimizer produces them now, but
+tools and serialized trees still name them, so deleting the types is the Phase 5
+cleanup this plan already scopes separately.
+
+Two failures the removal surfaced, both worth recording because neither was in
+the removal itself:
+
+* `kRules` is a fixed-size `std::array<..., 19>`. Dropping two entries without
+  shrinking it left two value-initialized (null) function pointers, which the
+  rewrite driver called — 942 tests segfaulted at once.
+* `range_filter_head` absorbed a fused step's `Project` into the morsel source
+  while skipping the `Update` between them, so the projection named a column
+  nothing had computed. The bug was introduced with three-node fusion
+  (`8156caac`) and was unreachable until canonicalize stopped fusing; the
+  existing island E2E test caught it immediately. A head may absorb a filter and
+  the projection directly above it, and nothing else.
+
+The tests that asserted the rewrites now assert what canonicalize leaves behind,
+and the two physical fusion cases build their fused-node reference directly
+rather than asking canonicalize for one — which makes them a sharper equivalence
+check than before, since the two sides no longer share a producer.
+
+Gates: debug ctest 1749/1749, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings, and an interleaved A/B over `core,filter,groupagg,null`
+at 9 repeats: total +2.67%, geomean 0.991, every query `noise`. That total looked
+directional (15 of 22 slower), so a `--replica-control` run of the same suite
+against **itself** was measured: total -1.29% at geomean 0.993. That is what the
+harness does with identical binaries, and this change is not distinguishable
+from it.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -907,16 +941,15 @@ per-commit A/B log; the entries above are the itemized history.
 | 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
 | 4. Run the physical map pipeline serially, then on the morsel executor | **DONE** (`32f62261`, `0b4150d6`, `8e31700a`): one plan per node decides both modes, and the island analysis is deleted. Earlier state, kept for context: | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. Step 2 (`0b4150d6`) gave the plan its own `PipelineMode`; step 3 (`8e31700a`) deleted the island analysis and handed `build_map_pipeline_parallel` the plan. |
-| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | Started: the planner fuses `Project(Filter(x))` itself (`918be2d3`), which is the precondition the item names. Canonicalize still produces the fused kinds and the three-node R6 shape is not fused physically yet, so the node kinds remain. |
+| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **DONE as an execution concern** (`918be2d3`, `8156caac`, `7c8936d5`): the planner fuses both shapes, canonicalize's R5/R6 are deleted, and nothing in the optimizer produces the fused kinds. The types themselves remain for tools and serialized trees — deleting them is Phase 5 item 2. |
 
-Current gates on the tree: full debug `ctest` 1747/1747, and PDS-H
+Current gates on the tree: full debug `ctest` 1749/1749, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) finish item 5 — physical fusion for the
-three-node `Project(Update(Filter(x)))` shape, then retire R5/R6 and the node
-kinds; (b) `KernelContext`, which is **not** started deliberately: its stated
+Phase 2 is now complete except `KernelContext`, which is **not** started
+deliberately: its stated
 trigger (one shared scratch/cancellation owner) is not met. Cancellation
 already has an owner in `interrupt.hpp`, and the map kernels share no scratch —
 the ad-hoc scratch that exists belongs to breaker operators, which is Phase 4.

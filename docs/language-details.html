@@ -1,0 +1,1362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Language Reference</title>
+  <meta name="description" content="A detailed Ibex language reference and tour covering table pipelines, I/O, notebook integration, TimeFrames, joins, functions, and benchmarks." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+
+  <!-- Nav -->
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link active" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="section">
+    <p class="section-label">Language tour</p>
+    <h2>Everything you need, nothing you don&rsquo;t</h2>
+    <p class="section-sub">A complete analytical pipeline in a handful of composable clauses.</p>
+
+    <div class="tour">
+
+      <!-- 1. Load & filter -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Load &amp; Filter</span>
+          <h3>External functions bring data in</h3>
+          <p>
+            <code>extern fn</code> declares a C++ data-source function as a
+            first-class Ibex binding. The compiler resolves it at link time;
+            the REPL loads the corresponding plugin <code>.so</code> at runtime.
+          </p>
+          <p>
+            Filter expressions support arithmetic, comparisons, and boolean
+            logic (<code>and</code>, <code>or</code>, <code>not</code>).
+            Multiple clauses chain in reading order.
+          </p>
+          <p>
+            Output plugins mirror the input API: <code>write_csv</code>,
+            <code>write_json</code>, and <code>write_parquet</code> accept a
+            DataFrame and a path and return the number of rows written.
+          </p>
+          <p>
+            The dedicated <a href="./io.html">I/O guide</a> covers CSV and
+            Parquet usage in more detail, plus SQLite reads through ADBC and
+            Kafka/Redpanda streaming into WebSocket dashboards for both JSON
+            and Schema-Registry-backed Avro, including headerless files,
+            custom delimiters, schema hints, and end-to-end demos.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">extern fn</span> <span class="fn-name">read_csv</span>(
+    <span class="fn-name">path</span>: String,
+    <span class="fn-name">nulls</span>: String = <span class="str">""</span>,
+    <span class="fn-name">delimiter</span>: String = <span class="str">","</span>,
+    <span class="fn-name">has_header</span>: Bool = <span class="kw">true</span>
+) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"csv.hpp"</span>;
+<span class="kw">extern fn</span> <span class="fn-name">read_json</span>(<span class="fn-name">path</span>: String) -&gt; DataFrame
+    <span class="kw">from</span> <span class="str">"json.hpp"</span>;
+
+<span class="kw">let</span> prices = <span class="fn-name">read_csv</span>(<span class="str">"prices.csv"</span>);
+<span class="kw">let</span> headerless = <span class="fn-name">read_csv</span>(<span class="str">"ticks.csv"</span>, <span class="fn-name">has_header</span> = <span class="kw">false</span>);
+<span class="kw">let</span> config = <span class="fn-name">read_json</span>(<span class="str">"config.json"</span>);
+
+<span class="cm">// Keep rows where price exceeds 1.0</span>
+<span class="kw">let</span> active = prices[<span class="kw">filter</span> price &gt; <span class="num">1.0</span>];
+
+<span class="cm">// Chain filter with a column projection</span>
+prices[
+    <span class="kw">filter</span> price &gt; <span class="num">1.0</span>,
+    <span class="kw">select</span> { symbol, price, volume }
+];
+
+<span class="cm">// Write results back to disk</span>
+<span class="kw">import</span> <span class="str">"csv"</span>;
+<span class="kw">import</span> <span class="str">"json"</span>;
+<span class="kw">import</span> <span class="str">"parquet"</span>;
+
+<span class="kw">let</span> n = <span class="fn-name">write_csv</span>(active, <span class="str">"out/active.csv"</span>);
+<span class="fn-name">write_json</span>(active, <span class="str">"out/active.json"</span>);
+<span class="fn-name">write_parquet</span>(active, <span class="str">"out/active.parquet"</span>);</code></pre>
+          <p>
+            The first-party Parquet backend also reads directly from public HTTPS
+            URLs, presigned URLs, and S3-compatible object storage with the same
+            <code>read_parquet(path)</code> call:
+            <code>read_parquet("https://data.example.com/prices.parquet")</code>
+            or
+            <code>read_parquet("s3://market-data/prices.parquet?region=us-east-1")</code>.
+          </p>
+        </div>
+      </div>
+
+      <!-- 1b. Inline Table Construction -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Inline Tables</span>
+          <h3>Build DataFrames from literals or existing column vectors</h3>
+          <p>
+            The <code>Table&nbsp;{&nbsp;&hellip;&nbsp;}</code> constructor builds
+            a <code>DataFrame</code> column-by-column. Each column value is either
+            an inline <code>Series</code> literal <code>[v,&nbsp;v,&nbsp;&hellip;]</code>
+            or any Ibex expression that produces a series or table &mdash; no file or
+            plugin declaration required.
+          </p>
+          <p>
+            For table-valued expression columns, the runtime extracts the column
+            from the result table: a <strong>single-column</strong> result is used
+            directly; a <strong>multi-column</strong> result is matched by
+            column name. Literal and expression columns may be freely mixed.
+          </p>
+          <p>
+            All columns must have equal row counts. The result is a first-class
+            <code>DataFrame</code>: chain operations, promote to
+            <code>as_timeframe</code>, or join with another table.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Series literals</span>
+<span class="kw">let</span> price = [<span class="num">150.0</span>, <span class="num">140.0</span>, <span class="num">300.0</span>];
+<span class="kw">let</span> empty: Series&lt;Float64&gt; = [];
+
+<span class="cm">// Series-literal columns</span>
+<span class="kw">let</span> t = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>, <span class="str">"MSFT"</span>],
+    price  = price
+};
+
+<span class="cm">// Assemble aligned columns from an existing table expression</span>
+<span class="kw">let</span> quotes = Table {
+    symbol = [<span class="str">"AAPL"</span>, <span class="str">"AAPL"</span>, <span class="str">"GOOG"</span>],
+    price  = [<span class="num">150.0</span>, <span class="num">155.0</span>, <span class="num">140.0</span>],
+    qty    = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">15</span>]
+};
+<span class="kw">let</span> enriched = Table {
+    symbol   = quotes,
+    price    = quotes,
+    notional = quotes[<span class="kw">select</span> { notional = price <span class="op">*</span> qty }]
+};
+
+<span class="cm">// Mix literals and expressions</span>
+<span class="kw">let</span> benchmark = Table {
+    label = [<span class="str">"average price"</span>],
+    value = quotes[<span class="kw">select</span> { value = <span class="fn-name">mean</span>(price) }]
+};
+
+<span class="cm">// Promote to TimeFrame</span>
+<span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(
+    Table { ts = [<span class="num">1000</span>, <span class="num">2000</span>, <span class="num">3000</span>], price = [<span class="num">10</span>, <span class="num">20</span>, <span class="num">30</span>] },
+    <span class="str">"ts"</span>
+);</code></pre>
+        </div>
+      </div>
+
+      <!-- 2. Aggregate -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Aggregation</span>
+          <h3>One clause for projection and grouped reduction</h3>
+          <p>
+            <code>select</code> doubles as a projection and an aggregation clause.
+            Add <code>by</code> to group; omit it for a global aggregate.
+          </p>
+          <p>
+            Aggregate functions: <code>first</code>, <code>last</code>,
+            <code>sum</code>, <code>mean</code>, <code>min</code>, <code>max</code>,
+            <code>count</code>, <code>median</code>, <code>std</code>,
+            <code>ewma</code>. All skip null rows by default. IEEE
+            <code>NaN</code> / <code>Inf</code> are not nulls, so normalize them
+            explicitly before aggregation when needed.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Mean sepal length and row count, by species</span>
+iris[<span class="kw">select</span> {
+    mean_sl = <span class="fn-name">mean</span>(`Sepal.Length`),
+    n       = <span class="fn-name">count</span>()
+}, <span class="kw">by</span> Species];
+
+<span class="cm">// OHLC per symbol — all in one pass</span>
+prices[<span class="kw">select</span> {
+    open   = <span class="fn-name">first</span>(price),
+    high   = <span class="fn-name">max</span>(price),
+    low    = <span class="fn-name">min</span>(price),
+    close  = <span class="fn-name">last</span>(price),
+    traded = <span class="fn-name">sum</span>(volume)
+}, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 2b. Grouped update -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Grouped Update</span>
+          <h3>Broadcast group aggregates back to every row</h3>
+          <p>
+            <code>update&nbsp;+&nbsp;by</code> evaluates each expression
+            <em>per group</em> and writes the result back to every row in
+            that group &mdash; no row reduction, no separate join step. This is
+            the equivalent of a SQL window function with
+            <code>PARTITION&nbsp;BY</code> and no frame clause.
+          </p>
+          <p>
+            Use it to attach group statistics (mean, z-score, rank) alongside
+            the original columns without losing any rows.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Attach species mean to every individual row</span>
+iris[<span class="kw">update</span> { group_mean = <span class="fn-name">mean</span>(`Sepal.Length`) }, <span class="kw">by</span> Species];
+
+<span class="cm">// Z-score within each symbol group</span>
+prices[<span class="kw">update</span> {
+    z = (price <span class="op">-</span> <span class="fn-name">mean</span>(price)) <span class="op">/</span> <span class="fn-name">std</span>(price)
+}, <span class="kw">by</span> symbol];
+
+<span class="cm">// Combine grouped update with filter — keeps all original rows</span>
+prices[
+    <span class="kw">update</span> { avg = <span class="fn-name">mean</span>(price) }, <span class="kw">by</span> symbol,
+    <span class="kw">filter</span> price <span class="op">&gt;</span> avg
+];</code></pre>
+        </div>
+      </div>
+
+      <!-- 3. Update -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Derived Columns</span>
+          <h3>Add or replace columns without losing any data</h3>
+          <p>
+            <code>update</code> appends named computed columns to every row.
+            All existing columns pass through untouched. A
+            <strong>tuple left-hand side</strong> unpacks a multi-column result
+            in one assignment. The bare <code>update = expr</code> form merges
+            <em>all</em> columns from a table-returning expression.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Enrich every row with return, range, and notional</span>
+ohlcv[<span class="kw">update</span> {
+    ret      = (close <span class="op">-</span> open) <span class="op">/</span> open,
+    range    = (high  <span class="op">-</span> low)  <span class="op">/</span> open,
+    notional = close <span class="op">*</span> volume
+}];
+
+<span class="cm">// Unpack a multi-column result with a tuple LHS</span>
+df[<span class="kw">update</span> { (delta, gamma) = compute_greeks() }];
+
+<span class="cm">// Merge all columns from a table-returning function</span>
+prices[<span class="kw">update</span> = gen_prices(symbols)];
+
+<span class="cm">// Chain an update with an aggregation</span>
+<span class="kw">let</span> daily = ohlcv[<span class="kw">update</span> { ret = (close <span class="op">-</span> open) <span class="op">/</span> open }];
+daily[<span class="kw">select</span> {
+    avg_ret    = <span class="fn-name">mean</span>(ret),
+    n_sessions = <span class="fn-name">count</span>()
+}, <span class="kw">by</span> sector]
+    [<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 4. Rename -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rename</span>
+          <h3>Relabel columns without touching the data</h3>
+          <p>
+            <code>rename</code> maps old column names to new ones while keeping
+            every other column intact. Use the single-name shorthand or the
+            braced multi-rename form. Column order is preserved.
+          </p>
+          <p>
+            Because <code>rename</code> runs before <code>select</code> in
+            canonical order, renamed columns are immediately visible to the
+            rest of the pipeline.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Single rename — no braces needed</span>
+trades[<span class="kw">rename</span> p = price];
+
+<span class="cm">// Rename multiple columns at once</span>
+trades[<span class="kw">rename</span> { p = price, q = volume }];
+
+<span class="cm">// Rename then select using the new name</span>
+trades[
+    <span class="kw">filter</span> price &gt; <span class="num">15</span>,
+    <span class="kw">rename</span> p = price,
+    <span class="kw">select</span> { p, volume }
+];
+
+<span class="cm">// Works with update and aggregation too</span>
+trades[
+    <span class="kw">rename</span> { sym = symbol, vol = volume },
+    <span class="kw">select</span> { total_vol = <span class="fn-name">sum</span>(vol) }, <span class="kw">by</span> sym
+];</code></pre>
+        </div>
+      </div>
+
+      <!-- 5. Order, Head & Distinct -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Order, Head, Tail &amp; Distinct</span>
+          <h3>Sort, keep the first or last rows, and deduplicate with explicit intent</h3>
+          <p>
+            <code>order</code> accepts a single column, a multi-key block with
+            <code>asc</code>&thinsp;/&thinsp;<code>desc</code> annotations, or no
+            argument at all to sort by every column in schema order.
+          </p>
+          <p>
+            <code>head</code> keeps the first <code>n</code> rows in the current
+            order, while <code>tail</code> keeps the last <code>n</code> rows.
+            Both work per group when combined with <code>by</code>.
+          </p>
+          <p>
+            <code>distinct</code> deduplicates on a single column or a set.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Sort by a single key (ascending by default)</span>
+iris[<span class="kw">order</span> `Sepal.Length`];
+
+<span class="cm">// Multi-key sort with explicit directions</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span>, symbol <span class="kw">asc</span> }];
+
+<span class="cm">// Keep the first 10 rows in current order</span>
+results[<span class="kw">head</span> <span class="num">10</span>];
+
+<span class="cm">// Top 3 rows per symbol after sorting</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">head</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
+
+<span class="cm">// Keep the last 10 rows in current order</span>
+results[<span class="kw">tail</span> <span class="num">10</span>];
+
+<span class="cm">// Bottom 3 rows per symbol after sorting</span>
+results[<span class="kw">order</span> { avg_ret <span class="kw">desc</span> }, <span class="kw">tail</span> <span class="num">3</span>, <span class="kw">by</span> symbol];
+
+<span class="cm">// Sort by all columns in schema order</span>
+iris[<span class="kw">order</span>];
+
+<span class="cm">// Unique species names</span>
+iris[<span class="kw">distinct</span> Species];
+
+<span class="cm">// Unique (species, length) pairs</span>
+iris[<span class="kw">distinct</span> { Species, `Sepal.Length` }];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Filter With Lag</span>
+          <h3>Use previous or next rows directly in predicates</h3>
+          <p>
+            Pure row-preserving functions such as <code>lag</code> and
+            <code>lead</code> can appear directly inside <code>filter</code>.
+            They use the current row order, so add a preceding
+            <code>order</code> block when the input order needs to be explicit.
+            The offset can be an integer literal or scalar <code>Int64</code>
+            expression.
+          </p>
+          <p>
+            This keeps shift-style patterns concise without materializing
+            temporary columns first. <code>Date - Date</code> returns an
+            integer day delta, so calendar-adjacent filters can combine
+            <code>lag(date_col, 1)</code> with date arithmetic directly.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Numbers that appear at least three times consecutively</span>
+<span class="kw">let</span> n = <span class="num">1</span>;
+logs[
+    <span class="kw">order</span> id
+][
+    <span class="kw">filter</span> num == <span class="fn-name">lag</span>(num, n) &amp;&amp; num == <span class="fn-name">lag</span>(num, n + <span class="num">1</span>)
+][
+    <span class="kw">distinct</span> { ConsecutiveNums = num }
+];</code></pre>
+        </div>
+      </div>
+
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rank</span>
+          <h3>Assign dense, first, min/max, or average ranks inside update</h3>
+          <p>
+            <code>rank(col)</code> is the shorthand single-key form. For
+            multi-key ranking, use
+            <code>rank(order { ... })</code> and spell sort direction per key.
+          </p>
+          <p>
+            The surrounding <code>by</code> clause partitions ranking by group,
+            which makes dense top-k filters much cleaner than
+            <code>distinct + order + head + semi join</code> rewrites.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Dense descending rank by score within each symbol</span>
+scores[
+    <span class="kw">update</span> { dense_rank = <span class="fn-name">rank</span>(score, method = dense, ascending = <span class="kw">false</span>) },
+    <span class="kw">by</span> symbol
+];
+
+<span class="cm">// Multi-key ranking with an explicit tie-break</span>
+scores[
+    <span class="kw">update</span> { order_rank = <span class="fn-name">rank</span>(<span class="kw">order</span> { score <span class="kw">desc</span>, ts <span class="kw">asc</span> }, method = first) },
+    <span class="kw">by</span> symbol
+];
+
+<span class="cm">// Top 3 dense ranks per department</span>
+employee[
+    <span class="kw">update</span> { salary_rank = <span class="fn-name">rank</span>(salary, method = dense, ascending = <span class="kw">false</span>) },
+    <span class="kw">by</span> departmentId
+][<span class="kw">filter</span> salary_rank &lt;= <span class="num">3</span>];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6. Joins -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Joins</span>
+          <h3>Inner, left, right, outer, semi, anti, cross, as-of — and non-equijoin predicates</h3>
+          <p>
+            The <strong>as-of join</strong> attaches the latest right row
+            at-or-before each left timestamp. It is the standard pattern for
+            enriching tick data with bar data, without look-ahead bias.
+          </p>
+          <p>
+            Join keys are named with <code>on</code>. When the expression after
+            <code>on</code> is a comparison or boolean expression rather than a
+            column name, it becomes a <strong>non-equijoin predicate</strong>
+            (theta join) evaluated for every pair of rows.
+            Both tables must be <code>TimeFrame</code>s for an asof join.
+          </p>
+          <p>
+            Inside a predicate a bare column name must exist on exactly one
+            side. When both inputs carry the name, write
+            <code>left(<em>col</em>)</code> or <code>right(<em>col</em>)</code>
+            &mdash; an ambiguous name is an error rather than a silent choice.
+            The predicate reads the two inputs&rsquo; own names, never the
+            join&rsquo;s output names.
+          </p>
+          <p>
+            A name held by <strong>both</strong> inputs cannot appear twice in
+            the output, and Ibex will not invent a spelling for it. Such a
+            collision is an error unless the join says what to call each side
+            with <code>suffix { "_left", "_right" }</code>. The clause always
+            names both; an empty string leaves that side under its original
+            name. Suffixes apply to the collisions only &mdash; a column that
+            just one input carries keeps its name. A same-name key folds into a
+            single output column and so never collides, and semi and anti joins
+            emit no right columns at all.
+          </p>
+          <p>
+            A <strong>null key matches nothing</strong> &mdash; not even another
+            null. That is the same three-valued rule
+            <code>filter x == y</code> follows, and deliberately unlike
+            <code>by</code>, where nulls do group together. Add
+            <code>nulls equal</code> after the keys to ask for the other
+            behaviour: a null then matches exactly the nulls on the other side,
+            and never a present value &mdash; not even the zero the null&rsquo;s
+            cell physically holds. For a composite key every component follows
+            the same rule, so <code>(1,&nbsp;null)</code> pairs with
+            <code>(1,&nbsp;null)</code> and not with <code>(1,&nbsp;0)</code>.
+            The clause governs equality keys, so it is an error on a join that
+            has none &mdash; a <code>cross join</code>, or one whose
+            <code>on</code> is a bare predicate.
+          </p>
+          <p>
+            A join can also state how its rows are expected to line up, and
+            have the executor check it:
+            <code>orders join customers on cust_id <em>expect</em> n:1</code>.
+            The left term is how many left rows may match one right row, the
+            right term how many right rows may match one left row &mdash; so
+            <code>n:1</code> reads &ldquo;many orders, one customer&rdquo;. It
+            is checked against the pairs actually emitted, so the same rule
+            covers every join kind, and an unmatched row can never break it.
+            Because it is checked rather than assumed, the optimizer may rely on
+            it: <code>expect n:1</code> keeps a left-side uniqueness proof valid
+            in the output, which a join could not otherwise conclude.
+          </p>
+          <p>
+            When a row has several matches and only one is wanted,
+            <code><em>take</em> first</code> / <code>last</code> keeps one.
+            Both read the right value&rsquo;s own ordering claim &mdash; the one
+            <code>order</code> establishes, which travels with the value, so
+            ordering a binding once is enough. A right input carrying no order
+            is an error rather than a silent pick, since &ldquo;first&rdquo;
+            would otherwise mean whichever match the executor happened to reach.
+            <code>take any</code> keeps one match and says the choice does not
+            matter; which one is unspecified and must not be relied on.
+          </p>
+          <p>
+            This is deliberately not a rename rule. Renaming an overlap between
+            two snapshots of the same table and catching an accidental overlap
+            between unrelated tables want opposite handling, so the first asks
+            for the clause and the second gets an error naming the column and
+            both sides.
+          </p>
+          <p>
+            A join makes <strong>no promise about row order</strong>: the engine
+            picks which side to build its hash index from, and that choice shows
+            up in the output. Add <code>order</code> when the order matters. The
+            optimizer can often satisfy it from inside the join, so asking is
+            usually free. As-of joins are the exception &mdash; they return a
+            <code>TimeFrame</code>, which is always time-ascending.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Inner join — drop non-matching rows</span>
+<span class="kw">let</span> enriched = daily <span class="kw">join</span> fund <span class="kw">on</span> symbol;
+
+<span class="cm">// Left join — preserve all left rows</span>
+<span class="kw">let</span> with_meta = prices <span class="kw">left join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Right join — preserve all right rows</span>
+<span class="kw">let</span> with_scores = prices <span class="kw">right join</span> scores <span class="kw">on</span> symbol;
+
+<span class="cm">// Outer join — preserve rows from both sides</span>
+<span class="kw">let</span> unioned = prices <span class="kw">outer join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Semi join — keep left rows that have a match</span>
+<span class="kw">let</span> matched = prices <span class="kw">semi join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Anti join — keep left rows that have no match</span>
+<span class="kw">let</span> missing = prices <span class="kw">anti join</span> metadata <span class="kw">on</span> symbol;
+
+<span class="cm">// Cross join — cartesian product</span>
+<span class="kw">let</span> cartesian = prices <span class="kw">cross join</span> metadata;
+
+<span class="cm">// Non-equijoin — pair rows where a column satisfies an inequality</span>
+<span class="kw">let</span> events = ticks <span class="kw">join</span> windows <span class="kw">on</span> ts &gt;= start &amp;&amp; ts &lt; end;
+
+<span class="cm">// left(...) / right(...) when both inputs share a column name.</span>
+<span class="cm">// Those shared names collide in the output too, so the join</span>
+<span class="cm">// also needs a suffix clause — the two mechanisms are separate:</span>
+<span class="cm">// the qualifiers read the inputs, the suffixes name the output.</span>
+<span class="kw">let</span> widened = bars_a <span class="kw">join</span> bars_b
+    <span class="kw">on</span> <span class="kw">left</span>(ts) &gt;= <span class="kw">right</span>(ts) &amp;&amp; <span class="kw">left</span>(close) &gt; <span class="kw">right</span>(close)
+    <span class="kw">suffix</span> { <span class="str">"_a"</span>, <span class="str">"_b"</span> };
+
+<span class="cm">// suffix — rename what collides, on both sides</span>
+<span class="kw">let</span> compared = prices_2023 <span class="kw">join</span> prices_2024 <span class="kw">on</span> symbol
+    <span class="kw">suffix</span> { <span class="str">"_old"</span>, <span class="str">"_new"</span> };
+
+<span class="cm">// An empty side keeps its own names; only the right is renamed</span>
+<span class="kw">let</span> annotated = prices <span class="kw">join</span> prices_adj <span class="kw">on</span> symbol
+    <span class="kw">suffix</span> { <span class="str">""</span>, <span class="str">"_adj"</span> };
+
+<span class="cm">// nulls equal — a null key matches the nulls, and only those.</span>
+<span class="cm">// `with_meta` above has a null `sector` wherever the lookup missed,</span>
+<span class="cm">// so by default those rows pair with nothing when joined back on it.</span>
+<span class="kw">let</span> peers  = with_meta[<span class="kw">select</span> { sector, peer = symbol }];
+<span class="kw">let</span> paired = with_meta <span class="kw">join</span> peers <span class="kw">on</span> sector <span class="kw">nulls</span> equal;
+
+<span class="cm">// As-of join — each tick gets the latest bar at or before ts</span>
+<span class="kw">let</span> tf   = <span class="fn-name">as_timeframe</span>(ticks,  <span class="str">"ts"</span>);
+<span class="kw">let</span> bars = <span class="fn-name">as_timeframe</span>(bars_1m, <span class="str">"ts"</span>);
+tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
+        </div>
+      </div>
+
+      <!-- 6a. Correlated scalar subqueries -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Subqueries</span>
+          <h3>Compare a row against an aggregate of the rows that relate to it</h3>
+          <p>
+            Inside a <code>filter</code>, <code>scalar(...)</code> holds a table
+            expression whose single aggregate column is compared against the
+            outer row. <code>outer(column)</code> captures a column from the
+            enclosing query &mdash; it is the correlation boundary. A bare name
+            inside the subquery always means the subquery&rsquo;s own column, so
+            the two sides can share names without ambiguity.
+          </p>
+          <p>
+            The subquery is <strong>decorrelated</strong>, never run once per
+            outer row: a correlated one becomes an aggregate grouped by the
+            captured column, left-joined back onto the outer rows; an
+            uncorrelated one becomes a cross join against its single row. When
+            nothing matches an outer row&rsquo;s key the value is null, and
+            comparing against null keeps no rows &mdash; SQL&rsquo;s
+            scalar-subquery semantics.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Each part's cheapest supplier — TPC-H Q2's shape.</span>
+<span class="cm">// The minimum is taken over the supply rows whose ps_partkey</span>
+<span class="cm">// matches THIS row's p_partkey.</span>
+(parts <span class="kw">join</span> supply <span class="kw">on</span> p_partkey)[
+    <span class="kw">filter</span> ps_supplycost == <span class="fn-name">scalar</span>(
+        supply[
+            <span class="kw">filter</span> ps_partkey == <span class="kw">outer</span>(p_partkey),
+            <span class="kw">select</span> { m = <span class="fn-name">min</span>(ps_supplycost) }
+        ]
+    )
+];
+
+<span class="cm">// Capture nothing and it is UNcorrelated: one value, the</span>
+<span class="cm">// same for every row, evaluated once and broadcast.</span>
+supply[
+    <span class="kw">filter</span> ps_supplycost &gt; <span class="fn-name">scalar</span>(supply[<span class="kw">select</span> { m = <span class="fn-name">mean</span>(ps_supplycost) }])
+];
+
+<span class="cm">// The subquery is a filter, not a projection: its value</span>
+<span class="cm">// never becomes a column of the result.</span></code></pre>
+        </div>
+      </div>
+
+      <!-- 6b. Null handling -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Null Handling</span>
+          <h3>SQL-style three-valued logic, Arrow-style storage</h3>
+          <p>
+            Every column carries an Arrow-compatible validity bitmap alongside
+            its value buffer. Null propagates through arithmetic, comparisons,
+            and every value function &mdash; <em>null in, null out</em>:
+            <code>null&nbsp;*&nbsp;x&nbsp;=&nbsp;null</code>,
+            <code>null&nbsp;&gt;&nbsp;5&nbsp;=&nbsp;null</code>,
+            <code>abs(null)&nbsp;=&nbsp;null</code>,
+            <code>is_nan(null)&nbsp;=&nbsp;null</code>. The only functions that
+            consume null are the ones built for it:
+            <code>is&nbsp;null</code>&nbsp;/&nbsp;<code>is&nbsp;not&nbsp;null</code>,
+            <code>coalesce</code>, <code>fill_null</code>, and
+            <code>null_if_nan</code>&nbsp;/&nbsp;<code>null_if_not_finite</code>.
+            <code>filter</code> silently drops rows where the predicate is null.
+          </p>
+          <p>
+            Use <code>is null</code> / <code>is not null</code> to inspect the
+            validity bitmap directly &mdash; these predicates always return a
+            valid <code>Bool</code>, never null. Three-valued boolean operators
+            follow SQL rules: <code>true&nbsp;OR&nbsp;null&nbsp;=&nbsp;true</code>,
+            <code>false&nbsp;AND&nbsp;null&nbsp;=&nbsp;false</code>.
+          </p>
+          <p>
+            Nulls arise from joins with unmatched rows (left join: unmatched
+            right columns; right join: unmatched left columns; outer join:
+            both sides), dcast (missing pivot combinations), and aggregates
+            over groups with no valid observations &mdash; every value-bearing
+            aggregate (<code>sum</code>, <code>mean</code>, <code>first</code>,
+            <code>last</code>, &hellip;) returns null for an all-null group,
+            plus <code>std</code> on fewer than 2 non-null values,
+            <code>skew</code> on fewer than 3, <code>kurtosis</code> on
+            fewer than 4. Only <code>count</code> never returns null.
+          </p>
+          <p>
+            A <code>TimeFrame</code>&rsquo;s time index may not contain nulls
+            at all &mdash; a null has no position in time, so
+            <code>as_timeframe</code> rejects one rather than let
+            <code>asof join</code>, <code>window</code> and
+            <code>resample</code> each decide what it means. Every other column
+            may be null as usual.
+          </p>
+          <p>
+            A null is never equal to anything, itself included, so a null
+            <strong>join key</strong> matches no row by default; a
+            <code>by</code> key is the deliberate exception, grouping nulls
+            together. A join can opt into the grouping behaviour for its keys
+            with <code>nulls equal</code>.
+          </p>
+          <p>
+            Floating-point <code>NaN</code> and <code>Inf</code> values are
+            separate from nulls. Use <code>null_if_nan</code> or
+            <code>null_if_not_finite</code> to convert them into nulls before
+            grouped reductions.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Left join introduces nulls for unmatched rows</span>
+<span class="kw">let</span> enriched = employees <span class="kw">left join</span> departments <span class="kw">on</span> dept_id;
+
+<span class="cm">// Test the validity bitmap with IS NULL / IS NOT NULL</span>
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is null</span> }];
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> }];
+
+<span class="cm">// Null propagates through arithmetic</span>
+<span class="cm">// bonus is null wherever budget is null</span>
+enriched[<span class="kw">select</span> { name, bonus = salary <span class="op">+</span> budget }];
+
+<span class="cm">// 3VL: true OR null = true; keeps the row</span>
+enriched[<span class="kw">filter</span> { dept_name <span class="kw">is not null</span> <span class="op">||</span> salary <span class="op">&gt;</span> <span class="num">80000</span> }];
+
+<span class="cm">// Aggregates skip null rows automatically</span>
+enriched[<span class="kw">select</span> { avg_sal = <span class="fn-name">mean</span>(salary) }, <span class="kw">by</span> dept_name];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6c. Scalar functions -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Scalar Functions</span>
+          <h3>Math and date extraction built in</h3>
+          <p>
+            Ibex ships a small set of built-in scalar functions that apply
+            element-wise to a column. Math: <code>abs</code>, <code>log</code>,
+            <code>sqrt</code>, row-wise <code>pmin</code>, row-wise <code>pmax</code>.
+            Date/time extraction: <code>year</code>,
+            <code>month</code>, <code>day</code>, <code>hour</code>,
+            <code>minute</code>, <code>second</code>.
+          </p>
+          <p>
+            All scalar functions operate on <code>Numeric</code> or
+            <code>Date&nbsp;|&nbsp;Timestamp</code> columns and produce a new
+            column of the return type. Use them inside <code>update</code>,
+            <code>select</code>, or <code>filter</code> expressions.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Math functions</span>
+trades[<span class="kw">update</span> {
+    log_ret  = <span class="fn-name">log</span>(price <span class="op">/</span> <span class="fn-name">lag</span>(price, <span class="num">1</span>)),
+    vol      = <span class="fn-name">sqrt</span>(variance),
+    notional = <span class="fn-name">abs</span>(pnl),
+    hi       = <span class="fn-name">pmax</span>(bid, ask, wap),
+    lo       = <span class="fn-name">pmin</span>(bid, ask, wap)
+}];
+
+<span class="cm">// Date / time extraction</span>
+trades[<span class="kw">update</span> {
+    yr = <span class="fn-name">year</span>(date),
+    mo = <span class="fn-name">month</span>(date),
+    dy = <span class="fn-name">day</span>(date)
+}];
+
+trades[<span class="kw">update</span> { hr = <span class="fn-name">hour</span>(timestamp) }];
+
+<span class="cm">// Use in filter</span>
+trades[<span class="kw">filter</span> <span class="fn-name">year</span>(date) <span class="op">=</span> <span class="num">2024</span>];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6c-2. String pattern matching -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">String Matching</span>
+          <h3><code>like</code> matches a string against a pattern</h3>
+          <p>
+            <code>like(value, pattern)</code> is SQL-LIKE matching &mdash;
+            <code>(String,&nbsp;String)&nbsp;-&gt;&nbsp;Bool</code>. The pattern
+            must cover the <strong>whole</strong> value: <code>%</code> matches
+            zero or more characters, <code>_</code> matches exactly one code
+            point, and <code>\</code> escapes either of them. Matching is
+            case-sensitive.
+          </p>
+          <p>
+            There is no infix <code>LIKE</code> keyword; <code>NOT LIKE</code> is
+            the ordinary <code>!</code> operator. Because <code>like</code>
+            returns <code>Bool</code>, it works as a field expression as well as
+            a predicate. Null propagates: a null value or pattern yields null,
+            and a null predicate keeps no row.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Substring, suffix, prefix</span>
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_name, <span class="str">"%green%"</span>)];
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_type, <span class="str">"%BRASS"</span>)];
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(p_container, <span class="str">"SM %"</span>)];
+
+<span class="cm">// NOT LIKE, with two ordered fragments</span>
+orders[<span class="kw">filter</span> <span class="op">!</span><span class="fn-name">like</span>(o_comment, <span class="str">"%special%requests%"</span>)];
+
+<span class="cm">// Bool-valued, so it is also a field</span>
+parts[<span class="kw">update</span> { is_green = <span class="fn-name">like</span>(p_name, <span class="str">"%green%"</span>) }];
+
+<span class="cm">// _ is one character; \ escapes a literal % or _</span>
+parts[<span class="kw">filter</span> <span class="fn-name">like</span>(code, <span class="str">"A_C"</span>)];
+sales[<span class="kw">filter</span> <span class="fn-name">like</span>(label, <span class="str">"100\\%"</span>)];</code></pre>
+        </div>
+      </div>
+
+      <!-- 6d. Type system: casts and round() -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Type System</span>
+          <h3>Explicit casts and rounding for numeric conversions</h3>
+          <p>
+            Ibex never coerces <code>Int</code>&thinsp;&harr;&thinsp;<code>Float</code>
+            implicitly. Use type-name constructors — <code>Int64(x)</code>,
+            <code>Float64(x)</code>, etc. — for explicit numeric casts. They
+            work on scalars and on entire columns.
+          </p>
+          <p>
+            <strong>Float &rarr; Int casts</strong> require the value to be a
+            whole number. Use <code>round(x,&nbsp;mode)</code> first when the
+            value may have a fractional part. Five modes are available:
+            <code>nearest</code> (ties away from zero), <code>bankers</code>
+            (ties to even — statistically unbiased), <code>floor</code>,
+            <code>ceil</code>, <code>trunc</code>.
+          </p>
+          <p>
+            Type annotations on <code>let</code> bindings and function
+            parameters are optional. When present, they are validated:
+            scalar types must match exactly; schema annotations require all
+            declared columns to be present with the correct types.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Explicit scalar casts</span>
+<span class="kw">let</span> n: Int64   = <span class="fn-name">Int64</span>(<span class="num">3.0</span>);   <span class="cm">// ok — 3.0 is a whole number</span>
+<span class="kw">let</span> f: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// ok — Int → Float always succeeds</span>
+<span class="cm">// Int64(3.9)  ← runtime error: fractional part</span>
+
+<span class="cm">// Round a Float column to Int</span>
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">round</span>(volume_f, nearest) }];
+
+<span class="cm">// All five rounding modes</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, nearest)   <span class="cm">// → 4  (ties away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, nearest)   <span class="cm">// → 3  (tie → away from zero)</span>
+<span class="fn-name">round</span>(<span class="num">2.5</span>, bankers)   <span class="cm">// → 2  (tie → nearest even)</span>
+<span class="fn-name">round</span>(<span class="num">3.5</span>, bankers)   <span class="cm">// → 4  (tie → nearest even)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, floor)     <span class="cm">// → 3  (toward −∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, ceil)      <span class="cm">// → 4  (toward +∞)</span>
+<span class="fn-name">round</span>(<span class="num">3.7</span>, trunc)     <span class="cm">// → 3  (toward zero)</span>
+
+<span class="cm">// Column-level cast after rounding</span>
+prices[<span class="kw">update</span> { vol_int = <span class="fn-name">Int64</span>(<span class="fn-name">round</span>(volume_f, nearest)) }];
+
+<span class="cm">// Annotation validation</span>
+<span class="kw">let</span> y: Float64 = <span class="fn-name">Float64</span>(<span class="num">42</span>);   <span class="cm">// explicit cast satisfies annotation</span></code></pre>
+        </div>
+      </div>
+
+      <!-- 7. Vectorized RNG -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Vectorized RNG</span>
+          <h3>Generate random columns in a single vectorized pass</h3>
+          <p>
+            Eight built-in <code>rand_*</code> functions each produce one
+            independent draw <em>per row</em> &mdash; no row-by-row loop, no
+            user-space scalar overhead. Each thread has its own
+            <code>mt19937_64</code> seeded from <code>std::random_device</code>,
+            so parallel queries produce independent streams without locking.
+          </p>
+          <p>
+            Continuous distributions return <code>Float64</code>:
+            <code>rand_uniform</code>, <code>rand_normal</code>,
+            <code>rand_student_t</code>, <code>rand_gamma</code>,
+            <code>rand_exponential</code>.
+            Discrete distributions return <code>Int64</code>:
+            <code>rand_bernoulli</code>, <code>rand_poisson</code>,
+            <code>rand_int</code>.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Gaussian noise column</span>
+df[<span class="kw">update</span> { noise = <span class="fn-name">rand_normal</span>(<span class="num">0.0</span>, <span class="num">1.0</span>) }];
+
+<span class="cm">// Uniform weight, biased coin, die roll — all in one pass</span>
+df[<span class="kw">update</span> {
+    w    = <span class="fn-name">rand_uniform</span>(<span class="num">0.0</span>, <span class="num">1.0</span>),
+    flip = <span class="fn-name">rand_bernoulli</span>(<span class="num">0.7</span>),
+    die  = <span class="fn-name">rand_int</span>(<span class="num">1</span>, <span class="num">6</span>)
+}];
+
+<span class="cm">// Simulate inter-arrival times and Poisson counts</span>
+df[<span class="kw">update</span> {
+    wait   = <span class="fn-name">rand_exponential</span>(<span class="num">2.5</span>),
+    events = <span class="fn-name">rand_poisson</span>(<span class="num">4.0</span>)
+}];</code></pre>
+        </div>
+      </div>
+
+      <!-- 8. rep() and boolean masks -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">rep &amp; Boolean Masks</span>
+          <h3>Fill, repeat, and cycle columns with named-argument syntax</h3>
+          <p>
+            <code>rep(x)</code> mirrors R&rsquo;s <code>rep()</code>: it fills
+            a column by repeating a scalar literal or cycling an existing column.
+            Named arguments &mdash; <code>times</code>, <code>each</code>, and
+            <code>length_out</code> &mdash; control the exact repetition pattern.
+          </p>
+          <p>
+            Passing a <code>Bool</code> literal produces a first-class
+            <code>Series&lt;Bool&gt;</code> (a boolean mask), useful as a
+            computed flag or validity indicator alongside numeric columns.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Constant-fill: all rows set to zero</span>
+df[<span class="kw">update</span> { zero = <span class="fn-name">rep</span>(<span class="num">0</span>) }];
+
+<span class="cm">// All-true boolean mask</span>
+df[<span class="kw">update</span> { active = <span class="fn-name">rep</span>(<span class="kw">true</span>) }];
+
+<span class="cm">// Repeat each element of a column twice</span>
+df[<span class="kw">update</span> { rep2 = <span class="fn-name">rep</span>(price, each=<span class="num">2</span>) }];
+
+<span class="cm">// Named args: times, each, length_out</span>
+df[<span class="kw">update</span> { flag = <span class="fn-name">rep</span>(flag_col, times=<span class="num">50</span>) }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 9. Cumulative functions -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Cumulative Functions</span>
+          <h3>Running totals and products in a single O(n) pass</h3>
+          <p>
+            <code>cumsum(col)</code> and <code>cumprod(col)</code> compute
+            prefix sums and products over any <code>Int</code> or
+            <code>Float</code> column. Both return the same type as their input
+            and are valid in <code>select</code> and <code>update</code> blocks
+            &mdash; DataFrame or TimeFrame &mdash; with or without a
+            <code>window</code> clause.
+          </p>
+          <p>
+            Typical use: cumulative P&amp;L, compounded returns, or an
+            index-rebased price series.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Valid in select (produces only the cumulative column)</span>
+df[<span class="kw">select</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
+
+<span class="cm">// Valid in update (adds column alongside existing ones)</span>
+df[<span class="kw">update</span> { cum_pnl = <span class="fn-name">cumsum</span>(pnl) }];
+
+<span class="cm">// Compounded return: product of (1 + daily_ret)</span>
+df[<span class="kw">update</span> {
+    growth = <span class="fn-name">cumprod</span>(<span class="num">1.0</span> <span class="op">+</span> daily_ret)
+}];
+
+<span class="cm">// Also valid on a TimeFrame (no window clause needed)</span>
+tf[<span class="kw">update</span> { running_vol = <span class="fn-name">cumsum</span>(volume) }];</code></pre>
+        </div>
+      </div>
+
+      <!-- 10. Null / NaN cleanup -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Null / NaN Cleanup</span>
+          <h3>Clean missing and dirty float values before aggregation</h3>
+          <p>
+            Three built-in functions cover data.table&rsquo;s
+            <code>nafill</code> semantics in a single O(n) pass:
+          </p>
+          <ul>
+            <li><code>fill_null(col, value)</code> &mdash; constant fill</li>
+            <li><code>fill_forward(col)</code> &mdash; LOCF (last observation carried forward)</li>
+            <li><code>fill_backward(col)</code> &mdash; NOCB (next observation carried backward)</li>
+          </ul>
+          <p>
+            All three work on any column type (<code>Int</code>,
+            <code>Float</code>, <code>String</code>, &hellip;) in
+            <code>select</code> or <code>update</code> blocks.
+            Unfillable leading (LOCF) or trailing (NOCB) nulls remain null.
+          </p>
+          <p>
+            For dirty <code>Float64</code> columns, Ibex also provides
+            <code>is_nan(x)</code>, <code>null_if_nan(x)</code>, and
+            <code>null_if_not_finite(x)</code>. These are the right way to
+            make grouped <code>mean</code> / <code>sum</code> ignore
+            <code>NaN</code> and infinities. All of these (and
+            <code>coalesce</code>) are ordinary row-wise functions: they take
+            any expression, compose inside larger expressions
+            (<code>fill_null(price, 0) * qty</code>), and follow the null
+            rule &mdash; <code>is_nan(null)</code> is null, not false
+            (&ldquo;NaN or missing?&rdquo; is
+            <code>is_nan(x)&nbsp;||&nbsp;x&nbsp;is&nbsp;null</code>).
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Constant fill: replace null prices with 0</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
+
+<span class="cm">// LOCF: carry last known price into gaps</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }];
+
+<span class="cm">// NOCB: fill backwards from next available value</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_backward</span>(price) }];
+
+<span class="cm">// Chain: LOCF then fill remaining leading nulls with 0</span>
+df[<span class="kw">update</span> { price = <span class="fn-name">fill_forward</span>(price) }]
+  [<span class="kw">update</span> { price = <span class="fn-name">fill_null</span>(price, <span class="num">0</span>) }];
+
+<span class="cm">// Float cleanup: turn NaN / Inf into null before aggregation</span>
+quotes[<span class="kw">update</span> {
+    px_bad   = <span class="fn-name">is_nan</span>(px),
+    px_clean = <span class="fn-name">null_if_not_finite</span>(px)
+}]
+[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(px_clean) }, <span class="kw">by</span> symbol];
+
+<span class="cm">// Direct aggregate expressions are also allowed</span>
+quotes[<span class="kw">select</span> { avg_notional = <span class="fn-name">mean</span>(price * volume) }, <span class="kw">by</span> symbol];
+quotes[<span class="kw">select</span> { avg_px = <span class="fn-name">mean</span>(<span class="fn-name">null_if_nan</span>(px)) }, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 11. Rolling windows -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Rolling Windows</span>
+          <h3>Time-based rolling aggregates in one O(n) pass</h3>
+          <p>
+            <code>as_timeframe</code> validates sort order in O(n) and records the
+            time-index column. <code>window&nbsp;&lt;dur&gt;</code> sets the
+            lookback; rolling functions (<code>rolling_sum</code>,
+            <code>rolling_mean</code>, <code>rolling_count</code>, <code>lag</code>)
+            use a two-pointer scan with no per-row heap allocation.
+          </p>
+          <p>
+            Duration literals: <code>1s</code>, <code>30s</code>, <code>1m</code>,
+            <code>5m</code>, <code>1h</code>, &hellip;
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+
+<span class="cm">// Previous tick's price</span>
+tf[<span class="kw">update</span> { prev_price = <span class="fn-name">lag</span>(price, <span class="num">1</span>) }];
+
+<span class="cm">// Tick count in the last 60 seconds</span>
+tf[<span class="kw">window</span> <span class="num">1m</span>, <span class="kw">update</span> { ticks_1m = <span class="fn-name">rolling_count</span>() }];
+
+<span class="cm">// Multiple rolling aggregates in one pass</span>
+tf[<span class="kw">window</span> <span class="num">5m</span>, <span class="kw">update</span> {
+    sum_5m  = <span class="fn-name">rolling_sum</span>(price),
+    mean_5m = <span class="fn-name">rolling_mean</span>(price)
+}];</code></pre>
+        </div>
+      </div>
+
+      <!-- 8. Resample -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Resample</span>
+          <h3>Aggregate ticks into equal-width time buckets</h3>
+          <p>
+            <code>resample&nbsp;&lt;dur&gt;</code> floors timestamps into
+            fixed-width intervals and reduces each bucket to one output row.
+            Combine with <code>by</code> for per-symbol bars.
+          </p>
+          <p>
+            The output <code>TimeFrame</code> carries the bucket start time as its
+            time index, ready for downstream joins or further resampling.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="kw">let</span> tf = <span class="fn-name">as_timeframe</span>(ticks, <span class="str">"ts"</span>);
+
+<span class="cm">// 1-minute OHLC bars</span>
+<span class="kw">let</span> bars = tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    high  = <span class="fn-name">max</span>(price),
+    low   = <span class="fn-name">min</span>(price),
+    close = <span class="fn-name">last</span>(price)
+}];
+
+<span class="cm">// Per-symbol 1-minute bars</span>
+tf[<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+    open  = <span class="fn-name">first</span>(price),
+    close = <span class="fn-name">last</span>(price)
+}, <span class="kw">by</span> symbol];
+
+<span class="cm">// Enrich ticks with the latest bar's close</span>
+tf <span class="kw">asof join</span> bars <span class="kw">on</span> ts;</code></pre>
+        </div>
+      </div>
+
+      <!-- 9. Reshape (melt & dcast) -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Reshape</span>
+          <h3>Pivot and unpivot with melt &amp; dcast</h3>
+          <p>
+            <code>melt</code> converts a wide DataFrame to long format: id columns
+            stay fixed while measure columns are unpivoted into
+            <code>variable</code>&thinsp;/&thinsp;<code>value</code> rows.
+            Combine with <code>select</code> to choose specific measure columns.
+          </p>
+          <p>
+            <code>dcast</code> is the inverse &mdash; it pivots a long table back to
+            wide format. Distinct values of the pivot column become new column names.
+            Combine with <code>by</code> for row keys and <code>select</code> for the
+            value column. Missing cells are filled with null.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Wide → long: unpivot all columns except symbol</span>
+ohlc[<span class="kw">melt</span> symbol];
+<span class="cm">// → symbol | variable | value</span>
+<span class="cm">//   AAPL   | open     | 150.0</span>
+<span class="cm">//   AAPL   | high     | 155.0</span>
+<span class="cm">//   ...</span>
+
+<span class="cm">// Only unpivot specific columns</span>
+ohlc[<span class="kw">melt</span> symbol, <span class="kw">select</span> { open, close }];
+
+<span class="cm">// Long → wide: pivot back</span>
+long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];
+<span class="cm">// → symbol | open  | high  | low   | close</span>
+
+<span class="cm">// Roundtrip: melt then dcast recovers original data</span>
+<span class="kw">let</span> long  = wide[<span class="kw">melt</span> symbol];
+<span class="kw">let</span> wide2 = long[<span class="kw">dcast</span> variable, <span class="kw">select</span> value, <span class="kw">by</span> symbol];</code></pre>
+        </div>
+      </div>
+
+      <!-- 10. Scalar & compile -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Scalar &amp; Codegen</span>
+          <h3>Extract single values and compile to C++</h3>
+          <p>
+            <code>scalar</code> pulls one typed value out of a single-cell result
+            table. It is available as a binding in subsequent expressions.
+          </p>
+          <p>
+            <code>ibex_compile</code> transpiles a <code>.ibex</code> file to a
+            self-contained C++ source file. The helper script compiles and links it
+            in one step.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Pull a single value from an aggregate</span>
+<span class="kw">let</span> total = <span class="fn-name">scalar</span>(
+    prices[<span class="kw">select</span> { total = <span class="fn-name">sum</span>(price) }],
+    total
+);
+
+<span class="cm">// Use it in subsequent expressions</span>
+prices[<span class="kw">update</span> { weight = price <span class="op">/</span> total }];</code></pre>
+<pre style="margin-top: 0.6rem;"><code><span class="cm"># Compile and run in one step</span>
+scripts/ibex-run.sh examples/quant.ibex</code></pre>
+        </div>
+      </div>
+
+      <!-- 10. Stream -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Stream</span>
+          <h3>Continuous pipelines with no new syntax</h3>
+          <p>
+            <code>Stream&nbsp;{&nbsp;}</code> wires a source extern, an anonymous
+            transform block, and a sink extern into a continuous event loop.
+            The transform is written in plain Ibex — the same clauses used
+            for batch queries.
+          </p>
+          <p>
+            When the transform contains <code>resample</code>, the runtime
+            automatically switches to <strong>TimeBucket</strong> mode:
+            it buffers rows and emits one output batch per closed time bucket.
+            Otherwise it operates <strong>PerRow</strong>, forwarding each
+            incoming batch immediately.
+          </p>
+          <p>
+            In <strong>TimeBucket</strong> mode the bucket is flushed by
+            whichever trigger fires first: a <em>wall-clock check</em> (the
+            configured duration has elapsed since the bucket opened) or a
+            <em>data-timestamp check</em> (an incoming row carries a later
+            bucket's timestamp). The wall-clock trigger gives prompt delivery
+            for real-time feeds; the data-timestamp trigger handles historical
+            replay correctly.
+          </p>
+          <p class="note">
+            <strong>Source timeout contract:</strong> the wall-clock check
+            runs only when the source call returns. Sources should use a short
+            internal timeout and return <code>StreamTimeout{}</code> when no
+            data arrives — the runtime fires the flush check and immediately
+            calls the source again. Ibex does not buffer data on behalf of the
+            source; whether messages arriving during this window are preserved
+            depends on the transport. For OS kernel-backed sockets (UDP, TCP)
+            the kernel's receive buffer holds packets safely. For user-space
+            transports use <code>StreamBuffered</code> (see below).
+          </p>
+          <p>
+            Use <code>import</code> to load a library stub that registers
+            the extern source and sink functions as a plugin.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// Load the UDP plugin (registers udp_recv / udp_send)</span>
+<span class="kw">import</span> <span class="str">"udp"</span>;
+
+<span class="cm">// Receive ticks, resample to 1-minute OHLC bars, forward over UDP</span>
+<span class="kw">let</span> ohlc_stream = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+        open  = <span class="fn-name">first</span>(price),
+        high  = <span class="fn-name">max</span>(price),
+        low   = <span class="fn-name">min</span>(price),
+        close = <span class="fn-name">last</span>(price)
+    }],
+    sink = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9002</span>)
+};
+
+<span class="cm">// PerRow stream: forward filtered rows with no buffering</span>
+<span class="kw">let</span> live_filter = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    transform = [<span class="kw">filter</span> price &gt; <span class="num">100.0</span>, <span class="kw">rename</span> p = price],
+    sink      = <span class="fn-name">udp_send</span>(<span class="str">"127.0.0.1"</span>, <span class="num">9003</span>)
+};</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// WebSocket sink: push OHLC bars to browser dashboards</span>
+<span class="kw">import</span> <span class="str">"websocket"</span>;
+
+<span class="kw">let</span> ws_stream = Stream {
+    source    = <span class="fn-name">udp_recv</span>(<span class="num">9001</span>, <span class="str">"ts:ts,symbol:str,price:f64,volume:i64"</span>),
+    transform = [<span class="kw">resample</span> <span class="num">1m</span>, <span class="kw">select</span> {
+        open  = <span class="fn-name">first</span>(price),
+        high  = <span class="fn-name">max</span>(price),
+        low   = <span class="fn-name">min</span>(price),
+        close = <span class="fn-name">last</span>(price)
+    }],
+    <span class="cm">// ws_send starts a TCP listener; browsers connect with new WebSocket("ws://…")</span>
+    sink = <span class="fn-name">ws_send</span>(<span class="num">8080</span>)
+};</code></pre>
+        </div>
+      </div>
+
+      <!-- 11. StreamBuffered -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">StreamBuffered</span>
+          <h3>A ready-made producer queue for in-process sources</h3>
+          <p>
+            For in-process or user-space transports the plugin needs a
+            thread-safe queue between its producer and the Ibex event loop.
+            <code>StreamBuffered</code> provides one out of the box — a lockless
+            SPSC ring buffer paired with a compatible <code>ExternFn</code> —
+            so the plugin author doesn't have to implement their own.
+          </p>
+          <p>
+            Use <code>make_buffered_source(producer_fn)</code> to let the Ibex
+            query control the capacity: the plugin only supplies the
+            data-production logic; the ring is lazily initialised on the first
+            event-loop call using the <code>capacity</code> argument from the
+            query. A <strong>producer thread</strong> is started at that point,
+            calls <code>buf.write(table)</code> (blocking on backpressure), and
+            signals completion with <code>buf.close()</code>. The event loop
+            drains the ring, returning <code>StreamTimeout{}</code> when empty
+            so wall-clock bucket flushes still fire on schedule.
+          </p>
+          <p>
+            Cache-line-separated <code>std::atomic</code> head and tail indices
+            keep producer and consumer on independent cache lines — no false
+            sharing, no mutex on the hot path.
+          </p>
+          <p class="note">
+            <strong>When to use each approach:</strong> for UDP/TCP sockets the
+            OS kernel already manages a receive buffer (<code>SO_RCVBUF</code>)
+            independently of the application — no application-level queue is
+            needed. Return <code>StreamTimeout{}</code> directly from
+            <code>recvfrom</code> with a short socket timeout instead.
+            <code>StreamBuffered</code> is for in-process queues, shared-memory
+            channels, or any transport without a kernel-managed receive buffer.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// C++ plugin — only the data-production logic</span>
+<span class="kw">#include</span> &lt;ibex/runtime/stream_buffered.hpp&gt;
+
+registry.register_table(<span class="str">"my_src"</span>,
+    ibex::runtime::make_buffered_source([](ibex::runtime::StreamBuffered&amp; buf) {
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; batch : my_data_source) {
+            buf.write(batch);  <span class="cm">// yields if ring full</span>
+        }
+        buf.close();
+    }));</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// Ibex query — capacity is a first-class tuning parameter</span>
+<span class="kw">extern fn</span> my_src(capacity: Int) -&gt; TimeFrame <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
+<span class="kw">extern fn</span> my_sink(df: DataFrame) -&gt; Int <span class="kw">from</span> <span class="str">"plugin.hpp"</span>;
+
+Stream {
+    source    = <span class="fn-name">my_src</span>(<span class="num">512</span>),
+    transform = [<span class="kw">resample</span> <span class="num">1s</span>, <span class="kw">select</span> { close = <span class="fn-name">last</span>(price) }],
+    sink      = <span class="fn-name">my_sink</span>()
+};</code></pre>
+        </div>
+      </div>
+
+      <!-- 12. Model Specification -->
+      <div class="tour-item">
+        <div class="tour-text">
+          <span class="tour-tag">Model Specification</span>
+          <h3>R-style formula syntax for regression, built into the query bracket</h3>
+          <p>
+            The <code>model</code> clause lets you fit OLS, ridge, WLS, or the
+            plugin-backed <code>lightgbm</code> method
+            regressions with a familiar <code>y&nbsp;~&nbsp;x1&nbsp;+&nbsp;x2</code>
+            formula. Ibex builds the design matrix automatically — numeric columns
+            pass through, categorical columns are dummy-encoded, and interaction
+            terms (<code>:</code>) and crossing (<code>*</code>) expand just like in R.
+          </p>
+          <p>
+            Results are accessed via S3-style accessor functions:
+            <code>model_coef</code>, <code>model_summary</code>,
+            <code>model_fitted</code>, <code>model_residuals</code>,
+            <code>model_importance</code>, and
+            <code>model_r_squared</code>. The <code>method&nbsp;=</code> parameter
+            is optional and defaults to <code>ols</code>; it also supports
+            built-ins (<code>ols</code>, <code>ridge</code>,
+            <code>wls</code>) plus plugin methods registered by name. The bundled
+            <code>lightgbm</code> plugin links real Microsoft LightGBM and trains
+            gradient-boosted trees — use <code>model_fitted</code> for in-sample
+            predictions, <code>model_importance</code> for per-feature gains, and
+            <code>model_predict(m,&nbsp;newdata)</code> to score new data by
+            reusing the trained model.
+          </p>
+        </div>
+        <div class="tour-code">
+<pre><code><span class="cm">// OLS with filter — all in one bracket</span>
+<span class="kw">let</span> m = prices[
+    <span class="kw">filter</span> volume &gt; <span class="num">1000000</span>,
+    <span class="kw">model</span> { close ~ open + high + low }
+];
+
+<span class="cm">// Accessor functions for detailed results</span>
+<span class="kw">let</span> coefs = <span class="fn-name">model_coef</span>(m);
+<span class="kw">let</span> stats = <span class="fn-name">model_summary</span>(m);
+<span class="kw">let</span> r2    = <span class="fn-name">model_r_squared</span>(m);</code></pre>
+<pre style="margin-top:0.6rem;"><code><span class="cm">// Ridge regression with L2 penalty</span>
+<span class="kw">let</span> ridge = prices[<span class="kw">model</span> {
+    close ~ open + volume,
+    method = ridge,
+    lambda = <span class="num">0.1</span>
+}];
+
+<span class="cm">// Real LightGBM gradient-boosted trees (load plugin first)</span>
+<span class="kw">import</span> <span class="str">"lightgbm"</span>;
+<span class="kw">let</span> boosted = prices[<span class="kw">model</span> {
+    close ~ open + high + low + volume,
+    method = lightgbm,
+    iterations = <span class="num">300</span>,
+    learning_rate = <span class="num">0.03</span>
+}];
+<span class="kw">let</span> preds = <span class="fn-name">model_fitted</span>(boosted);      <span class="cm">// in-sample predictions</span>
+<span class="kw">let</span> gains = <span class="fn-name">model_importance</span>(boosted);  <span class="cm">// term | gain</span>
+<span class="kw">let</span> scored = <span class="fn-name">model_predict</span>(boosted, new_prices);  <span class="cm">// score new data</span></code></pre>
+        </div>
+      </div>
+
+    </div><!-- .tour -->
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span>Ibex &mdash; typed DataFrame pipelines</span>
+    <a href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">
+      github.com/bobjansen/Ibex &#8599;
+    </a>
+  </footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Advanced Workflows</title>
+  <meta name="description" content="Advanced Ibex workflows: compilation, streams, producer queues, and model specifications." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="./code-copy.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <nav class="nav">
+    <span class="nav-logo">Ibex</span>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link active" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <img class="hero-logo" src="./Ibex.png" alt="Ibex logo" />
+    <p class="eyebrow">Advanced workflows</p>
+    <h1>Compile, stream, and model data</h1>
+    <p class="lead">Use the same table-expression vocabulary for application embedding, continuous inputs, and model-oriented analysis.</p>
+  </section>
+
+  <section class="section" id="compile">
+    <p class="section-label">Native applications</p>
+    <h2>Compile scripts to C++23</h2>
+    <p>
+      <code>ibex_compile</code> transpiles an <code>.ibex</code> script to C++23
+      using the Ibex runtime. Use it when a pipeline needs to ship as part of a
+      native application. Typed <code>extern fn</code> declarations form the
+      boundary for application-specific data sources and sinks.
+    </p>
+<pre><code><span class="cm"># transpile a script, then build it with your application</span>
+ibex_compile analysis.ibex</code></pre>
+    <p>See the <a href="./notebooks.html">integration guide</a> for interactive host use and the <a href="https://github.com/bobjansen/Ibex/blob/main/SPEC.md" target="_blank" rel="noopener">specification</a> for extern-function semantics.</p>
+  </section>
+
+  <section class="section" id="streams">
+    <p class="section-label">Continuous data</p>
+    <h2>Apply table pipelines to streams</h2>
+    <p>
+      Stream sources evaluate a bracketed clause list for each incoming batch.
+      The pipeline syntax is unchanged: filter, update, select, grouping, and
+      time-window operations remain ordinary Ibex expressions. This lets batch
+      and continuous workflows share their transformation definitions.
+    </p>
+    <div class="grid-2">
+      <article class="card"><h3>Event-time windows</h3><p>Time-based windowing can use incoming data timestamps, allowing historical replay and live input to use the same source definition.</p></article>
+      <article class="card"><h3>Plugin sources</h3><p>Bundled I/O plugins supply file, database, and Kafka sources. See the <a href="./io.html">I/O guide</a> for setup and examples.</p></article>
+    </div>
+  </section>
+
+  <section class="section" id="queues">
+    <p class="section-label">In-process sources</p>
+    <h2>Feed a stream through a producer queue</h2>
+    <p>
+      A producer queue provides a ready-made handoff for application-owned
+      batches. It is useful when a C++ program owns the connection, decoding,
+      or lifecycle, but wants Ibex to perform the downstream table work.
+      Keep the source boundary typed so table schemas are known before the
+      pipeline executes.
+    </p>
+  </section>
+
+  <section class="section" id="models">
+    <p class="section-label">Model specifications</p>
+    <h2>Describe regressions with formulas</h2>
+    <p>
+      Model specifications use R-style formula syntax in the query context.
+      Use the model and matrix helpers from the <a href="./functions.html">function reference</a>
+      to construct model inputs and access their outputs alongside ordinary
+      table transformations.
+    </p>
+  </section>
+
+  <footer class="footer"><span>Ibex &mdash; typed DataFrame pipelines</span><a href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">github.com/bobjansen/Ibex &#8599;</a></footer>
+</main>
+</body>
+</html>

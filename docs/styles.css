@@ -75,6 +75,81 @@ body {
   color: var(--ink);
 }
 
+/* ── Documentation layout ──────────────────────────────────────────────── */
+
+.docs-layout {
+  display: grid;
+  grid-template-columns: 12.5rem minmax(0, 1fr);
+  gap: 3rem;
+  align-items: start;
+}
+
+.docs-sidebar {
+  position: sticky;
+  top: 1.25rem;
+  padding: 0.35rem 0 1rem;
+}
+
+.docs-overview {
+  display: block;
+  margin-bottom: 1rem;
+  color: var(--ink);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.docs-tree p {
+  margin: 1rem 0 0.28rem;
+  color: var(--ink);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.docs-tree a {
+  display: block;
+  padding: 0.14rem 0 0.14rem 0.65rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  text-decoration: none;
+}
+
+.docs-tree a:hover { color: var(--accent); }
+
+.docs-content { min-width: 0; }
+
+.docs-header {
+  margin-bottom: 2rem;
+  padding-bottom: 1.6rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.docs-content section {
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--line);
+  scroll-margin-top: 1rem;
+}
+
+.docs-content section h2 { margin-top: 0; }
+.docs-content section h3 { margin-top: 0.45rem; }
+.docs-content section p { color: var(--muted); margin: 0.35rem 0 0; }
+
+.example-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.example-card { color: inherit; text-decoration: none; }
+.example-card:hover { border-color: var(--accent); }
+
+@media (max-width: 720px) {
+  .docs-layout { display: block; }
+  .docs-sidebar { position: static; margin-bottom: 2rem; }
+  .docs-tree { columns: 2; }
+  .docs-tree p { break-after: avoid; }
+  .example-grid { grid-template-columns: 1fr; }
+}
+
 /* ── Hero ────────────────────────────────────────────────────────────────── */
 
 .hero {

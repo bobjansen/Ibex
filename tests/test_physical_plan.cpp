@@ -609,12 +609,15 @@ TEST_CASE("Migrated filter keeps the empty input's schema carrier", "[physical][
     REQUIRE(result->find("price") != nullptr);
 }
 
-TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]") {
-    // Phase 4 item 1, step 1. The plan classifies joins before it runs them, so
-    // the description can be proven equal to the builder's own branch while
-    // being wrong is still free. A temporary assertion at the seam compared the
-    // two on all 1754 tests and all 22 PDS-H queries (59 joins) with zero
-    // disagreements; these cases are the readable subset that survives it.
+TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical][join]") {
+    // Phase 4 item 1. The plan classifies every join, and now BUILDS the
+    // streaming ones -- `build_physical_join` owns their construction, so they
+    // leave the migration backlog (Join 59 -> 6 across PDS-H; the 6 are the
+    // materializing joins, which still fall back and still count).
+    //
+    // The classification was proven equal to the builder's own branches by a
+    // temporary assertion at the seam, across the full suite and all 22 PDS-H
+    // queries, before any of it was allowed to route anything.
     using runtime::physical::JoinBranch;
     using runtime::physical::JoinDeclineReason;
     using runtime::physical::JoinStrategy;
@@ -705,15 +708,25 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
         }
     }
 
-    SECTION("explain prints the description under the fallback line") {
-        auto ir = require_ir("(a join b on k);");
+    SECTION("a streaming join is a migrated plan; a materializing one is not") {
         const runtime::TableRegistry empty;
-        const auto plan = runtime::physical::plan_physical(*ir, empty, nullptr);
-        CHECK_FALSE(plan.migrated);  // still executed by the per-kind switch
-        CHECK(plan.join.describes);
-        const std::string text = runtime::physical::explain_physical(plan);
+        auto streaming = require_ir("(a join b on k);");
+        const auto sp = runtime::physical::plan_physical(*streaming, empty, nullptr);
+        // `build_physical_join` builds this one, not the per-kind switch, which
+        // is what takes it out of the migration backlog.
+        CHECK(sp.migrated);
+        CHECK(sp.join.describes);
+        CHECK(sp.join.branch == JoinBranch::SingleKeyInner);
+
+        auto materializing = require_ir("(a left join b on k);");
+        const auto mp = runtime::physical::plan_physical(*materializing, empty, nullptr);
+        // Still a fallback, and still counted as one. If this became migrated
+        // too the backlog would be measuring the label rather than the port.
+        CHECK_FALSE(mp.migrated);
+        CHECK(mp.join.describes);
+        const std::string text = runtime::physical::explain_physical(mp);
         CHECK(text.find("MaterializedCall") != std::string::npos);
-        CHECK(text.find("Join(StreamingProbe branch=SingleKeyInner keys=1") != std::string::npos);
+        CHECK(text.find("Join(MaterializeBoth") != std::string::npos);
     }
 }
 

@@ -12793,27 +12793,36 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // Only nodes this rewrite can account for may be walked past, because
         // what follows aggregates the JOIN's output directly and never builds
         // the skipped nodes. A Project selects columns the join output already
-        // has, and an Update is handled by the counted-column remap below.
+        // has; an Update has to be vetted by `fused_left_join_counted_column`,
+        // which is why they are collected rather than merely counted.
         //
         // FilterProject and FilterUpdateProject used to be skipped here too,
         // and that silently dropped their predicate: `(l left join r on k)
         // [filter v > k][select {k, v}][select {n = sum(k)}, by k]` returned a
         // group per join key instead of a group per surviving row.
+        std::vector<const ir::UpdateNode*> skipped_updates;
         while (aggregate_child != nullptr &&
                (aggregate_child->kind() == ir::NodeKind::Project ||
                 aggregate_child->kind() == ir::NodeKind::Update) &&
                !aggregate_child->children().empty()) {
+            if (aggregate_child->kind() == ir::NodeKind::Update) {
+                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+                skipped_updates.push_back(static_cast<const ir::UpdateNode*>(aggregate_child));
+            }
             aggregate_child = aggregate_child->children().front().get();
         }
         if (streamable && aggregate_child != nullptr &&
             aggregate_child->kind() == ir::NodeKind::Join) {
             const auto& join = static_cast<const ir::JoinNode&>(*aggregate_child);
+            // Null when an update between the aggregate and the join computes
+            // something this rewrite cannot reproduce from the join output.
+            auto counted = fused_left_join_counted_column(agg, skipped_updates);
             const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
                                    !join.predicate().has_value() && agg.group_by().size() == 1 &&
                                    agg.aggregations().size() == 1 &&
                                    (agg.aggregations().front().func == ir::AggFunc::Count ||
                                     agg.aggregations().front().func == ir::AggFunc::Sum) &&
-                                   !agg.aggregations().front().column.name.empty() &&
+                                   counted.has_value() &&
                                    agg.group_by().front().name == join.keys().front().left;
             if (candidate) {
                 auto left = materialize_row_local(*join.children()[0], registry, scalars, externs,
@@ -12826,21 +12835,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 if (!right.has_value()) {
                     return std::unexpected(std::move(right.error()));
                 }
-                std::string counted_column = agg.aggregations().front().column.name;
-                if (agg.children().front()->kind() == ir::NodeKind::Update) {
-                    const auto& update =
-                        static_cast<const ir::UpdateNode&>(*agg.children().front());
-                    for (const auto& field : update.fields()) {
-                        if (field.alias != counted_column) {
-                            continue;
-                        }
-                        robin_hood::unordered_set<std::string> refs;
-                        collect_expr_column_refs(field.expr, refs);
-                        if (refs.size() == 1) {
-                            counted_column = *refs.begin();
-                        }
-                    }
-                }
+                const std::string counted_column = std::move(*counted);
                 if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
                     fused.has_value()) {
                     return make_table_source(std::move(*fused));

@@ -1969,6 +1969,60 @@ auto join_table_impl(const Table& left, const Table& right, ir::JoinKind kind,
     return join_failure(output);
 }
 
+namespace {
+
+/// The column a field counts, when the field is exactly what `count(col)`
+/// lowers to: `alias = Int64(col is not null)` (see `make_count_flag_field` in
+/// the lowerer). Matched structurally rather than by name, because the alias is
+/// generated and the shape is the actual contract.
+auto count_flag_source_column(const ir::Expr& expr) -> std::optional<std::string> {
+    const auto* cast = std::get_if<ir::CallExpr>(&expr.node);
+    if (cast == nullptr || cast->callee != "Int64" || cast->args.size() != 1 ||
+        !cast->named_args.empty() || cast->args.front() == nullptr) {
+        return std::nullopt;
+    }
+    const auto* is_null = std::get_if<ir::IsNullExpr>(&cast->args.front()->node);
+    if (is_null == nullptr || !is_null->negated || is_null->operand == nullptr) {
+        return std::nullopt;
+    }
+    const auto* column = std::get_if<ir::ColumnRef>(&is_null->operand->node);
+    return column != nullptr ? std::optional{column->name} : std::nullopt;
+}
+
+}  // namespace
+
+auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
+                                    std::span<const ir::UpdateNode* const> skipped_updates)
+    -> std::optional<std::string> {
+    if (aggregate.aggregations().size() != 1 || aggregate.group_by().size() != 1) {
+        return std::nullopt;
+    }
+    std::string counted = aggregate.aggregations().front().column.name;
+    const std::string& group_key = aggregate.group_by().front().name;
+    if (counted.empty()) {
+        return std::nullopt;
+    }
+    // Aggregate-first: each update's aliases name columns produced below it, so
+    // resolving in this order follows the same direction the data flows back up.
+    for (const ir::UpdateNode* update : skipped_updates) {
+        for (const ir::FieldSpec& field : update->fields()) {
+            if (field.alias == group_key) {
+                // The group key would be computed here, not read from the join.
+                return std::nullopt;
+            }
+            if (field.alias != counted) {
+                continue;
+            }
+            auto source = count_flag_source_column(field.expr);
+            if (!source.has_value()) {
+                return std::nullopt;
+            }
+            counted = std::move(*source);
+        }
+    }
+    return counted;
+}
+
 auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
                            const Table& left, const Table& right, std::string_view counted_column)
     -> std::optional<Table> {

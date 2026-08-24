@@ -347,6 +347,15 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     if (root.kind() == ir::NodeKind::Join) {
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
         plan.join = plan_join(static_cast<const ir::JoinNode&>(root));
+        // A streaming join is executed by the plan now: `build_physical_join`
+        // builds it, not the per-kind switch. A materializing one is still a
+        // fallback and says so, which is why the backlog drops by the streaming
+        // joins only -- the ones actually ported.
+        if (plan.join.strategy == JoinStrategy::StreamingProbe) {
+            plan.migrated = true;
+            plan.source_node = &root;
+            return plan;
+        }
     }
 
     // Peel map kinds top-down. `is_map_step` mirrors the per-kind switch's

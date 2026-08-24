@@ -12649,6 +12649,141 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     return profile_operator(std::move(result.value()), exec.execution_profile, node);
 }
 
+/// Build a join the plan migrated: `HashBuild` on one side, `HashProbe` on the
+/// other, expressed for now as the streaming operators that already implement
+/// exactly that. The kernel-pipeline plan's Phase 4 item 1.
+///
+/// The three branches are the ones that used to sit in `build_operator_impl`'s
+/// per-kind switch, moved rather than rewritten -- which is the whole point of
+/// this slice. Construction lives with the plan, the decisions are the same
+/// ones `plan_join` already relayed, and the operators are untouched. The
+/// backlog moves because a join is now executed *by* the physical plan, the
+/// same sense in which a migrated map chain is: through a plan-owned builder
+/// rather than the per-kind switch. What is still ahead is decomposing the
+/// build and the probe into separate pipeline stages with a barrier between
+/// them, so a probe can be a step inside a map pipeline.
+auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
+                         const TableRegistry& registry, const ScalarRegistry* scalars,
+                         const ExternRegistry* externs, const ExecutionContext& exec,
+                         ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& join = static_cast<const ir::JoinNode&>(node);
+    const physical::JoinPlan& jp = plan.join;
+    if (jp.branch == physical::JoinBranch::SemiAnti) {
+        const bool stage_probe = has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+        // Multiple producers: tried the same overlap the inner-join site
+        // once had here too, twice. First attempt (unbudgeted): q04
+        // regressed +19%. Second attempt, under a since-removed
+        // helper-thread budget: q04 and q18 both STILL regressed, and in
+        // both cases the overlap is entered exactly once per query (verified with a temporary
+        // entry-count trace) -- there is no recursive pile-up here for a
+        // budget to bound, so the budget was never going to help. The
+        // cost is inherent to overlapping this specific pair of sides,
+        // not to how many raw threads accumulate. Reverted a second
+        // time; see plans/parallelism-overview.md's "generalize
+        // multiple producers" section before trying again here.
+        auto left_op =
+            build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+        if (!left_op.has_value()) {
+            return std::unexpected(std::move(left_op.error()));
+        }
+        auto right =
+            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right.has_value()) {
+            return std::unexpected(std::move(right.error()));
+        }
+        return make_pipelined_stage_if(std::make_unique<ChunkedSemiAntiJoinOperator>(
+                                           std::move(left_op.value()), std::move(right.value()),
+                                           join.kind(), &join.keys(), &exec),
+                                       stage_probe, exec,
+                                       execution_profile_entry(exec.execution_profile, node));
+    }
+    // `nulls equal` goes to the materialized join, which implements the
+    // policy. These streaming operators hash and probe on their own and
+    // would each need the same null tagging; sending the opt-in case to the
+    // one implementation that has it keeps a single definition of the
+    // semantics -- and leaves this hot path bit-for-bit unchanged for every
+    // join that does not ask for it.
+    if (jp.branch == physical::JoinBranch::SingleKeyInner) {
+        const bool stage_probe = has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+        // A deferred probe scan must not be interpreted here — the join
+        // publishes build-side bounds into its filter slot first, then
+        // interprets the right subtree itself (resolve_deferred_probe).
+        const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
+
+        // Multiple producers (plans/parallelism-overview.md): the left
+        // build and the right materialize were overlapped on a raw
+        // std::thread here for a time (q10 ~-3% in-suite), but every
+        // widening of the idea measured worse and was reverted, and the
+        // site was removed ahead of the kernel-pipeline restructure —
+        // branch concurrency needs a cost-aware gate, not a thread-count
+        // one. Left builds first, then the right materializes.
+        auto left_op =
+            build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+        if (!left_op.has_value()) {
+            return std::unexpected(std::move(left_op.error()));
+        }
+        if (probe.scan != nullptr) {
+            return make_pipelined_stage_if(
+                std::make_unique<ChunkedInnerJoinOperator>(
+                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
+                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
+                    &join.pending_order()),
+                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+        }
+        auto right =
+            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right.has_value()) {
+            return std::unexpected(std::move(right.error()));
+        }
+        return make_pipelined_stage_if(
+            std::make_unique<ChunkedInnerJoinOperator>(std::move(left_op.value()),
+                                                       std::move(right.value()), &join.keys(), exec,
+                                                       join.suffix(), &join.pending_order()),
+            stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+    }
+    // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
+    // "stream multi-key joins" item): same shape as the single-key
+    // streamable path just above, minus the multiple-producers-overlap
+    // machinery -- this builds the hash index on the smaller of the two
+    // sides and streams/scans the other through
+    // `ChunkedInnerJoinOperator`'s pair-key path, replacing
+    // `join_table_impl`'s whole-table hash join for exactly this shape.
+    // A deferred-probe right side (e.g. TPC-H q09's lineitem) is honored
+    // exactly like the single-key branch above; see
+    // `ChunkedInnerJoinOperator::resolve_deferred_probe_pair` for the
+    // one-component filter this POC pushes into the scan.
+    if (jp.branch == physical::JoinBranch::PairIntInner) {
+        const bool stage_probe = has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
+        const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
+        auto left_op =
+            build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+        if (!left_op.has_value()) {
+            return std::unexpected(std::move(left_op.error()));
+        }
+        if (probe.scan != nullptr) {
+            return make_pipelined_stage_if(
+                std::make_unique<ChunkedInnerJoinOperator>(
+                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
+                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
+                    &join.pending_order()),
+                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+        }
+        auto right =
+            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right.has_value()) {
+            return std::unexpected(std::move(right.error()));
+        }
+        return make_pipelined_stage_if(
+            std::make_unique<ChunkedInnerJoinOperator>(std::move(left_op.value()),
+                                                       std::move(right.value()), &join.keys(), exec,
+                                                       join.suffix(), &join.pending_order()),
+            stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+    }
+
+    return std::unexpected("physical join: plan named no streaming branch");
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -12681,6 +12816,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // composer walks it in both modes, so there is no arrangement of map nodes
     // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (plan.migrated && plan.join.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
+    }
     if (plan.migrated) {
         // Every migrated plan, both modes: the composer walks the chain and
         // hands the morsel run off at its boundary, and that run picks its own
@@ -13118,128 +13257,9 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (join.children().size() != 2) {
             return std::unexpected("join node expects exactly two children");
         }
-        // The plan decides; this reads its decision. `plan_join` relays the same
-        // three gates the branches below used to call, and names WHICH one
-        // answered, so the routing is identical by construction and this seam
-        // infers nothing -- it dispatches on the branch the planner chose.
-        // The sides come from the plan too: which side builds is a cost
-        // question, and the day it stops being "textual right" it should change
-        // in the planner without this seam noticing.
-        const physical::JoinPlan& jp = plan.join;
-        if (jp.branch == physical::JoinBranch::SemiAnti) {
-            const bool stage_probe =
-                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
-            // Multiple producers: tried the same overlap the inner-join site
-            // once had here too, twice. First attempt (unbudgeted): q04
-            // regressed +19%. Second attempt, under a since-removed
-            // helper-thread budget: q04 and q18 both STILL regressed, and in
-            // both cases the overlap is entered exactly once per query (verified with a temporary
-            // entry-count trace) -- there is no recursive pile-up here for a
-            // budget to bound, so the budget was never going to help. The
-            // cost is inherent to overlapping this specific pair of sides,
-            // not to how many raw threads accumulate. Reverted a second
-            // time; see plans/parallelism-overview.md's "generalize
-            // multiple producers" section before trying again here.
-            auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
-            if (!left_op.has_value()) {
-                return std::unexpected(std::move(left_op.error()));
-            }
-            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
-            if (!right.has_value()) {
-                return std::unexpected(std::move(right.error()));
-            }
-            return make_pipelined_stage_if(std::make_unique<ChunkedSemiAntiJoinOperator>(
-                                               std::move(left_op.value()), std::move(right.value()),
-                                               join.kind(), &join.keys(), &exec),
-                                           stage_probe, exec,
-                                           execution_profile_entry(exec.execution_profile, node));
-        }
-        // `nulls equal` goes to the materialized join, which implements the
-        // policy. These streaming operators hash and probe on their own and
-        // would each need the same null tagging; sending the opt-in case to the
-        // one implementation that has it keeps a single definition of the
-        // semantics -- and leaves this hot path bit-for-bit unchanged for every
-        // join that does not ask for it.
-        if (jp.branch == physical::JoinBranch::SingleKeyInner) {
-            const bool stage_probe =
-                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
-            // A deferred probe scan must not be interpreted here — the join
-            // publishes build-side bounds into its filter slot first, then
-            // interprets the right subtree itself (resolve_deferred_probe).
-            const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
-
-            // Multiple producers (plans/parallelism-overview.md): the left
-            // build and the right materialize were overlapped on a raw
-            // std::thread here for a time (q10 ~-3% in-suite), but every
-            // widening of the idea measured worse and was reverted, and the
-            // site was removed ahead of the kernel-pipeline restructure —
-            // branch concurrency needs a cost-aware gate, not a thread-count
-            // one. Left builds first, then the right materializes.
-            auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
-            if (!left_op.has_value()) {
-                return std::unexpected(std::move(left_op.error()));
-            }
-            if (probe.scan != nullptr) {
-                return make_pipelined_stage_if(
-                    std::make_unique<ChunkedInnerJoinOperator>(
-                        std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                        externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
-                        &join.pending_order()),
-                    stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
-            }
-            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
-            if (!right.has_value()) {
-                return std::unexpected(std::move(right.error()));
-            }
-            return make_pipelined_stage_if(
-                std::make_unique<ChunkedInnerJoinOperator>(
-                    std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
-                    join.suffix(), &join.pending_order()),
-                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
-        }
-        // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
-        // "stream multi-key joins" item): same shape as the single-key
-        // streamable path just above, minus the multiple-producers-overlap
-        // machinery -- this builds the hash index on the smaller of the two
-        // sides and streams/scans the other through
-        // `ChunkedInnerJoinOperator`'s pair-key path, replacing
-        // `join_table_impl`'s whole-table hash join for exactly this shape.
-        // A deferred-probe right side (e.g. TPC-H q09's lineitem) is honored
-        // exactly like the single-key branch above; see
-        // `ChunkedInnerJoinOperator::resolve_deferred_probe_pair` for the
-        // one-component filter this POC pushes into the scan.
-        if (jp.branch == physical::JoinBranch::PairIntInner) {
-            const bool stage_probe =
-                has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
-            const auto probe = deferred_probe_scan_of(*join.children()[1], exec);
-            auto left_op =
-                build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
-            if (!left_op.has_value()) {
-                return std::unexpected(std::move(left_op.error()));
-            }
-            if (probe.scan != nullptr) {
-                return make_pipelined_stage_if(
-                    std::make_unique<ChunkedInnerJoinOperator>(
-                        std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                        externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
-                        &join.pending_order()),
-                    stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
-            }
-            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
-            if (!right.has_value()) {
-                return std::unexpected(std::move(right.error()));
-            }
-            return make_pipelined_stage_if(
-                std::make_unique<ChunkedInnerJoinOperator>(
-                    std::move(left_op.value()), std::move(right.value()), &join.keys(), exec,
-                    join.suffix(), &join.pending_order()),
-                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
-        }
+        // Only the materializing join reaches here now. A streaming one is a
+        // migrated plan and was built by `build_physical_join` at the seam
+        // above, the same way a migrated map chain never reaches this switch.
         const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
         return build_binary_materializing_operator(
             *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,

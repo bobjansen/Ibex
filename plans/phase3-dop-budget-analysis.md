@@ -363,9 +363,35 @@ Three reasons this beats retiring the flag:
 byte-identical output between "morsel pipeline at DOP=1" and "serial composer".
 The serial composer demonstrably handles every shape in the suite.
 
-Not yet built — it changes executor construction for every single-core query
-and wants its own gates (ctest, `check_answers.py` at `IBEX_CORES=1` and 8, and
-an A/B at 8 cores to confirm the multi-core path is untouched).
+**LANDED (`27457f8d`).** Measured at one core on PDS-H SF-1, five interleaved
+rounds each: q14 0.22 → 0.09, q19 0.29 → 0.15, q12 0.24 → 0.14, q03 0.34 →
+0.23, q10 0.33 → 0.25. `IBEX_CORES=1` and `IBEX_PARALLEL=0` are now
+indistinguishable in time as well as in output.
+
+**The first attempt was wrong, and the way it was wrong is the finding.**
+Declining only the *split* (`morsel_worker_count`) took `morsels` from 92 to 0
+on q12/q14 and moved the wall time not at all. The split was never the cost:
+every branch of the run builder had already called `materialize_operator` on
+the whole input. The in-tree comment claiming the non-morselizing branch "costs
+exactly what not forming a pipeline costs" is wrong for the same reason — it
+omits the materialize. The decision has to happen at the construction seam,
+before the run is entered. The split change was kept anyway, for the honest
+counter: `morsels=115` printed beside `parallel=0` reads as work done rather
+than work paid for and discarded, which is exactly why this went unnoticed.
+
+Gates: debug ctest 1754/1754; `check_answers.py` 22/22 under `IBEX_PARALLEL=1`,
+`IBEX_PARALLEL=0` and `IBEX_CORES=1`; interleaved 8-core A/B over all 22
+queries at 8 repeats (geomean 0.9971) and the 11 unclear ones re-run at 16
+(geomean 0.9995), byte-identical throughout. Every apparent regression in the
+first run reversed sign in the second — q19 +7.3% → −3.7%, q15 +3.5% → −3.5%,
+q04 −3.9% → +2.5% — this box's noise signature rather than an effect.
+
+**What this unblocks.** Retiring `IBEX_PARALLEL=0` is now a documented
+equivalence rather than a judgement call: the two settings select the same path
+at one core. It is still not free — the flag remains the byte-identity oracle
+(`MEASURING.md`, `ibex-e2e.sh` ×5) and the `ibex-st` benchmark line — so the
+next step is to decide whether `IBEX_CORES=1` can carry both of those jobs,
+not to delete the flag.
 
 ### 9.5 State of the tree after this section
 

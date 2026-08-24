@@ -194,37 +194,51 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
 /// deciding them here means the chain is peeled once and its mode travels with
 /// it.
 void resolve_pipeline_mode(Plan& plan) {
-    std::size_t prefix = 0;
-    for (const MapStep& step : plan.steps) {
-        if (execution_capability(*step.node) != ExecutionCapability::ParallelMap) {
-            // The chain continues into something a morsel may not hold. The
-            // prefix so far is still a pipeline; this step is its boundary.
-            break;
+    // Search top-down for the outermost run of steps that may run over morsels.
+    // Outermost-first is the existing policy, not a new one: when a chain's root
+    // was ineligible, the per-kind recursion re-planned one node lower and took
+    // the first island it found on the way down. This finds the same run without
+    // re-planning anything.
+    SerialOnlyReason reason = SerialOnlyReason::NotParallelMap;
+    std::size_t index = 0;
+    while (index < plan.steps.size()) {
+        if (execution_capability(*plan.steps[index].node) != ExecutionCapability::ParallelMap) {
+            // Bounds a run from above (a row-local Update is the case that
+            // matters) and cannot join one. Keep looking below it.
+            ++index;
+            continue;
         }
-        if (!map_step_expressions_are_subset_evaluable(*step.node)) {
-            // One unsupported expression makes the whole chain serial rather
-            // than shortening it: the steps above it would have to consume a
-            // partial result they were not planned over.
-            plan.mode = PipelineMode::Serial;
-            plan.serial_reason = SerialOnlyReason::UnsupportedExpression;
-            return;
+        if (!map_step_expressions_are_subset_evaluable(*plan.steps[index].node)) {
+            // A step a morsel cannot evaluate. It joins no run, and a run above
+            // it would have to consume a partial result it was not planned over.
+            reason = SerialOnlyReason::UnsupportedExpression;
+            ++index;
+            continue;
         }
-        ++prefix;
-    }
-    if (prefix == 0) {
-        plan.mode = PipelineMode::Serial;
-        plan.serial_reason = SerialOnlyReason::NotParallelMap;
+        std::size_t end = index;
+        while (end < plan.steps.size() &&
+               execution_capability(*plan.steps[end].node) == ExecutionCapability::ParallelMap &&
+               map_step_expressions_are_subset_evaluable(*plan.steps[end].node)) {
+            ++end;
+        }
+        const auto run_begin = plan.steps.begin() + static_cast<std::ptrdiff_t>(index);
+        const auto run_end = plan.steps.begin() + static_cast<std::ptrdiff_t>(end);
+        if (std::all_of(run_begin, run_end, [](const MapStep& step) {
+                return is_metadata_only_node(step.node->kind());
+            })) {
+            // Nothing per-row to spread. Another run may still exist below.
+            reason = SerialOnlyReason::NoRowWork;
+            index = end + 1;
+            continue;
+        }
+        plan.mode = PipelineMode::MorselParallel;
+        plan.serial_reason = SerialOnlyReason::None;
+        plan.parallel_begin = index;
+        plan.parallel_end = end;
         return;
     }
-    if (std::all_of(plan.steps.begin(), plan.steps.begin() + static_cast<std::ptrdiff_t>(prefix),
-                    [](const MapStep& step) { return is_metadata_only_node(step.node->kind()); })) {
-        plan.mode = PipelineMode::Serial;
-        plan.serial_reason = SerialOnlyReason::NoRowWork;
-        return;
-    }
-    plan.mode = PipelineMode::MorselParallel;
-    plan.serial_reason = SerialOnlyReason::None;
-    plan.parallel_steps = prefix;
+    plan.mode = PipelineMode::Serial;
+    plan.serial_reason = reason;
 }
 
 }  // namespace
@@ -341,8 +355,8 @@ auto parallel_input_node(const Plan& plan) -> const ir::Node* {
     if (plan.mode != PipelineMode::MorselParallel) {
         return nullptr;
     }
-    return plan.parallel_steps < plan.steps.size() ? plan.steps[plan.parallel_steps].node
-                                                   : plan.source_node;
+    return plan.parallel_end < plan.steps.size() ? plan.steps[plan.parallel_end].node
+                                                 : plan.source_node;
 }
 
 auto serial_only_reason_name(SerialOnlyReason reason) -> std::string_view {
@@ -416,11 +430,13 @@ auto explain_physical(const Plan& plan) -> std::string {
     out += "\n";
     out += "  mode: ";
     if (plan.mode == PipelineMode::MorselParallel) {
-        out += "morsel-parallel(";
-        out += std::to_string(plan.parallel_steps);
+        out += "morsel-parallel(steps ";
+        out += std::to_string(plan.parallel_begin);
+        out += "..";
+        out += std::to_string(plan.parallel_end);
         out += " of ";
         out += std::to_string(plan.steps.size());
-        out += " steps)";
+        out += ")";
     } else {
         out += "serial(";
         out += serial_only_reason_name(plan.serial_reason);

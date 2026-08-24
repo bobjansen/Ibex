@@ -104,12 +104,25 @@ struct Plan {
     std::vector<MapStep> steps;
     PipelineMode mode = PipelineMode::Serial;
     SerialOnlyReason serial_reason = SerialOnlyReason::NotParallelMap;
-    /// Length of the leading run of steps that may execute over morsels; zero
-    /// unless `mode` is `MorselParallel`. The chain above it — a row-local
-    /// `Update` and anything over it — executes serially on the pipeline's
-    /// output, which is exactly what the island seam does today by rooting a
-    /// shorter chain.
-    std::size_t parallel_steps = 0;
+    /// The half-open range of steps that may execute over morsels, as indices
+    /// into `steps` (sink-first). Empty unless `mode` is `MorselParallel`.
+    ///
+    /// The run need not start at the root. `df[filter ...][update ...]` lowers
+    /// to Update over Filter: the update bounds the run from above, the filter
+    /// is the run, and the source feeds it. Steps before `parallel_begin`
+    /// execute serially on the pipeline's output; steps at and after
+    /// `parallel_end` are the run's input, built and materialized beneath it.
+    ///
+    /// Modelling the run's position is what lets one plan describe the whole
+    /// chain. Before it, a chain whose root was not parallel-eligible was
+    /// declared serial and the per-kind recursion re-planned each node until it
+    /// stumbled on the eligible sub-chain.
+    std::size_t parallel_begin = 0;
+    std::size_t parallel_end = 0;
+
+    [[nodiscard]] auto parallel_step_count() const noexcept -> std::size_t {
+        return parallel_end - parallel_begin;
+    }
     std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
 };

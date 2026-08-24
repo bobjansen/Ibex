@@ -12818,6 +12818,82 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
     return std::unexpected("physical join: plan named no streaming branch");
 }
 
+/// Build an aggregate the plan migrated: the streaming operator, or the
+/// Join+Aggregate fusion. Phase 4 item 2.
+///
+/// Moved from `build_operator_impl`'s per-kind switch rather than rewritten.
+/// `MaterializeAll` never arrives here -- it is not migrated, still falls back,
+/// and is still counted in the backlog, which is what keeps that number honest.
+auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
+                              const TableRegistry& registry, const ScalarRegistry* scalars,
+                              const ExternRegistry* externs, const ExecutionContext& exec,
+                              ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& agg = static_cast<const ir::AggregateNode&>(node);
+    if (agg.children().empty()) {
+        return std::unexpected("aggregate node missing child");
+    }
+    // The plan decides; this reads its decision. `plan_aggregate` relays the
+    // same two predicates this code used to call, so the routing is
+    // identical by construction.
+    const physical::AggregatePlan& ap = plan.aggregate;
+    if (ap.strategy == physical::AggregateStrategy::FusedLeftJoinCount) {
+        // Two logical nodes, one physical step: the join named here is
+        // consumed, never handed to `build_operator`, so it is neither
+        // planned nor counted separately. The skip is a consequence of who
+        // calls whom -- the same way a fused `MapStep` partner is skipped
+        // by the plan's walk simply never descending to it.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& join = static_cast<const ir::JoinNode&>(*ap.fused_join);
+        const std::string& counted_column = ap.counted_column;
+        auto left =
+            materialize_row_local(*join.children()[0], registry, scalars, externs, exec, model_out);
+        if (!left.has_value()) {
+            return std::unexpected(std::move(left.error()));
+        }
+        auto right =
+            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+        if (!right.has_value()) {
+            return std::unexpected(std::move(right.error()));
+        }
+        if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
+            fused.has_value()) {
+            return make_table_source(std::move(*fused));
+        }
+        auto joined = join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
+                                      compute_mask, join.suffix(), join.pending_order(),
+                                      join.null_match(), join.expect(), join.take(), &exec);
+        if (!joined.has_value()) {
+            return std::unexpected(std::move(joined.error()));
+        }
+        auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
+        if (!result.has_value()) {
+            return std::unexpected(std::move(result.error()));
+        }
+        return make_table_source(std::move(*result));
+    }
+    if (ap.strategy == physical::AggregateStrategy::StreamingSorted) {
+        auto child_op =
+            build_operator(*agg.children().front(), registry, scalars, externs, exec, model_out);
+        if (!child_op.has_value()) {
+            return std::unexpected(std::move(child_op.error()));
+        }
+        // The sorted operator streams group-at-a-time when the child's
+        // chunks arrive sorted on the group keys, and otherwise replays the
+        // first chunk into a hash ChunkedAggregateOperator — so it is safe
+        // to route the whole streamable subset here.
+        // Aggregates are often the terminal breaker and hash aggregation
+        // emits only after consuming all input. Scheduling one in its own
+        // stage in that shape buys no overlap and only creates a thread.
+        // A join below it is staged instead: its probe stream can fill the
+        // aggregate while it keeps pulling the next probe chunk.
+        return std::make_unique<ChunkedSortedAggregateOperator>(
+            std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec);
+    }
+
+    return std::unexpected("physical aggregate: plan named no executable strategy");
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -12850,6 +12926,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // composer walks it in both modes, so there is no arrangement of map nodes
     // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (plan.migrated && plan.aggregate.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
+    }
     if (plan.migrated && plan.join.describes) {
         physical::note_map_pipeline_executed();
         return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
@@ -13054,67 +13134,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Aggregate) {
-        const auto& agg = static_cast<const ir::AggregateNode&>(node);
-        if (agg.children().empty()) {
-            return std::unexpected("aggregate node missing child");
-        }
-        // The plan decides; this reads its decision. `plan_aggregate` relays the
-        // same two predicates this code used to call, so the routing is
-        // identical by construction.
-        const physical::AggregatePlan& ap = plan.aggregate;
-        if (ap.strategy == physical::AggregateStrategy::FusedLeftJoinCount) {
-            // Two logical nodes, one physical step: the join named here is
-            // consumed, never handed to `build_operator`, so it is neither
-            // planned nor counted separately. The skip is a consequence of who
-            // calls whom -- the same way a fused `MapStep` partner is skipped
-            // by the plan's walk simply never descending to it.
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            const auto& join = static_cast<const ir::JoinNode&>(*ap.fused_join);
-            const std::string& counted_column = ap.counted_column;
-            auto left = materialize_row_local(*join.children()[0], registry, scalars, externs, exec,
-                                              model_out);
-            if (!left.has_value()) {
-                return std::unexpected(std::move(left.error()));
-            }
-            auto right = materialize_row_local(*join.children()[1], registry, scalars, externs,
-                                               exec, model_out);
-            if (!right.has_value()) {
-                return std::unexpected(std::move(right.error()));
-            }
-            if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
-                fused.has_value()) {
-                return make_table_source(std::move(*fused));
-            }
-            auto joined = join_table_impl(*left, *right, join.kind(), join.keys(), nullptr, scalars,
-                                          compute_mask, join.suffix(), join.pending_order(),
-                                          join.null_match(), join.expect(), join.take(), &exec);
-            if (!joined.has_value()) {
-                return std::unexpected(std::move(joined.error()));
-            }
-            auto result = aggregate_table(*joined, agg.group_by(), agg.aggregations(), &exec);
-            if (!result.has_value()) {
-                return std::unexpected(std::move(result.error()));
-            }
-            return make_table_source(std::move(*result));
-        }
-        if (ap.strategy == physical::AggregateStrategy::StreamingSorted) {
-            auto child_op = build_operator(*agg.children().front(), registry, scalars, externs,
-                                           exec, model_out);
-            if (!child_op.has_value()) {
-                return std::unexpected(std::move(child_op.error()));
-            }
-            // The sorted operator streams group-at-a-time when the child's
-            // chunks arrive sorted on the group keys, and otherwise replays the
-            // first chunk into a hash ChunkedAggregateOperator — so it is safe
-            // to route the whole streamable subset here.
-            // Aggregates are often the terminal breaker and hash aggregation
-            // emits only after consuming all input. Scheduling one in its own
-            // stage in that shape buys no overlap and only creates a thread.
-            // A join below it is staged instead: its probe stream can fill the
-            // aggregate while it keeps pulling the next probe chunk.
-            return std::make_unique<ChunkedSortedAggregateOperator>(
-                std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec);
-        }
+        // Only `MaterializeAll` reaches here now -- Median, Quantile and Ewma.
+        // A streaming or fused aggregate is a migrated plan and was built by
+        // `build_physical_aggregate` at the seam above, so it falls through to
+        // the whole-table path below exactly as it always did.
     }
 
     if (node.kind() == ir::NodeKind::TopK) {

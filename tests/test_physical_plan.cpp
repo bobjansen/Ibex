@@ -121,10 +121,19 @@ TEST_CASE("Physical plan declines breakers and grouped updates with reasons", "[
     REQUIRE_FALSE(order.migrated);
     REQUIRE(order.reason == runtime::physical::FallbackReason::NotMapChain);
 
-    const auto [aggregate_tree, aggregate] =
+    // A streamable aggregate is migrated now -- `build_physical_aggregate`
+    // builds it -- so the breaker that still declines is one needing every
+    // value at once.
+    const auto [streaming_tree, streaming] =
         serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+    REQUIRE(streaming.migrated);
+    REQUIRE(streaming.aggregate.strategy == runtime::physical::AggregateStrategy::StreamingSorted);
+
+    const auto [aggregate_tree, aggregate] =
+        serial_plan("trades[select { total = median(price) }, by { symbol }];");
     REQUIRE_FALSE(aggregate.migrated);
     REQUIRE(aggregate.reason == runtime::physical::FallbackReason::NotMapChain);
+    REQUIRE(aggregate.aggregate.strategy == runtime::physical::AggregateStrategy::MaterializeAll);
 
     // A grouped update is a barrier even though a bare update is a map: the
     // walk stops at the root, so there are no steps and no source.
@@ -808,7 +817,10 @@ TEST_CASE("The fallback backlog is counted by kind, in every mode", "[physical][
     //    what rules out double counting now that the gate is gone: the seam
     //    visits each node once per build, whatever the budget.
     const auto registry = trades_registry();
-    auto ir = require_ir("trades[select { total = sum(price) }, by { symbol }];");
+    // Median still falls back -- it needs every value at once -- so it still
+    // counts. A `sum` would count nothing now that streaming aggregates build
+    // from the plan, which is exactly what the backlog is meant to track.
+    auto ir = require_ir("trades[select { total = median(price) }, by { symbol }];");
 
     const auto measure = [&](std::size_t threads) {
         runtime::ExecutionContext exec;
@@ -834,16 +846,21 @@ TEST_CASE("The fallback backlog is counted by kind, in every mode", "[physical][
     CHECK(runtime::physical::node_kind_name(ir::NodeKind::Scan) == "Scan");
 }
 
-TEST_CASE("Fallback queries keep their existing executor under the planner",
+TEST_CASE("A migrated aggregate executes through the plan and still answers right",
           "[physical][execute]") {
     const auto registry = trades_registry();
     auto ir = require_ir("trades[select { total = sum(price) }, by { symbol }];");
     const runtime::ExecutionContext exec = serial_exec();
 
-    const auto before = runtime::physical::physical_materialized_calls();
+    // This used to assert the opposite -- that the query raised the fallback
+    // counter -- and it kept passing after `sum` became migrated only because
+    // that counter is process-global and other tests in the same binary bump
+    // it. A test that no longer tests its own premise, passing quietly. The
+    // pipeline counter is the one this query now moves.
+    const auto before = runtime::physical::physical_map_pipelines();
     const auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(result.has_value());
-    REQUIRE(runtime::physical::physical_materialized_calls() > before);
+    REQUIRE(runtime::physical::physical_map_pipelines() > before);
 
     // Grouped output in first-occurrence order: A then B.
     const auto* symbols = std::get_if<Column<std::string>>(result->find("symbol"));

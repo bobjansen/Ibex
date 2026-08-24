@@ -26,6 +26,8 @@
 #include <thread>
 #include <vector>
 
+#include "physical_plan.hpp"
+
 namespace {
 
 using namespace ibex;
@@ -1868,7 +1870,7 @@ TEST_CASE("E2E: parallel serial-island matches serial output", "[e2e][parallel]"
 TEST_CASE("E2E: parallel serial-island falls back to serial for ineligible shapes",
           "[e2e][parallel]") {
     auto tables = make_island_table();
-    // lag() is not row-local: analyze_parallel_island rejects it, so the seam
+    // lag() is not row-local: the pipeline is serial-only, so the seam
     // must leave the query on the untouched serial chain and still succeed.
     auto serial = run("t[select { price, prev = lag(price, 1) }];", tables);
     auto parallel = run_parallel("t[select { price, prev = lag(price, 1) }];", tables, 3);
@@ -1942,10 +1944,10 @@ TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][p
     // columns, which is the shape most likely to be dropped by a path that
     // reasons about columns.
     //
-    // It no longer forms an island. The plan is Project(Update(Scan)): the
-    // update is a barrier now, leaving a chain of just the project, and a
-    // metadata-only chain has no per-row work to spread (NoRowWork). Both of
-    // those are deliberate, so this asserts the reason rather than eligibility
+    // It no longer runs over morsels. The plan is Project(Update(Scan)): the
+    // update bounds the parallel prefix now, leaving a prefix of just the
+    // project, and a metadata-only chain has no per-row work to spread
+    // (NoRowWork). Both of those are deliberate, so this asserts the reason
     // — a different reason would mean something else changed. The morsel
     // source's own column-less handling is covered in test_operator.cpp.
     {
@@ -1953,9 +1955,10 @@ TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][p
         REQUIRE(parsed.has_value());
         auto lowered = parser::lower(*parsed);
         REQUIRE(lowered.has_value());
-        auto candidate = runtime::analyze_parallel_island(**lowered);
-        CHECK_FALSE(candidate.eligible());
-        CHECK(candidate.reason == runtime::ParallelEligibilityReason::NoRowWork);
+        const auto plan =
+            runtime::physical::plan_physical(**lowered, runtime::TableRegistry{}, nullptr);
+        CHECK(plan.mode == runtime::physical::PipelineMode::Serial);
+        CHECK(plan.serial_reason == runtime::physical::SerialOnlyReason::NoRowWork);
     }
     auto serial = run("Table(3)[select { c = 1 }];", {});
     auto parallel = run_parallel("Table(3)[select { c = 1 }];", {}, 2);

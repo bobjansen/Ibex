@@ -55,9 +55,9 @@ enum class FallbackReason : std::uint8_t {
 
 /// How a migrated pipeline may execute. This is the plan's answer to "may the
 /// morsel executor run this", decided once during lowering from the same rules
-/// that used to live in `analyze_parallel_island` — a pipeline that carries its
-/// own mode is what lets parallel execution become a mode of a pipeline rather
-/// than a second executor with its own analysis.
+/// that used to live in the island analysis — a pipeline that carries its own
+/// mode is what lets parallel execution become a mode of a pipeline rather than
+/// a second executor with its own analysis.
 enum class PipelineMode : std::uint8_t {
     /// Every step runs on the single build thread, in order.
     Serial,
@@ -88,7 +88,7 @@ enum class SerialOnlyReason : std::uint8_t {
 /// consumed read-only. Step nodes are `const ir::Node*` rather than copied
 /// payloads so there is exactly one definition of each step's semantics; the
 /// plan records *shape*, the IR remains the program. Like
-/// `ParallelIslandCandidate`, the plan **borrows** the IR it was lowered
+/// every analysis over the IR, the plan **borrows** the IR it was lowered
 /// from and must not outlive it. `steps` is ordered top-down (sink first),
 /// matching the direction the executor composes in.
 struct Plan {

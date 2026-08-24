@@ -10592,7 +10592,7 @@ struct IslandWorkerChain {
         auto next = build_row_local_map_operator(*op_node, std::move(worker.chain), scalars,
                                                  externs, exec, true);
         if (!next.has_value()) {
-            // analyze_parallel_island() only admits row-local map kinds.
+            // The plan's step vocabulary only admits row-local map kinds.
             return std::unexpected("parallel island: " + next.error());
         }
         worker.chain = std::move(next.value());
@@ -11321,7 +11321,7 @@ class TwoPhaseFilterOperator final : public Operator {
 
 // Build one eligible row-local parallel-map chain as an island: materialize its
 // input subtree once, then run the chain over morsels of that table instead of
-// one whole-table chunk. `candidate.operators` is source-to-sink.
+// one whole-table chunk. The operators are ordered source-to-sink.
 //
 // Two executors, one morsel model. A large input fans out across the worker
 // pool and is reassembled by `ParallelIslandOperator`'s ordered merger; a small
@@ -11344,11 +11344,35 @@ class TwoPhaseFilterOperator final : public Operator {
 // directly into workers would mean handing them something other than a
 // finished table — at which point the LazyTable synchronization contract
 // applies in full and eligibility has to be re-established.
-auto build_parallel_island(const ParallelIslandCandidate& candidate, const TableRegistry& registry,
-                           const ScalarRegistry* scalars, const ExternRegistry* externs,
-                           const ExecutionContext& exec, ModelResult* model_out)
+/// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
+/// records steps sink-first; every executor here composes bottom-up.
+auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<const ir::Node*> {
+    std::vector<const ir::Node*> operators;
+    operators.reserve(plan.parallel_steps);
+    for (std::size_t i = plan.parallel_steps; i > 0; --i) {
+        operators.push_back(plan.steps[i - 1]);
+    }
+    return operators;
+}
+
+/// Run a physical map pipeline over morsels. The plan says which steps may run
+/// in parallel (`parallel_steps`) and what feeds them (`parallel_input_node`);
+/// this builds that input, materializes it, and executes the prefix over its
+/// morsels. It is the pipeline's parallel *mode*, not a separate executor with
+/// its own idea of what is eligible.
+///
+/// `steps` inside a plan are sink-first; the operators here run source-to-sink,
+/// so the prefix is reversed once, on the build thread.
+auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry& registry,
+                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                 const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    auto input_op = build_operator(*candidate.input, registry, scalars, externs, exec, model_out);
+    const std::vector<const ir::Node*> operators = parallel_pipeline_operators(plan);
+    const ir::Node* input_node = physical::parallel_input_node(plan);
+    if (input_node == nullptr) {
+        return std::unexpected("map pipeline: parallel mode without an input");
+    }
+    auto input_op = build_operator(*input_node, registry, scalars, externs, exec, model_out);
     if (!input_op.has_value()) {
         return std::unexpected(std::move(input_op.error()));
     }
@@ -11369,9 +11393,8 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     }
 
     if (worker_count >= 2) {
-        const auto head = candidate.operators.empty()
-                              ? std::nullopt
-                              : range_filter_head(*candidate.operators.front(), *owned);
+        const auto head =
+            operators.empty() ? std::nullopt : range_filter_head(*operators.front(), *owned);
         if (exec.parallel_stats != nullptr && head.has_value()) {
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
@@ -11381,7 +11404,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         // metadata-only: a row-touching operator would need the per-morsel
         // chunks the two-phase form does not produce, but Project and Rename
         // copy no rows and so are simply run once over the finished output.
-        const auto tail = std::span{candidate.operators}.subspan(head.has_value() ? 1 : 0);
+        const auto tail = std::span{operators}.subspan(head.has_value() ? 1 : 0);
         if (head.has_value() && std::ranges::all_of(tail, [](const ir::Node* node) {
                 return is_metadata_only_node(node->kind());
             })) {
@@ -11403,8 +11426,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         std::vector<IslandWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            auto worker =
-                build_island_worker_chain(candidate.operators, *owned, scalars, externs, exec);
+            auto worker = build_island_worker_chain(operators, *owned, scalars, externs, exec);
             if (!worker.has_value()) {
                 return std::unexpected(std::move(worker.error()));
             }
@@ -11422,7 +11444,7 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
         OperatorPtr serial = make_table_source(std::move(*owned));
-        for (const ir::Node* op_node : candidate.operators) {
+        for (const ir::Node* op_node : operators) {
             auto next = build_row_local_map_operator(*op_node, std::move(serial), scalars, externs,
                                                      exec, false);
             if (!next.has_value()) {
@@ -11434,11 +11456,11 @@ auto build_parallel_island(const ParallelIslandCandidate& candidate, const Table
     }
 
     OperatorPtr chain = std::make_unique<PartitionedTableSource>(*owned, grain);
-    for (const ir::Node* op_node : candidate.operators) {
+    for (const ir::Node* op_node : operators) {
         auto next =
             build_row_local_map_operator(*op_node, std::move(chain), scalars, externs, exec, true);
         if (!next.has_value()) {
-            // analyze_parallel_island() only admits row-local map kinds.
+            // The plan's step vocabulary only admits row-local map kinds.
             return std::unexpected("parallel island: " + next.error());
         }
         chain = std::move(next.value());
@@ -12450,52 +12472,55 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // source's morsels straight into workers, instead of materializing first,
     // reintroduces both hazards and must re-establish eligibility (per-worker
     // readers + a frozen cache) before it removes that assertion.
-    if (exec.parallel) {
-        const auto island = analyze_parallel_island(node);
-        if (island.eligible()) {
-            // A row-local chain rooted directly at a decomposable lazy scan is
-            // one physical pipeline: decode and maps run in the same worker
-            // task, and the ordered ring feeds the next breaker. This is the
-            // production replacement for the old materialize-before-fan-out
-            // island boundary. Probe scans keep their join-owned dynamic
-            // filter timing and therefore do not enter here.
-            if (exec.stream_scans && island.input->kind() == ir::NodeKind::Scan) {
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                const auto& scan = static_cast<const ir::ScanNode&>(*island.input);
-                if (!registry.contains(scan.source_name())) {
-                    if (const auto* deferred = exec.deferred_scan(scan.source_name());
-                        deferred != nullptr && deferred->filter == nullptr) {
-                        auto units = deferred_scan_units(*deferred);
-                        if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
-                            physical::note_map_pipeline_executed();
-                            return build_pipelined_scan(island.operators, true, *deferred,
-                                                        std::move(units), scalars, externs, exec);
-                        }
+    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md Phase 2,
+    // item 4). One plan per node, consulted in both modes: it decides whether
+    // this is a pipeline at all, and if so whether the pipeline may run over
+    // morsels. There is no second analysis to disagree with it.
+    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (plan.migrated && plan.mode == physical::PipelineMode::MorselParallel && exec.parallel) {
+        // A row-local chain rooted directly at a decomposable lazy scan is
+        // one physical pipeline: decode and maps run in the same worker
+        // task, and the ordered ring feeds the next breaker. This is the
+        // production replacement for the old materialize-before-fan-out
+        // island boundary. Probe scans keep their join-owned dynamic
+        // filter timing and therefore do not enter here.
+        const ir::Node* input_node = physical::parallel_input_node(plan);
+        if (exec.stream_scans && input_node != nullptr &&
+            input_node->kind() == ir::NodeKind::Scan) {
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+            const auto& scan = static_cast<const ir::ScanNode&>(*input_node);
+            if (!registry.contains(scan.source_name())) {
+                if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                    deferred != nullptr && deferred->filter == nullptr) {
+                    auto units = deferred_scan_units(*deferred);
+                    if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
+                        physical::note_map_pipeline_executed();
+                        return build_pipelined_scan(parallel_pipeline_operators(plan), true,
+                                                    *deferred, std::move(units), scalars, externs,
+                                                    exec);
                     }
                 }
             }
-            physical::note_map_pipeline_executed();
-            return build_parallel_island(island, registry, scalars, externs, exec, model_out);
         }
-        // Not island-eligible at this root: fall through to the existing
-        // per-kind construction. The recursion below may still form an island
-        // around a shorter sub-chain (an ineligible outer predicate does not
-        // make an inner projection ineligible), which is why a declined
-        // analysis does NOT route into the physical planner's executor here.
+        physical::note_map_pipeline_executed();
+        return build_map_pipeline_parallel(plan, registry, scalars, externs, exec, model_out);
     }
-
-    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md Phase 1).
-    // Serial mode only for now: the island above already owns the parallel
-    // execution of the same pipeline. A migrated plan composes the identical
-    // operator chain — same constructors, same per-node profile entries, same
-    // source construction (the source goes through the public build_operator,
-    // so every Scan/ExternCall streaming decision below is unchanged).
-    if (!exec.parallel) {
-        const physical::Plan plan = physical::plan_physical(node, registry, externs);
-        if (plan.migrated) {
-            physical::note_map_pipeline_executed();
-            return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
-        }
+    // Serial composition of a migrated pipeline: same constructors, same
+    // per-node profile entries, same source construction (the source goes
+    // through the public build_operator, so every Scan/ExternCall streaming
+    // decision below is unchanged).
+    //
+    // In parallel mode this is deliberately NOT taken. A pipeline whose own
+    // mode is serial may still contain a parallel one below a step that bounds
+    // it — `df[filter ...][update ...]` is the shape — and the per-kind
+    // recursion below finds it by re-planning at each node. Consuming the whole
+    // chain here would swallow that inner pipeline. Modelling a serial tail
+    // over a parallel prefix in one plan is Phase 3 work.
+    if (plan.migrated && !exec.parallel) {
+        physical::note_map_pipeline_executed();
+        return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
+    }
+    if (!plan.migrated && !exec.parallel) {
         physical::note_materialized_call(plan.reason);
     }
 

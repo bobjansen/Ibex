@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "physical_plan.hpp"
+
 namespace {
 
 using namespace ibex;
@@ -82,20 +84,36 @@ TEST_CASE("Lower carries the scope escape into the IR") {
     REQUIRE(ir::as_column_ref(*cmp->right) == nullptr);
 }
 
-TEST_CASE("Parallel-island eligibility follows lowered canonical IR", "[runtime][pipeline]") {
+namespace {
+
+/// The pipeline the runtime seam would plan for this root. An empty registry is
+/// enough: these cases are about chain shape and expressions, not about which
+/// scan kind the source resolves to.
+auto pipeline_of(const ir::Node& root) -> runtime::physical::Plan {
+    return runtime::physical::plan_physical(root, runtime::TableRegistry{}, nullptr);
+}
+
+auto runs_over_morsels(const runtime::physical::Plan& plan) -> bool {
+    return plan.migrated && plan.mode == runtime::physical::PipelineMode::MorselParallel;
+}
+
+}  // namespace
+
+TEST_CASE("Map pipeline mode follows lowered canonical IR", "[runtime][pipeline]") {
     auto program = require_parse("df[filter price > 10, select { price }];");
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    auto candidate = runtime::analyze_parallel_island(**result);
-    REQUIRE(candidate.eligible());
-    REQUIRE(candidate.input != nullptr);
-    CHECK(candidate.input->kind() == ir::NodeKind::Scan);
-    REQUIRE(candidate.operators.size() == 1);
-    CHECK(candidate.operators[0]->kind() == ir::NodeKind::FilterProject);
+    const auto plan = pipeline_of(**result);
+    REQUIRE(runs_over_morsels(plan));
+    const ir::Node* input = runtime::physical::parallel_input_node(plan);
+    REQUIRE(input != nullptr);
+    CHECK(input->kind() == ir::NodeKind::Scan);
+    REQUIRE(plan.parallel_steps == 1);
+    CHECK(plan.steps[0]->kind() == ir::NodeKind::FilterProject);
 }
 
-TEST_CASE("Parallel-island eligibility excludes a bare update", "[runtime][pipeline]") {
+TEST_CASE("A bare update bounds the parallel prefix", "[runtime][pipeline]") {
     // An `update` is row-local, and an earlier slice did admit it here. It is
     // excluded again on measurement: an update is 1:1 and `update_table` builds
     // its output by moving the input, so a morsel island buys parallelism over
@@ -107,32 +125,31 @@ TEST_CASE("Parallel-island eligibility excludes a bare update", "[runtime][pipel
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        auto candidate = runtime::analyze_parallel_island(**result);
-        CHECK_FALSE(candidate.eligible());
-        CHECK(candidate.reason == runtime::ParallelEligibilityReason::NotParallelMap);
+        const auto plan = pipeline_of(**result);
+        CHECK_FALSE(runs_over_morsels(plan));
+        CHECK(plan.serial_reason == runtime::physical::SerialOnlyReason::NotParallelMap);
     }
     {
-        // An update above a filter does not drag the filter out of an island:
-        // build_operator retries at each node, so the filter below still forms
-        // one of its own.
+        // An update above a filter does not drag the filter out of a parallel
+        // pipeline: build_operator re-plans at each node, so the filter below
+        // still forms one of its own. Modelling both halves in a single plan is
+        // Phase 3 work; until then the recursion is what finds the inner one.
         auto program = require_parse("df[filter price > 5][update { n = price * 2 }];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        auto candidate = runtime::analyze_parallel_island(**result);
-        CHECK_FALSE(candidate.eligible());
+        CHECK_FALSE(runs_over_morsels(pipeline_of(**result)));
 
         const ir::Node* child = (**result).children().front().get();
         REQUIRE(child != nullptr);
-        auto below = runtime::analyze_parallel_island(*child);
-        CHECK(below.eligible());
+        CHECK(runs_over_morsels(pipeline_of(*child)));
     }
 }
 
-TEST_CASE("Parallel-island eligibility requires per-row work", "[runtime][pipeline]") {
+TEST_CASE("A parallel pipeline requires per-row work", "[runtime][pipeline]") {
     // `project_table` and `rename_table` build their output with
     // `add_column_shared` — no rows are copied, and the cost is O(columns). An
-    // island of nothing but those would gather every morsel and concatenate the
+    // pipeline of nothing but those would gather every morsel and concatenate the
     // results in order to parallelize a pointer assignment: measured on 20M
     // rows over six columns, a bare `select` went 0.65-0.83s serial to
     // 1.20-1.36s as an island, a bare `rename` 0.68-0.72s to 1.31-1.45s.
@@ -144,31 +161,31 @@ TEST_CASE("Parallel-island eligibility requires per-row work", "[runtime][pipeli
             auto result = parser::lower(program);
             REQUIRE(result.has_value());
 
-            auto candidate = runtime::analyze_parallel_island(**result);
-            CHECK_FALSE(candidate.eligible());
-            CHECK(candidate.reason == runtime::ParallelEligibilityReason::NoRowWork);
+            const auto plan = pipeline_of(**result);
+            CHECK_FALSE(runs_over_morsels(plan));
+            CHECK(plan.serial_reason == runtime::physical::SerialOnlyReason::NoRowWork);
         }
     }
     {
         // But they are not demoted from ParallelMap, because above a filter
-        // they belong in that filter's island — free there, and excluding them
+        // they belong in that filter's pipeline — free there, and excluding them
         // would split the chain and materialize in between. This is the case
         // the rule must not break.
         auto program = require_parse("df[filter price > 5][rename px = price];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        auto candidate = runtime::analyze_parallel_island(**result);
-        REQUIRE(candidate.eligible());
-        REQUIRE(candidate.operators.size() == 2);
-        CHECK(candidate.operators[0]->kind() == ir::NodeKind::Filter);
-        CHECK(candidate.operators[1]->kind() == ir::NodeKind::Rename);
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.parallel_steps == 2);
+        // Steps are sink-first: the rename is the root, the filter below it.
+        CHECK(plan.steps[0]->kind() == ir::NodeKind::Rename);
+        CHECK(plan.steps[1]->kind() == ir::NodeKind::Filter);
     }
 }
 
-TEST_CASE("Parallel-island eligibility rejects updates that are not row-local",
-          "[runtime][pipeline]") {
-    // Every update is excluded from an island now, so these pass for the same
+TEST_CASE("A parallel pipeline rejects updates that are not row-local", "[runtime][pipeline]") {
+    // Every update is excluded from the parallel prefix now, so these pass for the same
     // reason a plain one does. They are kept because each would be *silently
     // wrong* rather than merely slow if some later change re-admitted updates
     // without re-checking row-locality — the aggregate case especially, which
@@ -188,19 +205,18 @@ TEST_CASE("Parallel-island eligibility rejects updates that are not row-local",
         auto program = require_parse(src);
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
-        CHECK_FALSE(runtime::analyze_parallel_island(**result).eligible());
+        CHECK_FALSE(runs_over_morsels(pipeline_of(**result)));
     }
 }
 
-TEST_CASE("Parallel-island eligibility rejects lowered non-row-local expressions",
-          "[runtime][pipeline]") {
+TEST_CASE("A parallel pipeline rejects lowered non-row-local expressions", "[runtime][pipeline]") {
     auto program = require_parse("df[filter lag(price) > 10];");
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    auto candidate = runtime::analyze_parallel_island(**result);
-    CHECK_FALSE(candidate.eligible());
-    CHECK(candidate.reason == runtime::ParallelEligibilityReason::UnsupportedExpression);
+    const auto plan = pipeline_of(**result);
+    CHECK_FALSE(runs_over_morsels(plan));
+    CHECK(plan.serial_reason == runtime::physical::SerialOnlyReason::UnsupportedExpression);
 }
 
 TEST_CASE("Lowering optimizer elides dead pure preamble calls") {

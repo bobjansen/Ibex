@@ -92,15 +92,15 @@ struct ColumnKernelSignature {
 
 /// Classify a node kind's execution capability — the *most* a node of this kind
 /// may be. Expression-level constraints are checked by
-/// analyze_parallel_island(), not duplicated at call sites.
+/// `map_step_expressions_are_subset_evaluable`, not duplicated at call sites.
 [[nodiscard]] auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability;
 
 /// True when a node relabels or selects columns without touching a row.
 ///
 /// `project_table` and `rename_table` both build their output with
 /// `add_column_shared` — they copy no rows at all, and cost O(columns) rather
-/// than O(rows). Two callers depend on that: `analyze_parallel_island` refuses
-/// a chain made only of these (there is nothing to parallelize), and the
+/// than O(rows). Two callers depend on that: a physical pipeline made only of
+/// these is serial-only (there is nothing to parallelize), and the
 /// two-phase filter runs them **once over its finished output** rather than
 /// per morsel, which is what lets a `filter … rename` chain keep the fast path.
 [[nodiscard]] auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool;
@@ -126,34 +126,5 @@ struct ColumnKernelSignature {
 /// it: there is one definition of "this step may run per morsel", not one per
 /// analysis.
 [[nodiscard]] auto map_step_expressions_are_subset_evaluable(const ir::Node& node) -> bool;
-
-enum class ParallelEligibilityReason : std::uint8_t {
-    Eligible,
-    NotParallelMap,
-    UnsupportedExpression,
-    UnsupportedShape,
-    /// Every operator in the chain is metadata-only, so there is no per-row
-    /// work to spread across threads — see `analyze_parallel_island`.
-    NoRowWork,
-};
-
-/// A maximal, bottom-up chain of parallel-map candidates rooted at an IR node.
-/// `operators` is ordered source-to-sink; `input` is the subtree that must
-/// provide the materialized input table when a parallel executor is added.
-struct ParallelIslandCandidate {
-    std::vector<const ir::Node*> operators;
-    const ir::Node* input = nullptr;
-    ParallelEligibilityReason reason = ParallelEligibilityReason::NotParallelMap;
-
-    [[nodiscard]] auto eligible() const noexcept -> bool {
-        return reason == ParallelEligibilityReason::Eligible;
-    }
-};
-
-/// The sole expression-aware eligibility analysis for a parallel map island.
-/// Unknown calls (including externs/plugins), generators, transforms, ranks,
-/// and aggregates make the candidate serial-only through
-/// ir::is_subset_evaluable_expr().
-[[nodiscard]] auto analyze_parallel_island(const ir::Node& root) -> ParallelIslandCandidate;
 
 }  // namespace ibex::runtime

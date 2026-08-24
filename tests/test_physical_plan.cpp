@@ -609,6 +609,45 @@ TEST_CASE("Migrated filter keeps the empty input's schema carrier", "[physical][
     REQUIRE(result->find("price") != nullptr);
 }
 
+TEST_CASE("The fallback backlog is counted by kind, in every mode", "[physical][execute]") {
+    // The backlog is what orders Phase 4, so it has to be trustworthy in two
+    // ways this pins down.
+    //
+    // 1. It attributes to the NODE KIND, not just a total. A bare count cannot
+    //    say whether to port the join or the aggregate first.
+    // 2. It counts the same in both execution modes. The call used to sit
+    //    behind `if (!exec.can_fan_out())`, so at two cores or more the backlog
+    //    read as empty -- a migration counter reporting nothing on the
+    //    configuration everything is measured on. Equal deltas here are also
+    //    what rules out double counting now that the gate is gone: the seam
+    //    visits each node once per build, whatever the budget.
+    const auto registry = trades_registry();
+    auto ir = require_ir("trades[select { total = sum(price) }, by { symbol }];");
+
+    const auto measure = [&](std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = threads;
+        const auto before = runtime::physical::physical_fallbacks_for(ir::NodeKind::Aggregate);
+        const auto result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return runtime::physical::physical_fallbacks_for(ir::NodeKind::Aggregate) - before;
+    };
+
+    const std::uint64_t serial_delta = measure(1);
+    const std::uint64_t parallel_delta = measure(4);
+    CHECK(serial_delta >= 1);
+    CHECK(serial_delta == parallel_delta);
+
+    // A kind the query does not contain must not move, or the attribution is
+    // recording something other than the node it names.
+    const auto joins_before = runtime::physical::physical_fallbacks_for(ir::NodeKind::Join);
+    (void)measure(1);
+    CHECK(runtime::physical::physical_fallbacks_for(ir::NodeKind::Join) == joins_before);
+
+    CHECK(runtime::physical::node_kind_name(ir::NodeKind::Aggregate) == "Aggregate");
+    CHECK(runtime::physical::node_kind_name(ir::NodeKind::Scan) == "Scan");
+}
+
 TEST_CASE("Fallback queries keep their existing executor under the planner",
           "[physical][execute]") {
     const auto registry = trades_registry();

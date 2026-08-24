@@ -962,6 +962,30 @@ Gates: debug ctest 1752/1752, `check_answers.py` 22/22 under both
 `IBEX_PARALLEL` settings, interleaved A/B over `core,filter,null,groupagg` at 9
 repeats: total -1.86%, geomean 1.011, every query `noise`.
 
+**Phase 3 — the pipelined scan becomes a source strategy (2026-08-24,
+`79d40dab`).** The construction seam chose between streaming a decomposable
+deferred scan and materialize-then-morselize, which meant the choice could only
+be offered to a chain that was parallel end to end: `bc8025b9` had to gate it on
+`parallel_begin == 0 && parallel_end == steps.size()`, since the composer's
+serial tail is not something `build_pipelined_scan` models.
+
+That choice belongs to the run — it is a property of what feeds the run, not of
+the query's root. `build_map_pipeline_parallel` now makes it, so a run with
+serial steps above it streams its source too: `df[filter ...][update ...]` over
+a decomposable source used to decode the whole thing and morselize, and now
+streams with the update composed over the reassembled output. **The construction
+seam has no pipeline special case left at all** — it plans, and hands every
+migrated plan to the composer.
+
+Gates: debug ctest 1753/1753 (new case: the streamed shape under a serial step,
+asserting `pipelined_scans == 1`, in-order values, and the serial answer), 22/22
+answers both modes, micro A/B at +0.25% (all noise), and a PDS-H A/B over all 22
+queries at 8 cores: geomean 0.9985, byte-identical output, no verdict surviving
+Holm-Bonferroni. Worth stating plainly: the micro suites are CSV-backed and
+barely touch this path, and PDS-H did not move because those queries were
+already parallel end to end — the removed gate rarely bound them. The result
+here is a capability and a simplification, not a speedup.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -985,11 +1009,13 @@ already has an owner in `interrupt.hpp`, and the map kernels share no scratch �
 the ad-hoc scratch that exists belongs to breaker operators, which is Phase 4.
 Building it before a caller needs it is the ceremony this plan's own risk table
 warns about. Phase 3 has started: the
-serial-tail-over-parallel-run modelling landed in `bc8025b9`. What remains
-there is `build_pipelined_scan` as a source mode of the same pipeline rather
-than a special case at the seam — it is now gated on the run covering the whole
-chain (`parallel_begin == 0 && parallel_end == steps.size()`), because the
-composer's serial tail is something that builder does not model. The row-local update family's
+serial-tail-over-parallel-run modelling landed in `bc8025b9`, and the pipelined
+scan became the run's own source strategy in `79d40dab`. Both things item 4
+deliberately left are done, and the construction seam now holds no pipeline
+special case. What remains in Phase 3 is its own list: the executor owning
+bounded handoffs and DOP budgets (items 1-2), raw-thread construction removed
+from join/builder branches (item 4), and per-pipeline scheduling accounting
+(item 5). The row-local update family's
 remaining bridge users are the legacy null-handling arms and anything only the
 general evaluator reaches, both of which are shape gaps rather than mode gaps
 now.

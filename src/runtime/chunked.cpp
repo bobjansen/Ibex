@@ -11389,6 +11389,19 @@ class TwoPhaseFilterOperator final : public Operator {
 // directly into workers would mean handing them something other than a
 // finished table — at which point the LazyTable synchronization contract
 // applies in full and eligibility has to be re-established.
+/// Defined below; both are consulted by the run builder, which decides its own
+/// source strategy.
+[[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t;
+
+/// Defined below; the run builder chooses between this streaming source and
+/// materialize-then-morselize, so the choice lives with the run rather than at
+/// the construction seam.
+[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators, bool count_as_island,
+                                        const DeferredScan& scan, std::vector<SourceUnit> units,
+                                        const ScalarRegistry* scalars,
+                                        const ExternRegistry* externs, const ExecutionContext& exec)
+    -> std::expected<OperatorPtr, std::string>;
+
 /// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
 /// records steps sink-first; every executor here composes bottom-up.
 auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapStep> {
@@ -11417,6 +11430,29 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     if (input_node == nullptr) {
         return std::unexpected("map pipeline: parallel mode without an input");
     }
+
+    // Source strategy, decided here because it is a property of this run's
+    // input rather than of the query's root. A decomposable deferred scan can
+    // feed the run one unit at a time -- decode and maps in the same worker
+    // task, the ordered ring feeding whatever is above -- instead of being
+    // decoded whole and morselized. Probe scans keep their join-owned dynamic
+    // filter timing (a null filter slot is what distinguishes them) and so do
+    // not stream here.
+    if (exec.stream_scans && input_node->kind() == ir::NodeKind::Scan) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& scan = static_cast<const ir::ScanNode&>(*input_node);
+        if (!registry.contains(scan.source_name())) {
+            if (const auto* deferred = exec.deferred_scan(scan.source_name());
+                deferred != nullptr && deferred->filter == nullptr) {
+                auto units = deferred_scan_units(*deferred);
+                if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
+                    return build_pipelined_scan(operators, true, *deferred, std::move(units),
+                                                scalars, externs, exec);
+                }
+            }
+        }
+    }
+
     auto input_op = build_operator(*input_node, registry, scalars, externs, exec, model_out);
     if (!input_op.has_value()) {
         return std::unexpected(std::move(input_op.error()));
@@ -12542,41 +12578,13 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // composer walks it in both modes, so there is no arrangement of map nodes
     // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
-    if (plan.migrated && plan.mode == physical::PipelineMode::MorselParallel && exec.parallel) {
-        // A row-local chain rooted directly at a decomposable lazy scan is one
-        // physical pipeline: decode and maps run in the same worker task, and
-        // the ordered ring feeds the next breaker. This is the production
-        // replacement for the old materialize-before-fan-out island boundary.
-        // Probe scans keep their join-owned dynamic filter timing and therefore
-        // do not enter here. It applies only when the run reaches the source
-        // with nothing serial above it -- otherwise the composer's serial tail
-        // has to wrap the pipeline, which build_pipelined_scan does not model.
-        const ir::Node* input_node = physical::parallel_input_node(plan);
-        if (exec.stream_scans && plan.parallel_begin == 0 &&
-            plan.parallel_end == plan.steps.size() && input_node != nullptr &&
-            input_node->kind() == ir::NodeKind::Scan) {
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            const auto& scan = static_cast<const ir::ScanNode&>(*input_node);
-            if (!registry.contains(scan.source_name())) {
-                if (const auto* deferred = exec.deferred_scan(scan.source_name());
-                    deferred != nullptr && deferred->filter == nullptr) {
-                    auto units = deferred_scan_units(*deferred);
-                    if (units.size() > 1 && scan_pipeline_worker_count(units.size()) >= 2) {
-                        physical::note_map_pipeline_executed();
-                        return build_pipelined_scan(parallel_pipeline_operators(plan), true,
-                                                    *deferred, std::move(units), scalars, externs,
-                                                    exec);
-                    }
-                }
-            }
-        }
-    }
     if (plan.migrated) {
-        // Serial mode, or a parallel plan whose run the composer hands off at
-        // its boundary. Same constructors, same per-node profile entries, same
-        // source construction (the source goes through the public
-        // build_operator, so every Scan/ExternCall streaming decision below is
-        // unchanged).
+        // Every migrated plan, both modes: the composer walks the chain and
+        // hands the morsel run off at its boundary, and that run picks its own
+        // source strategy. Same constructors, same per-node profile entries,
+        // same source construction (an input the run does not stream goes
+        // through the public build_operator, so every Scan/ExternCall decision
+        // below is unchanged).
         if (plan.mode != physical::PipelineMode::MorselParallel || !exec.parallel) {
             physical::note_map_pipeline_executed();
         }

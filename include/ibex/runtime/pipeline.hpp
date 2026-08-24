@@ -48,11 +48,17 @@ using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(
     const ExecutionContext&, const std::vector<ColumnKernelSignature>*,
     bool preserve_empty_morsels);
 
-struct MapKernelDispatch {
+/// One step of a physical map pipeline: the IR node it executes and the kernel
+/// proven able to execute it. Node and dispatch travel together because they
+/// are one decision — a step whose factory belonged to a different node was a
+/// silent possibility while the planner kept them in two vectors indexed
+/// alike.
+struct MapStep {
+    const ir::Node* node = nullptr;
     MapKernelCapability capability = MapKernelCapability::FilterGather;
     MapKernelFactory factory = nullptr;
 
-    friend auto operator==(const MapKernelDispatch&, const MapKernelDispatch&) -> bool = default;
+    friend auto operator==(const MapStep&, const MapStep&) -> bool = default;
 };
 
 /// Storage shape selected once when a physical map pipeline is constructed.

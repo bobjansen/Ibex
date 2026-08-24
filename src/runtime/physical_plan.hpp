@@ -89,8 +89,7 @@ enum class SerialOnlyReason : std::uint8_t {
 /// payloads so there is exactly one definition of each step's semantics; the
 /// plan records *shape*, the IR remains the program. Like
 /// every analysis over the IR, the plan **borrows** the IR it was lowered
-/// from and must not outlive it. `steps` is ordered top-down (sink first),
-/// matching the direction the executor composes in.
+/// from and must not outlive it.
 struct Plan {
     bool migrated = false;
     FallbackReason reason = FallbackReason::NotMapChain;
@@ -100,8 +99,9 @@ struct Plan {
     /// `MaterializedInput`. Recorded for every plan whose walk completed,
     /// migrated or not.
     const ir::Node* source_node = nullptr;
-    std::vector<const ir::Node*> steps;
-    std::vector<MapKernelDispatch> kernel_dispatch;
+    /// Ordered top-down (sink first), matching the direction the executor
+    /// composes in. Each step carries its own kernel dispatch.
+    std::vector<MapStep> steps;
     PipelineMode mode = PipelineMode::Serial;
     SerialOnlyReason serial_reason = SerialOnlyReason::NotParallelMap;
     /// Length of the leading run of steps that may execute over morsels; zero

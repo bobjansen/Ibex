@@ -110,7 +110,7 @@ TEST_CASE("Map pipeline mode follows lowered canonical IR", "[runtime][pipeline]
     REQUIRE(input != nullptr);
     CHECK(input->kind() == ir::NodeKind::Scan);
     REQUIRE(plan.parallel_steps == 1);
-    CHECK(plan.steps[0]->kind() == ir::NodeKind::FilterProject);
+    CHECK(plan.steps[0].node->kind() == ir::NodeKind::FilterProject);
 }
 
 TEST_CASE("A bare update bounds the parallel prefix", "[runtime][pipeline]") {
@@ -179,8 +179,8 @@ TEST_CASE("A parallel pipeline requires per-row work", "[runtime][pipeline]") {
         REQUIRE(runs_over_morsels(plan));
         REQUIRE(plan.parallel_steps == 2);
         // Steps are sink-first: the rename is the root, the filter below it.
-        CHECK(plan.steps[0]->kind() == ir::NodeKind::Rename);
-        CHECK(plan.steps[1]->kind() == ir::NodeKind::Filter);
+        CHECK(plan.steps[0].node->kind() == ir::NodeKind::Rename);
+        CHECK(plan.steps[1].node->kind() == ir::NodeKind::Filter);
     }
 }
 

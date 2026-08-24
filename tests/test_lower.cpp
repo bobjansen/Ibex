@@ -114,14 +114,14 @@ TEST_CASE("Map pipeline mode follows lowered canonical IR", "[runtime][pipeline]
     const ir::Node* input = runtime::physical::parallel_input_node(plan);
     REQUIRE(input != nullptr);
     CHECK(input->kind() == ir::NodeKind::Scan);
-    REQUIRE(plan.parallel_steps == 1);
+    REQUIRE(plan.parallel_step_count() == 1);
     // One fused step: the filter is the step's node, the projection rides on
     // it. The plan expresses the fusion the tree no longer carries.
     CHECK(plan.steps[0].node->kind() == ir::NodeKind::Filter);
     CHECK(plan.steps[0].fused_project != nullptr);
 }
 
-TEST_CASE("A bare update bounds the parallel prefix", "[runtime][pipeline]") {
+TEST_CASE("A bare update bounds the parallel run", "[runtime][pipeline]") {
     // An `update` is row-local, and an earlier slice did admit it here. It is
     // excluded again on measurement: an update is 1:1 and `update_table` builds
     // its output by moving the input, so a morsel island buys parallelism over
@@ -139,18 +139,25 @@ TEST_CASE("A bare update bounds the parallel prefix", "[runtime][pipeline]") {
     }
     {
         // An update above a filter does not drag the filter out of a parallel
-        // pipeline: build_operator re-plans at each node, so the filter below
-        // still forms one of its own. Modelling both halves in a single plan is
-        // Phase 3 work; until then the recursion is what finds the inner one.
+        // pipeline. One plan describes both halves: the run is the filter, the
+        // update is composed serially above it, and the source feeds it. This
+        // used to be found by re-planning at each node on the way down — the
+        // plan now says it outright.
         auto program = require_parse("df[filter price > 5][update { n = price * 2 }];");
         auto result = parser::lower(program);
         REQUIRE(result.has_value());
 
-        CHECK_FALSE(runs_over_morsels(pipeline_of(**result)));
-
-        const ir::Node* child = (**result).children().front().get();
-        REQUIRE(child != nullptr);
-        CHECK(runs_over_morsels(pipeline_of(*child)));
+        const auto plan = pipeline_of(**result);
+        REQUIRE(runs_over_morsels(plan));
+        REQUIRE(plan.steps.size() == 2);
+        CHECK(plan.steps[0].node->kind() == ir::NodeKind::Update);
+        CHECK(plan.steps[1].node->kind() == ir::NodeKind::Filter);
+        // The run starts below the update, not at the root.
+        CHECK(plan.parallel_begin == 1);
+        CHECK(plan.parallel_end == 2);
+        const ir::Node* input = runtime::physical::parallel_input_node(plan);
+        REQUIRE(input != nullptr);
+        CHECK(input->kind() == ir::NodeKind::Scan);
     }
 }
 
@@ -185,7 +192,7 @@ TEST_CASE("A parallel pipeline requires per-row work", "[runtime][pipeline]") {
 
         const auto plan = pipeline_of(**result);
         REQUIRE(runs_over_morsels(plan));
-        REQUIRE(plan.parallel_steps == 2);
+        REQUIRE(plan.parallel_step_count() == 2);
         // Steps are sink-first: the rename is the root, the filter below it.
         CHECK(plan.steps[0].node->kind() == ir::NodeKind::Rename);
         CHECK(plan.steps[1].node->kind() == ir::NodeKind::Filter);

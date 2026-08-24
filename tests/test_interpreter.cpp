@@ -8802,10 +8802,15 @@ TEST_CASE("global aggregate is deterministic across thread counts", "[agg][paral
         CHECK(got[5] == serial[5]);
         CHECK(got[6] == serial[6]);
         CHECK(got[7] == serial[7]);
-        // (1) the float reductions may re-associate, but only in the low bits.
-        CHECK(got[1] == Catch::Approx(serial[1]).epsilon(1e-12));  // sum
-        CHECK(got[2] == Catch::Approx(serial[2]).epsilon(1e-12));  // mean
-        CHECK(got[3] == Catch::Approx(serial[3]).epsilon(1e-9));   // stddev
+        // (1) and the float reductions match serial EXACTLY, not merely
+        // closely. The range is cut by row count alone, so `parallel = false`
+        // runs the same morsels the workers would have -- inline, in the same
+        // ascending order -- and re-association cannot occur. An `Approx` here
+        // would pass just as well if a schedule-dependent cut crept back in,
+        // which is the bug this file exists to catch.
+        CHECK(got[1] == serial[1]);  // sum
+        CHECK(got[2] == serial[2]);  // mean
+        CHECK(got[3] == serial[3]);  // stddev
     }
 }
 

@@ -986,6 +986,52 @@ barely touch this path, and PDS-H did not move because those queries were
 already parallel end to end — the removed gate rarely bound them. The result
 here is a capability and a simplification, not a speedup.
 
+**Concurrency-ownership inventory (2026-08-24).** Taken from the tree before
+starting Phase 3 items 1-4, since those items are phrased as "the executor is
+the only thing allowed to X" and the first question is what does X today.
+
+*Raw thread construction* — two sites, and only one is in the execution path:
+
+| Site | What it is |
+|---|---|
+| `WorkerPool` (`worker_pool.cpp:105-111`) | The shared pool itself: `std::jthread`, or `std::thread` with an explicit join where Apple's libc++ lacks jthread. Sanctioned by definition. |
+| `PipelinedStageOperator::start()` (`chunked.cpp:12280`) | One long-lived producer thread per stage, parked on the consumer's ring backpressure. Deliberately not a pool worker — it is long-lived and blocks, which a fixed-size pool cannot host — and it declares itself with `StageThreadScope` so the profiler attributes its work rather than charging the caller. |
+
+**Phase 3 item 4 ("eliminate raw-thread construction from individual
+join/builder branches") is already satisfied.** The two branch-concurrency
+sites it names are gone; what remains at those spots are comments recording why
+(`chunked.cpp:10002` and `:13066`): both overlapped a build with a materialize
+on a raw thread, both measured worse (q09 +57% then +47.5% under a budget; q10's
+~-3% did not survive widening), and both were reverted. The conclusion recorded
+there is that branch concurrency needs a cost-aware gate rather than a
+thread-count one. Item 4 should be closed by citing that, not by doing work.
+
+*Bounded producer/consumer handoffs* — three, all operator classes in
+`chunked.cpp`, plus the pool's own:
+
+| Owner | Shape |
+|---|---|
+| `ParallelIslandOperator` (class `:10670`, cvs `:10977`) | Sequence-indexed ring (`ring_` + `ring_ready_`, window 2, `released_`, `active_workers_`). Ordered reassembly by morsel sequence. |
+| `PipelinedScanOperator` (class `:11928`, cvs `:12198`) | The same shape over `expected<Chunk, string>`, ordered by unit sequence, plus worker-failure propagation and categorical state carriers. |
+| `PipelinedStageOperator` (cvs `:12385`) | **Not** a sequence ring: a `std::deque<Chunk>` FIFO capped at 2, ordered by having a single producer. Owns the raw thread above. |
+| `WorkerPool` (`worker_pool.cpp:35, 116`) | Batch-done and work-available; the pool's own machinery. |
+
+The first two are near-identical and share the invariant that actually matters
+(ordered reassembly by sequence); the third is a plain bounded queue and should
+not be merged into them just because it also has two condition variables. That
+is the shape of Phase 3 item 1: one reusable ordered-handoff component owned by
+the executor, used by the two sequence rings, with the stage's FIFO left as what
+it is.
+
+*Fan-out sites* — 41 `pool.submit` calls: `chunked.cpp` 25, `update.cpp` 7,
+`kernel_update.cpp` 4, and one each in `aggregate/join/filter/sort/lazy_table`.
+These are not handoffs, but they are where DOP is seized, so they are item 2's
+surface. The current policy is outermost-wins, enforced rather than documented:
+`WorkerPool::submit` calls `invariant_violation` if called from a pool thread
+(`worker_pool.cpp:406-411`), and 29 call sites ask `on_worker_pool_thread()`
+first and run serially instead. Any budget work has to keep that check working,
+because it is what makes nested parallelism a crash rather than a deadlock.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 

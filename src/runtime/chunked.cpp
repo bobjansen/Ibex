@@ -13119,14 +13119,14 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("join node expects exactly two children");
         }
         // The plan decides; this reads its decision. `plan_join` relays the same
-        // three gates the branches below used to call, so the routing is
-        // identical by construction -- what changes is where the decision lives.
+        // three gates the branches below used to call, and names WHICH one
+        // answered, so the routing is identical by construction and this seam
+        // infers nothing -- it dispatches on the branch the planner chose.
         // The sides come from the plan too: which side builds is a cost
         // question, and the day it stops being "textual right" it should change
         // in the planner without this seam noticing.
         const physical::JoinPlan& jp = plan.join;
-        const bool streams = jp.strategy == physical::JoinStrategy::StreamingProbe;
-        if (streams && (jp.kind == ir::JoinKind::Semi || jp.kind == ir::JoinKind::Anti)) {
+        if (jp.branch == physical::JoinBranch::SemiAnti) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             // Multiple producers: tried the same overlap the inner-join site
@@ -13162,7 +13162,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // one implementation that has it keeps a single definition of the
         // semantics -- and leaves this hot path bit-for-bit unchanged for every
         // join that does not ask for it.
-        if (streams && jp.key_count == 1) {
+        if (jp.branch == physical::JoinBranch::SingleKeyInner) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             // A deferred probe scan must not be interpreted here — the join
@@ -13212,7 +13212,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // exactly like the single-key branch above; see
         // `ChunkedInnerJoinOperator::resolve_deferred_probe_pair` for the
         // one-component filter this POC pushes into the scan.
-        if (streams && jp.key_count == 2) {
+        if (jp.branch == physical::JoinBranch::PairIntInner) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             const auto probe = deferred_probe_scan_of(*join.children()[1], exec);

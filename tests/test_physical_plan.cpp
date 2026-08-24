@@ -615,6 +615,7 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
     // being wrong is still free. A temporary assertion at the seam compared the
     // two on all 1754 tests and all 22 PDS-H queries (59 joins) with zero
     // disagreements; these cases are the readable subset that survives it.
+    using runtime::physical::JoinBranch;
     using runtime::physical::JoinDeclineReason;
     using runtime::physical::JoinStrategy;
 
@@ -654,13 +655,31 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
             "(a as DataFrame<{ k1: Int64, k2: Int64 }> "
             " join b as DataFrame<{ k1: Int64, k2: Int64 }> on { k1, k2 });");
         CHECK(plan.strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan.branch == JoinBranch::PairIntInner);
         CHECK(plan.decline == JoinDeclineReason::None);
         CHECK(plan.key_count == 2);
     }
 
     SECTION("semi and anti stream on the same terms") {
-        CHECK(plan_of("(a semi join b on k);").strategy == JoinStrategy::StreamingProbe);
-        CHECK(plan_of("(a anti join b on k);").strategy == JoinStrategy::StreamingProbe);
+        CHECK(plan_of("(a semi join b on k);").branch == JoinBranch::SemiAnti);
+        CHECK(plan_of("(a anti join b on k);").branch == JoinBranch::SemiAnti);
+    }
+
+    SECTION("the branch is named, so the seam never infers it from key count") {
+        // The seam dispatches on this. It used to deduce the operator from
+        // `key_count == 1` vs `== 2`, which held only while StreamingProbe
+        // implied a full gate had passed -- a coupling nothing would have
+        // reported if a later gate broke it.
+        CHECK(plan_of("(a join b on k);").branch == JoinBranch::SingleKeyInner);
+        CHECK(plan_of("(a left join b on k);").branch == JoinBranch::None);
+        // None exactly when both sides materialize, in both directions.
+        for (const char* src : {"(a join b on k);", "(a semi join b on k);",
+                                "(a left join b on k);", "(a join b on x < y);"}) {
+            CAPTURE(src);
+            const auto plan = plan_of(src);
+            CHECK((plan.branch == JoinBranch::None) ==
+                  (plan.strategy == JoinStrategy::MaterializeBoth));
+        }
     }
 
     SECTION("every decline is named, not a bare conjunction") {
@@ -694,7 +713,7 @@ TEST_CASE("The plan describes a join it does not execute yet", "[physical][join]
         CHECK(plan.join.describes);
         const std::string text = runtime::physical::explain_physical(plan);
         CHECK(text.find("MaterializedCall") != std::string::npos);
-        CHECK(text.find("Join(StreamingProbe keys=1") != std::string::npos);
+        CHECK(text.find("Join(StreamingProbe branch=SingleKeyInner keys=1") != std::string::npos);
     }
 }
 

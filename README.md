@@ -12,6 +12,32 @@ including the separate MIT attribution for Poorman-derived Ibex test material.
 Small pull requests are welcome under the contribution terms in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Start the browser UI from a release
+
+The release archive is self-contained: keep the `bin/`, `bin/ui/`, and
+`plugins/` directories together after extracting it. The commands below work
+for a new user without Node.js or a source checkout.
+
+On Linux or macOS:
+
+```bash
+cd ibex-<version>
+IBEX_LIBRARY_PATH="$PWD/plugins" ./bin/ibex ui --data-dir .
+```
+
+On Windows PowerShell:
+
+```powershell
+cd ibex-<version>
+$env:IBEX_LIBRARY_PATH = "$PWD/plugins"
+.\bin\ibex.exe ui --data-dir .
+```
+
+Open the printed `http://127.0.0.1:8765` address in a browser. The UI assets
+are bundled at `bin/ui`; Node.js is only needed when building Ibex from source.
+The `--data-dir` directory is the sandbox the UI can read and write. Press
+Ctrl+C in the terminal to stop the server.
+
 Notable language features:
   - compact bracket syntax for filtering, selecting, updating, grouping, ordering, joining, and reshaping tables
   - excellent columnar execution, with parallelism for eligible large operations
@@ -790,7 +816,8 @@ It prints a loopback URL (by default `http://127.0.0.1:8765`). The UI keeps one
 REPL session per browser session, shows tables and schemas in an Environment
 pane, supports `Ctrl/Cmd+Enter` to run the editor, and pages result rows so a
 query never sends an unbounded result set to the browser. The bundled UI is
-built with the normal CMake build and requires Node.js/npm. On Linux, the UI is
+included in release archives; Node.js/npm is only required when building it
+from source. On Linux, the UI is
 confined with Landlock to `--data-dir`; when that option is omitted, its data
 access is confined to the directory from which it was launched. Configured
 plugin directories remain readable (but not writable) so bundled imports such

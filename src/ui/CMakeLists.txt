@@ -50,3 +50,11 @@ add_custom_command(
     VERBATIM
 )
 add_custom_target(ibex_ui_assets DEPENDS "${IBEX_UI_INDEX}")
+
+# Keep the installed layout identical to the build-tree layout. The `ibex`
+# executable resolves its default web root relative to its own directory, so
+# an installed/released binary must have its bundled assets at `bin/ui`.
+install(
+    DIRECTORY "${IBEX_UI_OUTPUT_DIR}/"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}/ui"
+)

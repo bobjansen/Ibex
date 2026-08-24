@@ -10,6 +10,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="./styles.css" />
   <script src="./code-copy.js" defer></script>
+  <script src="./repl-demo.js" defer></script>
 </head>
 <body>
 <main class="page">
@@ -48,6 +49,36 @@
       <span><strong>Fast</strong> execution</span>
       <span><strong>Interactive</strong> and <strong>compiled</strong>
         workflows</span>
+    </div>
+  </section>
+
+  <!-- Interactive REPL -->
+  <section class="section repl-showcase" aria-labelledby="repl-demo-title">
+    <div class="repl-copy">
+      <p class="section-label">Explore</p>
+      <h2 id="repl-demo-title">Try the thought, see the table</h2>
+      <p class="section-sub">
+        Ibex is designed for interactive data exploration. Type a pipeline into
+        the REPL, evaluate the result, adjust your code, and repeat.
+      </p>
+      <p class="section-sub">
+        The same pipeline can run in a notebook, script, or compiled binary
+        unchanged, without switching languages or API.
+      </p>
+      <p class="section-sub">
+        This session groups 10 million generated ticks and shows the actual
+        output and measured runtime on my workstation.
+      </p>
+      <p class="repl-caption">Sample captured locally using <code>:timing
+        on</code> in the REPL: 10M generated ticks. Timings vary by machine and
+      run.</p>
+    </div>
+    <div class="repl-terminal" data-repl-demo aria-label="Animated Ibex REPL session">
+      <div class="terminal-titlebar">
+        <span>ibex — interactive session</span>
+        <button class="terminal-replay" type="button" data-repl-replay>Replay</button>
+      </div>
+      <pre class="terminal-output" data-repl-output></pre>
     </div>
   </section>
 
@@ -166,7 +197,7 @@
 <pre><code><span class="cm"># Unpack the archive for your platform, then:</span>
 ./ibex --plugin-path ./plugins</code></pre>
 <pre><code><span class="kw">import</span> <span class="str">"data_gen"</span>;
-<span class="kw">let</span> ticks = <span class="fn-name">data_gen</span>(<span class="num">100</span>);
+<span class="kw">let</span> ticks = <span class="fn-name">gen_ticks</span>(<span class="num">100</span>);
 
 <span class="cm">// Order symbols by total volume</span>
 ticks[

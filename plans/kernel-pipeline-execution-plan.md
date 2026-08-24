@@ -229,6 +229,61 @@ to make every node universally streaming:
   preserves rich operators (median, quantile, EWMA, predicates, reshape, etc.)
   until a physical implementation is complete.
 
+## Where this stands, and what is left (2026-08-24)
+
+One ordered list, because the per-phase status below is spread across five
+sections and the headline number (97% of real-work nodes described by the plan)
+flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
+
+**Done.**
+
+* Phase 1 — physical plan exists and is inspectable.
+* Phase 2 — map kernels ported, fusion is physical, fused node kinds retired as
+  an execution concern. `KernelContext` deliberately not built: its stated
+  trigger (one shared scratch/cancellation owner) is still unmet.
+* Phase 3 items 1, 3, 4 — one ordered handoff owned by the executor, islands
+  dissolved into a pipeline mode, no raw-thread branch concurrency.
+* Phase 4 construction ownership — every breaker PDS-H reaches is built from
+  the plan. Backlog 116 -> 6 breakers.
+
+**Next, in the order I would take them.**
+
+1. **Phase 4 decomposition — the actual item 1-2.** Split the join into
+   `HashBuild` + `HashProbe` across a barrier, and the aggregate into
+   discovery / per-partition slots / final ordering / emission. This is the
+   half that changes operators rather than their constructors, and the only
+   one that unlocks a probe fusing into a map pipeline, one build feeding
+   several probes, or per-phase scheduling. Everything below is smaller.
+   Constraint inherited from `e07445ca`: any partition-owned aggregate must
+   keep the merge order thread-count-invariant — serial, one core and eight
+   must agree bit for bit, and the determinism test asserts exact equality.
+2. **Port `Tail`, `TopK`, `FilterHead`, `FilterTail`.** Same single-operator
+   shape as Order/Head/Distinct, half an hour each, and it removes the
+   asymmetry of ported and unported siblings sharing one switch.
+3. **Phase 5 item 1 — split `chunked.cpp` by ownership.** It is ~13k lines and
+   now holds planner-owned builders next to the per-kind switch they replaced;
+   the split is easier the more of Phase 4 has landed, not less.
+4. **Sweep the process-global plan counters in tests.** One test
+   ("Fallback queries keep their existing executor") was PASSING while its
+   premise was false, because `physical_materialized_calls` is process-wide and
+   other tests in the same binary bump it. ctest never flagged it. Others may
+   lean on the same counters the same way.
+5. **Phase 3 item 5 — per-pipeline scheduling accounting.** Small, and worth
+   more after (1) gives it phases to attribute to.
+6. **Phase 3 item 2 — DOP/memory budgets.** Analysed and blocked, see
+   `phase3-dop-budget-analysis.md`: the pool is 65% idle with nothing queued,
+   so a budget rations a resource that is not scarce. Reopen only when a
+   multi-producer change needs it, or if `profile_suite.py` starts showing
+   queues.
+
+**Deliberately not doing.**
+
+* Porting the 6 materializing joins. They are the explicit `MaterializedCall`
+  the plan wants, not a gap.
+* A cost model for join build-side selection. Real (it is q12's diagnosed
+  regression) but it is a planner-quality question, not a migration one, and
+  `plan_join` records today's choice rather than pretending to make one.
+
 ## Migration phases
 
 ### Phase 0 — freeze contracts and gain observability
@@ -1180,19 +1235,74 @@ Re-run the numbers before starting each item rather than trusting this table.
 Order is driven by measured serial time and semantic completeness, not by
 operator count.
 
-1. **Hash join:** migrate the existing supported single-key/two-Int64-key
-   streaming paths as `HashBuild + HashProbe`; retain all other join semantics
-   behind `MaterializedCall`.
-2. **Hash aggregate:** migrate the current partition-owned paths and express
-   discovery, per-partition slots, final ordering, and output emission as
-   distinct physical phases. Keep median/quantile/EWMA fallback explicit.
-3. **Distinct and ordered operations:** use the established kernel/selection
-   library; migrate only where their global state has a complete contract.
+**Status (2026-08-24): ownership done, decomposition not started.** These two
+halves are separated deliberately, because the first is easily mistaken for the
+second and the measured backlog only reports the first.
+
+*What landed.* The physical plan decides and a plan-owned builder constructs,
+for every breaker PDS-H reaches:
+
+| kind | before | after | commit |
+|---|---|---|---|
+| Join (streaming) | 59 | 6 | `f5610646` |
+| Aggregate | 30 | 0 | `902d6941` |
+| Order | 18 | 0 | `ececc75f` |
+| Head, Distinct | 9 | 0 | `49ca33c1` |
+
+Plans 233, pipelines 70 -> 180, fallbacks 163 -> 53 (47 of them bare `Scan`
+with nothing to migrate). So the plan describes **180 of the 186 nodes carrying
+real work, 97%**, against 38% when the backlog was first measured. The
+remaining 6 are materializing joins, unported on purpose: they carry semantics
+the streaming operators do not implement (`nulls equal`, `expect`, non-equi
+predicates), so porting them means porting the semantics, not the construction.
+
+*What did NOT land, and is what items 1-2 actually ask for.* The operators are
+unchanged. A join is still one `ChunkedInnerJoinOperator`, not a `HashBuild`
+feeding a separate `HashProbe` across a barrier; the aggregate is still one
+operator, not discovery / per-partition slots / final ordering / emission as
+distinct phases. Consequences that are invisible in the backlog number:
+
+* a probe cannot be a step inside a map pipeline, so it cannot fuse with the
+  filters or projections above it;
+* one build cannot feed several probes;
+* the aggregate's phases cannot be scheduled or measured separately, which is
+  what [[project_high_cardinality_groupby_gap]] and the partition-owned work
+  need.
+
+The exit criterion below is therefore NOT met. "Inspectable physical plans" is
+satisfied; "fast paths no longer depend on special builder branches" is not --
+the branches moved into `build_physical_join` / `build_physical_aggregate`
+rather than dissolving into pipeline stages.
+
+*Method note, since it decided the outcome twice.* Each port ran: name the
+builder's own predicates and de-duplicate them; have the planner RELAY them;
+have the seam consume the plan; move construction. Writing a planner that
+restates the gates instead of relaying them produced a wrong classification
+within the hour (`plan_join` and two-key Int64 joins, `6de3956d`), and an
+equivalence probe built from the same reading agreed with the mistake. Order,
+Head and Distinct skipped the first three steps because they have no
+eligibility gate at all -- a one-valued strategy enum would be the ceremony the
+risk table warns about.
+
+1. **Hash join:** ~~migrate the supported single-key/two-Int64-key streaming
+   paths~~ (construction: DONE, `f5610646`) — express them as `HashBuild +
+   HashProbe` across a barrier: NOT STARTED. All other join semantics remain
+   behind `MaterializedCall`, which is the intended end state for them.
+2. **Hash aggregate:** ~~migrate the current paths~~ (construction: DONE,
+   `902d6941`) — express discovery, per-partition slots, final ordering and
+   emission as distinct physical phases: NOT STARTED. Median/quantile/EWMA
+   fallback is explicit and still counted.
+3. **Distinct and ordered operations:** construction DONE (`ececc75f`,
+   `49ca33c1`). `Tail`, `TopK`, `FilterHead` and `FilterTail` are the same
+   single-operator shape and are NOT ported, so they now sit in the per-kind
+   switch beside ported siblings — an asymmetry worth closing cheaply.
 4. Delete the corresponding `chunked.cpp` classes only after the physical path
    handles every previously supported shape and the fallback is mutation-tested.
+   Blocked on 1-2: the classes are still the implementation.
 
-Exit: q09/q18/q20-shaped plans have inspectable physical plans and their
-existing fast paths no longer depend on special builder branches.
+Exit (unchanged, and not yet met): q09/q18/q20-shaped plans have inspectable
+physical plans and their existing fast paths no longer depend on special
+builder branches.
 
 ### Phase 5 — retire the monolith and simplify IR
 

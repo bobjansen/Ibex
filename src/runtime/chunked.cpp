@@ -4063,7 +4063,6 @@ class ChunkedInnerJoinOperator final : public Operator {
 
     static constexpr std::size_t kNil = std::numeric_limits<std::size_t>::max();
 
-    const ValidityBitmap* build_validity_ = nullptr;  // null → build key has no nulls
     const ValidityBitmap* probe_validity_ = nullptr;  // reset per probe chunk
     // Build-on-right is preferred when right is small enough that probing
     // it from streaming left chunks is cache-friendly. Above this, we
@@ -4091,7 +4090,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (rkey == nullptr) {
             return "join key not found in right table: " + right_key_name;
         }
-        if (auto err = detect_key_kind(*rkey, key_kind_)) {
+        if (auto err = detect_key_kind(*rkey, index_.key_kind)) {
             return err;
         }
 
@@ -4371,7 +4370,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     void build_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
                           const ValidityBitmap* v0, const ValidityBitmap* v1) {
         const std::size_t n = col0.size();
-        chain_next_.assign(n, kNil);
+        index_.chain_next.assign(n, kNil);
         pair_heads_.reserve(n);
         const auto* d0 = col0.data();
         const auto* d1 = col1.data();
@@ -4382,9 +4381,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             PairKey key{static_cast<std::uint64_t>(d0[r]), static_cast<std::uint64_t>(d1[r])};
             auto [it, inserted] = pair_heads_.try_emplace(key, r);
             if (!inserted) {
-                chain_next_[r] = it->second;
+                index_.chain_next[r] = it->second;
                 it->second = r;
-                build_unique_ = false;
+                index_.unique = false;
             }
         }
     }
@@ -4407,16 +4406,16 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (it == pair_heads_.end()) {
                     continue;
                 }
-                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = it->second; cur != kNil; cur = index_.chain_next[cur]) {
                     out_l.push_back(l);
                     out_r.push_back(cur);
                 }
             }
         };
         if (probe_ranges_parallel(n, li, ri, scan)) {
-            return build_unique_ && li.size() == n;
+            return index_.unique && li.size() == n;
         }
-        if (build_unique_) {
+        if (index_.unique) {
             li.resize(n);
             ri.resize(n);
             std::size_t* lp = li.data();
@@ -4450,7 +4449,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             while (cur != kNil) {
                 li.push_back(l);
                 ri.push_back(cur);
-                cur = chain_next_[cur];
+                cur = index_.chain_next[cur];
             }
         }
         return false;
@@ -4615,7 +4614,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::nullopt;
         }
 
-        key_kind_ = ExprType::Int;
+        index_.key_kind = ExprType::Int;
         if (auto err = build_index(build, keys_->front().left)) {
             return err;
         }
@@ -4639,12 +4638,12 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (key_validity != nullptr && !(*key_validity)[i]) {
                     continue;
                 }
-                const auto it = i64_heads_.find(key_data[i]);
-                if (it == i64_heads_.end()) {
+                const auto it = index_.i64_heads.find(key_data[i]);
+                if (it == index_.i64_heads.end()) {
                     continue;
                 }
                 hits.push_back(SwappedHit{.rrow = i, .head = it->second});
-                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = it->second; cur != kNil; cur = index_.chain_next[cur]) {
                     ++total;
                 }
             }
@@ -4704,7 +4703,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (gathered_out != nullptr) {
                     gathered_out[h] = key_data[hit.rrow];
                 }
-                for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = hit.head; cur != kNil; cur = index_.chain_next[cur]) {
                     li[pos] = cur;
                     ri[pos] = h;
                     ++pos;
@@ -4880,56 +4879,56 @@ class ChunkedInnerJoinOperator final : public Operator {
         // never looked up. Both halves are needed: a null cell holds the type's
         // zero value, so a null probe key would otherwise find a genuine `0`.
         const auto* build_entry = build_side.find_entry(key_name);
-        build_validity_ = build_entry != nullptr && build_entry->validity.has_value()
+        index_.validity = build_entry != nullptr && build_entry->validity.has_value()
                               ? &*build_entry->validity
                               : nullptr;
         const std::size_t n = build_side.rows();
-        chain_next_.assign(n, kNil);
+        index_.chain_next.assign(n, kNil);
 
-        if (key_kind_ == ExprType::Int) {
+        if (index_.key_kind == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(key);
             if (col == nullptr)
                 return "inner join: build-side key type mismatch";
-            build_scalar(*col, i64_heads_);
-        } else if (key_kind_ == ExprType::Double) {
+            build_scalar(*col, index_.i64_heads);
+        } else if (index_.key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr)
                 return "inner join: build-side key type mismatch";
-            build_scalar(*col, f64_heads_);
-        } else if (key_kind_ == ExprType::Bool) {
+            build_scalar(*col, index_.f64_heads);
+        } else if (index_.key_kind == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(key);
             if (col == nullptr)
                 return "inner join: build-side key type mismatch";
-            bool_heads_.reserve(n);
+            index_.bool_heads.reserve(n);
             for (std::size_t r = n; r-- > 0;) {
                 const bool v = (*col)[r];
-                auto [it, inserted] = bool_heads_.try_emplace(v, r);
+                auto [it, inserted] = index_.bool_heads.try_emplace(v, r);
                 if (!inserted) {
-                    chain_next_[r] = it->second;
+                    index_.chain_next[r] = it->second;
                     it->second = r;
-                    build_unique_ = false;
+                    index_.unique = false;
                 }
             }
-        } else if (key_kind_ == ExprType::Date) {
+        } else if (index_.key_kind == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(key);
             if (col == nullptr)
                 return "inner join: build-side key type mismatch";
-            build_scalar(*col, date_heads_);
-        } else if (key_kind_ == ExprType::Timestamp) {
+            build_scalar(*col, index_.date_heads);
+        } else if (index_.key_kind == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(key);
             if (col == nullptr)
                 return "inner join: build-side key type mismatch";
-            build_scalar(*col, ts_heads_);
-        } else if (key_kind_ == ExprType::String) {
+            build_scalar(*col, index_.ts_heads);
+        } else if (index_.key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
-                string_heads_.reserve(n);
+                index_.string_heads.reserve(n);
                 for (std::size_t r = n; r-- > 0;) {
                     auto code = static_cast<std::size_t>(c_cat->code_at(r));
                     insert_chain_sv(std::string_view{dict[code]}, r);
                 }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
-                string_heads_.reserve(n);
+                index_.string_heads.reserve(n);
                 for (std::size_t r = n; r-- > 0;) {
                     insert_chain_sv((*c_str)[r], r);
                 }
@@ -4953,15 +4952,15 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
             auto [it, inserted] = heads.try_emplace(data[r], r);
             if (!inserted) {
-                chain_next_[r] = it->second;
+                index_.chain_next[r] = it->second;
                 it->second = r;
-                build_unique_ = false;
+                index_.unique = false;
             }
         }
     }
 
     [[nodiscard]] auto build_is_null(std::size_t row) const noexcept -> bool {
-        return build_validity_ != nullptr && !(*build_validity_)[row];
+        return index_.validity != nullptr && !(*index_.validity)[row];
     }
     [[nodiscard]] auto probe_is_null(std::size_t row) const noexcept -> bool {
         return probe_validity_ != nullptr && !(*probe_validity_)[row];
@@ -4971,11 +4970,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (build_is_null(r)) {
             return;
         }
-        auto [it, inserted] = string_heads_.try_emplace(sv, r);
+        auto [it, inserted] = index_.string_heads.try_emplace(sv, r);
         if (!inserted) {
-            chain_next_[r] = it->second;
+            index_.chain_next[r] = it->second;
             it->second = r;
-            build_unique_ = false;
+            index_.unique = false;
         }
     }
 
@@ -5057,7 +5056,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// parallel path declines and the caller should run its serial loop.
     ///
     /// **This is the join's only parallel axis, and it is the whole of it.**
-    /// The build side is a shared read-only hash index — `heads`, `chain_next_`
+    /// The build side is a shared read-only hash index — `heads`, `index_.chain_next`
     /// — so probing it concurrently needs no locking at all, and the build
     /// itself is not worth threading: it is 1.5% of q10 against the probe and
     /// output assembly's ~15%.
@@ -5193,14 +5192,14 @@ class ChunkedInnerJoinOperator final : public Operator {
                     continue;
                 }
                 hits.push_back(SwappedHit{.rrow = r, .head = head});
-                for (std::size_t cur = head; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = head; cur != kNil; cur = index_.chain_next[cur]) {
                     ++total;
                 }
             }
         };
         const auto replay = [&](const std::vector<SwappedHit>& hits, std::size_t pos) {
             for (const SwappedHit& hit : hits) {
-                for (std::size_t cur = hit.head; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = hit.head; cur != kNil; cur = index_.chain_next[cur]) {
                     li[pos] = cur;
                     ri[pos] = hit.rrow;
                     ++pos;
@@ -5272,7 +5271,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (it == heads.end()) {
                     continue;
                 }
-                for (std::size_t cur = it->second; cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = it->second; cur != kNil; cur = index_.chain_next[cur]) {
                     out_l.push_back(l);
                     out_r.push_back(cur);
                 }
@@ -5282,9 +5281,9 @@ class ChunkedInnerJoinOperator final : public Operator {
             // `li_identity` means li == 0..n-1, which for a unique build side
             // is exactly "every row matched" — the same test the serial path
             // makes, just recovered from the totals.
-            return build_unique_ && li.size() == n;
+            return index_.unique && li.size() == n;
         }
-        if (build_unique_) {
+        if (index_.unique) {
             li.resize(n);
             ri.resize(n);
             std::size_t* lp = li.data();
@@ -5318,7 +5317,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             while (cur != kNil) {
                 li.push_back(l);
                 ri.push_back(cur);
-                cur = chain_next_[cur];
+                cur = index_.chain_next[cur];
             }
         }
         return false;
@@ -5336,16 +5335,16 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (probe_is_null(l)) {
                     continue;
                 }
-                for (std::size_t cur = head_of(l); cur != kNil; cur = chain_next_[cur]) {
+                for (std::size_t cur = head_of(l); cur != kNil; cur = index_.chain_next[cur]) {
                     out_l.push_back(l);
                     out_r.push_back(cur);
                 }
             }
         };
         if (probe_ranges_parallel(n, li, ri, scan)) {
-            return build_unique_ && li.size() == n;
+            return index_.unique && li.size() == n;
         }
-        if (build_unique_) {
+        if (index_.unique) {
             li.resize(n);
             ri.resize(n);
             std::size_t* lp = li.data();
@@ -5375,7 +5374,7 @@ class ChunkedInnerJoinOperator final : public Operator {
             while (cur != kNil) {
                 li.push_back(l);
                 ri.push_back(cur);
-                cur = chain_next_[cur];
+                cur = index_.chain_next[cur];
             }
         }
         return false;
@@ -5394,11 +5393,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     // stale memo would silently join against the wrong rows. |dict| lookups
     // per chunk is noise next to |chunk rows|.
     void resolve_categorical_heads(const std::vector<std::string>& dict) {
-        code_heads_.assign(dict.size(), kNil);
+        index_.code_heads.assign(dict.size(), kNil);
         for (std::size_t c = 0; c < dict.size(); ++c) {
-            if (auto it = string_heads_.find(std::string_view{dict[c]});
-                it != string_heads_.end()) {
-                code_heads_[c] = it->second;
+            if (auto it = index_.string_heads.find(std::string_view{dict[c]});
+                it != index_.string_heads.end()) {
+                index_.code_heads[c] = it->second;
             }
         }
     }
@@ -5423,46 +5422,46 @@ class ChunkedInnerJoinOperator final : public Operator {
         ri.reserve(n);
         bool li_identity = false;
 
-        if (key_kind_ == ExprType::Int) {
+        if (index_.key_kind == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
             li_identity =
-                probe_scalar(i64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (key_kind_ == ExprType::Double) {
+                probe_scalar(index_.i64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (index_.key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
             li_identity =
-                probe_scalar(f64_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (key_kind_ == ExprType::Bool) {
+                probe_scalar(index_.f64_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (index_.key_kind == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
-            li_identity =
-                probe_scalar(bool_heads_, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
-        } else if (key_kind_ == ExprType::Date) {
+            li_identity = probe_scalar(
+                index_.bool_heads, n, [&](std::size_t i) { return (*col)[i]; }, li, ri);
+        } else if (index_.key_kind == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
             li_identity =
-                probe_scalar(date_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (key_kind_ == ExprType::Timestamp) {
+                probe_scalar(index_.date_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (index_.key_kind == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(key);
             if (col == nullptr) {
                 return std::unexpected("inner join: left key type mismatch");
             }
             const auto* data = col->data();
             li_identity =
-                probe_scalar(ts_heads_, n, [&](std::size_t i) { return data[i]; }, li, ri);
-        } else if (key_kind_ == ExprType::String) {
+                probe_scalar(index_.ts_heads, n, [&](std::size_t i) { return data[i]; }, li, ri);
+        } else if (index_.key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
                 const auto& dict = c_cat->dictionary();
                 // Resolving the dictionary costs |dict| hash lookups and saves
@@ -5475,12 +5474,12 @@ class ChunkedInnerJoinOperator final : public Operator {
                     li_identity = probe_resolved(
                         n,
                         [&](std::size_t i) {
-                            return code_heads_[static_cast<std::size_t>(c_cat->code_at(i))];
+                            return index_.code_heads[static_cast<std::size_t>(c_cat->code_at(i))];
                         },
                         li, ri);
                 } else {
                     li_identity = probe_scalar(
-                        string_heads_, n,
+                        index_.string_heads, n,
                         [&](std::size_t i) {
                             return std::string_view{
                                 dict[static_cast<std::size_t>(c_cat->code_at(i))]};
@@ -5489,7 +5488,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                 }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
                 li_identity = probe_scalar(
-                    string_heads_, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
+                    index_.string_heads, n, [&](std::size_t i) { return (*c_str)[i]; }, li, ri);
             } else {
                 return std::unexpected("inner join: left key type mismatch");
             }
@@ -5552,42 +5551,42 @@ class ChunkedInnerJoinOperator final : public Operator {
         // `resolve_categorical_heads`.
         auto do_phase1_resolved = [&](auto&& head_at) { probe_swapped(n_right, head_at, li, ri); };
 
-        if (key_kind_ == ExprType::Int) {
+        if (index_.key_kind == ExprType::Int) {
             const auto* col = std::get_if<Column<std::int64_t>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            do_phase1([&](std::size_t r) { return data[r]; }, i64_heads_);
-        } else if (key_kind_ == ExprType::Double) {
+            do_phase1([&](std::size_t r) { return data[r]; }, index_.i64_heads);
+        } else if (index_.key_kind == ExprType::Double) {
             const auto* col = std::get_if<Column<double>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            do_phase1([&](std::size_t r) { return data[r]; }, f64_heads_);
-        } else if (key_kind_ == ExprType::Bool) {
+            do_phase1([&](std::size_t r) { return data[r]; }, index_.f64_heads);
+        } else if (index_.key_kind == ExprType::Bool) {
             const auto* col = std::get_if<Column<bool>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
-            do_phase1([&](std::size_t r) { return (*col)[r]; }, bool_heads_);
-        } else if (key_kind_ == ExprType::Date) {
+            do_phase1([&](std::size_t r) { return (*col)[r]; }, index_.bool_heads);
+        } else if (index_.key_kind == ExprType::Date) {
             const auto* col = std::get_if<Column<Date>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            do_phase1([&](std::size_t r) { return data[r]; }, date_heads_);
-        } else if (key_kind_ == ExprType::Timestamp) {
+            do_phase1([&](std::size_t r) { return data[r]; }, index_.date_heads);
+        } else if (index_.key_kind == ExprType::Timestamp) {
             const auto* col = std::get_if<Column<Timestamp>>(rkey);
             if (col == nullptr)
                 return std::unexpected("inner join: right key type mismatch");
             const auto* data = col->data();
-            do_phase1([&](std::size_t r) { return data[r]; }, ts_heads_);
-        } else if (key_kind_ == ExprType::String) {
+            do_phase1([&](std::size_t r) { return data[r]; }, index_.ts_heads);
+        } else if (index_.key_kind == ExprType::String) {
             if (const auto* c_cat = std::get_if<Column<Categorical>>(rkey)) {
                 const auto& dict = c_cat->dictionary();
                 if (dict.size() < n_right) {
                     resolve_categorical_heads(dict);
                     do_phase1_resolved([&](std::size_t r) {
-                        return code_heads_[static_cast<std::size_t>(c_cat->code_at(r))];
+                        return index_.code_heads[static_cast<std::size_t>(c_cat->code_at(r))];
                     });
                 } else {
                     do_phase1(
@@ -5595,10 +5594,10 @@ class ChunkedInnerJoinOperator final : public Operator {
                             return std::string_view{
                                 dict[static_cast<std::size_t>(c_cat->code_at(r))]};
                         },
-                        string_heads_);
+                        index_.string_heads);
                 }
             } else if (const auto* c_str = std::get_if<Column<std::string>>(rkey)) {
-                do_phase1([&](std::size_t r) { return (*c_str)[r]; }, string_heads_);
+                do_phase1([&](std::size_t r) { return (*c_str)[r]; }, index_.string_heads);
             } else {
                 return std::unexpected("inner join: right key type mismatch");
             }
@@ -5793,25 +5792,46 @@ class ChunkedInnerJoinOperator final : public Operator {
 
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
-    ExprType key_kind_ = ExprType::Int;
 
     // Hash index on the build side (right in Stream, left in Swapped).
-    bool build_unique_ = true;
-    std::vector<std::size_t> chain_next_;
     // Probe-chunk dictionary code -> build chain head (kNil = no match).
     // Rebuilt per chunk by resolve_categorical_heads.
-    std::vector<std::size_t> code_heads_;
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads_;
-    robin_hood::unordered_flat_map<double, std::size_t> f64_heads_;
-    robin_hood::unordered_flat_map<bool, std::size_t> bool_heads_;
-    robin_hood::unordered_flat_map<Date, std::size_t> date_heads_;
-    robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads_;
-    robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
-        string_heads_;
     // Two-fixed-width-int-key path (see `initialize_pair`): both key values
     // pack into one 128-bit-ish struct, injective with no knowledge of their
     // domains -- same trick as the aggregate's own `PairIntKey`, but this is a
     // separate type since the two classes don't share member scope.
+    /// Everything a hash build produces and a hash probe consumes: the chained
+    /// index over one side's key column, plus what the probe needs to interpret
+    /// it. Gathered into one type so the two phases can eventually be separate
+    /// operators with this passed between them -- Phase 4's `HashBuild` and
+    /// `HashProbe` -- rather than loose members only one class can reach.
+    ///
+    /// Still a member of the operator today: naming the boundary is what makes
+    /// the split possible, and doing that first keeps the split itself from
+    /// also being a hunt for which fields belong on which side.
+    struct HashIndex {
+        ExprType key_kind = ExprType::Int;
+        /// False once any key repeats: the probe can skip chain walking when a
+        /// build side is unique.
+        bool unique = true;
+        /// Row -> next row with the same key, `kNil` at the end of a chain.
+        std::vector<std::size_t> chain_next;
+        /// Head row per key, one map per key representation.
+        std::vector<std::size_t> code_heads;
+        robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads;
+        robin_hood::unordered_flat_map<double, std::size_t> f64_heads;
+        robin_hood::unordered_flat_map<bool, std::size_t> bool_heads;
+        robin_hood::unordered_flat_map<Date, std::size_t> date_heads;
+        robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads;
+        robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
+            string_heads;
+        /// Borrowed from the build table; null when the key column has no
+        /// nulls. A null key matches nothing, so null build rows are never
+        /// indexed and null probe rows are never looked up.
+        const ValidityBitmap* validity = nullptr;
+    };
+    HashIndex index_;
+
     bool pair_mode_ = false;
     struct PairKey {
         std::uint64_t a = 0;

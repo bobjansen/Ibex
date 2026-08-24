@@ -55,7 +55,7 @@ enum class FallbackReason : std::uint8_t {
 
 /// How a migrated pipeline may execute. This is the plan's answer to "may the
 /// morsel executor run this", decided once during lowering from the same rules
-/// that used to live in the island analysis — a pipeline that carries its own
+/// that used to live in the pipeline analysis — a pipeline that carries its own
 /// mode is what lets parallel execution become a mode of a pipeline rather than
 /// a second executor with its own analysis.
 enum class PipelineMode : std::uint8_t {
@@ -72,7 +72,7 @@ enum class SerialOnlyReason : std::uint8_t {
     /// No leading step is a `ParallelMap` — a bare row-local `Update` is the
     /// case that matters. It is a map step, and deliberately not a parallel
     /// one: an update is 1:1 and splits its field computation inside the
-    /// operator, so a morsel island would buy two whole-table copies. See
+    /// operator, so a morsel pipeline would buy two whole-table copies. See
     /// `execution_capability(const ir::Node&)`.
     NotParallelMap,
     /// A step reads rows a morsel does not contain (rolling, rank, generator,
@@ -150,7 +150,7 @@ struct Plan {
 [[nodiscard]] auto fallback_reason_name(FallbackReason reason) -> std::string_view;
 
 // Process-wide counters. An executed pipeline and the pre-planner construction
-// are indistinguishable from the outside, so — like ParallelIslandStats — the
+// are indistinguishable from the outside, so — like ParallelPipelineStats — the
 // path needs its own proof it fired. Read the deltas around a query in tests;
 // report them from profiling tooling later.
 [[nodiscard]] auto physical_plans_built() -> std::uint64_t;
@@ -159,7 +159,7 @@ struct Plan {
 
 /// Record that a pipeline is executing (called once per plan that migrates,
 /// whether the executor is the Phase 1 serial composer or the parallel
-/// island, which is the same pipeline's parallel mode).
+/// pipeline, which is the same pipeline's parallel mode).
 void note_map_pipeline_executed();
 
 /// Record a fallback with its reason.

@@ -164,7 +164,7 @@ TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "
 
 // The rules the plan applies when it decides its own mode, over the shapes that
 // exercise each one. This case was written as a differential check against the
-// island analysis while both existed; with that analysis deleted it states
+// pipeline analysis while both existed; with that analysis deleted it states
 // the expected verdicts directly, which is what it was proving all along.
 // Fusion as a physical choice: a Project directly over a Filter is one gather
 // pass whether or not canonicalize rewrote the tree into a FilterProject node.
@@ -367,7 +367,7 @@ TEST_CASE("A parallel run below a serial step still reaches the workers",
 
     runtime::ExecutionContext serial;
     serial.parallel = false;
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
     parallel.parallel = true;
     parallel.parallel_threads = 4;
@@ -389,7 +389,7 @@ TEST_CASE("A parallel run below a serial step still reaches the workers",
           std::vector<std::int64_t>(parallel_doubled->begin(), parallel_doubled->end()));
     // The filter below the update fanned out; a silent serial fallback would
     // leave this at zero.
-    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(stats.parallel_pipelines.load() == 1);
 }
 
 // The fused step through real morsels, which is where fusion could go wrong
@@ -430,7 +430,7 @@ TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][paralle
 
     runtime::ExecutionContext serial;
     serial.parallel = false;
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
     parallel.parallel = true;
     parallel.parallel_threads = 4;
@@ -455,7 +455,7 @@ TEST_CASE("A fused step runs over morsels", "[physical][execute][fusion][paralle
     CHECK(std::vector<std::int64_t>(serial_price->begin(), serial_price->end()) ==
           std::vector<std::int64_t>(parallel_price->begin(), parallel_price->end()));
     // It took the parallel path rather than quietly falling back.
-    CHECK(stats.parallel_islands.load() == 1);
+    CHECK(stats.parallel_pipelines.load() == 1);
 }
 
 TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][parallel]") {

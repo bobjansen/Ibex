@@ -385,7 +385,7 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
 TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filter][range]") {
     // `try_splice_column_leaf` evaluates its kernel over the WHOLE table, so it
     // must decline for every partial range — including one that begins at zero,
-    // which is morsel 0 of every island. That decline cannot be tested through
+    // which is morsel 0 of every morsel pipeline. That decline cannot be tested through
     // output: with begin == 0 the spliced whole-table column and the range
     // agree on every value, so a value oracle passes either way (this was
     // confirmed by mutation — restoring the `begin != 0` guard left the
@@ -436,17 +436,17 @@ TEST_CASE("a column-kernel leaf is never spliced under a partial range", "[filte
 // guarantee is only this: enough morsels per worker that one slow morsel cannot
 // strand the rest, without ever exceeding the measured plateau.
 // ---------------------------------------------------------------------------
-TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][parallel]") {
+TEST_CASE("morsel_grain derives a grain instead of asking for one", "[runtime][parallel]") {
     ibex::runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 8;
 
     SECTION("an explicit grain is honoured exactly") {
         exec.parallel_grain = 12345;
-        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 12345);
+        CHECK(ibex::runtime::morsel_grain(exec, 20'000'000) == 12345);
         // Including one that the derivation would never choose itself.
         exec.parallel_grain = 8'000'000;
-        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 8'000'000);
+        CHECK(ibex::runtime::morsel_grain(exec, 20'000'000) == 8'000'000);
     }
 
     SECTION("a large input clamps to the plateau, not to rows/threads") {
@@ -454,7 +454,7 @@ TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][p
         // rows/(threads*4) would give 625k here, which the sweep measured as
         // clearly worse than 64k. If this ever returns something larger, the
         // clamp has been dropped and large inputs have silently regressed.
-        CHECK(ibex::runtime::island_grain(exec, 20'000'000) == 65536);
+        CHECK(ibex::runtime::morsel_grain(exec, 20'000'000) == 65536);
     }
 
     SECTION("a small input shrinks the grain to keep every worker fed") {
@@ -466,7 +466,7 @@ TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][p
         // machine with fewer cores, which is exactly where CI runs.
         const std::size_t threads =
             std::min<std::size_t>(8, ibex::runtime::process_worker_pool().size());
-        const std::size_t grain = ibex::runtime::island_grain(exec, 200'000);
+        const std::size_t grain = ibex::runtime::morsel_grain(exec, 200'000);
         CHECK(grain < 65536);
         const std::size_t morsels = (200'000 + grain - 1) / grain;
         CHECK(morsels >= threads * 2);
@@ -474,8 +474,8 @@ TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][p
 
     SECTION("a tiny input still floors at a usable grain") {
         // Never one row per morsel: that would be more tasks than work.
-        CHECK(ibex::runtime::island_grain(exec, 10) == 4096);
-        CHECK(ibex::runtime::island_grain(exec, 0) == 4096);
+        CHECK(ibex::runtime::morsel_grain(exec, 10) == 4096);
+        CHECK(ibex::runtime::morsel_grain(exec, 0) == 4096);
     }
 
     SECTION("more threads means smaller morsels at the same input size") {
@@ -484,9 +484,9 @@ TEST_CASE("island_grain derives a grain instead of asking for one", "[runtime][p
         // compare.
         if (ibex::runtime::process_worker_pool().size() >= 2) {
             exec.parallel_threads = 1;
-            const std::size_t few = ibex::runtime::island_grain(exec, 200'000);
+            const std::size_t few = ibex::runtime::morsel_grain(exec, 200'000);
             exec.parallel_threads = 2;
-            const std::size_t many = ibex::runtime::island_grain(exec, 200'000);
+            const std::size_t many = ibex::runtime::morsel_grain(exec, 200'000);
             CHECK(many < few);
         }
     }

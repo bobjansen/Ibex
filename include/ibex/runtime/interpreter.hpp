@@ -484,20 +484,20 @@ using DeferredScanRegistry = std::map<std::string, DeferredScan>;
 /// seed, and worker-failure/cancellation state are added by later phases. A
 /// default-constructed context (no deferred scans) reproduces the pre-context
 /// serial behavior.
-/// Per-query counters for the parallel-island executor. Optional: a query only
+/// Per-query counters for the morsel-parallel executor. Optional: a query only
 /// pays for them when an `ExecutionContext` points at one, and they are touched
-/// once per island (never per row or per morsel), so they are free on the hot
+/// once per pipeline (never per row or per morsel), so they are free on the hot
 /// path.
 ///
-/// Their reason to exist is that the island decision is invisible from the
-/// outside — a parallel island and a serial one produce identical output by
+/// Their reason to exist is that the decision is invisible from the
+/// outside — a morsel-parallel pipeline and a serial one produce identical output by
 /// construction. Without a counter, a benchmark or a test cannot tell "ran in
 /// parallel" from "silently fell back to serial", which is the failure mode
 /// that makes a parallel test hollow.
-struct ParallelIslandStats {
-    std::atomic<std::uint64_t> parallel_islands{0};  ///< islands run on worker threads
-    std::atomic<std::uint64_t> serial_islands{0};    ///< islands below the grain threshold
-    std::atomic<std::uint64_t> morsels{0};           ///< morsels those islands partitioned into
+struct ParallelPipelineStats {
+    std::atomic<std::uint64_t> parallel_pipelines{0};  ///< pipelines run on worker threads
+    std::atomic<std::uint64_t> serial_pipelines{0};    ///< pipelines below the grain threshold
+    std::atomic<std::uint64_t> morsels{0};             ///< morsels those pipelines partitioned into
     /// Streamed scan pipelines, with or without fused row-local maps, that have
     /// no whole-table boundary between the source and the next breaker.
     std::atomic<std::uint64_t> pipelined_scans{0};
@@ -506,7 +506,7 @@ struct ParallelIslandStats {
     /// parent is already processing earlier chunks. This makes scheduler
     /// activation observable separately from source-level scan pipelining.
     std::atomic<std::uint64_t> pipelined_stages{0};
-    /// Islands whose head operator was absorbed into a range-evaluating source
+    /// Pipelines whose head operator was absorbed into a range-evaluating source
     /// instead of being run above a gathered morsel. Observability for the
     /// zero-copy path: it is a silent optimization, so without a counter a
     /// regression to gathering everywhere would only show up as a slow
@@ -524,7 +524,7 @@ struct ParallelIslandStats {
     /// per-morsel temporary columns silently restores an allocation and copy
     /// per window.
     std::atomic<std::uint64_t> parallel_direct_numeric_fields{0};
-    /// Islands run as a two-phase filter — output presized from per-morsel
+    /// Pipelines run as a two-phase filter — output presized from per-morsel
     /// popcounts, then gathered into disjoint slices — instead of through the
     /// ordered merger. Same reason as `range_heads`: both produce identical
     /// output, so without a counter a silent fall back to the merger (a
@@ -586,7 +586,7 @@ struct ExecutionContext {
     /// `MorselParallel`, executes its parallel prefix over morsels of the
     /// materialized pipeline input instead of a single whole-table chunk.
     /// Whether those morsels run
-    /// on worker threads or serially is decided per island by the size
+    /// on worker threads or serially is decided per pipeline by the size
     /// thresholds below; either way an ordered merger emits results in morsel
     /// `sequence` order, so output is byte-identical to the plain serial path.
     /// **On by default.** A 24-configuration sweep from 131k to 20M rows, at 2
@@ -595,11 +595,11 @@ struct ExecutionContext {
     /// `IBEX_PARALLEL=0` turns it off.
     bool parallel = true;
 
-    /// Morsel row-grain for the island source when `parallel` is set. The input
+    /// Morsel row-grain for the pipeline source when `parallel` is set. The input
     /// is partitioned into contiguous ranges of at most this many rows, and one
     /// range is one parallel task. Ignored when `parallel` is false.
     ///
-    /// **0 means derive it from the input** (`island_grain`), which is the
+    /// **0 means derive it from the input** (`morsel_grain`), which is the
     /// default: a measured sweep found no grain in a 1000x band that loses to
     /// serial, so there is nothing here worth asking a user to tune. A non-zero
     /// value is an explicit override and is used as given.
@@ -612,29 +612,29 @@ struct ExecutionContext {
     /// count.
     std::size_t parallel_threads = 0;
 
-    /// The plan's grain-size serial threshold: an island input smaller than
+    /// The plan's grain-size serial threshold: an pipeline input smaller than
     /// this stays on the serial morsel chain rather than paying task,
     /// synchronization, and merge overhead to parallelize cache-resident work.
     /// Tests that need the worker path on a small table set this to 0.
     ///
     /// This is a floor on ROWS, which is the right unit for splitting one
     /// expression across ranges (`evaluate_field_maybe_parallel`, whose work is
-    /// per row). An island also copies per *cell*, so it applies
+    /// per row). An pipeline also copies per *cell*, so it applies
     /// `parallel_min_cells` on top of this.
     std::size_t parallel_min_rows = 65536;
 
-    /// Second island threshold, in cells (rows x output columns), or 0 to skip
+    /// Second pipeline threshold, in cells (rows x output columns), or 0 to skip
     /// the check.
     ///
-    /// An island's cost is dominated by copying rows out, which scales with
+    /// An pipeline's cost is dominated by copying rows out, which scales with
     /// table WIDTH — so a row count alone cannot say whether the work is worth
     /// a fan-out. Measured: 131,072 rows won at 6 columns and *lost* at 2, on
     /// the same predicate. Both clear any sane row threshold; only the cell
     /// count separates them.
     std::size_t parallel_min_cells = 512UL * 1024;
 
-    /// Optional island counters, or null to record nothing. Not owned.
-    ParallelIslandStats* parallel_stats = nullptr;
+    /// Optional pipeline counters, or null to record nothing. Not owned.
+    ParallelPipelineStats* parallel_stats = nullptr;
 
     /// Whether a lazy source is streamed through its scan operator rather than
     /// decoded whole before the plan runs.
@@ -673,8 +673,8 @@ struct ExecutionContext {
     }
 };
 
-/// Apply the parallel-island environment switches to `exec`: `IBEX_PARALLEL`
-/// enables islands, and `IBEX_MORSEL_ROWS` overrides the morsel grain (and,
+/// Apply the parallel-pipeline environment switches to `exec`: `IBEX_PARALLEL`
+/// enables pipelines, and `IBEX_MORSEL_ROWS` overrides the morsel grain (and,
 /// when set explicitly, drops the serial threshold to that grain so a
 /// deliberately small grain is honored). Unset variables leave `exec`
 /// untouched, so this never overrides a budget the caller chose.
@@ -682,16 +682,16 @@ struct ExecutionContext {
 /// `IBEX_CORES` IS applied here, to `parallel_threads`: it is the compute
 /// budget, and the process pool it used to defer to is now sized for decode.
 ///
-/// This is how a benchmark run turns the executor on: parallel islands stay off
+/// This is how a benchmark run turns the executor on: parallel pipelines stay off
 /// by default until Phase 1's acceptance measurements say otherwise.
 void configure_parallel_from_env(ExecutionContext& exec);
 
-/// A process-lifetime island counter when `IBEX_PARALLEL_STATS` is set in the
+/// A process-lifetime pipeline counter when `IBEX_PARALLEL_STATS` is set in the
 /// environment, else null. `configure_parallel_from_env` installs it, and the
 /// accumulated totals are written to stderr at process exit.
 ///
-/// This exists because the island decision is invisible from the outside: an
-/// island and the serial chain produce identical output by construction, so a
+/// This exists because the pipeline decision is invisible from the outside: an
+/// pipeline and the serial chain produce identical output by construction, so a
 /// benchmark cannot tell "ran in parallel" from "silently fell back to serial".
 /// Without it an A/B showing no difference has two indistinguishable readings —
 /// the parallelism did not pay, or it never happened. `ExecutionContext::
@@ -700,8 +700,8 @@ void configure_parallel_from_env(ExecutionContext& exec);
 ///
 /// Accumulating across queries is the point rather than a limitation: a PDS-H
 /// run is 22 queries in one warm process, and the question worth asking is how
-/// many islands the *suite* formed.
-[[nodiscard]] auto process_island_stats() -> ParallelIslandStats*;
+/// many pipelines the *suite* formed.
+[[nodiscard]] auto process_pipeline_stats() -> ParallelPipelineStats*;
 
 /// Materialize a deferred scan now: static conjuncts plus whatever bounds its
 /// filter slot carries (if `ready`). The single decode path for deferred

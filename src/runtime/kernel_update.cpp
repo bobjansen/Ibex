@@ -2133,7 +2133,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     if (!route.has_plan() && fallback == nullptr) {
         return std::optional<ComputedColumn>{};
     }
-    // Reentrancy: a fused island operator calls its update from a worker
+    // Reentrancy: a fused pipeline operator calls its update from a worker
     // thread. Submitting from there deadlocks the pool (WorkerPool::submit
     // aborts rather than let it happen), and that morsel is already one
     // worker's share -- splitting it again would only oversubscribe.
@@ -2144,11 +2144,11 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     if (rows < exec.parallel_min_rows) {
         return std::optional<ComputedColumn>{};
     }
-    // Same derivation as an island's, so the two parallel paths partition
+    // Same derivation as an pipeline's, so the two parallel paths partition
     // alike. Note a zero `parallel_grain` now means "derive", not "one row per
     // morsel" — reading it directly here would have split a 20M-row update into
     // 20M tasks.
-    const std::size_t grain = island_grain(exec, rows);
+    const std::size_t grain = morsel_grain(exec, rows);
     if (grain == 0) {
         return std::optional<ComputedColumn>{};
     }

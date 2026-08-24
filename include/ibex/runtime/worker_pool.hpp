@@ -14,14 +14,14 @@
 
 namespace ibex::runtime {
 
-/// Process-owned worker pool for the runtime's parallel islands
+/// Process-owned worker pool for the runtime's morsel pipelines
 /// (`plans/runtime-multithreading-plan.md`, Phase 1).
 ///
 /// Deliberately small and boring, as the plan requires: pre-spawned threads, a
 /// single mutex+condvar task queue, and a completion latch. There is no work
 /// stealing, no futures/continuations, and no DAG scheduler — the parallel
-/// island's coordination (a shared morsel cursor and an ordered merger) lives
-/// in the island operator, not here.
+/// pipeline's coordination (a shared morsel cursor and an ordered merger) lives
+/// in the pipeline operator, not here.
 ///
 /// The one-query-at-a-time invariant (Phase 0 item 6, `query_lease.hpp`) is
 /// what lets this stay simple: there is no cross-query fairness, priority, or
@@ -68,11 +68,11 @@ class WorkerPool {
     /// while the batch runs, so this must not block.
     ///
     /// `worker_count` is clamped to `size()`. The calling thread is *not* one
-    /// of the workers: in a parallel island it is the ordered merger's
+    /// of the workers: in a morsel pipeline it is the ordered merger's
     /// consumer, and must stay free to release completed morsels.
     ///
     /// Not reentrant: a worker body must never submit its own batch (nested
-    /// islands are not a Phase 1 shape and would deadlock against a saturated
+    /// pipelines are not a Phase 1 shape and would deadlock against a saturated
     /// pool).
     [[nodiscard]] auto submit(std::size_t worker_count, std::function<void(std::size_t)> body)
         -> Batch;
@@ -113,7 +113,7 @@ void shutdown_process_worker_pool();
 /// True when the calling thread belongs to a WorkerPool.
 ///
 /// The guard against nested parallelism. Anything that may run inside a pool
-/// task — an operator in a parallel island, and so everything it calls — must
+/// task — an operator in a morsel pipeline, and so everything it calls — must
 /// check this before submitting work of its own, because `WorkerPool::submit`
 /// from a worker deadlocks (and aborts loudly rather than hanging).
 [[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
@@ -252,11 +252,11 @@ void stage_park_end() noexcept;
 /// differs). See the definition for the measurements behind the policy.
 [[nodiscard]] auto decode_thread_count() -> std::size_t;
 
-/// Whether `IBEX_PARALLEL` asks the interpreter to enable parallel islands.
+/// Whether `IBEX_PARALLEL` asks the interpreter to enable morsel pipelines.
 /// `nullopt` when `IBEX_PARALLEL` is unset or unrecognized, so the caller keeps
 /// whatever it already chose; otherwise the requested setting.
 ///
-/// It answers BOTH ways on purpose. Parallel islands are on by default now, so
+/// It answers BOTH ways on purpose. Parallel pipelines are on by default now, so
 /// a switch that could only turn them on would leave no way to turn them off —
 /// which is what a user hitting a threading bug, or an A/B measuring the
 /// feature, actually needs. Accepts `1`/`on`/`true`/`yes` and

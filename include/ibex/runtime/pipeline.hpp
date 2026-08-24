@@ -41,7 +41,7 @@ struct ColumnKernelSignature;
 /// physical planner stores this pointer after proving the node's capability,
 /// so its executor need not redispatch on the capability for every step.
 /// `source_signature` is null only for compatibility callers outside a
-/// physical plan (parallel islands); a physical map pipeline passes its
+/// physical plan (morsel pipelines); a physical map pipeline passes its
 /// resolved source representations so construction can select a route once.
 
 struct MapStep;
@@ -130,7 +130,7 @@ struct ColumnKernelSignature {
 /// assignment, none of which are row-local — but an unguarded, ungrouped update
 /// whose every field is scalar-only *is* a row-local map. That conditional role
 /// is exactly what the runtime multithreading plan asks for, and it is the
-/// difference between an island that holds a query's arithmetic and one that
+/// difference between a pipeline that holds a query's arithmetic and one that
 /// holds only the projection around it.
 ///
 /// Every other kind defers to the kind-based classification above.

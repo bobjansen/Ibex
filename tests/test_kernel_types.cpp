@@ -1214,7 +1214,7 @@ TEST_CASE("Parallel row-local update splits inside the chunk kernel",
                  .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
                  .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.0}})}}}};
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -1257,7 +1257,7 @@ TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][pa
                  .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "price"}}),
                  .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 2.0}})}}}};
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -1291,7 +1291,7 @@ TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][up
          .expr = ir::Expr{
              .node = ir::CallExpr{.callee = "sqrt", .args = std::move(args), .named_args = {}}}}};
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -1343,7 +1343,7 @@ TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
                  .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "doubled"}}),
                  .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 1.0}})}}}};
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 4;
@@ -1390,7 +1390,7 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
          .expr = ir::Expr{.node = ir::CallExpr{
                               .callee = "substring", .args = std::move(args), .named_args = {}}}}};
 
-    runtime::ParallelIslandStats stats;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext exec;
     exec.parallel = true;
     exec.parallel_threads = 4;

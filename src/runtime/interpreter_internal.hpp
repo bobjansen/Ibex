@@ -1227,6 +1227,17 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 /// have replaced one drift hazard with a subtler one.
 [[nodiscard]] auto is_streamable_inner_join(const ir::JoinNode& join) -> bool;
 
+/// The other two streaming gates, shared for the same reason as the one above
+/// and with the same hazard in mind. The physical planner reads all three
+/// rather than restating them: a plan that reimplemented these clauses said
+/// `MaterializeBoth` for a two-key Int64 join the builder streams, and its
+/// equivalence probe -- written from the same reading -- agreed with it.
+[[nodiscard]] auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool;
+
+/// Two Int64 keys on both sides, schema-provable. Not a property of the node
+/// alone: it calls `infer_schema` on both children.
+[[nodiscard]] auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool;
+
 /// Whole-table single-key inner join, implemented over
 /// `ChunkedInnerJoinOperator`. Callers must check `is_streamable_inner_join`
 /// first; richer join semantics remain in `join_table_impl`, which is the

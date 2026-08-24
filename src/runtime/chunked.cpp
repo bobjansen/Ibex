@@ -9951,6 +9951,13 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
 /// `ChunkedInnerJoinOperator::initialize_pair` re-checks the actual runtime
 /// column type regardless -- this is a routing optimization, not the sole
 /// guarantee of correctness.
+auto is_streamable_semi_anti_join(const ir::JoinNode& join) -> bool {
+    return (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
+           !join.predicate().has_value() && join.keys().size() == 1 &&
+           join.null_match() == ir::NullMatch::Never && !join.expect().asserts_anything() &&
+           join.take() == ir::MatchSelection::All;
+}
+
 auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
     if (join.kind() != ir::JoinKind::Inner || join.predicate().has_value() ||
         join.keys().size() != 2 || join.null_match() != ir::NullMatch::Never ||
@@ -13111,12 +13118,15 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         if (join.children().size() != 2) {
             return std::unexpected("join node expects exactly two children");
         }
-        const bool streamable_semi_anti =
-            (join.kind() == ir::JoinKind::Semi || join.kind() == ir::JoinKind::Anti) &&
-            !join.predicate().has_value() && join.keys().size() == 1 &&
-            join.null_match() == ir::NullMatch::Never && !join.expect().asserts_anything() &&
-            join.take() == ir::MatchSelection::All;
-        if (streamable_semi_anti) {
+        // The plan decides; this reads its decision. `plan_join` relays the same
+        // three gates the branches below used to call, so the routing is
+        // identical by construction -- what changes is where the decision lives.
+        // The sides come from the plan too: which side builds is a cost
+        // question, and the day it stops being "textual right" it should change
+        // in the planner without this seam noticing.
+        const physical::JoinPlan& jp = plan.join;
+        const bool streams = jp.strategy == physical::JoinStrategy::StreamingProbe;
+        if (streams && (jp.kind == ir::JoinKind::Semi || jp.kind == ir::JoinKind::Anti)) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             // Multiple producers: tried the same overlap the inner-join site
@@ -13152,7 +13162,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // one implementation that has it keeps a single definition of the
         // semantics -- and leaves this hot path bit-for-bit unchanged for every
         // join that does not ask for it.
-        if (is_streamable_inner_join(join)) {
+        if (streams && jp.key_count == 1) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             // A deferred probe scan must not be interpreted here — the join
@@ -13202,7 +13212,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // exactly like the single-key branch above; see
         // `ChunkedInnerJoinOperator::resolve_deferred_probe_pair` for the
         // one-component filter this POC pushes into the scan.
-        if (is_streamable_pair_int_join(join)) {
+        if (streams && jp.key_count == 2) {
             const bool stage_probe =
                 has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
             const auto probe = deferred_probe_scan_of(*join.children()[1], exec);

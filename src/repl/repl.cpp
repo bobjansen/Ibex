@@ -50,6 +50,7 @@
 #include "ibex/ir/cardinality.hpp"
 #ifdef _WIN32
 #define NOMINMAX
+#include <io.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -103,7 +104,10 @@ using EvalValue = std::variant<runtime::Table, runtime::ScalarValue, runtime::Co
 // Programmatic users can observe the value which the terminal REPL would
 // render. It is thread-local so a future server with worker threads does not
 // accidentally hand a result to another request.
-thread_local ExecutionResult* active_execution_result = nullptr;
+auto active_execution_result() -> ExecutionResult*& {
+    static thread_local ExecutionResult* result = nullptr;
+    return result;
+}
 
 struct BoundCallArg {
     const parser::Param* param = nullptr;
@@ -945,17 +949,17 @@ void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
 // same formatting the REPL applies to a bare expression statement. Shared by
 // the top-level statement printer and the `print(...)` builtin.
 void render_eval_value(const EvalValue& value) {
-    if (active_execution_result != nullptr) {
+    if (active_execution_result() != nullptr) {
         if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
-            active_execution_result->scalar = *scalar;
+            active_execution_result()->scalar = *scalar;
         } else if (const auto* col = std::get_if<runtime::ColumnValue>(&value)) {
             runtime::Table temp;
             temp.add_column("column", *col);
-            active_execution_result->table = temp;
-            active_execution_result->tables.push_back(std::move(temp));
+            active_execution_result()->table = temp;
+            active_execution_result()->tables.push_back(std::move(temp));
         } else {
-            active_execution_result->table = std::get<runtime::Table>(value);
-            active_execution_result->tables.push_back(*active_execution_result->table);
+            active_execution_result()->table = std::get<runtime::Table>(value);
+            active_execution_result()->tables.push_back(*active_execution_result()->table);
         }
     }
     if (const auto* scalar = std::get_if<runtime::ScalarValue>(&value)) {
@@ -5634,14 +5638,18 @@ namespace {
 // the programmatic boundary until diagnostics have a native structured sink.
 // This process-wide redirect is serialized and is only used by the local UI
 // server; ordinary REPL and batch execution never take this path.
-std::mutex execution_capture_mutex;
+auto execution_capture_mutex() -> std::mutex& {
+    static std::mutex mutex;
+    return mutex;
+}
 
 class StdoutCapture {
    public:
-    StdoutCapture() {
-        std::fflush(stdout);
+    // C FILE ownership is acquired from tmpfile() and released with fclose().
+    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+    StdoutCapture() : file_(std::tmpfile()) {
+        static_cast<void>(std::fflush(stdout));
         std::cout.flush();
-        file_ = std::tmpfile();
         if (file_ == nullptr) {
             return;
         }
@@ -5662,19 +5670,25 @@ class StdoutCapture {
 
     StdoutCapture(const StdoutCapture&) = delete;
     auto operator=(const StdoutCapture&) -> StdoutCapture& = delete;
+    StdoutCapture(StdoutCapture&&) = delete;
+    auto operator=(StdoutCapture&&) -> StdoutCapture& = delete;
 
     [[nodiscard]] auto take() -> std::string {
         restore(false);
         if (file_ == nullptr) {
             return {};
         }
-        std::rewind(file_);
+        if (std::fseek(file_, 0, SEEK_SET) != 0) {
+            static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
+            file_ = nullptr;
+            return {};
+        }
         std::string output;
         std::array<char, 4096> buffer{};
         while (const auto count = std::fread(buffer.data(), 1, buffer.size(), file_)) {
             output.append(buffer.data(), count);
         }
-        std::fclose(file_);
+        static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
         file_ = nullptr;
         return output;
     }
@@ -5682,7 +5696,7 @@ class StdoutCapture {
    private:
     void restore(bool close_file = true) {
         if (active_) {
-            std::fflush(stdout);
+            static_cast<void>(std::fflush(stdout));
             std::cout.flush();
 #ifdef _WIN32
             static_cast<void>(_dup2(original_fd_, _fileno(stdout)));
@@ -5695,7 +5709,7 @@ class StdoutCapture {
             active_ = false;
         }
         if (close_file && file_ != nullptr) {
-            std::fclose(file_);
+            static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
             file_ = nullptr;
         }
     }
@@ -5721,11 +5735,11 @@ auto error_from_output(std::string output) -> std::string {
 
 class ReplSession::Impl {
    public:
-    Impl(const ReplConfig& config, runtime::ExternRegistry& registry)
-        : config(config), registry(registry), tables(build_builtin_tables()) {}
+    Impl(ReplConfig session_config, runtime::ExternRegistry& extern_registry)
+        : config(std::move(session_config)), registry(&extern_registry), tables(build_builtin_tables()) {}
 
     ReplConfig config;
-    runtime::ExternRegistry& registry;
+    runtime::ExternRegistry* registry;
     runtime::TableRegistry tables;
     LazyTableRegistry lazy_tables;
     runtime::ScalarRegistry scalars;
@@ -5760,16 +5774,16 @@ auto ReplSession::execute(std::string_view source) -> ExecutionResult {
 
     const auto comments = collect_script_comment_lines(normalized);
     const auto doc_comment_groups = build_statement_comment_groups(parsed->statements, comments);
-    std::scoped_lock lock(execution_capture_mutex);
+    const std::scoped_lock lock(execution_capture_mutex());
     StdoutCapture capture;
-    active_execution_result = &result;
+    active_execution_result() = &result;
     const bool ok = execute_statements(
         parsed->statements, impl_->tables, impl_->lazy_tables, impl_->scalars, impl_->columns,
         impl_->models, impl_->functions, impl_->compile_time_lists, impl_->extern_decls,
-        impl_->registry, impl_->config.plugin_search_paths, impl_->loaded_plugins,
+        *impl_->registry, impl_->config.plugin_search_paths, impl_->loaded_plugins,
         impl_->config.import_search_paths, nullptr, &doc_comment_groups, &impl_->function_sources,
         &impl_->declaration_docs, &impl_->imports, normalized);
-    active_execution_result = nullptr;
+    active_execution_result() = nullptr;
     const std::string output = capture.take();
     result.ok = ok;
     if (!ok) {

@@ -111,7 +111,7 @@ auto read_request(Socket socket) -> std::optional<HttpRequest> {
             return std::nullopt;
         }
         raw.append(buffer.data(), static_cast<std::size_t>(count));
-        if (raw.size() > 1024 * 1024) {
+        if (raw.size() > static_cast<std::size_t>(1024) * 1024) {
             return std::nullopt;
         }
     }
@@ -140,7 +140,7 @@ auto read_request(Socket socket) -> std::optional<HttpRequest> {
             return std::nullopt;
         }
     }
-    if (content_length > 8 * 1024 * 1024) {
+    if (content_length > static_cast<std::size_t>(8) * 1024 * 1024) {
         return std::nullopt;
     }
     request.body = raw.substr(header_end + 4);

@@ -12918,6 +12918,52 @@ auto build_physical_order(const ir::Node& node, const TableRegistry& registry,
     return std::make_unique<ChunkedOrderOperator>(std::move(child_op.value()), &order.keys(), exec);
 }
 
+/// Build a row-limit breaker. Phase 4 item 3, same shape as the ordering one:
+/// `ChunkedHeadOperator` handles every Head, so there is no decision to
+/// describe and no `Plan` to consult.
+auto build_physical_head(const ir::Node& node, const TableRegistry& registry,
+                         const ScalarRegistry* scalars, const ExternRegistry* externs,
+                         const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& head = static_cast<const ir::HeadNode&>(node);
+    if (head.children().empty()) {
+        return std::unexpected("head node missing child");
+    }
+    // Evaluated before the child is built, as it always was: a bad count is the
+    // caller's error and should not be preceded by constructing a subtree.
+    auto count = evaluate_row_count_expr_impl(head.count_expr(), scalars, externs);
+    if (!count.has_value()) {
+        return std::unexpected(count.error());
+    }
+    // Head(Order(x)) is rewritten by canonicalize R16 into TopK(x);
+    // Head(Filter(x)) with no group_by is rewritten by R7 into FilterHead(x);
+    // Head past Project/Rename is handled by R4.
+    auto child_op =
+        build_operator(*head.children().front(), registry, scalars, externs, exec, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    return std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()), *count,
+                                                 &head.group_by());
+}
+
+/// Build a distinct breaker. As above: one operator, no decision.
+auto build_physical_distinct(const ir::Node& node, const TableRegistry& registry,
+                             const ScalarRegistry* scalars, const ExternRegistry* externs,
+                             const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    if (node.children().empty()) {
+        return std::unexpected("distinct node missing child");
+    }
+    auto child_op =
+        build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec);
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -12950,6 +12996,14 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // composer walks it in both modes, so there is no arrangement of map nodes
     // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (plan.migrated && node.kind() == ir::NodeKind::Head) {
+        physical::note_map_pipeline_executed();
+        return build_physical_head(node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.migrated && node.kind() == ir::NodeKind::Distinct) {
+        physical::note_map_pipeline_executed();
+        return build_physical_distinct(node, registry, scalars, externs, exec, model_out);
+    }
     if (plan.migrated && node.kind() == ir::NodeKind::Order) {
         physical::note_map_pipeline_executed();
         return build_physical_order(node, registry, scalars, externs, exec, model_out);
@@ -13135,17 +13189,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         }
     }
 
-    if (node.kind() == ir::NodeKind::Distinct) {
-        if (node.children().empty()) {
-            return std::unexpected("distinct node missing child");
-        }
-        auto child_op =
-            build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec);
-    }
+    // No Distinct branch: every Distinct is a migrated plan, built by
+    // `build_physical_distinct` at the seam above.
 
     // No Order branch: every Order is a migrated plan, built by
     // `build_physical_order` at the seam above. Unlike the join and the
@@ -13177,26 +13222,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             std::move(child_op.value()), &topk.keys(), topk.count(), &topk.group_by(), keep);
     }
 
-    if (node.kind() == ir::NodeKind::Head) {
-        const auto& head = static_cast<const ir::HeadNode&>(node);
-        if (head.children().empty()) {
-            return std::unexpected("head node missing child");
-        }
-        auto count = evaluate_row_count_expr_impl(head.count_expr(), scalars, externs);
-        if (!count.has_value()) {
-            return std::unexpected(count.error());
-        }
-        // Head(Order(x)) is rewritten by canonicalize R16 into TopK(x);
-        // Head(Filter(x)) with no group_by is rewritten by R7 into FilterHead(x);
-        // Head past Project/Rename is handled by R4.
-        auto child_op =
-            build_operator(*head.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedHeadOperator>(std::move(child_op.value()), *count,
-                                                     &head.group_by());
-    }
+    // No Head branch: every Head is a migrated plan, built by
+    // `build_physical_head` at the seam above.
 
     if (node.kind() == ir::NodeKind::Tail) {
         const auto& tail = static_cast<const ir::TailNode&>(node);

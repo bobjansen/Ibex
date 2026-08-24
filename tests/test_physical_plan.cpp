@@ -343,6 +343,55 @@ TEST_CASE("The planner fuses a project over an update over a filter", "[physical
     }
 }
 
+// A run below a serial step has to actually reach the workers, not merely be
+// described. `df[filter ...][update ...]` puts the update above the run: the
+// filter's morsels fan out, the ordered merger reassembles them, and the update
+// runs once over the finished table.
+TEST_CASE("A parallel run below a serial step still reaches the workers",
+          "[physical][execute][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<std::int64_t> price;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<std::int64_t>(r));
+    }
+    runtime::Table table;
+    table.add_column("price", std::move(price));
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    auto ir = require_ir("trades[filter price > 19999][update { doubled = price * 2 }];");
+    const auto plan = runtime::physical::plan_physical(*ir, registry, nullptr);
+    REQUIRE(plan.migrated);
+    REQUIRE(plan.mode == runtime::physical::PipelineMode::MorselParallel);
+    REQUIRE(plan.parallel_begin == 1);
+
+    runtime::ExecutionContext serial;
+    serial.parallel = false;
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel = true;
+    parallel.parallel_threads = 4;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_min_cells = 0;
+    parallel.parallel_grain = 4'096;
+    parallel.parallel_stats = &stats;
+
+    const auto a = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto b = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(a->rows() == kRows - 20'000);
+    const auto* serial_doubled = std::get_if<Column<std::int64_t>>(a->find("doubled"));
+    const auto* parallel_doubled = std::get_if<Column<std::int64_t>>(b->find("doubled"));
+    REQUIRE(serial_doubled != nullptr);
+    REQUIRE(parallel_doubled != nullptr);
+    CHECK(std::vector<std::int64_t>(serial_doubled->begin(), serial_doubled->end()) ==
+          std::vector<std::int64_t>(parallel_doubled->begin(), parallel_doubled->end()));
+    // The filter below the update fanned out; a silent serial fallback would
+    // leave this at zero.
+    CHECK(stats.parallel_islands.load() == 1);
+}
+
 // The fused step through real morsels, which is where fusion could go wrong
 // without the answer changing shape: `range_filter_head` absorbs a fused
 // project into the morsel source exactly as it absorbs a FilterProject node's
@@ -442,7 +491,7 @@ TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][para
         const auto [tree, plan] = serial_plan(test.source);
         REQUIRE(plan.migrated);
         REQUIRE((plan.mode == PipelineMode::MorselParallel) == test.parallel);
-        REQUIRE(plan.parallel_steps == test.parallel_steps);
+        REQUIRE(plan.parallel_step_count() == test.parallel_steps);
         REQUIRE(plan.serial_reason == test.reason);
         REQUIRE((runtime::physical::parallel_input_node(plan) != nullptr) == test.parallel);
     }
@@ -463,7 +512,7 @@ TEST_CASE("A pipeline's mode names the step that bounds it", "[physical][plan][p
     REQUIRE(plan.steps.size() == 2);
     // Only the filter may run over morsels; the update below it is the
     // boundary, and executes serially as it does today.
-    REQUIRE(plan.parallel_steps == 1);
+    REQUIRE(plan.parallel_step_count() == 1);
     REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
     const ir::Node* input = runtime::physical::parallel_input_node(plan);
     REQUIRE(input != nullptr);

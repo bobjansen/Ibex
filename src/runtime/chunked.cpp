@@ -11393,8 +11393,8 @@ class TwoPhaseFilterOperator final : public Operator {
 /// records steps sink-first; every executor here composes bottom-up.
 auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapStep> {
     std::vector<MapStep> operators;
-    operators.reserve(plan.parallel_steps);
-    for (std::size_t i = plan.parallel_steps; i > 0; --i) {
+    operators.reserve(plan.parallel_step_count());
+    for (std::size_t i = plan.parallel_end; i > plan.parallel_begin; --i) {
         operators.push_back(plan.steps[i - 1]);
     }
     return operators;
@@ -12463,6 +12463,20 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
                              const TableRegistry& registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const ExecutionContext& exec,
                              ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
+    // The morsel run, when the plan has one and a parallel executor was asked
+    // for, is built as a unit: it owns the steps in
+    // [parallel_begin, parallel_end) *and* the construction of its own input,
+    // which it materializes before fanning out. Everything above it is composed
+    // here, serially, exactly as it would be over any other child.
+    //
+    // `exec.parallel` is part of the condition, not an assumption: the plan's
+    // mode says what the pipeline *may* do, and a serial run of the same plan
+    // must compose every step here instead.
+    if (exec.parallel && plan.mode == physical::PipelineMode::MorselParallel &&
+        index == plan.parallel_begin) {
+        physical::note_map_pipeline_executed();
+        return build_map_pipeline_parallel(plan, registry, scalars, externs, exec, model_out);
+    }
     const auto build_child = [&] -> std::expected<OperatorPtr, std::string> {
         if (index + 1 == plan.steps.size()) {
             return build_operator(*plan.source_node, registry, scalars, externs, exec, model_out);
@@ -12522,20 +12536,24 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // source's morsels straight into workers, instead of materializing first,
     // reintroduces both hazards and must re-establish eligibility (per-worker
     // readers + a frozen cache) before it removes that assertion.
-    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md Phase 2,
-    // item 4). One plan per node, consulted in both modes: it decides whether
-    // this is a pipeline at all, and if so whether the pipeline may run over
-    // morsels. There is no second analysis to disagree with it.
+    // Physical-plan seam (plans/kernel-pipeline-execution-plan.md). One plan
+    // per node, and it describes the whole map chain: which steps run over
+    // morsels, what feeds them, and what runs serially above them. The
+    // composer walks it in both modes, so there is no arrangement of map nodes
+    // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
     if (plan.migrated && plan.mode == physical::PipelineMode::MorselParallel && exec.parallel) {
-        // A row-local chain rooted directly at a decomposable lazy scan is
-        // one physical pipeline: decode and maps run in the same worker
-        // task, and the ordered ring feeds the next breaker. This is the
-        // production replacement for the old materialize-before-fan-out
-        // island boundary. Probe scans keep their join-owned dynamic
-        // filter timing and therefore do not enter here.
+        // A row-local chain rooted directly at a decomposable lazy scan is one
+        // physical pipeline: decode and maps run in the same worker task, and
+        // the ordered ring feeds the next breaker. This is the production
+        // replacement for the old materialize-before-fan-out island boundary.
+        // Probe scans keep their join-owned dynamic filter timing and therefore
+        // do not enter here. It applies only when the run reaches the source
+        // with nothing serial above it -- otherwise the composer's serial tail
+        // has to wrap the pipeline, which build_pipelined_scan does not model.
         const ir::Node* input_node = physical::parallel_input_node(plan);
-        if (exec.stream_scans && input_node != nullptr &&
+        if (exec.stream_scans && plan.parallel_begin == 0 &&
+            plan.parallel_end == plan.steps.size() && input_node != nullptr &&
             input_node->kind() == ir::NodeKind::Scan) {
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
             const auto& scan = static_cast<const ir::ScanNode&>(*input_node);
@@ -12552,25 +12570,19 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 }
             }
         }
-        physical::note_map_pipeline_executed();
-        return build_map_pipeline_parallel(plan, registry, scalars, externs, exec, model_out);
     }
-    // Serial composition of a migrated pipeline: same constructors, same
-    // per-node profile entries, same source construction (the source goes
-    // through the public build_operator, so every Scan/ExternCall streaming
-    // decision below is unchanged).
-    //
-    // In parallel mode this is deliberately NOT taken. A pipeline whose own
-    // mode is serial may still contain a parallel one below a step that bounds
-    // it — `df[filter ...][update ...]` is the shape — and the per-kind
-    // recursion below finds it by re-planning at each node. Consuming the whole
-    // chain here would swallow that inner pipeline. Modelling a serial tail
-    // over a parallel prefix in one plan is Phase 3 work.
-    if (plan.migrated && !exec.parallel) {
-        physical::note_map_pipeline_executed();
+    if (plan.migrated) {
+        // Serial mode, or a parallel plan whose run the composer hands off at
+        // its boundary. Same constructors, same per-node profile entries, same
+        // source construction (the source goes through the public
+        // build_operator, so every Scan/ExternCall streaming decision below is
+        // unchanged).
+        if (plan.mode != physical::PipelineMode::MorselParallel || !exec.parallel) {
+            physical::note_map_pipeline_executed();
+        }
         return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
     }
-    if (!plan.migrated && !exec.parallel) {
+    if (!exec.parallel) {
         physical::note_materialized_call(plan.reason);
     }
 

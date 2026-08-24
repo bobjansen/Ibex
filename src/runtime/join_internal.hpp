@@ -61,6 +61,29 @@ using PredicateMaskEvaluator = std::expected<Mask, std::string> (*)(const ir::Ex
     const ir::AggregateNode& aggregate, std::span<const ir::UpdateNode* const> skipped_updates)
     -> std::optional<std::string>;
 
+/// The Join+Aggregate fusion, resolved from the aggregate alone: walk past the
+/// Project/Update nodes between them, find the join, and check every clause the
+/// rewrite needs. `nullopt` when this is not that shape.
+///
+/// One definition for a seven-clause predicate that was written out twice --
+/// chunked.cpp and interpreter.cpp -- along with the skip-walk feeding it. The
+/// copies had already drifted: one gated on the aggregations being streamable
+/// and the other did not. Harmless, because a single Count/Sum is streamable by
+/// definition, which is exactly how this kind of divergence survives long
+/// enough to matter.
+struct FusedLeftJoinCount {
+    /// The join whose output the aggregate consumes. Naming it is what makes
+    /// this a fusion in the plan rather than a walk rediscovered in a builder:
+    /// two logical nodes, one physical step.
+    const ir::JoinNode* join = nullptr;
+    /// The column the count/sum reads, resolved back through any updates
+    /// between the aggregate and the join.
+    std::string counted_column;
+};
+
+[[nodiscard]] auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
+    -> std::optional<FusedLeftJoinCount>;
+
 /// Physical rewrite for a unique-left-key left join followed by
 /// count(right_column) grouped by that key. Returns nullopt when the shape or
 /// runtime proofs are insufficient and the ordinary join must be used.

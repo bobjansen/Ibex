@@ -1911,6 +1911,49 @@ TEST_CASE("Interpret filter on empty table") {
     REQUIRE(result->rows() == 0);
 }
 
+TEST_CASE("Interpret compiled numeric update over an emptied range") {
+    // The compiled numeric tree writes into a caller-owned destination, and a
+    // zero-row range hands it a null one: `Column<T>::resize_for_overwrite(0)`
+    // leaves `data()` null. That is a legitimate shape -- a filter selecting
+    // nothing -- but the destination check read it as an absent output and
+    // aborted the process (`494f15c1`, which split the `_into` form out of
+    // `eval_numeric_update_blocks`; before it, the empty case fell out of the
+    // block loop never running).
+    //
+    // Two things this shape needs, both learned by writing the wrong test
+    // first: the table must be NON-empty and emptied by a filter, because an
+    // already-empty input never reaches the numeric evaluator at all; and the
+    // expression must be a multi-node arithmetic tree, because a single binary
+    // op takes a different fast path. Both arms are covered -- the int and
+    // double roots have separate destination checks.
+    runtime::Table table;
+    table.add_column("price", Column<double>{1.0, 2.0, 3.0});
+    table.add_column("size", Column<std::int64_t>{1, 2, 3});
+
+    runtime::TableRegistry registry;
+    registry.emplace("trades", table);
+
+    SECTION("double root") {
+        auto ir = require_ir("trades[filter size > 100][update { s = price * 2.0 + 1.0 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 0);
+        const auto* scaled = std::get_if<Column<double>>(result->find("s"));
+        REQUIRE(scaled != nullptr);
+        REQUIRE(scaled->size() == 0);
+    }
+
+    SECTION("int root") {
+        auto ir = require_ir("trades[filter size > 100][update { s = size * 2 + 1 }];");
+        auto result = runtime::interpret(*ir, registry);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == 0);
+        const auto* scaled = std::get_if<Column<std::int64_t>>(result->find("s"));
+        REQUIRE(scaled != nullptr);
+        REQUIRE(scaled->size() == 0);
+    }
+}
+
 TEST_CASE("Interpret aggregate on single row") {
     runtime::Table table;
     table.add_column("price", Column<std::int64_t>{42});

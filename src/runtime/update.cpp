@@ -1135,6 +1135,17 @@ auto eval_numeric_int_node_block(const NumericUpdateNode& node, std::uint32_t id
 auto eval_numeric_update_blocks_into(const std::vector<NumericUpdateNode>& nodes,
                                      std::uint32_t root, std::size_t rows, ExprType output_kind,
                                      std::int64_t* out_int, double* out_double) -> void {
+    if (rows == 0) {
+        // An empty range is a legitimate shape, not a missing destination: a
+        // filter that selects nothing, or a zero-row morsel. `Column<T>::
+        // resize_for_overwrite(0)` leaves `data()` null, so the output-pointer
+        // checks below would report an absent destination for a write that has
+        // nothing to write. Returning here also skips the scratch allocation,
+        // which no block would have used. Before this function was split out of
+        // `eval_numeric_update_blocks` the empty case fell out of the block loop
+        // never running; the split turned it into an abort.
+        return;
+    }
     std::vector<std::uint8_t> modes(nodes.size(), 0U);
     if (output_kind == ExprType::Double) {
         mark_numeric_double_subtree(nodes, root, modes);

@@ -3,12 +3,17 @@
 
 #include "physical_plan.hpp"
 
+#include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ibex::runtime::physical {
 
@@ -17,6 +22,13 @@ namespace {
 std::atomic<std::uint64_t> g_plans_built{0};
 std::atomic<std::uint64_t> g_map_pipelines{0};
 std::atomic<std::uint64_t> g_materialized_calls{0};
+
+/// Fallbacks by node kind and by reason. `NodeKind` is a `std::uint8_t` enum, so
+/// 256 slots covers it by construction and no sentinel enumerator has to be
+/// maintained alongside the IR.
+constexpr std::size_t kKindSlots = 256;
+std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_kind{};
+std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_reason{};
 
 /// Printable name for a step kind. Only map kinds appear here — the planner
 /// never admits anything else into `steps`.
@@ -42,7 +54,7 @@ auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
 /// Printable name for the breaker feeding a `MaterializedInput` pipeline. The
 /// common breakers are named; anything else prints its numeric kind, which is
 /// enough to look up and better than claiming a name this table does not know.
-auto source_node_kind_name(ir::NodeKind kind) -> std::string_view {
+auto node_kind_name_impl(ir::NodeKind kind) -> std::string_view {
     switch (kind) {
         case ir::NodeKind::Join:
             return "Join";
@@ -82,6 +94,37 @@ auto source_node_kind_name(ir::NodeKind kind) -> std::string_view {
             return "Update";
         case ir::NodeKind::Stream:
             return "Stream";
+        // The map kinds too: a chain can fall back with one of these at its
+        // root (`MalformedMapNode`), and an unlabeled bucket is exactly what
+        // made the first backlog reading unusable.
+        case ir::NodeKind::Scan:
+            return "Scan";
+        case ir::NodeKind::Filter:
+            return "Filter";
+        case ir::NodeKind::Project:
+            return "Project";
+        case ir::NodeKind::Rename:
+            return "Rename";
+        case ir::NodeKind::FilterProject:
+            return "FilterProject";
+        case ir::NodeKind::FilterUpdateProject:
+            return "FilterUpdateProject";
+        case ir::NodeKind::ExternCall:
+            return "ExternCall";
+        case ir::NodeKind::Program:
+            return "Program";
+        case ir::NodeKind::Cov:
+            return "Cov";
+        case ir::NodeKind::Corr:
+            return "Corr";
+        case ir::NodeKind::Transpose:
+            return "Transpose";
+        case ir::NodeKind::Matmul:
+            return "Matmul";
+        case ir::NodeKind::Model:
+            return "Model";
+        case ir::NodeKind::AsTimeframe:
+            return "AsTimeframe";
         default:
             return "Other";
     }
@@ -423,7 +466,7 @@ auto explain_physical(const Plan& plan) -> std::string {
             // "which operator feeds this pipeline" is the question a reader has.
             out += "MaterializedInput(";
             out +=
-                plan.source_node != nullptr ? source_node_kind_name(plan.source_node->kind()) : "?";
+                plan.source_node != nullptr ? node_kind_name_impl(plan.source_node->kind()) : "?";
             out += ")";
             break;
     }
@@ -472,9 +515,77 @@ void note_map_pipeline_executed() {
     g_map_pipelines.fetch_add(1, std::memory_order_relaxed);
 }
 
-void note_materialized_call(FallbackReason reason) {
+void note_materialized_call(FallbackReason reason, ir::NodeKind kind) {
     g_materialized_calls.fetch_add(1, std::memory_order_relaxed);
-    (void)reason;
+    g_fallback_by_kind[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    g_fallback_by_reason[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
+
+auto physical_fallbacks_for(ir::NodeKind kind) -> std::uint64_t {
+    return g_fallback_by_kind[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+}
+
+auto node_kind_name(ir::NodeKind kind) -> std::string_view {
+    return node_kind_name_impl(kind);
+}
+
+auto physical_fallback_report() -> std::string {
+    // Descending by count: the top line is the next thing worth porting, which
+    // is the whole point of keeping this by kind.
+    std::vector<std::pair<std::uint64_t, ir::NodeKind>> rows;
+    for (std::size_t i = 0; i < kKindSlots; ++i) {
+        const std::uint64_t n = g_fallback_by_kind[i].load(std::memory_order_relaxed);
+        if (n != 0) {
+            rows.emplace_back(n, static_cast<ir::NodeKind>(i));
+        }
+    }
+    std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string out;
+    for (const auto& [count, kind] : rows) {
+        out += "plan fallback: kind=";
+        out += node_kind_name_impl(kind);
+        out += " count=" + std::to_string(count) + "\n";
+    }
+    return out;
+}
+
+namespace {
+
+/// `IBEX_PLAN_STATS=1` prints the migration backlog at exit: how much of the
+/// query surface the physical plan describes, and what it does not.
+///
+/// The counters existed before this and nothing read them, which meant the plan
+/// document's own mitigation -- "every fallback explicit, profiled, and covered
+/// by a migration backlog keyed by its measured cost" -- was written down but
+/// not in place, and Phase 4's port order stayed the a-priori guess it was
+/// drafted as.
+struct FallbackReporter {
+    const bool enabled = std::getenv("IBEX_PLAN_STATS") != nullptr;
+
+    ~FallbackReporter() {
+        if (!enabled) {
+            return;
+        }
+        ibex::formatting::print(
+            stderr,
+            "plan stats: plans={} pipelines={} fallbacks={} not_map_chain={} "
+            "empty_chain={} malformed={}\n",
+            physical_plans_built(), physical_map_pipelines(), physical_materialized_calls(),
+            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::NotMapChain)].load(
+                std::memory_order_relaxed),
+            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::EmptyChain)].load(
+                std::memory_order_relaxed),
+            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::MalformedMapNode)].load(
+                std::memory_order_relaxed));
+        const std::string report = physical_fallback_report();
+        if (!report.empty()) {
+            ibex::formatting::print(stderr, "{}", report);
+        }
+    }
+};
+
+const FallbackReporter g_fallback_reporter;
+
+}  // namespace
 
 }  // namespace ibex::runtime::physical

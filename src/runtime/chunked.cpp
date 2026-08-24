@@ -12686,9 +12686,12 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         }
         return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
     }
-    if (!exec.can_fan_out()) {
-        physical::note_materialized_call(plan.reason);
-    }
+    // Counted in every mode. It used to fire only when the query could not fan
+    // out, so at two cores or more the backlog read as empty -- a migration
+    // counter that reports nothing on the configuration everything is measured
+    // on. The seam visits each node once, so there is nothing to double count;
+    // the test asserts the two modes agree.
+    physical::note_materialized_call(plan.reason, node.kind());
 
     // A deferred lazy scan can be streamed instead of materialized. Everything
     // else — a registered table, a source with no unit decomposition — falls

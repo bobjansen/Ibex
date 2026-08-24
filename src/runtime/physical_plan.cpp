@@ -152,13 +152,13 @@ auto classify_source(const ir::Node& node, const TableRegistry& registry,
 /// it.
 void resolve_pipeline_mode(Plan& plan) {
     std::size_t prefix = 0;
-    for (const ir::Node* step : plan.steps) {
-        if (execution_capability(*step) != ExecutionCapability::ParallelMap) {
+    for (const MapStep& step : plan.steps) {
+        if (execution_capability(*step.node) != ExecutionCapability::ParallelMap) {
             // The chain continues into something a morsel may not hold. The
             // prefix so far is still a pipeline; this step is its boundary.
             break;
         }
-        if (!map_step_expressions_are_subset_evaluable(*step)) {
+        if (!map_step_expressions_are_subset_evaluable(*step.node)) {
             // One unsupported expression makes the whole chain serial rather
             // than shortening it: the steps above it would have to consume a
             // partial result they were not planned over.
@@ -174,7 +174,7 @@ void resolve_pipeline_mode(Plan& plan) {
         return;
     }
     if (std::all_of(plan.steps.begin(), plan.steps.begin() + static_cast<std::ptrdiff_t>(prefix),
-                    [](const ir::Node* step) { return is_metadata_only_node(step->kind()); })) {
+                    [](const MapStep& step) { return is_metadata_only_node(step.node->kind()); })) {
         plan.mode = PipelineMode::Serial;
         plan.serial_reason = SerialOnlyReason::NoRowWork;
         return;
@@ -205,7 +205,6 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             plan.reason = FallbackReason::MalformedMapNode;
             return plan;
         }
-        plan.steps.push_back(cur);
         const MapKernelCapability capability = *map_kernel_capability(*cur);
         const MapKernelFactory factory = map_kernel_factory(capability);
         if (factory == nullptr) {
@@ -216,7 +215,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             plan.reason = FallbackReason::MalformedMapNode;
             return plan;
         }
-        plan.kernel_dispatch.push_back({.capability = capability, .factory = factory});
+        plan.steps.push_back({.node = cur, .capability = capability, .factory = factory});
         cur = children.front().get();
     }
 
@@ -277,7 +276,7 @@ auto parallel_input_node(const Plan& plan) -> const ir::Node* {
     if (plan.mode != PipelineMode::MorselParallel) {
         return nullptr;
     }
-    return plan.parallel_steps < plan.steps.size() ? plan.steps[plan.parallel_steps]
+    return plan.parallel_steps < plan.steps.size() ? plan.steps[plan.parallel_steps].node
                                                    : plan.source_node;
 }
 
@@ -304,9 +303,9 @@ auto explain_physical(const Plan& plan) -> std::string {
         return out;
     }
     out += "MapPipeline\n";
-    for (const ir::Node* step : plan.steps) {
+    for (const MapStep& step : plan.steps) {
         out += "  ";
-        out += map_step_kind_name(step->kind());
+        out += map_step_kind_name(step.node->kind());
         out += "\n";
     }
     out += "  source: ";

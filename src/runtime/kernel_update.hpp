@@ -104,6 +104,43 @@ struct DirectCategoricalPlan {
     std::vector<Column<Categorical>::code_type> literal_codes;
 };
 
+/// One node of a compiled numeric expression tree, in post-order: `left` and
+/// `right` index earlier entries of the same vector, so a plan is position
+/// independent and can be copied. Column pointers are absolute-row, which is
+/// what lets one plan serve any `RowRange` of the input it was planned against.
+struct NumericTreeNode {
+    enum class Kind : std::uint8_t {
+        IntColumn,
+        DoubleColumn,
+        IntScalar,
+        DoubleScalar,
+        Binary,
+        Min,
+        Max,
+        Unary
+    };
+
+    Kind kind = Kind::IntScalar;
+    ExprType type = ExprType::Int;
+    ir::ArithmeticOp op = ir::ArithmeticOp::Add;
+    std::uint32_t left = 0;
+    std::uint32_t right = 0;
+    const std::int64_t* ints = nullptr;
+    const double* doubles = nullptr;
+    std::int64_t int_scalar = 0;
+    double double_scalar = 0.0;
+    double (*unary)(double) = nullptr;
+};
+
+/// A compiled arithmetic tree over columns and scalars: the general numeric
+/// shape the single-operation `DirectFieldPlan` family cannot name. The root's
+/// type is the output kind, so a caller sizes its destination from the plan.
+struct DirectNumericTreePlan {
+    std::vector<NumericTreeNode> nodes;
+    std::uint32_t root = 0;
+    ExprType type = ExprType::Int;
+};
+
 /// A resolved `__interp` expression whose leaves can be copied without
 /// formatting or allocation.  It is deliberately internal to the update
 /// kernels, but shared by chunk and table writers so their two-pass string
@@ -193,6 +230,13 @@ struct StringInterpolationPlan {
                                                     FixedWidthNumericKind output_kind,
                                                     NumericOutputSpan output) -> bool;
 
+[[nodiscard]] auto try_plan_direct_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
+                                                const ScalarRegistry* scalars)
+    -> std::optional<DirectNumericTreePlan>;
+[[nodiscard]] auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
+                                                   ::ibex::runtime::RowRange range,
+                                                   NumericOutputSpan output) -> bool;
+
 [[nodiscard]] auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
                                                   const ScalarRegistry* scalars)
     -> std::optional<StringInterpolationPlan>;
@@ -220,10 +264,11 @@ struct DirectFieldRoute {
     std::optional<DirectPredicatePlan> predicate;
     std::optional<DirectValidityPlan> validity;
     std::optional<DirectFieldPlan> fixed_width;
+    std::optional<DirectNumericTreePlan> numeric_tree;
 
     [[nodiscard]] auto has_plan() const noexcept -> bool {
         return string.has_value() || categorical.has_value() || predicate.has_value() ||
-               validity.has_value() || fixed_width.has_value();
+               validity.has_value() || fixed_width.has_value() || numeric_tree.has_value();
     }
 };
 

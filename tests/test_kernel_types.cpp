@@ -1273,12 +1273,10 @@ TEST_CASE("A declined split still avoids the table bridge", "[kernel][update][pa
     CHECK(stats.parallel_fields.load() == 0);
 }
 
-// An expression the direct route does not name keeps the bridge, deliberately:
-// the table evaluator can still split it through its own range writer, and
-// declining is how such a field keeps its parallelism rather than how it loses
-// it. `sqrt` is one — the compiled numeric tree owns it, and that tree has no
-// range-writing form on this side of the seam yet.
-TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][parallel]") {
+// A compiled arithmetic tree is a route arm of its own, so an expression the
+// single-operation families cannot name -- `sqrt` over a column here -- still
+// splits inside the chunk kernel rather than crossing to the table evaluator.
+TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][update][parallel]") {
     constexpr std::size_t kRows = 40'000;
     Column<double> price;
     for (std::size_t r = 0; r < kRows; ++r) {
@@ -1306,6 +1304,53 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
         runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
     REQUIRE(updated.has_value());
     const auto& root = std::get<Column<double>>(*updated->columns[1].column);
+    REQUIRE(root.size() == kRows);
     CHECK(root[9] == Catch::Approx(3.0));
+    // The window boundaries are where a range that read or wrote the wrong rows
+    // would first show.
+    CHECK(root[4'096] == Catch::Approx(std::sqrt(4'096.0)));
+    CHECK(root[kRows - 1] == Catch::Approx(std::sqrt(static_cast<double>(kRows - 1))));
+    CHECK(stats.chunk_direct_updates.load() == 1);
+    CHECK(stats.parallel_fields.load() == 1);
+    CHECK(stats.parallel_direct_numeric_fields.load() == 1);
+}
+
+// An expression outside the direct vocabulary entirely keeps the bridge,
+// deliberately: the table evaluator can still split it through its own range
+// writer, so declining is how such a field keeps its parallelism rather than
+// how it loses it. A string result is one -- no numeric window this splitter
+// can pre-size, and no route arm that writes bytes outside `__interp`.
+TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<std::string> name;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        name.push_back("abcdef");
+    }
+    runtime::Chunk chunk;
+    chunk.add_column("name", std::move(name));
+    std::vector<ir::ExprPtr> args;
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "name"}}));
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}}));
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{3}}}));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "head",
+         .expr = ir::Expr{.node = ir::CallExpr{
+                              .callee = "substring", .args = std::move(args), .named_args = {}}}}};
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_grain = 4'096;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    const auto& head = std::get<Column<std::string>>(*updated->columns[1].column);
+    REQUIRE(head.size() == kRows);
+    CHECK(head[0] == "bcd");
     CHECK(stats.chunk_direct_updates.load() == 0);
 }

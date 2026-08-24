@@ -1975,6 +1975,64 @@ TEST_CASE("E2E: a filter between a left join and its aggregate is not dropped",
     require_tables_equal(out, parallel);
 }
 
+// The same rewrite, and the other half of what it used to assume: an update
+// between the join and the aggregate computes a column the join output does not
+// have. It used to walk past that update and remap the aggregate onto whatever
+// single column the field referenced, which is right for exactly one shape --
+// the `Int64(col is not null)` flag `count(col)` lowers to -- and wrong for any
+// field that computes a value. `w = v * 2` failed outright ("aggregate column
+// not found: w"); summing `v` in its place would have been worse, since it
+// would have answered.
+TEST_CASE("E2E: an update between a left join and its aggregate is not bypassed",
+          "[e2e][join][aggregate]") {
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2, 3});
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{1, 1, 2});
+    right.add_column("v", Column<std::int64_t>{100, 1, 100});
+    runtime::TableRegistry tables;
+    tables.emplace("l", std::move(left));
+    tables.emplace("r", std::move(right));
+
+    // Join rows: (1,100) (1,1) (2,100) (3,null). Doubling v and summing by k:
+    // k=1 -> 200+2, k=2 -> 200, k=3 -> null doubled is null, so the sum of an
+    // all-null group.
+    const auto* src = "(l left join r on k)[update { w = v * 2 }][select { n = sum(w) }, by k];";
+    auto out = run(src, tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "k") == std::vector<std::int64_t>{1, 2, 3});
+    const auto* sums = std::get_if<Column<std::int64_t>>(out.find("n"));
+    REQUIRE(sums != nullptr);
+    CHECK((*sums)[0] == 202);
+    CHECK((*sums)[1] == 200);
+
+    require_tables_equal(out, run_parallel(src, tables, 2));
+}
+
+// And the shape the fast path exists for still takes it: `count(col)` over a
+// left join, which lowers to that flag update plus a sum. This is the case the
+// vetting must keep admitting -- a rule that declined everything would pass the
+// test above and quietly cost the queries this rewrite was written for.
+TEST_CASE("E2E: count over a left join still uses the fused rewrite", "[e2e][join][aggregate]") {
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{1, 2, 3});
+    runtime::Table right;
+    right.add_column("k", Column<std::int64_t>{1, 1, 2});
+    right.add_column("v", Column<std::int64_t>{100, 1, 100});
+    runtime::TableRegistry tables;
+    tables.emplace("l", std::move(left));
+    tables.emplace("r", std::move(right));
+
+    // k=1 matches twice, k=2 once, k=3 not at all — and an unmatched left row
+    // counts zero, which is the whole point of counting the right column.
+    const auto* src = "(l left join r on k)[select { n = count(v) }, by k];";
+    auto out = run(src, tables);
+    REQUIRE(out.rows() == 3);
+    CHECK(col_i64(out, "k") == std::vector<std::int64_t>{1, 2, 3});
+    CHECK(col_i64(out, "n") == std::vector<std::int64_t>{2, 1, 0});
+    require_tables_equal(out, run_parallel(src, tables, 2));
+}
+
 TEST_CASE("E2E: a column-less row scaffold survives the parallel path", "[e2e][parallel]") {
     // A `Table(n)` scaffold carries its row count in `logical_rows` with no
     // columns, which is the shape most likely to be dropped by a path that

@@ -5,6 +5,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/pipeline.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -163,6 +164,71 @@ TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "
 
     const std::string text = runtime::physical::explain_physical(plan);
     REQUIRE(text.find("source: MaterializedInput(Distinct)") != std::string::npos);
+}
+
+// The plan's execution mode has to be the same verdict `analyze_parallel_island`
+// reaches by walking the IR itself — that equality is what lets the island
+// become a mode of a pipeline instead of a second analysis. Checked over the
+// shapes that exercise every rule: eligible chains, the Update boundary, the
+// metadata-only chain, an expression a morsel cannot evaluate, a chain over a
+// breaker, and a root that is no chain at all.
+TEST_CASE("Pipeline mode agrees with the island analysis", "[physical][plan][parallel]") {
+    const auto check = [](const char* source) {
+        const auto [tree, plan] = serial_plan(source);
+        const auto island = runtime::analyze_parallel_island(*tree);
+        INFO(source);
+        REQUIRE((plan.migrated && plan.mode == runtime::physical::PipelineMode::MorselParallel) ==
+                island.eligible());
+        if (!island.eligible()) {
+            return;
+        }
+        // `operators` is source-to-sink; the plan records steps sink-first.
+        REQUIRE(plan.parallel_steps == island.operators.size());
+        for (std::size_t i = 0; i < island.operators.size(); ++i) {
+            REQUIRE(plan.steps[plan.parallel_steps - 1 - i] == island.operators[i]);
+        }
+        REQUIRE(runtime::physical::parallel_input_node(plan) == island.input);
+    };
+
+    check("trades[filter price > 5];");
+    check("trades[filter price > 15, select { price }];");
+    check("trades[filter price > 5][rename { p = price }];");
+    // Metadata-only: no per-row work to spread.
+    check("trades[select { price }];");
+    check("trades[rename { p = price }];");
+    // A bare row-local update is a map step and deliberately not a parallel
+    // one, so it bounds the prefix rather than joining it.
+    check("trades[update { p2 = price * 2 }];");
+    check("trades[update { p2 = price * 2 }][filter p2 > 5];");
+    // Over a breaker, which is a pipeline since 32f62261 and was always an
+    // eligible island.
+    check("trades[distinct { symbol, price }][filter price > 5];");
+    check("trades[select { total = sum(price) }, by { symbol }][filter total > 5];");
+    // Not a map chain at all.
+    check("trades[order { price }];");
+    check("trades;");
+}
+
+TEST_CASE("A pipeline's mode names the step that bounds it", "[physical][plan][parallel]") {
+    const auto [tree, plan] = serial_plan("trades[update { p2 = price * 2 }][filter p2 > 5];");
+    REQUIRE(plan.migrated);
+    REQUIRE(plan.mode == runtime::physical::PipelineMode::MorselParallel);
+    REQUIRE(plan.steps.size() == 2);
+    // Only the filter may run over morsels; the update below it is the
+    // boundary, and executes serially as it does today.
+    REQUIRE(plan.parallel_steps == 1);
+    REQUIRE(plan.steps.front()->kind() == ir::NodeKind::Filter);
+    const ir::Node* input = runtime::physical::parallel_input_node(plan);
+    REQUIRE(input != nullptr);
+    REQUIRE(input->kind() == ir::NodeKind::Update);
+
+    const auto [metadata_tree, metadata] = serial_plan("trades[select { price }];");
+    REQUIRE(metadata.migrated);
+    REQUIRE(metadata.mode == runtime::physical::PipelineMode::Serial);
+    REQUIRE(metadata.serial_reason == runtime::physical::SerialOnlyReason::NoRowWork);
+    REQUIRE(runtime::physical::parallel_input_node(metadata) == nullptr);
+    REQUIRE(runtime::physical::explain_physical(metadata).find(
+                "mode: serial(metadata-only chain, no per-row work)") != std::string::npos);
 }
 
 TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical][explain]") {

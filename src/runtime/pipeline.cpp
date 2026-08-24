@@ -96,9 +96,7 @@ auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool {
     return kind == ir::NodeKind::Project || kind == ir::NodeKind::Rename;
 }
 
-namespace {
-
-auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
+auto map_step_expressions_are_subset_evaluable(const ir::Node& node) -> bool {
     switch (node.kind()) {
         case ir::NodeKind::Filter:
             return ir::is_subset_evaluable_expr(
@@ -122,8 +120,6 @@ auto expressions_are_subset_evaluable(const ir::Node& node) -> bool {
             return false;
     }
 }
-
-}  // namespace
 
 auto execution_capability(const ir::Node& node) -> ExecutionCapability {
     // A bare `update` is deliberately NOT a ParallelMap, even though it is
@@ -151,7 +147,7 @@ auto analyze_parallel_island(const ir::Node& root) -> ParallelIslandCandidate {
     const ir::Node* current = &root;
 
     while (execution_capability(*current) == ExecutionCapability::ParallelMap) {
-        if (!expressions_are_subset_evaluable(*current)) {
+        if (!map_step_expressions_are_subset_evaluable(*current)) {
             candidate.reason = ParallelEligibilityReason::UnsupportedExpression;
             return candidate;
         }

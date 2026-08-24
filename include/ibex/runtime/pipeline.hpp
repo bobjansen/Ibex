@@ -118,6 +118,15 @@ struct ColumnKernelSignature {
 /// Every other kind defers to the kind-based classification above.
 [[nodiscard]] auto execution_capability(const ir::Node& node) -> ExecutionCapability;
 
+/// Whether every expression in one map step can be evaluated over a subset of
+/// rows. Unknown calls (including externs/plugins), generators, transforms,
+/// ranks, and aggregates cannot, which is what makes a chain serial-only.
+///
+/// Public because the physical planner decides a pipeline's execution mode with
+/// it: there is one definition of "this step may run per morsel", not one per
+/// analysis.
+[[nodiscard]] auto map_step_expressions_are_subset_evaluable(const ir::Node& node) -> bool;
+
 enum class ParallelEligibilityReason : std::uint8_t {
     Eligible,
     NotParallelMap,

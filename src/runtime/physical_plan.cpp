@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <string>
 
 namespace ibex::runtime::physical {
 
@@ -145,6 +146,43 @@ auto classify_source(const ir::Node& node, const TableRegistry& registry,
     return false;
 }
 
+/// Decide the pipeline's execution mode from its own steps. These are the
+/// rules `analyze_parallel_island` applies while walking the IR; deciding them
+/// here means the chain is peeled once and its mode travels with it.
+void resolve_pipeline_mode(Plan& plan) {
+    std::size_t prefix = 0;
+    for (const ir::Node* step : plan.steps) {
+        if (execution_capability(*step) != ExecutionCapability::ParallelMap) {
+            // The chain continues into something a morsel may not hold. The
+            // prefix so far is still a pipeline; this step is its boundary.
+            break;
+        }
+        if (!map_step_expressions_are_subset_evaluable(*step)) {
+            // One unsupported expression makes the whole chain serial rather
+            // than shortening it: the steps above it would have to consume a
+            // partial result they were not planned over.
+            plan.mode = PipelineMode::Serial;
+            plan.serial_reason = SerialOnlyReason::UnsupportedExpression;
+            return;
+        }
+        ++prefix;
+    }
+    if (prefix == 0) {
+        plan.mode = PipelineMode::Serial;
+        plan.serial_reason = SerialOnlyReason::NotParallelMap;
+        return;
+    }
+    if (std::all_of(plan.steps.begin(), plan.steps.begin() + static_cast<std::ptrdiff_t>(prefix),
+                    [](const ir::Node* step) { return is_metadata_only_node(step->kind()); })) {
+        plan.mode = PipelineMode::Serial;
+        plan.serial_reason = SerialOnlyReason::NoRowWork;
+        return;
+    }
+    plan.mode = PipelineMode::MorselParallel;
+    plan.serial_reason = SerialOnlyReason::None;
+    plan.parallel_steps = prefix;
+}
+
 }  // namespace
 
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,
@@ -217,6 +255,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             }
         }
     }
+    resolve_pipeline_mode(plan);
     plan.migrated = true;
     return plan;
 }
@@ -229,6 +268,28 @@ auto fallback_reason_name(FallbackReason reason) -> std::string_view {
             return "bare source, no map steps";
         case FallbackReason::MalformedMapNode:
             return "map node is structurally malformed";
+    }
+    return "unknown";
+}
+
+auto parallel_input_node(const Plan& plan) -> const ir::Node* {
+    if (plan.mode != PipelineMode::MorselParallel) {
+        return nullptr;
+    }
+    return plan.parallel_steps < plan.steps.size() ? plan.steps[plan.parallel_steps]
+                                                   : plan.source_node;
+}
+
+auto serial_only_reason_name(SerialOnlyReason reason) -> std::string_view {
+    switch (reason) {
+        case SerialOnlyReason::None:
+            return "none";
+        case SerialOnlyReason::NotParallelMap:
+            return "no leading parallel-map step";
+        case SerialOnlyReason::UnsupportedExpression:
+            return "expression needs rows outside the morsel";
+        case SerialOnlyReason::NoRowWork:
+            return "metadata-only chain, no per-row work";
     }
     return "unknown";
 }
@@ -275,6 +336,19 @@ auto explain_physical(const Plan& plan) -> std::string {
                 plan.source_node != nullptr ? source_node_kind_name(plan.source_node->kind()) : "?";
             out += ")";
             break;
+    }
+    out += "\n";
+    out += "  mode: ";
+    if (plan.mode == PipelineMode::MorselParallel) {
+        out += "morsel-parallel(";
+        out += std::to_string(plan.parallel_steps);
+        out += " of ";
+        out += std::to_string(plan.steps.size());
+        out += " steps)";
+    } else {
+        out += "serial(";
+        out += serial_only_reason_name(plan.serial_reason);
+        out += ")";
     }
     out += "\n";
     if (!plan.source_signature.empty()) {

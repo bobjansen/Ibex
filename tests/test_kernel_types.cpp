@@ -1315,6 +1315,59 @@ TEST_CASE("A compiled numeric tree splits inside the chunk kernel", "[kernel][up
     CHECK(stats.parallel_direct_numeric_fields.load() == 1);
 }
 
+// A multi-field clause folds one field at a time in parallel mode too, each
+// planned against the chunk the previous field produced -- so a later field
+// that reads an earlier field's output sees it. All-or-nothing still holds: a
+// clause cannot land half its fields in the kernel and half over the bridge.
+TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
+          "[kernel][update][parallel]") {
+    constexpr std::size_t kRows = 40'000;
+    Column<double> price;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        price.push_back(static_cast<double>(r));
+    }
+    runtime::Chunk chunk;
+    chunk.add_column("price", std::move(price));
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "doubled",
+         .expr = ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Mul,
+                                                 .left = ir::make_expr_ptr(ir::Expr{
+                                                     .node = ir::ColumnRef{.name = "price"}}),
+                                                 .right = ir::make_expr_ptr(ir::Expr{
+                                                     .node = ir::Literal{.value = 2.0}})}}},
+        // Reads the field above, which is what pins the fold order.
+        {.alias = "shifted",
+         .expr = ir::Expr{
+             .node = ir::BinaryExpr{
+                 .op = ir::ArithmeticOp::Add,
+                 .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "doubled"}}),
+                 .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = 1.0}})}}}};
+
+    runtime::ParallelIslandStats stats;
+    runtime::ExecutionContext exec;
+    exec.parallel = true;
+    exec.parallel_threads = 4;
+    exec.parallel_min_rows = 0;
+    exec.parallel_min_cells = 0;
+    exec.parallel_grain = 4'096;
+    exec.parallel_stats = &stats;
+
+    auto updated =
+        runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
+    REQUIRE(updated.has_value());
+    REQUIRE(updated->columns.size() == 3);
+    const auto& doubled = std::get<Column<double>>(*updated->columns[1].column);
+    const auto& shifted = std::get<Column<double>>(*updated->columns[2].column);
+    REQUIRE(doubled.size() == kRows);
+    REQUIRE(shifted.size() == kRows);
+    CHECK(doubled[4'096] == 8'192.0);
+    CHECK(shifted[4'096] == 8'193.0);
+    CHECK(shifted[kRows - 1] == static_cast<double>(2 * (kRows - 1)) + 1.0);
+    CHECK(stats.chunk_direct_updates.load() == 2);
+    // Both fields were split, not just the first.
+    CHECK(stats.parallel_fields.load() == 2);
+}
+
 // An expression outside the direct vocabulary entirely keeps the bridge,
 // deliberately: the table evaluator can still split it through its own range
 // writer, so declining is how such a field keeps its parallelism rather than

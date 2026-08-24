@@ -12782,9 +12782,17 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             }
         }
         const ir::Node* aggregate_child = agg.children().front().get();
+        // Only nodes this rewrite can account for may be walked past, because
+        // what follows aggregates the JOIN's output directly and never builds
+        // the skipped nodes. A Project selects columns the join output already
+        // has, and an Update is handled by the counted-column remap below.
+        //
+        // FilterProject and FilterUpdateProject used to be skipped here too,
+        // and that silently dropped their predicate: `(l left join r on k)
+        // [filter v > k][select {k, v}][select {n = sum(k)}, by k]` returned a
+        // group per join key instead of a group per surviving row.
         while (aggregate_child != nullptr &&
                (aggregate_child->kind() == ir::NodeKind::Project ||
-                aggregate_child->kind() == ir::NodeKind::FilterProject ||
                 aggregate_child->kind() == ir::NodeKind::Update) &&
                !aggregate_child->children().empty()) {
             aggregate_child = aggregate_child->children().front().get();

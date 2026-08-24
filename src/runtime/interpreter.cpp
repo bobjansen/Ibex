@@ -574,9 +574,11 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 return aggregate_table(it->second, agg.group_by(), agg.aggregations(), &exec);
             }
             const ir::Node* aggregate_child = &child_node;
+            // See the same walk in chunked.cpp: only nodes this rewrite can
+            // account for may be skipped, since it aggregates the join output
+            // directly. A skipped FilterProject dropped its predicate.
             while (aggregate_child != nullptr &&
                    (aggregate_child->kind() == ir::NodeKind::Project ||
-                    aggregate_child->kind() == ir::NodeKind::FilterProject ||
                     aggregate_child->kind() == ir::NodeKind::Update) &&
                    !aggregate_child->children().empty()) {
                 aggregate_child = aggregate_child->children().front().get();

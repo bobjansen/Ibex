@@ -117,9 +117,14 @@ TEST_CASE("Column kernel signatures capture storage representation and null poli
 }
 
 TEST_CASE("Physical plan declines breakers and grouped updates with reasons", "[physical][plan]") {
+    // Order is migrated now -- `build_physical_order` builds it -- so the
+    // breaker standing in for "declines" here is one that still does.
     const auto [order_tree, order] = serial_plan("trades[order { price }];");
-    REQUIRE_FALSE(order.migrated);
-    REQUIRE(order.reason == runtime::physical::FallbackReason::NotMapChain);
+    REQUIRE(order.migrated);
+
+    const auto [distinct_tree, distinct] = serial_plan("trades[distinct symbol];");
+    REQUIRE_FALSE(distinct.migrated);
+    REQUIRE(distinct.reason == runtime::physical::FallbackReason::NotMapChain);
 
     // A streamable aggregate is migrated now -- `build_physical_aggregate`
     // builds it -- so the breaker that still declines is one needing every
@@ -504,7 +509,7 @@ TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][para
     }
 
     // Roots that are no pipeline at all never claim a mode.
-    for (const char* source : {"trades[order { price }];", "trades;"}) {
+    for (const char* source : {"trades[distinct symbol];", "trades;"}) {
         INFO(source);
         const auto [tree, plan] = serial_plan(source);
         REQUIRE_FALSE(plan.migrated);
@@ -544,7 +549,7 @@ TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical]
     REQUIRE(text.find("  source signature: fixed-width/all-valid string-slabs/all-valid "
                       "packed-bool/all-valid\n") != std::string::npos);
 
-    const auto [fallback_tree, fallback] = serial_plan("trades[order { price }];");
+    const auto [fallback_tree, fallback] = serial_plan("trades[distinct symbol];");
     const std::string declined = runtime::physical::explain_physical(fallback);
     REQUIRE(declined.find("MaterializedCall(root is not a row-local map)") != std::string::npos);
 }

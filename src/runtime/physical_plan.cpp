@@ -357,6 +357,13 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     // stay silent about 51% of the backlog until the day execution moves would
     // mean the description and the executor land together, untested against
     // each other.
+    if (root.kind() == ir::NodeKind::Order) {
+        // Nothing to classify: one operator runs every Order. The plan owns
+        // construction, which is the whole content of this port.
+        plan.migrated = true;
+        plan.source_node = &root;
+        return plan;
+    }
     if (root.kind() == ir::NodeKind::Aggregate) {
         // Described, not executed: `migrated` stays false and the per-kind
         // switch still builds every aggregate. The description is proven equal

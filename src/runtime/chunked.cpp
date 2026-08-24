@@ -12894,6 +12894,30 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
     return std::unexpected("physical aggregate: plan named no executable strategy");
 }
 
+/// Build an ordering breaker. Phase 4 item 3.
+///
+/// No strategy vocabulary here on purpose: `ChunkedOrderOperator` handles every
+/// Order there is, so unlike `plan_join` and `plan_aggregate` there is no
+/// decision to describe. Adding a one-valued enum would be the ceremony the
+/// plan document's risk table warns about -- what this buys is that the plan
+/// owns construction, not that it makes a choice.
+auto build_physical_order(const ir::Node& node, const TableRegistry& registry,
+                          const ScalarRegistry* scalars, const ExternRegistry* externs,
+                          const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& order = static_cast<const ir::OrderNode&>(node);
+    if (order.children().empty()) {
+        return std::unexpected("order node missing child");
+    }
+    auto child_op =
+        build_operator(*order.children().front(), registry, scalars, externs, exec, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    return std::make_unique<ChunkedOrderOperator>(std::move(child_op.value()), &order.keys(), exec);
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
@@ -12926,6 +12950,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // composer walks it in both modes, so there is no arrangement of map nodes
     // that only one of the two paths can express.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    if (plan.migrated && node.kind() == ir::NodeKind::Order) {
+        physical::note_map_pipeline_executed();
+        return build_physical_order(node, registry, scalars, externs, exec, model_out);
+    }
     if (plan.migrated && plan.aggregate.describes) {
         physical::note_map_pipeline_executed();
         return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
@@ -13119,26 +13147,16 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec);
     }
 
-    if (node.kind() == ir::NodeKind::Order) {
-        const auto& order = static_cast<const ir::OrderNode&>(node);
-        if (order.children().empty()) {
-            return std::unexpected("order node missing child");
-        }
-        auto child_op =
-            build_operator(*order.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedOrderOperator>(std::move(child_op.value()), &order.keys(),
-                                                      exec);
-    }
+    // No Order branch: every Order is a migrated plan, built by
+    // `build_physical_order` at the seam above. Unlike the join and the
+    // aggregate there is no eligibility gate to relay -- one operator handles
+    // every Order -- so the plan has nothing to decide and says only that this
+    // node is an ordering breaker.
 
-    if (node.kind() == ir::NodeKind::Aggregate) {
-        // Only `MaterializeAll` reaches here now -- Median, Quantile and Ewma.
-        // A streaming or fused aggregate is a migrated plan and was built by
-        // `build_physical_aggregate` at the seam above, so it falls through to
-        // the whole-table path below exactly as it always did.
-    }
+    // No Aggregate branch: `MaterializeAll` (Median, Quantile, Ewma) falls
+    // through to the whole-table path below exactly as it always did, and every
+    // other aggregate is a migrated plan built by `build_physical_aggregate` at
+    // the seam above.
 
     if (node.kind() == ir::NodeKind::TopK) {
         // Fused Head(Order(x)) / Tail(Order(x)) — canonicalize R16. The

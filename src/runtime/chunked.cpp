@@ -10357,9 +10357,9 @@ auto build_filter_project_gather_map(const MapStep& step, OperatorPtr child,
     // kernel -- only a step able to name both nodes.
     const ir::Expr* predicate = nullptr;
     const std::vector<ir::ColumnRef>* columns = nullptr;
-    if (step.fused != nullptr) {
+    if (step.fused_project != nullptr) {
         predicate = &static_cast<const ir::FilterNode&>(*step.node).predicate();
-        columns = &static_cast<const ir::ProjectNode&>(*step.fused).columns();
+        columns = &static_cast<const ir::ProjectNode&>(*step.fused_project).columns();
     } else {
         const auto& fp = static_cast<const ir::FilterProjectNode&>(*step.node);
         predicate = &fp.predicate();
@@ -10375,14 +10375,29 @@ auto build_filter_update_project_gather_map(
     const ExternRegistry* externs, const ExecutionContext& exec,
     const std::vector<ColumnKernelSignature>* source_signature, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*step.node);
+    // Two shapes, one kernel: canonicalize's fused node, and a Filter the
+    // planner fused with the Update and Project above it. The operator wants a
+    // predicate, the update fields, and a column list wherever they come from.
+    const ir::Expr* predicate = nullptr;
+    const std::vector<ir::FieldSpec>* fields = nullptr;
+    const std::vector<ir::ColumnRef>* project_columns = nullptr;
+    if (step.fused_project != nullptr) {
+        predicate = &static_cast<const ir::FilterNode&>(*step.node).predicate();
+        fields = &static_cast<const ir::UpdateNode&>(*step.fused_update).fields();
+        project_columns = &static_cast<const ir::ProjectNode&>(*step.fused_project).columns();
+    } else {
+        const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*step.node);
+        predicate = &fup.predicate();
+        fields = &fup.fields();
+        project_columns = &fup.project_columns();
+    }
     robin_hood::unordered_set<std::string> update_outputs;
     robin_hood::unordered_set<std::string> needed;
-    for (const auto& field : fup.fields()) {
+    for (const auto& field : *fields) {
         update_outputs.insert(field.alias);
         collect_expr_column_refs(field.expr, needed);
     }
-    for (const auto& column : fup.project_columns()) {
+    for (const auto& column : *project_columns) {
         if (!update_outputs.contains(column.name)) {
             needed.insert(column.name);
         }
@@ -10393,9 +10408,8 @@ auto build_filter_update_project_gather_map(
         gather_columns.push_back(ir::ColumnRef{.name = name});
     }
     return std::make_unique<ChunkedFilterUpdateProjectOperator>(
-        std::move(child), &fup.predicate(), &fup.fields(), &fup.project_columns(),
-        std::move(gather_columns), scalars, externs, exec,
-        physical_filter_route(fup.predicate(), source_signature), preserve_empty_morsels);
+        std::move(child), predicate, fields, project_columns, std::move(gather_columns), scalars,
+        externs, exec, physical_filter_route(*predicate, source_signature), preserve_empty_morsels);
 }
 
 auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory {
@@ -10561,8 +10575,9 @@ struct RangeHead {
         // A planner-fused Project rides along exactly as the fused IR kind's
         // column list does below: same head, same absorbed projection.
         const std::vector<ir::ColumnRef>* project =
-            step.fused != nullptr ? &static_cast<const ir::ProjectNode&>(*step.fused).columns()
-                                  : nullptr;
+            step.fused_project != nullptr
+                ? &static_cast<const ir::ProjectNode&>(*step.fused_project).columns()
+                : nullptr;
         return RangeHead{.predicate = &predicate, .project = project};
     }
     if (step.node->kind() == ir::NodeKind::FilterProject) {

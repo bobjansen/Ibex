@@ -57,12 +57,16 @@ using MapKernelFactory = std::expected<OperatorPtr, std::string> (*)(
 /// silent possibility while the planner kept them in two vectors indexed
 /// alike.
 struct MapStep {
+    /// The step's leading node, and the one its capability was proven from.
+    /// For a planner-fused shape this is the `Filter`, which runs first.
     const ir::Node* node = nullptr;
-    /// A second IR node this step executes in the same pass — the `Project`
-    /// above a `Filter`, fused by the planner rather than by canonicalize.
-    /// Null for an unfused step, including one whose node is already a fused
-    /// IR kind.
-    const ir::Node* fused = nullptr;
+    /// Further IR nodes this step executes in the same pass, fused by the
+    /// planner rather than by canonicalize. Both null for an unfused step,
+    /// including one whose node is already a fused IR kind. The shapes are
+    /// `Project(Filter(x))` and `Project(Update(Filter(x)))` — the same two
+    /// canonicalize R5 and R6 rewrite, expressed physically.
+    const ir::Node* fused_update = nullptr;
+    const ir::Node* fused_project = nullptr;
     MapKernelCapability capability = MapKernelCapability::FilterGather;
     MapKernelFactory factory = nullptr;
 

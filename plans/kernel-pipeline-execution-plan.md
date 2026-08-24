@@ -701,26 +701,60 @@ including the interpreter-vs-transpiled parity case, and `check_answers.py`
 22/22 under both `IBEX_PARALLEL` settings. No performance claim -- this removes
 a per-chunk metadata bridge, not a row loop.
 
-**Where Phase 2 stands (2026-08-23).** Written from the tree, not from a
+**The compiled numeric tree as a route arm (2026-08-24, `aea4d347`).** The tree
+was the last shape that could evaluate a whole chunk but not one range of it, so
+a parallel chunk update over general arithmetic -- `sqrt(x) * 2.0 + pmin(y,
+0.5)` -- had no arm, declined the split, and crossed to `update_table` only to
+be split there by that file's own compiled tree.
+
+It is now a plan and a range writer like the rest: `DirectNumericTreePlan` holds
+the post-order nodes, the root, and the root's type; `write_direct_numeric_tree_range`
+fills a caller-positioned window. Node column pointers were already
+absolute-row, which is what lets one plan serve any `RowRange` of the input it
+was planned against. The arm sits after `fixed_width` in `DirectFieldRoute`, the
+order the serial dispatch already used, and is dispatched ahead of the caller's
+fallback hook.
+
+Both executors therefore reach it, on purpose: the table splitter now writes
+such a field with the kernel tree rather than falling through to
+`try_write_compiled_numeric_update_expr`. Gating the arm on "the caller has no
+fallback" would have been the smaller change and the wrong one -- it would put
+the two executors back into disagreement about which expressions have a fast
+path, which is the thing this phase exists to remove. The two trees agree where
+both apply (Int `Div` widens to `Double` in each, `Mod` is `safe_imod` /
+`std::fmod` in each) and the kernel tree accepts a strict subset: no cast
+wrappers, no column-kernel splices. `try_numeric_tree_update` is that same plan
+written over the whole range, so one implementation remains rather than two.
+
+Still bridged in parallel mode after this: the legacy null-handling arms outside
+the `DirectValidityPlan` vocabulary, anything only the general evaluator reaches
+(a string result has no numeric window to pre-size), and multi-field clauses.
+
+Gates: debug ctest 1739/1739, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings, and `IBEX_PARALLEL_STATS=1` on a 5M-row
+`sqrt(x) * 2.0 + pmin(y, 0.5)` update reporting `chunk_direct_updates=1` where
+it was 0. No performance claim -- a per-chunk metadata bridge removed, not a row
+loop.
+
+**Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
 | Item | State |
 |---|---|
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
-| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. **Remaining gap: an expression the direct route does not name — a compiled numeric tree, the legacy null-handling arms — still converts to a `Table` in parallel mode**, because only the table evaluator has a range writer for it. Multi-field clauses also keep the bridge in parallel mode. |
+| 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses also keep the bridge in parallel mode. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
 | 4. Run the physical map pipeline serially, then on the morsel executor | Serial only. The morsel executor is still reached through the island seam, not through the physical plan. **Untouched.** |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
 
-Current gates on the tree: full debug `ctest` 1735/1735, and PDS-H
+Current gates on the tree: full debug `ctest` 1739/1739, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) give the compiled numeric tree a
-range-writing form so it joins `DirectFieldRoute`, which is what still sends a
-parallel chunk update through the table bridge (multi-field clauses in parallel
-mode are the same shape of gap); (b) item 4, so the physical plan owns morsel
+Resume point, in priority order: (a) multi-field clauses in parallel mode, which
+now that every single-field shape but the legacy null-handling arms has a range
+writer are the largest remaining user of the table bridge; (b) item 4, so the physical plan owns morsel
 execution rather than the island seam; (c) `KernelContext`, once the writers
 above need one shared scratch/cancellation owner.
 

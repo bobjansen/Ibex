@@ -794,12 +794,36 @@ Gates: debug ctest 1742/1742, `check_answers.py` 22/22 under both
 query `noise` -- the no-regression bar this phase sets for a construction-path
 change.
 
-Remaining for item 4: (2) move the eligibility rules (ParallelMap prefix,
-subset-evaluable expressions, the no-row-work metadata rule, the deliberate
-exclusion of bare `Update`) onto the plan as its execution mode, computed once
-during lowering; (3) give `build_parallel_island` the `Plan` and delete
+Remaining for item 4: (3) give `build_parallel_island` the `Plan` and delete
 `analyze_parallel_island` / `ParallelIslandCandidate`. `build_pipelined_scan`
 stays a source-side streaming mode until Phase 3 item 3.
+
+**Item 4, step 2 — the plan decides the mode (2026-08-24, `0b4150d6`).** The
+rules that say whether a map chain may run over morsels lived inside
+`analyze_parallel_island`, which reached them by walking the IR itself. They now
+belong to the plan: `PipelineMode` (Serial / MorselParallel), `SerialOnlyReason`,
+and `parallel_steps` -- the length of the leading run of steps that may run in
+parallel -- resolved once from steps the planner has already peeled.
+
+The rules are relocated, not changed: a leading run of `ParallelMap` steps, each
+subset-evaluable, and not a chain of nothing but Project/Rename. A bare
+row-local `Update` still bounds the prefix rather than joining it, so
+`parallel_input_node` names the step below the prefix (or the source when the
+whole chain is parallel) -- the same boundary the island seam produces today by
+rooting a shorter chain. `explain_physical` prints the mode and, when serial,
+why.
+
+The equivalence evidence, which is what step 3 rests on: a temporary assertion
+at the live seam compared the plan's verdict, prefix length, step identity, and
+input node against `analyze_parallel_island`'s on every query built in parallel
+mode. It held across the full debug suite (1744 cases) and all 22 PDS-H queries
+run **on the debug binary** under `IBEX_PARALLEL=1` -- the release build compiles
+the assertion out, so running PDS-H there would have proven nothing. The probe
+was removed before the commit; the corpus test "Pipeline mode agrees with the
+island analysis" keeps a readable subset.
+
+Gates: debug ctest 1744/1744, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings. No performance claim -- no execution path changed.
 
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
@@ -809,10 +833,10 @@ per-commit A/B log; the entries above are the itemized history.
 | 1. Extract view/selection/validity/output-writer/scratch APIs | Views, `Selection`, and the fixed-width/bool/string/validity output writers exist and are used. **`KernelContext` does not exist** — scratch, cancellation, RNG stream, and profiling counters are still passed ad hoc. |
 | 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
-| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. **Steps 2-3 (execution mode on the plan, then the island deleted) not started.** |
+| 4. Run the physical map pipeline serially, then on the morsel executor | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. Step 2 landed (`0b4150d6`): the plan decides its own `PipelineMode`, proven equal to the island's verdict across the suite and PDS-H. **Step 3 (the island deleted, `build_parallel_island` taking the Plan) not started.** |
 | 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
 
-Current gates on the tree: full debug `ctest` 1742/1742, and PDS-H
+Current gates on the tree: full debug `ctest` 1744/1744, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.

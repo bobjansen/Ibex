@@ -152,36 +152,38 @@ auto make_update_rolling(ir::NodeId id, std::string alias, std::string col_ref) 
 
 }  // namespace
 
-TEST_CASE("canonicalize R5: Project(Filter(x)) fuses to FilterProject(x)", "[ir][canonicalize]") {
+// R5 and R6 (Project(Filter) and Project(Update(Filter)) fusion) were removed:
+// fusing is an execution choice and the physical planner makes it, so
+// canonicalize leaves these shapes alone. What the old tests protected — that
+// the shape executes as one pass — is now covered by the fusion cases in
+// test_physical_plan.cpp. What canonicalize still owes them is to leave the
+// tree in the shape the planner can fuse.
+TEST_CASE("canonicalize leaves Project(Filter(x)) for the physical planner", "[ir][canonicalize]") {
     auto tree = with_child(make_project({1}, {"a", "b"}),
                            with_child(make_filter({2}), make_scan({3}, "t")));
     auto out = ir::canonicalize(std::move(tree));
-    REQUIRE(out->kind() == ir::NodeKind::FilterProject);
+    REQUIRE(out->kind() == ir::NodeKind::Project);
     REQUIRE(out->children().size() == 1);
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
-    const auto& fp = static_cast<const ir::FilterProjectNode&>(*out);
-    REQUIRE(fp.columns().size() == 2);
-    REQUIRE(fp.columns()[0].name == "a");
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
 }
 
-TEST_CASE("canonicalize R6: Project(Update(Filter(x))) fuses when row-local",
+TEST_CASE("canonicalize leaves Project(Update(Filter(x))) for the physical planner",
           "[ir][canonicalize]") {
     auto tree = with_child(make_project({1}, {"a", "b"}),
                            with_child(make_update_row_local({2}, "b", "raw_b"),
                                       with_child(make_filter({3}), make_scan({4}, "t"))));
     auto out = ir::canonicalize(std::move(tree));
-    REQUIRE(out->kind() == ir::NodeKind::FilterUpdateProject);
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
-    const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*out);
-    REQUIRE(fup.fields().size() == 1);
-    REQUIRE(fup.fields().front().alias == "b");
-    REQUIRE(fup.project_columns().size() == 2);
+    REQUIRE(out->kind() == ir::NodeKind::Project);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Filter);
 }
 
-TEST_CASE("canonicalize R6: Project(Update(Filter(x))) preserved when update is cross-row",
+TEST_CASE("canonicalize preserves Project(Update(Filter(x))) with a cross-row update",
           "[ir][canonicalize]") {
-    // rolling_sum reaches across rows, so R6 must not fire — the shape stays
-    // Project(Update(Filter(Scan))).
+    // rolling_sum reaches across rows. The shape stays Project(Update(Filter(
+    // Scan))) — and the physical planner will not fuse it either, since
+    // `map_kernel_capability` declines a non-row-local update.
     auto tree = with_child(make_project({1}, {"a", "b"}),
                            with_child(make_update_rolling({2}, "b", "raw_b"),
                                       with_child(make_filter({3}), make_scan({4}, "t"))));
@@ -303,15 +305,22 @@ TEST_CASE("canonicalize R12: Filter(Update(x)) preserved when predicate reads up
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
 }
 
-TEST_CASE("canonicalize R12 then R6: Project(Filter(Update(x))) fuses end-to-end",
+TEST_CASE("canonicalize R12: a filter on an untouched column sinks below an update",
           "[ir][canonicalize]") {
+    // R12 is the rule under test: the filter reads a column the update does not
+    // write, so it belongs below it. The result used to be fused by R6; now it
+    // stays Project(Update(Filter(Scan))), which is the shape the physical
+    // planner fuses into one step.
     auto tree = with_child(
         make_project({1}, {"a", "b"}),
         with_child(make_filter_cmp_col({2}, "a", 500),
                    with_child(make_update_row_local({3}, "b", "raw_b"), make_scan({4}, "t"))));
     auto out = ir::canonicalize(std::move(tree));
-    REQUIRE(out->kind() == ir::NodeKind::FilterUpdateProject);
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
+    REQUIRE(out->kind() == ir::NodeKind::Project);
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Update);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children().front()->children().front()->children().front()->kind() ==
+            ir::NodeKind::Scan);
 }
 
 TEST_CASE("canonicalize R13: Head(Head(x)) collapses to tighter bound", "[ir][canonicalize]") {
@@ -556,10 +565,19 @@ TEST_CASE("canonicalize R18: Filter on group_by column pushes below Aggregate",
     REQUIRE(out->kind() == ir::NodeKind::Aggregate);
     REQUIRE(out->children().size() == 1);
     // R18 pushes Filter below Aggregate; R20 then inserts a column-pruning
-    // Project between Aggregate and Filter, which fuses with the Filter via R5
-    // into a FilterProject node.
-    REQUIRE(out->children().front()->kind() == ir::NodeKind::FilterProject);
-    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Scan);
+    // Project between Aggregate and Filter. That pair used to be fused by R5
+    // into a FilterProject node; the physical planner fuses it now, so the
+    // canonical tree keeps both nodes.
+    REQUIRE(out->children().front()->kind() == ir::NodeKind::Project);
+    REQUIRE(out->children().front()->children().front()->kind() == ir::NodeKind::Filter);
+    // Below the filter the pruning passes may leave their own projection; what
+    // R18 is asserted on is that the filter sits under the aggregate and above
+    // the scan, so walk to the leaf rather than pinning the count.
+    const ir::Node* leaf = out->children().front()->children().front().get();
+    while (!leaf->children().empty()) {
+        leaf = leaf->children().front().get();
+    }
+    REQUIRE(leaf->kind() == ir::NodeKind::Scan);
 }
 
 TEST_CASE("canonicalize R18: Filter on agg alias stays above Aggregate (HAVING-style)",

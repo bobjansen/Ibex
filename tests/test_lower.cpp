@@ -38,21 +38,26 @@ TEST_CASE("Lower filter and select to IR") {
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    // Canonicalize R5 fuses Project(Filter(x)) into FilterProject(x).
-    const auto* fp = as_node<ir::FilterProjectNode>(result->get());
-    REQUIRE(fp != nullptr);
-    REQUIRE(fp->columns().size() == 1);
-    REQUIRE(fp->columns()[0].name == "price");
+    // Canonicalize leaves Project(Filter(x)) alone — fusing it is the physical
+    // planner's decision now, not a property of the tree.
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->columns().size() == 1);
+    REQUIRE(project->columns()[0].name == "price");
+
+    REQUIRE(project->children().size() == 1);
+    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
+    REQUIRE(filter != nullptr);
 
     // Predicate is a FilterCmp with a FilterColumn on the left referencing "price".
-    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&fp->predicate().node);
+    const auto* cmp = std::get_if<ibex::ir::CompareExpr>(&filter->predicate().node);
     REQUIRE(cmp != nullptr);
     const auto* col = std::get_if<ibex::ir::ColumnRef>(&cmp->left->node);
     REQUIRE(col != nullptr);
     REQUIRE(col->name == "price");
 
-    REQUIRE(fp->children().size() == 1);
-    const auto* scan = as_node<ir::ScanNode>(fp->children()[0].get());
+    REQUIRE(filter->children().size() == 1);
+    const auto* scan = as_node<ir::ScanNode>(filter->children()[0].get());
     REQUIRE(scan != nullptr);
     REQUIRE(scan->source_name() == "df");
 }
@@ -110,7 +115,10 @@ TEST_CASE("Map pipeline mode follows lowered canonical IR", "[runtime][pipeline]
     REQUIRE(input != nullptr);
     CHECK(input->kind() == ir::NodeKind::Scan);
     REQUIRE(plan.parallel_steps == 1);
-    CHECK(plan.steps[0].node->kind() == ir::NodeKind::FilterProject);
+    // One fused step: the filter is the step's node, the projection rides on
+    // it. The plan expresses the fusion the tree no longer carries.
+    CHECK(plan.steps[0].node->kind() == ir::NodeKind::Filter);
+    CHECK(plan.steps[0].fused_project != nullptr);
 }
 
 TEST_CASE("A bare update bounds the parallel prefix", "[runtime][pipeline]") {
@@ -1001,13 +1009,16 @@ enriched[filter x > 10, select { x }];
     auto result = parser::lower(program);
     REQUIRE(result.has_value());
 
-    // Canonicalize R5 fuses Project(Filter(x)) into FilterProject(x); here x
-    // is the Update subtree, so the shape is FilterProject(Update(Scan)).
-    const auto* fp = as_node<ir::FilterProjectNode>(result->get());
-    REQUIRE(fp != nullptr);
-    REQUIRE(fp->children().size() == 1);
+    // Canonicalize leaves the projection and filter unfused, so the shape is
+    // Project(Filter(Update(Scan))).
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->children().size() == 1);
+    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
+    REQUIRE(filter != nullptr);
+    REQUIRE(filter->children().size() == 1);
 
-    const auto* update = as_node<ir::UpdateNode>(fp->children()[0].get());
+    const auto* update = as_node<ir::UpdateNode>(filter->children()[0].get());
     REQUIRE(update != nullptr);
     REQUIRE(update->children().size() == 1);
     REQUIRE(update->children()[0] != nullptr);
@@ -1167,8 +1178,9 @@ parts[filter p_partkey == scalar(
 
     // A filter returns the rows it kept, not a wider table: the plan ends in a
     // projection back to the outer query's columns, with no trace of the
-    // generated one. (Canonicalize fuses the Project onto the Filter below it.)
-    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    // generated one. (The Project stays its own node; the physical planner is
+    // what fuses it with the Filter below.)
+    const auto* fused = as_node<ir::ProjectNode>(result->get());
     REQUIRE(fused != nullptr);
     std::vector<std::string> kept;
     for (const auto& column : fused->columns()) {
@@ -1217,7 +1229,7 @@ parts[filter p_partkey == scalar(
 
     // The user's own __ibex_scalar_0 is kept, so the subquery had to land in
     // __ibex_scalar_1 instead of silently colliding with it.
-    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    const auto* fused = as_node<ir::ProjectNode>(result->get());
     REQUIRE(fused != nullptr);
     std::vector<std::string> kept;
     for (const auto& column : fused->columns()) {
@@ -1318,7 +1330,7 @@ parts[filter p_partkey == scalar(supply[select { m = min(ps_cost) }])];
     REQUIRE(aggregate->aggregations()[0].alias == "__ibex_scalar_0");
 
     // Still a filter, so still not a wider table.
-    const auto* fused = as_node<ir::FilterProjectNode>(result->get());
+    const auto* fused = as_node<ir::ProjectNode>(result->get());
     REQUIRE(fused != nullptr);
     std::vector<std::string> kept;
     for (const auto& column : fused->columns()) {

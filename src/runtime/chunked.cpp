@@ -10568,6 +10568,14 @@ struct RangeHead {
         return std::nullopt;
     }
     if (step.node->kind() == ir::NodeKind::Filter) {
+        // A head absorbs a filter and, at most, the projection directly above
+        // it. A fused step that also carries an Update computes columns between
+        // the two, and absorbing the projection here would skip that
+        // computation -- the projection would then name a column nothing
+        // produced. Such a step keeps its operator chain.
+        if (step.fused_update != nullptr) {
+            return std::nullopt;
+        }
         const auto& predicate = static_cast<const ir::FilterNode&>(*step.node).predicate();
         if (!is_range_native_expr(predicate)) {
             return std::nullopt;

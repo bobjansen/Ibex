@@ -858,6 +858,46 @@ Gates: debug ctest 1744/1744, `check_answers.py` 22/22 under both
 at 9 repeats -- this reroutes construction for every query in parallel mode --
 at geomean 1.006, total -0.25%, every query `noise`.
 
+**Item 5, step 1 — fusion becomes physical (2026-08-24, `d3d4ae7c`,
+`918be2d3`).** Item 5 asks for the fused execution node kinds to be retired
+"once physical-pipeline fusion proves equivalent", and that fusion did not
+exist: canonicalize R5 rewrote `Project(Filter(x))` into a `FilterProject`
+*node* and the planner recognized the kind. Deleting R5 would have deleted the
+fusion, not relocated it.
+
+Two commits. `d3d4ae7c` replaced the plan's `steps` + `kernel_dispatch` pair of
+position-indexed vectors with one `MapStep` carrying node, capability, and
+factory together — a step had to stop being addressable as a bare node pointer
+before it could name two nodes. `918be2d3` then fuses in the planner: the step
+names the `Filter` as its node and the `Project` as `fused`, and resolves the
+same `FilterProjectGather` kernel. No new kernel was needed —
+`ChunkedFilterProjectOperator` only ever wanted a predicate and a column list.
+
+The fusion is carried, not merely planned: `MapStep` replaces bare node
+pointers through the parallel executors too, so `range_filter_head` absorbs a
+fused project into the morsel source exactly as it absorbs a `FilterProject`
+node's column list. A step that lost its `fused` partner between the planner
+and a worker would have produced correct rows with the projection silently
+dropped — right answers, wrong columns — which is why the plumbing goes all the
+way rather than stopping at the serial composer.
+
+It fires only on IR that reaches the runtime unfused today, since both the
+compiled and REPL paths canonicalize (`repl.cpp` runs it explicitly, and that
+was itself a fix). The tests therefore build the unfused tree by hand and check
+the plan shape, execution matching the canonicalized `FilterProject` byte for
+byte in both modes, and a 40k-row case that actually morselizes with
+`parallel_islands == 1` asserted so a silent serial fallback cannot pass.
+
+Gates: debug ctest 1747/1747, `check_answers.py` 22/22 under both
+`IBEX_PARALLEL` settings. No performance claim -- no shape in the current
+pipeline reaches the new fusion yet.
+
+**Remaining for item 5**: `Project(Update(Filter(x)))` (canonicalize R6) needs a
+step naming three nodes, then R5/R6 can be removed from canonicalize and the
+node kinds retired from the IR. That last step moves work off canonicalize's
+path for every query and touches ~25 files across `ir/`, `parser/`, `codegen/`,
+and `runtime/`, so it wants its own A/B rather than riding along here.
+
 **Where Phase 2 stands (2026-08-24).** Written from the tree, not from a
 per-commit A/B log; the entries above are the itemized history.
 
@@ -867,16 +907,21 @@ per-commit A/B log; the entries above are the itemized history.
 | 2. Port filter/project/rename/row-local update kernels | Filter: every representation. Project/rename: metadata map. Row-local update: the direct-plan family above, plus multi-field ordering, and (since `9474fcb4`) the same plans in parallel mode, split by the kernel itself. Since `aea4d347` the compiled numeric tree is a route arm too, so general arithmetic splits in the kernel. **Remaining gap: the legacy null-handling arms and anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode**, because only the table evaluator has a range writer for those. Multi-field clauses fold in the kernel too since `63d7f8a1`. |
 | 3. Static dispatch tables and capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`, with `ColumnKernelSignature` recorded for resolved scan sources. |
 | 4. Run the physical map pipeline serially, then on the morsel executor | **DONE** (`32f62261`, `0b4150d6`, `8e31700a`): one plan per node decides both modes, and the island analysis is deleted. Earlier state, kept for context: | Serial only, but the plan can now describe every shape the island executes: since `32f62261` a map chain over a breaker is a `MaterializedInput` pipeline rather than a fallback. The morsel executor is still reached through the island seam. Step 2 (`0b4150d6`) gave the plan its own `PipelineMode`; step 3 (`8e31700a`) deleted the island analysis and handed `build_map_pipeline_parallel` the plan. |
-| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **Untouched.** Canonicalize still produces them and the planner lowers the tree as built. |
+| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | Started: the planner fuses `Project(Filter(x))` itself (`918be2d3`), which is the precondition the item names. Canonicalize still produces the fused kinds and the three-node R6 shape is not fused physically yet, so the node kinds remain. |
 
-Current gates on the tree: full debug `ctest` 1744/1744, and PDS-H
+Current gates on the tree: full debug `ctest` 1747/1747, and PDS-H
 `check_answers.py` 22/22 under both `IBEX_PARALLEL` settings. No
 performance claim is made for this block: the entries it summarizes were
 gated individually when they landed, and it is not a fresh A/B.
 
-Resume point, in priority order: (a) `KernelContext`, once the writers above
-need one shared scratch/cancellation owner; (b) item 5, retiring
-`FilterProject`/`FilterUpdateProject` as execution node kinds. Phase 3 then
+Resume point, in priority order: (a) finish item 5 — physical fusion for the
+three-node `Project(Update(Filter(x)))` shape, then retire R5/R6 and the node
+kinds; (b) `KernelContext`, which is **not** started deliberately: its stated
+trigger (one shared scratch/cancellation owner) is not met. Cancellation
+already has an owner in `interrupt.hpp`, and the map kernels share no scratch —
+the ad-hoc scratch that exists belongs to breaker operators, which is Phase 4.
+Building it before a caller needs it is the ceremony this plan's own risk table
+warns about. Phase 3 then
 picks up the two things item 4 deliberately left: a plan that can model a
 serial tail over a parallel prefix (so the per-kind recursion is no longer what
 finds an inner pipeline), and `build_pipelined_scan` as a source mode of the

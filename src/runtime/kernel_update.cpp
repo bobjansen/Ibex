@@ -178,30 +178,6 @@ auto numeric_double_value(const NumericOperand& operand) -> double {
                : std::get<double>(operand.scalar);
 }
 
-struct NumericTreeNode {
-    enum class Kind : std::uint8_t {
-        IntColumn,
-        DoubleColumn,
-        IntScalar,
-        DoubleScalar,
-        Binary,
-        Min,
-        Max,
-        Unary
-    };
-
-    Kind kind = Kind::IntScalar;
-    ExprType type = ExprType::Int;
-    ir::ArithmeticOp op = ir::ArithmeticOp::Add;
-    std::uint32_t left = 0;
-    std::uint32_t right = 0;
-    const std::int64_t* ints = nullptr;
-    const double* doubles = nullptr;
-    std::int64_t int_scalar = 0;
-    double double_scalar = 0.0;
-    UnaryDoubleFn unary = nullptr;
-};
-
 auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
                           const ScalarRegistry* scalars, std::vector<NumericTreeNode>& nodes)
     -> std::optional<std::uint32_t> {
@@ -289,6 +265,85 @@ auto compile_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
     return static_cast<std::uint32_t>(nodes.size() - 1);
 }
 
+auto eval_numeric_tree_double(const NumericTreeNode* nodes, std::uint32_t index, std::size_t row)
+    -> double {
+    const auto& node = nodes[index];
+    switch (node.kind) {
+        case NumericTreeNode::Kind::IntColumn:
+            return static_cast<double>(node.ints[row]);
+        case NumericTreeNode::Kind::DoubleColumn:
+            return node.doubles[row];
+        case NumericTreeNode::Kind::IntScalar:
+            return static_cast<double>(node.int_scalar);
+        case NumericTreeNode::Kind::DoubleScalar:
+            return node.double_scalar;
+        case NumericTreeNode::Kind::Min:
+            return std::min(eval_numeric_tree_double(nodes, node.left, row),
+                            eval_numeric_tree_double(nodes, node.right, row));
+        case NumericTreeNode::Kind::Max:
+            return std::max(eval_numeric_tree_double(nodes, node.left, row),
+                            eval_numeric_tree_double(nodes, node.right, row));
+        case NumericTreeNode::Kind::Unary:
+            return node.unary(eval_numeric_tree_double(nodes, node.left, row));
+        case NumericTreeNode::Kind::Binary: {
+            const double left = eval_numeric_tree_double(nodes, node.left, row);
+            const double right = eval_numeric_tree_double(nodes, node.right, row);
+            switch (node.op) {
+                case ir::ArithmeticOp::Add:
+                    return left + right;
+                case ir::ArithmeticOp::Sub:
+                    return left - right;
+                case ir::ArithmeticOp::Mul:
+                    return left * right;
+                case ir::ArithmeticOp::Div:
+                    return left / right;
+                case ir::ArithmeticOp::Mod:
+                    return std::fmod(left, right);
+            }
+        }
+    }
+    invariant_violation("numeric tree: unhandled double node");
+}
+
+auto eval_numeric_tree_int(const NumericTreeNode* nodes, std::uint32_t index, std::size_t row)
+    -> std::int64_t {
+    const auto& node = nodes[index];
+    switch (node.kind) {
+        case NumericTreeNode::Kind::IntColumn:
+            return node.ints[row];
+        case NumericTreeNode::Kind::IntScalar:
+            return node.int_scalar;
+        case NumericTreeNode::Kind::Min:
+            return std::min(eval_numeric_tree_int(nodes, node.left, row),
+                            eval_numeric_tree_int(nodes, node.right, row));
+        case NumericTreeNode::Kind::Max:
+            return std::max(eval_numeric_tree_int(nodes, node.left, row),
+                            eval_numeric_tree_int(nodes, node.right, row));
+        case NumericTreeNode::Kind::Binary: {
+            const std::int64_t left = eval_numeric_tree_int(nodes, node.left, row);
+            const std::int64_t right = eval_numeric_tree_int(nodes, node.right, row);
+            switch (node.op) {
+                case ir::ArithmeticOp::Add:
+                    return left + right;
+                case ir::ArithmeticOp::Sub:
+                    return left - right;
+                case ir::ArithmeticOp::Mul:
+                    return left * right;
+                case ir::ArithmeticOp::Div:
+                    invariant_violation("numeric tree: Int division widens to Double");
+                case ir::ArithmeticOp::Mod:
+                    return safe_imod(left, right);
+            }
+            return 0;  // exhaustive switch; keeps strict compilers aware.
+        }
+        case NumericTreeNode::Kind::DoubleColumn:
+        case NumericTreeNode::Kind::DoubleScalar:
+        case NumericTreeNode::Kind::Unary:
+            invariant_violation("numeric tree: Double node in Int expression");
+    }
+    invariant_violation("numeric tree: unhandled Int node");
+}
+
 auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
                              const ScalarRegistry* scalars) -> std::optional<Chunk> {
     if (fields.size() != 1) {
@@ -296,104 +351,30 @@ auto try_numeric_tree_update(const Chunk& input, const std::vector<ir::FieldSpec
     }
     const ChunkView view(input);
     const auto source = predicate_input(view);
-    std::vector<NumericTreeNode> nodes;
-    nodes.reserve(8);
-    const auto root = compile_numeric_tree(fields.front().expr, source, scalars, nodes);
-    if (!root.has_value()) {
+    const auto plan = try_plan_direct_numeric_tree(fields.front().expr, source, scalars);
+    if (!plan.has_value()) {
         return std::nullopt;
     }
-    const auto eval_double = [&](auto&& self, std::uint32_t index, std::size_t row) -> double {
-        const auto& node = nodes[index];
-        switch (node.kind) {
-            case NumericTreeNode::Kind::IntColumn:
-                return static_cast<double>(node.ints[row]);
-            case NumericTreeNode::Kind::DoubleColumn:
-                return node.doubles[row];
-            case NumericTreeNode::Kind::IntScalar:
-                return static_cast<double>(node.int_scalar);
-            case NumericTreeNode::Kind::DoubleScalar:
-                return node.double_scalar;
-            case NumericTreeNode::Kind::Min:
-                return std::min(self(self, node.left, row), self(self, node.right, row));
-            case NumericTreeNode::Kind::Max:
-                return std::max(self(self, node.left, row), self(self, node.right, row));
-            case NumericTreeNode::Kind::Unary:
-                return node.unary(self(self, node.left, row));
-            case NumericTreeNode::Kind::Binary: {
-                const double left = self(self, node.left, row);
-                const double right = self(self, node.right, row);
-                switch (node.op) {
-                    case ir::ArithmeticOp::Add:
-                        return left + right;
-                    case ir::ArithmeticOp::Sub:
-                        return left - right;
-                    case ir::ArithmeticOp::Mul:
-                        return left * right;
-                    case ir::ArithmeticOp::Div:
-                        return left / right;
-                    case ir::ArithmeticOp::Mod:
-                        return std::fmod(left, right);
-                }
-            }
-        }
-        invariant_violation("numeric tree: unhandled double node");
-    };
-    const auto eval_int = [&](auto&& self, std::uint32_t index, std::size_t row) -> std::int64_t {
-        const auto& node = nodes[index];
-        switch (node.kind) {
-            case NumericTreeNode::Kind::IntColumn:
-                return node.ints[row];
-            case NumericTreeNode::Kind::IntScalar:
-                return node.int_scalar;
-            case NumericTreeNode::Kind::Min:
-                return std::min(self(self, node.left, row), self(self, node.right, row));
-            case NumericTreeNode::Kind::Max:
-                return std::max(self(self, node.left, row), self(self, node.right, row));
-            case NumericTreeNode::Kind::Binary: {
-                const std::int64_t left = self(self, node.left, row);
-                const std::int64_t right = self(self, node.right, row);
-                switch (node.op) {
-                    case ir::ArithmeticOp::Add:
-                        return left + right;
-                    case ir::ArithmeticOp::Sub:
-                        return left - right;
-                    case ir::ArithmeticOp::Mul:
-                        return left * right;
-                    case ir::ArithmeticOp::Div:
-                        invariant_violation("numeric tree: Int division widens to Double");
-                    case ir::ArithmeticOp::Mod:
-                        return safe_imod(left, right);
-                }
-                return 0;  // exhaustive switch; keeps strict compilers aware.
-            }
-            case NumericTreeNode::Kind::DoubleColumn:
-            case NumericTreeNode::Kind::DoubleScalar:
-            case NumericTreeNode::Kind::Unary:
-                invariant_violation("numeric tree: Double node in Int expression");
-        }
-        invariant_violation("numeric tree: unhandled Int node");
-    };
-
+    const auto range = ::ibex::runtime::RowRange::whole(view.rows());
     ColumnValue values;
-    if (nodes[*root].type == ExprType::Int) {
+    NumericOutputSpan window;
+    if (plan->type == ExprType::Int) {
         Column<std::int64_t> output;
         output.resize_for_overwrite(view.rows());
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            output.data()[row] = eval_int(eval_int, *root, row);
-        }
         values = std::move(output);
+        window.ints = std::get<Column<std::int64_t>>(values).data();
     } else {
         Column<double> output;
         output.resize_for_overwrite(view.rows());
-        for (std::size_t row = 0; row < view.rows(); ++row) {
-            output.data()[row] = eval_double(eval_double, *root, row);
-        }
         values = std::move(output);
+        window.doubles = std::get<Column<double>>(values).data();
     }
-    return write_direct_update(
-        input, fields.front().alias, std::make_shared<ColumnValue>(std::move(values)),
-        collect_expr_validity(fields.front().expr, source,
-                              ::ibex::runtime::RowRange::whole(view.rows())));
+    if (!write_direct_numeric_tree_range(*plan, range, window)) {
+        return std::nullopt;
+    }
+    return write_direct_update(input, fields.front().alias,
+                               std::make_shared<ColumnValue>(std::move(values)),
+                               collect_expr_validity(fields.front().expr, source, range));
 }
 
 auto try_metadata_alias_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields)
@@ -2050,6 +2031,45 @@ auto write_fixed_width_numeric_binary(const ir::Expr& expr, const PredicateInput
     return false;
 }
 
+auto try_plan_direct_numeric_tree(const ir::Expr& expr, const PredicateInput& input,
+                                  const ScalarRegistry* scalars)
+    -> std::optional<DirectNumericTreePlan> {
+    DirectNumericTreePlan plan;
+    plan.nodes.reserve(8);
+    const auto root = compile_numeric_tree(expr, input, scalars, plan.nodes);
+    if (!root.has_value()) {
+        return std::nullopt;
+    }
+    plan.root = *root;
+    plan.type = plan.nodes[*root].type;
+    return plan;
+}
+
+auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
+                                     ::ibex::runtime::RowRange range, NumericOutputSpan output)
+    -> bool {
+    // Node column pointers are absolute-row, so a range reads its own rows and
+    // writes the window the caller positioned at `range.begin`.
+    if (plan.type == ExprType::Int) {
+        if (output.ints == nullptr) {
+            return false;
+        }
+        for (std::size_t offset = 0; offset < range.count; ++offset) {
+            output.ints[offset] =
+                eval_numeric_tree_int(plan.nodes.data(), plan.root, range.begin + offset);
+        }
+        return true;
+    }
+    if (output.doubles == nullptr) {
+        return false;
+    }
+    for (std::size_t offset = 0; offset < range.count; ++offset) {
+        output.doubles[offset] =
+            eval_numeric_tree_double(plan.nodes.data(), plan.root, range.begin + offset);
+    }
+    return true;
+}
+
 auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
                        const ScalarRegistry* scalars) -> DirectFieldRoute {
     DirectFieldRoute route;
@@ -2070,6 +2090,10 @@ auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
         return route;
     }
     route.fixed_width = try_plan_direct_fixed_width_field(expr, input, scalars);
+    if (route.fixed_width.has_value()) {
+        return route;
+    }
+    route.numeric_tree = try_plan_direct_numeric_tree(expr, input, scalars);
     return route;
 }
 
@@ -2282,6 +2306,9 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
             return route.fixed_width->numeric_kind == FixedWidthNumericKind::Int ? ExprType::Int
                                                                                  : ExprType::Double;
         }
+        if (route.numeric_tree.has_value()) {
+            return route.numeric_tree->type;
+        }
         return std::nullopt;
     }();
     const auto destination = inferred.has_value() ? inferred : plan_kind;
@@ -2383,6 +2410,16 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
                 }
                 continue;
             }
+            const bool tree_destination =
+                route.numeric_tree.has_value() &&
+                ((route.numeric_tree->type == ExprType::Int && dst_int != nullptr) ||
+                 (route.numeric_tree->type == ExprType::Double && dst_double != nullptr));
+            if (tree_destination &&
+                write_direct_numeric_tree_range(*route.numeric_tree, range, window)) {
+                pieces[index] = collect_expr_validity(expr, input, range);
+                used_direct_numeric.store(true, std::memory_order_relaxed);
+                continue;
+            }
             if (fallback == nullptr) {
                 pieces[index] = std::unexpected(
                     "evaluate_field_windows: no direct plan covers this range and the caller "
@@ -2414,8 +2451,9 @@ namespace {
 /// which leaves the original update to the table evaluator.
 ///
 /// The route is required rather than optional here, unlike in serial mode. A
-/// field the route does not name (a compiled numeric tree, the legacy
-/// null-handling arms) has no range writer on this side of the seam, and the
+/// field the route does not name (the legacy null-handling arms, an expression
+/// only the general evaluator reaches) has no range writer on this side of the
+/// seam, and the
 /// table evaluator can still split it through its own fallback hook -- so
 /// declining is how such a field keeps its parallelism, not how it loses it.
 auto try_direct_update_field_parallel(const Chunk& input, const std::vector<ir::FieldSpec>& fields,

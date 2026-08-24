@@ -168,7 +168,9 @@ auto mime_type(const std::filesystem::path& path) -> std::string_view {
     return "text/html; charset=utf-8";
 }
 
-auto send_response(Socket socket, int status, std::string_view status_text, std::string body,
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+auto send_response(Socket socket, int status, std::string_view status_text, const std::string& body,
+                   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                    std::string_view content_type = "application/json; charset=utf-8",
                    std::string_view cookie = {}) -> void {
     std::ostringstream response;
@@ -275,6 +277,7 @@ auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
         *entry.column);
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto table_page(const runtime::Table& table, std::size_t offset, std::size_t limit) -> json {
     const std::size_t start = std::min(offset, table.rows());
     const std::size_t end = std::min(table.rows(), start + limit);
@@ -299,6 +302,7 @@ auto bounded_limit(const json& body) -> std::size_t {
     return std::clamp<std::size_t>(requested, 1, 1000);
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto query_size(std::string_view target, std::string_view key, std::size_t fallback)
     -> std::size_t {
     const auto question = target.find('?');
@@ -352,6 +356,7 @@ auto url_decode(std::string_view encoded) -> std::optional<std::string> {
     return decoded;
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto query_value(std::string_view target, std::string_view key) -> std::optional<std::string> {
     const auto question = target.find('?');
     if (question == std::string_view::npos)
@@ -504,12 +509,14 @@ constexpr __u64 kLandlockReadExecuteAccess =
 
 auto add_landlock_path_rule(int ruleset_fd, const std::filesystem::path& directory,
                             __u64 allowed_access) -> std::optional<std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open(2).
     const int directory_fd = open(directory.c_str(), O_PATH | O_CLOEXEC);
     if (directory_fd < 0) {
         return "could not open a Landlock allow-list directory";
     }
     landlock_path_beneath_attr rule{.allowed_access = allowed_access, .parent_fd = directory_fd};
     const int add_result = static_cast<int>(
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
         syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0));
     close(directory_fd);
     if (add_result != 0) {
@@ -522,6 +529,7 @@ auto enable_landlock(const std::filesystem::path& data_directory,
                      const std::vector<std::filesystem::path>& read_only_directories)
     -> std::optional<std::string> {
     const int abi = static_cast<int>(
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
         syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION));
     if (abi < 3) {
         return "Landlock ABI 3 or newer is required to confine reads and writes";
@@ -529,6 +537,7 @@ auto enable_landlock(const std::filesystem::path& data_directory,
     landlock_ruleset_attr ruleset_attr{};
     ruleset_attr.handled_access_fs = kLandlockFilesystemAccess;
     const int ruleset_fd = static_cast<int>(
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
         syscall(SYS_landlock_create_ruleset, &ruleset_attr, sizeof(ruleset_attr), 0));
     if (ruleset_fd < 0)
         return "could not create the Landlock ruleset";
@@ -544,7 +553,9 @@ auto enable_landlock(const std::filesystem::path& data_directory,
             return error;
         }
     }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux prctl(2) and syscall(2).
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
         syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0) {
         close(ruleset_fd);
         return "could not enforce the Landlock ruleset";
@@ -571,7 +582,7 @@ auto readable_plugin_directories(const repl::ReplConfig& config)
         return std::nullopt;
     }
     std::ranges::sort(directories);
-    directories.erase(std::unique(directories.begin(), directories.end()), directories.end());
+    directories.erase(std::ranges::unique(directories).begin(), directories.end());
     return directories;
 }
 #endif
@@ -628,12 +639,17 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
     if (listener == kInvalidSocket)
         return 1;
     int reuse = 1;
+#ifdef _WIN32
     static_cast<void>(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
                                  reinterpret_cast<const char*>(&reuse), sizeof(reuse)));
+#else
+    static_cast<void>(setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)));
+#endif
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(config.port);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast): socket API requires sockaddr*.
     if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
         listen(listener, 16) != 0) {
         std::cerr << "error: unable to listen on http://127.0.0.1:" << config.port << "\n";
@@ -747,7 +763,7 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                               environment_json(session).dump(), "application/json; charset=utf-8",
                               created_cookie);
             } else if (request->method == "GET") {
-                const auto asset = static_file(*assets, request->target);
+                const auto* const asset = static_file(*assets, request->target);
                 if (!asset) {
                     send_response(client, 404, "Not Found", "Not found",
                                   "text/plain; charset=utf-8");

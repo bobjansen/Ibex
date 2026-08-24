@@ -500,7 +500,7 @@ for rows in "${SIZES[@]}"; do
         ibex_st_raw="$size_result_dir/ibex_st_raw.tsv"
         ibex_st_tsv="$size_result_dir/ibex_st.tsv"
         IBEX_ROOT="$IBEX_ROOT" BUILD_DIR="$BUILD_DIR" \
-            IBEX_PARALLEL=0 IBEX_FW_SUFFIX=-st \
+            IBEX_CORES=1 IBEX_FW_SUFFIX=-st \
             bash "$SCRIPT_DIR/bench_ibex.sh" \
                 --csv "$csv" --csv-multi "$csv_multi" --csv-trades "$csv_trades" \
                 --csv-events "$csv_events" --csv-lookup "$csv_lookup" --csv-users "$csv_users" \

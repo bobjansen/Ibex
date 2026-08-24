@@ -55,7 +55,7 @@ Two window flavours are benchmarked:
     `--duckdb-threads` (8), Polars its default pool, Ibex its parallel islands.
     This is the *what-users-experience* comparison.
   - `1`: single-threaded everywhere (`POLARS_MAX_THREADS=1`, DuckDB
-    `threads=1`, `IBEX_PARALLEL=0`). The apples-to-apples *engine efficiency*
+    `threads=1`, `IBEX_CORES=1`). The apples-to-apples *engine efficiency*
     comparison.
 
   **Ibex is no longer single-threaded by default**, so every engine is now

@@ -404,7 +404,7 @@ TEST_CASE("filter_selection: the fused pass splits into row ranges without chang
                                           cmp("w", ir::CompareOp::Lt, lit_d(17.0))};
 
     runtime::ExecutionContext serial;
-    serial.parallel = false;
+    serial.parallel_threads = 1;
     const auto want = select(table, conjuncts, serial);
     REQUIRE(!want.empty());
     REQUIRE(want.size() < kRows);  // the predicate must actually reject rows
@@ -414,7 +414,6 @@ TEST_CASE("filter_selection: the fused pass splits into row ranges without chang
     for (const std::size_t threads :
          {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{8}}) {
         runtime::ExecutionContext parallel;
-        parallel.parallel = true;
         parallel.parallel_threads = threads;
         CHECK(select(table, conjuncts, parallel) == want);
     }

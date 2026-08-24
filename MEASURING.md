@@ -83,7 +83,7 @@ ones that matter for measurement:
 |---|---|
 | `IBEX_CORES` | compute budget. **Pin it** — unset means `hardware_concurrency()`. Cap local cross-engine runs at 8; never 24 (polars thrashes and inflates Ibex ~1.7×) |
 | `IBEX_PROFILE_OPERATORS=1` | per-node + per-statement profile to stderr. The main diagnostic |
-| `IBEX_PARALLEL=0/1` | parallel islands off/on — the byte-identity A/B switch |
+| `IBEX_CORES=1` | one compute thread — the byte-identity A/B setting. There is no separate on/off switch: a budget of one *is* serial, and the aggregate morsel cut is keyed on rows, so every core count answers bit for bit. |
 | `IBEX_STREAM_SCAN=0` | opt out of streaming scans |
 | `IBEX_JOIN_PROBE=0` | opt out of the parallel join probe |
 | `IBEX_DECODE_THREADS` | absolute pool size, bypassing policy |
@@ -263,8 +263,8 @@ at all.
 For the parallel/serial contract, the equivalent is a straight diff:
 
 ```bash
-diff <(IBEX_PARALLEL=1 ./build-release/tools/ibex_eval ... q.ibex) \
-     <(IBEX_PARALLEL=0 ./build-release/tools/ibex_eval ... q.ibex)
+diff <(IBEX_CORES=8 ./build-release/tools/ibex_eval ... q.ibex) \
+     <(IBEX_CORES=1 ./build-release/tools/ibex_eval ... q.ibex)
 ```
 
 ### perf, and what does not work here

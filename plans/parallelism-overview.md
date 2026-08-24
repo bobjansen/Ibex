@@ -211,7 +211,7 @@ rules are:
 | `IBEX_CORES` | `compute_thread_count()` | compute budget (`auto` = `hardware_concurrency`) |
 | `IBEX_DECODE_THREADS` | `decode_thread_count()` | absolute pool size override |
 | `IBEX_DECODE_SATURATION` | `decode_thread_count()` | memory-system saturation point (default 8) |
-| `IBEX_PARALLEL` | `parallel_enabled_from_env()` | islands on/off (answers both ways) |
+| ~~`IBEX_PARALLEL`~~ | removed 2026-08-24 | serial is `IBEX_CORES=1`; a budget of one *is* parallelism off, and there is no longer a second spelling that can disagree with it |
 | `IBEX_MORSEL_ROWS` | `morsel_rows_from_env()` | island grain override; also lowers `parallel_min_rows` |
 | `IBEX_CHUNK_ROWS` | `source_chunk_rows_from_env()` | forces multi-chunk sources (test-only) |
 | `IBEX_STREAM_SCAN` | `stream_scans_from_env()` | streaming scan on/off |

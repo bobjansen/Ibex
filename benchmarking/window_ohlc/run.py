@@ -526,7 +526,7 @@ def main() -> None:
                          "invariant, not a tuning knob. An integer pins all four "
                          "(POLARS_MAX_THREADS, IBEX_CORES, DuckDB PRAGMA, "
                          "ClickHouse max_threads). '1' additionally sets "
-                         "IBEX_PARALLEL=0. 'auto' = each engine's own default, "
+                         "IBEX_CORES=1. 'auto' = each engine's own default, "
                          "which is NOT comparable across engines.")
     ap.add_argument("--engines", nargs="+",
                     default=["ibex", "polars", "duckdb", "clickhouse"])
@@ -556,7 +556,7 @@ def main() -> None:
         # without pinning it would quietly hand Ibex threads its competitors
         # were denied -- and the headline "single-threaded, Ibex wins at every
         # scale" result was measured back when Ibex had no threads to give.
-        os.environ["IBEX_PARALLEL"] = "0"
+        os.environ["IBEX_CORES"] = "1"
         duck_threads = 1
         label = "1t"        # single-threaded / per-core
     elif args.threads == "auto":

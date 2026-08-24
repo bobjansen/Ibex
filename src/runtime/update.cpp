@@ -1786,7 +1786,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
 /// groups there are — it is one hash and compare per ROW.
 [[nodiscard]] auto bucketing_worker_count(const ExecutionContext& exec, std::size_t rows)
     -> std::size_t {
-    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+    if (on_worker_pool_thread() || !exec.can_fan_out() || rows < exec.parallel_min_rows) {
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
@@ -1839,7 +1839,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
     // `run_group` is reached from a worker only through this function, but the
     // pipeline executor can call the whole update from a pool thread; submitting
     // from there deadlocks the pool.
-    if (on_worker_pool_thread() || !exec.parallel || remaining_groups < 2) {
+    if (on_worker_pool_thread() || !exec.can_fan_out() || remaining_groups < 2) {
         return 0;
     }
     if (rows < exec.parallel_min_rows) {
@@ -1875,7 +1875,7 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
 [[nodiscard]] auto grouped_reduction_worker_count(const ExecutionContext& exec,
                                                   std::size_t group_count, std::size_t rows)
     -> std::size_t {
-    if (on_worker_pool_thread() || !exec.parallel || group_count < 2 ||
+    if (on_worker_pool_thread() || !exec.can_fan_out() || group_count < 2 ||
         rows < exec.parallel_min_rows) {
         return 0;
     }
@@ -3472,7 +3472,7 @@ struct WindowTask {
         tasks.push_back(WindowTask{.rows = group_rows[g], .halo = 0});
     }
 
-    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+    if (on_worker_pool_thread() || !exec.can_fan_out() || rows < exec.parallel_min_rows) {
         return tasks;
     }
     const std::size_t pool_size = process_worker_pool().size();
@@ -4292,7 +4292,7 @@ auto evaluate_field_maybe_parallel(const ir::Expr& expr, const Table& table,
     if (on_worker_pool_thread()) {
         return whole_categorical();
     }
-    if (!exec.parallel || rows < exec.parallel_min_rows) {
+    if (!exec.can_fan_out() || rows < exec.parallel_min_rows) {
         return whole_categorical();
     }
     auto inferred = infer_expr_type(expr, table, ctx.scalars, ctx.externs);

@@ -252,20 +252,9 @@ void stage_park_end() noexcept;
 /// differs). See the definition for the measurements behind the policy.
 [[nodiscard]] auto decode_thread_count() -> std::size_t;
 
-/// Whether `IBEX_PARALLEL` asks the interpreter to enable morsel pipelines.
-/// `nullopt` when `IBEX_PARALLEL` is unset or unrecognized, so the caller keeps
-/// whatever it already chose; otherwise the requested setting.
-///
-/// It answers BOTH ways on purpose. Parallel pipelines are on by default now, so
-/// a switch that could only turn them on would leave no way to turn them off —
-/// which is what a user hitting a threading bug, or an A/B measuring the
-/// feature, actually needs. Accepts `1`/`on`/`true`/`yes` and
-/// `0`/`off`/`false`/`no`.
-[[nodiscard]] auto parallel_enabled_from_env() -> std::optional<bool>;
-
 /// Whether `IBEX_STREAM_SCAN` asks for lazy sources to be streamed through
 /// their scan operator rather than decoded whole. Same three-state contract and
-/// same spellings as `parallel_enabled_from_env`.
+/// same spellings as `stream_scans_from_env`'s siblings.
 ///
 /// `configure_parallel_from_env` applies this to `ExecutionContext::
 /// stream_scans`, which is the only thing the scan seams read. Nothing else may
@@ -275,7 +264,7 @@ void stage_park_end() noexcept;
 
 /// Whether `IBEX_JOIN_PROBE` asks for join probes to fan out across worker
 /// ranges. Same three-state contract and same spellings as
-/// `parallel_enabled_from_env`; applied to
+/// the shared on/off spelling; applied to
 /// `ExecutionContext::parallel_join_probe`.
 [[nodiscard]] auto parallel_join_probe_from_env() -> std::optional<bool>;
 

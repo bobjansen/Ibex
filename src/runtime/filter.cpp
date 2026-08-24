@@ -3150,7 +3150,7 @@ void select_bounds_range(const std::vector<BoundsSpec>& specs, const std::vector
 auto select_bounds_morsels(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
     constexpr std::size_t kMinRowsPerMorsel = 65536;
     constexpr std::size_t kMaxMorsels = 64;
-    if (!exec.parallel || on_worker_pool_thread() || rows < exec.parallel_min_rows) {
+    if (!exec.can_fan_out() || on_worker_pool_thread() || rows < exec.parallel_min_rows) {
         return 1;
     }
     const std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);

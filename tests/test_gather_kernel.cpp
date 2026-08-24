@@ -44,7 +44,6 @@ namespace {
 /// 65k-row table to reach the worker path.
 auto parallel_exec() -> runtime::ExecutionContext {
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_min_rows = 0;
     exec.parallel_min_cells = 0;
     exec.parallel_threads = 8;

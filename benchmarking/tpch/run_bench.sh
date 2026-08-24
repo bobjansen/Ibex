@@ -171,12 +171,12 @@ echo "=== scale factor: SF-${SCALE} (parquet -> parquet_sf${SCALE}) ==="
 SUFFIX="_sf${SCALE}"
 
 echo "=== ibex (multi-threaded, ${CORES:-$(nproc)} cores) ==="
-IBEX_CORES="${CORES:-auto}" IBEX_PARALLEL=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
+IBEX_CORES="${CORES:-auto}" "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
     --warmup "$WARMUP" --iters "$ITERS" \
     --out "$RESULTS/ibex${SUFFIX}.tsv"
 
 echo "=== ibex-st (single-threaded) ==="
-IBEX_CORES=1 IBEX_PARALLEL=0 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
+IBEX_CORES=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
     --warmup "$WARMUP" --iters "$ITERS" \
     --out "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 sed 's/^ibex\t/ibex-st\t/' "$RESULTS/ibex_st${SUFFIX}.tsv.tmp" > "$RESULTS/ibex_st${SUFFIX}.tsv"

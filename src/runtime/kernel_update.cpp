@@ -2137,7 +2137,7 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
     // thread. Submitting from there deadlocks the pool (WorkerPool::submit
     // aborts rather than let it happen), and that morsel is already one
     // worker's share -- splitting it again would only oversubscribe.
-    if (!exec.parallel || on_worker_pool_thread()) {
+    if (!exec.can_fan_out() || on_worker_pool_thread()) {
         return std::optional<ComputedColumn>{};
     }
     const std::size_t rows = input.rows();
@@ -2527,7 +2527,7 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     };
     if (fields.size() > 1) {
         auto folded =
-            exec.parallel
+            exec.can_fan_out()
                 ? fold_fields([&](const Chunk& current, const std::vector<ir::FieldSpec>& one) {
                       return try_direct_update_field_parallel(current, one, scalars, exec);
                   })
@@ -2538,7 +2538,7 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
             return direct(std::move(*folded), fields.size());
         }
     }
-    if (!exec.parallel) {
+    if (!exec.can_fan_out()) {
         if (auto output = try_direct_update_field(input, fields, scalars); output.has_value()) {
             return direct(std::move(*output), 1);
         }

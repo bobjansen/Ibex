@@ -140,7 +140,7 @@ auto radix_sort_impl(std::vector<std::uint64_t> src_keys, std::size_t rows) -> s
 /// More workers than groups is pointless; each caller checks its own group
 /// count, which this cannot see.
 auto group_barrier_worker_count(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
-    if (on_worker_pool_thread() || !exec.parallel || rows < exec.parallel_min_rows) {
+    if (on_worker_pool_thread() || !exec.can_fan_out() || rows < exec.parallel_min_rows) {
         return 0;
     }
     const std::size_t pool_size = process_worker_pool().size();
@@ -291,7 +291,7 @@ auto gather_rows_parallel(const Table& input, const std::vector<Idx>& idx,
     const std::size_t budget = exec.compute_budget();
     const std::size_t threads = std::min(budget, pool_size);
     const bool worth_it =
-        exec.parallel && !on_worker_pool_thread() && threads >= 2 && n_cols != 0 &&
+        exec.can_fan_out() && !on_worker_pool_thread() && threads >= 2 && n_cols != 0 &&
         rows >= exec.parallel_min_rows &&
         (exec.parallel_min_cells == 0 || rows * n_cols >= exec.parallel_min_cells);
     if (!worth_it) {

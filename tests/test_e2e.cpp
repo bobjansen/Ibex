@@ -114,7 +114,6 @@ auto run_parallel(std::string_view src, const runtime::TableRegistry& tables, st
     auto lowered = parser::lower(*parsed);
     REQUIRE(lowered.has_value());
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_grain = grain;
     exec.parallel_threads = threads;
     exec.parallel_min_rows = threads > 1 ? 0 : exec.parallel_min_rows;
@@ -1824,7 +1823,7 @@ days[update = gen_correlated_returns(symbols)];
 
 // --- Phase 1 serial-morsel equivalence ---------------------------------------
 //
-// With ExecutionContext.parallel set, an eligible row-local chain is executed
+// With a compute budget of two or more, an eligible row-local chain is executed
 // over a PartitionedTableSource in morsel grains. This slice runs the morsels
 // serially, so the result must be byte-identical to the plain serial path. A
 // small grain (relative to the row count) forces several morsels and a range
@@ -2310,7 +2309,6 @@ auto run_failing_pipeline(bool interrupt_before, bool interrupt_during) -> std::
     REQUIRE(lowered.has_value());
 
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_grain = 64;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
@@ -2368,7 +2366,6 @@ TEST_CASE("E2E: morsel pipeline cancels cleanly when interrupted", "[e2e][parall
     REQUIRE(lowered.has_value());
 
     runtime::ExecutionContext exec;
-    exec.parallel = true;
     exec.parallel_grain = 7;
     exec.parallel_threads = 4;
     exec.parallel_min_rows = 0;
@@ -2663,7 +2660,6 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         auto lowered = parser::lower(*parsed);
         REQUIRE(lowered.has_value());
         runtime::ExecutionContext exec;
-        exec.parallel = true;
         exec.parallel_threads = threads;
         exec.parallel_min_rows = 0;
         exec.parallel_min_cells = 0;
@@ -2759,7 +2755,6 @@ TEST_CASE("E2E: a grouped windowed update spreads its groups across threads", "[
         auto lowered = parser::lower(*parsed);
         REQUIRE(lowered.has_value());
         runtime::ExecutionContext exec;
-        exec.parallel = true;
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;
         exec.parallel_min_cells = 0;
@@ -2790,7 +2785,6 @@ TEST_CASE("E2E: the pipeline size gate counts cells, not rows", "[e2e][parallel]
         auto lowered = parser::lower(*parsed);
         REQUIRE(lowered.has_value());
         runtime::ExecutionContext exec;
-        exec.parallel = true;
         exec.parallel_grain = 7;
         exec.parallel_threads = 4;
         exec.parallel_min_rows = 0;

@@ -281,50 +281,10 @@ TEST_CASE("a stage thread is distinguishable from a pool worker and the caller",
     }
 }
 
-// `IBEX_PARALLEL` has to answer both ways.
-//
-// Morsel pipelines are on by default, so a switch that could only turn them ON
-// would leave a user hitting a threading bug -- or an A/B measuring the feature
-// -- with no way to turn them off. That is exactly the kind of gap nothing else
-// would catch: the flag would look like it worked in every test that sets it to
-// "1", which is the only value the old one understood.
-TEST_CASE("IBEX_PARALLEL can turn morsel pipelines off as well as on",
-          "[runtime][parallel][worker_pool]") {
-    const EnvGuard guard("IBEX_PARALLEL");
-
-    SECTION("unset leaves the caller's choice alone") {
-        runtime::unset_env("IBEX_PARALLEL");
-        CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
-    }
-
-    SECTION("true-ish values ask for on") {
-        for (const char* value : {"1", "on", "true", "yes"}) {
-            runtime::set_env("IBEX_PARALLEL", value);
-            CAPTURE(value);
-            REQUIRE(runtime::parallel_enabled_from_env().has_value());
-            CHECK(runtime::parallel_enabled_from_env().value());
-        }
-    }
-
-    SECTION("false-ish values ask for off") {
-        for (const char* value : {"0", "off", "false", "no"}) {
-            runtime::set_env("IBEX_PARALLEL", value);
-            CAPTURE(value);
-            REQUIRE(runtime::parallel_enabled_from_env().has_value());
-            CHECK_FALSE(runtime::parallel_enabled_from_env().value());
-        }
-    }
-
-    SECTION("an unrecognized value leaves the choice alone rather than guessing") {
-        runtime::set_env("IBEX_PARALLEL", "maybe");
-        CHECK_FALSE(runtime::parallel_enabled_from_env().has_value());
-    }
-}
-
-// The other two execution switches parse exactly like `IBEX_PARALLEL`.
+// The execution switches all parse the same way.
 //
 // They share one `env_flag` parser precisely so the accepted spellings cannot
-// drift apart -- `IBEX_PARALLEL=off` working while `IBEX_JOIN_PROBE=off` is
+// drift apart -- `IBEX_STREAM_SCAN=off` working while `IBEX_JOIN_PROBE=off` is
 // silently ignored is the failure this pins down, and it is invisible in any
 // test that only ever writes "0".
 TEST_CASE("execution switches share one on/off spelling", "[runtime][parallel][worker_pool]") {
@@ -355,7 +315,6 @@ TEST_CASE("execution switches share one on/off spelling", "[runtime][parallel][w
 
     check_flag("IBEX_STREAM_SCAN", runtime::stream_scans_from_env);
     check_flag("IBEX_JOIN_PROBE", runtime::parallel_join_probe_from_env);
-    check_flag("IBEX_PARALLEL", runtime::parallel_enabled_from_env);
 }
 
 // The I8 contract: the environment reaches these settings through

@@ -3008,7 +3008,7 @@ class ChunkedDistinctOperator final : public Operator {
         // row gate, guards only the first use.
         if (packed_part_count_ == 0) {
             constexpr std::size_t kMinRows = 1U << 15U;
-            if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
+            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
                 rows < kMinRows) {
                 return false;
             }
@@ -3421,7 +3421,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     [[nodiscard]] auto intersect_worker_count(std::size_t right_rows, std::size_t slots) const
         -> std::size_t {
         constexpr std::size_t kSlotBudgetBytes = 8UL << 20;
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() || slots == 0 ||
+        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() || slots == 0 ||
             right_rows < kMinParallelPredicateRows) {
             return 0;
         }
@@ -3681,7 +3681,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // The context checks come before the pool binding for the same reason
         // as everywhere else: constructing the pool spawns its threads
         // eagerly, and a serial query must not pay for them.
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread() ||
+        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
             rows < kMinParallelPredicateRows) {
             return serial_select();
         }
@@ -5082,7 +5082,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// submitting a batch.
     [[nodiscard]] auto probe_parallel_workers(std::size_t n) const -> std::size_t {
         constexpr std::size_t kMinProbeRows = 1U << 14U;
-        if (exec_ == nullptr || !exec_->parallel || !exec_->parallel_join_probe ||
+        if (exec_ == nullptr || !exec_->can_fan_out() || !exec_->parallel_join_probe ||
             on_worker_pool_thread() || n < kMinProbeRows) {
             return 0;
         }
@@ -6502,7 +6502,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (scratch_stride_ != 0) {
                 return false;
             }
-            if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
+            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
                 return false;
             }
             if (std::max(rows_offered_, rows) < kPairOwnedMinRows) {
@@ -7118,7 +7118,7 @@ class ChunkedAggregateOperator final : public Operator {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
+        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
             return false;
         }
         if (!partitioned_active_) {
@@ -7379,7 +7379,7 @@ class ChunkedAggregateOperator final : public Operator {
         if (tail.size() * sizeof(AggSlotCore) < kMinTailBytes) {
             return false;
         }
-        if (exec_ == nullptr || !exec_->parallel || on_worker_pool_thread()) {
+        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
             return false;
         }
         auto& pool = process_worker_pool();
@@ -7954,7 +7954,7 @@ class ChunkedAggregateOperator final : public Operator {
     auto try_accumulate_parallel(const std::uint32_t* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
                                  std::size_t rows) -> bool {
-        // Partition on the data alone -- not `exec_->parallel`, the thread
+        // Partition on the data alone -- not `exec_->can_fan_out()`, the thread
         // budget, or whether this runs on a pool thread. Those choose who
         // executes the morsels; the cut decides the arithmetic, and a cut that
         // varied with the schedule would let the same query answer differently
@@ -8330,7 +8330,7 @@ class ChunkedAggregateOperator final : public Operator {
     auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
                                        const std::vector<const ColumnEntry*>& agg_entries,
                                        std::size_t rows) -> bool {
-        // Partition on the data alone -- not `exec_->parallel`, the thread
+        // Partition on the data alone -- not `exec_->can_fan_out()`, the thread
         // budget, or whether this runs on a pool thread. Those choose who
         // executes the morsels; the cut decides the arithmetic, and a cut that
         // varied with the schedule would let the same query answer differently
@@ -8729,7 +8729,7 @@ class ChunkedAggregateOperator final : public Operator {
 
     /// How many row-morsels to split a global aggregate into; 1 = stay serial.
     [[nodiscard]] auto ungrouped_morsels(std::size_t rows) const -> std::size_t {
-        // Deliberately NOT gated on `exec_->parallel`, the thread budget, or
+        // Deliberately NOT gated on `exec_->can_fan_out()`, the thread budget, or
         // whether this runs on a pool thread. Those decide who EXECUTES the
         // morsels, not how the range is cut, and a float reduction's result
         // depends on where it is cut. Keeping the cut a function of the data
@@ -8993,7 +8993,7 @@ class ChunkedAggregateOperator final : public Operator {
         auto& pool = process_worker_pool();
         const std::size_t threads =
             std::min(n_out_columns, exec_ != nullptr ? exec_->compute_budget() : pool.size());
-        if (exec_ != nullptr && exec_->parallel && !on_worker_pool_thread() && threads > 1 &&
+        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() && threads > 1 &&
             n_groups_ >= exec_->parallel_min_rows) {
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(threads, [&](std::size_t) {
@@ -10262,9 +10262,6 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
 }
 
 void configure_parallel_from_env(ExecutionContext& exec) {
-    if (const auto want = parallel_enabled_from_env(); want.has_value()) {
-        exec.parallel = *want;
-    }
     // The other two execution switches, applied the same way and for the same
     // reason: one authority per setting. Both were `getenv` at their use sites
     // until the seams that share them started to outnumber the settings —
@@ -11437,7 +11434,7 @@ class TwoPhaseFilterOperator final : public Operator {
 
 [[nodiscard]] auto morsel_worker_count(const ExecutionContext& exec, std::uint64_t morsel_count)
     -> std::size_t {
-    if (morsel_count < 2 || !exec.parallel) {
+    if (morsel_count < 2 || !exec.can_fan_out()) {
         return 0;
     }
     // Past the parallel gate: consulting the pool here is free of the
@@ -11782,7 +11779,7 @@ class DeferredScanSourceOperator final : public Operator {
     /// inside a pool task all get — the last because submitting from a worker
     /// deadlocks against a saturated pool.
     static auto unit_window(const ExecutionContext& exec) -> std::size_t {
-        if (!exec.parallel || on_worker_pool_thread()) {
+        if (!exec.can_fan_out() || on_worker_pool_thread()) {
             return 1;
         }
         auto& pool = process_worker_pool();
@@ -12471,7 +12468,7 @@ class PipelinedStageOperator final : public Operator {
 
 [[nodiscard]] auto make_pipelined_stage(OperatorPtr child, const ExecutionContext& exec,
                                         ExecutionProfileEntry* entry) -> OperatorPtr {
-    if (!exec.parallel || on_worker_pool_thread() || process_worker_pool().size() < 2) {
+    if (!exec.can_fan_out() || on_worker_pool_thread() || process_worker_pool().size() < 2) {
         return child;
     }
     if (exec.parallel_stats != nullptr) {
@@ -12584,7 +12581,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // which it materializes before fanning out. Everything above it is composed
     // here, serially, exactly as it would be over any other child.
     //
-    // `exec.parallel` is part of the condition, not an assumption: the plan's
+    // `exec.can_fan_out()` is part of the condition, not an assumption: the plan's
     // mode says what the pipeline *may* do, and a serial run of the same plan
     // must compose every step here instead.
     //
@@ -12603,13 +12600,12 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // Deciding here, before the run is entered, is what skips it.
     //
     // The budget alone is consulted, never the pool: constructing it spawns
-    // threads a declining query would never use. `compute_budget()` answers
+    // threads a declining query would never use. `can_fan_out()` answers
     // without touching it, and answers for an unconfigured context too -- on a
     // single-core box that is a budget of one just as surely as an explicit
     // `IBEX_CORES=1` is.
-    const bool budget_can_fan_out = exec.compute_budget() >= 2;
-    if (exec.parallel && budget_can_fan_out &&
-        plan.mode == physical::PipelineMode::MorselParallel && index == plan.parallel_begin) {
+    if (exec.can_fan_out() && plan.mode == physical::PipelineMode::MorselParallel &&
+        index == plan.parallel_begin) {
         physical::note_map_pipeline_executed();
         return build_map_pipeline_parallel(plan, registry, scalars, externs, exec, model_out);
     }
@@ -12685,12 +12681,12 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         // same source construction (an input the run does not stream goes
         // through the public build_operator, so every Scan/ExternCall decision
         // below is unchanged).
-        if (plan.mode != physical::PipelineMode::MorselParallel || !exec.parallel) {
+        if (plan.mode != physical::PipelineMode::MorselParallel || !exec.can_fan_out()) {
             physical::note_map_pipeline_executed();
         }
         return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
     }
-    if (!exec.parallel) {
+    if (!exec.can_fan_out()) {
         physical::note_materialized_call(plan.reason);
     }
 
@@ -12712,7 +12708,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                 deferred != nullptr && deferred->filter == nullptr) {
                 auto units = deferred_scan_units(*deferred);
                 if (units.size() > 1) {
-                    if (exec.parallel && scan_pipeline_worker_count(units.size()) > 0) {
+                    if (exec.can_fan_out() && scan_pipeline_worker_count(units.size()) > 0) {
                         return build_pipelined_scan({}, false, *deferred, std::move(units), scalars,
                                                     externs, exec);
                     }

@@ -43,6 +43,20 @@ auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
     return "?";
 }
 
+auto join_branch_name(JoinBranch branch) -> std::string_view {
+    switch (branch) {
+        case JoinBranch::None:
+            return "None";
+        case JoinBranch::SemiAnti:
+            return "SemiAnti";
+        case JoinBranch::SingleKeyInner:
+            return "SingleKeyInner";
+        case JoinBranch::PairIntInner:
+            return "PairIntInner";
+    }
+    return "?";
+}
+
 auto join_decline_name(JoinDeclineReason reason) -> std::string_view {
     switch (reason) {
         case JoinDeclineReason::None:
@@ -560,10 +574,18 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
     // `interpreter_internal.hpp` had already written down why -- "a six-clause
     // predicate duplicated across two files, where a later clause added to one
     // copy silently routes a join the operator cannot handle".
-    out.strategy = (is_streamable_semi_anti_join(join) || is_streamable_inner_join(join) ||
-                    is_streamable_pair_int_join(join))
-                       ? JoinStrategy::StreamingProbe
-                       : JoinStrategy::MaterializeBoth;
+    // Ask each gate by name and remember which one answered, in the order the
+    // seam used to try them -- semi/anti first, since a semi join with one key
+    // satisfies nothing below it.
+    if (is_streamable_semi_anti_join(join)) {
+        out.branch = JoinBranch::SemiAnti;
+    } else if (is_streamable_inner_join(join)) {
+        out.branch = JoinBranch::SingleKeyInner;
+    } else if (is_streamable_pair_int_join(join)) {
+        out.branch = JoinBranch::PairIntInner;
+    }
+    out.strategy = out.branch == JoinBranch::None ? JoinStrategy::MaterializeBoth
+                                                  : JoinStrategy::StreamingProbe;
 
     // The clause walk below only EXPLAINS a decline. It is deliberately not the
     // decision, so it cannot route anything; if it ever disagrees with the
@@ -605,6 +627,7 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
     out.decline = JoinDeclineReason::None;
     if (join.children().size() != 2) {
         out.strategy = JoinStrategy::MaterializeBoth;
+        out.branch = JoinBranch::None;
         return out;
     }
     // Textual left streams, textual right is hashed. Which side *should* build
@@ -623,6 +646,10 @@ auto explain_join(const JoinPlan& plan) -> std::string {
     }
     std::string out = "Join(";
     out += join_strategy_name(plan.strategy);
+    if (plan.branch != JoinBranch::None) {
+        out += " branch=";
+        out += join_branch_name(plan.branch);
+    }
     out += " keys=" + std::to_string(plan.key_count);
     if (plan.decline != JoinDeclineReason::None) {
         out += " decline=";

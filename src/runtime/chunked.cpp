@@ -11350,7 +11350,7 @@ auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<cons
     std::vector<const ir::Node*> operators;
     operators.reserve(plan.parallel_steps);
     for (std::size_t i = plan.parallel_steps; i > 0; --i) {
-        operators.push_back(plan.steps[i - 1]);
+        operators.push_back(plan.steps[i - 1].node);
     }
     return operators;
 }
@@ -12420,14 +12420,15 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         return build_physical_map_step(plan, index + 1, registry, scalars, externs, exec,
                                        model_out);
     };
-    const ir::Node& node = *plan.steps[index];
+    const MapStep& step = plan.steps[index];
+    const ir::Node& node = *step.node;
     if (exec.execution_profile == nullptr) {
         auto child = build_child();
         if (!child.has_value()) {
             return child;
         }
-        return plan.kernel_dispatch[index].factory(node, std::move(child.value()), scalars, externs,
-                                                   exec, &plan.source_signature, false);
+        return step.factory(node, std::move(child.value()), scalars, externs, exec,
+                            &plan.source_signature, false);
     }
     auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
@@ -12435,9 +12436,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
         ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
-            result =
-                plan.kernel_dispatch[index].factory(node, std::move(result.value()), scalars,
-                                                    externs, exec, &plan.source_signature, false);
+            result = step.factory(node, std::move(result.value()), scalars, externs, exec,
+                                  &plan.source_signature, false);
         }
     }
     if (!result.has_value()) {

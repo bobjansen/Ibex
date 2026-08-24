@@ -63,11 +63,9 @@ TEST_CASE("Physical plan lowers filter+select into a fused map step", "[physical
     const auto [plan_tree, plan] = serial_plan("trades[filter price > 15, select { price }];");
     REQUIRE(plan.migrated);
     REQUIRE(plan.steps.size() == 1);
-    REQUIRE(plan.steps.front()->kind() == ir::NodeKind::FilterProject);
-    REQUIRE(plan.kernel_dispatch.size() == 1);
-    REQUIRE(plan.kernel_dispatch.front().capability ==
-            runtime::MapKernelCapability::FilterProjectGather);
-    REQUIRE(plan.kernel_dispatch.front().factory != nullptr);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::FilterProject);
+    REQUIRE(plan.steps.front().capability == runtime::MapKernelCapability::FilterProjectGather);
+    REQUIRE(plan.steps.front().factory != nullptr);
     REQUIRE(plan.source == runtime::physical::SourceKind::TableScan);
     REQUIRE(plan.source_node != nullptr);
     REQUIRE(plan.source_node->kind() == ir::NodeKind::Scan);
@@ -84,20 +82,16 @@ TEST_CASE("Physical plan lowers select-only and row-local update chains", "[phys
     const auto [project_tree, project] = serial_plan("trades[select { price }];");
     REQUIRE(project.migrated);
     REQUIRE(project.steps.size() == 1);
-    REQUIRE(project.steps.front()->kind() == ir::NodeKind::Project);
-    REQUIRE(project.kernel_dispatch.size() == 1);
-    REQUIRE(project.kernel_dispatch.front().capability ==
-            runtime::MapKernelCapability::MetadataMap);
-    REQUIRE(project.kernel_dispatch.front().factory != nullptr);
+    REQUIRE(project.steps.front().node->kind() == ir::NodeKind::Project);
+    REQUIRE(project.steps.front().capability == runtime::MapKernelCapability::MetadataMap);
+    REQUIRE(project.steps.front().factory != nullptr);
 
     const auto [update_tree, update] = serial_plan("trades[update { doubled = price * 2 }];");
     REQUIRE(update.migrated);
     REQUIRE(update.steps.size() == 1);
-    REQUIRE(update.steps.front()->kind() == ir::NodeKind::Update);
-    REQUIRE(update.kernel_dispatch.size() == 1);
-    REQUIRE(update.kernel_dispatch.front().capability ==
-            runtime::MapKernelCapability::RowLocalUpdate);
-    REQUIRE(update.kernel_dispatch.front().factory != nullptr);
+    REQUIRE(update.steps.front().node->kind() == ir::NodeKind::Update);
+    REQUIRE(update.steps.front().capability == runtime::MapKernelCapability::RowLocalUpdate);
+    REQUIRE(update.steps.front().factory != nullptr);
 }
 
 TEST_CASE("Physical plan classifies an unregistered scan as LazyScan", "[physical][plan]") {
@@ -154,7 +148,7 @@ TEST_CASE("A map chain over a breaker plans as a materialized-input pipeline", "
     REQUIRE(plan.migrated);
     REQUIRE(plan.source == runtime::physical::SourceKind::MaterializedInput);
     REQUIRE(plan.steps.size() == 1);
-    REQUIRE(plan.steps.front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
     REQUIRE(plan.source_node != nullptr);
     REQUIRE(plan.source_node->kind() == ir::NodeKind::Distinct);
     // No registered-scan signature to prove a representation with, so the
@@ -225,7 +219,7 @@ TEST_CASE("A pipeline's mode names the step that bounds it", "[physical][plan][p
     // Only the filter may run over morsels; the update below it is the
     // boundary, and executes serially as it does today.
     REQUIRE(plan.parallel_steps == 1);
-    REQUIRE(plan.steps.front()->kind() == ir::NodeKind::Filter);
+    REQUIRE(plan.steps.front().node->kind() == ir::NodeKind::Filter);
     const ir::Node* input = runtime::physical::parallel_input_node(plan);
     REQUIRE(input != nullptr);
     REQUIRE(input->kind() == ir::NodeKind::Update);

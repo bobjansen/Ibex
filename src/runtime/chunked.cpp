@@ -10644,6 +10644,176 @@ struct IslandWorkerChain {
     }
     return worker;
 }
+/// A bounded, sequence-ordered handoff between several producers and one
+/// consumer — the one implementation of that shape in the runtime.
+///
+/// Slots are addressed `sequence % window`, so a producer may run at most
+/// `window` sequences ahead of the consumer and then parks; the consumer parks
+/// on the slot it needs next. Both waits are wrapped in `RingWaitScope`,
+/// because produced-ahead and waiting-on-workers are idle rather than work —
+/// counting them as work makes a blocked worker read as a busy one and
+/// overstates occupancy.
+///
+/// Failure is ordered by sequence, not by arrival: the lowest-sequence failure
+/// is the one reported, so the message a query returns never depends on which
+/// thread lost a race. `record_fault` takes a static string and allocates
+/// nothing, which is the only reporting path still available when allocation is
+/// what failed.
+///
+/// Producer liveness is tracked so the consumer cannot wait for a sequence that
+/// is never coming: a producer that leaves for any reason — exhaustion, error,
+/// exception — must call `producer_exited`, which is what turns "a worker died"
+/// into an error rather than a hang.
+class OrderedChunkRing {
+   public:
+    OrderedChunkRing(std::size_t window, std::size_t producers)
+        : window_(window == 0 ? 1 : window),
+          ring_(window == 0 ? 1 : window),
+          active_producers_(producers) {}
+
+    OrderedChunkRing(const OrderedChunkRing&) = delete;
+    auto operator=(const OrderedChunkRing&) -> OrderedChunkRing& = delete;
+    OrderedChunkRing(OrderedChunkRing&&) = delete;
+    auto operator=(OrderedChunkRing&&) -> OrderedChunkRing& = delete;
+
+    /// What a producer should do with the sequence it just claimed.
+    enum class Acquire : std::uint8_t {
+        Proceed,  ///< the slot is free; produce into it
+        Abandon,  ///< cancelled, or a lower sequence already failed
+    };
+
+    /// Park until this sequence's slot is free. Called with no lock held.
+    [[nodiscard]] auto acquire(std::uint64_t sequence) -> Acquire {
+        std::unique_lock lock(mutex_);
+        const RingWaitScope ring_wait;
+        space_.wait(lock, [&] {
+            return cancelled_ || sequence < released_ + window_ ||
+                   (has_error_ && error_sequence_ < sequence);
+        });
+        // Only ever abandons sequences above the reported failure, so the
+        // consumer still receives everything below it.
+        return (cancelled_ || (has_error_ && error_sequence_ < sequence)) ? Acquire::Abandon
+                                                                          : Acquire::Proceed;
+    }
+
+    void publish(std::uint64_t sequence, Chunk chunk) {
+        {
+            const std::scoped_lock lock(mutex_);
+            ring_[static_cast<std::size_t>(sequence % window_)] = std::move(chunk);
+        }
+        ready_.notify_one();
+    }
+
+    /// Record an owned message. The caller has already built the string, so
+    /// taking it by value and moving it under the lock never allocates here.
+    void record_error(std::uint64_t sequence, std::string message) noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (claim_failure(sequence)) {
+                error_owned_ = std::move(message);
+                error_fixed_ = nullptr;
+            }
+        }
+        wake_all();
+    }
+
+    /// Record a message in static storage. Allocates nothing at all, so it is
+    /// the only reporting path available once allocation is what failed.
+    void record_fault(std::uint64_t sequence, const char* message) noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            if (claim_failure(sequence)) {
+                error_owned_.clear();  // frees, never allocates
+                error_fixed_ = message;
+            }
+        }
+        wake_all();
+    }
+
+    void producer_exited() noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            --active_producers_;
+        }
+        ready_.notify_all();
+    }
+
+    /// Take the chunk at `sequence`, or nullopt when the run stopped before
+    /// producing it — cancelled, failed, or out of producers. The caller asks
+    /// `failure()` for why.
+    [[nodiscard]] auto take(std::uint64_t sequence) -> std::optional<Chunk> {
+        std::optional<Chunk> chunk;
+        {
+            std::unique_lock lock(mutex_);
+            const auto slot = static_cast<std::size_t>(sequence % window_);
+            {
+                const RingWaitScope ring_wait;
+                ready_.wait(lock, [&] {
+                    return ring_[slot].has_value() || cancelled_ || active_producers_ == 0 ||
+                           (has_error_ && error_sequence_ <= sequence);
+                });
+            }
+            if (ring_[slot].has_value()) {
+                chunk = std::move(ring_[slot]);
+                ring_[slot].reset();
+                ++released_;
+            }
+        }
+        if (chunk.has_value()) {
+            space_.notify_all();
+        }
+        return chunk;
+    }
+
+    [[nodiscard]] auto failure() const -> std::optional<std::string> {
+        const std::scoped_lock lock(mutex_);
+        if (!has_error_) {
+            return std::nullopt;
+        }
+        return error_fixed_ != nullptr ? std::string(error_fixed_) : error_owned_;
+    }
+
+    void cancel() noexcept {
+        {
+            const std::scoped_lock lock(mutex_);
+            cancelled_ = true;
+        }
+        wake_all();
+    }
+
+   private:
+    /// True if `sequence` becomes the reported failure. Lowest sequence wins,
+    /// so the error a query reports never depends on thread timing.
+    [[nodiscard]] auto claim_failure(std::uint64_t sequence) noexcept -> bool {
+        if (has_error_ && sequence >= error_sequence_) {
+            return false;
+        }
+        has_error_ = true;
+        error_sequence_ = sequence;
+        return true;
+    }
+
+    void wake_all() noexcept {
+        ready_.notify_all();
+        space_.notify_all();
+    }
+
+    std::size_t window_;
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;  // consumer waits for the next sequence
+    std::condition_variable space_;  // producers wait for ring space
+    std::vector<std::optional<Chunk>> ring_;
+    std::uint64_t released_ = 0;
+    std::size_t active_producers_ = 0;
+    bool cancelled_ = false;
+    // The failure channel is split so it can be written without allocating.
+    // `error_owned_` carries a message moved in from a producer; `error_fixed_`
+    // points at static storage.
+    bool has_error_ = false;
+    std::uint64_t error_sequence_ = 0;
+    std::string error_owned_;
+    const char* error_fixed_ = nullptr;
+};
 
 // Runtime-multithreading Phase 1: the parallel island executor.
 //
@@ -10675,12 +10845,8 @@ class ParallelIslandOperator final : public Operator {
           workers_(std::move(workers)),
           grain_(grain == 0 ? 1 : grain),
           morsel_count_(morsel_count),
-          window_(std::max<std::size_t>(workers_.size() * 2, 2)),
           pool_(&pool),
-          active_workers_(workers_.size()) {
-        ring_.resize(window_);
-        ring_ready_.assign(window_, false);
-    }
+          ring_(std::max<std::size_t>(workers_.size() * 2, 2), workers_.size()) {}
 
     ~ParallelIslandOperator() override { cancel_and_join(); }
 
@@ -10704,28 +10870,9 @@ class ParallelIslandOperator final : public Operator {
             return fail(interrupt_message());
         }
 
-        std::optional<Chunk> chunk;
-        {
-            std::unique_lock lock(mutex_);
-            const auto slot = static_cast<std::size_t>(next_sequence_ % window_);
-            {
-                // Idle, not serial work: the merger is waiting on its workers.
-                const RingWaitScope ring_wait;
-                ready_.wait(lock, [&] {
-                    return ring_ready_[slot] || cancelled_ || active_workers_ == 0 ||
-                           (has_error_ && error_sequence_ <= next_sequence_);
-                });
-            }
-            if (ring_ready_[slot]) {
-                chunk = std::move(ring_[slot]);
-                ring_[slot].reset();
-                ring_ready_[slot] = false;
-                ++next_sequence_;
-                ++released_;
-            }
-        }
+        std::optional<Chunk> chunk = ring_.take(next_sequence_);
         if (chunk.has_value()) {
-            space_.notify_all();
+            ++next_sequence_;
             return std::optional<Chunk>{std::move(*chunk)};
         }
 
@@ -10739,15 +10886,7 @@ class ParallelIslandOperator final : public Operator {
         if (interrupt_requested()) {
             return fail(interrupt_message());
         }
-        // Compose the message out here, before `fail()` takes the same lock.
-        std::optional<std::string> failure;
-        {
-            const std::scoped_lock lock(mutex_);
-            if (has_error_) {
-                failure = error_fixed_ != nullptr ? std::string(error_fixed_) : error_owned_;
-            }
-        }
-        if (failure.has_value()) {
+        if (auto failure = ring_.failure(); failure.has_value()) {
             return fail(std::move(*failure));
         }
         return fail("parallel island: missing output morsel");
@@ -10758,13 +10897,7 @@ class ParallelIslandOperator final : public Operator {
     // exception — it must stop counting as active and must wake the merger.
     // Skipping this on any path leaves the consumer waiting for a sequence that
     // is never coming, which is a hang rather than an error.
-    void worker_exited() noexcept {
-        {
-            const std::scoped_lock lock(mutex_);
-            --active_workers_;
-        }
-        ready_.notify_all();
-    }
+    void worker_exited() noexcept { ring_.producer_exited(); }
 
     void run_worker(std::size_t worker_id) noexcept {
         // Cleanup runs however this scope is left, so no path can leave the
@@ -10792,14 +10925,14 @@ class ParallelIslandOperator final : public Operator {
             // function is noexcept precisely so a worker cannot unwind into the
             // pool. `what()` cannot be stored: it dies with the exception.
             try {
-                record_error(sequence,
-                             "parallel island: worker exception: " + std::string(error.what()));
+                ring_.record_error(
+                    sequence, "parallel island: worker exception: " + std::string(error.what()));
             } catch (...) {
-                record_fault(sequence,
-                             "parallel island: worker exception (no memory to report it)");
+                ring_.record_fault(sequence,
+                                   "parallel island: worker exception (no memory to report it)");
             }
         } catch (...) {
-            record_fault(sequence, "parallel island: worker threw a non-standard exception");
+            ring_.record_fault(sequence, "parallel island: worker threw a non-standard exception");
         }
     }
 
@@ -10814,24 +10947,13 @@ class ParallelIslandOperator final : public Operator {
             // Published so an exception thrown below is attributed to the
             // morsel that was in flight, not to sequence 0.
             claimed = sequence;
-            {
-                std::unique_lock lock(mutex_);
-                // Backpressure: this morsel's ring slot is only free once the
-                // consumer has released the morsel `window_` ahead of it.
-                // Produced-ahead is idle, not work: `run_task` subtracts this
-                // from the worker time it records, or a blocked worker reads as
-                // a busy one and `occupancy` overstates the machine.
-                const RingWaitScope ring_wait;
-                space_.wait(lock, [&] {
-                    return cancelled_ || sequence < released_ + window_ ||
-                           (has_error_ && error_sequence_ < sequence);
-                });
-                if (cancelled_ || (has_error_ && error_sequence_ < sequence)) {
-                    break;  // only ever abandons morsels above the reported failure
-                }
+            // Backpressure: this morsel's slot is only free once the consumer
+            // has released the morsel `window` ahead of it.
+            if (ring_.acquire(sequence) == OrderedChunkRing::Acquire::Abandon) {
+                break;
             }
             if (interrupt_requested()) {
-                cancel();
+                ring_.cancel();
                 break;
             }
 
@@ -10840,77 +10962,20 @@ class ParallelIslandOperator final : public Operator {
             auto produced = worker.chain->next();
 
             if (!produced.has_value()) {
-                record_error(sequence, std::move(produced.error()));
+                ring_.record_error(sequence, std::move(produced.error()));
                 break;
             }
             if (!produced->has_value()) {
-                record_fault(sequence, "parallel island: worker produced no output morsel");
+                ring_.record_fault(sequence, "parallel island: worker produced no output morsel");
                 break;
             }
             Chunk out = std::move(**produced);
             if (out.sequence != sequence || out.row_offset != begin) {
-                record_fault(sequence, "parallel island: morsel identity gap or reordering");
+                ring_.record_fault(sequence, "parallel island: morsel identity gap or reordering");
                 break;
             }
-            {
-                const std::scoped_lock lock(mutex_);
-                const auto slot = static_cast<std::size_t>(sequence % window_);
-                ring_[slot] = std::move(out);
-                ring_ready_[slot] = true;
-            }
-            ready_.notify_one();
+            ring_.publish(sequence, std::move(out));
         }
-    }
-
-    // Record an owned message. The caller has already built the string, so
-    // taking it by value and moving it under the lock never allocates here.
-    void record_error(std::uint64_t sequence, std::string message) noexcept {
-        {
-            const std::scoped_lock lock(mutex_);
-            if (claim_failure(sequence)) {
-                error_owned_ = std::move(message);
-                error_fixed_ = nullptr;
-            }
-        }
-        wake_all();
-    }
-
-    // Record a message in static storage. Allocates nothing at all, so it is
-    // the only reporting path available once allocation is what failed.
-    void record_fault(std::uint64_t sequence, const char* message) noexcept {
-        {
-            const std::scoped_lock lock(mutex_);
-            if (claim_failure(sequence)) {
-                error_owned_.clear();  // frees, never allocates
-                error_fixed_ = message;
-            }
-        }
-        wake_all();
-    }
-
-    // True if `sequence` becomes the reported failure. Lowest sequence wins, so
-    // the error a query reports never depends on thread timing.
-    [[nodiscard]] auto claim_failure(std::uint64_t sequence) noexcept -> bool {
-        if (has_error_ && sequence >= error_sequence_) {
-            return false;
-        }
-        has_error_ = true;
-        error_sequence_ = sequence;
-        return true;
-    }
-
-    void wake_all() noexcept {
-        ready_.notify_all();
-        space_.notify_all();
-    }
-
-    void cancel() {
-        {
-            const std::scoped_lock lock(mutex_);
-            cancelled_ = true;
-        }
-        ready_.notify_all();
-        space_.notify_all();
     }
 
     // Called from the destructor, so nothing here may throw: an escaping
@@ -10919,7 +10984,7 @@ class ParallelIslandOperator final : public Operator {
     // nothing for `wait()` to rethrow — this guards the path regardless.
     void cancel_and_join() noexcept {
         try {
-            cancel();
+            ring_.cancel();
             batch_.wait();
         } catch (...) {  // NOLINT(bugprone-empty-catch)
             // Nothing left to report: the caller is either unwinding or has
@@ -10938,9 +11003,8 @@ class ParallelIslandOperator final : public Operator {
         if (interrupt_requested()) {
             return std::unexpected(interrupt_message());
         }
-        if (has_error_) {
-            return std::unexpected(error_fixed_ != nullptr ? std::string(error_fixed_)
-                                                           : error_owned_);
+        if (auto failure = ring_.failure(); failure.has_value()) {
+            return std::unexpected(std::move(*failure));
         }
         for (auto& worker : workers_) {
             auto trailing = worker.chain->next();
@@ -10968,27 +11032,12 @@ class ParallelIslandOperator final : public Operator {
     std::vector<IslandWorkerChain> workers_;
     std::size_t grain_ = 1;
     std::uint64_t morsel_count_ = 0;
-    std::size_t window_ = 2;
     WorkerPool* pool_;
 
     std::atomic<std::uint64_t> cursor_{0};
 
-    std::mutex mutex_;
-    std::condition_variable ready_;  // consumer waits for the next sequence
-    std::condition_variable space_;  // workers wait for ring space
-    std::vector<std::optional<Chunk>> ring_;
-    std::vector<bool> ring_ready_;
-    std::uint64_t released_ = 0;
-    std::size_t active_workers_ = 0;
-    bool cancelled_ = false;
-    // The failure channel is split so it can be written without allocating.
-    // `error_owned_` carries a message moved in from a worker (moving a string
-    // never allocates); `error_fixed_` points at static storage and is the only
-    // path usable when the failure *is* an allocation failure.
-    bool has_error_ = false;
-    std::string error_owned_;
-    const char* error_fixed_ = nullptr;
-    std::uint64_t error_sequence_ = 0;
+    // The ordered handoff between the workers and this operator's `next()`.
+    OrderedChunkRing ring_;
 
     std::uint64_t next_sequence_ = 0;
     bool started_ = false;
@@ -11937,7 +11986,7 @@ class PipelinedScanOperator final : public Operator {
           exec_(&exec),
           pool_(&pool),
           window_(std::max<std::size_t>(workers_.size() * 2, 2)),
-          ring_(window_) {}
+          ring_(window_, workers_.size()) {}
 
     ~PipelinedScanOperator() override { cancel_and_join(); }
 
@@ -11953,39 +12002,18 @@ class PipelinedScanOperator final : public Operator {
         start();
 
         while (next_sequence_ < units_.size()) {
-            std::expected<Chunk, std::string> produced = std::unexpected("missing pipeline unit");
-            {
-                std::unique_lock lock(mutex_);
-                const std::size_t slot = next_sequence_ % window_;
-                {
-                    // Idle, not serial work: the consumer is waiting on its
-                    // decode workers. Counting this as self time reported a
-                    // streaming scan's wait as the query's serial residue.
-                    const RingWaitScope ring_wait;
-                    ready_.wait(lock, [&] {
-                        return ring_[slot].has_value() || cancelled_ || worker_failure_.has_value();
-                    });
-                }
-                if (worker_failure_.has_value()) {
-                    auto message = std::move(*worker_failure_);
-                    lock.unlock();
-                    return fail(std::move(message));
-                }
-                if (!ring_[slot].has_value()) {
-                    lock.unlock();
-                    return fail(interrupt_requested() ? interrupt_message()
-                                                      : "scan pipeline: missing output unit");
-                }
-                produced = std::move(**ring_[slot]);
-                ring_[slot].reset();
-                ++next_sequence_;
-                ++released_;
-            }
-            space_.notify_all();
-
+            std::optional<Chunk> produced = ring_.take(next_sequence_);
             if (!produced.has_value()) {
-                return fail(std::move(produced.error()));
+                // Stopped before this unit: cancelled, failed, or out of
+                // workers. The ring reports the lowest-sequence failure, so the
+                // message does not depend on which worker lost a race.
+                if (auto failure = ring_.failure(); failure.has_value()) {
+                    return fail(std::move(*failure));
+                }
+                return fail(interrupt_requested() ? interrupt_message()
+                                                  : "scan pipeline: missing output unit");
             }
+            ++next_sequence_;
             Chunk chunk = std::move(*produced);
             if (!chunk.columns.empty() && chunk.rows() == 0) {
                 if (!empty_schema_carrier_.has_value()) {
@@ -12022,6 +12050,14 @@ class PipelinedScanOperator final : public Operator {
     }
 
     void run_worker(std::size_t worker_id) noexcept {
+        // However this worker leaves, it must stop counting as a producer, or
+        // the consumer waits for a unit that is never coming.
+        struct ExitGuard {
+            OrderedChunkRing* ring;
+            ~ExitGuard() { ring->producer_exited(); }
+        } const guard{&ring_};
+
+        std::size_t claimed = 0;
         try {
             auto& worker = workers_[worker_id];
             while (true) {
@@ -12029,30 +12065,36 @@ class PipelinedScanOperator final : public Operator {
                 if (sequence >= units_.size()) {
                     return;
                 }
-                {
-                    std::unique_lock lock(mutex_);
-                    const RingWaitScope ring_wait;  // produced-ahead: idle, not work
-                    space_.wait(lock, [&] { return cancelled_ || sequence < released_ + window_; });
-                    if (cancelled_) {
-                        return;
-                    }
+                claimed = sequence;
+                if (ring_.acquire(sequence) == OrderedChunkRing::Acquire::Abandon) {
+                    return;
                 }
                 if (interrupt_requested()) {
-                    cancel();
+                    ring_.cancel();
                     return;
                 }
 
                 auto result = run_unit(worker, sequence);
-                {
-                    const std::scoped_lock lock(mutex_);
-                    ring_[sequence % window_] = std::move(result);
+                if (!result.has_value()) {
+                    ring_.record_error(sequence, std::move(result.error()));
+                    return;
                 }
-                ready_.notify_one();
+                ring_.publish(sequence, std::move(*result));
             }
         } catch (const std::exception& error) {
-            record_worker_failure("scan pipeline: worker exception: " + std::string(error.what()));
+            // Sequence-tagged like any other failure, so the reported message
+            // obeys the same lowest-sequence rule. Composing it allocates and
+            // the likeliest exception here is bad_alloc, hence the
+            // allocation-free fallback underneath.
+            try {
+                ring_.record_error(claimed,
+                                   "scan pipeline: worker exception: " + std::string(error.what()));
+            } catch (...) {
+                ring_.record_fault(claimed,
+                                   "scan pipeline: worker exception (no memory to report it)");
+            }
         } catch (...) {
-            record_worker_failure("scan pipeline: worker threw a non-standard exception");
+            ring_.record_fault(claimed, "scan pipeline: worker threw a non-standard exception");
         }
     }
 
@@ -12126,27 +12168,6 @@ class PipelinedScanOperator final : public Operator {
         }
     }
 
-    void record_worker_failure(std::string message) noexcept {
-        {
-            const std::scoped_lock lock(mutex_);
-            if (!worker_failure_.has_value()) {
-                worker_failure_ = std::move(message);
-            }
-            cancelled_ = true;
-        }
-        ready_.notify_all();
-        space_.notify_all();
-    }
-
-    void cancel() noexcept {
-        {
-            const std::scoped_lock lock(mutex_);
-            cancelled_ = true;
-        }
-        ready_.notify_all();
-        space_.notify_all();
-    }
-
     void finish_workers() {
         if (batch_.has_value()) {
             batch_->wait();
@@ -12168,7 +12189,7 @@ class PipelinedScanOperator final : public Operator {
     }
 
     void cancel_and_join() noexcept {
-        cancel();
+        ring_.cancel();
         try {
             finish_workers();
         } catch (...) {  // NOLINT(bugprone-empty-catch)
@@ -12189,21 +12210,17 @@ class PipelinedScanOperator final : public Operator {
     const ExecutionContext* exec_;
     WorkerPool* pool_;
     std::size_t window_ = 2;
-    std::vector<std::optional<std::expected<Chunk, std::string>>> ring_;
+    // The same ordered handoff the morsel executor uses: one implementation of
+    // the bounded, sequence-ordered producer/consumer shape.
+    OrderedChunkRing ring_;
     std::vector<std::optional<Column<Categorical>>> cat_states_;
     std::optional<Chunk> empty_schema_carrier_;
     std::optional<WorkerPool::Batch> batch_;
     std::atomic<std::size_t> cursor_{0};
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::condition_variable space_;
-    std::optional<std::string> worker_failure_;
-    std::size_t released_ = 0;
     std::size_t next_sequence_ = 0;
     std::size_t emitted_rows_ = 0;
     std::uint64_t emitted_sequence_ = 0;
     bool started_ = false;
-    bool cancelled_ = false;
     bool finished_ = false;
     bool validated_ = false;
 };

@@ -248,15 +248,23 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
 
 **Next, in the order I would take them.**
 
-1. **Split the join operator, with the orientation resolved at run time.**
-   Re-ordered ahead of the aggregate on 2026-08-25; the previous text called
-   this "blocked on the run-time build-side choice", and that was an
-   assumption rather than a constraint. See "The build-side choice does not
-   block the split" below. No cardinality estimate, no behaviour change:
-   the same `n_right <= kStreamRightThreshold` / materialize-and-compare
-   logic relocated into the build phase, which publishes the index *and*
-   which side it indexed. This is `8a644381`'s pattern applied to the
-   operator instead of the data.
+1. ~~**Split the join operator, with the orientation resolved at run time.**~~
+   **DONE 2026-08-25.** `49188c71` made the orientation a value a build phase
+   returns (`JoinOrientation`, `JoinBuildOutcome`, `build_join_side` /
+   `choose_and_build_single_key` / `choose_and_build_pair`, with `adopt_build`
+   the one place an orientation becomes operator shape). `c2d32f1a` stopped
+   the plan asserting a build side it does not choose (`left_input` /
+   `right_input`, `orientation=runtime`) -- which was the actual blocker: two
+   pipelines cannot be scheduled around a decision the plan has already made
+   wrongly. `a2569785` + `433eb6df` partitioned the head table and made the
+   fill morsel-parallel, no locks and no merge, bit-identical to the serial
+   build by construction. `8cb4e936` gave the build a caller: `run_build()` is
+   a phase entry point and `build_physical_join` runs it at plan-execution
+   time, so the build's completion is a point in the plan rather than a flag
+   the probe checks. Measured: q21 -8.5% from the parallel fill alone; the
+   scheduled invocation is geomean -1.9% over all 22 queries, with q21 +5.1%
+   and q19 +5.5% reported rather than averaged away. `IBEX_JOIN_BUILD_SERIAL`
+   and `IBEX_JOIN_BUILD_LAZY` are the kill switches and the A/B handles.
 2. **Make the probe a step inside a map pipeline.** What (1) exists for:
    morsels come from the probe source, the filters and projections above the
    join fuse into the same morsel loop instead of materializing between

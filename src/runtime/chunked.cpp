@@ -4070,8 +4070,134 @@ auto detect_join_key_kind(const ColumnValue& col, ExprType& out) -> std::optiona
 /// null-keyed build row is never indexed, and a null-keyed probe row is never
 /// looked up. Both halves are needed: a null cell holds the type's zero value,
 /// so a null probe key would otherwise find a genuine `0`.
-auto build_join_hash_index(const Table& build_side, const std::string& key_name, ExprType key_kind)
-    -> std::expected<JoinHashIndex, std::string> {
+/// Fill one `PartitionedHeads` from `n` build rows, serially when it has one
+/// partition and over the worker pool when it has more.
+///
+/// The two paths must produce a bit-identical index, and the reason they do is
+/// worth stating rather than trusting. The serial build walks rows from `n-1`
+/// down to 0, so a key's head is its LOWEST row and its chain ascends. The
+/// parallel build scatters rows into partitions keeping them ascending within
+/// each, then walks each partition's slice in reverse -- and because every row
+/// carrying a given key lands in that key's one partition, reverse order
+/// within the partition is reverse order within the key. Same head, same
+/// chain, in any partition count. Output row order is a join contract
+/// (SPEC.md 5.6 leaves it open, but `emit_swapped` and the chained probe both
+/// depend on the chain's direction), so this is not a detail.
+///
+/// Writes are disjoint by construction: `chain_next[row]` is written only by
+/// the worker owning that row's partition, and each partition's map is its
+/// own. No locks, and no merge afterwards -- which is the whole reason the
+/// head table is partitioned rather than built per-worker and combined.
+template <class Heads, class KeyAt, class IsNull>
+void fill_partitioned_heads(Heads& heads, std::size_t n, const KeyAt& key_at, const IsNull& is_null,
+                            std::vector<std::size_t>& chain_next, bool& unique) {
+    const auto insert = [&](std::size_t row, bool& dup) {
+        auto [head, inserted] = heads.try_emplace(key_at(row), row);
+        if (!inserted) {
+            chain_next[row] = *head;
+            *head = row;
+            dup = true;
+        }
+    };
+    if (heads.partition_count() == 1) {
+        heads.reserve(n);
+        bool dup = false;
+        for (std::size_t r = n; r-- > 0;) {
+            if (is_null(r)) {
+                continue;
+            }
+            insert(r, dup);
+        }
+        unique = unique && !dup;
+        return;
+    }
+
+    const std::size_t parts = heads.partition_count();
+    auto& pool = process_worker_pool();
+    const std::size_t ranges = std::min(pool.size(), parts);
+    const std::size_t grain = (n + ranges - 1) / ranges;
+    heads.reserve(n);
+
+    // Pass 1: which partition each row belongs to, and how many rows each
+    // (range, partition) pair contributes. Null-keyed rows are never indexed,
+    // so they are given no partition and never counted.
+    std::vector<std::uint8_t> part_of_row(n, 0);
+    std::vector<char> indexed(n, 0);
+    std::vector<std::size_t> counts(ranges * parts, 0);
+    {
+        auto batch = pool.submit(ranges, [&](std::size_t r) {
+            const std::size_t begin = r * grain;
+            const std::size_t end = std::min(n, begin + grain);
+            std::size_t* row_counts = counts.data() + (r * parts);
+            for (std::size_t row = begin; row < end; ++row) {
+                if (is_null(row)) {
+                    continue;
+                }
+                const std::size_t part = heads.part_of(key_at(row));
+                part_of_row[row] = static_cast<std::uint8_t>(part);
+                indexed[row] = 1;
+                ++row_counts[part];
+            }
+        });
+        batch.wait();
+    }
+
+    std::vector<std::size_t> offsets(ranges * parts, 0);
+    std::vector<std::size_t> part_begin(parts + 1, 0);
+    {
+        std::size_t running = 0;
+        for (std::size_t p = 0; p < parts; ++p) {
+            part_begin[p] = running;
+            for (std::size_t r = 0; r < ranges; ++r) {
+                offsets[(r * parts) + p] = running;
+                running += counts[(r * parts) + p];
+            }
+        }
+        part_begin[parts] = running;
+    }
+
+    // Pass 2: scatter. Ranges are laid out in ascending order within each
+    // partition and each range walks ascending, so a partition's slice is
+    // ascending in row index -- which is what pass 3 reverses.
+    std::vector<std::size_t> scatter_rows(part_begin[parts]);
+    {
+        auto batch = pool.submit(ranges, [&](std::size_t r) {
+            const std::size_t begin = r * grain;
+            const std::size_t end = std::min(n, begin + grain);
+            std::size_t* cursor = offsets.data() + (r * parts);
+            for (std::size_t row = begin; row < end; ++row) {
+                if (indexed[row] == 0) {
+                    continue;
+                }
+                scatter_rows[cursor[part_of_row[row]]++] = row;
+            }
+        });
+        batch.wait();
+    }
+
+    // Pass 3: one worker per partition, claimed dynamically.
+    std::vector<char> dup(parts, 0);
+    {
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(std::min(pool.size(), parts), [&](std::size_t) {
+            for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < parts;
+                 p = cursor.fetch_add(1, std::memory_order_relaxed)) {
+                bool part_dup = false;
+                for (std::size_t i = part_begin[p + 1]; i-- > part_begin[p];) {
+                    insert(scatter_rows[i], part_dup);
+                }
+                dup[p] = part_dup ? 1 : 0;
+            }
+        });
+        batch.wait();
+    }
+    for (const char d : dup) {
+        unique = unique && d == 0;
+    }
+}
+
+auto build_join_hash_index(const Table& build_side, const std::string& key_name, ExprType key_kind,
+                           std::size_t partitions) -> std::expected<JoinHashIndex, std::string> {
     const ColumnValue* key = build_side.find(key_name);
     if (key == nullptr) {
         return std::unexpected("join key not found in build side: " + key_name);
@@ -4088,33 +4214,12 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
     const auto is_null = [&index](std::size_t row) noexcept {
         return index.validity != nullptr && !(*index.validity)[row];
     };
-    const auto chain = [&index](std::size_t row, std::size_t& head) {
-        index.chain_next[row] = head;
-        head = row;
-        index.unique = false;
-    };
-    const auto build_scalar = [&]<typename ColT, typename Map>(const ColT& col, Map& heads) {
-        const std::size_t rows = col.size();
-        heads.reserve(rows);
+    const auto build_scalar = [&]<typename ColT, typename Heads>(const ColT& col, Heads& heads) {
         const auto* data = col.data();
-        for (std::size_t r = rows; r-- > 0;) {
-            if (is_null(r)) {
-                continue;
-            }
-            auto [head, inserted] = heads.try_emplace(data[r], r);
-            if (!inserted) {
-                chain(r, *head);
-            }
-        }
-    };
-    const auto insert_sv = [&](std::string_view sv, std::size_t r) {
-        if (is_null(r)) {
-            return;
-        }
-        auto [head, inserted] = index.string_heads.try_emplace(sv, r);
-        if (!inserted) {
-            chain(r, *head);
-        }
+        heads.partition(partitions);
+        fill_partitioned_heads(
+            heads, col.size(), [data](std::size_t r) { return data[r]; }, is_null, index.chain_next,
+            index.unique);
     };
 
     if (key_kind == ExprType::Int) {
@@ -4132,15 +4237,12 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         if (col == nullptr)
             return std::unexpected("inner join: build-side key type mismatch");
         // No `data()` on a packed bool column, so this is the one
-        // representation `build_scalar` cannot serve.
-        index.bool_heads.reserve(n);
-        for (std::size_t r = n; r-- > 0;) {
-            const bool v = (*col)[r];
-            auto [head, inserted] = index.bool_heads.try_emplace(v, r);
-            if (!inserted) {
-                chain(r, *head);
-            }
-        }
+        // representation `build_scalar` cannot serve. Left unpartitioned: a
+        // bool key has two values, so partitioning can only leave every
+        // partition but two empty.
+        fill_partitioned_heads(
+            index.bool_heads, n, [col](std::size_t r) { return (*col)[r]; }, is_null,
+            index.chain_next, index.unique);
     } else if (key_kind == ExprType::Date) {
         const auto* col = std::get_if<Column<Date>>(key);
         if (col == nullptr)
@@ -4152,18 +4254,20 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
             return std::unexpected("inner join: build-side key type mismatch");
         build_scalar(*col, index.ts_heads);
     } else if (key_kind == ExprType::String) {
+        index.string_heads.partition(partitions);
         if (const auto* c_cat = std::get_if<Column<Categorical>>(key)) {
             const auto& dict = c_cat->dictionary();
-            index.string_heads.reserve(n);
-            for (std::size_t r = n; r-- > 0;) {
-                auto code = static_cast<std::size_t>(c_cat->code_at(r));
-                insert_sv(std::string_view{dict[code]}, r);
-            }
+            fill_partitioned_heads(
+                index.string_heads, n,
+                [c_cat, &dict](std::size_t r) {
+                    return std::string_view{dict[static_cast<std::size_t>(c_cat->code_at(r))]};
+                },
+                is_null, index.chain_next, index.unique);
         } else if (const auto* c_str = std::get_if<Column<std::string>>(key)) {
-            index.string_heads.reserve(n);
-            for (std::size_t r = n; r-- > 0;) {
-                insert_sv((*c_str)[r], r);
-            }
+            fill_partitioned_heads(
+                index.string_heads, n,
+                [c_str](std::size_t r) { return std::string_view{(*c_str)[r]}; }, is_null,
+                index.chain_next, index.unique);
         } else {
             return std::unexpected("inner join: build-side key type mismatch");
         }
@@ -4175,27 +4279,25 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
 /// `build_join_hash_index`, over a packed pair of Int64 keys. A row with either
 /// key null is never indexed -- null never matches, not even another null.
 auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
-                           const ValidityBitmap* v0, const ValidityBitmap* v1) -> JoinHashIndex {
+                           const ValidityBitmap* v0, const ValidityBitmap* v1,
+                           std::size_t partitions) -> JoinHashIndex {
     JoinHashIndex index;
     index.key_kind = ExprType::Int;
     const std::size_t n = col0.size();
     index.chain_next.assign(n, kJoinNil);
-    index.pair_heads.reserve(n);
     const auto* d0 = col0.data();
     const auto* d1 = col1.data();
-    for (std::size_t r = n; r-- > 0;) {
-        if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
-            continue;
-        }
-        JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
-                                   static_cast<std::uint64_t>(d1[r])};
-        auto [head, inserted] = index.pair_heads.try_emplace(key, r);
-        if (!inserted) {
-            index.chain_next[r] = *head;
-            *head = r;
-            index.unique = false;
-        }
-    }
+    index.pair_heads.partition(partitions);
+    fill_partitioned_heads(
+        index.pair_heads, n,
+        [d0, d1](std::size_t r) {
+            return JoinHashIndex::PairKey{static_cast<std::uint64_t>(d0[r]),
+                                          static_cast<std::uint64_t>(d1[r])};
+        },
+        [v0, v1](std::size_t r) {
+            return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
+        },
+        index.chain_next, index.unique);
     return index;
 }
 
@@ -4226,8 +4328,9 @@ struct JoinBuildOutcome {
 /// decisions below reduce to, and the only place a `JoinHashIndex` becomes
 /// shared and const.
 auto build_join_side(const Table& side, const std::string& key_name, ExprType key_kind,
-                     JoinOrientation orientation) -> std::expected<JoinBuildOutcome, std::string> {
-    auto built = build_join_hash_index(side, key_name, key_kind);
+                     JoinOrientation orientation, std::size_t partitions)
+    -> std::expected<JoinBuildOutcome, std::string> {
+    auto built = build_join_hash_index(side, key_name, key_kind, partitions);
     if (!built.has_value()) {
         return std::unexpected(std::move(built.error()));
     }
@@ -4246,7 +4349,7 @@ auto build_join_side(const Table& side, const std::string& key_name, ExprType ke
 /// build's. It is only ever consulted when swapping was otherwise preferred.
 auto choose_and_build_single_key(const Table& left, const Table& right, const std::string& left_key,
                                  const std::string& right_key, ExprType key_kind,
-                                 bool order_preservation_pays)
+                                 bool order_preservation_pays, std::size_t partitions)
     -> std::expected<JoinBuildOutcome, std::string> {
     // Swapping indexes the smaller (left) side and scans the right, which
     // gives up left-row order. When an `order` above this join wants exactly
@@ -4255,9 +4358,9 @@ auto choose_and_build_single_key(const Table& left, const Table& right, const st
     // "larger" stays modest, since the index is probed once per row of the
     // other side. The same trade is made in join.cpp.
     if (left.rows() < right.rows() && !order_preservation_pays) {
-        return build_join_side(left, left_key, key_kind, JoinOrientation::BuildLeft);
+        return build_join_side(left, left_key, key_kind, JoinOrientation::BuildLeft, partitions);
     }
-    return build_join_side(right, right_key, key_kind, JoinOrientation::BuildRight);
+    return build_join_side(right, right_key, key_kind, JoinOrientation::BuildRight, partitions);
 }
 
 /// One side's two Int64 key columns and their validity, or the error a join
@@ -4302,7 +4405,8 @@ auto pair_key_columns(const Table& side, const std::string& name0, const std::st
 /// the order the operator already checked in, so consolidating the two
 /// previously separate blocks cannot change which error a caller sees.
 auto choose_and_build_pair(const Table& left, const Table& right, const ir::JoinKey& k0,
-                           const ir::JoinKey& k1) -> std::expected<JoinBuildOutcome, std::string> {
+                           const ir::JoinKey& k1, std::size_t partitions)
+    -> std::expected<JoinBuildOutcome, std::string> {
     auto right_keys = pair_key_columns(right, k0.right, k1.right, "right");
     if (!right_keys.has_value()) {
         return std::unexpected(std::move(right_keys.error()));
@@ -4314,12 +4418,12 @@ auto choose_and_build_pair(const Table& left, const Table& right, const ir::Join
         }
         return JoinBuildOutcome{
             .index = std::make_shared<const JoinHashIndex>(build_join_pair_index(
-                *left_keys->col0, *left_keys->col1, left_keys->v0, left_keys->v1)),
+                *left_keys->col0, *left_keys->col1, left_keys->v0, left_keys->v1, partitions)),
             .orientation = JoinOrientation::BuildLeft};
     }
     return JoinBuildOutcome{
         .index = std::make_shared<const JoinHashIndex>(build_join_pair_index(
-            *right_keys->col0, *right_keys->col1, right_keys->v0, right_keys->v1)),
+            *right_keys->col0, *right_keys->col1, right_keys->v0, right_keys->v1, partitions)),
         .orientation = JoinOrientation::BuildRight};
 }
 
@@ -5484,8 +5588,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         // Small right: index it without ever measuring the left, which is the
         // one orientation this join can choose without draining a child.
         if (n_right <= kStreamRightThreshold) {
-            return adopt_build(
-                build_join_side(right_, right_key_name, key_kind, JoinOrientation::BuildRight));
+            return adopt_build(build_join_side(right_, right_key_name, key_kind,
+                                               JoinOrientation::BuildRight,
+                                               build_partitions(n_right)));
         }
 
         Table left_table;
@@ -5509,9 +5614,31 @@ class ChunkedInnerJoinOperator final : public Operator {
         // skip.
         const bool order_pays =
             n_left < n_right && order_preserving_pays(left_table, n_left, n_right);
-        auto outcome = choose_and_build_single_key(left_table, right_, left_key_name,
-                                                   right_key_name, key_kind, order_pays);
+        auto outcome =
+            choose_and_build_single_key(left_table, right_, left_key_name, right_key_name, key_kind,
+                                        order_pays, build_partitions(std::min(n_left, n_right)));
         return adopt_build(std::move(outcome), std::move(left_table));
+    }
+
+    /// How many partitions this join's hash build may fill concurrently, or 1
+    /// to build it serially.
+    ///
+    /// Same admission shape as `probe_parallel_workers`, and for the same
+    /// reasons: no nested pool submissions, and below a floor the scatter and
+    /// the two counting passes cost more than the inserts they spread. The
+    /// floor is higher than the probe's because a partitioned build makes
+    /// three passes over the keys where a serial build makes one.
+    [[nodiscard]] auto build_partitions(std::size_t n) const -> std::size_t {
+        constexpr std::size_t kMinBuildRows = 1U << 17U;  // 131072
+        const ExecutionContext* exec = probe_.exec_;
+        if (exec == nullptr || !exec->can_fan_out() || on_worker_pool_thread() ||
+            n < kMinBuildRows) {
+            return 1;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t workers =
+            std::min({exec->compute_budget(), pool.size(), std::size_t{64}});
+        return workers < 2 ? 1 : workers;
     }
 
     /// Publish what a build produced, and hand back the orientation it chose.
@@ -5596,7 +5723,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         // materialized, so `adopt_build` drains it as a single chunk through
         // the existing `use_materialized_left_` mechanism rather than
         // re-wrapping it in an operator.
-        auto outcome = choose_and_build_pair(left_table, right_, k0, k1);
+        auto outcome =
+            choose_and_build_pair(left_table, right_, k0, k1,
+                                  build_partitions(std::min(left_table.rows(), right_.rows())));
         return adopt_build(std::move(outcome), std::move(left_table));
     }
 
@@ -5774,8 +5903,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         // Publish only: this path builds on the left and scans the right, but
         // it emits one precomputed table rather than running either streaming
         // shape, so it takes no operator mode from the orientation.
-        if (auto published = publish_build(build_join_side(
-                build, keys_->front().left, ExprType::Int, JoinOrientation::BuildLeft));
+        if (auto published = publish_build(
+                build_join_side(build, keys_->front().left, ExprType::Int,
+                                JoinOrientation::BuildLeft, build_partitions(build.rows())));
             !published.has_value()) {
             return std::move(published.error());
         }

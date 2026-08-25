@@ -9,6 +9,7 @@
 #include <ibex/ir/group_key_reduction.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_reorder.hpp>
+#include <ibex/ir/join_semi_reduction.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/required_columns.hpp>
@@ -3650,6 +3651,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     lowered.value() =
         ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);
     lowered.value() = ir::push_semi_joins_down(std::move(lowered.value()), context.source_schemas);
+    lowered.value() =
+        ir::reduce_inner_joins_to_semi(std::move(lowered.value()), context.source_schemas);
     {
         // Default-constructed on purpose: `unknown_callee` claims every effect,
         // so the effect-sensitive passes stay conservative about the externs a
@@ -4986,6 +4989,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
+        rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
         rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
         // A source scanned twice in the plan (nation on both join sides, a
         // self-joined fact table) gets one instance name per scan, so each

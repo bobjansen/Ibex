@@ -3930,6 +3930,69 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
 /// to neither alone; `ChunkedInnerJoinOperator::kNil` aliases it.
 inline constexpr std::size_t kJoinNil = std::numeric_limits<std::size_t>::max();
 
+/// A hash-index head table split into partitions by key hash.
+///
+/// Every key belongs to exactly one partition, so P workers can fill P
+/// partitions with no shared writes, no locks, and -- unlike per-worker maps --
+/// no merge afterwards. That is what makes a hash build morsel-parallel, and
+/// it is the reason this type exists: `build_join_hash_index` is one serial
+/// loop, and on TPC-H q21 it spends 40 ms hashing 1.29M rows inside a 75 ms
+/// query (measured 2026-08-25, see plans/kernel-pipeline-execution-plan.md,
+/// "Where join time actually goes").
+///
+/// `partition_count == 1` is exactly the single-map behaviour this replaced,
+/// bit for bit: one partition, mask 0, every key landing in `parts[0]`.
+/// Partitioning the TYPE and filling it in parallel are deliberately separate
+/// steps -- the first cannot change a result, so anything the second breaks is
+/// unambiguously the second's fault.
+template <class Key, class Hash = robin_hood::hash<Key>, class Eq = std::equal_to<Key>>
+struct PartitionedHeads {
+    using Map = robin_hood::unordered_flat_map<Key, std::size_t, Hash, Eq>;
+    /// Always a power of two, so `part_of` is a mask rather than a modulo.
+    std::vector<Map> parts{1};
+    std::size_t mask = 0;
+
+    /// Size to `count` partitions (rounded down to a power of two, at least 1).
+    void partition(std::size_t count) {
+        std::size_t p = 1;
+        while (p * 2 <= count) {
+            p *= 2;
+        }
+        parts.assign(p, Map{});
+        mask = p - 1;
+    }
+
+    [[nodiscard]] auto partition_count() const noexcept -> std::size_t { return parts.size(); }
+
+    [[nodiscard]] auto part_of(const Key& key) const noexcept -> std::size_t {
+        return mask == 0 ? 0 : (Hash{}(key)&mask);
+    }
+
+    /// Reserve for `n` build rows. Split across partitions, since a key can
+    /// only land in one of them.
+    void reserve(std::size_t n) {
+        const std::size_t per = (n / parts.size()) + 1;
+        for (auto& part : parts) {
+            part.reserve(per);
+        }
+    }
+
+    /// Insert `row` as the head for `key` if absent. Returns a pointer to the
+    /// stored head (never null) and whether it was newly inserted, so a caller
+    /// that loses the race to an earlier row can chain onto what is there.
+    auto try_emplace(const Key& key, std::size_t row) -> std::pair<std::size_t*, bool> {
+        auto [it, inserted] = parts[part_of(key)].try_emplace(key, row);
+        return {&it->second, inserted};
+    }
+
+    /// The head row for `key`, or `kJoinNil` when the build side has none.
+    [[nodiscard]] auto find_head(const Key& key) const -> std::size_t {
+        const auto& part = parts[part_of(key)];
+        const auto it = part.find(key);
+        return it == part.end() ? kJoinNil : it->second;
+    }
+};
+
 /// Everything a hash build produces and a hash probe consumes: the chained
 /// index over one side's key column, plus what the probe needs to interpret it.
 ///
@@ -3949,13 +4012,12 @@ struct JoinHashIndex {
     /// Row -> next row with the same key, `kJoinNil` at the end of a chain.
     std::vector<std::size_t> chain_next;
     /// Head row per key, one map per key representation.
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> i64_heads;
-    robin_hood::unordered_flat_map<double, std::size_t> f64_heads;
-    robin_hood::unordered_flat_map<bool, std::size_t> bool_heads;
-    robin_hood::unordered_flat_map<Date, std::size_t> date_heads;
-    robin_hood::unordered_flat_map<Timestamp, std::size_t> ts_heads;
-    robin_hood::unordered_flat_map<std::string_view, std::size_t, StringViewHash, StringViewEq>
-        string_heads;
+    PartitionedHeads<std::int64_t> i64_heads;
+    PartitionedHeads<double> f64_heads;
+    PartitionedHeads<bool> bool_heads;
+    PartitionedHeads<Date> date_heads;
+    PartitionedHeads<Timestamp> ts_heads;
+    PartitionedHeads<std::string_view, StringViewHash, StringViewEq> string_heads;
 
     /// Two-fixed-width-int-key path: both key values pack into one struct,
     /// injective with no knowledge of their domains -- same trick as the
@@ -3972,7 +4034,7 @@ struct JoinHashIndex {
             return static_cast<std::size_t>(h);
         }
     };
-    robin_hood::unordered_flat_map<PairKey, std::size_t, PairKeyHash> pair_heads;
+    PartitionedHeads<PairKey, PairKeyHash> pair_heads;
 
     /// Borrowed from the build table; null when the key column has no nulls. A
     /// null key matches nothing, so null build rows are never indexed and null
@@ -4039,9 +4101,9 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
             if (is_null(r)) {
                 continue;
             }
-            auto [it, inserted] = heads.try_emplace(data[r], r);
+            auto [head, inserted] = heads.try_emplace(data[r], r);
             if (!inserted) {
-                chain(r, it->second);
+                chain(r, *head);
             }
         }
     };
@@ -4049,9 +4111,9 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         if (is_null(r)) {
             return;
         }
-        auto [it, inserted] = index.string_heads.try_emplace(sv, r);
+        auto [head, inserted] = index.string_heads.try_emplace(sv, r);
         if (!inserted) {
-            chain(r, it->second);
+            chain(r, *head);
         }
     };
 
@@ -4074,9 +4136,9 @@ auto build_join_hash_index(const Table& build_side, const std::string& key_name,
         index.bool_heads.reserve(n);
         for (std::size_t r = n; r-- > 0;) {
             const bool v = (*col)[r];
-            auto [it, inserted] = index.bool_heads.try_emplace(v, r);
+            auto [head, inserted] = index.bool_heads.try_emplace(v, r);
             if (!inserted) {
-                chain(r, it->second);
+                chain(r, *head);
             }
         }
     } else if (key_kind == ExprType::Date) {
@@ -4127,10 +4189,10 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
         }
         JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
                                    static_cast<std::uint64_t>(d1[r])};
-        auto [it, inserted] = index.pair_heads.try_emplace(key, r);
+        auto [head, inserted] = index.pair_heads.try_emplace(key, r);
         if (!inserted) {
-            index.chain_next[r] = it->second;
-            it->second = r;
+            index.chain_next[r] = *head;
+            *head = r;
             index.unique = false;
         }
     }
@@ -4568,11 +4630,11 @@ struct JoinProbe {
                 if (probe_is_null(l)) {
                     continue;
                 }
-                auto it = heads.find(get(l));
-                if (it == heads.end()) {
+                const std::size_t head = heads.find_head(get(l));
+                if (head == kNil) {
                     continue;
                 }
-                for (std::size_t cur = it->second; cur != kNil; cur = index().chain_next[cur]) {
+                for (std::size_t cur = head; cur != kNil; cur = index().chain_next[cur]) {
                     out_l.push_back(l);
                     out_r.push_back(cur);
                 }
@@ -4594,12 +4656,12 @@ struct JoinProbe {
                 if (probe_is_null(l)) {
                     continue;
                 }
-                auto it = heads.find(get(l));
-                if (it == heads.end()) {
+                const std::size_t head = heads.find_head(get(l));
+                if (head == kNil) {
                     continue;
                 }
                 lp[out] = l;
-                rp[out] = it->second;
+                rp[out] = head;
                 ++out;
             }
             li.resize(out);
@@ -4610,11 +4672,11 @@ struct JoinProbe {
             if (probe_is_null(l)) {
                 continue;
             }
-            auto it = heads.find(get(l));
-            if (it == heads.end()) {
+            const std::size_t head = heads.find_head(get(l));
+            if (head == kNil) {
                 continue;
             }
-            std::size_t cur = it->second;
+            std::size_t cur = head;
             while (cur != kNil) {
                 li.push_back(l);
                 ri.push_back(cur);
@@ -4696,10 +4758,7 @@ struct JoinProbe {
     void resolve_categorical_heads(const std::vector<std::string>& dict) {
         probe_code_heads_.assign(dict.size(), kNil);
         for (std::size_t c = 0; c < dict.size(); ++c) {
-            if (auto it = index().string_heads.find(std::string_view{dict[c]});
-                it != index().string_heads.end()) {
-                probe_code_heads_[c] = it->second;
-            }
+            probe_code_heads_[c] = index().string_heads.find_head(std::string_view{dict[c]});
         }
     }
 
@@ -4859,11 +4918,11 @@ struct JoinProbe {
                 if (is_null(l)) {
                     continue;
                 }
-                auto it = index().pair_heads.find(get_key(l));
-                if (it == index().pair_heads.end()) {
+                const std::size_t head = index().pair_heads.find_head(get_key(l));
+                if (head == kNil) {
                     continue;
                 }
-                for (std::size_t cur = it->second; cur != kNil; cur = index().chain_next[cur]) {
+                for (std::size_t cur = head; cur != kNil; cur = index().chain_next[cur]) {
                     out_l.push_back(l);
                     out_r.push_back(cur);
                 }
@@ -4882,12 +4941,12 @@ struct JoinProbe {
                 if (is_null(l)) {
                     continue;
                 }
-                auto it = index().pair_heads.find(get_key(l));
-                if (it == index().pair_heads.end()) {
+                const std::size_t head = index().pair_heads.find_head(get_key(l));
+                if (head == kNil) {
                     continue;
                 }
                 lp[out] = l;
-                rp[out] = it->second;
+                rp[out] = head;
                 ++out;
             }
             li.resize(out);
@@ -4898,11 +4957,11 @@ struct JoinProbe {
             if (is_null(l)) {
                 continue;
             }
-            auto it = index().pair_heads.find(get_key(l));
-            if (it == index().pair_heads.end()) {
+            const std::size_t head = index().pair_heads.find_head(get_key(l));
+            if (head == kNil) {
                 continue;
             }
-            std::size_t cur = it->second;
+            std::size_t cur = head;
             while (cur != kNil) {
                 li.push_back(l);
                 ri.push_back(cur);
@@ -4949,12 +5008,7 @@ struct JoinProbe {
         // both the serial and the parallel path.
         auto do_phase1 = [&](auto&& key_at, const auto& heads) {
             probe_swapped(
-                n_right,
-                [&](std::size_t r) {
-                    auto it = heads.find(key_at(r));
-                    return it == heads.end() ? kNil : it->second;
-                },
-                li, ri);
+                n_right, [&](std::size_t r) { return heads.find_head(key_at(r)); }, li, ri);
         };
         // Same shape with the chain head already resolved — see
         // `resolve_categorical_heads`.
@@ -5067,8 +5121,7 @@ struct JoinProbe {
             }
             JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
                                        static_cast<std::uint64_t>(d1[r])};
-            auto it = index().pair_heads.find(key);
-            return it == index().pair_heads.end() ? kNil : it->second;
+            return index().pair_heads.find_head(key);
         };
 
         std::vector<std::size_t> li;
@@ -5746,13 +5799,12 @@ class ChunkedInnerJoinOperator final : public Operator {
                 if (key_validity != nullptr && !(*key_validity)[i]) {
                     continue;
                 }
-                const auto it = probe_.index().i64_heads.find(key_data[i]);
-                if (it == probe_.index().i64_heads.end()) {
+                const std::size_t head = probe_.index().i64_heads.find_head(key_data[i]);
+                if (head == kNil) {
                     continue;
                 }
-                hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = it->second});
-                for (std::size_t cur = it->second; cur != kNil;
-                     cur = probe_.index().chain_next[cur]) {
+                hits.push_back(JoinProbe::SwappedHit{.rrow = i, .head = head});
+                for (std::size_t cur = head; cur != kNil; cur = probe_.index().chain_next[cur]) {
                     ++total;
                 }
             }

@@ -265,7 +265,23 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
    scheduled invocation is geomean -1.9% over all 22 queries, with q21 +5.1%
    and q19 +5.5% reported rather than averaged away. `IBEX_JOIN_BUILD_SERIAL`
    and `IBEX_JOIN_BUILD_LAZY` are the kill switches and the A/B handles.
-2. **Make the probe a step inside a map pipeline.** What (1) exists for:
+2. **Make the probe a step inside a map pipeline.** Three of the four
+   preconditions are now met: the build is a scheduled phase (`8cb4e936`),
+   the build side is jointly owned so N probes can share one (`6df9a966`),
+   and the probe is an operator of its own (`177b7a93`, `JoinProbeOperator`).
+   What remains is admitting it into `build_morsel_worker_chain`, which today
+   takes only `MapStep`s whose capability is row-local -- a probe is 1:N, and
+   the chain builder's vocabulary has no word for that yet.
+
+   **Test gap found on the way, not closed:** the extraction shipped a
+   deterministic segfault on q18 that all 1756 ctest tests passed through.
+   The suite has no deferred-probe join whose resolved right falls under
+   `kStreamRightThreshold`; building one needs a lazy source declaring >65536
+   rows, a filter slot, and a decode returning few rows. check_answers.py
+   caught it at 21/22. Worth closing before the morsel chain work, because
+   that work will touch the same construction path.
+
+   Original reasons, unchanged:
    morsels come from the probe source, the filters and projections above the
    join fuse into the same morsel loop instead of materializing between
    them, and one build can feed several probes (the index is already

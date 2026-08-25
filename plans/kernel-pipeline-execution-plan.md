@@ -248,31 +248,44 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
 
 **Next, in the order I would take them.**
 
-1. **Phase 4 decomposition — the actual item 1-2.** The join's build and probe
-   are now separate types with an immutable index between them (`8a644381`,
-   `f6a1a632`); splitting them into separately scheduled OPERATORS is blocked
-   on the run-time build-side choice, see item 1 below. Next in this line is
-   the aggregate: discovery / per-partition slots / final ordering / emission. This is the
-   half that changes operators rather than their constructors, and the only
-   one that unlocks a probe fusing into a map pipeline, one build feeding
-   several probes, or per-phase scheduling. Everything below is smaller.
-   Constraint inherited from `e07445ca`: any partition-owned aggregate must
-   keep the merge order thread-count-invariant — serial, one core and eight
-   must agree bit for bit, and the determinism test asserts exact equality.
-2. **Port `Tail`, `TopK`, `FilterHead`, `FilterTail`.** Same single-operator
+1. **Split the join operator, with the orientation resolved at run time.**
+   Re-ordered ahead of the aggregate on 2026-08-25; the previous text called
+   this "blocked on the run-time build-side choice", and that was an
+   assumption rather than a constraint. See "The build-side choice does not
+   block the split" below. No cardinality estimate, no behaviour change:
+   the same `n_right <= kStreamRightThreshold` / materialize-and-compare
+   logic relocated into the build phase, which publishes the index *and*
+   which side it indexed. This is `8a644381`'s pattern applied to the
+   operator instead of the data.
+2. **Make the probe a step inside a map pipeline.** The item that actually
+   delivers Umbra-style parallelism, and what (1) exists for: morsels come
+   from the probe source, the filters and projections above the join fuse
+   into the same morsel loop, one build can feed several probes (the index
+   is already `shared_ptr<const>`), and `probe_parallel_workers`'
+   `on_worker_pool_thread()` veto stops silently serializing every join
+   nested under another fan-out.
+3. **Phase 4 decomposition of the aggregate** — discovery / per-partition
+   slots / final ordering / emission. Constraint inherited from `e07445ca`:
+   any partition-owned aggregate must keep the merge order
+   thread-count-invariant — serial, one core and eight must agree bit for
+   bit. **Measured 2026-08-25: this constraint is already violated on the
+   current tree, before any decomposition work.** See "The determinism
+   constraint is already broken" below; it has to be reconciled first, and
+   there is no test that would have caught it.
+4. **Port `Tail`, `TopK`, `FilterHead`, `FilterTail`.** Same single-operator
    shape as Order/Head/Distinct, half an hour each, and it removes the
    asymmetry of ported and unported siblings sharing one switch.
-3. **Phase 5 item 1 — split `chunked.cpp` by ownership.** It is ~13k lines and
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership.** It is ~13k lines and
    now holds planner-owned builders next to the per-kind switch they replaced;
    the split is easier the more of Phase 4 has landed, not less.
-4. **Sweep the process-global plan counters in tests.** One test
+6. **Sweep the process-global plan counters in tests.** One test
    ("Fallback queries keep their existing executor") was PASSING while its
    premise was false, because `physical_materialized_calls` is process-wide and
    other tests in the same binary bump it. ctest never flagged it. Others may
    lean on the same counters the same way.
-5. **Phase 3 item 5 — per-pipeline scheduling accounting.** Small, and worth
-   more after (1) gives it phases to attribute to.
-6. **Phase 3 item 2 — DOP/memory budgets.** Analysed and blocked, see
+7. **Phase 3 item 5 — per-pipeline scheduling accounting.** Small, and worth
+   more after (1)-(3) give it phases to attribute to.
+8. **Phase 3 item 2 — DOP/memory budgets.** Analysed and blocked, see
    `phase3-dop-budget-analysis.md`: the pool is 65% idle with nothing queued,
    so a budget rations a resource that is not scarce. Reopen only when a
    multi-producer change needs it, or if `profile_suite.py` starts showing
@@ -282,9 +295,126 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
 
 * Porting the 6 materializing joins. They are the explicit `MaterializedCall`
   the plan wants, not a gap.
-* A cost model for join build-side selection. Real (it is q12's diagnosed
-  regression) but it is a planner-quality question, not a migration one, and
-  `plan_join` records today's choice rather than pretending to make one.
+* A cost model for join build-side selection *as a prerequisite for the
+  split*. Real as a planner-quality question (it is q12's diagnosed
+  regression), and `plan_join` records today's choice rather than pretending
+  to make one — but it is not on this migration's critical path. Once (1)
+  lands it becomes a narrow optimization with one target: deleting the
+  `MaterializeOperator(left)` barrier that exists purely to measure a row
+  count. Sequenced after (2), measurable on its own.
+* Deferred-probe registration selectivity (`build_side_worth_deferring`,
+  `src/ir/scan_predicates.cpp`). A DIFFERENT decision from the build-side
+  choice — see "Two decisions, routinely conflated" below. Scan-layer work,
+  its own schedule, not this plan's.
+
+### Two decisions, routinely conflated (2026-08-25)
+
+Two things in the tree are both called "the join cost model". They live in
+different files, answer different questions, and have different failure
+modes. Keeping them apart is what re-ordered the list above.
+
+**Decision A — deferred-probe registration.** `build_side_worth_deferring`,
+`src/ir/scan_predicates.cpp`. Should the build side be eagerly materialized
+so its key bounds can be pushed into the probe scan's Parquet decode? Current
+rule: `build_est.rows * 2 < probe_rows`. This is a DECODE-PRUNING question.
+It is what `plans/deferred-probe-selectivity-cost-model-plan.md` scopes with
+its `column_origin_of` domain-size ratio — that file was deleted from the
+tree in `50ff03c8` ("Clean up plans in the tree") and reads from
+`git show 50ff03c8^:plans/deferred-probe-selectivity-cost-model-plan.md`.
+
+**Decision B — which side is the build side.**
+`ChunkedInnerJoinOperator::initialize`, `src/runtime/chunked.cpp`. Rule:
+`n_right <= kStreamRightThreshold` (65536) build on right, else materialize
+left, compare `n_left < n_right`, possibly swap.
+
+Only B is what the operator split ever needed. Landing A would leave the
+split exactly as blocked as it is today, so "blocked on the join cost model"
+was pointing at the wrong artifact.
+
+### The build-side choice does not block the split (2026-08-25)
+
+What the adaptive path actually does when it "cannot decide statically":
+
+```cpp
+auto left_res = MaterializeOperator(std::move(left_)).run();   // chunked.cpp
+```
+
+It drains the entire left child into a `Table` BEFORE deciding, and the right
+side is already a whole `Table` by construction at the call site. In the
+large-right case the operator pays TWO full barriers, and the orientation is
+chosen after one side is fully materialized. The adaptivity is therefore
+already barrier-shaped: it is not an obstacle to `HashBuild + HashProbe`
+across a barrier.
+
+The one thing that genuinely wants a plan-time decision is naming the probe
+pipeline's SOURCE ahead of time. Ibex does not JIT — constructing the probe
+pipeline is allocating operator objects, which can happen after the build
+barrier completes at a cost of nothing. Umbra must decide at compile time
+because it generates code; this engine has a freedom Umbra does not and was
+declining to use it.
+
+So the blocker was an assumption — *"the physical plan must name the build
+side statically"* — not a constraint. Have `JoinPlan` carry both children as
+pipelines plus a runtime-resolved orientation, the same way `plan_join`
+already RELAYS a branch rather than pretending to decide it, and the
+two-operator structure lands with no cardinality estimate at all.
+
+**The parallelism gap this exposes, which is the actual prize.**
+`JoinProbe::probe_parallel_workers` (`chunked.cpp`) declines fan-out when
+`on_worker_pool_thread()`, per the no-nested-submission rule. So Ibex
+parallelizes INSIDE operators, and a join nested under any other fan-out runs
+its probe serially. Umbra parallelizes the PIPELINE; the operator is serial
+code run once per morsel, so a probe under another parallel region is
+parallel by construction and the veto has nothing to veto. That — not a
+better build-side choice — is what the split buys, and it is why item (2)
+above is the one that matters.
+
+*Unverified premise, worth one measurement before writing code:* instrument
+`probe_parallel_workers` to count declines attributable to
+`on_worker_pool_thread()` specifically and run PDS-H SF-1 at 8 cores. If
+joins nested under islands routinely decline, (2)'s payoff is quantified up
+front. If they almost never do, the argument above is weaker than stated and
+the ordering should be revisited rather than defended.
+
+### The determinism constraint is already broken (2026-08-25)
+
+Measured on `3f923086`, `build-release`, before any decomposition work. Same
+query, same data, `t[select { s = sum(v) }, by { g1, g2 }]`, 400k rows, 221
+groups, values chosen so re-association is visible (~1 ULP of 1.8e12):
+
+```
+IBEX_CORES=1        ->  1810000090365.2402
+IBEX_CORES=2,3,5,8  ->  1810000090365.2397    (all four agree bit for bit)
+```
+
+`IBEX_DISABLE_OWNED_PAIR_AGG=1` at 8 cores reproduces the 1-core answer
+exactly, so `try_owned_pair` is the sole differentiator. Checked against an
+independent exact reference (plain ascending-order summation over the same
+input, all 221 groups): the owned-pair path matches in 221/221, the serial
+path differs in 219/221. It is the SERIAL path that re-associates — it
+partitions by row count and merges partials inline, exactly as `e07445ca`
+designed for the ungrouped case — while the owned path bypasses that merge
+and sums in plain row order. Both are internally consistent; they disagree
+with each other, and which one runs is gated on `can_fan_out()`.
+
+What IS invariant: inside the owned path, `part_count` varies 2/2/4/8 across
+`IBEX_CORES=2/3/5/8` (itself contrary to this plan's "partition count is
+data-derived, never core-count-derived") and the answer does not move. The
+P-way merge on `first_rows` and the ascending scatter both hold. The defect
+is one level up — not inside partition-owned aggregation, but in the choice
+of whether to use it.
+
+Blast radius: two-int-key grouped `Sum(Double)` or `Count`, single aggregate,
+>= 65536 rows — `try_owned_pair`'s gates, i.e. the q18/q20 shapes. Single-int-key
+grouped sum is identical across 1/2/8 cores.
+
+No test covers this. The four `deterministic across thread counts` cases in
+`tests/test_interpreter.cpp` cover grouped *update* lifting, rank, collect
+aggregates and the *ungrouped* aggregate; nothing in `tests/` mentions the
+owned path at all. So item (3) needs an exact-equality gate on the grouped
+path written first, and it will fail on the current tree until the
+serial/owned split is reconciled — a pre-existing divergence, not something
+the decomposition introduces.
 
 ## Migration phases
 
@@ -1289,25 +1419,35 @@ risk table warns about.
 1. **Hash join:** ~~migrate the supported single-key/two-Int64-key streaming
    paths~~ (construction: DONE, `f5610646`) — express them as `HashBuild +
    HashProbe` across a barrier: **data side DONE (`5918b5cc`, `8a644381`,
-   `f6a1a632`), operator side blocked on a cost model.** The build is a phase
+   `f6a1a632`), operator side NEXT.** The build is a phase
    that returns an immutable `JoinHashIndex` (`build_join_hash_index` /
    `build_join_pair_index`), and `JoinProbe` is the type that consumes one:
    index, key list, output-name plans, per-worker scratch, probe-chunk
    validity and dictionary. The probe reads the build through
    `shared_ptr<const>`, so writing to build state during a probe is a compile
    error, and a probe can be constructed next to a build it did not run.
-   What is NOT done is two scheduled operators, and the reason is not
-   refactoring debt: `ChunkedInnerJoinOperator` picks its build side at RUN
-   time (`n_right <= kStreamRightThreshold`, else materialize left and
-   compare, possibly swapping roles). A static `HashBuild + HashProbe` pair
-   needs that decision at plan time, which needs the cardinality estimates
-   [[project_deferred_probe_selectivity_scoping]] scopes and this plan
-   deliberately does not own. All other join semantics remain behind
+   What is NOT done is two scheduled operators. **Corrected 2026-08-25:**
+   this previously read "blocked on a cost model", on the reasoning that
+   `ChunkedInnerJoinOperator` picks its build side at RUN time
+   (`n_right <= kStreamRightThreshold`, else materialize left and compare,
+   possibly swapping roles) and that a `HashBuild + HashProbe` pair needs
+   that decision at plan time. The second half does not follow — the
+   adaptive path already materializes a whole side before choosing, so it is
+   already barrier-shaped, and a non-JIT engine can construct the probe
+   pipeline after the build barrier for free. See "The build-side choice does
+   not block the split" above. The cardinality work
+   [[project_deferred_probe_selectivity_scoping]] scopes answers a different
+   question again (Decision A there). All other join semantics remain behind
    `MaterializedCall`, which is the intended end state for them.
 2. **Hash aggregate:** ~~migrate the current paths~~ (construction: DONE,
    `902d6941`) — express discovery, per-partition slots, final ordering and
    emission as distinct physical phases: NOT STARTED. Median/quantile/EWMA
-   fallback is explicit and still counted.
+   fallback is explicit and still counted. Blocked-first, not blocked: the
+   thread-count-invariance this decomposition is required to preserve is
+   already violated on the current tree by `try_owned_pair` vs the serial
+   path, with no test covering it — see "The determinism constraint is
+   already broken" above. Reconcile that before decomposing, or the
+   decomposition inherits a divergence it will be blamed for.
 3. **Distinct and ordered operations:** construction DONE (`ececc75f`,
    `49ca33c1`). `Tail`, `TopK`, `FilterHead` and `FilterTail` are the same
    single-operator shape and are NOT ported, so they now sit in the per-kind

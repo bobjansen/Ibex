@@ -14,10 +14,28 @@ The measurement that sees it is total CPU at one core against N:
 
     work_multiplier = cpu(N cores) / cpu(1 core)
 
-1.0 means the work was divided, which is the whole point of threads. Above 1.0
-the parallel path is doing something the serial path never does, and the
-excess is a hard cap on speedup: with a multiplier of m, N cores can return at
-best N/m.
+1.0 means CPU was conserved. Above 1.0 there are TWO possible causes and they
+need very different responses, so this number is a SCREEN, not a verdict:
+
+  (a) REDUNDANT WORK — the parallel path really does more. q17 sharded a
+      Parquet row group by row offset and each shard's `Skip` decoded and
+      discarded, so shard k re-decoded every shard before it (`7fae1146`,
+      q17 -33.6%). Fixable, and the fix is usually large.
+
+  (b) CONTENTION STALLS — the same work, slowed down. `task-clock` counts a
+      stalled core as busy, so threads competing for L3 and memory bandwidth
+      inflate CPU without doing anything extra. q06 reads 2.27x here, and a
+      row counter on its filter proves it processes IDENTICAL rows at 1 and 8
+      cores (12 calls, 11,997,996 rows, both). Its decode threads and its
+      filter simply contend.
+
+**Always confirm which one before acting.** The cheap test is to count the work
+directly — rows, calls, bytes — at 1 core and at N. If the counts match, it is
+(b) and there is no redundant work to delete.
+
+Note that a plain streaming read does NOT inflate on this box (400MB summed by
+1 thread vs 8: 13.8 -> 52.7 GB/s, task-clock flat at ~160ms), so (b) needs
+genuine concurrent contention, not merely touching a lot of memory.
 
 CPU comes from `getrusage(RUSAGE_CHILDREN)` — user+sys of the child process —
 so this needs no `perf` and runs anywhere. It agrees with
@@ -122,10 +140,11 @@ def main() -> int:
     print(f"{'SUITE':>6} {c1s:8.0f}ms {cns:8.0f}ms {suite_work:6.2f}x "
           f"{w1s:8.0f}ms {wns:8.0f}ms {w1s/wns:7.2f}x {args.cores/suite_work:5.2f}x")
     print()
-    print(f"The suite does {suite_work:.2f}x the work on {args.cores} cores, so "
-          f"{args.cores} cores can return at best {args.cores/suite_work:.2f}x.")
-    print(f"Removing the excess entirely would take the suite to "
-          f"~{wns/suite_work:.0f}ms at {args.cores} cores, from {wns:.0f}ms.")
+    print(f"The suite burns {suite_work:.2f}x the CPU on {args.cores} cores.")
+    print(f"That is a SCREEN, not a verdict: it is redundant work only where a")
+    print(f"direct count of rows/calls/bytes differs between 1 core and "
+          f"{args.cores}. Where the counts match it is contention, and there is")
+    print(f"nothing to delete. Confirm before acting -- see MEASURING.md 1b.")
     worst = sorted(rows, reverse=True)[:5]
     if worst and worst[0][0] > FLAG:
         print(f"\nworst multipliers (look here first):")

@@ -265,8 +265,29 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
    scheduled invocation is geomean -1.9% over all 22 queries, with q21 +5.1%
    and q19 +5.5% reported rather than averaged away. `IBEX_JOIN_BUILD_SERIAL`
    and `IBEX_JOIN_BUILD_LAZY` are the kill switches and the A/B handles.
-2. **Make the probe a step inside a map pipeline.** Three of the four
-   preconditions are now met: the build is a scheduled phase (`8cb4e936`),
+2. ~~**Make the probe a step inside a map pipeline.**~~ **BUILT 2026-08-25
+   (`f8e84446`, `7cc940b1`), off by default, and the finding is the coverage
+   rather than the code.** A map pipeline over a streaming join takes the
+   build and the probe side, morselizes the probe side, and runs probe + maps
+   in one worker chain; the join's output is never assembled. Correct at 1, 2
+   and 8 cores. It fires on **one query out of twenty-two** (q17, 6088-row
+   probe side), so it cannot be measured and no performance claim is made.
+
+   **What blocks coverage, and it is the next architectural item if this line
+   continues:** across PDS-H the join modes go 28 `Stream`, 12 `Precomputed`,
+   11 `Swapped`. `Precomputed` and `Swapped` materialize both sides and emit
+   one table -- they have no probe pipeline to give. **`Swapped` is the
+   un-Umbra shape**, and while it is chosen for a third of joins there is
+   nothing to fuse. A parallel map pipeline sitting directly on a join is
+   itself only 8 of 22 queries, and the intersection with `Stream` is nearly
+   empty.
+
+   Also corrected here: fusion avoiding a materialization between join and
+   maps is true only where a PARALLEL map pipeline was going to run. The
+   ordinary chunked path already streams a join's output into the operator
+   above it. The prize was argued larger than it is.
+
+   Three of the four preconditions were met by: the build is a scheduled phase (`8cb4e936`),
    the build side is jointly owned so N probes can share one (`6df9a966`),
    and the probe is an operator of its own (`177b7a93`, `JoinProbeOperator`).
    What remains is admitting it into `build_morsel_worker_chain`, which today

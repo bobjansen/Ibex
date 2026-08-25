@@ -400,6 +400,40 @@ probes. Both are unmeasured. Before (2) is scheduled on a performance
 argument, one of those two needs its own measurement -- the parallelism
 argument as originally written does not survive contact with the counter.
 
+### Where join time actually goes (2026-08-25)
+
+Measured, then stopped -- structure first, perf second. `IBEX_PROFILE_OPERATORS`
+plus temporary timers inside `build_join_hash_index` and `assemble_output`,
+PDS-H SF-1 at 8 cores, 11 join-carrying queries (instrumentation reverted).
+
+Joins are worth the attention: they are 96.7% of q05's wall, 80.2% of q08,
+74.9% of q21, 67.1% of q19, 64.9% of q04, 64.1% of q09.
+
+Two results, one of which retires a standing note.
+
+* **`assemble_output` does not dominate.** [[project_join_parallelism]] records
+  "assemble_output dominates" from the probe-threading work. It is 14% of join
+  self time across these 11 queries and never more than 10.5% of any query's
+  wall; on the two most join-dominated queries, q05 and q08, it is 3.9% and
+  1.3% of wall. Fusing the probe into a map pipeline to avoid materializing
+  between the probe and the maps above it is therefore a STRUCTURAL argument,
+  not a performance one -- which is consistent with the veto measurement above,
+  and is why item (2) carries no performance claim.
+* **The serial hash build is the real cost, and it is concentrated.** Builds are
+  29% of join self time over the 11 queries, but 70% of that total is ONE build:
+  q21 hashes 1,285,828 rows in **40.0 ms**, in a query whose whole wall is
+  75-79 ms. `build_join_hash_index` is a single loop with no fan-out (31 ns/row,
+  including a `heads.reserve(rows)` sized by row count rather than by any
+  distinct estimate). Umbra builds its hash table morsel-parallel; this engine
+  builds it on one thread.
+
+That is the join-perf target, and it lands naturally after the structural work
+rather than before it: a `HashBuild` that is its own scheduled phase over the
+build side's pipeline is a thing that CAN be morsel-parallel, where a build
+buried in `initialize()` is not. Note also that q21 is [[project_query_shape_conformance_regression]]'s
+dominant remaining gap (2.33x, 91% of it) -- these may be the same finding seen
+from two directions, which is worth checking before either is worked.
+
 ### The determinism constraint is already broken (2026-08-25)
 
 Measured on `3f923086`, `build-release`, before any decomposition work. Same

@@ -2258,6 +2258,26 @@ inline auto split_scan_groups(std::vector<KeyScanGroup> groups, std::size_t targ
     if (target <= 1) {
         return groups;
     }
+    // Splitting a row group is not free the way splitting a file is: a shard
+    // starts by `Skip`ping to its offset, and Parquet has no intra-row-group
+    // seek, so `Skip` DECODES AND DISCARDS. Shard k therefore re-decodes every
+    // preceding shard's rows and the group costs rows*(n+1)/2 instead of rows
+    // -- 4.5x at eight shards, which is what q17 measured (task-clock 79ms at
+    // one decode thread against 367ms at eight, rising ~41ms per thread).
+    //
+    // So split only when there is nothing else to spread over. With at least
+    // `target` groups the file already has that axis and splitting is pure
+    // redundant decode: never splitting measured q17 -32.7%, q08 -21.3%,
+    // q05 -14.3%, q09 -10.9%, q18 -8.7% (all p=0.000, 14-0 pairs), suite
+    // geomean -4.4%, with no query regressing and byte-identical output.
+    //
+    // Below `target` groups the re-decode is still the only way to reach the
+    // cores -- one group over eight shards is 4.5x the work across 8 threads,
+    // which is a win over deciding to stay serial -- so the old behaviour is
+    // kept exactly there.
+    if (groups.size() >= target) {
+        return groups;
+    }
     std::vector<KeyScanGroup> split;
     split.reserve(groups.size() * target);
     for (const auto& group : groups) {

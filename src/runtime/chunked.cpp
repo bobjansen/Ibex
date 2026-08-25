@@ -5419,8 +5419,16 @@ struct JoinProbe {
 /// that decided the orientation.
 class JoinProbeOperator final : public Operator {
    public:
-    JoinProbeOperator(OperatorPtr child, JoinProbe probe)
-        : child_(std::move(child)), probe_(std::move(probe)) {}
+    /// `preserve_empty_morsels` is the same contract every map kernel in a
+    /// morsel chain honours: one input morsel yields exactly one identified
+    /// output morsel, because the ordered ring indexes by sequence and a
+    /// coalesced empty result would be a lost slot rather than a smaller
+    /// answer. A probe needs it more than a filter does -- a morsel of
+    /// probe-side rows that matches nothing is entirely ordinary.
+    JoinProbeOperator(OperatorPtr child, JoinProbe probe, bool preserve_empty_morsels = false)
+        : child_(std::move(child)),
+          probe_(std::move(probe)),
+          preserve_empty_(preserve_empty_morsels) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -5436,12 +5444,20 @@ class JoinProbeOperator final : public Operator {
                 }
                 return std::optional<Chunk>{};
             }
-            auto out =
-                probe_.probe_chunk_against_right(chunk_to_table(std::move(*chunk_res.value())));
+            Chunk input = std::move(*chunk_res.value());
+            // A morsel's identity travels with it. `sequence` and `row_offset`
+            // identify which morsel this is, not which rows it holds, so a
+            // probe propagates them unchanged exactly as a filter does --
+            // both change the row count, and neither changes which morsel it
+            // is answering for. The ordered ring rejects a chunk that arrives
+            // without them.
+            const std::uint64_t sequence = input.sequence;
+            const std::size_t row_offset = input.row_offset;
+            auto out = probe_.probe_chunk_against_right(chunk_to_table(std::move(input)));
             if (!out.has_value()) {
                 return std::unexpected(std::move(out.error()));
             }
-            if (out->rows() == 0) {
+            if (out->rows() == 0 && !preserve_empty_) {
                 // Keep the planned empty table as a schema carrier. A join
                 // with no matches still has its left and right output columns;
                 // without this, a materializing sink sees no chunks at all.
@@ -5449,16 +5465,32 @@ class JoinProbeOperator final : public Operator {
                 continue;
             }
             emitted_nonempty_ = true;
-            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+            Chunk result = table_to_chunk(std::move(*out));
+            result.sequence = sequence;
+            result.row_offset = row_offset;
+            return std::optional<Chunk>{std::move(result)};
         }
     }
 
    private:
     OperatorPtr child_;
     JoinProbe probe_;
+    bool preserve_empty_ = false;
     std::optional<Table> empty_schema_;
     bool emitted_nonempty_ = false;
 };
+
+/// How many workers a probe over an already-materialized probe side may fan
+/// out to, or 0 to decline. Defined with the morsel machinery below.
+[[nodiscard]] auto probe_morsel_workers(const Table& input, const ExecutionContext& exec)
+    -> std::size_t;
+
+/// Run a probe over the morsels of an already-materialized probe side: one
+/// `JoinProbeOperator` per worker, all reading the same build, results merged
+/// in morsel order. Defined below, next to the morsel executor it uses.
+[[nodiscard]] auto build_probe_morsel_pipeline(Table input, const JoinProbe& probe,
+                                               std::size_t workers, const ExecutionContext& exec)
+    -> std::expected<OperatorPtr, std::string>;
 
 /// Inner hash join for single-key no-predicate joins.
 ///
@@ -5736,13 +5768,38 @@ class ChunkedInnerJoinOperator final : public Operator {
         // the deferred path drains `left_` to publish a filter, and if the
         // resolved right then lands under `kStreamRightThreshold` the fast
         // path arrives here with no `left_table` and a moved-from `left_`.
-        OperatorPtr probe_source;
+        std::optional<Table> materialized_probe_side;
         if (left_table.has_value()) {
-            probe_source = make_table_source(std::move(*left_table));
+            materialized_probe_side = std::move(*left_table);
         } else if (use_materialized_left_ && left_materialized_.has_value()) {
-            probe_source = make_table_source(std::move(*left_materialized_));
+            materialized_probe_side = std::move(*left_materialized_);
             left_materialized_.reset();
             use_materialized_left_ = false;
+        }
+
+        // The probe side is already a whole table, so it can be morselized:
+        // one probe per worker, each over its own morsel, all reading this one
+        // immutable build. That is the shape the last four commits were for --
+        // the probe stops being a loop the join runs and becomes the body of a
+        // morsel chain. Declined for a small probe side, where the gather and
+        // the ordered merge cost more than the probes they spread.
+        if (materialized_probe_side.has_value() && probe_.exec_ != nullptr) {
+            if (const std::size_t workers =
+                    probe_morsel_workers(*materialized_probe_side, *probe_.exec_);
+                workers >= 2) {
+                auto pipeline = build_probe_morsel_pipeline(std::move(*materialized_probe_side),
+                                                            probe_, workers, *probe_.exec_);
+                if (!pipeline.has_value()) {
+                    return std::move(pipeline.error());
+                }
+                probe_op_ = std::move(*pipeline);
+                return std::nullopt;
+            }
+        }
+
+        OperatorPtr probe_source;
+        if (materialized_probe_side.has_value()) {
+            probe_source = make_table_source(std::move(*materialized_probe_side));
         } else {
             probe_source = std::move(left_);
         }
@@ -6264,10 +6321,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// the orientation is BuildRight, since from then on the probe is an
     /// operator of its own and this class is build-side only.
     JoinProbe probe_;
-    /// Stream mode's probe, constructed when the build finishes. Null in the
-    /// Swapped and Precomputed modes, which emit one table rather than
-    /// streaming and so have no probe-side child to pull from.
-    std::unique_ptr<JoinProbeOperator> probe_op_;
+    /// Stream mode's probe, constructed when the build finishes: one
+    /// `JoinProbeOperator` over the probe-side child, or -- when that child
+    /// was already materialized and is big enough -- a morsel pipeline of
+    /// several of them over its morsels. Null in the Swapped and Precomputed
+    /// modes, which emit one table rather than streaming.
+    OperatorPtr probe_op_;
 
     // Deferred-probe context (see the second constructor). `deferred_probe_`
     // doubles as the mode flag: non-null until the probe scan is resolved.
@@ -11966,6 +12025,73 @@ class TwoPhaseFilterOperator final : public Operator {
                                         const ScalarRegistry* scalars,
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string>;
+
+// Internal linkage to match the forward declarations beside the join, which
+// sit inside this TU's anonymous namespace; the definitions must live down
+// here because they use the morsel executor, which is defined below the join.
+namespace {
+
+auto probe_morsel_workers(const Table& input, const ExecutionContext& exec) -> std::size_t {
+    // OPT-IN, and the measurement is why. On its own this is a LOSS: the
+    // probe already fans out inside one chunk (`probe_ranges_parallel`) with
+    // no copy, and morselizing replaces that with a per-morsel gather plus an
+    // ordered merge. Measured at 8 cores, interleaved, median of 15:
+    // q05 +1.7%, q09 +6.8% -- the only two PDS-H queries where it fires.
+    //
+    // It is wired anyway because the gather is not what this shape is for.
+    // A probe morsel becomes worth its gather when the filters and
+    // projections above the join run in the SAME chain, so the join's output
+    // is never materialized between them. That needs the probe admitted into
+    // the plan's step vocabulary, which is the next piece; this is the half
+    // that had to work first, and it does -- 22/22 answers at 1, 2 and 8
+    // cores with `IBEX_PROBE_MORSELS=1`.
+    if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
+        return 0;
+    }
+    if (!exec.can_fan_out() || on_worker_pool_thread()) {
+        return 0;
+    }
+    if (!is_worth_morselizing(exec, input.rows(), input.columns.size())) {
+        return 0;
+    }
+    const std::size_t grain = morsel_grain(exec, input.rows());
+    return morsel_worker_count(exec, partitioned_morsel_count(input, grain));
+}
+
+auto build_probe_morsel_pipeline(Table input, const JoinProbe& probe, std::size_t workers,
+                                 const ExecutionContext& exec)
+    -> std::expected<OperatorPtr, std::string> {
+    auto owned = std::make_unique<Table>(std::move(input));
+    const std::size_t grain = morsel_grain(exec, owned->rows());
+    const auto expected_morsels = partitioned_morsel_count(*owned, grain);
+    if (exec.parallel_stats != nullptr) {
+        exec.parallel_stats->parallel_pipelines.fetch_add(1, std::memory_order_relaxed);
+        exec.parallel_stats->morsels.fetch_add(expected_morsels, std::memory_order_relaxed);
+    }
+
+    static const std::vector<MapStep> no_steps;
+    std::vector<MorselWorkerChain> chains;
+    chains.reserve(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
+        // The chain is source + probe. Each worker gets its OWN `JoinProbe` --
+        // its scratch vectors and its per-chunk categorical head table are
+        // per-worker state -- and they share one build, because the index and
+        // the build side are both `shared_ptr<const>` and have been since
+        // `f6a1a632` and `6df9a966`. Copying the probe is what that ownership
+        // was for.
+        auto worker = build_morsel_worker_chain(no_steps, *owned, nullptr, nullptr, exec);
+        if (!worker.has_value()) {
+            return std::unexpected(std::move(worker.error()));
+        }
+        worker->chain = std::make_unique<JoinProbeOperator>(std::move(worker->chain), probe,
+                                                            /*preserve_empty_morsels=*/true);
+        chains.push_back(std::move(worker.value()));
+    }
+    return std::make_unique<MorselPipelineOperator>(std::move(owned), std::move(chains), grain,
+                                                    expected_morsels, process_worker_pool());
+}
+
+}  // namespace
 
 /// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
 /// records steps sink-first; every executor here composes bottom-up.

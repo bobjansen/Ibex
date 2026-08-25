@@ -13646,7 +13646,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
-        if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column);
+        if (auto fused = left_join_count_table(join, agg, *left, *right, counted_column, &exec);
             fused.has_value()) {
             return make_table_source(std::move(*fused));
         }

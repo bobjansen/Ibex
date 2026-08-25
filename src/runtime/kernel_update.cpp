@@ -2093,7 +2093,21 @@ auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
     if (route.fixed_width.has_value()) {
         return route;
     }
-    route.numeric_tree = try_plan_direct_numeric_tree(expr, input, scalars);
+    // The numeric-tree arm is deliberately NOT offered here. `aea4d347` added it so
+    // a parallel chunk update over general arithmetic would stop declining the
+    // split and crossing to `update_table`, and measured only that the metadata
+    // bridge went away -- "No performance claim: this removes a per-chunk metadata
+    // bridge, not a row loop." The row loop is the problem:
+    // `eval_numeric_tree_double` walks the node array recursively FOR EVERY ROW,
+    // switching on kind per node and calling through a function pointer for unary
+    // ops, where `try_write_compiled_numeric_update_expr` on the other side of the
+    // bridge runs a compiled loop. Bisected on q01 at SF-2 (min-of-5): this arm
+    // costs 389/211/168ms at 2/4/8 cores against 220/137/130ms without it, +34-79%.
+    //
+    // Declining the split and paying the bridge is therefore the faster route, and
+    // is what shipped before `aea4d347`. Re-offer the arm once the tree is compiled
+    // rather than interpreted per row; the plan, the range writer and their tests
+    // are kept for that, and `try_numeric_tree_update` still uses them serially.
     return route;
 }
 
@@ -2525,7 +2539,13 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
         }
         return current;
     };
-    if (fields.size() > 1) {
+    // The fold is only worth its per-field barriers when there is more than one
+    // thread to spread them over. At a budget of one it is pure overhead: q01 at
+    // SF-2 measures 673ms with the fold and 361ms without, and the two are within
+    // noise at 2 and 4 cores (392/390 and 212/208). Below that budget the
+    // fall-through to the `update_table` bridge is the faster route, which is
+    // where this landed before `63d7f8a1` relaxed the gate from `!exec.parallel`.
+    if (exec.can_fan_out() && fields.size() > 1) {
         auto folded =
             exec.can_fan_out()
                 ? fold_fields([&](const Chunk& current, const std::vector<ir::FieldSpec>& one) {

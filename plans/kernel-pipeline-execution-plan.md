@@ -257,13 +257,15 @@ flatters it: that measures who CONSTRUCTS operators, not how they are shaped.
    logic relocated into the build phase, which publishes the index *and*
    which side it indexed. This is `8a644381`'s pattern applied to the
    operator instead of the data.
-2. **Make the probe a step inside a map pipeline.** The item that actually
-   delivers Umbra-style parallelism, and what (1) exists for: morsels come
-   from the probe source, the filters and projections above the join fuse
-   into the same morsel loop, one build can feed several probes (the index
-   is already `shared_ptr<const>`), and `probe_parallel_workers`'
-   `on_worker_pool_thread()` veto stops silently serializing every join
-   nested under another fan-out.
+2. **Make the probe a step inside a map pipeline.** What (1) exists for:
+   morsels come from the probe source, the filters and projections above the
+   join fuse into the same morsel loop instead of materializing between
+   them, and one build can feed several probes (the index is already
+   `shared_ptr<const>`). **Needs a performance argument before it is
+   scheduled:** the one this list first gave it -- that
+   `probe_parallel_workers`' `on_worker_pool_thread()` veto is serializing
+   nested joins -- was measured and is false on PDS-H (0 of 52 declines).
+   See "The build-side choice does not block the split" below.
 3. **Phase 4 decomposition of the aggregate** — discovery / per-partition
    slots / final ordering / emission. Constraint inherited from `e07445ca`:
    any partition-owned aggregate must keep the merge order
@@ -369,12 +371,34 @@ parallel by construction and the veto has nothing to veto. That — not a
 better build-side choice — is what the split buys, and it is why item (2)
 above is the one that matters.
 
-*Unverified premise, worth one measurement before writing code:* instrument
-`probe_parallel_workers` to count declines attributable to
-`on_worker_pool_thread()` specifically and run PDS-H SF-1 at 8 cores. If
-joins nested under islands routinely decline, (2)'s payoff is quantified up
-front. If they almost never do, the argument above is weaker than stated and
-the ordering should be revisited rather than defended.
+*Premise MEASURED 2026-08-25, and it does not hold.* `probe_parallel_workers`
+was instrumented to record why it declined, over all 22 PDS-H SF-1 queries at
+8 cores (`IBEX_CORES=8`, `ibex_eval` per query; instrumentation reverted, not
+committed):
+
+```
+35  ADMIT
+17  too_small     (n < kMinProbeRows = 16384)
+ 0  nested        (on_worker_pool_thread())
+ 0  no_fanout
+```
+
+Zero. The `on_worker_pool_thread()` veto never fires for a join probe on this
+workload, so "it silently serializes every join nested under another fan-out"
+was wrong as a statement about what is happening today. It is latent, not
+active, and the reason it is latent is itself the finding: **no join probe in
+PDS-H ever runs on a pool thread**, because joins are not inside parallel
+pipelines at all. Their probes are parallel (35 of 52 admit) purely through
+an intra-operator fan-out that works only because the operator sits on the
+main thread.
+
+That leaves the Umbra gap real but differently shaped, and item (2)'s payoff
+restated honestly: not "unlock parallelism a veto is blocking", but that a
+probe inside a map pipeline fuses with the filters and projections above it
+instead of materializing between them, and that one build can feed several
+probes. Both are unmeasured. Before (2) is scheduled on a performance
+argument, one of those two needs its own measurement -- the parallelism
+argument as originally written does not survive contact with the counter.
 
 ### The determinism constraint is already broken (2026-08-25)
 

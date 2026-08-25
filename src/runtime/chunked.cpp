@@ -5581,8 +5581,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
 
         // Stream mode is the probe, and the probe is its own operator. The
-        // join constructed it when the build finished and delegates from here
-        // on: everything left in this class is build-side.
+        // join constructs it on first use and delegates from here on:
+        // everything left in this class is build-side.
+        if (auto err = ensure_probe_op()) {
+            return std::unexpected(std::move(*err));
+        }
         return probe_op_->next();
     }
 
@@ -5777,43 +5780,100 @@ class ChunkedInnerJoinOperator final : public Operator {
             use_materialized_left_ = false;
         }
 
-        // The probe side is already a whole table, so it can be morselized:
-        // one probe per worker, each over its own morsel, all reading this one
-        // immutable build. That is the shape the last four commits were for --
-        // the probe stops being a loop the join runs and becomes the body of a
-        // morsel chain. Declined for a small probe side, where the gather and
-        // the ordered merge cost more than the probes they spread.
-        if (materialized_probe_side.has_value() && probe_.exec_ != nullptr) {
-            if (const std::size_t workers =
-                    probe_morsel_workers(*materialized_probe_side, *probe_.exec_);
-                workers >= 2) {
-                auto pipeline = build_probe_morsel_pipeline(std::move(*materialized_probe_side),
-                                                            probe_, workers, *probe_.exec_);
-                if (!pipeline.has_value()) {
-                    return std::move(pipeline.error());
-                }
-                probe_op_ = std::move(*pipeline);
-                return std::nullopt;
-            }
-        }
-
-        OperatorPtr probe_source;
-        if (materialized_probe_side.has_value()) {
-            probe_source = make_table_source(std::move(*materialized_probe_side));
-        } else {
-            probe_source = std::move(left_);
-        }
-        if (probe_source == nullptr) {
-            // Every way of losing the probe side is a bug in the three
-            // branches above, and one of them was. Aborting with a name beats
+        // The probe side is kept rather than consumed. Building the probe
+        // operator here would settle a question a caller above may want to
+        // answer differently: a map pipeline over this join can take the probe
+        // and run it at the head of its own worker chains, which is the Umbra
+        // shape -- one build pipeline, then a probe pipeline whose maps run in
+        // the same worker as the probe. `take_fusible_probe` is that handoff,
+        // and it has to happen before `ensure_probe_op` commits.
+        probe_side_ = std::move(materialized_probe_side);
+        if (!probe_side_.has_value() && left_ == nullptr) {
+            // Every way of losing the probe side is a bug in the branches
+            // above, and one of them was. Aborting with a name beats
             // dereferencing null inside a pool thread, which is what the
             // deferred fast-path case actually did.
             invariant_violation("join probe: no probe-side source after the build phase");
         }
+        return std::nullopt;
+    }
+
+    /// Build Stream mode's probe operator, once, on first use.
+    ///
+    /// Split from `adopt_build` so a caller that wants to fuse this probe into
+    /// its own pipeline has a window in which the decision is still open --
+    /// see `take_fusible_probe`.
+    auto ensure_probe_op() -> std::optional<std::string> {
+        if (probe_op_ != nullptr) {
+            return std::nullopt;
+        }
+        // A materialized probe side can be morselized: one probe per worker,
+        // each over its own morsel, all reading this one immutable build.
+        // Opt-in, and `probe_morsel_workers` records the measurement that
+        // explains why.
+        if (probe_side_.has_value() && probe_.exec_ != nullptr) {
+            if (const std::size_t workers = probe_morsel_workers(*probe_side_, *probe_.exec_);
+                workers >= 2) {
+                auto pipeline = build_probe_morsel_pipeline(std::move(*probe_side_), probe_,
+                                                            workers, *probe_.exec_);
+                if (!pipeline.has_value()) {
+                    return std::move(pipeline.error());
+                }
+                probe_side_.reset();
+                probe_op_ = std::move(*pipeline);
+                return std::nullopt;
+            }
+        }
+        OperatorPtr probe_source =
+            probe_side_.has_value() ? make_table_source(std::move(*probe_side_)) : std::move(left_);
+        probe_side_.reset();
         probe_op_ = std::make_unique<JoinProbeOperator>(std::move(probe_source), std::move(probe_));
         return std::nullopt;
     }
 
+   public:
+    /// One build, one probe side, ready to be run by someone else.
+    struct FusibleProbe {
+        Table probe_side;
+        JoinProbe probe;
+    };
+
+    /// Hand the probe and its input to a caller that will run them itself.
+    /// Empty unless this join settled on `BuildRight` and nothing has pulled
+    /// from it yet: a swapped or precomputed join emits one table and has no
+    /// probe pipeline to give.
+    ///
+    /// A probe side that is still streaming gets materialized here, which
+    /// sounds like a cost added and is not: the caller is a parallel map
+    /// pipeline, which was going to materialize the join's OUTPUT and
+    /// morselize that. This materializes the probe side instead, and the
+    /// join's output is then never assembled at all -- it is produced a morsel
+    /// at a time inside the workers. Which of the two tables is larger is a
+    /// real question and a measured one; it is not a question of whether a
+    /// materialization exists.
+    ///
+    /// The operator is left without a probe and must be discarded.
+    [[nodiscard]] auto take_fusible_probe()
+        -> std::expected<std::optional<FusibleProbe>, std::string> {
+        if (mode_ != Mode::Stream || probe_op_ != nullptr) {
+            return std::optional<FusibleProbe>{};
+        }
+        if (!probe_side_.has_value()) {
+            if (left_ == nullptr) {
+                return std::optional<FusibleProbe>{};
+            }
+            auto drained = MaterializeOperator(std::move(left_)).run();
+            if (!drained.has_value()) {
+                return std::unexpected(std::move(drained.error()));
+            }
+            probe_side_ = std::move(*drained);
+        }
+        FusibleProbe out{.probe_side = std::move(*probe_side_), .probe = std::move(probe_)};
+        probe_side_.reset();
+        return std::optional<FusibleProbe>{std::move(out)};
+    }
+
+   private:
     /// Two-fixed-width-int-key path: narrow first cut of the streaming
     /// two-key join (plans/parallelism-overview.md's "stream multi-key
     /// joins" item). Non-deferred case: `right_` is already a whole `Table`
@@ -6321,7 +6381,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// the orientation is BuildRight, since from then on the probe is an
     /// operator of its own and this class is build-side only.
     JoinProbe probe_;
-    /// Stream mode's probe, constructed when the build finishes: one
+    /// The probe side, drained by the build phase and held until either
+    /// `ensure_probe_op` turns it into a source or `take_fusible_probe` hands
+    /// it to a pipeline above. Empty when the probe side streams from `left_`.
+    std::optional<Table> probe_side_;
+    /// Stream mode's probe, constructed on first use: one
     /// `JoinProbeOperator` over the probe-side child, or -- when that child
     /// was already materialized and is big enough -- a morsel pipeline of
     /// several of them over its morsels. Null in the Swapped and Precomputed
@@ -11184,13 +11248,17 @@ struct MorselWorkerChain {
 [[nodiscard]] auto build_morsel_worker_chain(const std::vector<MapStep>& operators,
                                              const Table& input, const ScalarRegistry* scalars,
                                              const ExternRegistry* externs,
-                                             const ExecutionContext& exec)
+                                             const ExecutionContext& exec,
+                                             const JoinProbe* probe_head = nullptr)
     -> std::expected<MorselWorkerChain, std::string> {
     // A qualifying head is absorbed into the source rather than built as an
     // operator above it — same output, without materializing the morsel first.
+    // Not available under a probe head: that optimization reads the first
+    // operator as a filter over the SOURCE's rows, and with a probe between
+    // them the source's rows are the probe side, not the filter's input.
     std::size_t first_op = 0;
     std::unique_ptr<MorselSource> source;
-    if (!operators.empty()) {
+    if (!operators.empty() && probe_head == nullptr) {
         if (auto head = range_filter_head(operators.front(), input); head.has_value()) {
             source = std::make_unique<RangeFilterMorselSource>(input, head->predicate,
                                                                head->project, scalars);
@@ -11202,6 +11270,14 @@ struct MorselWorkerChain {
     }
 
     MorselWorkerChain worker{.source = source.get(), .chain = std::move(source)};
+    // The probe runs first, on this worker's own morsel of the probe side, and
+    // every map above it runs in the same worker on the probe's output. That
+    // is the whole point of the fused shape: the join's output is never
+    // assembled as a table between the probe and the maps.
+    if (probe_head != nullptr) {
+        worker.chain = std::make_unique<JoinProbeOperator>(std::move(worker.chain), *probe_head,
+                                                           /*preserve_empty_morsels=*/true);
+    }
     for (std::size_t i = first_op; i < operators.size(); ++i) {
         const MapStep& op_node = operators[i];
         // `preserve_empty_morsels` is what makes one input morsel yield exactly
@@ -12031,6 +12107,56 @@ class TwoPhaseFilterOperator final : public Operator {
 // here because they use the morsel executor, which is defined below the join.
 namespace {
 
+/// Build a streaming join here and take its probe, so a map pipeline above it
+/// can run that probe at the head of its own worker chains.
+///
+/// Returns an empty optional -- not an error -- for every join this cannot
+/// fuse: a materializing one, a semi/anti one, a deferred probe scan (whose
+/// right subtree must be interpreted by the join itself, after it publishes
+/// build-side bounds), and any orientation that leaves no materialized probe
+/// side. The caller then materializes the join's output as it always did.
+///
+/// Narrow on purpose. The point is to establish that two pipelines meeting at
+/// a barrier can be built and can produce the right answer; widening the
+/// shapes is cheap once that is true, and pointless before.
+auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
+                         const ScalarRegistry* scalars, const ExternRegistry* externs,
+                         const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<std::optional<ChunkedInnerJoinOperator::FusibleProbe>, std::string> {
+    if (std::getenv("IBEX_PROBE_MORSELS") == nullptr) {
+        return std::optional<ChunkedInnerJoinOperator::FusibleProbe>{};
+    }
+    const physical::Plan plan = physical::plan_physical(node, registry, externs);
+    const physical::JoinPlan& jp = plan.join;
+    if (!jp.describes || jp.strategy != physical::JoinStrategy::StreamingProbe ||
+        (jp.branch != physical::JoinBranch::SingleKeyInner &&
+         jp.branch != physical::JoinBranch::PairIntInner)) {
+        return std::optional<ChunkedInnerJoinOperator::FusibleProbe>{};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& join = static_cast<const ir::JoinNode&>(node);
+    if (deferred_probe_scan_of(*join.children()[1], exec).scan != nullptr) {
+        return std::optional<ChunkedInnerJoinOperator::FusibleProbe>{};
+    }
+
+    auto left_op = build_operator(*join.children()[0], registry, scalars, externs, exec, model_out);
+    if (!left_op.has_value()) {
+        return std::unexpected(std::move(left_op.error()));
+    }
+    auto right =
+        materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+    if (!right.has_value()) {
+        return std::unexpected(std::move(right.error()));
+    }
+    auto op = std::make_unique<ChunkedInnerJoinOperator>(
+        std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
+        &join.pending_order());
+    if (auto err = op->run_build()) {
+        return std::unexpected(std::move(*err));
+    }
+    return op->take_fusible_probe();
+}
+
 auto probe_morsel_workers(const Table& input, const ExecutionContext& exec) -> std::size_t {
     // OPT-IN, and the measurement is why. On its own this is a LOSS: the
     // probe already fans out inside one chunk (`probe_ranges_parallel`) with
@@ -12079,12 +12205,10 @@ auto build_probe_morsel_pipeline(Table input, const JoinProbe& probe, std::size_
         // the build side are both `shared_ptr<const>` and have been since
         // `f6a1a632` and `6df9a966`. Copying the probe is what that ownership
         // was for.
-        auto worker = build_morsel_worker_chain(no_steps, *owned, nullptr, nullptr, exec);
+        auto worker = build_morsel_worker_chain(no_steps, *owned, nullptr, nullptr, exec, &probe);
         if (!worker.has_value()) {
             return std::unexpected(std::move(worker.error()));
         }
-        worker->chain = std::make_unique<JoinProbeOperator>(std::move(worker->chain), probe,
-                                                            /*preserve_empty_morsels=*/true);
         chains.push_back(std::move(worker.value()));
     }
     return std::make_unique<MorselPipelineOperator>(std::move(owned), std::move(chains), grain,
@@ -12144,15 +12268,36 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         }
     }
 
-    auto input_op = build_operator(*input_node, registry, scalars, externs, exec, model_out);
-    if (!input_op.has_value()) {
-        return std::unexpected(std::move(input_op.error()));
+    // Fused probe: when this pipeline's input is a streaming join, take its
+    // build and its probe side and run the probe at the head of every worker
+    // chain, instead of materializing the join's OUTPUT and morselizing that.
+    // The probe side becomes the morsel source, so the join's output is never
+    // assembled as a table at all -- it is produced a morsel at a time by the
+    // same worker that then runs the maps over it. Two pipelines meeting at a
+    // barrier, which is the shape this plan has been working toward.
+    std::optional<JoinProbe> fused_probe;
+    std::unique_ptr<Table> owned;
+    if (input_node->kind() == ir::NodeKind::Join) {
+        auto fused = try_take_join_probe(*input_node, registry, scalars, externs, exec, model_out);
+        if (!fused.has_value()) {
+            return std::unexpected(std::move(fused.error()));
+        }
+        if (fused->has_value()) {
+            owned = std::make_unique<Table>(std::move((*fused)->probe_side));
+            fused_probe = std::move((*fused)->probe);
+        }
     }
-    auto input_tbl = materialize_operator(std::move(input_op.value()));
-    if (!input_tbl.has_value()) {
-        return std::unexpected(std::move(input_tbl.error()));
+    if (owned == nullptr) {
+        auto input_op = build_operator(*input_node, registry, scalars, externs, exec, model_out);
+        if (!input_op.has_value()) {
+            return std::unexpected(std::move(input_op.error()));
+        }
+        auto input_tbl = materialize_operator(std::move(input_op.value()));
+        if (!input_tbl.has_value()) {
+            return std::unexpected(std::move(input_tbl.error()));
+        }
+        owned = std::make_unique<Table>(std::move(input_tbl.value()));
     }
-    auto owned = std::make_unique<Table>(std::move(input_tbl.value()));
     const std::size_t grain = morsel_grain(exec, owned->rows());
     const auto expected_morsels = partitioned_morsel_count(*owned, grain);
     // Morselize only when the work would actually fan out. Splitting earns its
@@ -12188,8 +12333,9 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     }
 
     if (worker_count >= 2) {
-        const auto head =
-            operators.empty() ? std::nullopt : range_filter_head(operators.front(), *owned);
+        const auto head = (operators.empty() || fused_probe.has_value())
+                              ? std::nullopt
+                              : range_filter_head(operators.front(), *owned);
         if (exec.parallel_stats != nullptr && head.has_value()) {
             exec.parallel_stats->range_heads.fetch_add(1, std::memory_order_relaxed);
         }
@@ -12227,7 +12373,9 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         std::vector<MorselWorkerChain> workers;
         workers.reserve(worker_count);
         for (std::size_t i = 0; i < worker_count; ++i) {
-            auto worker = build_morsel_worker_chain(operators, *owned, scalars, externs, exec);
+            auto worker =
+                build_morsel_worker_chain(operators, *owned, scalars, externs, exec,
+                                          fused_probe.has_value() ? &*fused_probe : nullptr);
             if (!worker.has_value()) {
                 return std::unexpected(std::move(worker.error()));
             }
@@ -12245,6 +12393,12 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
         // Morselizing here instead would add a per-morsel gather and a merge
         // concat to buy parallelism that was already judged not worth having.
         OperatorPtr serial = make_table_source(std::move(*owned));
+        if (fused_probe.has_value()) {
+            // Not worth morselizing, but the probe was already taken from the
+            // join and there is nothing to give it back to: run it here, over
+            // the whole probe side, with the maps above it as before.
+            serial = std::make_unique<JoinProbeOperator>(std::move(serial), *fused_probe);
+        }
         for (const MapStep& op_node : operators) {
             auto next = build_row_local_map_operator(op_node, std::move(serial), scalars, externs,
                                                      exec, false);

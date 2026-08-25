@@ -31,6 +31,10 @@ namespace ibex::runtime {
 
 struct WorkerPool::Batch::State {
     std::function<void(std::size_t)> body;
+    // A batch remembers how to help its owning pool make progress. This is
+    // deliberately kept on the state rather than inferred from thread-local
+    // state: a pool worker may wait on a batch belonging to any WorkerPool.
+    std::function<bool()> assist_one;
 
     std::mutex mutex;
     std::condition_variable done;
@@ -399,23 +403,24 @@ WorkerPool::~WorkerPool() {
 }
 
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
-    // Reentrant submission cannot work with this pool and must never be a
-    // silent hang. The worker set is fixed and every Batch is waited on (if not
-    // explicitly, then by its destructor), so a worker that submits and waits
-    // blocks one of the threads its own work needs. With enough of them the
-    // pool deadlocks, and it would do so only under a particular interleaving.
-    // Callers that might run on a pool thread ask `on_worker_pool_thread()`
-    // first and take their serial path.
-    if (on_worker_pool_thread()) {
-        invariant_violation(
-            "WorkerPool::submit called from a pool worker — nested submission deadlocks; "
-            "check on_worker_pool_thread() and run serially instead");
-    }
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
+    state->assist_one = [this] {
+        Task task;
+        {
+            const std::lock_guard pool_lock(impl_->mutex);
+            if (impl_->queue.empty()) {
+                return false;
+            }
+            task = std::move(impl_->queue.front());
+            impl_->queue.pop_front();
+        }
+        run_task(task);
+        return true;
+    };
     // One submit is one fork-join round trip: every batch is waited on before
     // its captures die, so counting here needs no matching hook in `wait()`
     // (which is idempotent, and which the destructor may call again).
@@ -432,8 +437,9 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
 
 namespace {
 
-/// Block until every worker body of `state` has returned, charging the wall
-/// time to the operator that submitted the batch.
+/// Block until every worker body of `state` has returned. A pool worker helps
+/// its own pool while waiting, so a saturated set of parents can safely fork a
+/// child batch instead of deadlocking with every thread parked.
 ///
 /// One helper for all three wait sites (`wait()`, the move-assign, the
 /// destructor) so none of them can be the one that forgets to account for
@@ -443,15 +449,39 @@ namespace {
 /// The clock is read only when profiling installed an entry, so an unprofiled
 /// run pays one null check per wait rather than two `steady_clock::now()`.
 void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex>& lock) {
-    if (state.profile_entry == nullptr) {
+    if (!on_worker_pool_thread()) {
+        if (state.profile_entry == nullptr) {
+            state.done.wait(lock, [&state] { return state.remaining == 0; });
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
         state.done.wait(lock, [&state] { return state.remaining == 0; });
+        record_execution_profile_barrier_wait(state.profile_entry,
+                                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - start));
         return;
     }
-    const auto start = std::chrono::steady_clock::now();
-    state.done.wait(lock, [&state] { return state.remaining == 0; });
-    record_execution_profile_barrier_wait(state.profile_entry,
-                                          std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              std::chrono::steady_clock::now() - start));
+
+    std::chrono::nanoseconds parked{0};
+    while (state.remaining != 0) {
+        lock.unlock();
+        const bool helped = state.assist_one();
+        lock.lock();
+        if (helped || state.remaining == 0) {
+            continue;
+        }
+        if (state.profile_entry == nullptr) {
+            state.done.wait(lock, [&state] { return state.remaining == 0; });
+        } else {
+            const auto start = std::chrono::steady_clock::now();
+            state.done.wait(lock, [&state] { return state.remaining == 0; });
+            parked += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start);
+        }
+    }
+    if (state.profile_entry != nullptr) {
+        record_execution_profile_barrier_wait(state.profile_entry, parked);
+    }
 }
 
 }  // namespace

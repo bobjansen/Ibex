@@ -4136,6 +4136,131 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
     }
     return index;
 }
+
+/// Which side of a hash join carries the index.
+///
+/// The choice is made at RUN time, from measured row counts, and this enum is
+/// what makes it a VALUE rather than a shape encoded across three operator
+/// members (`mode_`, `use_materialized_left_`, `left_table_`). A build phase
+/// can decide it without knowing who will probe, which is what a separately
+/// scheduled `HashBuild` needs; see plans/kernel-pipeline-execution-plan.md,
+/// "The build-side choice does not block the split" -- the physical plan does
+/// not have to name the side statically, because the pipeline that scans the
+/// other side is constructed after this phase has already run.
+enum class JoinOrientation : std::uint8_t {
+    BuildRight,  ///< index the right side, stream left chunks through it
+    BuildLeft,   ///< index the left side, scan the right once in probe order
+};
+
+/// Everything a hash build phase decides and produces. Which table to stream
+/// and which mode to run in are the caller's derivations from these two, not
+/// the build's business.
+struct JoinBuildOutcome {
+    std::shared_ptr<const JoinHashIndex> index;
+    JoinOrientation orientation = JoinOrientation::BuildRight;
+};
+
+/// Build the index over one named side. The primitive both orientation
+/// decisions below reduce to, and the only place a `JoinHashIndex` becomes
+/// shared and const.
+auto build_join_side(const Table& side, const std::string& key_name, ExprType key_kind,
+                     JoinOrientation orientation) -> std::expected<JoinBuildOutcome, std::string> {
+    auto built = build_join_hash_index(side, key_name, key_kind);
+    if (!built.has_value()) {
+        return std::unexpected(std::move(built.error()));
+    }
+    return JoinBuildOutcome{.index = std::make_shared<const JoinHashIndex>(std::move(*built)),
+                            .orientation = orientation};
+}
+
+/// The single-key build phase over two already-materialized sides: choose an
+/// orientation, build that side's index, return both. Reads and writes no
+/// operator state, so the same call serves a join operator and a `HashBuild`
+/// that has no probe attached yet.
+///
+/// `order_preservation_pays` arrives as a decided bool because it answers a
+/// question about the join's OUTPUT plan -- would declining to swap deliver a
+/// pending `order` for free -- which is the caller's to answer, not the
+/// build's. It is only ever consulted when swapping was otherwise preferred.
+auto choose_and_build_single_key(const Table& left, const Table& right, const std::string& left_key,
+                                 const std::string& right_key, ExprType key_kind,
+                                 bool order_preservation_pays)
+    -> std::expected<JoinBuildOutcome, std::string> {
+    // Swapping indexes the smaller (left) side and scans the right, which
+    // gives up left-row order. When an `order` above this join wants exactly
+    // the order the left already carries, declining to swap delivers it and
+    // that whole sort disappears -- worth a larger index, but only while
+    // "larger" stays modest, since the index is probed once per row of the
+    // other side. The same trade is made in join.cpp.
+    if (left.rows() < right.rows() && !order_preservation_pays) {
+        return build_join_side(left, left_key, key_kind, JoinOrientation::BuildLeft);
+    }
+    return build_join_side(right, right_key, key_kind, JoinOrientation::BuildRight);
+}
+
+/// One side's two Int64 key columns and their validity, or the error a join
+/// reports for them. `side_name` is "left" or "right" only so the message
+/// keeps naming the side the caller was asking about.
+struct PairKeyColumns {
+    const Column<std::int64_t>* col0 = nullptr;
+    const Column<std::int64_t>* col1 = nullptr;
+    const ValidityBitmap* v0 = nullptr;
+    const ValidityBitmap* v1 = nullptr;
+};
+
+auto pair_key_columns(const Table& side, const std::string& name0, const std::string& name1,
+                      std::string_view side_name) -> std::expected<PairKeyColumns, std::string> {
+    const ColumnValue* key0 = side.find(name0);
+    if (key0 == nullptr) {
+        return std::unexpected("join key not found in " + std::string(side_name) +
+                               " table: " + name0);
+    }
+    const ColumnValue* key1 = side.find(name1);
+    if (key1 == nullptr) {
+        return std::unexpected("join key not found in " + std::string(side_name) +
+                               " table: " + name1);
+    }
+    PairKeyColumns out;
+    out.col0 = std::get_if<Column<std::int64_t>>(key0);
+    out.col1 = std::get_if<Column<std::int64_t>>(key1);
+    if (out.col0 == nullptr || out.col1 == nullptr) {
+        return std::unexpected(
+            "ChunkedInnerJoinOperator: two-key join currently requires both keys to be Int64");
+    }
+    const auto* entry0 = side.find_entry(name0);
+    const auto* entry1 = side.find_entry(name1);
+    out.v0 = entry0 != nullptr && entry0->validity.has_value() ? &*entry0->validity : nullptr;
+    out.v1 = entry1 != nullptr && entry1->validity.has_value() ? &*entry1->validity : nullptr;
+    return out;
+}
+
+/// The two-Int64-key build phase. Same contract as the single-key one, with a
+/// simpler decision: no pending-order trade exists on this path, so the
+/// smaller side is indexed outright. Validates the right side first, which is
+/// the order the operator already checked in, so consolidating the two
+/// previously separate blocks cannot change which error a caller sees.
+auto choose_and_build_pair(const Table& left, const Table& right, const ir::JoinKey& k0,
+                           const ir::JoinKey& k1) -> std::expected<JoinBuildOutcome, std::string> {
+    auto right_keys = pair_key_columns(right, k0.right, k1.right, "right");
+    if (!right_keys.has_value()) {
+        return std::unexpected(std::move(right_keys.error()));
+    }
+    if (left.rows() <= right.rows()) {
+        auto left_keys = pair_key_columns(left, k0.left, k1.left, "left");
+        if (!left_keys.has_value()) {
+            return std::unexpected(std::move(left_keys.error()));
+        }
+        return JoinBuildOutcome{
+            .index = std::make_shared<const JoinHashIndex>(build_join_pair_index(
+                *left_keys->col0, *left_keys->col1, left_keys->v0, left_keys->v1)),
+            .orientation = JoinOrientation::BuildLeft};
+    }
+    return JoinBuildOutcome{
+        .index = std::make_shared<const JoinHashIndex>(build_join_pair_index(
+            *right_keys->col0, *right_keys->col1, right_keys->v0, right_keys->v1)),
+        .orientation = JoinOrientation::BuildRight};
+}
+
 /// The probe half of a hash join: everything that consumes a `JoinHashIndex`
 /// and turns probe-side rows into join output rows. It owns no build, which is
 /// the point -- Phase 4's `HashProbe` has to be able to exist next to a build
@@ -4808,7 +4933,7 @@ struct JoinProbe {
         const std::size_t n_right = right_->rows();
 
         // In swapped mode the index is on the left, so the right table is the
-        // probe side. Its null-keyed rows match nothing (see build_index).
+        // probe side. Its null-keyed rows match nothing (see build_join_hash_index).
         const auto* right_entry = right_->find_entry(keys_->front().right);
         probe_validity_ = right_entry != nullptr && right_entry->validity.has_value()
                               ? &*right_entry->validity
@@ -5303,11 +5428,11 @@ class ChunkedInnerJoinOperator final : public Operator {
 
         const std::size_t n_right = right_.rows();
 
+        // Small right: index it without ever measuring the left, which is the
+        // one orientation this join can choose without draining a child.
         if (n_right <= kStreamRightThreshold) {
-            if (auto err = build_index(right_, right_key_name, key_kind)) {
-                return err;
-            }
-            return std::nullopt;
+            return adopt_build(
+                build_join_side(right_, right_key_name, key_kind, JoinOrientation::BuildRight));
         }
 
         Table left_table;
@@ -5325,25 +5450,52 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         const std::size_t n_left = left_table.rows();
 
-        // Swapping indexes the smaller (left) side and scans the right, which
-        // gives up left-row order. When an `order` above this join wants
-        // exactly the order the left already carries, declining to swap
-        // delivers it and that whole sort disappears -- worth a larger index,
-        // but only while "larger" stays modest, since the index is probed once
-        // per row of the other side. The same trade is made in join.cpp.
-        if (n_left < n_right && !order_preserving_pays(left_table, n_left, n_right)) {
+        // Evaluated only when swapping was otherwise preferred: it is not a
+        // pure predicate (it can set up the probe's right-emit schema), so
+        // asking it unconditionally would move work the short-circuit used to
+        // skip.
+        const bool order_pays =
+            n_left < n_right && order_preserving_pays(left_table, n_left, n_right);
+        auto outcome = choose_and_build_single_key(left_table, right_, left_key_name,
+                                                   right_key_name, key_kind, order_pays);
+        return adopt_build(std::move(outcome), std::move(left_table));
+    }
+
+    /// Publish what a build produced, and hand back the orientation it chose.
+    /// The single place `probe_.index_` is written: `probe_.index()` gives the
+    /// probe a `const` reference, so the barrier stays a compile error to
+    /// cross rather than a convention.
+    auto publish_build(std::expected<JoinBuildOutcome, std::string> outcome)
+        -> std::expected<JoinOrientation, std::string> {
+        if (!outcome.has_value()) {
+            return std::unexpected(std::move(outcome.error()));
+        }
+        probe_.index_ = std::move(outcome->index);
+        return outcome->orientation;
+    }
+
+    /// Apply what a build phase decided: publish the index and put this
+    /// operator into the shape that orientation implies. The build returns a
+    /// value; every member write that follows from it happens here and
+    /// nowhere else.
+    ///
+    /// `left_table` is the materialized left when the decision needed one --
+    /// it becomes either the scanned-once swapped side or the single chunk
+    /// the stream path replays, depending on which way the build went.
+    auto adopt_build(std::expected<JoinBuildOutcome, std::string> outcome,
+                     std::optional<Table> left_table = std::nullopt) -> std::optional<std::string> {
+        auto orientation = publish_build(std::move(outcome));
+        if (!orientation.has_value()) {
+            return std::move(orientation.error());
+        }
+        if (*orientation == JoinOrientation::BuildLeft) {
             left_table_ = std::move(left_table);
-            if (auto err = build_index(*left_table_, left_key_name, key_kind)) {
-                return err;
-            }
             mode_ = Mode::Swapped;
             return std::nullopt;
         }
-
-        left_materialized_ = std::move(left_table);
-        use_materialized_left_ = true;
-        if (auto err = build_index(right_, right_key_name, key_kind)) {
-            return err;
+        if (left_table.has_value()) {
+            left_materialized_ = std::move(left_table);
+            use_materialized_left_ = true;
         }
         return std::nullopt;
     }
@@ -5366,19 +5518,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         const ir::JoinKey& k0 = keys_->at(0);
         const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* rkey0 = right_.find(k0.right);
-        if (rkey0 == nullptr) {
-            return "join key not found in right table: " + k0.right;
-        }
-        const ColumnValue* rkey1 = right_.find(k1.right);
-        if (rkey1 == nullptr) {
-            return "join key not found in right table: " + k1.right;
-        }
-        const auto* rcol0 = std::get_if<Column<std::int64_t>>(rkey0);
-        const auto* rcol1 = std::get_if<Column<std::int64_t>>(rkey1);
-        if (rcol0 == nullptr || rcol1 == nullptr) {
-            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to be "
-                   "Int64";
+        // Checked before the left child is drained, so an unusable right key
+        // still costs nothing to report.
+        if (auto right_keys = pair_key_columns(right_, k0.right, k1.right, "right");
+            !right_keys.has_value()) {
+            return std::move(right_keys.error());
         }
         Table left_table;
         if (use_materialized_left_ && left_materialized_.has_value()) {
@@ -5394,62 +5538,13 @@ class ChunkedInnerJoinOperator final : public Operator {
             }
             left_table = std::move(*left_res);
         }
-        const std::size_t n_left = left_table.rows();
-        const std::size_t n_right = right_.rows();
         probe_.pair_mode_ = true;
-
-        if (n_left <= n_right) {
-            return build_left_pair_index_and_swap(std::move(left_table));
-        }
-
-        // Build on the (smaller) right; left is already fully materialized,
-        // so it is drained as a single chunk through the existing
-        // `use_materialized_left_` mechanism rather than re-wrapped in an
-        // operator.
-        const auto* re0 = right_.find_entry(k0.right);
-        const auto* re1 = right_.find_entry(k1.right);
-        const ValidityBitmap* rv0 =
-            re0 != nullptr && re0->validity.has_value() ? &*re0->validity : nullptr;
-        const ValidityBitmap* rv1 =
-            re1 != nullptr && re1->validity.has_value() ? &*re1->validity : nullptr;
-        build_pair_index(*rcol0, *rcol1, rv0, rv1);
-        left_materialized_ = std::move(left_table);
-        use_materialized_left_ = true;
-        return std::nullopt;
-    }
-
-    // Build on the (smaller) left, scan right row-by-row: same shape as
-    // single-key `Mode::Swapped` / `emit_swapped`. Factored out of
-    // `initialize_pair` so `resolve_deferred_probe_pair` (which always
-    // builds on left -- the deferred side is definitionally the one too
-    // large to materialize first) can reuse it.
-    auto build_left_pair_index_and_swap(Table left_table) -> std::optional<std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* lkey0 = left_table.find(k0.left);
-        if (lkey0 == nullptr) {
-            return "join key not found in left table: " + k0.left;
-        }
-        const ColumnValue* lkey1 = left_table.find(k1.left);
-        if (lkey1 == nullptr) {
-            return "join key not found in left table: " + k1.left;
-        }
-        const auto* lcol0 = std::get_if<Column<std::int64_t>>(lkey0);
-        const auto* lcol1 = std::get_if<Column<std::int64_t>>(lkey1);
-        if (lcol0 == nullptr || lcol1 == nullptr) {
-            return "ChunkedInnerJoinOperator: two-key join currently requires both keys to "
-                   "be Int64";
-        }
-        const auto* le0 = left_table.find_entry(k0.left);
-        const auto* le1 = left_table.find_entry(k1.left);
-        const ValidityBitmap* lv0 =
-            le0 != nullptr && le0->validity.has_value() ? &*le0->validity : nullptr;
-        const ValidityBitmap* lv1 =
-            le1 != nullptr && le1->validity.has_value() ? &*le1->validity : nullptr;
-        build_pair_index(*lcol0, *lcol1, lv0, lv1);
-        left_table_ = std::move(left_table);
-        mode_ = Mode::Swapped;
-        return std::nullopt;
+        // On the BuildRight side of this decision the left is already fully
+        // materialized, so `adopt_build` drains it as a single chunk through
+        // the existing `use_materialized_left_` mechanism rather than
+        // re-wrapping it in an operator.
+        auto outcome = choose_and_build_pair(left_table, right_, k0, k1);
+        return adopt_build(std::move(outcome), std::move(left_table));
     }
 
     /// Deferred-probe POC for the two-key path (plans/parallelism-overview.md
@@ -5462,7 +5557,7 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// materialized. Membership in one component is necessary but not
     /// sufficient for the pair match, so this can only produce harmless
     /// false positives (rows sharing q09's l_partkey but not l_suppkey);
-    /// `build_left_pair_index_and_swap`'s exact pair probe afterward is what
+    /// `choose_and_build_pair`'s exact pair probe afterward is what
     /// actually enforces both keys, unchanged from the non-deferred path.
     ///
     /// Same `kStreamRightThreshold` gate as the single-key
@@ -5623,8 +5718,13 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::nullopt;
         }
 
-        if (auto err = build_index(build, keys_->front().left, ExprType::Int)) {
-            return err;
+        // Publish only: this path builds on the left and scans the right, but
+        // it emits one precomputed table rather than running either streaming
+        // shape, so it takes no operator mode from the orientation.
+        if (auto published = publish_build(build_join_side(
+                build, keys_->front().left, ExprType::Int, JoinOrientation::BuildLeft));
+            !published.has_value()) {
+            return std::move(published.error());
         }
 
         // Probe the candidate keys in scan order; record one hit per
@@ -5852,25 +5952,6 @@ class ChunkedInnerJoinOperator final : public Operator {
         // ungated to skip whole row groups (which has no gather downside).
         slot.min = mn;
         slot.max = mx;
-    }
-
-    /// Run the build phase and publish its result. Nothing else in this class
-    /// may write to the index: `probe_.index()` hands the probe a `const` reference,
-    /// so the barrier is a compile error to cross rather than a convention.
-    auto build_index(const Table& build_side, const std::string& key_name, ExprType key_kind)
-        -> std::optional<std::string> {
-        auto built = build_join_hash_index(build_side, key_name, key_kind);
-        if (!built.has_value()) {
-            return std::move(built.error());
-        }
-        probe_.index_ = std::make_shared<const JoinHashIndex>(std::move(*built));
-        return std::nullopt;
-    }
-
-    void build_pair_index(const Column<std::int64_t>& col0, const Column<std::int64_t>& col1,
-                          const ValidityBitmap* v0, const ValidityBitmap* v1) {
-        probe_.index_ =
-            std::make_shared<const JoinHashIndex>(build_join_pair_index(col0, col1, v0, v1));
     }
 
     /// Would indexing the right instead of the left buy the pending `order`,

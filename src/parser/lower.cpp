@@ -5,6 +5,7 @@
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_pushdown.hpp>
+#include <ibex/ir/join_semi_reduction.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
@@ -5193,6 +5194,7 @@ auto lower(const Program& program) -> LowerResult {
     // column, and its rules expect the un-fused Filter(Join(...)) shape.
     *lowered = ir::push_filters_into_joins(std::move(*lowered), source_schemas);
     *lowered = ir::push_semi_joins_down(std::move(*lowered), source_schemas);
+    *lowered = ir::reduce_inner_joins_to_semi(std::move(*lowered), source_schemas);
 
     const auto optimization_context = build_optimization_context(*effects);
     ir::OptimizationStats optimization_stats;
@@ -5245,6 +5247,7 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
         }
         shared.plan = ir::push_filters_into_joins(std::move(shared.plan), source_schemas);
         shared.plan = ir::push_semi_joins_down(std::move(shared.plan), source_schemas);
+        shared.plan = ir::reduce_inner_joins_to_semi(std::move(shared.plan), source_schemas);
         source_schemas.insert_or_assign(shared.name,
                                         ir::infer_schema(*shared.plan, source_schemas));
     }
@@ -5256,6 +5259,7 @@ auto lower_script(const Program& program, const ir::SourceSchemas& reader_schema
     }
     lowered->result = ir::push_filters_into_joins(std::move(lowered->result), source_schemas);
     lowered->result = ir::push_semi_joins_down(std::move(lowered->result), source_schemas);
+    lowered->result = ir::reduce_inner_joins_to_semi(std::move(lowered->result), source_schemas);
 
     const auto optimization_context = build_optimization_context(*effects);
     ir::OptimizationStats optimization_stats;
@@ -5287,6 +5291,7 @@ auto lower_expr(const Expr& expr, LowerContext& context) -> LowerResult {
         const ir::SourceSchemas schemas = lowerer.source_schemas();
         *lowered = ir::push_filters_into_joins(std::move(*lowered), schemas);
         *lowered = ir::push_semi_joins_down(std::move(*lowered), schemas);
+        *lowered = ir::reduce_inner_joins_to_semi(std::move(*lowered), schemas);
         // Directly, not through the optimizer: this path does not run one, so
         // a join here would never learn what the `order` above it wants. There
         // is no canonicalize to wait for either, which is the only reason the

@@ -72,6 +72,8 @@ import subprocess
 import sys
 import time
 
+import bench_env
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_QUERY_DIR = ROOT / "benchmarking/tpch/queries"
 PERF_LOG = ROOT / "build-release/post_commit_perf.log"
@@ -291,6 +293,7 @@ def main() -> int:
         return 1
 
     warn_if_busy()
+    print(bench_env.scale_factor_line())
     print(f"# base={args.base}  target={args.target}")
     print(f"# IBEX_CORES={args.cores} repeats={args.repeats} "
           f"warmup={args.warmup} min_effect={args.min_effect}% alpha={args.alpha}"

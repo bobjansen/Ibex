@@ -13,6 +13,7 @@ Usage:
   (defaults to all implemented queries if none are given)
 """
 import argparse
+import contextlib
 import csv
 import datetime
 import pathlib
@@ -26,6 +27,33 @@ ANSWERS_DIR = IBEX_ROOT / "benchmarking/data/tpch/dbgen/answers"
 OUT_DIR = IBEX_ROOT / "benchmarking/data/tpch/out"
 IBEX_EVAL = IBEX_ROOT / "build-release/tools/ibex_eval"
 PLUGIN_DIR = IBEX_ROOT / "build-release/tools"
+PARQUET_LINK = IBEX_ROOT / "benchmarking/data/tpch/parquet"
+
+
+@contextlib.contextmanager
+def scale_factor_1():
+    """Point the parquet symlink at SF-1 for the check, then put it back.
+
+    The official answers are SF-1 only, so this script used to be run by
+    flipping the symlink by hand. Twice now the flip was never undone and a
+    LATER benchmark silently measured a different dataset -- once producing a
+    1.9x "regression" that was purely the scale factor, and that got as far as
+    being written down as a machine-contamination finding before it was caught.
+    Owning the flip here means the trap cannot be left armed.
+    """
+    previous = PARQUET_LINK.readlink() if PARQUET_LINK.is_symlink() else None
+    if previous is not None and previous.name != "parquet_sf1":
+        print(f"# repointing {PARQUET_LINK.name} -> parquet_sf1 "
+              f"(was {previous.name}); will restore on exit")
+        PARQUET_LINK.unlink()
+        PARQUET_LINK.symlink_to("parquet_sf1")
+    try:
+        yield
+    finally:
+        if previous is not None and previous.name != "parquet_sf1":
+            PARQUET_LINK.unlink()
+            PARQUET_LINK.symlink_to(previous)
+            print(f"# restored {PARQUET_LINK.name} -> {previous.name}")
 
 # query number -> (ibex query file stem, revenue-scale columns get a looser
 # tolerance since the official answers are rounded to 2 decimal places)
@@ -173,8 +201,13 @@ def main() -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    with scale_factor_1():
+        return run_checks(args.queries)
+
+
+def run_checks(queries: list[str]) -> int:
     all_ok = True
-    for qnum in args.queries:
+    for qnum in queries:
         stem = IMPLEMENTED.get(qnum)
         if stem is None:
             print(f"{qnum}: SKIP (not implemented)")

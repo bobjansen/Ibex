@@ -586,8 +586,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                 if (!right.has_value()) {
                     return std::unexpected(std::move(right.error()));
                 }
-                if (auto fused =
-                        left_join_count_table(join, agg, *left, *right, fusion->counted_column);
+                if (auto fused = left_join_count_table(join, agg, *left, *right,
+                                                       fusion->counted_column, &exec);
                     fused.has_value()) {
                     return std::move(*fused);
                 }

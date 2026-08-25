@@ -2064,8 +2064,8 @@ auto fused_left_join_counted_column(const ir::AggregateNode& aggregate,
 }
 
 auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& aggregate,
-                           const Table& left, const Table& right, std::string_view counted_column)
-    -> std::optional<Table> {
+                           const Table& left, const Table& right, std::string_view counted_column,
+                           const ExecutionContext* exec) -> std::optional<Table> {
     if (join.kind() != ir::JoinKind::Left || join.keys().size() != 1 ||
         join.predicate().has_value() || join.null_match() != ir::NullMatch::Never ||
         join.take() != ir::MatchSelection::All || join.expect().asserts_anything() ||
@@ -2091,26 +2091,37 @@ auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& ag
     }
     const auto& left_values = std::get<Column<std::int64_t>>(*left_key->column);
     const auto& right_values = std::get<Column<std::int64_t>>(*right_key->column);
-    robin_hood::unordered_flat_map<std::int64_t, std::size_t> counts;
-    counts.reserve(right.rows());
-    const auto* counted_validity = counted->validity.has_value() ? &*counted->validity : nullptr;
-    for (std::size_t row = 0; row < right.rows(); ++row) {
-        if (counted_validity == nullptr || (*counted_validity)[row]) {
-            ++counts[right_values[row]];
-        }
-    }
-    robin_hood::unordered_flat_set<std::int64_t> seen;
-    seen.reserve(left.rows());
+
+    // The left keys are required to be unique by this fusion, so their map can
+    // name output slots directly. That is both smaller than a right-sized
+    // count map and unlocks a row-parallel right scan: workers only read this
+    // completed map and atomically add to the matching left slot. No worker
+    // owns a partial map and there is nothing to merge afterwards.
+    robin_hood::unordered_flat_map<std::int64_t, std::size_t> left_slots;
+    left_slots.reserve(left.rows());
     for (std::size_t row = 0; row < left.rows(); ++row) {
-        if (!seen.emplace(left_values[row]).second) {
+        if (!left_slots.emplace(left_values[row], row).second) {
             return std::nullopt;
         }
     }
+    std::vector<std::atomic<std::int64_t>> slot_counts(left.rows());
+    for (auto& count : slot_counts) {
+        count.store(0, std::memory_order_relaxed);
+    }
+    const auto* counted_validity = counted->validity.has_value() ? &*counted->validity : nullptr;
+    for_row_ranges(exec, right.rows(), [&](std::size_t begin, std::size_t end) {
+        for (std::size_t row = begin; row < end; ++row) {
+            if (counted_validity == nullptr || (*counted_validity)[row]) {
+                if (const auto it = left_slots.find(right_values[row]); it != left_slots.end()) {
+                    slot_counts[it->second].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    });
     Column<std::int64_t> out_counts;
     out_counts.resize_for_overwrite(left.rows());
     for (std::size_t row = 0; row < left.rows(); ++row) {
-        const auto it = counts.find(left_values[row]);
-        out_counts[row] = it == counts.end() ? 0 : static_cast<std::int64_t>(it->second);
+        out_counts[row] = slot_counts[row].load(std::memory_order_relaxed);
     }
     Table out;
     out.add_column(aggregate.group_by().front().name, *left_key->column);

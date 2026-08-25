@@ -89,7 +89,7 @@ struct FusedLeftJoinCount {
 /// runtime proofs are insufficient and the ordinary join must be used.
 [[nodiscard]] auto left_join_count_table(const ir::JoinNode& join,
                                          const ir::AggregateNode& aggregate, const Table& left,
-                                         const Table& right, std::string_view counted_column)
-    -> std::optional<Table>;
+                                         const Table& right, std::string_view counted_column,
+                                         const ExecutionContext* exec) -> std::optional<Table>;
 
 }  // namespace ibex::runtime

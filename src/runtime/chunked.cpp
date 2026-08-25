@@ -6975,6 +6975,20 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
+        // Partition-owned accumulation, the same shape the PairIntKey path
+        // above takes. It fuses discovery and the sum/count into one pass over
+        // partition-local state, so the global first-occurrence numbering --
+        // and with it the whole second `accumulate_gids` scan of every row --
+        // is deferred to a single merge over GROUPS at emission.
+        //
+        // `int_order_` holds the raw key whatever `int_key_kind_` is; the emit
+        // side reconstructs Date/Timestamp/Categorical from it exactly as it
+        // does for the ordinary int path, so this needs no kind-specific arm.
+        if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
+                key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
+            return std::nullopt;
+        }
+
         if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
                 key_at, rows, gids, int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
                 [&](std::int64_t key, std::uint32_t gid, std::size_t) { int_order_[gid] = key; },
@@ -7027,6 +7041,12 @@ class ChunkedAggregateOperator final : public Operator {
     /// breaks even -- q20's own chunks (~150k rows) sit between the two.
     static constexpr std::size_t kPairOwnedMinRows = 1U << 16U;  // 65536
 
+    /// Same gate for the single-Int64-key slice. Held at the pair path's value
+    /// until the sweep below says otherwise -- the mechanism is identical and
+    /// its break-even has no reason to differ by more than the key's own probe
+    /// cost, which is lower, not higher.
+    static constexpr std::size_t kIntOwnedMinRows = 1U << 16U;  // 65536
+
     /// Production PairIntKey ownership path (TPC-H q20's
     /// `by { l_partkey, l_suppkey }` is the motivating shape; validated
     /// there at -16.5%, 8/8 paired wins, 8 cores, vs. a q18/Int64 prototype
@@ -7043,9 +7063,10 @@ class ChunkedAggregateOperator final : public Operator {
     ///   `try_discover_partitioned` has no toggle either. `IBEX_DISABLE_
     ///   OWNED_PAIR_AGG=1` is a kill switch for the unusual case that needs
     ///   one, not a normal control surface.
-    template <typename KeyAt>
-    auto try_owned_pair(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
-                        const std::vector<const ColumnEntry*>& agg_entries) -> bool {
+    template <typename Key, typename Hash, typename KeyAt, typename Partitions>
+    auto try_owned(const KeyAt& key_at, std::size_t rows, std::uint32_t* gids,
+                   const std::vector<const ColumnEntry*>& agg_entries, Partitions& partitions,
+                   std::size_t min_rows) -> bool {
         if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr) {
             return false;
         }
@@ -7068,7 +7089,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
                 return false;
             }
-            if (std::max(rows_offered_, rows) < kPairOwnedMinRows) {
+            if (std::max(rows_offered_, rows) < min_rows) {
                 return false;
             }
             auto& pool0 = process_worker_pool();
@@ -7086,8 +7107,8 @@ class ChunkedAggregateOperator final : public Operator {
             part_count *= 2;
         }
         const std::uint64_t part_mask = part_count - 1;
-        if (owned_pair_partitions_.size() < part_count) {
-            owned_pair_partitions_.resize(part_count);
+        if (partitions.size() < part_count) {
+            partitions.resize(part_count);
         }
 
         const std::size_t ranges = workers;
@@ -7099,7 +7120,7 @@ class ChunkedAggregateOperator final : public Operator {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
                 std::size_t* row_counts = counts.data() + (r * part_count);
-                PairIntKeyHash hasher;
+                Hash hasher;
                 for (std::size_t row = begin; row < end; ++row) {
                     const auto part = static_cast<std::uint8_t>(hasher(key_at(row)) & part_mask);
                     part_of_row_[row] = part;
@@ -7153,10 +7174,10 @@ class ChunkedAggregateOperator final : public Operator {
             auto batch = pool.submit(std::min(workers, part_count), [&](std::size_t) {
                 for (std::size_t p = cursor.fetch_add(1, std::memory_order_relaxed); p < part_count;
                      p = cursor.fetch_add(1, std::memory_order_relaxed)) {
-                    auto& partition = owned_pair_partitions_[p];
+                    auto& partition = partitions[p];
                     for (std::size_t i = part_begin[p]; i < part_begin[p + 1]; ++i) {
                         const std::size_t row = scatter_rows_[i];
-                        const PairIntKey key = key_at(row);
+                        const Key key = key_at(row);
                         auto it = partition.index.find(key);
                         std::uint32_t local{};
                         if (it == partition.index.end()) {
@@ -7190,8 +7211,8 @@ class ChunkedAggregateOperator final : public Operator {
         owned_rows_seen_ += rows;
         owned_mode_ = true;
         if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            std::fprintf(stderr, "[agg_owned_pair] chunk rows=%zu part_count=%zu total_rows=%llu\n",
-                         rows, owned_pair_partitions_.size(),
+            std::fprintf(stderr, "[agg_owned] chunk rows=%zu part_count=%zu total_rows=%llu\n",
+                         rows, partitions.size(),
                          static_cast<unsigned long long>(owned_rows_seen_));
         }
         return true;
@@ -7201,46 +7222,64 @@ class ChunkedAggregateOperator final : public Operator {
     /// order (a P-way merge over `first_rows`, run once at final emission),
     /// and populate `pair_order_`/`flat_slots_` -- the arrays
     /// `build_output_chunk`'s `pair_int_fast_path_` branch already reads.
-    void finalize_owned_pair() {
+    template <typename Partitions, typename ResizeOrder, typename StoreKey>
+    void finalize_owned(Partitions& partitions, const ResizeOrder& resize_order,
+                        const StoreKey& store_key) {
         if (owned_finalized_) {
             return;
         }
         owned_finalized_ = true;
-        const std::size_t part_count = owned_pair_partitions_.size();
+        const std::size_t part_count = partitions.size();
         std::vector<std::size_t> cursors(part_count, 0);
         std::size_t total = 0;
-        for (const auto& partition : owned_pair_partitions_) {
+        for (const auto& partition : partitions) {
             total += partition.keys.size();
         }
         n_groups_ = total;
-        pair_order_.resize(total);
+        resize_order(total);
         AggSlotCore* fs = flat_slots_.grow_uninitialized(total * n_aggs_).data();
         std::size_t g = 0;
         while (true) {
             std::size_t best = part_count;
             std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
             for (std::size_t p = 0; p < part_count; ++p) {
-                if (cursors[p] >= owned_pair_partitions_[p].keys.size()) {
+                if (cursors[p] >= partitions[p].keys.size()) {
                     continue;
                 }
-                if (owned_pair_partitions_[p].first_rows[cursors[p]] < best_row) {
-                    best_row = owned_pair_partitions_[p].first_rows[cursors[p]];
+                if (partitions[p].first_rows[cursors[p]] < best_row) {
+                    best_row = partitions[p].first_rows[cursors[p]];
                     best = p;
                 }
             }
             if (best == part_count) {
                 break;
             }
-            const auto& partition = owned_pair_partitions_[best];
+            const auto& partition = partitions[best];
             const std::size_t local = cursors[best];
-            const PairIntKey& key = partition.keys[local];
-            pair_order_[g] = {static_cast<std::int64_t>(key.first),
-                              static_cast<std::int64_t>(key.second)};
+            store_key(g, partition.keys[local]);
             for (std::size_t a = 0; a < n_aggs_; ++a) {
                 fs[(g * n_aggs_) + a] = partition.slots[(local * n_aggs_) + a];
             }
             ++cursors[best];
             ++g;
+        }
+    }
+
+    /// Dispatch the deferred merge to whichever key the owned run filled. Only
+    /// one can be non-empty: the gate admits an owned run only before any group
+    /// exists, so a single operator commits to one key and keeps it.
+    void finalize_owned_active() {
+        if (!owned_pair_partitions_.empty()) {
+            finalize_owned(
+                owned_pair_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
+                [&](std::size_t g, const PairIntKey& key) {
+                    pair_order_[g] = {static_cast<std::int64_t>(key.first),
+                                      static_cast<std::int64_t>(key.second)};
+                });
+        } else if (!owned_int_partitions_.empty()) {
+            finalize_owned(
+                owned_int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
+                [&](std::size_t g, std::int64_t key) { int_order_[g] = key; });
         }
     }
 
@@ -7403,8 +7442,9 @@ class ChunkedAggregateOperator final : public Operator {
             return std::nullopt;
         }
 
-        if (try_owned_pair([&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); },
-                           rows, gids, agg_entries)) {
+        if (try_owned<PairIntKey, PairIntKeyHash>(
+                [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
+                agg_entries, owned_pair_partitions_, kPairOwnedMinRows)) {
             return std::nullopt;
         }
 
@@ -9331,7 +9371,7 @@ class ChunkedAggregateOperator final : public Operator {
         // -- which then runs completely unmodified, reading the same
         // pair_order_/flat_slots_/n_groups_ it always has.
         if (owned_mode_) {
-            finalize_owned_pair();
+            finalize_owned_active();
         }
 
         Chunk out;
@@ -9793,6 +9833,7 @@ class ChunkedAggregateOperator final : public Operator {
         std::vector<AggSlotCore> slots;  ///< n_local_groups * n_aggs_
     };
     std::vector<OwnedPartition<PairIntKey, PairIntKeyHash>> owned_pair_partitions_;
+    std::vector<OwnedPartition<std::int64_t, robin_hood::hash<std::int64_t>>> owned_int_partitions_;
     /// Set once this operator has committed to owned-partition mode. Per the
     /// plan's safety note, only ever ADMITTED before any other discovery path
     /// (serial or `try_discover_partitioned`) has created a group -- widening

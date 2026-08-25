@@ -95,9 +95,10 @@ enum class SerialOnlyReason : std::uint8_t {
 /// stops being a branch inside `build_operator` and becomes something a test
 /// and `explain physical` can both read.
 enum class JoinStrategy : std::uint8_t {
-    /// The right side is materialized into a hash table and the left streams
-    /// through it -- `HashBuild` on the right, `HashProbe` on the left. This is
-    /// what `is_streamable_inner_join` and the semi/anti gate select today.
+    /// One side is hashed into a table and the other streams through it --
+    /// `HashBuild` and `HashProbe`. Which side is which is a run-time
+    /// decision, not this strategy's claim; see `JoinPlan::left_input`. This
+    /// is what `is_streamable_inner_join` and the semi/anti gate select.
     StreamingProbe,
     /// Both sides are materialized before the join runs. Every semantics the
     /// streaming operators do not implement lands here.
@@ -164,10 +165,21 @@ struct JoinPlan {
     /// `MaterializeBoth`.
     JoinBranch branch = JoinBranch::None;
     JoinDeclineReason decline = JoinDeclineReason::None;
-    /// The side hashed into a table, and the side that streams through it.
-    /// Both null unless `strategy` is `StreamingProbe`.
-    const ir::Node* build_side = nullptr;
-    const ir::Node* probe_side = nullptr;
+    /// The join's two inputs, in textual order. Both null unless `strategy` is
+    /// `StreamingProbe`.
+    ///
+    /// Deliberately NOT named build and probe. These fields used to be, and
+    /// the claim was false whenever the operator swapped: which side is hashed
+    /// is resolved when the build phase runs, from measured row counts
+    /// (`JoinOrientation`, `choose_and_build_single_key` in chunked.cpp). A
+    /// plan that names a build side is a plan a scheduler would believe.
+    /// Naming the inputs and leaving the orientation to the build is what
+    /// lets both children be scheduled as pipelines without the plan
+    /// pretending to a decision it cannot make -- see
+    /// plans/kernel-pipeline-execution-plan.md, "The build-side choice does
+    /// not block the split".
+    const ir::Node* left_input = nullptr;
+    const ir::Node* right_input = nullptr;
     std::size_t key_count = 0;
 };
 

@@ -716,13 +716,15 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.branch = JoinBranch::None;
         return out;
     }
-    // Textual left streams, textual right is hashed. Which side *should* build
-    // is a cost question this plan deliberately does not answer yet -- it is
-    // the open item in plans/phase3-dop-budget-analysis.md and the root cause
-    // of q12's regression -- so recording today's choice is the honest first
-    // step, not a decision.
-    out.probe_side = join.children()[0].get();
-    out.build_side = join.children()[1].get();
+    // The two inputs, in textual order. Which one is hashed is decided by the
+    // build phase at run time from measured row counts, so the plan records
+    // the inputs and not an orientation. Which side *should* build is a cost
+    // question this plan still does not answer -- that is q12's diagnosed
+    // regression -- but the previous version of these two lines went further
+    // than "not answering" and asserted left-probes/right-builds, which the
+    // operator contradicts every time it swaps.
+    out.left_input = join.children()[0].get();
+    out.right_input = join.children()[1].get();
     return out;
 }
 
@@ -741,11 +743,12 @@ auto explain_join(const JoinPlan& plan) -> std::string {
         out += " decline=";
         out += join_decline_name(plan.decline);
     }
-    if (plan.build_side != nullptr) {
-        out += " build=";
-        out += node_kind_name_impl(plan.build_side->kind());
-        out += " probe=";
-        out += node_kind_name_impl(plan.probe_side->kind());
+    if (plan.left_input != nullptr) {
+        out += " left=";
+        out += node_kind_name_impl(plan.left_input->kind());
+        out += " right=";
+        out += node_kind_name_impl(plan.right_input->kind());
+        out += " orientation=runtime";
     }
     out += ")";
     return out;

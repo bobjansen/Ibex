@@ -87,9 +87,10 @@ Owner: `operator.hpp`.
 * Per-chunk interruption boundaries: long *pipelines* check
   `interrupt_requested()` between chunks; intra-operator fan-outs
   historically do not (documented gap, `parallelism-overview.md` I13).
-* An operator that fans out degrades to serial under
-  `on_worker_pool_thread()` — "outermost wins" — and `WorkerPool::submit`
-  aborts rather than deadlocks when reentered.
+* An operator normally degrades to serial under `on_worker_pool_thread()` —
+  "outermost wins" — to avoid needless nested fan-out. A necessary nested
+  `WorkerPool::submit` is safe: workers cooperatively execute queued tasks
+  while waiting for their child batch, so saturation cannot deadlock it.
 
 ## 4. Materialization — the sink
 

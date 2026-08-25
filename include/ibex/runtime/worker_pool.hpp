@@ -71,9 +71,10 @@ class WorkerPool {
     /// of the workers: in a morsel pipeline it is the ordered merger's
     /// consumer, and must stay free to release completed morsels.
     ///
-    /// Not reentrant: a worker body must never submit its own batch (nested
-    /// pipelines are not a Phase 1 shape and would deadlock against a saturated
-    /// pool).
+    /// Reentrant: a pool worker waiting on a child batch cooperatively executes
+    /// queued work until that batch completes. This prevents saturated parents
+    /// from deadlocking their children, but callers should still avoid deep or
+    /// tiny nested fan-outs when one outer batch would express the same work.
     [[nodiscard]] auto submit(std::size_t worker_count, std::function<void(std::size_t)> body)
         -> Batch;
 
@@ -112,10 +113,10 @@ void shutdown_process_worker_pool();
 
 /// True when the calling thread belongs to a WorkerPool.
 ///
-/// The guard against nested parallelism. Anything that may run inside a pool
-/// task — an operator in a morsel pipeline, and so everything it calls — must
-/// check this before submitting work of its own, because `WorkerPool::submit`
-/// from a worker deadlocks (and aborts loudly rather than hanging).
+/// A scheduling-context query. Operators use this to avoid gratuitous nested
+/// fan-out when an outer morsel batch already owns the available parallelism.
+/// `WorkerPool` itself supports a necessary nested batch by cooperatively
+/// executing queued work while its parent waits.
 [[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
 
 /// True on a runtime-owned thread that is NOT a pool worker.

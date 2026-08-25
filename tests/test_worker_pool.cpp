@@ -139,6 +139,27 @@ TEST_CASE("WorkerPool batch destruction waits for its bodies", "[runtime][worker
     CHECK(finished.load());
 }
 
+TEST_CASE("WorkerPool cooperatively completes nested batches from every worker",
+          "[runtime][worker_pool]") {
+    // All outer bodies reach the nested wait together. A conventional fixed
+    // pool deadlocks here: each worker is occupied by a parent while all child
+    // tasks remain queued. Cooperative waiting must let the parents drain that
+    // queue themselves.
+    runtime::WorkerPool pool(4);
+    std::atomic<std::size_t> parents_ready{0};
+    std::atomic<std::size_t> children_ran{0};
+    auto outer = pool.submit(4, [&](std::size_t) {
+        parents_ready.fetch_add(1, std::memory_order_release);
+        while (parents_ready.load(std::memory_order_acquire) != 4) {
+            std::this_thread::yield();
+        }
+        auto child = pool.submit(4, [&](std::size_t) { children_ran.fetch_add(1); });
+        child.wait();
+    });
+    outer.wait();
+    CHECK(children_ran.load() == 16);
+}
+
 TEST_CASE("decode_thread_count separates the decode pool from the compute budget",
           "[runtime][worker_pool]") {
     // The two budgets are different numbers on purpose: decode is

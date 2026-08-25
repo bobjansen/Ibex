@@ -631,8 +631,8 @@ struct ExecutionContext {
     ///
     /// This says only that fanning out is permitted. Whether it is *worthwhile*
     /// is each caller's own gate (row and cell floors, morsel counts, merge
-    /// costs), and whether it is *possible* here also depends on
-    /// `on_worker_pool_thread()`, since a pool worker cannot submit.
+    /// costs), and whether it is desirable here can also depend on
+    /// `on_worker_pool_thread()`, since an outer batch already owns the pool.
     [[nodiscard]] auto can_fan_out() const -> bool;
 
     /// The plan's grain-size serial threshold: an pipeline input smaller than

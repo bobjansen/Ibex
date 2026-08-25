@@ -63,6 +63,7 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
+#include <parquet/page_index.h>
 #include <parquet/statistics.h>
 #include <random>
 #include <span>
@@ -2238,6 +2239,21 @@ struct KeyScanGroup {
     std::size_t skip = 0;
 };
 
+/// A consecutive run of data pages.  Its byte range begins at a real page
+/// boundary, so no preceding data page is decoded just to reach this stripe.
+/// Dictionary bytes, when present, are prepended once per *stripe*, never once
+/// per data page.
+struct StringPageStripe {
+    std::size_t base;
+    std::size_t rows;
+    std::int64_t data_offset;
+    std::int64_t data_size;
+    std::int64_t dictionary_offset = 0;
+    std::int64_t dictionary_size = 0;
+    parquet::Compression::type compression;
+    const parquet::ColumnDescriptor* descriptor;
+};
+
 /// Subdivide each scan group so at least `target` independent shards exist,
 /// giving the fused filter scans a finer parallelism axis than "one task per
 /// row group" — the axis alone caps a table with 1-6 row groups (every SF-1
@@ -2546,6 +2562,156 @@ inline auto filtered_string_group_scan(parquet::arrow::FileReader& reader, int l
     return true;
 }
 
+inline auto string_page_stripes(parquet::arrow::FileReader& reader, int leaf_index,
+                                const std::vector<KeyScanGroup>& groups, std::size_t target)
+    -> std::optional<std::vector<StringPageStripe>> {
+    auto* raw = reader.parquet_reader();
+    auto indices = raw->GetPageIndexReader();
+    if (indices == nullptr)
+        return std::nullopt;
+    struct GroupPages {
+        const KeyScanGroup* group;
+        std::vector<parquet::PageLocation> pages;
+        const parquet::ColumnDescriptor* descriptor;
+        parquet::Compression::type compression;
+        std::int64_t dict_offset;
+        std::int64_t dict_size;
+    };
+    std::vector<GroupPages> all;
+    std::size_t total_pages = 0;
+    for (const auto& group : groups) {
+        auto index = indices->RowGroup(group.index);
+        auto offset = index == nullptr ? nullptr : index->GetOffsetIndex(leaf_index);
+        auto chunk = raw->metadata()->RowGroup(group.index)->ColumnChunk(leaf_index);
+        auto column = raw->RowGroup(group.index)->Column(leaf_index);
+        if (offset == nullptr || offset->page_locations().empty())
+            return std::nullopt;
+        auto pages = offset->page_locations();
+        const std::int64_t dict_offset =
+            chunk->has_dictionary_page() ? chunk->dictionary_page_offset() : 0;
+        const std::int64_t dict_size =
+            chunk->has_dictionary_page() ? pages.front().offset - dict_offset : 0;
+        if (dict_offset < 0 || dict_size < 0)
+            return std::nullopt;
+        total_pages += pages.size();
+        all.push_back({&group, std::move(pages), column->descr(), chunk->compression(), dict_offset,
+                       dict_size});
+    }
+    if (total_pages <= groups.size())
+        return std::nullopt;
+    std::vector<StringPageStripe> out;
+    for (const auto& entry : all) {
+        const auto& pages = entry.pages;
+        const std::size_t stripes = std::min(
+            pages.size(),
+            std::max<std::size_t>(1, (pages.size() * target + total_pages - 1) / total_pages));
+        const std::size_t pages_per = (pages.size() + stripes - 1) / stripes;
+        for (std::size_t first = 0; first < pages.size(); first += pages_per) {
+            const std::size_t last = std::min(pages.size(), first + pages_per);
+            const auto first_row = pages[first].first_row_index;
+            const auto next_row = last < pages.size()
+                                      ? pages[last].first_row_index
+                                      : static_cast<std::int64_t>(entry.group->rows);
+            const auto end = pages[last - 1].offset + pages[last - 1].compressed_page_size;
+            if (first_row < 0 || next_row <= first_row ||
+                next_row > static_cast<std::int64_t>(entry.group->rows) ||
+                end <= pages[first].offset)
+                return std::nullopt;
+            out.push_back({.base = entry.group->base + static_cast<std::size_t>(first_row),
+                           .rows = static_cast<std::size_t>(next_row - first_row),
+                           .data_offset = pages[first].offset,
+                           .data_size = end - pages[first].offset,
+                           .dictionary_offset = entry.dict_offset,
+                           .dictionary_size = entry.dict_size,
+                           .compression = entry.compression,
+                           .descriptor = entry.descriptor});
+        }
+    }
+    return out;
+}
+
+inline auto filtered_string_page_stripe(const StringPageStripe& task,
+                                        const std::shared_ptr<arrow::io::RandomAccessFile>& input,
+                                        const ibex::runtime::StringScanFilter& filter,
+                                        ibex::runtime::Selection& selected) -> bool {
+    std::shared_ptr<arrow::io::InputStream> stream;
+    if (task.dictionary_size == 0) {
+        auto result =
+            arrow::io::RandomAccessFile::GetStream(input, task.data_offset, task.data_size);
+        if (!result.ok())
+            throw std::runtime_error("read_parquet: failed to open string page stripe (" +
+                                     result.status().ToString() + ")");
+        stream = std::move(*result);
+    } else {
+        auto dictionary = input->ReadAt(task.dictionary_offset, task.dictionary_size);
+        auto data = input->ReadAt(task.data_offset, task.data_size);
+        if (!dictionary.ok() || !data.ok())
+            throw std::runtime_error("read_parquet: failed to read string page stripe");
+        arrow::BufferBuilder joined;
+        if (auto status = joined.Append((*dictionary)->data(), (*dictionary)->size()); !status.ok())
+            throw std::runtime_error(status.ToString());
+        if (auto status = joined.Append((*data)->data(), (*data)->size()); !status.ok())
+            throw std::runtime_error(status.ToString());
+        std::shared_ptr<arrow::Buffer> buffer;
+        if (auto status = joined.Finish(&buffer); !status.ok())
+            throw std::runtime_error(status.ToString());
+        stream = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
+    }
+    auto pages = parquet::PageReader::Open(std::move(stream), static_cast<std::int64_t>(task.rows),
+                                           task.compression);
+    auto column = std::static_pointer_cast<parquet::ByteArrayReader>(
+        parquet::ColumnReader::Make(task.descriptor, std::move(pages)));
+    const bool optional = task.descriptor->max_definition_level() != 0;
+    std::unique_ptr<parquet::ByteArray[]> values(
+        new parquet::ByteArray[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::unique_ptr<std::int16_t[]> definitions(
+        new std::int16_t[static_cast<std::size_t>(kDirectDecodeBatchRows)]);
+    std::size_t row = 0;
+    while (row < task.rows && column->HasNext()) {
+        const auto request = static_cast<std::int64_t>(
+            std::min<std::size_t>(kDirectDecodeBatchRows, task.rows - row));
+        std::int64_t read = 0;
+        const auto levels = column->ReadBatch(request, optional ? definitions.get() : nullptr,
+                                              nullptr, values.get(), &read);
+        if (levels <= 0)
+            throw std::runtime_error("read_parquet: string page stripe made no progress");
+        std::size_t value = 0;
+        for (std::int64_t i = 0; i < levels; ++i) {
+            if (!optional || definitions[static_cast<std::size_t>(i)] != 0) {
+                const auto& v = values[value++];
+                if (filter.passes(std::string_view{reinterpret_cast<const char*>(v.ptr), v.len}))
+                    selected.push_back(task.base + row + static_cast<std::size_t>(i));
+            }
+        }
+        row += static_cast<std::size_t>(levels);
+    }
+    if (row != task.rows)
+        throw std::runtime_error("read_parquet: string page stripe ended early");
+    return true;
+}
+
+inline auto filtered_string_page_stripes(const std::shared_ptr<arrow::io::RandomAccessFile>& input,
+                                         const ibex::runtime::StringScanFilter& filter,
+                                         const std::vector<StringPageStripe>& tasks,
+                                         std::size_t workers)
+    -> std::optional<ibex::runtime::Selection> {
+    std::vector<ibex::runtime::Selection> parts(tasks.size());
+    std::atomic<std::size_t> cursor{0};
+    auto run = [&](std::size_t) {
+        for (;;) {
+            const auto i = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (i >= tasks.size())
+                return;
+            filtered_string_page_stripe(tasks[i], input, filter, parts[i]);
+        }
+    };
+    if (workers <= 1)
+        run(0);
+    else
+        ibex::runtime::process_worker_pool().submit(workers, run).wait();
+    return merge_key_scan_parts(parts);
+}
+
 /// Every row group, in file order, with the file row index each starts at.
 inline auto whole_file_scan_groups(const parquet::FileMetaData& metadata)
     -> std::vector<KeyScanGroup> {
@@ -2631,6 +2797,10 @@ class ParquetLazyReaderFactoryState {
         std::call_once(dictionary_columns_once_,
                        [&] { dictionary_columns_ = dictionary_column_indices(*metadata_); });
         return make_parquet_reader(input_, path_, metadata_, dictionary_columns_);
+    }
+
+    [[nodiscard]] auto input() const -> const std::shared_ptr<arrow::io::RandomAccessFile>& {
+        return input_;
     }
 
    private:
@@ -2794,11 +2964,19 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                 parquet::Type::BYTE_ARRAY) {
                 return std::optional<ibex::runtime::Selection>{};
             }
-            const auto groups = restrict_to_unit(
-                split_scan_groups(whole_file_scan_groups(metadata), scan_shard_target(unit, exec)),
-                unit);
-            auto readers = parallel_readers(groups.size(), exec);
-            return filtered_string_selection(std::span{readers}, leaf_index, filter, groups);
+            const auto groups = restrict_to_unit(whole_file_scan_groups(metadata), unit);
+            const auto page_target = page_stripe_target(unit, exec);
+            if (page_target > 1) {
+                if (auto stripes = string_page_stripes(*reader_, leaf_index, groups, page_target);
+                    stripes.has_value() && stripes->size() > groups.size()) {
+                    return filtered_string_page_stripes(factory_->input(), filter, *stripes,
+                                                        std::min(page_target, stripes->size()));
+                }
+            }
+            const auto target = scan_shard_target(unit, exec);
+            const auto fallback = split_scan_groups(groups, target);
+            auto readers = parallel_readers(fallback.size(), exec);
+            return filtered_string_selection(std::span{readers}, leaf_index, filter, fallback);
         } catch (const std::exception& e) {
             return std::unexpected("read_parquet: fused string filter scan failed on " + path_ +
                                    " (" + e.what() + ")");
@@ -2856,6 +3034,25 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         if (unit != nullptr || factory_ == nullptr || !exec.can_fan_out() ||
             rows_ < std::max(exec.parallel_min_rows, kParallelDecodeMinRows) ||
             ibex::runtime::on_worker_pool_thread()) {
+            return 1;
+        }
+        const auto& pool = ibex::runtime::process_worker_pool();
+        return std::min(exec.compute_budget(), pool.size());
+    }
+
+    /// The page-index stripe path has independent compressed byte ranges, so
+    /// unlike Arrow FileReader shards it is safe to submit below a streamed
+    /// row-group worker. The pool's cooperative nested wait guarantees that
+    /// those parent workers execute the child tasks rather than deadlocking
+    /// while the fixed pool is saturated. A single process-wide pool still
+    /// bounds actual concurrency to its size; each source unit merely offers
+    /// enough stripes for idle capacity to find useful work.
+    [[nodiscard]] auto page_stripe_target(const ibex::runtime::SourceUnit* unit,
+                                          const ibex::runtime::ExecutionContext& exec) const
+        -> std::size_t {
+        const std::size_t work_rows = unit == nullptr ? rows_ : unit->rows;
+        if (factory_ == nullptr || !exec.can_fan_out() ||
+            work_rows < std::max(exec.parallel_min_rows, kParallelDecodeMinRows)) {
             return 1;
         }
         const auto& pool = ibex::runtime::process_worker_pool();

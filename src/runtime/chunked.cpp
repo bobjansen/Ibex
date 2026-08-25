@@ -4305,7 +4305,7 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
 ///
 /// The choice is made at RUN time, from measured row counts, and this enum is
 /// what makes it a VALUE rather than a shape encoded across three operator
-/// members (`mode_`, `use_materialized_left_`, `left_table_`). A build phase
+/// members (`mode_`, `probe_op_`, `left_table_`). A build phase
 /// can decide it without knowing who will probe, which is what a separately
 /// scheduled `HashBuild` needs; see plans/kernel-pipeline-execution-plan.md,
 /// "The build-side choice does not block the split" -- the physical plan does
@@ -5403,6 +5403,63 @@ struct JoinProbe {
     }
 };
 
+/// The streaming probe as an operator: a source of probe-side chunks, one
+/// completed build, and nothing else.
+///
+/// This is Phase 4's `HashProbe`. It owns no build -- it reads one through
+/// `JoinProbe`'s `shared_ptr<const>` handles -- and it does not know which
+/// side of the join was hashed, because by the time it exists that is settled.
+/// Two things follow, and they are the reason it is a type rather than a loop
+/// inside the join: it can be constructed next to a build it did not run, and
+/// several of it can read one build at once, which is what a per-worker morsel
+/// chain needs.
+///
+/// The empty-schema carrier travels with it, because "this join produced no
+/// rows but still has a schema" is a property of probing, not of the operator
+/// that decided the orientation.
+class JoinProbeOperator final : public Operator {
+   public:
+    JoinProbeOperator(OperatorPtr child, JoinProbe probe)
+        : child_(std::move(child)), probe_(std::move(probe)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        while (true) {
+            auto chunk_res = child_->next();
+            if (!chunk_res.has_value()) {
+                return std::unexpected(std::move(chunk_res.error()));
+            }
+            if (!chunk_res.value().has_value()) {
+                if (!emitted_nonempty_ && empty_schema_.has_value()) {
+                    auto schema = std::move(*empty_schema_);
+                    empty_schema_.reset();
+                    return std::optional<Chunk>{table_to_chunk(std::move(schema))};
+                }
+                return std::optional<Chunk>{};
+            }
+            auto out =
+                probe_.probe_chunk_against_right(chunk_to_table(std::move(*chunk_res.value())));
+            if (!out.has_value()) {
+                return std::unexpected(std::move(out.error()));
+            }
+            if (out->rows() == 0) {
+                // Keep the planned empty table as a schema carrier. A join
+                // with no matches still has its left and right output columns;
+                // without this, a materializing sink sees no chunks at all.
+                empty_schema_ = std::move(*out);
+                continue;
+            }
+            emitted_nonempty_ = true;
+            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+        }
+    }
+
+   private:
+    OperatorPtr child_;
+    JoinProbe probe_;
+    std::optional<Table> empty_schema_;
+    bool emitted_nonempty_ = false;
+};
+
 /// Inner hash join for single-key no-predicate joins.
 ///
 /// Two execution modes:
@@ -5491,49 +5548,10 @@ class ChunkedInnerJoinOperator final : public Operator {
             return std::optional<Chunk>{table_to_chunk(std::move(*out))};
         }
 
-        while (true) {
-            Table left_chunk;
-            if (use_materialized_left_) {
-                if (left_materialized_drained_) {
-                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                        auto schema = std::move(*empty_schema_);
-                        empty_schema_.reset();
-                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                    }
-                    return std::optional<Chunk>{};
-                }
-                left_materialized_drained_ = true;
-                left_chunk = std::move(left_materialized_).value_or(Table{});
-                left_materialized_.reset();
-            } else {
-                auto chunk_res = left_->next();
-                if (!chunk_res.has_value()) {
-                    return std::unexpected(std::move(chunk_res.error()));
-                }
-                if (!chunk_res.value().has_value()) {
-                    if (!emitted_nonempty_ && empty_schema_.has_value()) {
-                        auto schema = std::move(*empty_schema_);
-                        empty_schema_.reset();
-                        return std::optional<Chunk>{table_to_chunk(std::move(schema))};
-                    }
-                    return std::optional<Chunk>{};
-                }
-                left_chunk = chunk_to_table(std::move(*chunk_res.value()));
-            }
-            auto out = probe_.probe_chunk_against_right(std::move(left_chunk));
-            if (!out.has_value()) {
-                return std::unexpected(std::move(out.error()));
-            }
-            if (out->rows() == 0) {
-                // Keep the planned empty table as a schema carrier. A join
-                // with no matches still has its left and right output columns;
-                // without this, a materializing sink sees no chunks at all.
-                empty_schema_ = std::move(*out);
-                continue;
-            }
-            emitted_nonempty_ = true;
-            return std::optional<Chunk>{table_to_chunk(std::move(*out))};
-        }
+        // Stream mode is the probe, and the probe is its own operator. The
+        // join constructed it when the build finished and delegates from here
+        // on: everything left in this class is build-side.
+        return probe_op_->next();
     }
 
     /// Run this join's build phase to completion.
@@ -5707,10 +5725,35 @@ class ChunkedInnerJoinOperator final : public Operator {
             mode_ = Mode::Swapped;
             return std::nullopt;
         }
+        // BuildRight: the other side streams through the index, which is what
+        // `JoinProbeOperator` does. A left that has already been drained --
+        // either by the orientation decision above, or earlier by the
+        // deferred-probe path publishing its key bounds -- is replayed as one
+        // chunk rather than re-wrapped in its original operator, exactly as
+        // `use_materialized_left_` used to do inline.
+        //
+        // The second case is not hypothetical and cost a segfault to find:
+        // the deferred path drains `left_` to publish a filter, and if the
+        // resolved right then lands under `kStreamRightThreshold` the fast
+        // path arrives here with no `left_table` and a moved-from `left_`.
+        OperatorPtr probe_source;
         if (left_table.has_value()) {
-            left_materialized_ = std::move(left_table);
-            use_materialized_left_ = true;
+            probe_source = make_table_source(std::move(*left_table));
+        } else if (use_materialized_left_ && left_materialized_.has_value()) {
+            probe_source = make_table_source(std::move(*left_materialized_));
+            left_materialized_.reset();
+            use_materialized_left_ = false;
+        } else {
+            probe_source = std::move(left_);
         }
+        if (probe_source == nullptr) {
+            // Every way of losing the probe side is a bug in the three
+            // branches above, and one of them was. Aborting with a name beats
+            // dereferencing null inside a pool thread, which is what the
+            // deferred fast-path case actually did.
+            invariant_violation("join probe: no probe-side source after the build phase");
+        }
+        probe_op_ = std::make_unique<JoinProbeOperator>(std::move(probe_source), std::move(probe_));
         return std::nullopt;
     }
 
@@ -6217,8 +6260,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     std::shared_ptr<Table> right_ = std::make_shared<Table>();
     const std::vector<ir::JoinKey>* keys_;
     /// The probe half. The operator runs the build and decides which side to
-    /// index; everything after that belongs here.
+    /// index; everything after that belongs here. Moved into `probe_op_` when
+    /// the orientation is BuildRight, since from then on the probe is an
+    /// operator of its own and this class is build-side only.
     JoinProbe probe_;
+    /// Stream mode's probe, constructed when the build finishes. Null in the
+    /// Swapped and Precomputed modes, which emit one table rather than
+    /// streaming and so have no probe-side child to pull from.
+    std::unique_ptr<JoinProbeOperator> probe_op_;
 
     // Deferred-probe context (see the second constructor). `deferred_probe_`
     // doubles as the mode flag: non-null until the probe scan is resolved.
@@ -6239,7 +6288,6 @@ class ChunkedInnerJoinOperator final : public Operator {
     // Stream mode: when right > threshold and left >= right, left was
     // materialized to measure but not swapped; replay as a single chunk.
     std::optional<Table> left_materialized_;
-    bool left_materialized_drained_ = false;
     bool use_materialized_left_ = false;
     std::optional<Table> empty_schema_;
     bool emitted_nonempty_ = false;

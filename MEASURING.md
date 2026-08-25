@@ -43,6 +43,46 @@ costs one run.
 Reach for the full suite only to confirm a change you already believe in, or to
 check you did not regress something else.
 
+## 1b. Before believing any scaling number: is the work being DIVIDED?
+
+`IBEX_PROFILE_OPERATORS` and everything built on it measures how work is
+*distributed* -- occupancy, barrier wait, serial fraction, Amdahl ceiling. None
+of it can see work that should not exist. Parallelism that MULTIPLIES work
+still improves wall time, because N threads doing kN work finish sooner than
+one thread doing k, so every one of those metrics reads healthy while most of
+the machine is wasted.
+
+That is not hypothetical. q17 reported **85% pool occupancy, 2ms of serial
+self-time and a 22.79x Amdahl ceiling** while burning 4.6x the CPU: the fused
+key scan sharded each Parquet row group by row offset, and a shard's `Skip`
+decodes and discards, so shard k re-decoded every shard before it. Three days
+of aggregate metrics pointed at "scheduling". Fixed in `7fae1146` -- q17
+-33.6%, q08 -20.2%, q05 -15.8%, q09 -11.6%, suite geomean -3.9%.
+
+The measurement that sees it is total CPU at one core against N:
+
+```bash
+python benchmarking/work_multiplication.py                 # whole suite
+python benchmarking/work_multiplication.py --queries q17    # one query
+```
+
+`work_x = cpu(N cores) / cpu(1 core)`. **1.00 means the work was divided.**
+Above that the parallel path is doing something the serial path never does,
+and the excess is a hard cap: with a multiplier of m, N cores return at best
+N/m. Read `work_x` first and `speedup` second -- a query can look fine on
+speedup and still waste most of the machine.
+
+CPU comes from `getrusage(RUSAGE_CHILDREN)`, so no `perf` is needed; it agrees
+with `perf stat -e task-clock` to a millisecond or two. Workers park on a
+condition variable rather than spinning, so an idle thread costs nothing and
+the number is real work, not wait.
+
+When it flags something, the order that worked was: (1) `work_x` at 1 vs N,
+(2) `perf record` at both and diff the symbol shares, (3) `perf record -g` to
+get that symbol's CALLERS -- the memmove was inside Parquet's `PlainDecoder`,
+not Ibex's morsel merge where it was assumed to be -- (4) isolate with the knob
+that separates the two pools, `IBEX_DECODE_THREADS` against `IBEX_CORES`.
+
 ## 1a. The mechanics: what to run
 
 ### Running a query

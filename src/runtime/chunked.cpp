@@ -5630,6 +5630,11 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// three passes over the keys where a serial build makes one.
     [[nodiscard]] auto build_partitions(std::size_t n) const -> std::size_t {
         constexpr std::size_t kMinBuildRows = 1U << 17U;  // 131072
+        // Kill switch, and the A/B handle: with it set, the same binary runs
+        // the serial build, so the two can be interleaved without rebuilding.
+        if (std::getenv("IBEX_JOIN_BUILD_SERIAL") != nullptr) {
+            return 1;
+        }
         const ExecutionContext* exec = probe_.exec_;
         if (exec == nullptr || !exec->can_fan_out() || on_worker_pool_thread() ||
             n < kMinBuildRows) {

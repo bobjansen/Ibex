@@ -4442,10 +4442,15 @@ struct JoinProbe {
     const std::vector<ir::JoinKey>* keys_ = nullptr;
     const ExecutionContext* exec_ = nullptr;
     ir::JoinSuffixPolicy suffix_;
-    /// The join's right table, borrowed from the operator that owns it. Bound
-    /// once: the address is stable even where the operator move-assigns the
-    /// table itself (the deferred path does that after the scan resolves).
-    const Table* right_ = nullptr;
+    /// The join's right table, owned jointly and immutably.
+    ///
+    /// Shared rather than borrowed because a probe has to be able to outlive
+    /// the operator that ran the build, and because several probes -- one per
+    /// morsel worker -- have to be able to read one build side at once. A raw
+    /// pointer into a member could do neither, and depended on the operator
+    /// never reallocating the table it points at. Null until the build phase
+    /// resolves it, which on the deferred path is only after the scan runs.
+    std::shared_ptr<const Table> right_;
     /// What the build phase produced. Immutable, and shareable: this is the
     /// only thing the probe needs from a build.
     std::shared_ptr<const JoinHashIndex> index_;
@@ -5421,7 +5426,7 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr)
         : left_(std::move(left)),
-          right_(std::move(right)),
+          right_(std::make_shared<Table>(std::move(right))),
           keys_(keys),
           pending_order_(pending_order) {
         bind_probe(keys, std::move(suffix), exec);
@@ -5568,15 +5573,17 @@ class ChunkedInnerJoinOperator final : public Operator {
     // materialize left to pick the smaller build side.
     static constexpr std::size_t kStreamRightThreshold = 65536;
 
-    /// Hand the probe what it needs before anything runs. `&right_` is bound
-    /// once here: the table is move-assigned later on the deferred path, but
-    /// the member's address does not change.
+    /// Hand the probe what it needs before anything runs, including joint
+    /// ownership of the right side. The `shared_ptr`'s identity is stable from
+    /// construction even where the table it points at is filled later (the
+    /// deferred path fills it once the scan resolves), so this binds once and
+    /// the build phase writes through it.
     void bind_probe(const std::vector<ir::JoinKey>* keys, ir::JoinSuffixPolicy suffix,
                     const ExecutionContext& exec) {
         probe_.keys_ = keys;
         probe_.suffix_ = std::move(suffix);
         probe_.exec_ = &exec;
-        probe_.right_ = &right_;
+        probe_.right_ = right_;
     }
 
     auto initialize() -> std::optional<std::string> {
@@ -5596,7 +5603,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         const std::string& left_key_name = keys_->front().left;
         const std::string& right_key_name = keys_->front().right;
-        const ColumnValue* rkey = right_.find(right_key_name);
+        const ColumnValue* rkey = right_->find(right_key_name);
         if (rkey == nullptr) {
             return "join key not found in right table: " + right_key_name;
         }
@@ -5605,12 +5612,12 @@ class ChunkedInnerJoinOperator final : public Operator {
             return err;
         }
 
-        const std::size_t n_right = right_.rows();
+        const std::size_t n_right = right_->rows();
 
         // Small right: index it without ever measuring the left, which is the
         // one orientation this join can choose without draining a child.
         if (n_right <= kStreamRightThreshold) {
-            return adopt_build(build_join_side(right_, right_key_name, key_kind,
+            return adopt_build(build_join_side(*right_, right_key_name, key_kind,
                                                JoinOrientation::BuildRight,
                                                build_partitions(n_right)));
         }
@@ -5636,9 +5643,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         // skip.
         const bool order_pays =
             n_left < n_right && order_preserving_pays(left_table, n_left, n_right);
-        auto outcome =
-            choose_and_build_single_key(left_table, right_, left_key_name, right_key_name, key_kind,
-                                        order_pays, build_partitions(std::min(n_left, n_right)));
+        auto outcome = choose_and_build_single_key(left_table, *right_, left_key_name,
+                                                   right_key_name, key_kind, order_pays,
+                                                   build_partitions(std::min(n_left, n_right)));
         return adopt_build(std::move(outcome), std::move(left_table));
     }
 
@@ -5727,7 +5734,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         const ir::JoinKey& k1 = keys_->at(1);
         // Checked before the left child is drained, so an unusable right key
         // still costs nothing to report.
-        if (auto right_keys = pair_key_columns(right_, k0.right, k1.right, "right");
+        if (auto right_keys = pair_key_columns(*right_, k0.right, k1.right, "right");
             !right_keys.has_value()) {
             return std::move(right_keys.error());
         }
@@ -5751,8 +5758,8 @@ class ChunkedInnerJoinOperator final : public Operator {
         // the existing `use_materialized_left_` mechanism rather than
         // re-wrapping it in an operator.
         auto outcome =
-            choose_and_build_pair(left_table, right_, k0, k1,
-                                  build_partitions(std::min(left_table.rows(), right_.rows())));
+            choose_and_build_pair(left_table, *right_, k0, k1,
+                                  build_partitions(std::min(left_table.rows(), right_->rows())));
         return adopt_build(std::move(outcome), std::move(left_table));
     }
 
@@ -5804,11 +5811,11 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (!right.has_value()) {
             return std::move(right.error());
         }
-        right_ = std::move(*right);
+        *right_ = std::move(*right);
         deferred_probe_ = nullptr;
         if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
             std::fprintf(stderr, "[pair_defer] filter_published=%d right_rows_after_filter=%zu\n",
-                         static_cast<int>(use_materialized_left_), right_.rows());
+                         static_cast<int>(use_materialized_left_), right_->rows());
         }
         return initialize_pair();
     }
@@ -5856,7 +5863,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (!right.has_value()) {
             return std::move(right.error());
         }
-        right_ = std::move(right.value());
+        *right_ = std::move(right.value());
         deferred_probe_ = nullptr;
         return std::nullopt;
     }
@@ -5874,7 +5881,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         if (!right.has_value()) {
             return std::move(right.error());
         }
-        right_ = std::move(right.value());
+        *right_ = std::move(right.value());
         return std::nullopt;
     }
 
@@ -6202,7 +6209,12 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     OperatorPtr left_;
-    Table right_;
+    /// The right side, owned jointly with every probe reading it. A
+    /// `shared_ptr` rather than a member `Table` because a probe must be able
+    /// to outlive this operator and several probes must be able to read one
+    /// build side at once -- see `JoinProbe::right_`. Written only by the
+    /// build phase, which finishes before any probe runs.
+    std::shared_ptr<Table> right_ = std::make_shared<Table>();
     const std::vector<ir::JoinKey>* keys_;
     /// The probe half. The operator runs the build and decides which side to
     /// index; everything after that belongs here.

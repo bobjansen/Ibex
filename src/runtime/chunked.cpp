@@ -5452,12 +5452,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     }
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
-        if (!initialized_) {
-            auto err = initialize();
-            if (err.has_value()) {
-                return std::unexpected(std::move(*err));
-            }
-            initialized_ = true;
+        if (auto err = run_build()) {
+            return std::unexpected(std::move(*err));
         }
 
         if (mode_ == Mode::Precomputed) {
@@ -5533,6 +5529,32 @@ class ChunkedInnerJoinOperator final : public Operator {
             emitted_nonempty_ = true;
             return std::optional<Chunk>{table_to_chunk(std::move(*out))};
         }
+    }
+
+    /// Run this join's build phase to completion.
+    ///
+    /// The build is a phase with an explicit caller now, not a side effect of
+    /// whoever happens to pull the first chunk. `build_physical_join` runs it
+    /// at plan-execution time; `next()` still calls it, because a join reached
+    /// by any other path must work and because idempotence is what makes both
+    /// callers safe. After it returns the index is immutable and the probe
+    /// side can stream through it -- that is the barrier, stated as a call
+    /// rather than as a comment about `initialized_`.
+    ///
+    /// Deliberately NOT what this changes: it does not overlap the build with
+    /// anything. Overlapping a join's two sides has been tried twice and
+    /// regressed both times (`32889afd`, `27cb4a27`); this makes the build
+    /// schedulable, and what to schedule it against stays an open, measured
+    /// question.
+    auto run_build() -> std::optional<std::string> {
+        if (initialized_) {
+            return std::nullopt;
+        }
+        if (auto err = initialize()) {
+            return err;
+        }
+        initialized_ = true;
+        return std::nullopt;
     }
 
    private:
@@ -13054,6 +13076,25 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 /// rather than the per-kind switch. What is still ahead is decomposing the
 /// build and the probe into separate pipeline stages with a barrier between
 /// them, so a probe can be a step inside a map pipeline.
+/// Run a join's build phase here, at plan-execution time, instead of leaving
+/// it to fire inside the probe's first `next()`.
+///
+/// This is what makes the build *scheduled*: it has a caller that is not the
+/// probe, and its completion is a point in the plan rather than a flag the
+/// probe checks. `IBEX_JOIN_BUILD_LAZY=1` restores the old timing, which is
+/// both a kill switch and the A/B handle for the one thing this changes that
+/// is not free -- when the build side's child is drained.
+auto scheduled_join_build(std::unique_ptr<ChunkedInnerJoinOperator> op)
+    -> std::expected<OperatorPtr, std::string> {
+    static const bool lazy = std::getenv("IBEX_JOIN_BUILD_LAZY") != nullptr;
+    if (!lazy) {
+        if (auto err = op->run_build()) {
+            return std::unexpected(std::move(*err));
+        }
+    }
+    return OperatorPtr{std::move(op)};
+}
+
 auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
                          const TableRegistry& registry, const ScalarRegistry* scalars,
                          const ExternRegistry* externs, const ExecutionContext& exec,
@@ -13116,23 +13157,28 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             return std::unexpected(std::move(left_op.error()));
         }
         if (probe.scan != nullptr) {
-            return make_pipelined_stage_if(
-                std::make_unique<ChunkedInnerJoinOperator>(
-                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
-                    &join.pending_order()),
-                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+            auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
+                std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
+                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order()));
+            if (!built.has_value()) {
+                return std::unexpected(std::move(built.error()));
+            }
+            return make_pipelined_stage_if(std::move(*built), stage_probe, exec,
+                                           execution_profile_entry(exec.execution_profile, node));
         }
         auto right =
             materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
-        return make_pipelined_stage_if(
-            std::make_unique<ChunkedInnerJoinOperator>(std::move(left_op.value()),
-                                                       std::move(right.value()), &join.keys(), exec,
-                                                       join.suffix(), &join.pending_order()),
-            stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+        auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
+            std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
+            &join.pending_order()));
+        if (!built.has_value()) {
+            return std::unexpected(std::move(built.error()));
+        }
+        return make_pipelined_stage_if(std::move(*built), stage_probe, exec,
+                                       execution_profile_entry(exec.execution_profile, node));
     }
     // Streaming two-Int64-key inner join (plans/parallelism-overview.md's
     // "stream multi-key joins" item): same shape as the single-key
@@ -13154,23 +13200,28 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             return std::unexpected(std::move(left_op.error()));
         }
         if (probe.scan != nullptr) {
-            return make_pipelined_stage_if(
-                std::make_unique<ChunkedInnerJoinOperator>(
-                    std::move(left_op.value()), join.children()[1].get(), &registry, scalars,
-                    externs, exec, &join.keys(), probe.scan, *probe.name, join.suffix(),
-                    &join.pending_order()),
-                stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+            auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
+                std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
+                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order()));
+            if (!built.has_value()) {
+                return std::unexpected(std::move(built.error()));
+            }
+            return make_pipelined_stage_if(std::move(*built), stage_probe, exec,
+                                           execution_profile_entry(exec.execution_profile, node));
         }
         auto right =
             materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }
-        return make_pipelined_stage_if(
-            std::make_unique<ChunkedInnerJoinOperator>(std::move(left_op.value()),
-                                                       std::move(right.value()), &join.keys(), exec,
-                                                       join.suffix(), &join.pending_order()),
-            stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
+        auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
+            std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
+            &join.pending_order()));
+        if (!built.has_value()) {
+            return std::unexpected(std::move(built.error()));
+        }
+        return make_pipelined_stage_if(std::move(*built), stage_probe, exec,
+                                       execution_profile_entry(exec.execution_profile, node));
     }
 
     return std::unexpected("physical join: plan named no streaming branch");

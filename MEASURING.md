@@ -66,11 +66,26 @@ python benchmarking/work_multiplication.py                 # whole suite
 python benchmarking/work_multiplication.py --queries q17    # one query
 ```
 
-`work_x = cpu(N cores) / cpu(1 core)`. **1.00 means the work was divided.**
-Above that the parallel path is doing something the serial path never does,
-and the excess is a hard cap: with a multiplier of m, N cores return at best
-N/m. Read `work_x` first and `speedup` second -- a query can look fine on
-speedup and still waste most of the machine.
+`work_x = cpu(N cores) / cpu(1 core)`. **1.00 means CPU was conserved.** Read
+`work_x` first and `speedup` second -- a query can look fine on speedup and
+still waste most of the machine.
+
+**A high `work_x` is a screen, not a verdict.** Two very different causes:
+
+* **Redundant work** -- the parallel path genuinely does more. q17's sharded
+  key scan re-decoded every preceding shard (`7fae1146`, -33.6%). Deletable.
+* **Contention stalls** -- the same work, slowed. `task-clock` counts a
+  stalled core as busy, so threads competing for L3 and bandwidth inflate CPU
+  without doing anything extra. q06 reads 2.27x, and a row counter on its
+  filter shows IDENTICAL rows at 1 and 8 cores (12 calls, 11,997,996 rows
+  both). Nothing to delete.
+
+**Confirm which before acting**, by counting the work directly -- rows, calls,
+bytes -- at 1 core and at N. Matching counts mean contention. This costs one
+temporary counter and it is the difference between a 33% win and a week spent
+chasing an artifact. A plain streaming read does not inflate on this box
+(400MB, 1 vs 8 threads: 13.8 -> 52.7 GB/s, task-clock flat), so contention
+needs concurrent competitors, not merely a large working set.
 
 CPU comes from `getrusage(RUSAGE_CHILDREN)`, so no `perf` is needed; it agrees
 with `perf stat -e task-clock` to a millisecond or two. Workers park on a

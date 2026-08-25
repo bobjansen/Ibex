@@ -33,6 +33,8 @@ import re
 import subprocess
 import sys
 
+import bench_env
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EVAL = ROOT / "build-release/tools/ibex_eval"
 PLUGINS = ROOT / "build-release/tools"
@@ -97,6 +99,7 @@ def main() -> int:
     if not EVAL.exists():
         print(f"missing {EVAL} — build the release target first", file=sys.stderr)
         return 1
+    print(bench_env.scale_factor_line())
     print(f"# PDS-H, IBEX_CORES={cores}, build-release, second run of two")
     print(
         f"{'query':6}{'wall':>9}{'serial':>10}{'barrier':>10}{'ring':>9}"

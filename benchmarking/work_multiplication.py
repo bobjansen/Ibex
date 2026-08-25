@@ -59,6 +59,8 @@ import subprocess
 import sys
 import time
 
+import bench_env
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EVAL = ROOT / "build-release/tools/ibex_eval"
 PLUGINS = ROOT / "build-release/tools"
@@ -113,6 +115,7 @@ def main() -> int:
     names = args.queries or sorted(p.stem for p in QUERY_DIR.glob("q??.ibex"))
     queries = [QUERY_DIR / f"{n}.ibex" for n in names]
 
+    print(bench_env.scale_factor_line())
     print(f"# IBEX_CORES=1 vs {args.cores}, repeats={args.repeats} (min), "
           f"taskset={args.taskset}")
     print(f"# work_x = cpu({args.cores}c)/cpu(1c). 1.00 = work divided; "

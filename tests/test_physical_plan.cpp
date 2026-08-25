@@ -660,14 +660,15 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
         CHECK(plan.strategy == JoinStrategy::StreamingProbe);
         CHECK(plan.decline == JoinDeclineReason::None);
         CHECK(plan.key_count == 1);
-        // Which side *should* build is a cost question the plan deliberately
-        // does not answer yet, so this pins what happens today rather than what
-        // ought to: textual left probes, textual right is hashed. Compared
-        // against this node's own children -- a second `require_ir` would build
-        // a different tree whose pointers could never match.
+        // The plan names the two inputs in textual order and says nothing
+        // about which one is hashed: that is resolved by the build phase at
+        // run time, so a plan asserting it would be false every time the
+        // operator swaps. Compared against this node's own children -- a
+        // second `require_ir` would build a different tree whose pointers
+        // could never match.
         REQUIRE(ir->children().size() == 2);
-        CHECK(plan.probe_side == ir->children()[0].get());
-        CHECK(plan.build_side == ir->children()[1].get());
+        CHECK(plan.left_input == ir->children()[0].get());
+        CHECK(plan.right_input == ir->children()[1].get());
     }
 
     SECTION("two Int64 keys stream as the pair shape when the schema proves it") {
@@ -724,10 +725,10 @@ TEST_CASE("The plan classifies a join and builds the streaming ones", "[physical
             CAPTURE(src);
             const auto plan = plan_of(src);
             CHECK(plan.strategy == JoinStrategy::MaterializeBoth);
-            // A declined join names no sides: claiming one would suggest a
-            // choice the materializing path never makes.
-            CHECK(plan.build_side == nullptr);
-            CHECK(plan.probe_side == nullptr);
+            // A declined join names no inputs: the materializing path has no
+            // build/probe shape at all, so naming sides would suggest one.
+            CHECK(plan.left_input == nullptr);
+            CHECK(plan.right_input == nullptr);
         }
     }
 

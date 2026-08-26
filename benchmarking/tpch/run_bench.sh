@@ -25,7 +25,8 @@
 #
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
-#                  [--skip-pdsh] [--cores N] [--label TEXT] [--no-archive]
+#                  [--skip-pdsh] [--polars-streaming] [--cores N] [--label TEXT]
+#                  [--no-archive]
 
 set -euo pipefail
 
@@ -38,6 +39,7 @@ SCALE=1
 WARMUP=1
 ITERS=5
 SKIP_PDSH=0
+POLARS_STREAMING=0
 ARCHIVE=1
 LABEL=""
 # Cores the whole comparison is pinned to. Unset means "every core on the box",
@@ -53,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --iters)  ITERS="$2";  shift 2 ;;
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
         --skip-pdsh) SKIP_PDSH=1; shift ;;
+        --polars-streaming) POLARS_STREAMING=1; shift ;;
         --cores)  CORES="$2"; shift 2 ;;
         --label)  LABEL="$2"; shift 2 ;;
         --no-archive) ARCHIVE=0; shift ;;
@@ -120,6 +123,9 @@ archive_run() {
         carried=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
     else
         measured+=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
+        if [[ "$POLARS_STREAMING" -eq 1 ]]; then
+            measured+=("pdsh-polars-stream" "pdsh-polars-stream-st")
+        fi
     fi
 
     local f
@@ -212,6 +218,28 @@ echo "=== upstream PDS-H Polars (single-threaded) ==="
 POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
     --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
     --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+
+# Polars' streaming executor, run only on request. Upstream selects the
+# in-memory one EXPLICITLY unless told otherwise, so which executor the
+# reference uses is a choice this harness makes rather than a default it
+# inherits -- and reporting a ratio against the slower of two available
+# executors would be the same mistake, in a new place, that removing the
+# in-tree Polars implementation was meant to end. Off by default because every
+# reference re-runs from scratch each sitting and these are two more full
+# passes; on when the comparison is the point.
+if [[ "$POLARS_STREAMING" -eq 1 ]]; then
+    echo "=== upstream PDS-H Polars, streaming engine (${CORES:-$(nproc)} cores) ==="
+    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars \
+        --polars-engine streaming --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" \
+        --iters "$ITERS" --framework pdsh-polars-stream \
+        --out "$RESULTS/pdsh_polars_stream${SUFFIX}.tsv"
+
+    echo "=== upstream PDS-H Polars, streaming engine (single-threaded) ==="
+    POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
+        --engine polars --polars-engine streaming --pdsh-root "$PDSH_ROOT" --sf "$SCALE" \
+        --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars-stream-st \
+        --out "$RESULTS/pdsh_polars_stream_st${SUFFIX}.tsv"
+fi
 
 echo "=== upstream PDS-H DuckDB SQL (${CORES:-$(nproc)} cores) ==="
 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --pdsh-root "$PDSH_ROOT" \

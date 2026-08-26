@@ -14,7 +14,9 @@ import sys
 from collections import defaultdict
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-FRAMEWORK_ORDER = ["ibex", "ibex-st", "pdsh-polars", "pdsh-polars-st", "pdsh-duckdb", "pdsh-duckdb-st"]
+FRAMEWORK_ORDER = ["ibex", "ibex-st", "pdsh-polars", "pdsh-polars-st",
+                   "pdsh-polars-stream", "pdsh-polars-stream-st",
+                   "pdsh-duckdb", "pdsh-duckdb-st"]
 QUERY_ORDER = ["q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
 
 

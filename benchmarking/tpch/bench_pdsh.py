@@ -36,6 +36,10 @@ def percentile(data: list[float], p: float) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=("polars", "duckdb"), required=True)
+    parser.add_argument("--polars-engine", choices=("in-memory", "streaming"), default="in-memory",
+                        help="which Polars executor to select (Polars only). Upstream pins "
+                             "'in-memory' explicitly unless told otherwise, so this is a real "
+                             "choice rather than a default; see the note in main().")
     parser.add_argument("--threads", type=int, default=None,
                         help="connection thread count (DuckDB only)")
     parser.add_argument("--pdsh-root", type=pathlib.Path, required=True,
@@ -48,6 +52,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.threads is not None and (args.engine != "duckdb" or args.threads < 1):
         parser.error("--threads requires --engine duckdb and a positive value")
+    if args.polars_engine != "in-memory" and args.engine != "polars":
+        parser.error("--polars-engine applies to --engine polars")
 
     parquet = DATA_ROOT / f"parquet_sf{args.sf}"
     if not parquet.is_dir():
@@ -67,7 +73,15 @@ def main() -> int:
     else:
         pdsh_data.symlink_to(parquet.name)
 
-    framework = args.framework or f"pdsh-{args.engine}"
+    # Upstream's `obtain_engine_config()` returns "in-memory" EXPLICITLY unless
+    # `RUN_POLARS_STREAMING` is set -- it is a selected configuration, not a
+    # default that tracks whatever Polars considers current. Reporting a ratio
+    # against one executor while the other exists is a choice, so name the
+    # executor in the framework rather than letting "pdsh-polars" stand for
+    # whichever one happened to run.
+    streaming = args.polars_engine == "streaming"
+    default_framework = f"pdsh-{args.engine}" + ("-stream" if streaming else "")
+    framework = args.framework or default_framework
     args.out.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     with tempfile.TemporaryDirectory(prefix="ibex_pdsh_") as tmp:
@@ -83,6 +97,7 @@ def main() -> int:
                 "RUN_PRE_RUN": "false",
                 "RUN_LOG_TIMINGS": "true",
                 "RUN_ITERATIONS": str(args.warmup + args.iters),
+                "RUN_POLARS_STREAMING": "true" if streaming else "false",
             }
             print(f"=== {framework} q{query_number:02d} ===", file=sys.stderr)
             command = [sys.executable, "-m", f"queries.{args.engine}.q{query_number}"]

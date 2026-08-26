@@ -61,6 +61,7 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
 #include <parquet/arrow/writer.h>
+#include <parquet/column_page.h>
 #include <parquet/column_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/page_index.h>
@@ -74,6 +75,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "dictionary_policy.hpp"
 
 namespace {
 
@@ -729,7 +732,49 @@ inline auto schema_table_from_arrow(const arrow::Schema& schema) -> ibex::runtim
 ///
 /// Getting this wrong is a performance choice, not a correctness one: a column
 /// read either way holds the same values.
-inline auto dictionary_column_indices(const parquet::FileMetaData& metadata) -> std::vector<int> {
+/// A column's dictionary size in bytes, summed over row groups, from metadata
+/// alone. The dictionary page runs from its own offset to the first data page.
+inline auto dictionary_bytes(const parquet::FileMetaData& metadata, int col) -> std::int64_t {
+    std::int64_t bytes = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        auto chunk = metadata.RowGroup(group)->ColumnChunk(col);
+        const auto dict_offset = chunk->dictionary_page_offset();
+        const auto data_offset = chunk->data_page_offset();
+        if (data_offset > dict_offset) {
+            bytes += data_offset - dict_offset;
+        }
+    }
+    return bytes;
+}
+
+/// The number of entries in a column's dictionary, summed over row groups, or
+/// nullopt when any row group does not expose one.
+///
+/// Read from the dictionary page's own header. Callers must bound this with
+/// `dictionary_bytes` first: a dictionary page is only bounded by the writer's
+/// page-size limit, and reading `l_comment`'s -- megabytes of strings this
+/// decision does not need -- to learn that it has far too many entries would
+/// cost more than the decision saves.
+inline auto dictionary_entry_count(parquet::ParquetFileReader& reader, int col)
+    -> std::optional<std::int64_t> {
+    const auto& metadata = *reader.metadata();
+    std::int64_t entries = 0;
+    for (int group = 0; group < metadata.num_row_groups(); ++group) {
+        auto pages = reader.RowGroup(group)->GetColumnPageReader(col);
+        if (pages == nullptr) {
+            return std::nullopt;
+        }
+        const auto page = pages->NextPage();
+        if (page == nullptr || page->type() != parquet::PageType::DICTIONARY_PAGE) {
+            return std::nullopt;
+        }
+        entries += static_cast<const parquet::DictionaryPage&>(*page).num_values();
+    }
+    return entries;
+}
+
+inline auto dictionary_column_indices(parquet::ParquetFileReader& reader) -> std::vector<int> {
+    const auto& metadata = *reader.metadata();
     std::vector<int> out;
     for (int col = 0; col < metadata.num_columns(); ++col) {
         if (metadata.schema()->Column(col)->physical_type() != parquet::Type::BYTE_ARRAY) {
@@ -754,6 +799,45 @@ inline auto dictionary_column_indices(const parquet::FileMetaData& metadata) -> 
                 }
             }
         }
+        // A dictionary must be small to be worth having. Reading a column as
+        // `Column<Categorical>` interns every dictionary entry, which costs
+        // ~400ns each and buys nothing when the dictionary is nearly as large
+        // as the column: supplier's s_name has one entry per row, and paying
+        // that turned a 20,000-row read into 9ms. Few entries is the condition
+        // that makes Categorical worth it on BOTH sides -- cheap to intern, and
+        // the representation downstream group-bys hash by code rather than by
+        // string. So this is a single test on the absolute entry count, with no
+        // row-count floor: `nation`'s 25 names stay categorical because 25
+        // entries are 25 entries, whatever the table's size.
+        if (fully_dictionary) {
+            // Bracket the entry count from the dictionary's byte size before
+            // reading it. A BYTE_ARRAY entry is a 4-byte length plus at least
+            // one character, so `bytes / 5` is the most entries it can hold;
+            // and an entry averaging more than `kBoundStringBytes` is one this
+            // decision would reject anyway, since interning copies those bytes.
+            // Only a dictionary whose bracket straddles the threshold has to be
+            // read -- which leaves the small, genuinely borderline ones.
+            namespace policy = ibex::parquet_dict;
+            const std::int64_t rows = metadata.num_rows();
+            switch (policy::verdict_from_bytes(dictionary_bytes(metadata, col), rows)) {
+                case policy::Verdict::Keep:
+                    break;
+                case policy::Verdict::Dense:
+                    fully_dictionary = false;
+                    break;
+                case policy::Verdict::NeedsCount: {
+                    const auto entries = dictionary_entry_count(reader, col);
+                    fully_dictionary = entries.has_value() && policy::worth_keeping(*entries, rows);
+                    break;
+                }
+            }
+        }
+        if (std::getenv("IBEX_DICT_ENTRY_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[dict] col=%-18s dict_bytes=%9lld -> %s\n",
+                         metadata.schema()->Column(col)->name().c_str(),
+                         static_cast<long long>(dictionary_bytes(metadata, col)),
+                         fully_dictionary ? "categorical" : "dense");
+        }
         if (fully_dictionary) {
             out.push_back(col);
         }
@@ -764,6 +848,24 @@ inline auto dictionary_column_indices(const parquet::FileMetaData& metadata) -> 
 /// Open `input` as an Arrow-backed Parquet reader, reading every fully
 /// dictionary-encoded string column straight back as a dictionary rather than
 /// materializing one `std::string` per row.
+/// `dictionary_column_indices`, computed once per file.
+inline auto cached_dictionary_column_indices(parquet::ParquetFileReader& reader,
+                                             const std::string& path) -> std::vector<int> {
+    static std::mutex mutex;
+    static std::map<std::pair<std::string, std::int64_t>, std::vector<int>> cache;
+    const auto key = std::pair{path, reader.metadata()->num_rows()};
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto it = cache.find(key); it != cache.end()) {
+            return it->second;
+        }
+    }
+    auto columns = dictionary_column_indices(reader);
+    const std::lock_guard lock(mutex);
+    cache.emplace(key, columns);
+    return columns;
+}
+
 inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> input,
                                 const std::string& path)
     -> std::unique_ptr<parquet::arrow::FileReader> {
@@ -775,7 +877,11 @@ inline auto make_parquet_reader(std::shared_ptr<arrow::io::RandomAccessFile> inp
     }
 
     auto properties = parquet::default_arrow_reader_properties();
-    for (int col : dictionary_column_indices(*builder.raw_reader()->metadata())) {
+    // Memoized per file: deciding this reads the borderline dictionaries, and
+    // a reader is built many times over a query's life (the pool hands out one
+    // per worker). Keyed by path and row count so a file replaced underneath a
+    // long-lived process is not answered from the old entry.
+    for (int col : cached_dictionary_column_indices(*builder.raw_reader(), path)) {
         properties.set_read_dictionary(col, true);
     }
     builder.properties(properties);
@@ -2785,7 +2891,17 @@ class ParquetLazyReaderFactoryState {
         : input_(std::move(input)),
           metadata_(std::move(metadata)),
           first_reader_(std::move(first_reader)),
-          path_(std::move(path)) {}
+          path_(std::move(path)) {
+        // Decided here rather than in `make_reader`, because deciding it needs
+        // a file reader (the dictionary entry counts come from the pages
+        // themselves) and `first_reader_` is moved out on the first call. One
+        // probe per file, reused by every reader the factory hands out -- which
+        // also keeps the choice identical across them, as it must be: two
+        // readers disagreeing would give one column two representations.
+        if (first_reader_ != nullptr) {
+            dictionary_columns_ = dictionary_column_indices(*first_reader_->parquet_reader());
+        }
+    }
 
     auto make_reader() -> std::unique_ptr<parquet::arrow::FileReader> {
         {
@@ -2794,8 +2910,6 @@ class ParquetLazyReaderFactoryState {
                 return std::move(first_reader_);
             }
         }
-        std::call_once(dictionary_columns_once_,
-                       [&] { dictionary_columns_ = dictionary_column_indices(*metadata_); });
         return make_parquet_reader(input_, path_, metadata_, dictionary_columns_);
     }
 
@@ -2807,7 +2921,6 @@ class ParquetLazyReaderFactoryState {
     std::shared_ptr<arrow::io::RandomAccessFile> input_;
     std::shared_ptr<parquet::FileMetaData> metadata_;
     std::vector<int> dictionary_columns_;
-    std::once_flag dictionary_columns_once_;
     std::unique_ptr<parquet::arrow::FileReader> first_reader_;
     std::string path_;
     std::mutex first_reader_mutex_;

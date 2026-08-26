@@ -400,3 +400,29 @@ TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",
         }
     }
 }
+
+TEST_CASE("chunked aggregate: clustered integer counts merge runs across chunks",
+          "[runtime][chunked][aggregate]") {
+    constexpr std::size_t kRows = 300'000;
+    Column<std::int64_t> keys;
+    keys.reserve(kRows);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        keys.push_back(static_cast<std::int64_t>(row / 4));
+    }
+    runtime::Table table;
+    table.add_column("k", std::move(keys));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+    const std::string query = "t[select { n = count() }, by { k }];";
+
+    const auto whole = run(query, registry);
+    // Deliberately not divisible by the four-row run length: every boundary
+    // bisects a group, so the per-chunk summaries must coalesce it exactly.
+    const ChunkGrainGuard guard{"70001"};
+    const auto chunked = run(query, registry);
+    REQUIRE(chunked.rows() == 75'000);
+    auto mismatch = runtime::compare_tables(whole, chunked);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}

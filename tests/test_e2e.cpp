@@ -3278,6 +3278,38 @@ TEST_CASE("partitioned group discovery matches the serial groups exactly",
     require_tables_equal(serial, parallel);
 }
 
+TEST_CASE("owned integer counts collapse clustered runs without changing group order",
+          "[runtime][parallel][aggregate]") {
+    constexpr std::size_t kRows = 300'000;
+    const auto check = [](std::vector<std::int64_t> keys) {
+        runtime::Table table;
+        table.add_column("k", Column<std::int64_t>{std::move(keys)});
+        runtime::TableRegistry tables;
+        tables.emplace("t", std::move(table));
+        constexpr std::string_view src = "t[select { n = count() }, by { k }];";
+        const auto serial = run_parallel(src, tables, 0, 1);
+        const auto parallel = run_parallel(src, tables, 0, 4);
+        require_tables_equal(serial, parallel);
+    };
+
+    SECTION("nondecreasing runs cross worker ranges") {
+        std::vector<std::int64_t> keys(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            keys[row] = static_cast<std::int64_t>(row / 4);
+        }
+        check(std::move(keys));
+    }
+
+    SECTION("clustered but unordered runs take the exact hash fallback") {
+        std::vector<std::int64_t> keys(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            const std::size_t run = row / 4;
+            keys[row] = static_cast<std::int64_t>((run * 7919) % 50'003);
+        }
+        check(std::move(keys));
+    }
+}
+
 TEST_CASE("partitioned group discovery matches the serial groups on string keys",
           "[runtime][parallel][aggregate]") {
     // The string counterpart of the case above, and the one that matters most:

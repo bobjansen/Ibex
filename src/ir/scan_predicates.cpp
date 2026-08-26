@@ -21,6 +21,10 @@
 #include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
+/// Above this fraction of its own base table, a build side covers too much of
+/// the join key's domain for a published Bloom/bounds filter to reject
+/// anything worth the apparatus. Calibrated below, not chosen blind.
+constexpr double kMaxBuildDomainCoverage = 0.9;
 // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast in this file
 // is guarded by a node.kind() check (or switch) matching the target node type.
 namespace {
@@ -37,7 +41,85 @@ auto append_conjuncts(const Expr& expr, std::vector<Expr>& out) -> bool {
     return true;
 }
 
-auto projected_scan(const Node& node) -> const ScanNode* {
+/// Every column name an expression reads.
+void expr_column_names(const Expr& expr, std::set<std::string>& out) {
+    if (const auto* ref = std::get_if<ColumnRef>(&expr.node)) {
+        out.insert(ref->name);
+        return;
+    }
+    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
+        if (cmp->left != nullptr) {
+            expr_column_names(*cmp->left, out);
+        }
+        if (cmp->right != nullptr) {
+            expr_column_names(*cmp->right, out);
+        }
+        return;
+    }
+    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node)) {
+        if (logical->left != nullptr) {
+            expr_column_names(*logical->left, out);
+        }
+        if (logical->right != nullptr) {
+            expr_column_names(*logical->right, out);
+        }
+        return;
+    }
+    if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
+        if (binary->left != nullptr) {
+            expr_column_names(*binary->left, out);
+        }
+        if (binary->right != nullptr) {
+            expr_column_names(*binary->right, out);
+        }
+        return;
+    }
+    if (const auto* is_null = std::get_if<IsNullExpr>(&expr.node)) {
+        if (is_null->operand != nullptr) {
+            expr_column_names(*is_null->operand, out);
+        }
+        return;
+    }
+    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
+        for (const auto& arg : call->args) {
+            if (arg != nullptr) {
+                expr_column_names(*arg, out);
+            }
+        }
+        for (const auto& named : call->named_args) {
+            if (named.value != nullptr) {
+                expr_column_names(*named.value, out);
+            }
+        }
+    }
+}
+
+/// True when the predicate reads a name that only exists above a Rename.
+auto predicate_reads_introduced_name(const Expr& predicate, const std::set<std::string>& introduced)
+    -> bool {
+    if (introduced.empty()) {
+        return false;
+    }
+    std::set<std::string> used;
+    expr_column_names(predicate, used);
+    return std::ranges::any_of(used,
+                               [&](const std::string& name) { return introduced.contains(name); });
+}
+
+/// The Scan a filter sits on, when every node between the two preserves rows
+/// and leaves the predicate's names resolvable against the scan.
+///
+/// `introduced` collects the names each Rename on the way down CREATES. Those
+/// names do not exist at the scan, so a predicate that reads one cannot be
+/// evaluated there and the caller must decline. Names the Rename leaves alone
+/// still resolve, which is the case that matters: a mapped join key
+/// (`part join lineitem on { p_partkey = l_partkey }` -- most of TPC-H) makes
+/// `push_filters_into_joins` land the pushed filter on Filter(Rename(Scan)),
+/// and without this the filter never fuses into the decode. The scan then
+/// decodes every row of every column and an ordinary Filter operator throws
+/// almost all of them away: q14 materializes 48M values to keep 150k rows.
+auto projected_scan(const Node& node, std::set<std::string>* introduced = nullptr)
+    -> const ScanNode* {
     if (node.children().size() != 1 || node.children().front() == nullptr) {
         return nullptr;
     }
@@ -118,8 +200,12 @@ auto take_unique_child(Node& parent) -> NodePtr {
 auto is_applied_scan_filter(const Node& node, const std::set<std::string>& applied_sources)
     -> bool {
     const auto* predicate = filter_predicate(node);
-    const auto* scan = projected_scan(node);
+    std::set<std::string> introduced;
+    const auto* scan = projected_scan(node, &introduced);
     if (predicate == nullptr || scan == nullptr || !applied_sources.contains(scan->source_name())) {
+        return false;
+    }
+    if (predicate_reads_introduced_name(*predicate, introduced)) {
         return false;
     }
     std::vector<Expr> conjuncts;
@@ -203,7 +289,9 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
     }
 
     if (const auto* predicate = filter_predicate(node)) {
-        if (const auto* scan = projected_scan(node)) {
+        std::set<std::string> introduced;
+        if (const auto* scan = projected_scan(node, &introduced);
+            scan != nullptr && !predicate_reads_introduced_name(*predicate, introduced)) {
             std::vector<Expr> conjuncts;
             if (append_conjuncts(*predicate, conjuncts)) {
                 auto& destination = candidates[scan->source_name()];
@@ -395,9 +483,51 @@ auto match_probe_chain(const Node& node, std::string key)
 // project_deferred_probe_no_cost_model.md). `row_counts` empty or the
 // estimate unavailable means "no information": permissive by default,
 // matching every existing caller (see the header doc).
+/// How much of its own base table the build side still carries, as a fraction.
+///
+/// The row-count gate below asks "is the build side smaller than the probe
+/// side". That is the wrong question when a table is small *by construction*
+/// rather than *by filtering*: q12 joins an unfiltered `orders` (1.5M rows)
+/// into `lineitem` (12M), passing the row-count gate three times over, yet
+/// every `l_orderkey` references a real `o_orderkey`, so the published Bloom
+/// rejects nothing and the whole apparatus is a pure loss. q14 is the same
+/// shape with `part`.
+///
+/// What separates those from q03 is not size but COVERAGE of the join key's
+/// value domain. Estimating that directly needs the probe key's distinct
+/// count, which this codebase has already been burned by twice (a sampled
+/// count regressed q10 5x; the footer span reads far above the truth for
+/// `l_orderkey`, whose generator skips values). So do not ask the probe side
+/// anything. Ask only about the BUILD side's own table: trace its key back to
+/// the base table it structurally comes from, and compare that table's
+/// unfiltered row count against the build side's estimated (filtered) rows.
+/// A build side still carrying all of its own table covers all of the key
+/// domain it can ever contribute, whatever the probe side looks like.
+///
+///   q12  origin orders, 1.5M of 1.5M   -> 1.00  decline
+///   q14  origin part,   400k of 400k   -> 1.00  decline
+///   q03  origin orders, filtered       -> well under 1, accept
+///
+/// A build side's own row count also caps its distinct keys ("no operator
+/// invents values"), so this needs no uniqueness proof and cannot be inflated
+/// by key skew the way a footer-derived distinct estimate can.
+auto build_side_key_domain_ratio(const JoinNode& join, const SourceRowCounts& row_counts,
+                                 const SourceSchemas& schemas, std::size_t build_rows)
+    -> std::optional<double> {
+    const auto origin = column_origin_of(*join.children()[0], join.keys().front().left, schemas);
+    if (!origin.has_value()) {
+        return std::nullopt;  // computed/derived key: no base table to size
+    }
+    const auto domain = row_counts.find(origin->source);
+    if (domain == row_counts.end() || domain->second == 0) {
+        return std::nullopt;
+    }
+    return static_cast<double>(build_rows) / static_cast<double>(domain->second);
+}
+
 auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_source,
-                                const SourceRowCounts& row_counts, const SourceSchemas& schemas)
-    -> bool {
+                                const SourceRowCounts& row_counts, const SourceSchemas& schemas,
+                                const std::map<std::string, double>& absorbed) -> bool {
     if (row_counts.empty()) {
         return true;  // gate disabled: caller supplied no cardinality info
     }
@@ -406,19 +536,34 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
         return true;  // probe source's own size unknown: nothing to compare against
     }
     const CardinalityEstimate build_est =
-        estimate_cardinality(*join.children()[0], row_counts, schemas);
+        estimate_cardinality(*join.children()[0], row_counts, schemas,
+                             CardinalityOptions{.absorbed_scan_selectivity = absorbed});
     if (!build_est.rows.has_value()) {
         return true;  // build side unestimable: decline to guess, stay permissive
     }
     // Slack factor: estimates are approximate (heuristic filter selectivity,
     // footer-span distinct counts), so require the build side to be clearly
     // smaller rather than gating on any margin at all.
-    return *build_est.rows * 2 < probe_rows->second;
+    if (*build_est.rows * 2 >= probe_rows->second) {
+        return false;
+    }
+    // Cheap check first, so the origin trace is only paid where it can matter.
+    const auto ratio = build_side_key_domain_ratio(join, row_counts, schemas, *build_est.rows);
+    if (std::getenv("IBEX_PROBE_GATE_DEBUG") != nullptr) {
+        const auto origin =
+            column_origin_of(*join.children()[0], join.keys().front().left, schemas);
+        std::fprintf(stderr, "[probe-gate] probe=%s key=%s build_rows=%zu origin=%s ratio=%s\n",
+                     probe_source.c_str(), join.keys().front().left.c_str(), *build_est.rows,
+                     origin.has_value() ? origin->source.c_str() : "<none>",
+                     ratio.has_value() ? std::to_string(*ratio).c_str() : "<none>");
+    }
+    return !ratio.has_value() || *ratio < kMaxBuildDomainCoverage;
 }
 
 void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         const std::map<std::string, std::size_t>& counts,
                         const SourceRowCounts& row_counts, const SourceSchemas& schemas,
+                        const std::map<std::string, double>& absorbed,
                         std::map<std::string, DeferrableProbeScan>& out) {
     if (node.kind() == NodeKind::Join) {
         const auto& join = static_cast<const JoinNode&>(node);
@@ -445,7 +590,7 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                 match.has_value() && sources.contains(match->first)) {
                 if (const auto count = counts.find(match->first);
                     count != counts.end() && count->second == 1 &&
-                    build_side_worth_deferring(join, match->first, row_counts, schemas)) {
+                    build_side_worth_deferring(join, match->first, row_counts, schemas, absorbed)) {
                     out.emplace(match->first,
                                 DeferrableProbeScan{.key_column = std::move(match->second)});
                 }
@@ -454,7 +599,7 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
     }
     for (const auto& child : node.children()) {
         if (child != nullptr) {
-            collect_deferrable(*child, sources, counts, row_counts, schemas, out);
+            collect_deferrable(*child, sources, counts, row_counts, schemas, absorbed, out);
         }
     }
 }
@@ -493,7 +638,8 @@ auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
 }
 
 auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources,
-                            const SourceRowCounts& row_counts, const SourceSchemas& schemas)
+                            const SourceRowCounts& row_counts, const SourceSchemas& schemas,
+                            const std::map<std::string, double>& absorbed_scan_selectivity)
     -> std::map<std::string, DeferrableProbeScan> {
     std::map<std::string, DeferrableProbeScan> out;
     if (sources.empty()) {
@@ -501,7 +647,7 @@ auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sourc
     }
     std::map<std::string, std::size_t> counts;
     count_scan_occurrences(root, counts);
-    collect_deferrable(root, sources, counts, row_counts, schemas, out);
+    collect_deferrable(root, sources, counts, row_counts, schemas, absorbed_scan_selectivity, out);
     return out;
 }
 

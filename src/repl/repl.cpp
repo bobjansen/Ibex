@@ -5046,6 +5046,24 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                 applied_filters.insert(name);
             }
         }
+        // What absorption is about to take out of the tree. The deferred-probe
+        // gate weighs a build side's filtered row estimate against its own
+        // table's size, and `remove_applied_scan_filters` deletes exactly the
+        // Filter nodes that estimate is made of -- without this every build
+        // side reads back its full table, and q03's filtered customer becomes
+        // indistinguishable from q12's unfiltered orders.
+        std::map<std::string, double> absorbed_scan_selectivity;
+        for (const auto& name : applied_filters) {
+            const auto conjuncts = predicates.find(name);
+            if (conjuncts == predicates.end()) {
+                continue;
+            }
+            double selectivity = 1.0;
+            for (const auto& conjunct : conjuncts->second) {
+                selectivity *= ir::compound_selectivity(conjunct);
+            }
+            absorbed_scan_selectivity.emplace(name, selectivity);
+        }
         if (!applied_filters.empty()) {
             rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
         }
@@ -5077,8 +5095,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         runtime::ExecutionContext exec{.deferred_scans = &deferred_scans,
                                        .execution_profile = nullptr};
         runtime::configure_parallel_from_env(exec);
-        for (auto& [name, info] :
-             ir::deferrable_probe_scans(*rewritten, deferrable_names, row_counts, schemas)) {
+        for (auto& [name, info] : ir::deferrable_probe_scans(
+                 *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
             if (needed == demand.end() || lazy == nullptr) {

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <variant>
@@ -36,12 +37,6 @@ auto count_conjuncts(const Expr& expr) -> int {
     return 1;
 }
 
-/// `filter_selectivity` raised to the conjunct count, treating each conjunct
-/// as an independent restriction (the standard independence assumption).
-auto compound_selectivity(const Expr& predicate, double filter_selectivity) -> double {
-    return std::pow(filter_selectivity, count_conjuncts(predicate));
-}
-
 // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
 // guarded by the switch on node.kind() matching the target node type.
 auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSchemas& schemas,
@@ -56,8 +51,18 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         case NodeKind::Scan: {
             const auto& scan = static_cast<const ScanNode&>(node);
             const auto found = sources.find(scan.source_name());
-            return found == sources.end() ? CardinalityEstimate{}
-                                          : CardinalityEstimate{.rows = found->second};
+            if (found == sources.end()) {
+                return CardinalityEstimate{};
+            }
+            const auto absorbed = options.absorbed_scan_selectivity.find(scan.source_name());
+            if (absorbed == options.absorbed_scan_selectivity.end()) {
+                return CardinalityEstimate{.rows = found->second};
+            }
+            // A filter fused into this scan's decode still removes its rows,
+            // even though the Filter node that expressed it is gone.
+            return {.rows = static_cast<std::size_t>(
+                        std::llround(static_cast<double>(found->second) * absorbed->second)),
+                    .heuristic = true};
         }
         case NodeKind::Program:
             return estimate(static_cast<const ProgramNode&>(node).main_node(), sources, schemas,
@@ -361,6 +366,10 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
 // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
+
+auto compound_selectivity(const Expr& predicate, double filter_selectivity) -> double {
+    return std::pow(filter_selectivity, count_conjuncts(predicate));
+}
 
 auto estimate_cardinality(const Node& root, const SourceRowCounts& sources,
                           const SourceSchemas& schemas, CardinalityOptions options)

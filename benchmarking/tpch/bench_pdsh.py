@@ -4,9 +4,12 @@
 
 """Time the upstream Polars PDS-H implementations against Ibex's Parquet data.
 
-This deliberately invokes the upstream query modules unchanged.  It therefore
-measures the PDS project's Polars lazy expressions and DuckDB SQL separately
-from this repository's hand-written Polars implementation (``bench_polars.py``).
+This deliberately invokes the upstream query modules unchanged, so the
+reference is the PDS project's own Polars lazy expressions and DuckDB SQL.
+This repository used to carry a second, hand-written Polars implementation
+alongside them; it was removed because a reference engine we maintain
+ourselves is one we can accidentally tune, and its query shapes had drifted
+from upstream's.
 """
 import argparse
 import csv

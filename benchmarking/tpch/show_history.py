@@ -44,7 +44,7 @@ def fmt_ms(v: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--framework", required=True, help="e.g. ibex, ibex-st, polars, pdsh-polars")
+    parser.add_argument("--framework", required=True, help="e.g. ibex, ibex-st, pdsh-polars, pdsh-duckdb")
     parser.add_argument("--query", help="e.g. q14 — omit to show every query's LATEST run only")
     parser.add_argument("--sf", type=int, help="scale factor filter")
     parser.add_argument("--cores", help="cores filter (e.g. 8, or 'all:24') — a matrix-sweep run "

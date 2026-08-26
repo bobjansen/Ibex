@@ -16,19 +16,19 @@ Usage:
 
 Examples:
     # Compare current Ibex and Polars SF-2 results
-    python3 compare_polars_detailed.py --ibex results/ibex_sf2.tsv --polars results/polars_sf2.tsv
+    python3 compare_polars_detailed.py --ibex results/ibex_sf2.tsv --polars results/pdsh_polars_sf2.tsv
 
     # Include upstream PDS results
     python3 compare_polars_detailed.py \\
         --ibex results/ibex_sf2.tsv \\
-        --polars results/polars_sf2.tsv \\
+        --polars results/pdsh_polars_sf2.tsv \\
         --pdsh results/pdsh_polars_sf2.tsv \\
         --title "SF-2 Query Alignment Test"
 
     # Compare archived runs
     python3 compare_polars_detailed.py \\
         --ibex results/runs/20260818T185136Z_4616c063_sf2/ibex_sf2.tsv \\
-        --polars results/runs/20260818T185136Z_4616c063_sf2/polars_sf2.tsv \\
+        --polars results/runs/20260818T185136Z_4616c063_sf2/pdsh_polars_sf2.tsv \\
         --title "Aug 18: Post-alignment"
 """
 
@@ -90,8 +90,8 @@ def main():
     )
     parser.add_argument("--ibex", default="results/ibex_sf2.tsv",
                         help="Ibex benchmark results (default: results/ibex_sf2.tsv)")
-    parser.add_argument("--polars", default="results/polars_sf2.tsv",
-                        help="Polars benchmark results (default: results/polars_sf2.tsv)")
+    parser.add_argument("--polars", default="results/pdsh_polars_sf2.tsv",
+                        help="Polars benchmark results (default: results/pdsh_polars_sf2.tsv)")
     parser.add_argument("--pdsh", help="Upstream PDS Polars results (optional)")
     parser.add_argument("--title", default="PDS-H Benchmark Comparison: Ibex vs Polars",
                         help="Report title")

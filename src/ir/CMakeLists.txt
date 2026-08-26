@@ -20,6 +20,7 @@ add_library(ibex_ir STATIC
     predicate_pushdown_pass.cpp
     required_columns.cpp
     column_origins.cpp
+    distinct_key_reduction.cpp
     group_key_reduction.cpp
     scan_predicates.cpp
     schema.cpp

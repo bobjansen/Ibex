@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/join_output.hpp>
 
@@ -164,19 +165,13 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
                                    child_origins(node, sources));
 
         case NodeKind::Rename: {
-            // Renaming changes what a column is CALLED, never where it came
-            // from. Applied in sequence, as the schema pass applies it, so the
-            // two cannot disagree about a chain like a->b, b->c.
             const auto& rename = static_cast<const RenameNode&>(node);
-            ColumnOriginMap out = child_origins(node, sources);
-            for (const auto& spec : rename.renames()) {
-                const auto it = out.find(spec.old_name);
-                if (it == out.end()) {
-                    continue;
-                }
-                ColumnOrigin origin = it->second;
-                out.erase(it);
-                out.insert_or_assign(spec.new_name, std::move(origin));
+            const ColumnNameMap names(rename.renames());
+            const ColumnOriginMap input = child_origins(node, sources);
+            ColumnOriginMap out;
+            out.reserve(input.size());
+            for (const auto& [name, origin] : input) {
+                out.insert_or_assign(std::string(names.output_name(name)), origin);
             }
             return out;
         }

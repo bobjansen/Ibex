@@ -27,6 +27,8 @@ struct Relation {
     /// join key. Absent means the plan cannot be costed at all -- see
     /// `collect_left_deep`.
     std::map<std::string, double> distinct;
+    /// Logical folded-key output name -> this leaf's native input name.
+    std::map<std::string, std::string> key_inputs;
 };
 
 struct JoinEdge {
@@ -130,18 +132,18 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
         relations.push_back(Relation{.node = &node,
                                      .rows = static_cast<double>(*estimate.rows),
                                      .schema = schema,
-                                     .distinct = {}});
+                                     .distinct = {},
+                                     .key_inputs = {}});
         return true;
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
-    // `JoinEdge::keys` and every distinct estimate hanging off them are keyed
-    // by bare column name, so one name has to mean one column across the whole
-    // chain. `normalize_mapped_join_keys` folds mapped keys away wherever the
-    // fold is unobservable; one that survives to here could not be folded, and
-    // the chain keeps its source order rather than being costed on a guess.
+    // Each edge needs one logical key name across the whole chain.
+    // `normalize_mapped_join_keys` supplies that name for safe mapped keys;
+    // one that remains non-folded keeps its source order rather than being
+    // costed on a guess.
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
+        !join_keys_are_folded(join.keys()) || join.children().size() != 2 ||
         join.children()[0] == nullptr || join.children()[1] == nullptr ||
         join.children()[1]->kind() == NodeKind::Join) {
         return false;
@@ -150,14 +152,27 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
         !collect_left_deep(*join.children()[1], stats, relations, edges, all_filters_sampled)) {
         return false;
     }
-    edges.push_back(
-        JoinEdge{.right_relation = relations.size() - 1, .keys = left_join_key_names(join.keys())});
+    Relation& right = relations.back();
+    for (const auto& key : join.keys()) {
+        right.key_inputs.insert_or_assign(std::string(key.output_name()), key.right);
+    }
+    edges.push_back(JoinEdge{.right_relation = relations.size() - 1,
+                             .keys = join_key_output_names(join.keys())});
     return true;
 }
 
-auto has_all_keys(const SchemaInfo& schema, const std::vector<std::string>& keys) -> bool {
-    return std::ranges::all_of(keys,
-                               [&](const std::string& key) { return schema.find(key) != nullptr; });
+auto relation_input_name(const Relation& relation, const std::string& logical)
+    -> const std::string* {
+    if (const auto found = relation.key_inputs.find(logical); found != relation.key_inputs.end()) {
+        return &found->second;
+    }
+    return relation.schema.find(logical) != nullptr ? &logical : nullptr;
+}
+
+auto has_all_keys(const Relation& relation, const std::vector<std::string>& keys) -> bool {
+    return std::ranges::all_of(keys, [&](const std::string& key) {
+        return relation_input_name(relation, key) != nullptr;
+    });
 }
 
 /// Fill in every relation's distinct estimate for every column used as a join
@@ -176,10 +191,11 @@ auto resolve_key_distincts(std::vector<Relation>& relations, const std::vector<J
     }
     for (auto& relation : relations) {
         for (const auto& key : key_columns) {
-            if (relation.schema.find(key) == nullptr) {
+            const auto* input_name = relation_input_name(relation, key);
+            if (input_name == nullptr) {
                 continue;  // this relation does not carry that key
             }
-            const auto distinct = distinct_estimate(*relation.node, key, stats);
+            const auto distinct = distinct_estimate(*relation.node, *input_name, stats);
             if (!distinct.has_value()) {
                 return false;
             }
@@ -206,7 +222,7 @@ auto make_group(std::size_t index, const Relation& relation) -> Group {
 auto group_carries(const Group& group, const std::vector<Relation>& relations,
                    const std::string& key) -> bool {
     return std::ranges::any_of(group.members, [&](std::size_t member) {
-        return relations[member].schema.find(key) != nullptr;
+        return relation_input_name(relations[member], key) != nullptr;
     });
 }
 
@@ -266,7 +282,7 @@ void absorb(Group& group, std::size_t index, const Relation& relation,
 auto connecting_edge(const Group& group, const std::vector<Relation>& relations,
                      std::size_t candidate, const std::vector<JoinEdge>& edges) -> const JoinEdge* {
     for (const auto& edge : edges) {
-        if (!has_all_keys(relations[candidate].schema, edge.keys)) {
+        if (!has_all_keys(relations[candidate], edge.keys)) {
             continue;
         }
         const bool group_has_keys = std::ranges::all_of(edge.keys, [&](const std::string& key) {

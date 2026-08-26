@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/required_columns.hpp>
 
 #include <map>
@@ -275,19 +276,13 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
 
         case NodeKind::Rename: {
             const auto& rename = static_cast<const RenameNode&>(node);
+            const ColumnNameMap names(rename.renames());
             ColumnDemand below;
             if (need.all) {
                 below.widen();
             } else {
                 for (const auto& name : need.names) {
-                    const std::string* source = &name;
-                    for (const auto& spec : rename.renames()) {
-                        if (spec.new_name == name) {
-                            source = &spec.old_name;
-                            break;
-                        }
-                    }
-                    below.add(*source);
+                    below.add(std::string(names.input_name(name)));
                 }
             }
             visit_children(node, below, out);
@@ -358,8 +353,29 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             // added below. Recorded for `join_output_demand`, whose callers ask
             // whether a key column is read above the join at all.
             out.joins[&node].merge(need);
-            ColumnDemand left_below = need;
-            ColumnDemand right_below = need;
+            ColumnDemand left_below;
+            ColumnDemand right_below;
+            if (need.all) {
+                left_below.widen();
+                right_below.widen();
+            } else {
+                std::vector<RenameSpec> left_folded_names;
+                std::vector<RenameSpec> right_folded_names;
+                for (const auto& key : join.keys()) {
+                    if (key.folds_output()) {
+                        left_folded_names.push_back(RenameSpec{
+                            .new_name = std::string(key.output_name()), .old_name = key.left});
+                        right_folded_names.push_back(RenameSpec{
+                            .new_name = std::string(key.output_name()), .old_name = key.right});
+                    }
+                }
+                const ColumnNameMap left_names(left_folded_names);
+                const ColumnNameMap right_names(right_folded_names);
+                for (const auto& name : need.names) {
+                    left_below.add(left_names.input_name(name));
+                    right_below.add(right_names.input_name(name));
+                }
+            }
             for (const auto& key : join.keys()) {
                 left_below.add(key.left);
                 right_below.add(key.right);

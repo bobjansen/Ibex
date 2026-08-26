@@ -108,3 +108,24 @@ TEST_CASE("join order rejects an uncosted source", "[ir][join_order]") {
     auto root = q3_chain(builder);
     CHECK_FALSE(ir::choose_inner_join_order(*root, stats).has_value());
 }
+
+TEST_CASE("join order costs folded mapped keys under each leaf's native name", "[ir][join_order]") {
+    ir::SourceStats stats = q3_stats();
+    stats.schemas["orders"] = ir::SchemaInfo::known(
+        {{"o_custkey", ir::ColumnType::Int64}, {"o_orderkey", ir::ColumnType::Int64}});
+    stats.schemas["lineitem"] = ir::SchemaInfo::known({{"l_orderkey", ir::ColumnType::Int64}});
+    stats.distinct["orders"] = {{"o_custkey", 150'000}, {"o_orderkey", 1'500'000}};
+    stats.distinct["lineitem"] = {{"l_orderkey", 1'500'000}};
+
+    ir::Builder builder;
+    auto first = builder.join(ir::JoinKind::Inner, {{"c_custkey", "o_custkey", true}});
+    first->add_child(builder.scan("customer"));
+    first->add_child(builder.scan("orders"));
+    auto root = builder.join(ir::JoinKind::Inner, {{"o_orderkey", "l_orderkey", true}});
+    root->add_child(std::move(first));
+    root->add_child(builder.scan("lineitem"));
+
+    const auto order = ir::choose_inner_join_order(*root, stats);
+    REQUIRE(order.has_value());
+    CHECK(*order == std::vector<std::size_t>{0, 1, 2});
+}

@@ -375,12 +375,36 @@ enum class MatchSelection : std::uint8_t {
 struct JoinKey {
     std::string left;
     std::string right;
+    /// Fold the right input key into the left key's output column even when
+    /// the two inputs spell it differently. Matching still reads `left` and
+    /// `right` natively; this flag changes output metadata only.
+    bool fold_output = false;
+    /// Optional logical label for the folded output. Empty means `left`.
+    /// This lets join reordering keep both inputs native while preserving the
+    /// label of the original left-deep plan.
+    std::string output_name_override;
 
     JoinKey() = default;
     JoinKey(const char* name) : left(name), right(name) {}
     JoinKey(std::string name) : left(name), right(std::move(name)) {}
     JoinKey(std::string left_name, std::string right_name)
         : left(std::move(left_name)), right(std::move(right_name)) {}
+    JoinKey(std::string left_name, std::string right_name, bool fold)
+        : left(std::move(left_name)), right(std::move(right_name)), fold_output(fold) {}
+    JoinKey(std::string left_name, std::string right_name, bool fold, std::string output_name)
+        : left(std::move(left_name)),
+          right(std::move(right_name)),
+          fold_output(fold),
+          output_name_override(std::move(output_name)) {}
+
+    [[nodiscard]] auto folds_output() const noexcept -> bool {
+        return fold_output || left == right;
+    }
+
+    [[nodiscard]] auto output_name() const noexcept -> std::string_view {
+        return output_name_override.empty() ? std::string_view(left)
+                                            : std::string_view(output_name_override);
+    }
 
     auto operator==(const JoinKey&) const -> bool = default;
 };
@@ -420,8 +444,24 @@ struct JoinSuffixPolicy {
     return names;
 }
 
+[[nodiscard]] inline auto join_key_output_names(const std::vector<JoinKey>& keys)
+    -> std::vector<std::string> {
+    std::vector<std::string> names;
+    names.reserve(keys.size());
+    for (const auto& key : keys) {
+        names.emplace_back(key.output_name());
+    }
+    return names;
+}
+
 [[nodiscard]] inline auto join_keys_are_same_named(const std::vector<JoinKey>& keys) -> bool {
     return std::ranges::all_of(keys, [](const JoinKey& key) { return key.left == key.right; });
+}
+
+/// True when every key has one logical output column, whether its two inputs
+/// use the same spelling or the join planner explicitly folded a mapped pair.
+[[nodiscard]] inline auto join_keys_are_folded(const std::vector<JoinKey>& keys) -> bool {
+    return std::ranges::all_of(keys, &JoinKey::folds_output);
 }
 
 /// Aggregation specification: apply function to column, store as alias.
@@ -906,11 +946,9 @@ class JoinNode final : public Node {
     }
     void set_pending_order(std::vector<OrderKey> keys) { pending_order_ = std::move(keys); }
 
-    /// Rewrite the key list in place. The one caller is
-    /// `normalize_mapped_join_keys`, which pairs it with a `Rename` inserted
-    /// below the right child so the join reads the same columns under new
-    /// names. Changing keys without that rename changes what the join matches
-    /// on, so this is not a general-purpose setter.
+    /// Rewrite the key list in place for optimizer transformations that retain
+    /// matching semantics while changing physical spellings or folded-output
+    /// metadata.
     void set_keys(std::vector<JoinKey> keys) { keys_ = std::move(keys); }
 
    private:

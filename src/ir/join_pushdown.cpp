@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/mapped_join_keys.hpp>
@@ -96,9 +97,11 @@ auto classify(const Expr& conjunct, const SchemaInfo& left, const SchemaInfo& ri
         return Destination::Above;
     }
 
-    auto is_key = [&](const std::string& name) {
-        return std::ranges::any_of(
-            keys, [&](const JoinKey& key) { return key.left == name && key.right == name; });
+    const auto folded_key = [&](const std::string& name) -> const JoinKey* {
+        const auto found = std::ranges::find_if(keys, [&](const JoinKey& key) {
+            return key.folds_output() && key.output_name() == name;
+        });
+        return found == keys.end() ? nullptr : &*found;
     };
 
     // Above the join a name shared by both sides resolves to the LEFT column,
@@ -109,7 +112,8 @@ auto classify(const Expr& conjunct, const SchemaInfo& left, const SchemaInfo& ri
         // All refs are join keys present on both sides: keys are equal on
         // every surviving row, so the conjunct may pre-filter BOTH inputs.
         if (right.is_known() && std::ranges::all_of(refs, [&](const std::string& name) {
-                return is_key(name) && right.find(name) != nullptr;
+                const auto* key = folded_key(name);
+                return key != nullptr && right.find(key->right) != nullptr;
             })) {
             return Destination::BothSides;
         }
@@ -122,12 +126,25 @@ auto classify(const Expr& conjunct, const SchemaInfo& left, const SchemaInfo& ri
     // Known left schema.
     if (right.is_known() && left.is_known() && !left.is_open() &&
         std::ranges::all_of(refs, [&](const std::string& name) {
-            return right.find(name) != nullptr && (left.find(name) == nullptr || is_key(name));
+            return right.find(name) != nullptr &&
+                   (left.find(name) == nullptr || folded_key(name) != nullptr);
         })) {
         return Destination::Right;
     }
 
     return Destination::Above;
+}
+
+auto remap_folded_key_refs_to_right(Expr expr, const std::vector<JoinKey>& keys) -> Expr {
+    std::vector<RenameSpec> aliases;
+    for (const auto& key : keys) {
+        if (key.folds_output() && key.output_name() != key.right) {
+            aliases.push_back(
+                RenameSpec{.new_name = std::string(key.output_name()), .old_name = key.right});
+        }
+    }
+    ColumnNameMap(aliases).remap_expr_to_input(expr);
+    return expr;
 }
 
 /// Rewrite one `Filter(pred, Join(a, b))` root. Children are assumed already
@@ -159,14 +176,6 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
     std::vector<Expr> kept_parts;
     for (const Expr* conjunct : conjuncts) {
         Destination dest = classify(*conjunct, left_schema, right_schema, join.keys());
-        // A mapped key has a different name on each input.  A predicate on
-        // that output key may still safely move to its owning (left) input,
-        // but it cannot be copied to the right without rewriting its column
-        // reference.  Keep it left-only; non-key predicates need no remap and
-        // retain the normal side classification.
-        if (!join_keys_are_same_named(join.keys()) && dest == Destination::BothSides) {
-            dest = Destination::Left;
-        }
         // Join-kind gating: only the non-null-supplying side may pre-filter.
         // Semi/Anti join the same way here: the left side is exactly the
         // "preserved" side (its rows survive or don't; the right side never
@@ -197,7 +206,7 @@ auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> Nod
                 break;
             case Destination::BothSides:
                 left_parts.push_back(*conjunct);
-                right_parts.push_back(*conjunct);
+                right_parts.push_back(remap_folded_key_refs_to_right(*conjunct, join.keys()));
                 break;
             case Destination::Above:
                 kept_parts.push_back(*conjunct);
@@ -280,7 +289,7 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
     // here could not be (see `rewrite_filter_over_join` for the list of why).
     if ((outer.kind() != JoinKind::Semi && outer.kind() != JoinKind::Anti) ||
         outer.predicate().has_value() || outer.keys().empty() ||
-        !join_keys_are_same_named(outer.keys())) {
+        !join_keys_are_folded(outer.keys())) {
         return node;
     }
     if (outer.children().size() != 2 || outer.children()[0] == nullptr ||
@@ -298,13 +307,13 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
 
     const SchemaInfo left = infer_schema(*inner.children()[0], sources);
     const SchemaInfo right = infer_schema(*inner.children()[1], sources);
-    const auto keys = left_join_key_names(outer.keys());
+    const auto keys = join_key_output_names(outer.keys());
     const auto in_schema = [](const SchemaInfo& s, const std::string& name) {
         return s.is_known() && s.find(name) != nullptr;
     };
     const auto is_inner_key = [&](const std::string& name) {
         return std::ranges::any_of(inner.keys(), [&](const JoinKey& key) {
-            return key.left == name && key.right == name;
+            return key.folds_output() && key.output_name() == name;
         });
     };
     // A left push is licensed when every key is in the (Known) left schema — a
@@ -334,6 +343,18 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
     // `node` (the semi/anti join) is reattached over the chosen side and Z, then
     // pushed again in case that side is itself a join it can descend into.
     NodePtr& target = push_left ? x : y;
+    if (push_right) {
+        std::vector<JoinKey> remapped = outer.keys();
+        for (auto& outer_key : remapped) {
+            const auto found = std::ranges::find_if(inner.keys(), [&](const JoinKey& inner_key) {
+                return inner_key.folds_output() && inner_key.output_name() == outer_key.left;
+            });
+            if (found != inner.keys().end()) {
+                outer_key.left = found->right;
+            }
+        }
+        outer.set_keys(std::move(remapped));
+    }
     node->add_child(std::move(target));
     node->add_child(std::move(z));
     NodePtr pushed = rewrite_semi_over_join(std::move(node), sources);

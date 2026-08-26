@@ -1193,7 +1193,7 @@ auto gather_rows(const Table& input, const std::vector<Idx>& idx,
 [[nodiscard]] auto expr_type_for_column(const ColumnValue& column) -> ExprType;
 [[nodiscard]] auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns)
     -> std::expected<Table, std::string>;
-[[nodiscard]] auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
+[[nodiscard]] auto rename_table(Table input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string>;
 [[nodiscard]] auto columns_table(const Table& input) -> std::expected<Table, std::string>;
 /// Whole-table `distinct`, implemented in `chunked.cpp` over

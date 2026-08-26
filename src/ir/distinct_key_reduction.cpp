@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>
 
 #include <algorithm>
@@ -64,13 +65,8 @@ auto resolve_value(const Node& node, std::string name) -> ValueId {
                 break;  // neither renames nor computes
 
             case NodeKind::Rename: {
-                const auto& rename = static_cast<const RenameNode&>(*current);
-                for (const auto& spec : rename.renames()) {
-                    if (spec.new_name == name) {
-                        name = spec.old_name;
-                        break;
-                    }
-                }
+                const ColumnNameMap names(static_cast<const RenameNode&>(*current).renames());
+                name = names.input_name(name);
                 break;
             }
 

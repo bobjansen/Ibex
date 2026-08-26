@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/time.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/nullability.hpp>
@@ -413,17 +414,30 @@ auto filtered_schema(const Expr& predicate, SchemaInfo input) -> SchemaInfo {
 /// holds.
 void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const SchemaInfo& right,
                           const std::vector<JoinOutputColumn>& plan, SchemaInfo& out) {
-    // Left columns always reach the output under their own names.
-    const auto left_key_survives = [&](const UniqueKey& key) {
-        return std::ranges::all_of(
-            key, [&](const std::string& name) { return out.find(name) != nullptr; });
+    robin_hood::unordered_map<std::string, std::string> left_out_name;
+    for (const auto& column : plan) {
+        if (column.side == JoinOutputSide::Left) {
+            left_out_name.emplace(left.fields()[column.source_index].name, column.name);
+        }
+    }
+    const auto left_key_in_output = [&](const UniqueKey& key) -> std::optional<UniqueKey> {
+        UniqueKey renamed;
+        renamed.reserve(key.size());
+        for (const std::string& name : key) {
+            const auto found = left_out_name.find(name);
+            if (found == left_out_name.end()) {
+                return std::nullopt;
+            }
+            renamed.push_back(found->second);
+        }
+        return renamed;
     };
 
     // Where each right column ends up in the output. The planner renames a
     // colliding right column rather than dropping it, so a right constraint
     // naming one carries over — under the planner's name. The exception is a
-    // same-name key, which the planner folds into the left column of that
-    // name: the join equates the two, so the constraint carries over there.
+    // folded key, which the planner folds into the left column: the join
+    // equates the two, so the constraint carries over under the left name.
     robin_hood::unordered_map<std::string, std::string> right_out_name;
     for (const auto& column : plan) {
         if (column.side == JoinOutputSide::Right) {
@@ -431,8 +445,8 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
         }
     }
     for (const auto& key : join.keys()) {
-        if (key.left == key.right) {
-            right_out_name.emplace(key.right, key.right);
+        if (key.folds_output()) {
+            right_out_name.emplace(key.right, key.output_name());
         }
     }
     // Restates a right-side constraint in output names, or fails if any of its
@@ -451,8 +465,8 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
     };
     const auto keep_left = [&]() {
         for (const auto& key : left.unique_keys()) {
-            if (left_key_survives(key)) {
-                out.add_unique_key(key);
+            if (auto renamed = left_key_in_output(key)) {
+                out.add_unique_key(std::move(*renamed));
             }
         }
     };
@@ -493,7 +507,8 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
             // ungrouped aggregate: its key is empty, so the pair is just the
             // left's key.
             for (const auto& left_key : left.unique_keys()) {
-                if (!left_key_survives(left_key)) {
+                auto left_renamed = left_key_in_output(left_key);
+                if (!left_renamed.has_value()) {
                     continue;
                 }
                 for (const auto& right_key : right.unique_keys()) {
@@ -501,7 +516,7 @@ void add_join_unique_keys(const JoinNode& join, const SchemaInfo& left, const Sc
                     if (!renamed.has_value()) {
                         continue;
                     }
-                    UniqueKey combined = left_key;
+                    UniqueKey combined = *left_renamed;
                     combined.insert(combined.end(), renamed->begin(), renamed->end());
                     out.add_unique_key(std::move(combined));
                 }
@@ -945,24 +960,20 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             std::vector<SchemaField> out = input.fields();
             std::optional<std::string> time_index = input.time_index();
             std::vector<UniqueKey> keys = input.unique_keys();
-            for (const auto& spec : rename.renames()) {
-                for (auto& field : out) {
-                    if (field.name == spec.old_name) {
-                        field.name = spec.new_name;
-                    }
-                }
-                if (time_index.has_value() && *time_index == spec.old_name) {
-                    time_index = spec.new_name;  // the index column was renamed
-                }
-                // Renaming a column changes what to call a constraint, never
-                // whether it holds. Applied in the same sequence as the fields
-                // above so the two cannot disagree.
-                for (auto& key : keys) {
-                    for (auto& name : key) {
-                        if (name == spec.old_name) {
-                            name = spec.new_name;
-                        }
-                    }
+            const ColumnNameMap names(rename.renames());
+            for (auto& field : out) {
+                field.name = names.output_name(field.name);
+            }
+            if (time_index.has_value()) {
+                *time_index = names.output_name(*time_index);
+            }
+            // Renaming changes what to call a constraint, never whether it
+            // holds. All names are mapped from the original input schema, so a
+            // braced multi-rename has the same simultaneous semantics here as
+            // it does at execution.
+            for (auto& key : keys) {
+                for (auto& name : key) {
+                    name = names.output_name(name);
                 }
             }
             SchemaInfo result =
@@ -1443,13 +1454,18 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
                 }
             }
             break;
-        case NodeKind::Rename:
-            for (const auto& spec : static_cast<const RenameNode&>(node).renames()) {
-                if (input.find(spec.old_name) == nullptr) {
-                    return missing_column("rename", spec.old_name);
-                }
+        case NodeKind::Rename: {
+            std::vector<std::string_view> input_names;
+            input_names.reserve(input.fields().size());
+            for (const auto& field : input.fields()) {
+                input_names.push_back(field.name);
+            }
+            const ColumnNameMap names(static_cast<const RenameNode&>(node).renames());
+            if (auto valid = names.validate_input(input_names); !valid.has_value()) {
+                return valid.error();
             }
             break;
+        }
         case NodeKind::Aggregate: {
             const auto& agg = static_cast<const AggregateNode&>(node);
             for (const auto& key : agg.group_by()) {

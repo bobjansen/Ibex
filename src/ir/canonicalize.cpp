@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/canonicalize.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
@@ -100,16 +101,9 @@ auto group_by_preserved_by_project(const std::vector<ColumnRef>& group_by, const
 // sort comparator references the pre-rename schema beneath.
 auto remap_keys_through_rename(std::vector<OrderKey> keys, const std::vector<RenameSpec>& renames)
     -> std::vector<OrderKey> {
-    robin_hood::unordered_map<std::string, std::string> new_to_old;
-    new_to_old.reserve(renames.size());
-    for (const auto& rs : renames) {
-        new_to_old.emplace(rs.new_name, rs.old_name);
-    }
+    const ColumnNameMap names(renames);
     for (auto& k : keys) {
-        auto it = new_to_old.find(k.name);
-        if (it != new_to_old.end()) {
-            k.name = it->second;
-        }
+        k.name = names.input_name(k.name);
     }
     return keys;
 }
@@ -117,16 +111,9 @@ auto remap_keys_through_rename(std::vector<OrderKey> keys, const std::vector<Ren
 auto remap_group_by_through_rename(std::vector<ColumnRef> group_by,
                                    const std::vector<RenameSpec>& renames)
     -> std::vector<ColumnRef> {
-    robin_hood::unordered_map<std::string, std::string> new_to_old;
-    new_to_old.reserve(renames.size());
-    for (const auto& rs : renames) {
-        new_to_old.emplace(rs.new_name, rs.old_name);
-    }
+    const ColumnNameMap names(renames);
     for (auto& c : group_by) {
-        auto it = new_to_old.find(c.name);
-        if (it != new_to_old.end()) {
-            c.name = it->second;
-        }
+        c.name = names.input_name(c.name);
     }
     return group_by;
 }
@@ -159,72 +146,6 @@ void collect_filter_column_refs(const Expr& expr, robin_hood::unordered_set<std:
             }
         },
         expr.node);
-}
-
-// Remap ColumnRef references inside a predicate expression new→old.
-void remap_filter_expr_through_rename(
-    Expr& expr, const robin_hood::unordered_map<std::string, std::string>& n2o) {
-    std::visit(
-        [&](auto& n) {
-            using T = std::decay_t<decltype(n)>;
-            if constexpr (std::is_same_v<T, ColumnRef>) {
-                if (n.lexical) {
-                    return;  // scalar binding: renames do not apply
-                }
-                auto it = n2o.find(n.name);
-                if (it != n2o.end()) {
-                    n.name = it->second;
-                }
-            } else if constexpr (std::is_same_v<T, BinaryExpr> || std::is_same_v<T, CompareExpr>) {
-                remap_filter_expr_through_rename(*n.left, n2o);
-                remap_filter_expr_through_rename(*n.right, n2o);
-            } else if constexpr (std::is_same_v<T, LogicalExpr>) {
-                remap_filter_expr_through_rename(*n.left, n2o);
-                if (n.right) {
-                    remap_filter_expr_through_rename(*n.right, n2o);
-                }
-            } else if constexpr (std::is_same_v<T, CallExpr>) {
-                for (auto& arg : n.args) {
-                    remap_filter_expr_through_rename(*arg, n2o);
-                }
-            } else if constexpr (std::is_same_v<T, IsNullExpr>) {
-                remap_filter_expr_through_rename(*n.operand, n2o);
-            }
-        },
-        expr.node);
-}
-
-// Compose outer(inner): the outer rename's old_name that matches an inner
-// new_name should reach through to the inner old_name. Identity pairs
-// (new == old) are dropped in the result.
-auto compose_renames(const std::vector<RenameSpec>& outer, const std::vector<RenameSpec>& inner)
-    -> std::vector<RenameSpec> {
-    robin_hood::unordered_map<std::string, std::string> inner_new_to_old;
-    inner_new_to_old.reserve(inner.size());
-    for (const auto& rs : inner) {
-        inner_new_to_old.emplace(rs.new_name, rs.old_name);
-    }
-    robin_hood::unordered_set<std::string> used_inner;
-    used_inner.reserve(inner.size());
-    std::vector<RenameSpec> out;
-    out.reserve(outer.size() + inner.size());
-    for (const auto& rs : outer) {
-        std::string old = rs.old_name;
-        auto it = inner_new_to_old.find(old);
-        if (it != inner_new_to_old.end()) {
-            used_inner.insert(it->first);
-            old = it->second;
-        }
-        if (rs.new_name != old) {
-            out.push_back(RenameSpec{.new_name = rs.new_name, .old_name = old});
-        }
-    }
-    for (const auto& rs : inner) {
-        if (!used_inner.contains(rs.new_name) && rs.new_name != rs.old_name) {
-            out.push_back(rs);
-        }
-    }
-    return out;
 }
 
 // Collect columns pinned to a literal constant by a conjunctive predicate.
@@ -549,7 +470,7 @@ auto try_rename_compose(NodePtr node) -> TryResult {
     }
     const auto& outer = static_cast<const RenameNode&>(*node);
     const auto& inner = static_cast<const RenameNode&>(*node->children().front());
-    auto composed = compose_renames(outer.renames(), inner.renames());
+    auto composed = ColumnNameMap::compose(outer.renames(), inner.renames());
     const auto merged_id = node->id();
     NodePtr outer_owned = std::move(node);
     NodePtr inner_owned = take_unique_child(*outer_owned);
@@ -586,13 +507,8 @@ auto try_filter_past_rename(NodePtr node) -> TryResult {
     }
     auto& filter = static_cast<FilterNode&>(*node);
     const auto& rename = static_cast<const RenameNode&>(*node->children().front());
-    robin_hood::unordered_map<std::string, std::string> n2o;
-    n2o.reserve(rename.renames().size());
-    for (const auto& rs : rename.renames()) {
-        n2o.emplace(rs.new_name, rs.old_name);
-    }
     Expr pred = filter.take_predicate();
-    remap_filter_expr_through_rename(pred, n2o);
+    ColumnNameMap(rename.renames()).remap_expr_to_input(pred);
     const auto filter_id = node->id();
     NodePtr filter_owned = std::move(node);
     NodePtr rename_owned = take_unique_child(*filter_owned);

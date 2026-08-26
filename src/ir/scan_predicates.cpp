@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/cardinality.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/scan_predicates.hpp>
@@ -41,84 +42,9 @@ auto append_conjuncts(const Expr& expr, std::vector<Expr>& out) -> bool {
     return true;
 }
 
-/// Every column name an expression reads.
-void expr_column_names(const Expr& expr, std::set<std::string>& out) {
-    if (const auto* ref = std::get_if<ColumnRef>(&expr.node)) {
-        out.insert(ref->name);
-        return;
-    }
-    if (const auto* cmp = std::get_if<CompareExpr>(&expr.node)) {
-        if (cmp->left != nullptr) {
-            expr_column_names(*cmp->left, out);
-        }
-        if (cmp->right != nullptr) {
-            expr_column_names(*cmp->right, out);
-        }
-        return;
-    }
-    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node)) {
-        if (logical->left != nullptr) {
-            expr_column_names(*logical->left, out);
-        }
-        if (logical->right != nullptr) {
-            expr_column_names(*logical->right, out);
-        }
-        return;
-    }
-    if (const auto* binary = std::get_if<BinaryExpr>(&expr.node)) {
-        if (binary->left != nullptr) {
-            expr_column_names(*binary->left, out);
-        }
-        if (binary->right != nullptr) {
-            expr_column_names(*binary->right, out);
-        }
-        return;
-    }
-    if (const auto* is_null = std::get_if<IsNullExpr>(&expr.node)) {
-        if (is_null->operand != nullptr) {
-            expr_column_names(*is_null->operand, out);
-        }
-        return;
-    }
-    if (const auto* call = std::get_if<CallExpr>(&expr.node)) {
-        for (const auto& arg : call->args) {
-            if (arg != nullptr) {
-                expr_column_names(*arg, out);
-            }
-        }
-        for (const auto& named : call->named_args) {
-            if (named.value != nullptr) {
-                expr_column_names(*named.value, out);
-            }
-        }
-    }
-}
-
-/// True when the predicate reads a name that only exists above a Rename.
-auto predicate_reads_introduced_name(const Expr& predicate, const std::set<std::string>& introduced)
-    -> bool {
-    if (introduced.empty()) {
-        return false;
-    }
-    std::set<std::string> used;
-    expr_column_names(predicate, used);
-    return std::ranges::any_of(used,
-                               [&](const std::string& name) { return introduced.contains(name); });
-}
-
 /// The Scan a filter sits on, when every node between the two preserves rows
-/// and leaves the predicate's names resolvable against the scan.
-///
-/// `introduced` collects the names each Rename on the way down CREATES. Those
-/// names do not exist at the scan, so a predicate that reads one cannot be
-/// evaluated there and the caller must decline. Names the Rename leaves alone
-/// still resolve, which is the case that matters: a mapped join key
-/// (`part join lineitem on { p_partkey = l_partkey }` -- most of TPC-H) makes
-/// `push_filters_into_joins` land the pushed filter on Filter(Rename(Scan)),
-/// and without this the filter never fuses into the decode. The scan then
-/// decodes every row of every column and an ordinary Filter operator throws
-/// almost all of them away: q14 materializes 48M values to keep 150k rows.
-auto projected_scan(const Node& node, std::set<std::string>* introduced = nullptr)
+/// and lets its predicate be translated to the scan's own names.
+auto projected_scan(const Node& node, std::vector<const RenameNode*>* renames = nullptr)
     -> const ScanNode* {
     if (node.children().size() != 1 || node.children().front() == nullptr) {
         return nullptr;
@@ -129,10 +55,8 @@ auto projected_scan(const Node& node, std::set<std::string>* introduced = nullpt
             if (child->children().size() != 1 || child->children().front() == nullptr) {
                 return nullptr;
             }
-            if (introduced != nullptr) {
-                for (const auto& spec : static_cast<const RenameNode&>(*child).renames()) {
-                    introduced->insert(spec.new_name);
-                }
+            if (renames != nullptr) {
+                renames->push_back(static_cast<const RenameNode*>(child));
             }
             child = child->children().front().get();
             continue;
@@ -212,12 +136,8 @@ auto take_unique_child(Node& parent) -> NodePtr {
 auto is_applied_scan_filter(const Node& node, const std::set<std::string>& applied_sources)
     -> bool {
     const auto* predicate = filter_predicate(node);
-    std::set<std::string> introduced;
-    const auto* scan = projected_scan(node, &introduced);
+    const auto* scan = projected_scan(node);
     if (predicate == nullptr || scan == nullptr || !applied_sources.contains(scan->source_name())) {
-        return false;
-    }
-    if (predicate_reads_introduced_name(*predicate, introduced)) {
         return false;
     }
     std::vector<Expr> conjuncts;
@@ -301,11 +221,14 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
     }
 
     if (const auto* predicate = filter_predicate(node)) {
-        std::set<std::string> introduced;
-        if (const auto* scan = projected_scan(node, &introduced);
-            scan != nullptr && !predicate_reads_introduced_name(*predicate, introduced)) {
+        std::vector<const RenameNode*> renames;
+        if (const auto* scan = projected_scan(node, &renames); scan != nullptr) {
+            Expr scan_predicate = *predicate;
+            for (const auto* rename : renames) {
+                ColumnNameMap(rename->renames()).remap_expr_to_input(scan_predicate);
+            }
             std::vector<Expr> conjuncts;
-            if (append_conjuncts(*predicate, conjuncts)) {
+            if (append_conjuncts(scan_predicate, conjuncts)) {
                 auto& destination = candidates[scan->source_name()];
                 destination.insert(destination.end(), conjuncts.begin(), conjuncts.end());
             }
@@ -439,12 +362,8 @@ auto match_probe_chain(const Node& node, std::string key)
                 break;
             }
             case NodeKind::Rename: {
-                for (const auto& rs : static_cast<const RenameNode&>(*cur).renames()) {
-                    if (rs.new_name == key) {
-                        key = rs.old_name;
-                        break;
-                    }
-                }
+                const ColumnNameMap names(static_cast<const RenameNode&>(*cur).renames());
+                key = names.input_name(key);
                 break;
             }
             case NodeKind::Update: {

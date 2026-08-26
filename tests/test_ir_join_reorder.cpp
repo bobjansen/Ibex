@@ -3,6 +3,7 @@
 
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/join_reorder.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -124,4 +125,39 @@ TEST_CASE("join reorder keeps First aggregates in source order", "[ir][join_reor
     stats.rows = {{"customer", 2'000}, {"orders", 1}};
     auto out = ir::reorder_inner_joins_for_aggregates(std::move(aggregate), stats);
     CHECK(scan_name(*out->children().front()->children()[0]) == "customer");
+}
+
+TEST_CASE("join reorder rebuilds folded mapped keys with native input names",
+          "[ir][join_reorder]") {
+    ir::SourceStats stats = misordered_stats();
+    stats.schemas["orders"] = ir::SchemaInfo::known(
+        {{"o_custkey", ir::ColumnType::Int64}, {"o_orderkey", ir::ColumnType::Int64}});
+    stats.schemas["lineitem"] = ir::SchemaInfo::known(
+        {{"l_orderkey", ir::ColumnType::Int64}, {"l_price", ir::ColumnType::Float64}});
+    stats.distinct["orders"] = {{"o_custkey", 150'000}, {"o_orderkey", 1'500'000}};
+    stats.distinct["lineitem"] = {{"l_orderkey", 1'000}};
+
+    ir::Builder builder;
+    auto first = builder.join(ir::JoinKind::Inner, {{"c_custkey", "o_custkey", true}});
+    first->add_child(builder.scan("customer"));
+    first->add_child(builder.scan("orders"));
+    auto chain = builder.join(ir::JoinKind::Inner, {{"o_orderkey", "l_orderkey", true}});
+    chain->add_child(std::move(first));
+    chain->add_child(builder.scan("lineitem"));
+    auto aggregate = builder.aggregate(
+        {}, {ir::AggSpec{.func = ir::AggFunc::Count, .column = {}, .alias = "n"}});
+    aggregate->add_child(std::move(chain));
+
+    auto out = ir::reorder_inner_joins_for_aggregates(std::move(aggregate), stats);
+    REQUIRE(out != nullptr);
+    CHECK_FALSE(ir::check_joins(*out, stats.schemas).has_value());
+    const auto& outer = static_cast<const ir::JoinNode&>(*out->children().front());
+    CHECK(ir::join_keys_are_folded(outer.keys()));
+    const auto& inner = static_cast<const ir::JoinNode&>(*outer.children().front());
+    CHECK(ir::join_keys_are_folded(inner.keys()));
+    const auto reordered_schema = ir::infer_schema(*out->children().front(), stats.schemas);
+    REQUIRE(reordered_schema.is_known());
+    CHECK(reordered_schema.find("c_custkey") != nullptr);
+    CHECK(reordered_schema.find("o_orderkey") != nullptr);
+    CHECK(reordered_schema.find("l_orderkey") == nullptr);
 }

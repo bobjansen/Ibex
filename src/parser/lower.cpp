@@ -3,6 +3,7 @@
 
 #include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_pushdown.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
@@ -855,12 +856,13 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             if (!names.has_value()) {
                 return std::nullopt;
             }
-            for (const auto& spec : rename.renames()) {
-                auto it = std::find(names->begin(), names->end(), spec.old_name);
-                if (it == names->end()) {
-                    return std::nullopt;
-                }
-                *it = spec.new_name;
+            std::vector<std::string_view> input_names(names->begin(), names->end());
+            const ir::ColumnNameMap mapping(rename.renames());
+            if (!mapping.validate_input(input_names).has_value()) {
+                return std::nullopt;
+            }
+            for (auto& name : *names) {
+                name = mapping.output_name(name);
             }
             return names;
         }
@@ -2790,6 +2792,9 @@ class Lowerer {
                     LowerError{.message = "rename: right-hand side must be a plain column name"});
             }
             renames.push_back(ir::RenameSpec{.new_name = field.name, .old_name = ident->name});
+        }
+        if (auto valid = ir::ColumnNameMap(renames).validate(); !valid.has_value()) {
+            return std::unexpected(LowerError{.message = valid.error()});
         }
         return renames;
     }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <robin_hood.h>
 #include <string>
@@ -25,6 +26,8 @@ struct Edge {
     std::size_t right = 0;
     std::vector<std::string> keys;
 };
+
+using LeafKeyNames = std::vector<std::map<std::string, std::string>>;
 
 auto next_id() -> std::uint64_t& {
     thread_local std::uint64_t value = 0;
@@ -55,31 +58,33 @@ void max_id(const Node& node, std::uint64_t& value) {
 /// still intact. `take_left_deep` moves children out as it descends and frees
 /// what it holds when it bails, which is unrecoverable: a rejection after that
 /// point leaves the aggregate with no input at all.
-auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vector<Edge>& edges)
-    -> bool {
+auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vector<Edge>& edges,
+                    LeafKeyNames& leaf_key_names) -> bool {
     if (node.kind() != NodeKind::Join) {
         leaves.push_back(&node);
+        leaf_key_names.emplace_back();
         return true;
     }
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     const auto& join = static_cast<const JoinNode&>(node);
-    // `Edge::keys` are bare column names, which only identify a column
-    // unambiguously across the whole chain when every join is same-named.
-    // Mapped keys reach here only when `normalize_mapped_join_keys` could not
-    // fold them (Right/Outer — excluded above anyway — a key read on both
-    // spellings above the join, a cross-side name collision, or an unknown
-    // schema), and then the chain keeps the order its author wrote.
+    // `Edge::keys` are logical folded-output names. A mapped key that
+    // `normalize_mapped_join_keys` could not safely fold keeps the order its
+    // author wrote.
     if (join.kind() != JoinKind::Inner || join.predicate().has_value() || join.keys().empty() ||
-        !join_keys_are_same_named(join.keys()) || join.children().size() != 2 ||
+        !join_keys_are_folded(join.keys()) || join.children().size() != 2 ||
         join.children()[0] == nullptr || join.children()[1] == nullptr ||
         join.children()[1]->kind() == NodeKind::Join) {
         return false;
     }
-    if (!scan_left_deep(*join.children()[0], leaves, edges)) {
+    if (!scan_left_deep(*join.children()[0], leaves, edges, leaf_key_names)) {
         return false;
     }
     leaves.push_back(join.children()[1].get());
-    edges.push_back(Edge{.right = leaves.size() - 1, .keys = left_join_key_names(join.keys())});
+    leaf_key_names.emplace_back();
+    for (const auto& key : join.keys()) {
+        leaf_key_names.back().insert_or_assign(std::string(key.output_name()), key.right);
+    }
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join_key_output_names(join.keys())});
     return true;
 }
 
@@ -93,7 +98,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
     // Must stay in lockstep with `scan_left_deep` above, including its reason
     // for rejecting mapped keys.
     if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
-        !join_keys_are_same_named(join->keys()) || join->mutable_children().size() != 2 ||
+        !join_keys_are_folded(join->keys()) || join->mutable_children().size() != 2 ||
         join->mutable_children()[0] == nullptr || join->mutable_children()[1] == nullptr ||
         join->mutable_children()[1]->kind() == NodeKind::Join) {
         return false;
@@ -105,7 +110,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
         return false;
     }
     leaves.push_back(std::move(right));
-    edges.push_back(Edge{.right = leaves.size() - 1, .keys = left_join_key_names(join->keys())});
+    edges.push_back(Edge{.right = leaves.size() - 1, .keys = join_key_output_names(join->keys())});
     return true;
 }
 
@@ -218,20 +223,29 @@ auto schemas_are_unambiguous(const std::vector<const Node*>& leaves, const std::
 /// child's schema -- caught at RUNTIME ("join key not found in right:
 /// ps_suppkey (available: p_partkey)" on q09), not at planning time, because
 /// nothing here re-validates the edge against the actual schemas.
+auto leaf_input_name(std::size_t leaf, const std::string& logical,
+                     const std::vector<SchemaInfo>& leaf_schemas,
+                     const LeafKeyNames& leaf_key_names) -> const std::string* {
+    if (const auto found = leaf_key_names[leaf].find(logical);
+        found != leaf_key_names[leaf].end()) {
+        return &found->second;
+    }
+    return leaf_schemas[leaf].find(logical) != nullptr ? &logical : nullptr;
+}
+
 auto connecting_keys(std::size_t candidate, const std::vector<std::size_t>& selected,
-                     const std::vector<Edge>& edges, const std::vector<SchemaInfo>& leaf_schemas)
-    -> const std::vector<std::string>* {
-    const auto& candidate_schema = leaf_schemas[candidate];
+                     const std::vector<Edge>& edges, const std::vector<SchemaInfo>& leaf_schemas,
+                     const LeafKeyNames& leaf_key_names) -> const std::vector<std::string>* {
     for (const auto& edge : edges) {
         const bool candidate_has_keys = std::ranges::all_of(edge.keys, [&](const std::string& key) {
-            return candidate_schema.find(key) != nullptr;
+            return leaf_input_name(candidate, key, leaf_schemas, leaf_key_names) != nullptr;
         });
         if (!candidate_has_keys) {
             continue;
         }
         const bool selected_has_keys = std::ranges::all_of(edge.keys, [&](const std::string& key) {
             return std::ranges::any_of(selected, [&](std::size_t member) {
-                return leaf_schemas[member].find(key) != nullptr;
+                return leaf_input_name(member, key, leaf_schemas, leaf_key_names) != nullptr;
             });
         });
         if (selected_has_keys) {
@@ -257,7 +271,8 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
     // back.
     std::vector<const Node*> preview;
     std::vector<Edge> preview_edges;
-    if (!scan_left_deep(*child, preview, preview_edges) ||
+    LeafKeyNames leaf_key_names;
+    if (!scan_left_deep(*child, preview, preview_edges, leaf_key_names) ||
         !schemas_are_unambiguous(preview, preview_edges, stats.schemas)) {
         return child;
     }
@@ -277,16 +292,31 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
     }
     NodePtr result = std::move(leaves[order->front()]);
     std::vector<std::size_t> selected{order->front()};
+    std::map<std::string, std::string> current_key_names;
+    for (const auto& edge : edges) {
+        for (const auto& logical : edge.keys) {
+            if (const auto* local =
+                    leaf_input_name(order->front(), logical, leaf_schemas, leaf_key_names)) {
+                current_key_names.insert_or_assign(logical, *local);
+            }
+        }
+    }
     for (std::size_t pos = 1; pos < order->size(); ++pos) {
         const std::size_t candidate = (*order)[pos];
-        const auto* keys = connecting_keys(candidate, selected, edges, leaf_schemas);
+        const auto* keys =
+            connecting_keys(candidate, selected, edges, leaf_schemas, leaf_key_names);
         if (keys == nullptr || leaves[candidate] == nullptr) {
             return nullptr;
         }
         std::vector<JoinKey> paired_keys;
         paired_keys.reserve(keys->size());
-        for (const auto& key : *keys) {
-            paired_keys.emplace_back(key);
+        for (const auto& logical : *keys) {
+            const auto left = current_key_names.find(logical);
+            const auto* right = leaf_input_name(candidate, logical, leaf_schemas, leaf_key_names);
+            if (left == current_key_names.end() || right == nullptr) {
+                return nullptr;
+            }
+            paired_keys.emplace_back(left->second, *right, true, logical);
         }
         auto join = std::make_unique<JoinNode>(NodeId{next_id()++}, JoinKind::Inner,
                                                std::move(paired_keys));
@@ -294,6 +324,20 @@ auto reorder_aggregate_child(NodePtr child, const SourceStats& stats) -> NodePtr
         join->add_child(std::move(leaves[candidate]));
         result = std::move(join);
         selected.push_back(candidate);
+        for (const auto& logical : *keys) {
+            current_key_names.insert_or_assign(logical, logical);
+        }
+        for (const auto& edge : edges) {
+            for (const auto& logical : edge.keys) {
+                if (current_key_names.contains(logical)) {
+                    continue;
+                }
+                if (const auto* local =
+                        leaf_input_name(candidate, logical, leaf_schemas, leaf_key_names)) {
+                    current_key_names.emplace(logical, *local);
+                }
+            }
+        }
     }
     return result;
 }

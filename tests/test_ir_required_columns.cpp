@@ -176,6 +176,21 @@ TEST_CASE("required_columns: mapped join demands each side's own key", "[ir][req
     CHECK(demand.at("right").names == std::set<std::string>{"a", "right_id"});
 }
 
+TEST_CASE("required_columns: a folded logical key maps to both native inputs",
+          "[ir][required_columns]") {
+    auto join = std::make_unique<ir::JoinNode>(
+        ir::NodeId{2}, ir::JoinKind::Inner,
+        std::vector<ir::JoinKey>{{"left_id", "right_id", true, "id"}});
+    join->add_child(make_scan("left"));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{9}, "right"));
+    auto plan =
+        with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"id"})), std::move(join));
+    auto demand = ir::required_columns(*plan);
+
+    CHECK(demand.at("left").names == std::set<std::string>{"left_id"});
+    CHECK(demand.at("right").names == std::set<std::string>{"right_id"});
+}
+
 TEST_CASE("required_columns: distinct cannot be narrowed", "[ir][required_columns]") {
     // Distinct de-duplicates over every input column: narrowing its input would
     // change which rows survive, not just which columns come back.

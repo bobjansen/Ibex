@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/cardinality.hpp>
+#include <ibex/ir/column_name_map.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -348,13 +349,8 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
             return below ? distinct_through(node, *below, stats) : std::nullopt;
         }
         case NodeKind::Rename: {
-            std::string below = column;
-            for (const auto& spec : static_cast<const RenameNode&>(node).renames()) {
-                if (spec.new_name == column) {
-                    below = spec.old_name;
-                    break;
-                }
-            }
+            const ColumnNameMap names(static_cast<const RenameNode&>(node).renames());
+            std::string below(names.input_name(column));
             return distinct_through(node, below, stats);
         }
         default:

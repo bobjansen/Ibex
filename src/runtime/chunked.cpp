@@ -8,6 +8,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
@@ -619,32 +620,25 @@ class ChunkedRenameOperator final : public Operator {
         }
         Chunk input = std::move(*chunk_res.value());
         const kernel::ChunkView view(input);
+        const ir::ColumnNameMap names(*renames_);
+        std::vector<std::string_view> input_names;
+        input_names.reserve(view.columns());
+        for (std::size_t pos = 0; pos < view.columns(); ++pos) {
+            input_names.push_back(view.entry(pos).name);
+        }
+        if (auto valid = names.validate_input(input_names); !valid.has_value()) {
+            return std::unexpected(valid.error());
+        }
         std::vector<kernel::MappedChunkColumn> map;
         map.reserve(view.columns());
-        for (const auto& spec : *renames_) {
-            if (!view.find_column(spec.old_name).has_value()) {
-                return std::unexpected("rename: column not found: " + spec.old_name);
-            }
-        }
         for (std::size_t pos = 0; pos < view.columns(); ++pos) {
-            std::string name = view.entry(pos).name;
-            for (const auto& spec : *renames_) {
-                if (spec.old_name == name) {
-                    name = spec.new_name;
-                    break;
-                }
-            }
+            std::string name(names.output_name(view.entry(pos).name));
             map.push_back({.source_position = pos, .name = std::move(name)});
         }
         const auto props = TableProperties::derive(
             view.properties(),
             [&](const std::string& name) -> KeyFate {
-                for (const auto& spec : *renames_) {
-                    if (spec.old_name == name) {
-                        return KeyFate::kept(spec.new_name);
-                    }
-                }
-                return KeyFate::kept(name);
+                return KeyFate::kept(std::string(names.output_name(name)));
             },
             RowTransform::Preserve);
         return std::optional<Chunk>{kernel::map_chunk(view, map, props)};
@@ -12235,7 +12229,8 @@ class TwoPhaseFilterOperator final : public Operator {
             case ir::NodeKind::Project:
                 return project_table(input, static_cast<const ir::ProjectNode&>(node).columns());
             case ir::NodeKind::Rename:
-                return rename_table(input, static_cast<const ir::RenameNode&>(node).renames());
+                return rename_table(std::move(input),
+                                    static_cast<const ir::RenameNode&>(node).renames());
             default:
                 // The pipeline builder only admits `is_metadata_only_node` kinds
                 // into `tail_`, so reaching this means the two have drifted.

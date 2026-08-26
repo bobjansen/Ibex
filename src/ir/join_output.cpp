@@ -67,27 +67,36 @@ auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
         return plan;
     }
 
-    const std::unordered_set<std::string_view> left_set(left_names.begin(), left_names.end());
-
-    // A same-name equijoin key folds into the single left column, so it is not
-    // a collision; a mapped key keeps both native columns and may well be one.
+    // A folded equijoin key contributes one left output column, so it is not a
+    // collision. Same-name keys fold by definition; a mapped key does so only
+    // when normalization proved its right spelling unobservable.
     const auto folds_into_left = [&](std::string_view name) {
         return std::ranges::any_of(
-            keys, [&](const JoinKey& key) { return key.left == key.right && key.right == name; });
+            keys, [&](const JoinKey& key) { return key.folds_output() && key.right == name; });
     };
 
     // Record the fold on the surviving left column while the planner still has
     // both sides in hand. This is the one place that knows a right column was
     // dropped in favour of a left one.
     for (auto& column : plan) {
-        if (!folds_into_left(left_names[column.source_index])) {
-            continue;
+        for (const auto& key : keys) {
+            if (!key.folds_output() || key.left != left_names[column.source_index]) {
+                continue;
+            }
+            const auto peer = std::ranges::find(right_names, key.right);
+            if (peer != right_names.end()) {
+                column.folded_peer_index =
+                    static_cast<std::size_t>(std::distance(right_names.begin(), peer));
+            }
+            column.name = key.output_name();
+            break;
         }
-        const auto peer = std::ranges::find(right_names, left_names[column.source_index]);
-        if (peer != right_names.end()) {
-            column.folded_peer_index =
-                static_cast<std::size_t>(std::distance(right_names.begin(), peer));
-        }
+    }
+
+    std::unordered_set<std::string_view> left_set;
+    left_set.reserve(plan.size());
+    for (const auto& column : plan) {
+        left_set.insert(column.name);
     }
 
     std::vector<std::size_t> emitted_right;

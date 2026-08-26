@@ -830,6 +830,30 @@ TEST_CASE("Lower rename with multiple renames") {
     REQUIRE(rename->renames()[1].old_name == "qty");
 }
 
+TEST_CASE("Lower rejects rename target collisions and duplicate mappings") {
+    for (const auto* source : {
+             "Table { a = [1], b = [2] }[rename { b = a }];",
+             "df[rename { x = a, x = b }];",
+             "df[rename { x = a, y = a }];",
+         }) {
+        CAPTURE(source);
+        auto program = require_parse(source);
+        auto result = parser::lower(program);
+        REQUIRE_FALSE(result.has_value());
+    }
+}
+
+TEST_CASE("Lower treats a rename list simultaneously") {
+    auto program = require_parse("Table { a = [1], b = [2] }[rename { b = a, a = b }];");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const auto schema = ir::infer_schema(**result, {});
+    REQUIRE(schema.is_known());
+    REQUIRE(schema.fields().size() == 2);
+    CHECK(schema.fields()[0].name == "b");
+    CHECK(schema.fields()[1].name == "a");
+}
+
 TEST_CASE("Lower filter + order pipeline") {
     auto program = require_parse("df[filter price > 10, order { price asc }];");
     auto result = parser::lower(program);

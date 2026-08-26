@@ -1,10 +1,10 @@
 // The companion to mapped_join_keys.ibex, which reads BOTH spellings of every
 // key and so keeps the join mapped. Here nothing above the join reads the
-// right-hand key columns, which lets `normalize_mapped_join_keys` rename them
-// away and fold each pair into one output column.
+// right-hand key columns, which lets `normalize_mapped_join_keys` fold each
+// pair into one logical output column while both inputs keep their native names.
 //
-// The join therefore runs same-named, with the whole join optimizer available
-// to it, and this case exists to prove that rewrite changes no answer: the
+// The whole join optimizer can therefore use the shared logical key, and this
+// case exists to prove that rewrite changes no answer: the
 // left join's unmatched rows in particular, where the folded key column must
 // still carry the LEFT row's value and the right's columns must still be null.
 let lhs = Table {

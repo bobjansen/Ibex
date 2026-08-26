@@ -864,6 +864,27 @@ TEST_CASE("E2E: rename multiple columns", "[e2e]") {
     CHECK(col_i64(out, "amount") == std::vector<std::int64_t>{5, 3, 8, 2, 1});
 }
 
+TEST_CASE("E2E: rename rejects a target that exists in a runtime-only schema", "[e2e]") {
+    auto tables = make_trades();
+    CHECK(
+        run_error("trades[rename { qty = price }];", tables).find("target column already exists") !=
+        std::string::npos);
+}
+
+TEST_CASE("E2E: rename swaps names without touching column data", "[e2e]") {
+    auto tables = make_trades();
+    const auto price_buffer = tables.at("trades").columns[0].column;
+    const auto qty_buffer = tables.at("trades").columns[1].column;
+    auto out = run("trades[rename { qty = price, price = qty }];", tables);
+    REQUIRE(out.columns.size() >= 2);
+    CHECK(out.columns[0].name == "qty");
+    CHECK(out.columns[1].name == "price");
+    CHECK(out.columns[0].column == price_buffer);
+    CHECK(out.columns[1].column == qty_buffer);
+    CHECK(col_i64(out, "qty") == std::vector<std::int64_t>{10, 20, 30, 40, 50});
+    CHECK(col_i64(out, "price") == std::vector<std::int64_t>{5, 3, 8, 2, 1});
+}
+
 // --- Multi-step pipelines ----------------------------------------------------
 
 TEST_CASE("E2E: filter + aggregate + order pipeline", "[e2e]") {

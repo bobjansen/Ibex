@@ -81,19 +81,21 @@ TEST_CASE("column_origins follows a rename, which a name comparison cannot") {
     CHECK_FALSE(ir::column_origin_of(*node, "n_nationkey", sources).has_value());
 }
 
-TEST_CASE("column_origins applies chained renames in sequence") {
+TEST_CASE("column_origins applies a multi-rename simultaneously") {
     ir::SourceSchemas sources;
-    sources.emplace("t", schema_of({"a"}));
+    sources.emplace("t", schema_of({"a", "b"}));
 
-    // a -> b, then b -> c. Applied out of order this would lose the column.
+    // Read every mapping against the input schema: a -> b and b -> c. This
+    // hand-built map violates the surface collision rule, but still pins the
+    // mapping primitive's simultaneous semantics for every IR consumer.
     std::vector<ir::RenameSpec> renames{ir::RenameSpec{.new_name = "b", .old_name = "a"},
                                         ir::RenameSpec{.new_name = "c", .old_name = "b"}};
     auto node = std::make_unique<ir::RenameNode>(ir::NodeId{2}, std::move(renames));
     node->add_child(scan("t"));
 
-    expect_origin(*node, sources, "c", "t", "a");
+    expect_origin(*node, sources, "b", "t", "a");
+    expect_origin(*node, sources, "c", "t", "b");
     CHECK_FALSE(ir::column_origin_of(*node, "a", sources).has_value());
-    CHECK_FALSE(ir::column_origin_of(*node, "b", sources).has_value());
 }
 
 TEST_CASE("column_origins keeps a copy but drops a computed column") {

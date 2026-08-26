@@ -61,6 +61,28 @@ TEST_CASE("join output plan: a mapped key keeps both native columns", "[ir][join
     REQUIRE(out == std::vector<std::string>{"left_id", "val", "right_id", "other"});
 }
 
+TEST_CASE("join output plan: an explicitly folded mapped key keeps native inputs",
+          "[ir][join][schema]") {
+    const auto plan = plan_of(JoinKind::Inner, {{"id", "right_id", true}}, {"id", "left_value"},
+                              {"right_id", "right_value"});
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->size() == 3);
+    CHECK((*plan)[0].name == "id");
+    CHECK((*plan)[0].folded_peer_index == 0);
+    CHECK((*plan)[1].name == "left_value");
+    CHECK((*plan)[2].name == "right_value");
+}
+
+TEST_CASE("join output plan: a folded key can preserve a logical label", "[ir][join][schema]") {
+    const auto plan = plan_of(JoinKind::Inner, {{"left_native", "right_native", true, "id"}},
+                              {"left_native", "left_value"}, {"right_native", "right_value"});
+    REQUIRE(plan.has_value());
+    REQUIRE(plan->size() == 3);
+    CHECK((*plan)[0].name == "id");
+    CHECK((*plan)[0].source_index == 0);
+    CHECK((*plan)[0].folded_peer_index == 0);
+}
+
 TEST_CASE("join output plan: semi and anti joins return the left columns only",
           "[ir][join][schema]") {
     for (const JoinKind kind : {JoinKind::Semi, JoinKind::Anti}) {

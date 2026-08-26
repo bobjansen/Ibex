@@ -7111,6 +7111,115 @@ class ChunkedAggregateOperator final : public Operator {
             partitions.resize(part_count);
         }
 
+        // A clustered count key should not pay the partition/scatter/hash
+        // pipeline once per ROW. Compress contiguous equal-key runs first and
+        // carry their lengths as count weights. This is exact for arbitrary
+        // input order: non-contiguous runs still meet in the exact hash
+        // fallback, while sorted inputs such as TPC-H lineitem reduce the
+        // expensive part of the pipeline by roughly their mean run length.
+        // Sample before committing because all-unique keys would only add two
+        // equality passes and retain the original item count.
+        bool compress_runs = false;
+        if constexpr (std::is_same_v<Key, std::int64_t>) {
+            compress_runs = owned_ordered_run_mode_;
+            if (!compress_runs && !owned_mode_ && plan_[0].func == ir::AggFunc::Count &&
+                rows >= 64 && std::getenv("IBEX_DISABLE_ORDERED_RUN_AGG") == nullptr) {
+                const std::size_t sampled = std::min<std::size_t>(rows, 8192);
+                std::size_t repeats = 0;
+                Key previous = key_at(0);
+                for (std::size_t row = 1; row < sampled; ++row) {
+                    const Key key = key_at(row);
+                    repeats += key == previous ? 1 : 0;
+                    previous = key;
+                }
+                compress_runs = repeats * 2 >= sampled - 1;
+            }
+        }
+
+        const std::size_t source_ranges = workers;
+        const std::size_t source_grain = (rows + source_ranges - 1) / source_ranges;
+        std::size_t items = rows;
+        std::vector<std::size_t> run_offsets(source_ranges + 1, 0);
+        if (compress_runs) {
+            {
+                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
+                    const std::size_t begin = r * source_grain;
+                    const std::size_t end = std::min(rows, begin + source_grain);
+                    if (begin >= end) {
+                        return;
+                    }
+                    std::size_t runs = 1;
+                    Key previous = key_at(begin);
+                    for (std::size_t row = begin + 1; row < end; ++row) {
+                        const Key key = key_at(row);
+                        runs += key == previous ? 0 : 1;
+                        previous = key;
+                    }
+                    run_offsets[r + 1] = runs;
+                });
+                batch.wait();
+            }
+            for (std::size_t r = 0; r < source_ranges; ++r) {
+                run_offsets[r + 1] += run_offsets[r];
+            }
+            items = run_offsets.back();
+            owned_run_rows_.resize(items);
+            owned_run_lengths_.resize(items);
+            {
+                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
+                    const std::size_t begin = r * source_grain;
+                    const std::size_t end = std::min(rows, begin + source_grain);
+                    if (begin >= end) {
+                        return;
+                    }
+                    std::size_t out = run_offsets[r];
+                    std::size_t anchor = begin;
+                    Key previous = key_at(begin);
+                    for (std::size_t row = begin + 1; row < end; ++row) {
+                        const Key key = key_at(row);
+                        if (key != previous) {
+                            owned_run_rows_[out] = anchor;
+                            owned_run_lengths_[out] = row - anchor;
+                            ++out;
+                            anchor = row;
+                            previous = key;
+                        }
+                    }
+                    owned_run_rows_[out] = anchor;
+                    owned_run_lengths_[out] = end - anchor;
+                });
+                batch.wait();
+            }
+        }
+
+        if constexpr (std::is_same_v<Key, std::int64_t>) {
+            if (compress_runs) {
+                const std::size_t old_runs = owned_ordered_run_keys_.size();
+                owned_ordered_run_keys_.resize(old_runs + items);
+                owned_ordered_run_counts_.resize(old_runs + items);
+                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
+                    const std::size_t begin = run_offsets[r];
+                    const std::size_t end = run_offsets[r + 1];
+                    for (std::size_t item = begin; item < end; ++item) {
+                        owned_ordered_run_keys_[old_runs + item] = key_at(owned_run_rows_[item]);
+                        owned_ordered_run_counts_[old_runs + item] = owned_run_lengths_[item];
+                    }
+                });
+                batch.wait();
+                const std::size_t check_begin = old_runs == 0 ? 1 : old_runs;
+                for (std::size_t i = check_begin; i < owned_ordered_run_keys_.size(); ++i) {
+                    if (owned_ordered_run_keys_[i] < owned_ordered_run_keys_[i - 1]) {
+                        owned_ordered_runs_nondecreasing_ = false;
+                        break;
+                    }
+                }
+                owned_rows_seen_ += rows;
+                owned_mode_ = true;
+                owned_ordered_run_mode_ = true;
+                return true;
+            }
+        }
+
         const std::size_t ranges = workers;
         const std::size_t grain = (rows + ranges - 1) / ranges;
         part_of_row_.resize(rows);
@@ -7269,7 +7378,9 @@ class ChunkedAggregateOperator final : public Operator {
     /// one can be non-empty: the gate admits an owned run only before any group
     /// exists, so a single operator commits to one key and keeps it.
     void finalize_owned_active() {
-        if (!owned_pair_partitions_.empty()) {
+        if (owned_ordered_run_mode_) {
+            finalize_owned_ordered_runs();
+        } else if (!owned_pair_partitions_.empty()) {
             finalize_owned(
                 owned_pair_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
                 [&](std::size_t g, const PairIntKey& key) {
@@ -7280,6 +7391,69 @@ class ChunkedAggregateOperator final : public Operator {
             finalize_owned(
                 owned_int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
                 [&](std::size_t g, std::int64_t key) { int_order_[g] = key; });
+        }
+    }
+
+    /// A clustered single-Int64 Count is summarized as contiguous runs while
+    /// chunks arrive. If the complete stream is nondecreasing, adjacent runs
+    /// are the final groups and no hash table is needed at all. If a later
+    /// chunk disproves ordering, merge the run summaries through a hash map at
+    /// emission; this preserves exact first-occurrence semantics without
+    /// retaining or replaying the input rows.
+    void finalize_owned_ordered_runs() {
+        if (owned_finalized_) {
+            return;
+        }
+        owned_finalized_ = true;
+        if (owned_ordered_run_keys_.empty()) {
+            n_groups_ = 0;
+            return;
+        }
+
+        if (owned_ordered_runs_nondecreasing_) {
+            std::size_t total = 1;
+            for (std::size_t i = 1; i < owned_ordered_run_keys_.size(); ++i) {
+                total += owned_ordered_run_keys_[i] == owned_ordered_run_keys_[i - 1] ? 0 : 1;
+            }
+            n_groups_ = total;
+            int_order_.resize(total);
+            AggSlotCore* slots = flat_slots_.grow_uninitialized(total).data();
+            std::size_t group = 0;
+            int_order_[0] = owned_ordered_run_keys_[0];
+            slots[0] = AggSlotCore{};
+            slots[0].count = static_cast<std::int64_t>(owned_ordered_run_counts_[0]);
+            for (std::size_t i = 1; i < owned_ordered_run_keys_.size(); ++i) {
+                if (owned_ordered_run_keys_[i] != int_order_[group]) {
+                    ++group;
+                    int_order_[group] = owned_ordered_run_keys_[i];
+                    slots[group] = AggSlotCore{};
+                }
+                slots[group].count += static_cast<std::int64_t>(owned_ordered_run_counts_[i]);
+            }
+            return;
+        }
+
+        robin_hood::unordered_flat_map<std::int64_t, std::uint32_t> index;
+        std::vector<std::int64_t> counts;
+        for (std::size_t i = 0; i < owned_ordered_run_keys_.size(); ++i) {
+            const std::int64_t key = owned_ordered_run_keys_[i];
+            auto it = index.find(key);
+            std::uint32_t group{};
+            if (it == index.end()) {
+                group = static_cast<std::uint32_t>(int_order_.size());
+                index.emplace(key, group);
+                int_order_.push_back(key);
+                counts.push_back(0);
+            } else {
+                group = it->second;
+            }
+            counts[group] += static_cast<std::int64_t>(owned_ordered_run_counts_[i]);
+        }
+        n_groups_ = int_order_.size();
+        AggSlotCore* slots = flat_slots_.grow_uninitialized(n_groups_).data();
+        for (std::size_t group = 0; group < n_groups_; ++group) {
+            slots[group] = AggSlotCore{};
+            slots[group].count = counts[group];
         }
     }
 
@@ -9834,6 +10008,12 @@ class ChunkedAggregateOperator final : public Operator {
     };
     std::vector<OwnedPartition<PairIntKey, PairIntKeyHash>> owned_pair_partitions_;
     std::vector<OwnedPartition<std::int64_t, robin_hood::hash<std::int64_t>>> owned_int_partitions_;
+    std::vector<std::size_t> owned_run_rows_;
+    std::vector<std::size_t> owned_run_lengths_;
+    std::vector<std::int64_t> owned_ordered_run_keys_;
+    std::vector<std::size_t> owned_ordered_run_counts_;
+    bool owned_ordered_run_mode_ = false;
+    bool owned_ordered_runs_nondecreasing_ = true;
     /// Set once this operator has committed to owned-partition mode. Per the
     /// plan's safety note, only ever ADMITTED before any other discovery path
     /// (serial or `try_discover_partitioned`) has created a group -- widening

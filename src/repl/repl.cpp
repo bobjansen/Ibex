@@ -4,6 +4,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/distinct_key_reduction.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
 #include <ibex/ir/group_key_reduction.hpp>
@@ -5019,6 +5020,10 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // above, which are its whole premise.
         rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten),
                                                                  schemas_with_instances);
+        // Needs no schema or uniqueness proof of its own -- it decides by
+        // walking the plan -- but it runs here so it sees the shape the joins
+        // and the FD reduction leave behind.
+        rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
             auto it = lazy_sources.find(name);
             if (it == lazy_sources.end()) {

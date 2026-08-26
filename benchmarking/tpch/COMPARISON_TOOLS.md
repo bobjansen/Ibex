@@ -23,13 +23,13 @@ python3 compare_polars_detailed.py
 # Custom files with title
 python3 compare_polars_detailed.py \
   --ibex results/ibex_sf2.tsv \
-  --polars results/polars_sf2.tsv \
+  --polars results/pdsh_polars_sf2.tsv \
   --title "My Test"
 
 # Include PDS Polars for trend analysis
 python3 compare_polars_detailed.py \
   --ibex results/ibex_sf2.tsv \
-  --polars results/polars_sf2.tsv \
+  --polars results/pdsh_polars_sf2.tsv \
   --pdsh results/pdsh_polars_sf2.tsv
 ```
 
@@ -138,7 +138,7 @@ for run in results/runs/*/; do
     echo "=== $(basename "$run") ==="
     python3 compare_polars_detailed.py \
       --ibex "$run/ibex_sf2.tsv" \
-      --polars "$run/polars_sf2.tsv" \
+      --polars "$run/pdsh_polars_sf2.tsv" \
       --title "$(basename "$run")" | tail -5
   fi
 done
@@ -151,13 +151,13 @@ cd ~/ibex/benchmarking/tpch
 # SF-1 comparison
 python3 compare_polars_detailed.py \
   --ibex results/ibex_sf1.tsv \
-  --polars results/polars_sf1.tsv \
+  --polars results/pdsh_polars_sf1.tsv \
   --title "SF-1 Comparison"
 
 # SF-4 comparison
 python3 compare_polars_detailed.py \
   --ibex results/ibex_sf4.tsv \
-  --polars results/polars_sf4.tsv \
+  --polars results/pdsh_polars_sf4.tsv \
   --title "SF-4 Comparison"
 ```
 

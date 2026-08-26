@@ -115,7 +115,7 @@ archive_run() {
     dir="$RESULTS/runs/${stamp}_${commit:0:8}${dirty_suffix}_sf${SCALE}"
     mkdir -p "$dir"
 
-    local measured=("ibex" "ibex-st" "polars" "polars-st") carried=()
+    local measured=("ibex" "ibex-st") carried=()
     if [[ "$SKIP_PDSH" -eq 1 ]]; then
         carried=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
     else
@@ -182,16 +182,6 @@ IBEX_CORES=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
 sed 's/^ibex\t/ibex-st\t/' "$RESULTS/ibex_st${SUFFIX}.tsv.tmp" > "$RESULTS/ibex_st${SUFFIX}.tsv"
 rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 
-echo "=== polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
-"${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_polars.py" --warmup "$WARMUP" --iters "$ITERS" \
-    --out "$RESULTS/polars${SUFFIX}.tsv"
-
-echo "=== polars-st (single-threaded, apples-to-apples vs. ibex) ==="
-POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_polars.py" \
-    --warmup "$WARMUP" --iters "$ITERS" --out "$RESULTS/polars_st${SUFFIX}.tsv.tmp"
-sed 's/^polars\t/polars-st\t/' "$RESULTS/polars_st${SUFFIX}.tsv.tmp" > "$RESULTS/polars_st${SUFFIX}.tsv"
-rm -f "$RESULTS/polars_st${SUFFIX}.tsv.tmp"
-
 if [[ "$SKIP_PDSH" -eq 1 ]]; then
     # The upstream engines are pinned baselines here: their numbers move only
     # when polars-benchmark or DuckDB itself changes, so a run without that
@@ -209,23 +199,27 @@ if [[ "$SKIP_PDSH" -eq 1 ]]; then
     exit 0
 fi
 
-echo "=== upstream PDS-H Polars (multi-threaded, $(nproc) cores) ==="
-uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
+# The upstream engines run under the same taskset core affinity as ibex. With
+# the in-tree Polars implementation removed these are the only reference left,
+# and measuring ibex on 8 cores against a reference free to use 24 is not a
+# comparison. (Nothing is version-pinned here: --pdsh-root is a checkout.)
+echo "=== upstream PDS-H Polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
+"${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
     --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
     --out "$RESULTS/pdsh_polars${SUFFIX}.tsv"
 
 echo "=== upstream PDS-H Polars (single-threaded) ==="
-POLARS_MAX_THREADS=1 uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
+POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
     --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
     --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
 
-echo "=== upstream PDS-H DuckDB SQL ==="
-uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --pdsh-root "$PDSH_ROOT" \
+echo "=== upstream PDS-H DuckDB SQL (${CORES:-$(nproc)} cores) ==="
+"${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --pdsh-root "$PDSH_ROOT" \
     --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-duckdb \
     --out "$RESULTS/pdsh_duckdb${SUFFIX}.tsv"
 
 echo "=== upstream PDS-H DuckDB SQL (single-threaded) ==="
-uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --threads 1 \
+"${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine duckdb --threads 1 \
     --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
     --framework pdsh-duckdb-st --out "$RESULTS/pdsh_duckdb_st${SUFFIX}.tsv"
 

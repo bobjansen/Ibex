@@ -14,7 +14,7 @@ import sys
 from collections import defaultdict
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-FRAMEWORK_ORDER = ["ibex", "ibex-st", "polars", "polars-st", "pdsh-polars", "pdsh-polars-st", "pdsh-duckdb", "pdsh-duckdb-st"]
+FRAMEWORK_ORDER = ["ibex", "ibex-st", "pdsh-polars", "pdsh-polars-st", "pdsh-duckdb", "pdsh-duckdb-st"]
 QUERY_ORDER = ["q01", "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
 
 
@@ -44,7 +44,7 @@ def fmt(v):
 def main():
     paths = [pathlib.Path(p) for p in sys.argv[1:]] or sorted((SCRIPT_DIR / "results").glob("*.tsv"))
     if not paths:
-        sys.exit("no results found — run bench_ibex.py / bench_polars.py first")
+        sys.exit("no results found — run bench_ibex.py / bench_pdsh.py first")
     avg_data = load(paths)
 
     present_queries = [q for q in QUERY_ORDER if q in avg_data]

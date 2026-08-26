@@ -70,10 +70,10 @@ echo ""
 
 # Find the TSV files
 BEFORE_IBEX=$(find "$BEFORE_DIR" -name "ibex_sf${SCALE}.tsv" | head -1)
-BEFORE_POLARS=$(find "$BEFORE_DIR" -name "polars_sf${SCALE}.tsv" | head -1)
+BEFORE_POLARS=$(find "$BEFORE_DIR" -name "pdsh_polars_sf${SCALE}.tsv" | head -1)
 
 AFTER_IBEX=$(find "$AFTER_DIR" -name "ibex_sf${SCALE}.tsv" | head -1)
-AFTER_POLARS=$(find "$AFTER_DIR" -name "polars_sf${SCALE}.tsv" | head -1)
+AFTER_POLARS=$(find "$AFTER_DIR" -name "pdsh_polars_sf${SCALE}.tsv" | head -1)
 
 if [[ -z "$BEFORE_IBEX" ]] || [[ -z "$AFTER_IBEX" ]]; then
     echo "error: could not find SF-$SCALE ibex results in both runs" >&2

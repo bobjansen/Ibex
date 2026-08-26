@@ -115,7 +115,7 @@ def main() -> int:
     parser.add_argument("old", nargs="?")
     parser.add_argument("new", nargs="?")
     parser.add_argument("--framework", default="ibex")
-    parser.add_argument("--reference", default="polars",
+    parser.add_argument("--reference", default="pdsh-polars",
                         help="engine that did NOT change, used to detect box drift")
     parser.add_argument("--list", action="store_true", help="list archived runs")
     args = parser.parse_args()

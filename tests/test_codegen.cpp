@@ -494,6 +494,16 @@ TEST_CASE("emitter: join node - mapped keys", "[codegen]") {
     CHECK(contains(out, "{\"left_id\", \"right_id\"}"));
 }
 
+TEST_CASE("emitter: folded join key preserves its logical output label", "[codegen]") {
+    ir::Builder b;
+    auto join = b.join(ir::JoinKind::Inner, {{"left_native", "right_native", true, "logical_id"}});
+    join->add_child(make_source(b, "left.csv"));
+    join->add_child(make_source(b, "right.csv"));
+
+    CHECK(contains(emit_to_string(*join),
+                   "{\"left_native\", \"right_native\", true, \"logical_id\"}"));
+}
+
 TEST_CASE("emitter: join node - right join", "[codegen]") {
     ir::Builder b;
     auto left = make_source(b, "left.csv");

@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
@@ -291,38 +292,38 @@ auto materialize_deferred_scan_rows(const DeferredScan& scan, const Selection& r
     return out;
 }
 
-auto rename_table(const Table& input, const std::vector<ir::RenameSpec>& renames)
+auto rename_table(Table input, const std::vector<ir::RenameSpec>& renames)
     -> std::expected<Table, std::string> {
-    robin_hood::unordered_map<std::string, std::string> rename_map;
-    rename_map.reserve(renames.size());
-    for (const auto& spec : renames) {
-        const auto* entry = input.find_entry(spec.old_name);
-        if (entry == nullptr) {
-            return std::unexpected("rename: column not found: " + spec.old_name +
-                                   " (available: " + format_columns(input) + ")");
-        }
-        rename_map[spec.old_name] = spec.new_name;
-    }
-
-    Table output;
+    std::vector<std::string_view> input_names;
+    input_names.reserve(input.columns.size());
     for (const auto& entry : input.columns) {
-        auto it = rename_map.find(entry.name);
-        const std::string& out_name = (it != rename_map.end()) ? it->second : entry.name;
-        // Rename only relabels columns; share the data rather than copying it.
-        output.add_column_from(out_name, entry);
+        input_names.push_back(entry.name);
+    }
+    const ir::ColumnNameMap names(renames);
+    if (auto valid = names.validate_input(input_names); !valid.has_value()) {
+        return std::unexpected(valid.error() + " (available: " + format_columns(input) + ")");
     }
 
     // Rename never drops a column, it relabels it; rewrite each key and the
     // time index to its new name.
-    apply_table_properties(output,
-                           TableProperties::derive(
-                               table_properties_of(input),
-                               [&](const std::string& name) -> KeyFate {
-                                   auto it = rename_map.find(name);
-                                   return KeyFate::kept(it != rename_map.end() ? it->second : name);
-                               },
-                               RowTransform::Preserve));
-    return output;
+    const TableProperties properties = TableProperties::derive(
+        table_properties_of(input),
+        [&](const std::string& name) -> KeyFate {
+            return KeyFate::kept(std::string(names.output_name(name)));
+        },
+        RowTransform::Preserve);
+
+    // The Table value is owned here. Relabel its entries and rebuild the name
+    // index in place; column buffers and validity bitmaps are untouched.
+    input.index.clear();
+    input.index.reserve(input.columns.size());
+    for (std::size_t pos = 0; pos < input.columns.size(); ++pos) {
+        auto& entry = input.columns[pos];
+        entry.name = names.output_name(entry.name);
+        input.index.emplace(entry.name, pos);
+    }
+    apply_table_properties(input, properties);
+    return input;
 }
 
 auto columns_table(const Table& input) -> std::expected<Table, std::string> {
@@ -556,7 +557,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            return rename_table(child.value(), rename.renames());
+            return rename_table(std::move(child.value()), rename.renames());
         }
         case ir::NodeKind::Aggregate: {
             const auto& agg = static_cast<const ir::AggregateNode&>(node);

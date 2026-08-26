@@ -55,10 +55,11 @@ struct JoinOutputColumn {
 /// rules. The contract is:
 ///
 ///   - semi/anti joins return the left columns only;
-///   - every left column is emitted, in input order, under its own name;
-///   - a same-name equijoin key contributes one output column (the left one),
-///     so it is never a collision;
-///   - differently named equijoin keys keep both native columns;
+///   - every left column is emitted in input order; a folded key may assign
+///     its surviving left column an explicit logical output label;
+///   - a folded equijoin key contributes one output column (the left one), so
+///     it is never a collision; same-name keys are always folded;
+///   - differently named, non-folded keys keep both native columns;
 ///   - any other name held by both inputs is a collision. Without a suffix
 ///     policy that is an error naming the column and both sides; with one,
 ///     each side takes its suffix, and a suffixed name that still collides is

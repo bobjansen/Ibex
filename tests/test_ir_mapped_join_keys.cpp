@@ -80,17 +80,6 @@ auto join_of(const ir::Node& root) -> const ir::JoinNode& {
     return static_cast<const ir::JoinNode&>(*node);
 }
 
-/// The rename specs sitting directly under the join's right child, or an empty
-/// vector when that child is not a Rename.
-auto right_renames(const ir::JoinNode& join) -> std::vector<ir::RenameSpec> {
-    const ir::Node& right = *join.children()[1];
-    if (right.kind() != ir::NodeKind::Rename) {
-        return {};
-    }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    return static_cast<const ir::RenameNode&>(right).renames();
-}
-
 auto key_pairs(const ir::JoinNode& join) -> std::vector<std::pair<std::string, std::string>> {
     std::vector<std::pair<std::string, std::string>> out;
     out.reserve(join.keys().size());
@@ -109,15 +98,12 @@ TEST_CASE("mapped join keys: an unread right key folds into the left's name",
         test_sources());
 
     const auto& join = join_of(*plan);
-    CHECK(ir::join_keys_are_same_named(join.keys()));
-    CHECK(key_pairs(join) == std::vector<std::pair<std::string, std::string>>{{"ak", "ak"}});
-
-    const auto renames = right_renames(join);
-    REQUIRE(renames.size() == 1);
-    CHECK(renames[0].old_name == "bk");
-    CHECK(renames[0].new_name == "ak");
-    // The rename is inserted, not substituted: the right scan is still there.
-    CHECK(join.children()[1]->children().front()->kind() == ir::NodeKind::Scan);
+    CHECK_FALSE(ir::join_keys_are_same_named(join.keys()));
+    CHECK(ir::join_keys_are_folded(join.keys()));
+    CHECK(key_pairs(join) == std::vector<std::pair<std::string, std::string>>{{"ak", "bk"}});
+    REQUIRE(join.keys().size() == 1);
+    CHECK(join.keys().front().fold_output);
+    CHECK(join.children()[1]->kind() == ir::NodeKind::Scan);
 }
 
 TEST_CASE("mapped join keys: a right key the plan reads is left alone", "[ir][mapped_join_keys]") {
@@ -129,7 +115,7 @@ TEST_CASE("mapped join keys: a right key the plan reads is left alone", "[ir][ma
 
     const auto& join = join_of(*plan);
     CHECK_FALSE(ir::join_keys_are_same_named(join.keys()));
-    CHECK(right_renames(join).empty());
+    CHECK_FALSE(ir::join_keys_are_folded(join.keys()));
 }
 
 TEST_CASE("mapped join keys: a left join folds, a right join does not", "[ir][mapped_join_keys]") {
@@ -138,7 +124,7 @@ TEST_CASE("mapped join keys: a left join folds, a right join does not", "[ir][ma
     auto left = ir::normalize_mapped_join_keys(
         project_over_join(ir::JoinKind::Left, {{"ak", "bk"}}, "a", "b", {"ak", "ax", "bx"}),
         test_sources());
-    CHECK(ir::join_keys_are_same_named(join_of(*left).keys()));
+    CHECK(ir::join_keys_are_folded(join_of(*left).keys()));
 
     // Right and Outer fill the surviving key column from the RIGHT row when a
     // right row goes unmatched, so folding would change its values.
@@ -146,7 +132,7 @@ TEST_CASE("mapped join keys: a left join folds, a right join does not", "[ir][ma
         auto plan = ir::normalize_mapped_join_keys(
             project_over_join(kind, {{"ak", "bk"}}, "a", "b", {"ak", "ax", "bx"}), test_sources());
         CHECK_FALSE(ir::join_keys_are_same_named(join_of(*plan).keys()));
-        CHECK(right_renames(join_of(*plan)).empty());
+        CHECK_FALSE(ir::join_keys_are_folded(join_of(*plan).keys()));
     }
 }
 
@@ -156,19 +142,20 @@ TEST_CASE("mapped join keys: semi and anti joins fold", "[ir][mapped_join_keys]"
     for (const auto kind : {ir::JoinKind::Semi, ir::JoinKind::Anti}) {
         auto plan = ir::normalize_mapped_join_keys(
             project_over_join(kind, {{"ak", "bk"}}, "a", "b", {"ak", "ax"}), test_sources());
-        CHECK(ir::join_keys_are_same_named(join_of(*plan).keys()));
-        REQUIRE(right_renames(join_of(*plan)).size() == 1);
+        CHECK(ir::join_keys_are_folded(join_of(*plan).keys()));
+        CHECK(join_of(*plan).children()[1]->kind() == ir::NodeKind::Scan);
     }
 }
 
 TEST_CASE("mapped join keys: a name that collides across the sides is left alone",
           "[ir][mapped_join_keys]") {
-    // `d` already has an `ak`, so renaming its `bk` to `ak` would duplicate a
-    // name inside the right child.
+    // `d` already has an `ak`, so folding `bk` under that output name would
+    // hide a distinct right-side column.
     auto into_right = ir::normalize_mapped_join_keys(
         project_over_join(ir::JoinKind::Inner, {{"ak", "bk"}}, "a", "d", {"ak", "ax"}),
         test_sources());
     CHECK_FALSE(ir::join_keys_are_same_named(join_of(*into_right).keys()));
+    CHECK_FALSE(ir::join_keys_are_folded(join_of(*into_right).keys()));
 
     // `e` (the LEFT side here) already has a `bk`, so the join's suffix policy
     // is already renaming one of the two; folding would change which.
@@ -176,6 +163,7 @@ TEST_CASE("mapped join keys: a name that collides across the sides is left alone
         project_over_join(ir::JoinKind::Inner, {{"ak", "bk"}}, "e", "b", {"ak", "ex"}),
         test_sources());
     CHECK_FALSE(ir::join_keys_are_same_named(join_of(*from_left).keys()));
+    CHECK_FALSE(ir::join_keys_are_folded(join_of(*from_left).keys()));
 }
 
 TEST_CASE("mapped join keys: an unknown side schema proves nothing", "[ir][mapped_join_keys]") {
@@ -185,6 +173,7 @@ TEST_CASE("mapped join keys: an unknown side schema proves nothing", "[ir][mappe
         project_over_join(ir::JoinKind::Inner, {{"ak", "bk"}}, "a", "b", {"ak", "ax", "bx"}),
         partial);
     CHECK_FALSE(ir::join_keys_are_same_named(join_of(*plan).keys()));
+    CHECK_FALSE(ir::join_keys_are_folded(join_of(*plan).keys()));
 }
 
 TEST_CASE("mapped join keys: a same-named join is not touched", "[ir][mapped_join_keys]") {
@@ -192,7 +181,7 @@ TEST_CASE("mapped join keys: a same-named join is not touched", "[ir][mapped_joi
         project_over_join(ir::JoinKind::Inner, {{"ak"}}, "a", "d", {"ak"}), test_sources());
     const auto& join = join_of(*plan);
     CHECK(ir::join_keys_are_same_named(join.keys()));
-    CHECK(right_renames(join).empty());
+    CHECK(ir::join_keys_are_folded(join.keys()));
     CHECK(join.children()[1]->kind() == ir::NodeKind::Scan);
 }
 
@@ -215,10 +204,10 @@ TEST_CASE("mapped join keys: a multi-key join folds only the mapped key",
 
     const auto& join = join_of(*plan);
     CHECK(key_pairs(join) ==
-          std::vector<std::pair<std::string, std::string>>{{"shared", "shared"}, {"ak", "ak"}});
-    const auto renames = right_renames(join);
-    REQUIRE(renames.size() == 1);
-    CHECK(renames[0].old_name == "bk");
+          std::vector<std::pair<std::string, std::string>>{{"shared", "shared"}, {"ak", "bk"}});
+    REQUIRE(join.keys().size() == 2);
+    CHECK_FALSE(join.keys()[0].fold_output);
+    CHECK(join.keys()[1].fold_output);
 }
 
 TEST_CASE("mapped join keys: both spellings reach the same pushdown decision",
@@ -256,10 +245,7 @@ TEST_CASE("mapped join keys: both spellings reach the same pushdown decision",
         const ir::Node* node = root.children().front().get();
         REQUIRE(node->kind() == ir::NodeKind::Join);
         const ir::Node& right = *node->children()[1];
-        // The mapped spelling gains a Rename between the join and the filter.
-        const ir::Node* below =
-            right.kind() == ir::NodeKind::Rename ? right.children().front().get() : &right;
-        return below->kind() == ir::NodeKind::Filter ? "filtered" : "unfiltered";
+        return right.kind() == ir::NodeKind::Filter ? "filtered" : "unfiltered";
     };
 
     auto same_named = ir::push_filters_into_joins(build({{"ak", "ak"}}, "rn"), sources);
@@ -267,4 +253,30 @@ TEST_CASE("mapped join keys: both spellings reach the same pushdown decision",
 
     CHECK(pushed_side(*same_named) == "filtered");
     CHECK(pushed_side(*mapped) == "filtered");
+}
+
+TEST_CASE("mapped join keys: a folded key predicate uses each input's native name",
+          "[ir][mapped_join_keys]") {
+    auto join = make_join({2}, ir::JoinKind::Inner, {{"ak", "bk"}}, make_scan({3}, "a"),
+                          make_scan({4}, "b"));
+    auto predicate = ir::Expr{
+        .node = ir::CompareExpr{
+            .op = ir::CompareOp::Gt,
+            .left = ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "ak"}}),
+            .right = ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{5}}})}};
+    auto filter = std::make_unique<ir::FilterNode>(ir::NodeId{1}, std::move(predicate));
+    filter->add_child(std::move(join));
+    auto plan = ir::push_filters_into_joins(
+        make_project({0}, {"ak", "ax", "bx"}, std::move(filter)), test_sources());
+
+    const auto& rewritten = join_of(*plan);
+    REQUIRE(rewritten.children()[0]->kind() == ir::NodeKind::Filter);
+    REQUIRE(rewritten.children()[1]->kind() == ir::NodeKind::Filter);
+    const auto predicate_name = [](const ir::Node& node) -> std::string {
+        const auto& filter_node = static_cast<const ir::FilterNode&>(node);
+        const auto& compare = std::get<ir::CompareExpr>(filter_node.predicate().node);
+        return std::get<ir::ColumnRef>(compare.left->node).name;
+    };
+    CHECK(predicate_name(*rewritten.children()[0]) == "ak");
+    CHECK(predicate_name(*rewritten.children()[1]) == "bk");
 }

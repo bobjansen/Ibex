@@ -690,7 +690,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                         *out_ << ", ";
                     first = false;
                     *out_ << "{\"" << escape_string(key.left) << "\", \""
-                          << escape_string(key.right) << "\"}";
+                          << escape_string(key.right) << "\"";
+                    if (key.fold_output) {
+                        *out_ << ", true";
+                        if (!key.output_name_override.empty()) {
+                            *out_ << ", \"" << escape_string(key.output_name_override) << "\"";
+                        }
+                    }
+                    *out_ << "}";
                 }
                 *out_ << "}, " << emit_filter_expr(*join.predicate())
                       << emit_join_suffix(join.suffix(), join.null_match(), join.expect(),
@@ -707,7 +714,14 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
                         *out_ << ", ";
                     first = false;
                     *out_ << "{\"" << escape_string(key.left) << "\", \""
-                          << escape_string(key.right) << "\"}";
+                          << escape_string(key.right) << "\"";
+                    if (key.fold_output) {
+                        *out_ << ", true";
+                        if (!key.output_name_override.empty()) {
+                            *out_ << ", \"" << escape_string(key.output_name_override) << "\"";
+                        }
+                    }
+                    *out_ << "}";
                 }
                 *out_ << "}";
             }

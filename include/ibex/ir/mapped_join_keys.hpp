@@ -8,25 +8,26 @@
 
 namespace ibex::ir {
 
-/// Normalize `on { left_key = right_key }` into a same-named join.
+/// Mark an unobservable mapped key as folded in the join's output.
 ///
-/// Five optimizer passes decline outright on a join whose keys are not
-/// same-named — filter pushdown and semi/anti pushdown
-/// (`src/ir/join_pushdown.cpp`), the reorder cost model
-/// (`src/ir/join_reorder.cpp`), join ordering (`src/ir/join_order.cpp`), and
-/// deferrable probe scans (`src/ir/scan_predicates.cpp`). Each has its own good
-/// reason, but the effect was that writing a join the mapped way silently cost
-/// most of the join optimizer: measured at SF-1, PDS-H q03 ran 13-16% slower
-/// purely for being spelled `on { o_orderkey = l_orderkey }`.
+/// Several optimizer passes need one stable name for a key across a join chain:
+/// filter and semi/anti pushdown, inner-chain costing, physical reordering, and
+/// deferred scan-side filtering. Without normalization that made a large part
+/// of the optimizer needlessly spelling-sensitive: measured at SF-1, PDS-H q03
+/// ran 13-16% slower purely for being spelled
+/// `on { o_orderkey = l_orderkey }`.
 ///
-/// Those passes are not wrong. What was missing is that nothing normalized
-/// their input. This pass renames the right side's key column to the left's,
-/// which turns the mapped form into the shape they already handle:
+/// Those passes are not wrong. What was missing is a shared logical key name.
+/// This pass preserves each input's native spelling and records that the right
+/// key folds into the left key's output column:
 ///
-///     Join(Inner, keys=[c_custkey = o_custkey])   Join(Inner, keys=[c_custkey])
-///       Scan customer                       ->      Scan customer
-///       Scan orders                                 Rename(o_custkey -> c_custkey)
-///                                                     Scan orders
+///     Join(Inner, keys=[c_custkey = o_custkey])
+///       Scan customer
+///       Scan orders
+///
+/// becomes the same tree with `fold_output=true` on that JoinKey. Execution
+/// still reads `o_custkey` from orders; the optimizer uses `c_custkey` as the
+/// folded key's logical output name.
 ///
 /// It also removes a cost the passes never had anything to do with: SPEC 12.3
 /// keeps BOTH key columns in a mapped join's output, so the join materialises a
@@ -45,10 +46,10 @@ namespace ibex::ir {
 ///     Reconstructing it would need an order-restoring projection, and under a
 ///     Left join it is not even a copy of the left key on unmatched rows.
 ///   - **Neither name collides across the two sides**: the left key's name is
-///     absent from the right child's schema (else the rename duplicates a name
-///     inside it) and the right key's name is absent from the left child's (else
-///     the fold changes which columns the suffix policy renames). Both schemas
-///     must be Known.
+///     absent from the right child's schema (else folding would hide a distinct
+///     column under that name) and the right key's name is absent from the left
+///     child (else the fold changes which columns the suffix policy renames).
+///     Both schemas must be Known.
 ///
 /// Anything unproven is left mapped, which is exactly today's behaviour.
 ///

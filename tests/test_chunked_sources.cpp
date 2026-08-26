@@ -18,7 +18,9 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/env.hpp>
+#include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/table_compare.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -60,6 +62,36 @@ class ChunkGrainGuard {
    private:
     std::optional<std::string> saved_;
 };
+
+/// Yields prebuilt chunks in order, so a test can vary what each one carries --
+/// here, whether it has a validity bitmap at all.
+class VectorSource final : public runtime::Operator {
+   public:
+    explicit VectorSource(std::vector<runtime::Chunk> chunks) : chunks_(std::move(chunks)) {}
+
+    auto next() -> std::expected<std::optional<runtime::Chunk>, std::string> override {
+        if (pos_ >= chunks_.size()) {
+            return std::optional<runtime::Chunk>{};
+        }
+        return std::optional<runtime::Chunk>{std::move(chunks_[pos_++])};
+    }
+
+   private:
+    std::vector<runtime::Chunk> chunks_;
+    std::size_t pos_ = 0;
+};
+
+auto run_extern(const std::string& source, runtime::ExternRegistry& externs) -> runtime::Table {
+    auto program = parser::parse(source);
+    REQUIRE(program.has_value());
+    auto ir = parser::lower(program.value());
+    REQUIRE(ir.has_value());
+    const runtime::TableRegistry registry;
+    runtime::ExecutionContext exec;
+    auto result = runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
+    REQUIRE(result.has_value());
+    return std::move(*result);
+}
 
 auto run(const std::string& source, const runtime::TableRegistry& registry) -> runtime::Table {
     auto program = parser::parse(source);
@@ -228,7 +260,8 @@ TEST_CASE("chunked distinct dedups across a serial-then-parallel transition",
     for (std::size_t i = 0; i < kRows; ++i) {
         a.push_back(static_cast<std::int64_t>(i % 100));
         b.push_back(7);  // a second column, so the key packs rather than taking
-                         // the single-column path, which has no parallel branch
+                         // the single-column path -- which has a parallel branch
+                         // of its own, covered by the next two cases
         keep.push_back(i < kFirstChunk ? (i % 8 == 0 ? 1 : 0) : 1);
     }
     runtime::Table table;
@@ -252,6 +285,110 @@ TEST_CASE("chunked distinct dedups across a serial-then-parallel transition",
     if (mismatch.has_value()) {
         FAIL(mismatch->message());
     }
+}
+
+TEST_CASE("chunked single-column distinct dedups across a serial-then-parallel transition",
+          "[runtime][chunked][distinct]") {
+    // The twin of the packed case above, for the one-column typed store. It has
+    // the same two invisible-to-each-other halves -- `seen` for the serial
+    // branch, one set per partition for the parallel one -- so it has the same
+    // hazard: a chunk under the row gate dedups into `seen` while leaving the
+    // operator unactivated, and the first chunk over the gate then partitions
+    // against empty sets and re-emits everything the serial chunk accepted.
+    //
+    // Same shape as the packed test: 5000 rows survive chunk 0 (under the 32768
+    // gate) and 40000 survive chunk 1 (over it).
+    constexpr std::size_t kRows = 120000;
+    constexpr std::size_t kFirstChunk = 40000;
+    Column<std::int64_t> a;
+    Column<std::int64_t> keep;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        a.push_back(static_cast<std::int64_t>(i % 100));
+        keep.push_back(i < kFirstChunk ? (i % 8 == 0 ? 1 : 0) : 1);
+    }
+    runtime::Table table;
+    table.add_column("a", std::move(a));
+    table.add_column("keep", std::move(keep));
+
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+    const std::string query = "t[filter keep == 1][select { a }][distinct { a }];";
+
+    const auto whole = run(query, registry);
+    REQUIRE(whole.rows() == 100);
+
+    const ChunkGrainGuard guard{"40000"};
+    const auto chunked = run(query, registry);
+    REQUIRE(chunked.rows() == whole.rows());
+    auto mismatch = runtime::compare_tables(whole, chunked);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+}
+
+TEST_CASE("chunked single-column distinct migrates partitioned values on a null chunk",
+          "[runtime][chunked][distinct][validity]") {
+    // The typed stores hold raw values and cannot express null, so the first
+    // null-bearing chunk migrates whatever they hold into the validity-aware
+    // generic index. Once the parallel path has run those values live in
+    // `parts`, NOT in `seen` -- a migration that reads only `seen` seeds
+    // nothing, and every value the threaded chunks emitted comes back a second
+    // time.
+    //
+    // This needs chunks that DIFFER in whether they carry a bitmap at all,
+    // which slicing one column cannot produce: an all-valid slice of a
+    // null-bearing column still carries its bitmap, so every chunk would take
+    // the generic path and the typed store would never run. A chunked extern
+    // source can, and it is also the real shape -- a Parquet row group with
+    // null-free stats yields a column with no validity, and a later row group
+    // is then the first to carry one.
+    constexpr std::size_t kFirstChunk = 40000;  // over the parallel path's row gate
+    constexpr std::int64_t kValues = 100;
+
+    runtime::ExternRegistry externs;
+    externs.register_chunked_table("null_tail_keys", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+
+        runtime::Chunk dense;
+        runtime::ColumnEntry dense_entry;
+        dense_entry.name = "a";
+        dense_entry.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{});
+        auto& dense_col = std::get<Column<std::int64_t>>(*dense_entry.column);
+        dense_col.reserve(kFirstChunk);
+        for (std::size_t i = 0; i < kFirstChunk; ++i) {
+            dense_col.push_back(static_cast<std::int64_t>(i) % kValues);
+        }
+        dense.columns.push_back(std::move(dense_entry));
+        chunks.push_back(std::move(dense));
+
+        // The first chunk to carry a bitmap: one repeat, one null, one repeat.
+        runtime::Chunk nullable;
+        runtime::ColumnEntry nullable_entry;
+        nullable_entry.name = "a";
+        nullable_entry.column =
+            std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{5, 7, 0});
+        runtime::ValidityBitmap valid;
+        valid.push_back(true);
+        valid.push_back(false);
+        valid.push_back(true);
+        nullable_entry.validity = std::move(valid);
+        nullable.columns.push_back(std::move(nullable_entry));
+        chunks.push_back(std::move(nullable));
+
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    const auto result = run_extern(
+        "extern fn null_tail_keys() -> DataFrame from \"x.hpp\"; "
+        "null_tail_keys()[distinct { a }];",
+        externs);
+
+    // The 100 values of the dense chunk, plus the null. The nullable chunk's 5
+    // and 0 are repeats, and a migration that seeded only `seen` emits both
+    // again for 103 rows -- which is what this asserted against before the
+    // partitions were seeded too.
+    REQUIRE(result.rows() == static_cast<std::size_t>(kValues) + 1);
 }
 
 TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",

@@ -2833,17 +2833,45 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
+    /// A single-column typed dedup store: the serial set, and -- once the
+    /// parallel path has run -- one set per partition. Exactly `PackedDedup`'s
+    /// split, minus the key buffer, because for one column the column already
+    /// is the key buffer.
     template <typename T>
-    auto gather_distinct_rows(Table t, robin_hood::unordered_flat_set<T>& seen,
-                              const Column<T>& col) -> std::optional<Table> {
+    struct TypedDedup {
+        robin_hood::unordered_flat_set<T> seen;
+        std::vector<robin_hood::unordered_flat_set<T>> parts;
+    };
+
+    template <typename T>
+    auto gather_distinct_rows(Table t, TypedDedup<T>& state, const Column<T>& col)
+        -> std::optional<Table> {
         const std::size_t rows = t.rows();
         std::vector<std::size_t> idx;
         idx.reserve(rows);
-        for (std::size_t row = 0; row < rows; ++row) {
-            if (!seen.insert(col[row]).second) {
-                continue;
+        // Exact-identity value types only -- see `try_typed_parallel` for why a
+        // float must not be partitioned by its hash. Bool is left serial too:
+        // two values fit in any cache, so there is nothing for partitioning to
+        // win.
+        constexpr bool kExactIdentity = std::is_same_v<T, std::int64_t> ||
+                                        std::is_same_v<T, Date> || std::is_same_v<T, Timestamp>;
+        bool threaded = false;
+        if constexpr (kExactIdentity) {
+            threaded = try_typed_parallel(col, rows, state, keep_);
+        }
+        if (threaded) {
+            for (std::size_t row = 0; row < rows; ++row) {
+                if (keep_[row] != 0) {
+                    idx.push_back(row);
+                }
             }
-            idx.push_back(row);
+        } else {
+            for (std::size_t row = 0; row < rows; ++row) {
+                if (!state.seen.insert(col[row]).second) {
+                    continue;
+                }
+                idx.push_back(row);
+            }
         }
         if (idx.empty()) {
             return std::nullopt;
@@ -2958,7 +2986,7 @@ class ChunkedDistinctOperator final : public Operator {
     ///
     /// The two set forms are alternatives, never both: a value deduped into
     /// `seen` is invisible to `parts` and vice versa, so once a chunk has taken
-    /// the parallel path every later chunk must too (`packed_part_count_`).
+    /// the parallel path every later chunk must too (`dedup_part_count_`).
     template <typename Packed, typename Hash>
     struct PackedDedup {
         robin_hood::unordered_flat_set<Packed, Hash> seen;
@@ -3006,7 +3034,7 @@ class ChunkedDistinctOperator final : public Operator {
         // rows already emitted. Every condition below therefore either holds
         // for the whole query (the context and the pool are fixed) or, like the
         // row gate, guards only the first use.
-        if (packed_part_count_ == 0) {
+        if (dedup_part_count_ == 0) {
             constexpr std::size_t kMinRows = 1U << 15U;
             if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
                 rows < kMinRows) {
@@ -3028,14 +3056,14 @@ class ChunkedDistinctOperator final : public Operator {
             // `count <= pool.size()` by construction and the pool never
             // shrinks, so `submit(part_count, ...)` below is never clamped —
             // which it must not be, or a partition's rows would go unvisited.
-            packed_part_count_ = count;
+            dedup_part_count_ = count;
             state.parts.resize(count);
             // Anything an earlier chunk deduped serially lives in `state.seen`,
             // which no worker will ever probe, so it has to move into the
             // partitions before the first parallel chunk runs. Without this a
             // value already emitted is inserted afresh and emitted a SECOND
             // time: the row gate is per chunk, so a chunk under it falls back
-            // to serial while leaving `packed_part_count_` at 0, and the next
+            // to serial while leaving `dedup_part_count_` at 0, and the next
             // chunk over the gate is then the first parallel use, against empty
             // partitions. A 5000-row chunk ahead of a 40000-row one is enough,
             // which any filter with uneven selectivity produces.
@@ -3049,7 +3077,7 @@ class ChunkedDistinctOperator final : public Operator {
             state.seen.clear();
         }
         auto& pool = process_worker_pool();
-        const std::size_t part_count = packed_part_count_;
+        const std::size_t part_count = dedup_part_count_;
         const std::size_t workers = part_count;
         const std::uint64_t part_mask = part_count - 1;
 
@@ -3088,6 +3116,107 @@ class ChunkedDistinctOperator final : public Operator {
                         continue;
                     }
                     if (seen.insert(state.keys[row]).second) {
+                        // Distinct partitions never share a row, so concurrent
+                        // writes here never target the same byte.
+                        keep[row] = 1;
+                    }
+                }
+            });
+            batch.wait();
+        }
+        return true;
+    }
+
+    /// The single-column twin of `try_packed_parallel`, for a store whose key
+    /// IS the column's value. Same partitioned discovery, same determinism
+    /// argument: keep flags are recorded at a row rather than a position, every
+    /// partition is scanned ascending, so the row kept for a value is the first
+    /// one however the workers interleave.
+    ///
+    /// A one-column `distinct` was the only shape with no parallel path at all,
+    /// and it is the most common one. The asymmetry was visible from outside
+    /// the engine: over the same 3M int64 keys, `distinct {k}` ran 70ms on one
+    /// core and 68ms on eight, while `distinct {k, k}` -- strictly more work,
+    /// but wide enough to reach the packed path -- ran 52ms on eight.
+    /// Deduplicating on one key must not cost more than deduplicating on two.
+    ///
+    /// Only exact-identity value types reach here (`gather_distinct_rows`
+    /// gates it): partitioning by hash is sound only where every pair the set
+    /// calls equal also hashes alike. Integers give that. Floats do not -- -0.0
+    /// and 0.0 compare equal and nothing promises they hash the same, so a
+    /// partitioned run could emit both where the serial run emits one.
+    template <typename T>
+    auto try_typed_parallel(const Column<T>& col, std::size_t rows, TypedDedup<T>& state,
+                            std::vector<std::uint8_t>& keep) -> bool {
+        if (dedup_part_count_ == 0) {
+            // Below this the fan-out costs more than the serial probe it
+            // replaces. As in the packed path, cardinality is what the pass is
+            // about to discover, so row count is the only gate available.
+            constexpr std::size_t kMinRows = 1U << 15U;
+            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
+                rows < kMinRows) {
+                return false;
+            }
+            const std::size_t pool_size = process_worker_pool().size();
+            const std::size_t budget = exec_->compute_budget();
+            const std::size_t workers = std::min({budget, pool_size, std::size_t{64}});
+            if (workers < 2) {
+                return false;
+            }
+            std::size_t count = 1;
+            while (count * 2 <= workers) {
+                count *= 2;  // a power of two, so the partition is a mask
+            }
+            dedup_part_count_ = count;
+        }
+        if (state.parts.size() != dedup_part_count_) {
+            // Whatever earlier chunks deduped serially lives in `seen`, which no
+            // worker will ever probe, so it has to move into the partitions
+            // before the first parallel chunk runs -- otherwise a value already
+            // emitted is inserted afresh and emitted a SECOND time. The row gate
+            // is per chunk, so a small chunk ahead of a large one produces
+            // exactly that. Same hasher and mask the workers use below, or a
+            // seeded value lands in a partition nobody probes for it.
+            state.parts.resize(dedup_part_count_);
+            robin_hood::hash<T> seed_hasher;
+            for (const T& value : state.seen) {
+                state.parts[seed_hasher(value) & (dedup_part_count_ - 1)].insert(value);
+            }
+            state.seen.clear();
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t part_count = dedup_part_count_;
+        const std::uint64_t part_mask = part_count - 1;
+
+        // Pass 1: note each row's partition. No key buffer to fill -- the
+        // column is one already -- so this is a read of `col` and a byte write.
+        part_of_row_.resize(rows);
+        const std::size_t ranges = std::max<std::size_t>(1, std::min(part_count, rows));
+        const std::size_t grain = (rows + ranges - 1) / ranges;
+        {
+            auto batch = pool.submit(ranges, [&](std::size_t r) {
+                const std::size_t begin = r * grain;
+                const std::size_t end = std::min(rows, begin + grain);
+                robin_hood::hash<T> hasher;
+                for (std::size_t row = begin; row < end; ++row) {
+                    part_of_row_[row] = static_cast<std::uint8_t>(hasher(col[row]) & part_mask);
+                }
+            });
+            batch.wait();
+        }
+
+        // Pass 2: one worker per partition, each scanning the whole chunk and
+        // touching only its own rows and its own set.
+        keep.assign(rows, 0);
+        {
+            auto batch = pool.submit(part_count, [&](std::size_t p) {
+                auto& seen = state.parts[p];
+                const auto tag = static_cast<std::uint8_t>(p);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (part_of_row_[row] != tag) {
+                        continue;
+                    }
+                    if (seen.insert(col[row]).second) {
                         // Distinct partitions never share a row, so concurrent
                         // writes here never target the same byte.
                         keep[row] = 1;
@@ -3239,8 +3368,8 @@ class ChunkedDistinctOperator final : public Operator {
     /// the position a value lands at here -- so the values can be seeded in
     /// whatever order the typed set iterates them.
     template <typename Container, typename ToScalar, typename ToHash>
-    void seed_generic_dedup_from(const Container& seen, const ToScalar& to_scalar,
-                                 const ToHash& to_hash) {
+    void seed_generic_dedup_values(const Container& seen, const ToScalar& to_scalar,
+                                   const ToHash& to_hash) {
         group_order_.reserve(group_order_.size() + seen.size());
         key_index_.hashes.reserve(key_index_.hashes.size() + seen.size());
         for (const auto& v : seen) {
@@ -3249,11 +3378,35 @@ class ChunkedDistinctOperator final : public Operator {
             group_order_.push_back(std::move(key));
             key_index_.hashes.push_back(to_hash(v));
         }
+    }
+
+    void rehash_generic_dedup() {
         std::size_t capacity = 1024;
         while (capacity * 7 < key_index_.hashes.size() * 10) {
             capacity *= 2;
         }
         key_index_.rehash(capacity);
+    }
+
+    template <typename Container, typename ToScalar, typename ToHash>
+    void seed_generic_dedup_from(const Container& seen, const ToScalar& to_scalar,
+                                 const ToHash& to_hash) {
+        seed_generic_dedup_values(seen, to_scalar, to_hash);
+        rehash_generic_dedup();
+    }
+
+    /// A typed store holds its values in `seen` before the parallel path has run
+    /// and in `parts` after it -- never both, but seeding from each in turn is
+    /// correct either way, and missing the partitions would silently re-emit
+    /// every value the threaded chunks had already accepted.
+    template <typename T, typename ToScalar, typename ToHash>
+    void seed_generic_dedup_from(const TypedDedup<T>& state, const ToScalar& to_scalar,
+                                 const ToHash& to_hash) {
+        seed_generic_dedup_values(state.seen, to_scalar, to_hash);
+        for (const auto& part : state.parts) {
+            seed_generic_dedup_values(part, to_scalar, to_hash);
+        }
+        rehash_generic_dedup();
     }
 
     /// Migrate whichever single-column typed store `process_single_column`
@@ -3317,10 +3470,12 @@ class ChunkedDistinctOperator final : public Operator {
     /// occurrence. Both are indexed by row and rewritten per chunk.
     std::vector<std::uint8_t> part_of_row_;
     std::vector<std::uint8_t> keep_;
-    /// Pinned on first parallel use. A key's partition is `hash & (count-1)`,
-    /// so a later chunk that partitioned differently would probe the wrong
-    /// worker's set and re-emit a value already seen.
-    std::size_t packed_part_count_ = 0;
+    /// Pinned on first parallel use, and shared by the packed and typed stores
+    /// -- an operator deduplicates on a fixed column count, so only one of them
+    /// is ever the live store. A key's partition is `hash & (count-1)`, so a
+    /// later chunk that partitioned differently would probe the wrong worker's
+    /// set and re-emit a value already seen.
+    std::size_t dedup_part_count_ = 0;
     PackedKeyEncoder encoder_;
     /// `t.columns` as pointers, rebuilt per chunk for the encoder. A member so
     /// the reserve is paid once rather than per chunk.
@@ -3331,11 +3486,11 @@ class ChunkedDistinctOperator final : public Operator {
     bool fast_dedup_seen_ = false;
     bool generic_dedup_seen_ = false;
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
-    robin_hood::unordered_flat_set<std::int64_t> seen_i64_;
-    robin_hood::unordered_flat_set<double> seen_f64_;
-    robin_hood::unordered_flat_set<bool> seen_bool_;
-    robin_hood::unordered_flat_set<Date> seen_date_;
-    robin_hood::unordered_flat_set<Timestamp> seen_timestamp_;
+    TypedDedup<std::int64_t> seen_i64_;
+    TypedDedup<double> seen_f64_;
+    TypedDedup<bool> seen_bool_;
+    TypedDedup<Date> seen_date_;
+    TypedDedup<Timestamp> seen_timestamp_;
     std::vector<std::uint8_t> seen_cat_flags_;
     robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
     std::deque<std::string> owned_strings_;

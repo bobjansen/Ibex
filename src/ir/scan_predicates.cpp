@@ -125,6 +125,18 @@ auto projected_scan(const Node& node, std::set<std::string>* introduced = nullpt
     }
     const Node* child = node.children().front().get();
     while (true) {
+        if (child->kind() == NodeKind::Rename) {
+            if (child->children().size() != 1 || child->children().front() == nullptr) {
+                return nullptr;
+            }
+            if (introduced != nullptr) {
+                for (const auto& spec : static_cast<const RenameNode&>(*child).renames()) {
+                    introduced->insert(spec.new_name);
+                }
+            }
+            child = child->children().front().get();
+            continue;
+        }
         // A Project subsets columns without renaming, so a predicate's column
         // names still resolve against whatever is beneath it.
         if (child->kind() == NodeKind::Project) {

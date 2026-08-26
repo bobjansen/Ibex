@@ -30,6 +30,7 @@ set(IBEX_TEST_SOURCES
     test_ir_optimizer.cpp
     test_ir_pending_order.cpp
     test_ir_column_origins.cpp
+    test_parquet_dictionary_policy.cpp
     test_ir_distinct_key_reduction.cpp
     test_ir_group_key_reduction.cpp
     test_ir_required_columns.cpp

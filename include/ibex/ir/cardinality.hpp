@@ -83,7 +83,25 @@ struct CardinalityOptions {
     /// Conservative default used until a source supplies predicate statistics.
     /// It affects planning cost only, never query semantics.
     double filter_selectivity = 0.25;
+
+    /// Selectivity of the filters a source has already ABSORBED into its scan.
+    ///
+    /// `remove_applied_scan_filters` deletes the Filter nodes whose predicates
+    /// were pushed into a scan's decode, so a plan walked after that step shows
+    /// every scan at its table's full size and estimates a filtered relation as
+    /// if nothing had filtered it. Supplying the absorbed selectivity here
+    /// restores the estimate the pre-absorption tree would have produced. Empty
+    /// (the default) means nothing was absorbed, which is the case for every
+    /// caller that runs before that step.
+    std::map<std::string, double> absorbed_scan_selectivity;
 };
+
+/// `filter_selectivity` raised to the predicate's conjunct count, treating each
+/// conjunct as an independent restriction (the standard independence
+/// assumption). Exposed so a caller that absorbed a filter into a scan can
+/// reconstruct the selectivity the Filter node would have contributed.
+[[nodiscard]] auto compound_selectivity(const Expr& predicate, double filter_selectivity = 0.25)
+    -> double;
 
 /// Estimate output rows for a logical plan. Unknown inputs remain unknown;
 /// this is deliberately more useful than inventing a global table-size default

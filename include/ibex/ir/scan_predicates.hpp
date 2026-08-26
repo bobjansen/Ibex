@@ -82,9 +82,16 @@ struct DeferrableProbeScan {
 /// (leaving them default-empty) disables the gate entirely and keeps the
 /// original, purely structural eligibility -- every existing caller does this
 /// today, including every unit test below.
-[[nodiscard]] auto deferrable_probe_scans(const Node& root, const std::set<std::string>& sources,
-                                          const SourceRowCounts& row_counts = {},
-                                          const SourceSchemas& schemas = {})
+/// `absorbed_scan_selectivity` carries the selectivity of filters already fused
+/// into a scan's decode, keyed by source. Callers that run AFTER
+/// `remove_applied_scan_filters` must supply it: the gate below weighs a build
+/// side's filtered row estimate against its own table's size, and without this
+/// every build side reads back its full table, making a genuinely reduced one
+/// indistinguishable from an unfiltered one.
+[[nodiscard]] auto deferrable_probe_scans(
+    const Node& root, const std::set<std::string>& sources, const SourceRowCounts& row_counts = {},
+    const SourceSchemas& schemas = {},
+    const std::map<std::string, double>& absorbed_scan_selectivity = {})
     -> std::map<std::string, DeferrableProbeScan>;
 
 /// Remove row-local filters which have already been applied by a lazy source.

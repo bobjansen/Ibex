@@ -367,6 +367,43 @@ TEST_CASE("deferrable_probe_scans: bare right-side scan of an inner join is elig
     CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"build"}).contains("build"));
 }
 
+TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",
+          "[ir][scan_predicates][deferred_scan]") {
+    // The row-count gate alone says yes -- 1.5M build rows against 12M probe
+    // rows clears `build * 2 < probe` three times over. But every probe key
+    // references a real build key, so the published filter rejects nothing and
+    // the whole apparatus is a pure loss. What separates this from a genuinely
+    // reduced build side is COVERAGE of the key's domain: this build side still
+    // carries all 1.5M rows of its own table.
+    const ir::SourceRowCounts rows{{"orders", 1500000}, {"lineitem", 12000000}};
+    ir::SourceSchemas schemas;
+    schemas.emplace("orders", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+    schemas.emplace("lineitem", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+
+    auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "orders"),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "lineitem"), "id");
+    CHECK_FALSE(
+        ir::deferrable_probe_scans(*plan, {"lineitem"}, rows, schemas).contains("lineitem"));
+}
+
+TEST_CASE("deferrable_probe_scans: a filter absorbed into the build scan still counts",
+          "[ir][scan_predicates][deferred_scan]") {
+    // Same shape, but the build side's filter was fused into its scan and its
+    // Filter node deleted. Without the absorbed selectivity the build side
+    // reads back its whole table and is indistinguishable from the case above;
+    // with it, the build side is a fraction of `orders` and deferring pays.
+    const ir::SourceRowCounts rows{{"orders", 1500000}, {"lineitem", 12000000}};
+    ir::SourceSchemas schemas;
+    schemas.emplace("orders", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+    schemas.emplace("lineitem", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+
+    auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "orders"),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "lineitem"), "id");
+    const std::map<std::string, double> absorbed{{"orders", 0.05}};
+    CHECK(ir::deferrable_probe_scans(*plan, {"lineitem"}, rows, schemas, absorbed)
+              .contains("lineitem"));
+}
+
 TEST_CASE("deferrable_probe_scans: mapped join key defers under the right-side name",
           "[ir][scan_predicates][deferred_scan]") {
     // Q2's p_partkey = ps_partkey join must defer partsupp with its physical

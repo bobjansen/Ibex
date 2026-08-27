@@ -7680,22 +7680,26 @@ class ChunkedAggregateOperator final : public Operator {
             if (scratch_stride_ != 0) {
                 return false;
             }
-            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
+            if (exec_ == nullptr || on_worker_pool_thread()) {
+                return false;
+            }
+            // Fan-out permission and the worker cap are the plan's
+            // (src/runtime/PARALLELISM.md); `decline != None` folds in
+            // `!exec_->can_fan_out()`. `min_rows` stays here: it is the owned
+            // strategy's own "is the specialization worth it" gate, lower than
+            // the radix `partition` floor, and an operator-resolved choice like
+            // the join's build orientation.
+            if (par_.partition.decline != physical::FanOutDecline::None ||
+                par_.partition.worker_cap < 2) {
                 return false;
             }
             if (std::max(rows_offered_, rows) < min_rows) {
                 return false;
             }
-            auto& pool0 = process_worker_pool();
-            const std::size_t budget0 = exec_->compute_budget();
-            if (std::min(budget0, pool0.size()) < 2) {
-                return false;
-            }
         }
 
         auto& pool = process_worker_pool();
-        const std::size_t budget = exec_->compute_budget();
-        const std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
+        const std::size_t workers = par_.partition.worker_cap;
         std::size_t part_count = 1;
         while (part_count * 2 <= workers) {
             part_count *= 2;
@@ -7703,9 +7707,6 @@ class ChunkedAggregateOperator final : public Operator {
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
-        }
-        if (workers >= 2) {
-            check_agg_plan(par_.partition, workers);  // the owned specialization of the phase
         }
 
         // A clustered count key should not pay the partition/scatter/hash
@@ -8771,7 +8772,18 @@ class ChunkedAggregateOperator final : public Operator {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
-        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
+        // The `partition` phase's worker cap and fan-out permission come from
+        // the plan (src/runtime/PARALLELISM.md); the operator keeps only the two
+        // checks it alone can make -- is it nested, did this operator's input so
+        // far clear the floor. `decline != None` folds in `!exec_->can_fan_out()`
+        // (the plan resolves `SingleCore` from it). `min_rows` is still the
+        // operator's: it is the radix strategy's own admission gate, stricter
+        // than `try_owned`'s, and lives beside the constant it names.
+        if (exec_ == nullptr || on_worker_pool_thread()) {
+            return false;
+        }
+        if (par_.partition.decline != physical::FanOutDecline::None ||
+            par_.partition.worker_cap < 2) {
             return false;
         }
         if (!partitioned_active_) {
@@ -8788,16 +8800,11 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
         auto& pool = process_worker_pool();
-        const std::size_t budget = exec_->compute_budget();
-        std::size_t workers = std::min({budget, pool.size(), std::size_t{64}});
-        if (workers < 2) {
-            return false;
-        }
+        const std::size_t workers = par_.partition.worker_cap;
         std::size_t part_count = 1;
         while (part_count * 2 <= workers) {
             part_count *= 2;  // a power of two, so the partition is a mask
         }
-        check_agg_plan(par_.partition, workers);  // the radix-hash discovery + accumulate phase
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);

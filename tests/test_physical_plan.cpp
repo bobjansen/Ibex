@@ -1219,7 +1219,7 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE(partition.name == "partition");
         REQUIRE(partition.parallelism.strategy ==
                 runtime::physical::PartitionStrategy::RadixHash);
-        REQUIRE(partition.parallelism.row_floor == (1U << 16U));  // try_owned's admission floor
+        REQUIRE(partition.parallelism.row_floor == (1U << 18U));  // radix kDefaultPartitionMinRows
         REQUIRE(partition.parallelism.breaker_max_workers == 64);
 
         const auto& finalize = plan.breaker_phases[1];

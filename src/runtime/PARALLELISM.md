@@ -170,7 +170,7 @@ category has a single clean owner today.
 | Category | Whether parallel + how | Represented in `physical::Plan`? | `explain physical` shows it? |
 |---|---|---|---|
 | **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
-| **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and the two fan-out phases (`hash-build`, `probe`). The **hash-build** phase is authoritative: `build_partitions` reads `build_plan_` (slice 4). The **probe** phase is still described-only — `probe_parallel_workers` decides for itself. Output assembly is inside `ChunkedInnerJoinOperator`. | Partial (structure + both phases; hash-build authoritative). | Structure + both phases. |
+| **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases. |
 | **Aggregate** | The plan owns `AggregatePlan` (which construction path). **Discovery, per-partition slots, the owned-aggregate hot table, and the finalize merge are inside `ChunkedAggregateOperator`.** | Partial. | Which path, not the phases. |
 | **Distinct / Order / TopK / Head / Tail** | **Nothing in the plan.** `execution_capability(Distinct)` returns `ParallelBarrier`, but that value is **never read to make a decision** — it names what a future executor *could* do. `build_physical_distinct` just constructs `ChunkedDistinctOperator`, which owns the entire decision internally: the `can_fan_out()` / `on_worker_pool_thread()` guard, a private `kMinRows` (hardcoded, and twice — accumulate and finalize), the partition count from `compute_budget()`, the two-pass "one worker per partition scans the whole chunk" model. | **No.** | **No.** |
 | **Layer C fan-out inside any operator** (group discovery, sort gather, decode, semi/anti predicate) | Always the operator's, each with its own private row threshold and its own `min(budget, pool, cap)` worker count. | No. | No. |
@@ -407,10 +407,11 @@ Breaker(Head)
   serial (single-operator breaker, no fan-out point)
 ```
 
-Join (slice 3, descriptive) — the strategy line, then one line per fan-out
-phase. The floors are the private constants `chunked.cpp` already applies
-(`build_partitions`'s `1U << 17U`, `probe_parallel_workers`'s `1U << 14U`); the
-operator still owns them, `build_physical_join` does not read the phases yet.
+Join — the strategy line, then one line per fan-out phase. Both floors
+(`build_partitions`'s `1U << 17U`, `probe_parallel_workers`'s `1U << 14U`) and
+the shared `min(budget, pool, 64)` cap live on the plan now;
+`resolved_join_parallelism` fills a `physical::JoinParallelism` at build time and
+the operator reads it (slices 4–5).
 
 ```
 Breaker(Join)
@@ -473,23 +474,27 @@ Every slice:
    the plan records "serial, by design", like `Head`. Parallelizing it (per-range
    local heaps + merge) is barely worth it for small k, and Ibex already wins
    top-k ~12×. Do not fold it into the Order port.
-3. **Join** — **slices 3 + 4 landed.** Slice 3 (descriptive): a streaming join's
+3. **Join** — **DONE (slices 3–5).** Slice 3 (descriptive): a streaming join's
    plan carries two phases, `hash-build` (`PartitionStrategy::HeadTable`, floor
    `1U << 17U`) and `probe` (`PartitionStrategy::Range`, floor `1U << 14U`), and
-   `explain physical` prints the strategy line plus both. Slice 4 (authority,
-   hash-build only): `resolved_join_build_plan` resolves the phase where the
-   `ExecutionContext` is in hand (every join construction site shares it), and
-   `ChunkedInnerJoinOperator::build_partitions` reads `build_plan_` instead of
-   re-deriving the floor and the `min(budget, pool, 64)` cap. The checks that
-   stay in the operator are the `IBEX_JOIN_BUILD_SERIAL` kill switch,
-   `on_worker_pool_thread`, and the per-build-side row floor. **The probe is
-   still operator-owned** — `probe_parallel_workers` has three axes and the
-   `parallel_join_probe` flag; that authority move is a later slice. Next is
-   making `build_join_hash_index`'s threading a scheduled-`HashBuild` decision:
-   q21's 40 ms build runs serial because the staged probe pulls the first chunk
-   on a pool thread (`on_worker_pool_thread()` → 1 partition), and a build
-   scheduled on the main thread ahead of the stage would fan out. That is the
-   speed lever, and it needs a benchmark.
+   `explain physical` prints the strategy line plus both. Slices 4–5 (authority):
+   `resolved_join_parallelism` resolves *both* phases where the
+   `ExecutionContext` is in hand (every join construction site shares it, as one
+   `physical::JoinParallelism`). `ChunkedInnerJoinOperator::build_partitions`
+   reads `par_.build` and `JoinProbe::probe_parallel_workers` reads `par_.probe`,
+   neither re-deriving the floor or the `min(budget, pool, 64)` cap. The checks
+   that stay in the operator are the ones only it can make: a kill switch
+   (`IBEX_JOIN_BUILD_SERIAL` / the `parallel_join_probe` toggle), nesting
+   (`on_worker_pool_thread`), and whether this side/chunk cleared the floor. Both
+   fan-outs now have a `ParallelPipelineStats` counter (`parallel_hash_builds`,
+   `parallel_probes`) so a gate that silently stopped matching is a red test, not
+   a slow query.
+
+   **Not a speed slice.** The hash build's parallel fill landed earlier
+   (`2458bfda` + `36e93fbd`, measured q21 −8.5%); slices 3–5 moved the *decision*
+   onto the plan, byte-identical throughout. The `probe_parallel_workers`
+   `on_worker_pool_thread()` veto was measured to fire 0/52 on PDS-H, so folding
+   it changed nothing.
 4. **Aggregate** — `AggregatePlan` gains discovery / accumulate / finalize
    phases. **Blocked-first:** `try_owned_pair` and the serial path re-associate
    differently and disagree bit-for-bit at ≥65536 rows, with no test. That

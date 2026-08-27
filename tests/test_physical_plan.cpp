@@ -1186,15 +1186,80 @@ TEST_CASE("The join operator reads the hash-build plan: parallel output equals s
 
     runtime::ExecutionContext serial;
     serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
     runtime::ExecutionContext parallel;
     parallel.parallel_threads = 8;
+    parallel.parallel_stats = &stats;
 
     const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
     REQUIRE(s.has_value());
     REQUIRE(p.has_value());
+    REQUIRE(stats.parallel_hash_builds.load() > 0);  // the fan-out path fired
     REQUIRE(s->rows() == p->rows());
     REQUIRE(s->rows() == static_cast<std::size_t>(kLeft) / kKeys * kRight);
+    for (const char* col : {"lv", "rv"}) {
+        const auto& sc = std::get<Column<std::int64_t>>(*s->find_entry(col)->column);
+        const auto& pc = std::get<Column<std::int64_t>>(*p->find_entry(col)->column);
+        for (std::size_t i = 0; i < s->rows(); ++i) {
+            REQUIRE(sc[i] == pc[i]);
+        }
+    }
+}
+
+TEST_CASE("The join operator reads the probe plan: parallel output equals serial",
+          "[physical][breaker][execute]") {
+    // n_left < n_right with no pending order drives the swapped path: left is
+    // indexed, the right side is scanned once through probe_ranges_parallel over
+    // its whole row count. With the right side (200000) above the 16384 probe
+    // floor the probe fans out -- the axis probe_parallel_workers now reads from
+    // probe_plan_. Swapped mode emits in right-scan order, which the parallel
+    // probe preserves exactly, so the two outputs are byte-identical with no
+    // `order` to normalise them.
+    constexpr std::int64_t kLeft = 120000;
+    constexpr std::int64_t kRight = 200000;
+    constexpr std::int64_t kKeys = 25000;
+    runtime::TableRegistry registry;
+    {
+        runtime::Table left;
+        Column<std::int64_t> lk;
+        Column<std::int64_t> lv;
+        for (std::int64_t r = 0; r < kLeft; ++r) {
+            lk.push_back(r % kKeys);
+            lv.push_back(r);
+        }
+        left.add_column("k", std::move(lk));
+        left.add_column("lv", std::move(lv));
+        registry.emplace("probe_left", left);
+
+        runtime::Table right;
+        Column<std::int64_t> rk;
+        Column<std::int64_t> rv;
+        for (std::int64_t r = 0; r < kRight; ++r) {
+            rk.push_back(r % kKeys);
+            rv.push_back(r * 10);
+        }
+        right.add_column("k", std::move(rk));
+        right.add_column("rv", std::move(rv));
+        registry.emplace("probe_right", right);
+    }
+
+    auto ir = require_ir("(probe_left join probe_right on k);");
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_stats = &stats;
+
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(stats.parallel_probes.load() > 0);  // the probe fan-out axis fired
+    REQUIRE(s->rows() == p->rows());
+    REQUIRE(s->rows() == static_cast<std::size_t>(kRight) / kKeys * kLeft);
     for (const char* col : {"lv", "rv"}) {
         const auto& sc = std::get<Column<std::int64_t>>(*s->find_entry(col)->column);
         const auto& pc = std::get<Column<std::int64_t>>(*p->find_entry(col)->column);

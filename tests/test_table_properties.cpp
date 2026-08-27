@@ -6,13 +6,20 @@
 // it, so the rules are pinned here rather than re-verified through whichever
 // operators happen to exercise them.
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <runtime_internal.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {

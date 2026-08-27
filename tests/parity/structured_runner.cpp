@@ -11,14 +11,15 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <utility>
 
 ibex::runtime::Table ibex_generated_execute();
 
-auto main(int argc, char** argv) -> int {
+auto main(int argc, char* const* argv) -> int {
     if (argc != 2)
         return 2;
     std::ifstream input(argv[1]);
-    std::string source{std::istreambuf_iterator<char>{input}, {}};
+    const std::string source{std::istreambuf_iterator<char>{input}, {}};
     auto parsed = ibex::parser::parse(source);
     if (!parsed) {
         std::cerr << parsed.error().message << '\n';

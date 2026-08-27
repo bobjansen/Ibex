@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <vector>
 
 using namespace ibex;
 

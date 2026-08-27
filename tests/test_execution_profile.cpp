@@ -3,6 +3,7 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
@@ -10,9 +11,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "execution_profile_internal.hpp"
@@ -26,7 +30,7 @@ TEST_CASE("operator profiling records pulls, rows, and pooled work", "[runtime][
                                                                     /*report=*/false);
     runtime::Table table;
     table.add_column("x", Column<std::int64_t>{1, 2, 3});
-    ir::ScanNode scan{ir::NodeId{42}, "trades"};
+    const ir::ScanNode scan{ir::NodeId{42}, "trades"};
     auto op = runtime::profile_operator(std::make_unique<runtime::TableSourceOperator>(table),
                                         profile, scan);
 
@@ -35,7 +39,7 @@ TEST_CASE("operator profiling records pulls, rows, and pooled work", "[runtime][
 
     auto* stage = profile->stage("test pool stage");
     {
-        runtime::ExecutionProfileScope scope(stage, runtime::ProfilePhase::Next);
+        const runtime::ExecutionProfileScope scope(stage, runtime::ProfilePhase::Next);
         runtime::WorkerPool pool{2};
         auto batch = pool.submit(2, [](std::size_t) {
             // Give the steady clock a non-zero interval without making the test
@@ -388,7 +392,7 @@ TEST_CASE("worker time is attributed before the batch is settled", "[runtime][pr
                                                                         /*report=*/false);
         auto* stage = profile->stage("attribution");
         {
-            runtime::ExecutionProfileScope scope(stage, runtime::ProfilePhase::Next);
+            const runtime::ExecutionProfileScope scope(stage, runtime::ProfilePhase::Next);
             auto batch = pool.submit(4, [](std::size_t) {});
             batch.wait();
         }

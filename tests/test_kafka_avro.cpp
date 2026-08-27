@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <avro/Compiler.hh>
 #include <avro/Encoder.hh>
+#include <avro/Generic.hh>
 #include <avro/GenericDatum.hh>
 #include <avro/Stream.hh>
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <variant>
 
 #include "kafka_avro.hpp"
+#include "kafka_common.hpp"
+#include "schema_registry_client.hpp"
 
 namespace {
 
@@ -49,7 +61,7 @@ auto encode_tick_record() -> std::string {
     auto out = avro::memoryOutputStream();
     auto encoder = avro::binaryEncoder();
     encoder->init(*out);
-    avro::GenericWriter writer(schema, encoder);
+    const avro::GenericWriter writer(schema, encoder);
     writer.write(datum);
     encoder->flush();
 

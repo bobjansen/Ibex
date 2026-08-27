@@ -3,15 +3,24 @@
 
 #include <ibex/core/column.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "physical_plan.hpp"
 
@@ -490,21 +499,47 @@ TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][para
         SerialOnlyReason reason;
     };
     const Case cases[] = {
-        {"trades[filter price > 5];", true, 1, SerialOnlyReason::None},
-        {"trades[filter price > 15, select { price }];", true, 1, SerialOnlyReason::None},
-        {"trades[filter price > 5][rename { p = price }];", true, 2, SerialOnlyReason::None},
+        {.source = "trades[filter price > 5];",
+         .parallel = true,
+         .parallel_steps = 1,
+         .reason = SerialOnlyReason::None},
+        {.source = "trades[filter price > 15, select { price }];",
+         .parallel = true,
+         .parallel_steps = 1,
+         .reason = SerialOnlyReason::None},
+        {.source = "trades[filter price > 5][rename { p = price }];",
+         .parallel = true,
+         .parallel_steps = 2,
+         .reason = SerialOnlyReason::None},
         // Over a breaker: a pipeline since 32f62261, and one that may run over
         // morsels — the breaker's output is materialized either way.
-        {"trades[distinct { symbol, price }][filter price > 5];", true, 1, SerialOnlyReason::None},
-        {"trades[select { total = sum(price) }, by { symbol }][filter total > 5];", true, 1,
-         SerialOnlyReason::None},
+        {.source = "trades[distinct { symbol, price }][filter price > 5];",
+         .parallel = true,
+         .parallel_steps = 1,
+         .reason = SerialOnlyReason::None},
+        {.source = "trades[select { total = sum(price) }, by { symbol }][filter total > 5];",
+         .parallel = true,
+         .parallel_steps = 1,
+         .reason = SerialOnlyReason::None},
         // Metadata-only: nothing per-row to spread.
-        {"trades[select { price }];", false, 0, SerialOnlyReason::NoRowWork},
-        {"trades[rename { p = price }];", false, 0, SerialOnlyReason::NoRowWork},
+        {.source = "trades[select { price }];",
+         .parallel = false,
+         .parallel_steps = 0,
+         .reason = SerialOnlyReason::NoRowWork},
+        {.source = "trades[rename { p = price }];",
+         .parallel = false,
+         .parallel_steps = 0,
+         .reason = SerialOnlyReason::NoRowWork},
         // A bare row-local update is a map step and deliberately not a parallel
         // one, so it bounds the prefix instead of joining it.
-        {"trades[update { p2 = price * 2 }];", false, 0, SerialOnlyReason::NotParallelMap},
-        {"trades[update { p2 = price * 2 }][filter p2 > 5];", true, 1, SerialOnlyReason::None},
+        {.source = "trades[update { p2 = price * 2 }];",
+         .parallel = false,
+         .parallel_steps = 0,
+         .reason = SerialOnlyReason::NotParallelMap},
+        {.source = "trades[update { p2 = price * 2 }][filter p2 > 5];",
+         .parallel = true,
+         .parallel_steps = 1,
+         .reason = SerialOnlyReason::None},
     };
 
     for (const auto& test : cases) {
@@ -604,8 +639,8 @@ TEST_CASE("Migrated pipelines produce identical results in serial and parallel",
         "trades[filter ok, update { doubled = price * 2 }]"
         "[select { doubled }];");
 
-    runtime::ExecutionContext serial = serial_exec();
-    runtime::ExecutionContext parallel;  // defaults: parallel on
+    const runtime::ExecutionContext serial = serial_exec();
+    const runtime::ExecutionContext parallel;  // defaults: parallel on
 
     const auto serial_result = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     const auto parallel_result =
@@ -1125,10 +1160,12 @@ TEST_CASE("The plan describes order's sort fan-out and explain physical is not s
             const char* source;
             const char* kind;
         };
-        for (const Case c : {Case{"trades[tail 2];", "Breaker(Tail)"},
-                             Case{"trades[order { price }][head 2];", "Breaker(TopK)"},
-                             Case{"trades[filter price > 10][head 2];", "Breaker(FilterHead)"},
-                             Case{"trades[filter price > 10][tail 2];", "Breaker(FilterTail)"}}) {
+        for (const Case c :
+             {Case{.source = "trades[tail 2];", .kind = "Breaker(Tail)"},
+              Case{.source = "trades[order { price }][head 2];", .kind = "Breaker(TopK)"},
+              Case{.source = "trades[filter price > 10][head 2];", .kind = "Breaker(FilterHead)"},
+              Case{.source = "trades[filter price > 10][tail 2];",
+                   .kind = "Breaker(FilterTail)"}}) {
             INFO(c.source);
             const auto [tree, plan] = serial_plan(c.source);
             REQUIRE(plan.migrated);

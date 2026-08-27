@@ -11,15 +11,23 @@
 // deliberately naive, test-local gather: reusing the runtime's own slicing
 // helper would make the comparison circular.
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "interpreter_internal.hpp"
@@ -156,36 +164,43 @@ auto predicates() -> std::vector<NamedPredicate> {
     std::vector<NamedPredicate> out;
     // Each entry targets a distinct evaluator path, all of which read column
     // data at a different point and so can drop an offset independently.
-    out.push_back({"fused numeric cmp spec", cmp(ir::CompareOp::Gt, col_ref("id"), ilit(20))});
+    out.push_back({.label = "fused numeric cmp spec",
+                   .expr = cmp(ir::CompareOp::Gt, col_ref("id"), ilit(20))});
+    out.push_back({.label = "fused arith cmp spec",
+                   .expr = cmp(ir::CompareOp::Lt,
+                               arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(90))});
     out.push_back(
-        {"fused arith cmp spec",
-         cmp(ir::CompareOp::Lt, arith(ir::ArithmeticOp::Mul, col_ref("id"), ilit(2)), ilit(90))});
-    out.push_back({"fused numeric cmp pair",
-                   logical(ir::LogicalOp::And, cmp(ir::CompareOp::Ge, col_ref("id"), ilit(10)),
-                           cmp(ir::CompareOp::Le, col_ref("id"), ilit(60)))});
+        {.label = "fused numeric cmp pair",
+         .expr = logical(ir::LogicalOp::And, cmp(ir::CompareOp::Ge, col_ref("id"), ilit(10)),
+                         cmp(ir::CompareOp::Le, col_ref("id"), ilit(60)))});
+    out.push_back({.label = "double column vs literal",
+                   .expr = cmp(ir::CompareOp::Gt, col_ref("price"), dlit(20.0))});
+    out.push_back({.label = "string column vs literal",
+                   .expr = cmp(ir::CompareOp::Eq, col_ref("name"), slit("row-3"))});
+    out.push_back({.label = "categorical vs literal",
+                   .expr = cmp(ir::CompareOp::Eq, col_ref("kind"), slit("beta"))});
     out.push_back(
-        {"double column vs literal", cmp(ir::CompareOp::Gt, col_ref("price"), dlit(20.0))});
+        {.label = "categorical IN-list",
+         .expr = logical(ir::LogicalOp::Or, cmp(ir::CompareOp::Eq, col_ref("kind"), slit("beta")),
+                         cmp(ir::CompareOp::Eq, col_ref("kind"), slit("gamma")))});
     out.push_back(
-        {"string column vs literal", cmp(ir::CompareOp::Eq, col_ref("name"), slit("row-3"))});
+        {.label = "bare boolean column", .expr = ir::Expr{.node = ir::ColumnRef{.name = "flag"}}});
+    out.push_back({.label = "3VL over a nullable column",
+                   .expr = cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
+    out.push_back({.label = "is null",
+                   .expr = ir::Expr{
+                       .node = ir::IsNullExpr{.operand = col_ref("nullable"), .negated = false}}});
+    out.push_back({.label = "is not null",
+                   .expr = ir::Expr{
+                       .node = ir::IsNullExpr{.operand = col_ref("nullable"), .negated = true}}});
+    out.push_back({.label = "column vs column",
+                   .expr = cmp(ir::CompareOp::Lt, col_ref("id"), col_ref("nullable"))});
     out.push_back(
-        {"categorical vs literal", cmp(ir::CompareOp::Eq, col_ref("kind"), slit("beta"))});
-    out.push_back({"categorical IN-list",
-                   logical(ir::LogicalOp::Or, cmp(ir::CompareOp::Eq, col_ref("kind"), slit("beta")),
-                           cmp(ir::CompareOp::Eq, col_ref("kind"), slit("gamma")))});
-    out.push_back({"bare boolean column", ir::Expr{.node = ir::ColumnRef{.name = "flag"}}});
-    out.push_back(
-        {"3VL over a nullable column", cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
-    out.push_back({"is null", ir::Expr{.node = ir::IsNullExpr{.operand = col_ref("nullable"),
-                                                              .negated = false}}});
-    out.push_back({"is not null", ir::Expr{.node = ir::IsNullExpr{.operand = col_ref("nullable"),
-                                                                  .negated = true}}});
-    out.push_back({"column vs column", cmp(ir::CompareOp::Lt, col_ref("id"), col_ref("nullable"))});
-    out.push_back(
-        {"negated predicate",
-         ir::Expr{.node = ir::LogicalExpr{
-                      .op = ir::LogicalOp::Not,
-                      .left = ir::make_expr_ptr(cmp(ir::CompareOp::Gt, col_ref("id"), ilit(20))),
-                      .right = nullptr}}});
+        {.label = "negated predicate",
+         .expr = ir::Expr{.node = ir::LogicalExpr{.op = ir::LogicalOp::Not,
+                                                  .left = ir::make_expr_ptr(cmp(
+                                                      ir::CompareOp::Gt, col_ref("id"), ilit(20))),
+                                                  .right = nullptr}}});
     return out;
 }
 
@@ -346,31 +361,35 @@ TEST_CASE("evaluate_field over a partial range matches evaluating a gathered ran
     std::vector<NamedPredicate> fields;
     // Scalar calls are range-native through the fused numeric tree.
     fields.push_back(
-        {"scalar call", ir::Expr{.node = ir::CallExpr{
-                                     .callee = "abs", .args = {col_ref("id")}, .named_args = {}}}});
-    fields.push_back({"nested arithmetic in a call",
-                      ir::Expr{.node = ir::CallExpr{
-                                   .callee = "abs",
-                                   .args = {arith(ir::ArithmeticOp::Sub, col_ref("id"), ilit(100))},
-                                   .named_args = {}}}});
+        {.label = "scalar call",
+         .expr = ir::Expr{
+             .node = ir::CallExpr{.callee = "abs", .args = {col_ref("id")}, .named_args = {}}}});
+    fields.push_back(
+        {.label = "nested arithmetic in a call",
+         .expr = ir::Expr{
+             .node = ir::CallExpr{.callee = "abs",
+                                  .args = {arith(ir::ArithmeticOp::Sub, col_ref("id"), ilit(100))},
+                                  .named_args = {}}}});
     // Coverage for the per-row fallback that a declined splice lands in — the
     // decline itself is not observable here (see the splice-counter test
     // below), because a whole-table `like` and the range agree on every value.
     fields.push_back(
-        {"spliced like leaf declines for a partial range",
-         ir::Expr{.node = ir::BinaryExpr{
-                      .op = ir::ArithmeticOp::Add,
-                      .left = call("Int64", {call("like", {col_ref("name"), slit("row-1")})}),
-                      .right = col_ref("id")}}});
+        {.label = "spliced like leaf declines for a partial range",
+         .expr =
+             ir::Expr{.node = ir::BinaryExpr{
+                          .op = ir::ArithmeticOp::Add,
+                          .left = call("Int64", {call("like", {col_ref("name"), slit("row-1")})}),
+                          .right = col_ref("id")}}});
     // Vectorized path: a boolean node in value position.
-    fields.push_back({"boolean node", cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))});
+    fields.push_back(
+        {.label = "boolean node", .expr = cmp(ir::CompareOp::Gt, col_ref("id"), ilit(50))});
     // Nulls must be carried at the right offset, not merely the right width.
-    fields.push_back(
-        {"nullable column arithmetic", ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Add,
-                                                                       .left = col_ref("nullable"),
-                                                                       .right = ilit(1)}}});
-    fields.push_back(
-        {"boolean over a nullable column", cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
+    fields.push_back({.label = "nullable column arithmetic",
+                      .expr = ir::Expr{.node = ir::BinaryExpr{.op = ir::ArithmeticOp::Add,
+                                                              .left = col_ref("nullable"),
+                                                              .right = ilit(1)}}});
+    fields.push_back({.label = "boolean over a nullable column",
+                      .expr = cmp(ir::CompareOp::Gt, col_ref("nullable"), ilit(40))});
 
     for (const auto& f : fields) {
         for (const std::size_t grain : {1U, 7U, 63U, 64U, 65U, 200U}) {

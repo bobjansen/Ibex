@@ -2,26 +2,31 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 using namespace ibex;
 
 TEST_CASE("optimizer: can_cse requires pure callable and const args", "[ir][optimizer]") {
-    ir::CallableSummary pure_const{
+    const ir::CallableSummary pure_const{
         .effects = ir::EffectSummary{},
         .arg_modes = {ir::ArgMode::Const, ir::ArgMode::Const},
     };
     CHECK(ir::can_cse(pure_const));
 
-    ir::CallableSummary pure_mutable{
+    const ir::CallableSummary pure_mutable{
         .effects = ir::EffectSummary{},
         .arg_modes = {ir::ArgMode::Const, ir::ArgMode::Mutable},
     };
     CHECK_FALSE(ir::can_cse(pure_mutable));
 
-    ir::CallableSummary effectful{
+    const ir::CallableSummary effectful{
         .effects =
             ir::EffectSummary{
                 .mask = ir::kEffNondet,
@@ -36,14 +41,14 @@ TEST_CASE("optimizer: can_cse requires pure callable and const args", "[ir][opti
 }
 
 TEST_CASE("optimizer: resource-aware IO reorder checks", "[ir][optimizer]") {
-    ir::EffectSummary read_file{
+    const ir::EffectSummary read_file{
         .mask = ir::kEffIoRead,
         .io_read_unscoped = false,
         .io_write_unscoped = false,
         .io_read_resources = {"file"},
         .io_write_resources = {},
     };
-    ir::EffectSummary write_ws{
+    const ir::EffectSummary write_ws{
         .mask = ir::kEffIoWrite,
         .io_read_unscoped = false,
         .io_write_unscoped = false,
@@ -52,7 +57,7 @@ TEST_CASE("optimizer: resource-aware IO reorder checks", "[ir][optimizer]") {
     };
     CHECK(ir::is_reorderable(read_file, write_ws));
 
-    ir::EffectSummary write_file{
+    const ir::EffectSummary write_file{
         .mask = ir::kEffIoWrite,
         .io_read_unscoped = false,
         .io_write_unscoped = false,
@@ -61,7 +66,7 @@ TEST_CASE("optimizer: resource-aware IO reorder checks", "[ir][optimizer]") {
     };
     CHECK_FALSE(ir::is_reorderable(read_file, write_file));
 
-    ir::EffectSummary nondet{
+    const ir::EffectSummary nondet{
         .mask = ir::kEffNondet,
         .io_read_unscoped = false,
         .io_write_unscoped = false,

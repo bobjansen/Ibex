@@ -6,8 +6,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <cstddef>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -51,7 +55,7 @@ TEST_CASE("Column<int> basic operations", "[core][column]") {
 }
 
 TEST_CASE("Column<int> filter", "[core][column]") {
-    ibex::Column<int> col{1, 2, 3, 4, 5, 6};
+    const ibex::Column<int> col{1, 2, 3, 4, 5, 6};
 
     auto evens = col.filter([](int x) { return x % 2 == 0; });
 
@@ -62,7 +66,7 @@ TEST_CASE("Column<int> filter", "[core][column]") {
 }
 
 TEST_CASE("Column<int> transform", "[core][column]") {
-    ibex::Column<int> col{1, 2, 3};
+    const ibex::Column<int> col{1, 2, 3};
 
     auto doubled = col.transform([](int x) { return x * 2; });
 
@@ -80,7 +84,7 @@ TEST_CASE("Column<double> works with floating-point", "[core][column]") {
 }
 
 TEST_CASE("Column default-constructs empty", "[core][column]") {
-    ibex::Column<int> col;
+    const ibex::Column<int> col;
 
     REQUIRE(col.empty());
     REQUIRE(col.size() == 0);
@@ -113,7 +117,7 @@ TEST_CASE("Column adopts immutable external storage and detaches on mutation",
 }
 
 TEST_CASE("Column range-for iteration", "[core][column]") {
-    ibex::Column<int> col{10, 20, 30};
+    const ibex::Column<int> col{10, 20, 30};
 
     int sum = 0;
     for (auto val : col) {
@@ -163,7 +167,7 @@ TEST_CASE("Column<bool> supports mutation and resize", "[core][column][bool]") {
 // --- Column<std::string> flat-buffer specialization -------------------------
 
 TEST_CASE("Column<string> default-constructs empty", "[core][column][string]") {
-    ibex::Column<std::string> col;
+    const ibex::Column<std::string> col;
 
     REQUIRE(col.empty());
     REQUIRE(col.size() == 0);
@@ -182,8 +186,8 @@ TEST_CASE("Column<string> push_back and access", "[core][column][string]") {
 }
 
 TEST_CASE("Column<string> from vector", "[core][column][string]") {
-    std::vector<std::string> data = {"alpha", "beta", "gamma"};
-    ibex::Column<std::string> col(data);
+    const std::vector<std::string> data = {"alpha", "beta", "gamma"};
+    const ibex::Column<std::string> col(data);
 
     REQUIRE(col.size() == 3);
     REQUIRE(col[0] == "alpha");
@@ -192,7 +196,7 @@ TEST_CASE("Column<string> from vector", "[core][column][string]") {
 }
 
 TEST_CASE("Column<string> initializer list", "[core][column][string]") {
-    ibex::Column<std::string> col{"foo", "bar", "baz"};
+    const ibex::Column<std::string> col{"foo", "bar", "baz"};
 
     REQUIRE(col.size() == 3);
     REQUIRE(col[0] == "foo");
@@ -201,12 +205,12 @@ TEST_CASE("Column<string> initializer list", "[core][column][string]") {
 }
 
 TEST_CASE("Column<string> at() throws on out-of-bounds", "[core][column][string]") {
-    ibex::Column<std::string> col{"one"};
+    const ibex::Column<std::string> col{"one"};
     REQUIRE_THROWS_AS(col.at(5), std::out_of_range);
 }
 
 TEST_CASE("Column<string> range-for iteration", "[core][column][string]") {
-    ibex::Column<std::string> col{"a", "bb", "ccc"};
+    const ibex::Column<std::string> col{"a", "bb", "ccc"};
 
     std::string joined;
     for (auto sv : col) {
@@ -216,7 +220,7 @@ TEST_CASE("Column<string> range-for iteration", "[core][column][string]") {
 }
 
 TEST_CASE("Column<string> handles empty strings", "[core][column][string]") {
-    ibex::Column<std::string> col{"", "x", ""};
+    const ibex::Column<std::string> col{"", "x", ""};
 
     REQUIRE(col.size() == 3);
     REQUIRE(col[0] == "");
@@ -245,7 +249,7 @@ TEST_CASE("Column<string> resize fills with value", "[core][column][string]") {
 // --- Column<Categorical> dictionary-encoded strings -------------------------
 
 TEST_CASE("Categorical default-constructs empty", "[core][column][categorical]") {
-    ibex::Column<ibex::Categorical> col;
+    const ibex::Column<ibex::Categorical> col;
     REQUIRE(col.empty());
     REQUIRE(col.size() == 0);
 }
@@ -276,7 +280,7 @@ TEST_CASE("Categorical shares dictionary codes for repeated values",
 }
 
 TEST_CASE("Categorical from dictionary", "[core][column][categorical]") {
-    std::vector<std::string> dict = {"X", "Y", "Z"};
+    const std::vector<std::string> dict = {"X", "Y", "Z"};
     ibex::Column<ibex::Categorical> col(dict);
 
     col.push_code(0);

@@ -3,6 +3,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <expected>
+
+#include "schema_registry.hpp"
 #include "schema_registry_client.hpp"
 
 TEST_CASE("Schema registry client normalizes base URLs") {

@@ -247,6 +247,8 @@ enum class PartitionStrategy : std::uint8_t {
     RadixHash,  ///< histogram → prefix-sum → scatter, then whole partitions
                 ///< (`try_discover_partitioned`)
     Owned,      ///< partition-owned key maps + slots (`try_owned` / async hot table)
+    RowRange,   ///< contiguous row ranges — the radix sort and `(column × range)` gather in
+                ///< `sort.cpp` that `order_table` runs
 };
 
 /// A row-count estimate available at plan time, and where it came from. The
@@ -298,10 +300,21 @@ struct BreakerPhase {
 /// definition of the policy.
 [[nodiscard]] auto distinct_dedup_parallelism(RowEstimate estimate) -> BreakerParallelism;
 
+/// `order`'s single `sort` phase. Unlike distinct, the fan-out already lives in
+/// `sort.cpp` (`radix_sort`, `gather_rows_parallel`) gated on the *shared*
+/// `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant --
+/// so `row_floor` is left 0, which `resolve_breaker_parallelism` fills from
+/// `exec.parallel_min_rows`. There is no per-breaker worker ceiling. The phase
+/// is descriptive: `ChunkedOrderOperator` buffers and calls `order_table`,
+/// which reads the knobs itself.
+[[nodiscard]] auto order_sort_parallelism() -> BreakerParallelism;
+
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one
 /// implementation of the worker-cap clamp that used to be open-coded per
-/// operator.
+/// operator. A phase with `row_floor == 0` inherits `exec.parallel_min_rows` --
+/// the shared knob is the default, and a non-zero `row_floor` (distinct's
+/// 32768) is a visible per-operator override of it.
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
                                  std::size_t pool_size);
 

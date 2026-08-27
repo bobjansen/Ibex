@@ -364,36 +364,61 @@ struct BreakerPhase {
 
 ## `explain physical` output
 
-Distinct, parallel, no estimate (streaming filtered input):
+`explain_physical(plan)` renders the **unresolved** capability (a `Plan` off
+`plan_physical` has no `ExecutionContext`); the builder resolves a local copy at
+construction, so a future `explain physical <query>` command with an exec in
+hand would show `cap≤N` / `serial (…)` in place of `cap=unresolved`.
+
+Distinct, off `plan_physical` (unresolved):
 
 ```
-Breaker(Distinct) keys={g,v}
-  dedup: parallel-capable  cap≤6  floor 32768  partitions=derived  packed-key
-         no row estimate → decided on first chunk
+Breaker(Distinct)
+  dedup: parallel-capable  cap=unresolved  floor 32768  partitions=derived  packed-key
+         no row estimate -> decided on first chunk
 ```
 
-Distinct, parallel, footer estimate (bare `Distinct(Scan)`):
+Distinct with a footer estimate (bare `Distinct(Scan)`) — the estimate line:
 
 ```
-Breaker(Distinct) keys={g,v}
-  dedup: parallel-capable  cap≤6  floor 32768  partitions=4  packed-key
-         estimate 3,200,000 rows (footer) → fan out
+Breaker(Distinct)
+  dedup: parallel-capable  cap=unresolved  floor 32768  partitions=derived  packed-key
+         estimate 3200000 rows (footer)
 ```
 
-Distinct, serial:
+Distinct, resolved single-core:
 
 ```
-Breaker(Distinct) keys={g,v}
+Breaker(Distinct)
   dedup: serial (single core)
+```
+
+Order (done): one descriptive phase, no per-breaker ceiling, floor inherited:
+
+```
+Breaker(Order)
+  sort: parallel-capable  cap=unresolved  floor (shared parallel_min_rows)  partitions=derived  row-range (sort + gather)
+        no row estimate -> decided on first chunk
+```
+
+Head / Tail / TopK — a serial single-operator breaker:
+
+```
+Breaker(Head)
+  serial (single-operator breaker, no fan-out point)
 ```
 
 Join, once decomposed:
 
 ```
-Breaker(Join) inner keys=1  strategy=StreamingProbe  inputs=[lineitem, orders]
-  hash-build: parallel-capable  cap≤6  floor 65536  partitions=derived  head-table
-  probe:      parallel-capable  cap≤6  floor 16384  partitions=derived  range
+Breaker(Join)
+  inner keys=1  strategy=StreamingProbe  inputs=[lineitem, orders]
+  hash-build: parallel-capable  cap=unresolved  floor 65536  partitions=derived  head-table
+  probe:      parallel-capable  cap=unresolved  floor 16384  partitions=derived  range
 ```
+
+(Distinct/Order do not print their key list — `DistinctNode`/`OrderNode` do not
+carry it as an accessible field; it lives in the child columns / the order
+keys, which `explain_breaker` does not walk.)
 
 ## Migration invariants
 
@@ -425,13 +450,18 @@ Every slice:
    operator aborts on disagreement) then authority (the operator reads
    `dedup_plan_.decline` / `.worker_cap`; `kMinRows` / the open-coded
    `min(budget, pool, 64)` / `check_dedup_plan` deleted). Byte-identical.
-2. **Order** — one fan-out point, but it already lives in `sort.cpp`
-   (`gather_rows_parallel`, the per-group sweep) gated on the *shared*
+2. **Order** — **DONE (descriptive).** One fan-out point, and it already lives
+   in `sort.cpp` (`radix_sort`, `gather_rows_parallel`) gated on the *shared*
    `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant —
-   `ChunkedOrderOperator` just buffers and calls `order_table`. The gap is
-   representation, not a buried tunable: a `BreakerPhase` would describe what
-   the sort will do in `explain physical`; the authority half is thin. Worth
-   doing for consistency, not where the leverage is.
+   `ChunkedOrderOperator` just buffers and calls `order_table`. So the plan
+   carries one `sort` phase (`PartitionStrategy::RowRange`, `row_floor` left 0 →
+   `resolve` fills it from `parallel_min_rows`), `explain physical` renders
+   `Breaker(Order)` instead of the old `MapPipeline` mislabel, and nothing in
+   the operator changed. The move also fixed `explain physical` for every
+   migrated breaker (Head/streaming-join/streaming-aggregate all used to print
+   `MapPipeline\n  source: TableScan()`). `resolve_breaker_parallelism` now
+   makes the shared knob the default and a non-zero `row_floor` (distinct's
+   32768) a visible per-operator override.
 
    **TopK is not in this bucket.** `ChunkedOrderedLimitOperator` is a serial
    streaming bounded-heap operator — O(n·log k), one pass, `push_heap` /

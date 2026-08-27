@@ -46,6 +46,18 @@ constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
 constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
+/// A hash aggregate's two fan-out floors, matching the private constants in
+/// `chunked.cpp`. `kAggPartitionRowFloor` is `try_owned`'s `kPairOwnedMinRows`
+/// (65536) — the lowest row count at which any partitioned path is attempted;
+/// `try_discover_partitioned`'s stricter `kDefaultPartitionMinRows` (1U << 18U)
+/// is a per-strategy detail the authority slice unifies. `kAggFinalizeRowFloor`
+/// matches the `1U << 17U` group-count gate on `finalize_owned`'s parallel
+/// co-ranking merge. Both phases share the `min(budget, pool, 64)` worker cap
+/// that is open-coded at ~7 sites in `ChunkedAggregateOperator` today.
+constexpr std::size_t kAggPartitionRowFloor = 1U << 16U;
+constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
+constexpr std::size_t kAggMaxWorkers = 64;
+
 /// A footer row estimate for `distinct`'s input, or `None` when the input is
 /// not a bare registered scan. Deliberately conservative: a Filter or Join
 /// under the Distinct makes the count unknowable at plan time, and the planner
@@ -451,6 +463,21 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (plan.aggregate.strategy != AggregateStrategy::MaterializeAll) {
             plan.migrated = true;
             plan.source_node = &root;
+            // Describe the hash aggregate's fan-out points. Only the streamed
+            // path reaches `ChunkedAggregateOperator` (via
+            // `ChunkedSortedAggregateOperator`'s hash fallback); the fused
+            // left-join count runs whole-table and has no fan-out to describe.
+            // Descriptive only (slice 1): `build_physical_aggregate` does not
+            // read these, the constants still live in `chunked.cpp`, and the
+            // operator aborts via `check_agg_plan` if its own decision ever
+            // disagrees. The authority slices move the decision the way
+            // distinct's and the join's did.
+            if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
+                plan.breaker_phases.push_back(
+                    {.name = "partition", .parallelism = aggregate_partition_parallelism()});
+                plan.breaker_phases.push_back(
+                    {.name = "finalize", .parallelism = aggregate_finalize_parallelism()});
+            }
             return plan;
         }
     }
@@ -637,11 +664,17 @@ auto explain_physical(const Plan& plan) -> std::string {
             out += '\n';
             return out;
         }
+        if (plan.aggregate.describes) {
+            // The strategy line, then one line per fan-out phase (the streamed
+            // hash path carries partition + finalize; see `plan_physical`). A
+            // fused left-join count has no phases and prints just the strategy.
+            out += "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate);
+            append_phase_lines(out, plan.breaker_phases);
+            out += '\n';
+            return out;
+        }
         if (!plan.breaker_phases.empty()) {
             return explain_breaker(kind, plan.breaker_phases) + "\n";
-        }
-        if (plan.aggregate.describes) {
-            return "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate) + "\n";
         }
         // Head / Tail / TopK: a single-operator breaker with no fan-out point.
         out += "Breaker(";
@@ -799,6 +832,22 @@ auto join_probe_parallelism() -> BreakerParallelism {
     return {.row_floor = kJoinProbeRowFloor,
             .breaker_max_workers = kJoinMaxWorkers,
             .strategy = PartitionStrategy::Range};
+}
+
+auto aggregate_partition_parallelism() -> BreakerParallelism {
+    // RadixHash is the general strategy; `try_owned` is a specialization of it
+    // (partition-owned key maps instead of whole scattered partitions). The
+    // operator resolves which at run time from the key type and cardinality,
+    // the way the join resolves its build orientation.
+    return {.row_floor = kAggPartitionRowFloor,
+            .breaker_max_workers = kAggMaxWorkers,
+            .strategy = PartitionStrategy::RadixHash};
+}
+
+auto aggregate_finalize_parallelism() -> BreakerParallelism {
+    return {.row_floor = kAggFinalizeRowFloor,
+            .breaker_max_workers = kAggMaxWorkers,
+            .strategy = PartitionStrategy::Owned};
 }
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,

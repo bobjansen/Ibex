@@ -666,6 +666,40 @@ TEST_CASE("join: semi and anti keep left order across a threaded predicate", "[j
     }
 }
 
+TEST_CASE("join: dense integer intersection preserves semi and anti membership", "[join]") {
+    constexpr std::int64_t kLeftRows = 20'000;
+    constexpr std::int64_t kRightRows = 80'000;  // over the swapped-build gate
+    Column<std::int64_t> left_ids;
+    left_ids.reserve(kLeftRows);
+    for (std::int64_t row = 0; row < kLeftRows; ++row) {
+        left_ids.push_back(row - (kLeftRows / 2));
+    }
+    Column<std::int64_t> right_ids;
+    right_ids.reserve(kRightRows);
+    for (std::int64_t row = 0; row < kRightRows; ++row) {
+        // Every even key in the left's moderately dense range, repeated.
+        right_ids.push_back(-(kLeftRows / 2) + 2 * (row % (kLeftRows / 2)));
+    }
+    runtime::Table lhs;
+    lhs.add_column("id", std::move(left_ids));
+    runtime::Table rhs;
+    rhs.add_column("id", std::move(right_ids));
+    runtime::TableRegistry tables;
+    tables.emplace("lhs", std::move(lhs));
+    tables.emplace("rhs", std::move(rhs));
+
+    auto semi = interpret_expr("lhs semi join rhs on id;", tables);
+    auto anti = interpret_expr("lhs anti join rhs on id;", tables);
+    REQUIRE(semi.rows() == static_cast<std::size_t>(kLeftRows / 2));
+    REQUIRE(anti.rows() == static_cast<std::size_t>(kLeftRows / 2));
+    const auto semi_ids = col_i64(semi, "id");
+    const auto anti_ids = col_i64(anti, "id");
+    for (std::size_t row = 0; row < semi_ids.size(); ++row) {
+        CHECK(semi_ids[row] % 2 == 0);
+        CHECK(anti_ids[row] % 2 != 0);
+    }
+}
+
 TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});

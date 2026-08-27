@@ -13,6 +13,51 @@ Absorbed `pds.md` (the 2026-08-11 status snapshot this grew out of) on
 2026-08-22: §5 and §6 took its still-unique traps and dead ends, §8 keeps
 its baseline record.
 
+## 2026-08-27 update — q22 is effectively closed
+
+The SF-2 run at `92e47974` made q22 the largest matched Polars-streaming gap:
+Ibex averaged 74.312ms (71.037ms minimum) at eight cores versus Polars'
+22.837ms (20.917ms minimum), a 3.25x ratio. It was not one bottleneck but three
+stacked costs that the canonical query shape exposed:
+
+1. The planner now proves
+   `filter is_null(right_marker)` over a left equijoin is an anti join when the
+   marker is non-null on every match and no right output is demanded. It also
+   removes a direct right-side `distinct` from semi/anti joins, because
+   duplicate right rows cannot change existence. Value-lineage follows bare
+   column copies through `update`/`project`/`distinct`, which proves q22's
+   copied marker is the non-null join key without making a nullable-column
+   assumption.
+2. Literal-bound `substring` joins interpolation in `DirectStringPlan`:
+   UTF-8 byte counts, prefix assignment, and disjoint writes replace per-row
+   string allocation and use the existing parallel field-window protocol.
+3. Swapped integer semi/anti build uses a dense candidate/hit table when the
+   smaller key range is at most four slots per row and no more than 2 Mi slots.
+   Workers scan the large side into private hit tables, OR them deterministically,
+   and retain the dense representation for the buffered-left probe.
+
+The final HEAD-vs-worktree measurement used 15 position-balanced blocks and
+105 internally timed executions per side on cores 0-7. q22's median fell from
+73.557ms to 25.058ms; the median paired ratio was **0.3408 (-65.92%)**, with
+15/15 wins and two-sided exact Wilcoxon p=0.000061. All 22 answers match. The
+final 15-repeat interleaved `compare_ibex_git.sh` no-regression gate measured
+-0.37% across the 85 execution benchmarks and a 1.001 geometric speedup; every
+individual verdict was noise.
+
+A final standalone core sweep (`warmup=3`, `iters=25`) measured:
+
+| cores | avg ms | min ms | speedup vs 1c |
+|---:|---:|---:|---:|
+| 1 | 51.76 | 50.49 | 1.00x |
+| 2 | 36.14 | 33.26 | 1.43x |
+| 4 | 28.61 | 24.91 | 1.81x |
+| 8 | 23.93 | 22.40 | 2.16x |
+
+Against the matched Polars artifact this leaves only a 4.8% average q22 gap
+at eight cores, inside the run-to-run comparison floor rather than a multi-day
+workstream. At one core Ibex is 28.8% faster than Polars streaming (51.76ms
+versus 72.722ms). The old q22 scaling was 1.58x; the final path reaches 2.16x.
+
 ## 1. What "beat Polars" means, in numbers
 
 PDS-H SF-2, pinned cores, same budget both engines

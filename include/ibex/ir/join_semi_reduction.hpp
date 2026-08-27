@@ -8,7 +8,7 @@
 
 namespace ibex::ir {
 
-/// Inner-join reduction to a semi join.
+/// Existence-join reductions.
 ///
 /// An inner join whose other side is *proved* unique on the join keys and
 /// contributes no column the plan reads is a semi join wearing an inner join's
@@ -17,6 +17,7 @@ namespace ibex::ir {
 ///
 ///   Join(Inner, k, X, Y)  ->  Join(Semi, k, X, Y)     Y unique on k, no Y column read
 ///   Join(Inner, k, X, Y)  ->  Join(Semi, k', Y, X)    X unique on k, no X column read
+///   Filter(is_null(r), Join(Left, k, X, Y)) -> Join(Anti, k, X, Y)
 ///
 /// PDS-H q21 is the motivating shape. Its `q1` binding joins a grouped
 /// aggregate -- unique on `l_orderkey` by construction -- to late line items,
@@ -41,13 +42,21 @@ namespace ibex::ir {
 /// covers a mapped key (`on { a = b }`), whose right-hand column survives in the
 /// output and lives on one side only.
 ///
-/// Conservative on everything else. The reduction is declined for a predicate
+/// The anti form additionally proves that `r` is a right-side value which is
+/// non-null on every match, and that no right output is observed above the
+/// filter. A `Distinct` immediately on the right of a semi/anti join is removed:
+/// existence is unchanged by duplicate right rows. PDS-H q22 is the motivating
+/// shape for both reductions.
+///
+/// Conservative on everything else. The inner reduction is declined for a predicate
 /// (non-equi), `take`, a declared `expect` (its pair count is what gets
 /// checked), `nulls equal`, a suffix policy (it renames the very columns this
 /// pass reasons about), an open or Unknown schema on either side, and any join
-/// this pass's demand map does not cover. `pending_order` is dropped on
-/// rewrite: it is a cost hint naming the old orientation, and per SPEC.md
-/// Section 5.6 row order is outside the join contract either way.
+/// this pass's demand map does not cover. `pending_order` is dropped when the
+/// inner rewrite changes orientation: it is a cost hint naming the old
+/// orientation, and per SPEC.md Section 5.6 row order is outside the join
+/// contract either way. The left-to-anti rewrite preserves it because the
+/// orientation does not change.
 ///
 /// Runs after `push_filters_into_joins` and `push_semi_joins_down` -- it wants
 /// the tree those leave behind, and the semi join it produces is a candidate

@@ -34,8 +34,12 @@ auto counts_by_k(ir::NodeId scan_id, ir::NodeId agg_id) -> ir::NodePtr {
 
 auto sources() -> ir::SourceSchemas {
     ir::SourceSchemas s;
-    s["lines"] = ir::SchemaInfo::known({{.name = "k"}, {.name = "v"}});
-    s["other"] = ir::SchemaInfo::known({{.name = "k"}, {.name = "w"}});
+    s["lines"] = ir::SchemaInfo::known(
+        {{.name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe},
+         {.name = "v", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}});
+    s["other"] = ir::SchemaInfo::known(
+        {{.name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe},
+         {.name = "w", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}});
     return s;
 }
 
@@ -66,6 +70,42 @@ auto join_of(const ir::Node& root) -> const ir::JoinNode& {
     REQUIRE(root.children()[0]->kind() == ir::NodeKind::Join);
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     return static_cast<const ir::JoinNode&>(*root.children()[0]);
+}
+
+auto q22_sources(bool marker_non_null = true) -> ir::SourceSchemas {
+    ir::SourceSchemas schemas;
+    schemas["customers"] = ir::SchemaInfo::known(
+        {{.name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Never},
+         {.name = "v", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Never}});
+    schemas["orders"] = ir::SchemaInfo::known(
+        {{.name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Never},
+         {.name = "order_marker",
+          .type = ir::ColumnType::Int64,
+          .nulls = marker_non_null ? ir::Nullability::Never : ir::Nullability::Maybe}});
+    return schemas;
+}
+
+/// The essential q22 shape: deduplicate orders, left join them to customers,
+/// and keep the null-padded rows. `projected` names what remains observable
+/// above the null filter.
+auto q22_plan(std::vector<std::string> projected) -> ir::NodePtr {
+    auto distinct = std::make_unique<ir::DistinctNode>(ir::NodeId{20});
+    distinct->add_child(make_scan(ir::NodeId{21}, "orders"));
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{22}, ir::JoinKind::Left,
+                                               std::vector<ir::JoinKey>{ir::JoinKey{"k"}});
+    join->add_child(make_scan(ir::NodeId{23}, "customers"));
+    join->add_child(std::move(distinct));
+    ir::Expr marker{.node = ir::IsNullExpr{.operand = ir::make_expr_ptr(ir::Expr{
+                                               .node = ir::ColumnRef{.name = "order_marker"}})}};
+    auto filter = std::make_unique<ir::FilterNode>(ir::NodeId{24}, std::move(marker));
+    filter->add_child(std::move(join));
+    std::vector<ir::ColumnRef> columns;
+    for (auto& name : projected) {
+        columns.push_back(ir::ColumnRef{.name = std::move(name)});
+    }
+    auto project = std::make_unique<ir::ProjectNode>(ir::NodeId{25}, std::move(columns));
+    project->add_child(std::move(filter));
+    return project;
 }
 
 }  // namespace
@@ -137,4 +177,49 @@ TEST_CASE("A declared cardinality keeps the inner join", "[ir][join][semi]") {
 
     auto out = ir::reduce_inner_joins_to_semi(std::move(project), sources());
     CHECK(join_of(*out).kind() == ir::JoinKind::Inner);
+}
+
+TEST_CASE("A left join null marker reduces to an anti join and drops right distinct",
+          "[ir][join][semi][anti]") {
+    auto out = ir::reduce_inner_joins_to_semi(q22_plan({"k", "v"}), q22_sources());
+    REQUIRE(out->children().size() == 1);
+    REQUIRE(out->children()[0]->kind() == ir::NodeKind::Join);
+    const auto& join = static_cast<const ir::JoinNode&>(*out->children()[0]);
+    CHECK(join.kind() == ir::JoinKind::Anti);
+    REQUIRE(join.children().size() == 2);
+    CHECK(join.children()[1]->kind() == ir::NodeKind::Scan);
+}
+
+TEST_CASE("Reading the null marker keeps the left join output schema", "[ir][join][semi][anti]") {
+    auto out = ir::reduce_inner_joins_to_semi(q22_plan({"v", "order_marker"}), q22_sources());
+    REQUIRE(out->children().size() == 1);
+    REQUIRE(out->children()[0]->kind() == ir::NodeKind::Filter);
+    REQUIRE(out->children()[0]->children().size() == 1);
+    REQUIRE(out->children()[0]->children()[0]->kind() == ir::NodeKind::Join);
+    const auto& join = static_cast<const ir::JoinNode&>(*out->children()[0]->children()[0]);
+    CHECK(join.kind() == ir::JoinKind::Left);
+}
+
+TEST_CASE("A nullable non-key marker does not prove an unmatched row", "[ir][join][semi][anti]") {
+    auto out = ir::reduce_inner_joins_to_semi(q22_plan({"v"}), q22_sources(false));
+    REQUIRE(out->children().size() == 1);
+    CHECK(out->children()[0]->kind() == ir::NodeKind::Filter);
+}
+
+TEST_CASE("An explicit anti join ignores a distinct on its right side", "[ir][join][semi][anti]") {
+    auto distinct = std::make_unique<ir::DistinctNode>(ir::NodeId{30});
+    distinct->add_child(make_scan(ir::NodeId{31}, "orders"));
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{32}, ir::JoinKind::Anti,
+                                               std::vector<ir::JoinKey>{ir::JoinKey{"k"}});
+    join->add_child(make_scan(ir::NodeId{33}, "customers"));
+    join->add_child(std::move(distinct));
+    auto project = std::make_unique<ir::ProjectNode>(
+        ir::NodeId{34}, std::vector<ir::ColumnRef>{ir::ColumnRef{.name = "v"}});
+    project->add_child(std::move(join));
+
+    auto out = ir::reduce_inner_joins_to_semi(std::move(project), q22_sources());
+    const auto& reduced = join_of(*out);
+    CHECK(reduced.kind() == ir::JoinKind::Anti);
+    REQUIRE(reduced.children().size() == 2);
+    CHECK(reduced.children()[1]->kind() == ir::NodeKind::Scan);
 }

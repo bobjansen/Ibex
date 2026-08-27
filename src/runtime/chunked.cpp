@@ -7663,7 +7663,7 @@ class ChunkedAggregateOperator final : public Operator {
         // expensive part of the pipeline by roughly their mean run length.
         // Sample before committing because all-unique keys would only add two
         // equality passes and retain the original item count.
-        bool compress_runs = false;
+        [[maybe_unused]] bool compress_runs = false;
         if constexpr (std::is_same_v<Key, std::int64_t>) {
             compress_runs = owned_ordered_run_mode_;
             if (!compress_runs && !owned_mode_ && plan_[0].func == ir::AggFunc::Count &&
@@ -7682,79 +7682,76 @@ class ChunkedAggregateOperator final : public Operator {
 
         const std::size_t source_ranges = workers;
         const std::size_t source_grain = (rows + source_ranges - 1) / source_ranges;
-        std::size_t items = rows;
-        std::vector<std::size_t> run_offsets(source_ranges + 1, 0);
-        if (compress_runs) {
-            {
-                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
-                    const std::size_t begin = r * source_grain;
-                    const std::size_t end = std::min(rows, begin + source_grain);
-                    if (begin >= end) {
-                        return;
-                    }
-                    std::size_t runs = 1;
-                    Key previous = key_at(begin);
-                    for (std::size_t row = begin + 1; row < end; ++row) {
-                        const Key key = key_at(row);
-                        runs += key == previous ? 0 : 1;
-                        previous = key;
-                    }
-                    run_offsets[r + 1] = runs;
-                });
-                batch.wait();
-            }
-            for (std::size_t r = 0; r < source_ranges; ++r) {
-                run_offsets[r + 1] += run_offsets[r];
-            }
-            items = run_offsets.back();
-            owned_run_rows_.resize(items);
-            owned_run_lengths_.resize(items);
-            {
-                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
-                    const std::size_t begin = r * source_grain;
-                    const std::size_t end = std::min(rows, begin + source_grain);
-                    if (begin >= end) {
-                        return;
-                    }
-                    std::size_t out = run_offsets[r];
-                    std::size_t anchor = begin;
-                    Key previous = key_at(begin);
-                    for (std::size_t row = begin + 1; row < end; ++row) {
-                        const Key key = key_at(row);
-                        if (key != previous) {
-                            owned_run_rows_[out] = anchor;
-                            owned_run_lengths_[out] = row - anchor;
-                            ++out;
-                            anchor = row;
-                            previous = key;
-                        }
-                    }
-                    owned_run_rows_[out] = anchor;
-                    owned_run_lengths_[out] = end - anchor;
-                });
-                batch.wait();
-            }
-        }
 
+        // Run compression only ever engages for a clustered single-Int64 Count
+        // (the `if constexpr` above is the only writer of `compress_runs`).
+        // Two parallel passes, no scratch: pass 1 counts runs per range so the
+        // per-range output offsets are contiguous, pass 2 emits (key, length)
+        // straight into `owned_ordered_run_{keys,counts}_`. A third pass to
+        // dereference anchor rows -- and the `owned_run_rows_/_lengths_` arrays
+        // it read -- used to sit between them; folding it into pass 2 drops one
+        // pool barrier per chunk, which is q21's `count() by l_orderkey` hot
+        // path (~23 chunks, this was 3 barriers each).
         if constexpr (std::is_same_v<Key, std::int64_t>) {
             if (compress_runs) {
+                std::vector<std::size_t> run_offsets(source_ranges + 1, 0);
+                {
+                    auto batch = pool.submit(source_ranges, [&](std::size_t r) {
+                        const std::size_t begin = r * source_grain;
+                        const std::size_t end = std::min(rows, begin + source_grain);
+                        if (begin >= end) {
+                            return;
+                        }
+                        std::size_t runs = 1;
+                        Key previous = key_at(begin);
+                        for (std::size_t row = begin + 1; row < end; ++row) {
+                            const Key key = key_at(row);
+                            runs += key == previous ? 0 : 1;
+                            previous = key;
+                        }
+                        run_offsets[r + 1] = runs;
+                    });
+                    batch.wait();
+                }
+                for (std::size_t r = 0; r < source_ranges; ++r) {
+                    run_offsets[r + 1] += run_offsets[r];
+                }
+                const std::size_t items = run_offsets.back();
                 const std::size_t old_runs = owned_ordered_run_keys_.size();
                 owned_ordered_run_keys_.resize(old_runs + items);
                 owned_ordered_run_counts_.resize(old_runs + items);
-                auto batch = pool.submit(source_ranges, [&](std::size_t r) {
-                    const std::size_t begin = run_offsets[r];
-                    const std::size_t end = run_offsets[r + 1];
-                    for (std::size_t item = begin; item < end; ++item) {
-                        owned_ordered_run_keys_[old_runs + item] = key_at(owned_run_rows_[item]);
-                        owned_ordered_run_counts_[old_runs + item] = owned_run_lengths_[item];
-                    }
-                });
-                batch.wait();
-                const std::size_t check_begin = old_runs == 0 ? 1 : old_runs;
-                for (std::size_t i = check_begin; i < owned_ordered_run_keys_.size(); ++i) {
-                    if (owned_ordered_run_keys_[i] < owned_ordered_run_keys_[i - 1]) {
-                        owned_ordered_runs_nondecreasing_ = false;
-                        break;
+                {
+                    auto batch = pool.submit(source_ranges, [&](std::size_t r) {
+                        const std::size_t begin = r * source_grain;
+                        const std::size_t end = std::min(rows, begin + source_grain);
+                        if (begin >= end) {
+                            return;
+                        }
+                        std::size_t out = old_runs + run_offsets[r];
+                        std::size_t anchor = begin;
+                        Key previous = key_at(begin);
+                        for (std::size_t row = begin + 1; row < end; ++row) {
+                            const Key key = key_at(row);
+                            if (key != previous) {
+                                owned_ordered_run_keys_[out] = previous;
+                                owned_ordered_run_counts_[out] = row - anchor;
+                                ++out;
+                                anchor = row;
+                                previous = key;
+                            }
+                        }
+                        owned_ordered_run_keys_[out] = previous;
+                        owned_ordered_run_counts_[out] = end - anchor;
+                    });
+                    batch.wait();
+                }
+                if (owned_ordered_runs_nondecreasing_) {
+                    const std::size_t from = old_runs == 0 ? 1 : old_runs;
+                    for (std::size_t i = from; i < old_runs + items; ++i) {
+                        if (owned_ordered_run_keys_[i] < owned_ordered_run_keys_[i - 1]) {
+                            owned_ordered_runs_nondecreasing_ = false;
+                            break;
+                        }
                     }
                 }
                 owned_rows_seen_ += rows;
@@ -10925,8 +10922,6 @@ class ChunkedAggregateOperator final : public Operator {
     std::optional<std::string> owned_async_error_;
     std::size_t owned_async_part_count_ = 0;
     bool owned_async_hot_mode_ = false;
-    std::vector<std::size_t> owned_run_rows_;
-    std::vector<std::size_t> owned_run_lengths_;
     std::vector<std::int64_t> owned_ordered_run_keys_;
     std::vector<std::size_t> owned_ordered_run_counts_;
     bool owned_ordered_run_mode_ = false;

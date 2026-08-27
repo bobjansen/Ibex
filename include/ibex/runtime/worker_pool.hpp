@@ -53,6 +53,35 @@ class WorkerPool {
         std::shared_ptr<State> state_;
     };
 
+    /// A set of independently submitted tasks with one end-of-stream join.
+    ///
+    /// Unlike `Batch`, adding a task is not a fork/join round trip: tasks may
+    /// run while the producer keeps adding more work, and profiling records a
+    /// single barrier when `wait()` closes the group. This is the scheduler
+    /// shape used by streaming sinks whose input arrives one chunk at a time.
+    class TaskGroup {
+       public:
+        struct State;
+
+        TaskGroup() = default;
+        TaskGroup(const TaskGroup&) = delete;
+        auto operator=(const TaskGroup&) -> TaskGroup& = delete;
+        TaskGroup(TaskGroup&&) noexcept;
+        auto operator=(TaskGroup&&) noexcept -> TaskGroup&;
+        ~TaskGroup();
+
+        /// Queue one task. Tasks may run concurrently and in any order.
+        void submit(std::function<void()> body);
+
+        /// Close the group and wait for every submitted task. Idempotent.
+        void wait();
+
+       private:
+        friend class WorkerPool;
+        explicit TaskGroup(std::shared_ptr<State> state) : state_(std::move(state)) {}
+        std::shared_ptr<State> state_;
+    };
+
     explicit WorkerPool(std::size_t threads);
     WorkerPool(const WorkerPool&) = delete;
     auto operator=(const WorkerPool&) -> WorkerPool& = delete;
@@ -78,7 +107,12 @@ class WorkerPool {
     [[nodiscard]] auto submit(std::size_t worker_count, std::function<void(std::size_t)> body)
         -> Batch;
 
+    /// Create an incrementally populated task group. The group and all its
+    /// tasks must finish before the pool is destroyed.
+    [[nodiscard]] auto task_group() -> TaskGroup;
+
    private:
+    [[nodiscard]] auto submit_unbarriered(std::function<void()> body) -> Batch;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::size_t threads_;

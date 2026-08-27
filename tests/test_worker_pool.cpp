@@ -139,6 +139,18 @@ TEST_CASE("WorkerPool batch destruction waits for its bodies", "[runtime][worker
     CHECK(finished.load());
 }
 
+TEST_CASE("WorkerPool task group runs incremental work and joins once", "[runtime][worker_pool]") {
+    runtime::WorkerPool pool(4);
+    std::atomic<std::size_t> ran{0};
+    auto group = pool.task_group();
+    for (std::size_t i = 0; i < 32; ++i) {
+        group.submit([&] { ran.fetch_add(1, std::memory_order_relaxed); });
+    }
+    group.wait();
+    group.wait();
+    CHECK(ran.load(std::memory_order_relaxed) == 32);
+}
+
 TEST_CASE("WorkerPool cooperatively completes nested batches from every worker",
           "[runtime][worker_pool]") {
     // All outer bodies reach the nested wait together. A conventional fixed

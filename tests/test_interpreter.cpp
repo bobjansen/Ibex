@@ -12702,6 +12702,74 @@ TEST_CASE("Streaming stddev accumulates moments across chunk boundaries") {
     REQUIRE((*sd)[0] == Catch::Approx(1.5811388301));  // std([1,2,3,4,5]) = sqrt(2.5)
 }
 
+TEST_CASE("Async hot Int64 sum preserves first-seen order and nulls across chunks",
+          "[runtime][aggregate][parallel]") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+    constexpr std::size_t kChunkRows = 65537;
+    constexpr std::size_t kRows = 2 * kChunkRows;
+
+    const auto make_chunk = [](std::size_t global_begin, std::size_t rows) {
+        runtime::Chunk chunk;
+        Column<std::int64_t> keys;
+        Column<double> values;
+        runtime::ValidityBitmap validity;
+        keys.reserve(rows);
+        values.reserve(rows);
+        validity.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::size_t global = global_begin + row;
+            const std::size_t group = global / 4;
+            keys.push_back(static_cast<std::int64_t>((group * 9973) % 40000));
+            values.push_back(static_cast<double>((global % 7) + 1) * 0.25);
+            validity.push_back(group != 123 && global % 19 != 0);
+        }
+        chunk.add_column("k", std::move(keys));
+        chunk.add_column("v", std::move(values), std::move(validity));
+        return chunk;
+    };
+
+    externs.register_chunked_table("hot_sum_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_chunk(0, kChunkRows));
+        chunks.push_back(make_chunk(kChunkRows, kChunkRows));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn hot_sum_src() -> DataFrame from \"x.hpp\"; "
+        "hot_sum_src()[select { total = sum(v) }, by { k }];");
+    runtime::ExecutionContext exec;
+    exec.parallel_threads = 4;
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs, nullptr, exec);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == (kRows + 3) / 4);
+
+    const auto* keys = std::get_if<Column<std::int64_t>>(result->find("k"));
+    const auto* totals_entry = result->find_entry("total");
+    REQUIRE(keys != nullptr);
+    REQUIRE(totals_entry != nullptr);
+    REQUIRE(totals_entry->validity.has_value());
+    const auto* totals = std::get_if<Column<double>>(&*totals_entry->column);
+    REQUIRE(totals != nullptr);
+
+    for (std::size_t group = 0; group < result->rows(); ++group) {
+        CHECK((*keys)[group] == static_cast<std::int64_t>((group * 9973) % 40000));
+        double expected = 0.0;
+        const std::size_t end = std::min(kRows, (group + 1) * 4);
+        for (std::size_t global = group * 4; global < end; ++global) {
+            if (group != 123 && global % 19 != 0) {
+                expected += static_cast<double>((global % 7) + 1) * 0.25;
+            }
+        }
+        CHECK((*totals_entry->validity)[group] == (group != 123));
+        if (group != 123) {
+            CHECK((*totals)[group] == expected);
+        }
+    }
+}
+
 // ── Widened streaming aggregates: First / Last ───────────────────────────────
 //
 // Numeric First/Last stream natively in both ChunkedSortedAggregateOperator

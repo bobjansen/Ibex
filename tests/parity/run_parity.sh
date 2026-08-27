@@ -72,7 +72,8 @@ fi
 IBEX_INCS=(
     "-I$ROOT_DIR/include"
     "-I$ROOT_DIR/libraries"
-    "-I$BUILD_DIR/_deps/robin_hood-src/src/include"
+    "-isystem"
+    "$BUILD_DIR/_deps/robin_hood-src/src/include"
 )
 
 if [[ -d "$ROOT_DIR/libs" ]]; then

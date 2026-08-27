@@ -414,10 +414,14 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         return plan;
     }
     if (root.kind() == ir::NodeKind::Order) {
-        // Nothing to classify: one operator runs every Order. The plan owns
-        // construction, which is the whole content of this port.
+        // One operator runs every Order (`ChunkedOrderOperator` → `order_table`).
+        // Its one fan-out point (the radix sort + row gather) is described so
+        // `explain physical` is not silent about it; the fan-out itself already
+        // lives in `sort.cpp` on the shared knobs, so the phase is descriptive
+        // rather than something the operator reads.
         plan.migrated = true;
         plan.source_node = &root;
+        plan.breaker_phases.push_back({.name = "sort", .parallelism = order_sort_parallelism()});
         return plan;
     }
     if (root.kind() == ir::NodeKind::Aggregate) {
@@ -575,14 +579,6 @@ auto serial_only_reason_name(SerialOnlyReason reason) -> std::string_view {
 
 auto explain_physical(const Plan& plan) -> std::string {
     std::string out;
-    if (!plan.breaker_phases.empty()) {
-        // A breaker whose parallelism the plan describes (Distinct today).
-        // `migrated` is true but there are no map steps — the breaker is its
-        // own operator, and the phases are what there is to explain.
-        const std::string_view kind =
-            plan.root != nullptr ? node_kind_name_impl(plan.root->kind()) : "?";
-        return explain_breaker(kind, plan.breaker_phases) + "\n";
-    }
     if (!plan.migrated) {
         out += "MaterializedCall(";
         out += fallback_reason_name(plan.reason);
@@ -596,6 +592,28 @@ auto explain_physical(const Plan& plan) -> std::string {
         if (plan.aggregate.describes) {
             out += "  " + explain_aggregate(plan.aggregate) + "\n";
         }
+        return out;
+    }
+    // A migrated breaker at the root -- its own operator, no map steps. Route
+    // every such shape here: without it, anything `migrated` with no `steps`
+    // (order, distinct, head, a streaming join/aggregate) fell through to the
+    // MapPipeline branch below and printed `MapPipeline\n  source: TableScan()`
+    // -- a lie, since the root is not a scan and there is no pipeline.
+    if (plan.steps.empty() && plan.root != nullptr) {
+        const std::string_view kind = node_kind_name_impl(plan.root->kind());
+        if (!plan.breaker_phases.empty()) {
+            return explain_breaker(kind, plan.breaker_phases) + "\n";
+        }
+        if (plan.join.describes) {
+            return "Breaker(Join)\n  " + explain_join(plan.join) + "\n";
+        }
+        if (plan.aggregate.describes) {
+            return "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate) + "\n";
+        }
+        // Head / Tail / TopK: a single-operator breaker with no fan-out point.
+        out += "Breaker(";
+        out += kind;
+        out += ")\n  serial (single-operator breaker, no fan-out point)\n";
         return out;
     }
     out += "MapPipeline\n";
@@ -714,6 +732,8 @@ auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
             return "radix-hash";
         case PartitionStrategy::Owned:
             return "owned";
+        case PartitionStrategy::RowRange:
+            return "row-range (sort + gather)";
     }
     return "?";
 }
@@ -726,8 +746,19 @@ auto distinct_dedup_parallelism(RowEstimate estimate) -> BreakerParallelism {
             .estimate = estimate};
 }
 
+auto order_sort_parallelism() -> BreakerParallelism {
+    // row_floor 0 -> resolve fills it from exec.parallel_min_rows; no per-breaker
+    // ceiling; no plan-time estimate (order's input is buffered, not sampled).
+    return {.strategy = PartitionStrategy::RowRange};
+}
+
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
                                  std::size_t pool_size) {
+    // A phase that names no floor of its own uses the shared knob. distinct's
+    // 32768 is a deliberate, now-visible override of it.
+    if (bp.row_floor == 0) {
+        bp.row_floor = exec.parallel_min_rows;
+    }
     if (!exec.can_fan_out()) {
         bp.decline = FanOutDecline::SingleCore;
         bp.worker_cap = 1;
@@ -763,8 +794,10 @@ auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& pha
         out += ": ";
         if (bp.worker_cap == 0) {
             // Unresolved: printed straight off plan_physical, before a builder
-            // with an ExecutionContext ran resolve_breaker_parallelism.
-            out += "parallel-capable  cap=unresolved  floor " + std::to_string(bp.row_floor);
+            // with an ExecutionContext ran resolve_breaker_parallelism. A
+            // `row_floor` of 0 means "inherit the shared parallel_min_rows".
+            out += "parallel-capable  cap=unresolved  floor ";
+            out += bp.row_floor == 0 ? "(shared parallel_min_rows)" : std::to_string(bp.row_floor);
         } else if (bp.decline == FanOutDecline::SingleCore) {
             out += "serial (single core)";
             continue;

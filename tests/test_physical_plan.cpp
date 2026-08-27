@@ -1147,9 +1147,9 @@ TEST_CASE("Migrated Tail / TopK / FilterHead / FilterTail execute through the pl
           "[physical][breaker][execute]") {
     const auto registry = trades_registry();
     // trades has 3 rows: price {10,20,30} (Int64), symbol {A,B,A}.
-    for (const char* source : {"trades[tail 2];", "trades[order { price }][head 2];",
-                               "trades[filter price > 15][head 2];",
-                               "trades[filter price > 15][tail 2];"}) {
+    for (const char* source :
+         {"trades[tail 2];", "trades[order { price }][head 2];",
+          "trades[filter price > 15][head 2];", "trades[filter price > 15][tail 2];"}) {
         INFO(source);
         auto ir = require_ir(source);
         runtime::ExecutionContext serial;
@@ -1179,13 +1179,13 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
         const auto& build = plan.breaker_phases[0];
         REQUIRE(build.name == "hash-build");
         REQUIRE(build.parallelism.strategy == runtime::physical::PartitionStrategy::HeadTable);
-        REQUIRE(build.parallelism.row_floor == (1U << 17U));      // chunked.cpp build_partitions
+        REQUIRE(build.parallelism.row_floor == (1U << 17U));  // chunked.cpp build_partitions
         REQUIRE(build.parallelism.breaker_max_workers == 64);
 
         const auto& probe = plan.breaker_phases[1];
         REQUIRE(probe.name == "probe");
         REQUIRE(probe.parallelism.strategy == runtime::physical::PartitionStrategy::Range);
-        REQUIRE(probe.parallelism.row_floor == (1U << 14U));      // probe_parallel_workers
+        REQUIRE(probe.parallelism.row_floor == (1U << 14U));  // probe_parallel_workers
         REQUIRE(probe.parallelism.breaker_max_workers == 64);
     }
 
@@ -1211,14 +1211,12 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         const auto [tree, plan] =
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
         REQUIRE(plan.migrated);
-        REQUIRE(plan.aggregate.strategy ==
-                runtime::physical::AggregateStrategy::StreamingSorted);
+        REQUIRE(plan.aggregate.strategy == runtime::physical::AggregateStrategy::StreamingSorted);
         REQUIRE(plan.breaker_phases.size() == 2);
 
         const auto& partition = plan.breaker_phases[0];
         REQUIRE(partition.name == "partition");
-        REQUIRE(partition.parallelism.strategy ==
-                runtime::physical::PartitionStrategy::RadixHash);
+        REQUIRE(partition.parallelism.strategy == runtime::physical::PartitionStrategy::RadixHash);
         REQUIRE(partition.parallelism.row_floor == (1U << 18U));  // radix kDefaultPartitionMinRows
         REQUIRE(partition.parallelism.breaker_max_workers == 64);
 
@@ -1248,8 +1246,7 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
             " left join lineitem as DataFrame<{ l_orderkey: Int64 }> "
             " on { o_orderkey = l_orderkey })"
             "[select { n = count() }, by { o_orderkey }];");
-        if (plan.aggregate.strategy ==
-            runtime::physical::AggregateStrategy::FusedLeftJoinCount) {
+        if (plan.aggregate.strategy == runtime::physical::AggregateStrategy::FusedLeftJoinCount) {
             REQUIRE(plan.breaker_phases.empty());
         }
     }

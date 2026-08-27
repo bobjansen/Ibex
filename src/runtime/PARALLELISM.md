@@ -419,10 +419,27 @@ Every slice:
 
 ## Sequence and blockers
 
-1. **`BreakerParallelism` + Distinct** — the smallest case (one phase, no
-   eligibility gate, self-contained fan-out). Observability slice, then
-   authority slice.
-2. **Order, TopK** — same one-phase shape.
+1. **`BreakerParallelism` + Distinct** — **DONE.** One phase, no eligibility
+   gate, self-contained fan-out. Landed as two slices: observability (the
+   planner describes the `dedup` phase, `explain physical` prints it, the
+   operator aborts on disagreement) then authority (the operator reads
+   `dedup_plan_.decline` / `.worker_cap`; `kMinRows` / the open-coded
+   `min(budget, pool, 64)` / `check_dedup_plan` deleted). Byte-identical.
+2. **Order** — one fan-out point, but it already lives in `sort.cpp`
+   (`gather_rows_parallel`, the per-group sweep) gated on the *shared*
+   `parallel_min_rows` / `parallel_min_cells` knobs, not a private constant —
+   `ChunkedOrderOperator` just buffers and calls `order_table`. The gap is
+   representation, not a buried tunable: a `BreakerPhase` would describe what
+   the sort will do in `explain physical`; the authority half is thin. Worth
+   doing for consistency, not where the leverage is.
+
+   **TopK is not in this bucket.** `ChunkedOrderedLimitOperator` is a serial
+   streaming bounded-heap operator — O(n·log k), one pass, `push_heap` /
+   `pop_heap` capped at `count`, with a `heap.front()` skip fast path. It does
+   **not** sort and has **no fan-out point**, so it needs no `BreakerPhase` —
+   the plan records "serial, by design", like `Head`. Parallelizing it (per-range
+   local heaps + merge) is barely worth it for small k, and Ibex already wins
+   top-k ~12×. Do not fold it into the Order port.
 3. **Join** — `JoinPlan` gains `phases` for hash-build and probe;
    `build_join_hash_index`'s threading becomes a phase decision. This is where
    the measured cost is (q21's 40 ms serial hash build) — decomposition here is

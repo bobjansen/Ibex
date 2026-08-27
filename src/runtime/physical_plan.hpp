@@ -235,9 +235,11 @@ struct AggregatePlan {
 // `chunked.cpp` — invisible to `explain physical`, un-A/B-able except through
 // `IBEX_CORES`. These types move the *decision* and the *tunable* onto the
 // plan, one phase at a time; the determinism devices and the kernels stay in
-// the operator. This slice is observability only: the planner fills these in
-// and `explain physical` prints them, while the operator keeps its own
-// identical logic plus a debug assert that the two agree.
+// the operator. Distinct is done: the planner fills a `dedup` phase,
+// `build_physical_distinct` resolves its worker cap, and
+// `ChunkedDistinctOperator` reads it rather than deciding for itself. The two
+// checks that stay in the operator — is it nested, did this chunk clear the
+// floor — are the two only the operator can make.
 
 enum class PartitionStrategy : std::uint8_t {
     PackedKey,  ///< hash-partition a packed key, one map per partition (Distinct, string/int
@@ -287,6 +289,14 @@ struct BreakerPhase {
     std::string_view name;
     BreakerParallelism parallelism;
 };
+
+/// The `dedup` phase's capability half: the row floor and worker ceiling that
+/// used to be `1U << 15U` and `std::size_t{64}` inside `ChunkedDistinctOperator`
+/// (twice, once per dedup path), plus the packed-key strategy. Both the planner
+/// (from a footer estimate) and the whole-table `distinct_table` adapter (from
+/// the input's exact row count) build the phase through here, so there is one
+/// definition of the policy.
+[[nodiscard]] auto distinct_dedup_parallelism(RowEstimate estimate) -> BreakerParallelism;
 
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one

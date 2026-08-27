@@ -976,6 +976,57 @@ TEST_CASE("The plan describes the distinct dedup fan-out phase", "[physical][bre
         REQUIRE(text.find("floor 32768") != std::string::npos);
         REQUIRE(text.find("packed-key") != std::string::npos);
     }
+
+    SECTION("distinct_dedup_parallelism is the one definition of the policy") {
+        const auto bp = runtime::physical::distinct_dedup_parallelism(
+            {.rows = 999, .source = runtime::physical::RowEstimate::Source::ChildExact});
+        REQUIRE(bp.row_floor == (1U << 15U));
+        REQUIRE(bp.breaker_max_workers == 64);
+        REQUIRE(bp.strategy == runtime::physical::PartitionStrategy::PackedKey);
+        REQUIRE(bp.estimate.rows == 999);
+    }
+}
+
+TEST_CASE("The distinct operator reads the plan: parallel output equals serial",
+          "[physical][breaker][execute]") {
+    // A table over the 32768 fan-out floor, with heavy key repetition so the
+    // parallel packed-key partitions and the serial set must agree on both
+    // which rows survive and their first-occurrence order.
+    constexpr std::int64_t kRows = 60000;
+    runtime::Table table;
+    {
+        Column<std::int64_t> a;
+        Column<std::int64_t> b;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            a.push_back(r % 137);
+            b.push_back(r % 89);
+        }
+        table.add_column("a", std::move(a));
+        table.add_column("b", std::move(b));
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("big", table);
+
+    auto ir = require_ir("big[distinct { a, b }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(s->rows() == p->rows());
+    const auto& sa = std::get<Column<std::int64_t>>(*s->find_entry("a")->column);
+    const auto& pa = std::get<Column<std::int64_t>>(*p->find_entry("a")->column);
+    const auto& sb = std::get<Column<std::int64_t>>(*s->find_entry("b")->column);
+    const auto& pb = std::get<Column<std::int64_t>>(*p->find_entry("b")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(sa[i] == pa[i]);
+        REQUIRE(sb[i] == pb[i]);
+    }
 }
 
 TEST_CASE("resolve_breaker_parallelism is the one place the worker cap is computed",

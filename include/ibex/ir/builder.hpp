@@ -6,6 +6,13 @@
 #include <ibex/ir/node.hpp>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ibex::ir {
 

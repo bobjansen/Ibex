@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <robin_hood.h>
 #include <set>
 #include <string>
 #include <vector>

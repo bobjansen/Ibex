@@ -8,7 +8,9 @@
 #include <ibex/runtime/operator.hpp>
 
 #include <cstdint>
+#include <expected>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ibex::runtime {

@@ -5,8 +5,11 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <robin_hood.h>
+#include <string>
 #include <string_view>
 
 namespace ibex::ir {

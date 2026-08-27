@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 

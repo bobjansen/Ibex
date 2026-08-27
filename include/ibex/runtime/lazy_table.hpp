@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/like.hpp>
 
@@ -15,6 +16,7 @@
 #include <robin_hood.h>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ibex::runtime {

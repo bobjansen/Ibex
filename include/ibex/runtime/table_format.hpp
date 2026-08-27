@@ -9,6 +9,7 @@
 // test diffs their stdout byte-for-byte — so the formatter lives here, in the
 // runtime layer, rather than being duplicated per consumer.
 
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <cstddef>

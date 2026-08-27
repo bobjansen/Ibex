@@ -121,6 +121,7 @@ using DemandMap = std::map<std::string, ColumnDemand>;
 struct DemandSink {
     DemandMap sources;
     std::map<const Node*, ColumnDemand> joins;
+    std::map<const Node*, ColumnDemand> filters;
 };
 
 void visit(const Node& node, const ColumnDemand& need, DemandSink& out);
@@ -168,6 +169,11 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::Filter: {
+            // Record the parent's demand before adding the predicate's own
+            // reads.  A rewrite that removes the predicate needs to know
+            // whether a referenced column was observable above it or existed
+            // only as the predicate's marker.
+            out.filters[&node].merge(need);
             ColumnDemand below = need;
             collect_refs(static_cast<const FilterNode&>(node).predicate(), below);
             visit_children(node, below, out);
@@ -445,6 +451,14 @@ auto join_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>
     all.widen();
     visit(root, all, out);
     return std::move(out.joins);
+}
+
+auto filter_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand> {
+    DemandSink out;
+    ColumnDemand all;
+    all.widen();
+    visit(root, all, out);
+    return std::move(out.filters);
 }
 
 }  // namespace ibex::ir

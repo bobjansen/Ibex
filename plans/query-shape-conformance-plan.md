@@ -1734,3 +1734,21 @@ longer clears the bar this plan's own standing lesson sets. **Recommend:
 close this as a known, understood, single-query gap — not a work item** —
 unless real-world query telemetry (outside this synthetic suite) turns up
 more instances of the same shape to design against.
+
+## q22, resolved 2026-08-27 — existence shape plus two runtime costs
+
+The earlier "smaller, unstarted" q22 item is closed. The acceptable engine-side
+rewrite now recognizes a left equijoin followed by `is_null` of a provably
+non-null right marker as an anti join, provided demand analysis proves no right
+output is observed. A direct `Distinct` on the right is removed from semi/anti
+joins. This converts the canonical query without changing its text and follows
+the project rule above that rewrite shape is the engine's responsibility.
+
+The rewrite exposed two independent runtime costs: literal-bound UTF-8
+`substring` now uses the direct parallel count/prefix/write string protocol,
+and dense integer semi/anti intersection scans the large key column through a
+bounded dense hit table rather than millions of hash probes. The final
+HEAD-vs-worktree q22 A/B was -65.92% by median paired ratio (15/15 blocks,
+two-sided exact Wilcoxon p=0.000061); the eight-core standalone average is
+23.93ms versus 74.312ms in the triggering SF-2 artifact. All 22 answers and
+the full interpreter/transpiler parity test pass.

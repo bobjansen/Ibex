@@ -392,8 +392,14 @@ TEST_CASE("deferrable_probe_scans: an unfiltered build side is declined",
     // carries all 1.5M rows of its own table.
     const ir::SourceRowCounts rows{{"orders", 1500000}, {"lineitem", 12000000}};
     ir::SourceSchemas schemas;
-    schemas.emplace("orders", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
-    schemas.emplace("lineitem", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+    schemas.emplace(
+        "orders",
+        ir::SchemaInfo::known({ir::SchemaField{
+            .name = "id", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
+    schemas.emplace(
+        "lineitem",
+        ir::SchemaInfo::known({ir::SchemaField{
+            .name = "id", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
 
     auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "orders"),
                            std::make_unique<ir::ScanNode>(ir::NodeId{2}, "lineitem"), "id");
@@ -409,8 +415,14 @@ TEST_CASE("deferrable_probe_scans: a filter absorbed into the build scan still c
     // with it, the build side is a fraction of `orders` and deferring pays.
     const ir::SourceRowCounts rows{{"orders", 1500000}, {"lineitem", 12000000}};
     ir::SourceSchemas schemas;
-    schemas.emplace("orders", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
-    schemas.emplace("lineitem", ir::SchemaInfo::known({ir::SchemaField{.name = "id"}}));
+    schemas.emplace(
+        "orders",
+        ir::SchemaInfo::known({ir::SchemaField{
+            .name = "id", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
+    schemas.emplace(
+        "lineitem",
+        ir::SchemaInfo::known({ir::SchemaField{
+            .name = "id", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
 
     auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "orders"),
                            std::make_unique<ir::ScanNode>(ir::NodeId{2}, "lineitem"), "id");

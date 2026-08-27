@@ -66,4 +66,13 @@ struct ColumnDemand {
 /// `root` is unmodified, so compute the map, then rewrite.
 [[nodiscard]] auto join_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>;
 
+/// What each `Filter`'s parent reads from the filter output, before the
+/// filter's own predicate columns are added to its input demand.  This is the
+/// distinction a shape-changing rewrite needs: a predicate may consume a
+/// right-join marker solely to decide which LEFT rows survive, while no caller
+/// observes that marker as an output column.
+///
+/// Pointers have the same lifetime rule as `join_output_demand`.
+[[nodiscard]] auto filter_output_demand(const Node& root) -> std::map<const Node*, ColumnDemand>;
+
 }  // namespace ibex::ir

@@ -247,7 +247,8 @@ TEST_CASE("kernel validity gather handles an externally offset source and adjoin
     for (std::size_t i = 0; i < 100; ++i) {
         if (i % 3 != 1) {
             const std::size_t bit = 3 + i;
-            (*bytes)[bit / 8] |= std::uint8_t{1} << (bit % 8);
+            const auto mask = static_cast<std::uint8_t>(std::uint8_t{1} << (bit % 8));
+            (*bytes)[bit / 8] = static_cast<std::uint8_t>((*bytes)[bit / 8] | mask);
         }
     }
     const std::shared_ptr<const void> owner = bytes;

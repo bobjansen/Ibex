@@ -14891,6 +14891,80 @@ auto build_physical_head(const ir::Node& node, const TableRegistry& registry,
                                                  &head.group_by());
 }
 
+/// Build a `Tail` breaker. Moved verbatim from the per-kind switch: `Tail`
+/// needs every row before it can keep the last N, so it materializes the child
+/// and calls `tail_table` rather than streaming. Same single-operator shape as
+/// Head -- no `Plan` to consult.
+auto build_physical_tail(const ir::Node& node, const TableRegistry& registry,
+                         const ScalarRegistry* scalars, const ExternRegistry* externs,
+                         const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& tail = static_cast<const ir::TailNode&>(node);
+    if (tail.children().empty()) {
+        return std::unexpected("tail node missing child");
+    }
+    auto count = evaluate_row_count_expr_impl(tail.count_expr(), scalars, externs);
+    if (!count.has_value()) {
+        return std::unexpected(count.error());
+    }
+    return build_unary_materializing_operator(
+        *tail.children().front(), registry, scalars, externs, exec, model_out,
+        [&](Table input) { return tail_table(input, *count, tail.group_by()); });
+}
+
+/// Build a `TopK` breaker (fused `Head(Order(x))` / `Tail(Order(x))`, canonicalize
+/// R16). `ChunkedOrderedLimitOperator` is a serial bounded-heap select
+/// (O(n log k), one pass) -- deliberately not a fan-out point, see
+/// src/runtime/PARALLELISM.md. Moved verbatim from the per-kind switch.
+auto build_physical_topk(const ir::Node& node, const TableRegistry& registry,
+                         const ScalarRegistry* scalars, const ExternRegistry* externs,
+                         const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& topk = static_cast<const ir::TopKNode&>(node);
+    if (topk.children().empty()) {
+        return std::unexpected("topk node missing child");
+    }
+    auto child_op =
+        build_operator(*topk.children().front(), registry, scalars, externs, exec, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    const auto keep = (topk.keep_mode() == ir::TopKNode::KeepMode::First)
+                          ? ChunkedOrderedLimitOperator::KeepMode::First
+                          : ChunkedOrderedLimitOperator::KeepMode::Last;
+    return std::make_unique<ChunkedOrderedLimitOperator>(std::move(child_op.value()), &topk.keys(),
+                                                         topk.count(), &topk.group_by(), keep);
+}
+
+/// Build a `FilterHead` / `FilterTail` breaker (fused `Head(Filter(x))` /
+/// `Tail(Filter(x))`, canonicalize R7/R8). One streaming operator each. Moved
+/// verbatim from the per-kind switch.
+auto build_physical_filter_head_tail(const ir::Node& node, const TableRegistry& registry,
+                                     const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                     const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    if (node.children().empty() || node.children().front() == nullptr) {
+        return std::unexpected("filter_head/filter_tail node missing child");
+    }
+    auto child_op =
+        build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
+    if (!child_op.has_value()) {
+        return std::unexpected(std::move(child_op.error()));
+    }
+    if (node.kind() == ir::NodeKind::FilterHead) {
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+        const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+        return std::make_unique<ChunkedFilterHeadOperator>(std::move(child_op.value()),
+                                                           &fh.predicate(), fh.count(), scalars);
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+    return std::make_unique<ChunkedFilterTailOperator>(std::move(child_op.value()), &ft.predicate(),
+                                                       ft.count(), scalars);
+}
+
 /// Build a distinct breaker. The plan describes the `dedup` fan-out phase
 /// (src/runtime/PARALLELISM.md); this resolves its worker cap here, where the
 /// `ExecutionContext` is in hand, and hands it to the operator, which reads it
@@ -14955,6 +15029,19 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     if (plan.migrated && node.kind() == ir::NodeKind::Head) {
         physical::note_map_pipeline_executed();
         return build_physical_head(node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.migrated && node.kind() == ir::NodeKind::Tail) {
+        physical::note_map_pipeline_executed();
+        return build_physical_tail(node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.migrated && node.kind() == ir::NodeKind::TopK) {
+        physical::note_map_pipeline_executed();
+        return build_physical_topk(node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.migrated && (node.kind() == ir::NodeKind::FilterHead ||
+                          node.kind() == ir::NodeKind::FilterTail)) {
+        physical::note_map_pipeline_executed();
+        return build_physical_filter_head_tail(node, registry, scalars, externs, exec, model_out);
     }
     if (plan.migrated && node.kind() == ir::NodeKind::Distinct) {
         physical::note_map_pipeline_executed();
@@ -15063,33 +15150,9 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                                             exec, false);
     }
 
-    // Fused Head(Filter(x)) / Tail(Filter(x)) produced by canonicalize R7/R8.
-    if (node.kind() == ir::NodeKind::FilterHead) {
-        const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
-        if (fh.children().empty()) {
-            return std::unexpected("filter_head node missing child");
-        }
-        auto child_op =
-            build_operator(*fh.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedFilterHeadOperator>(std::move(child_op.value()),
-                                                           &fh.predicate(), fh.count(), scalars);
-    }
-    if (node.kind() == ir::NodeKind::FilterTail) {
-        const auto& ft = static_cast<const ir::FilterTailNode&>(node);
-        if (ft.children().empty()) {
-            return std::unexpected("filter_tail node missing child");
-        }
-        auto child_op =
-            build_operator(*ft.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedFilterTailOperator>(std::move(child_op.value()),
-                                                           &ft.predicate(), ft.count(), scalars);
-    }
+    // No FilterHead / FilterTail branch: fused Head(Filter(x)) / Tail(Filter(x))
+    // (canonicalize R7/R8) is a migrated plan built by
+    // `build_physical_filter_head_tail` at the seam above.
 
     // Fused Project(Update(Filter(x))) produced by canonicalize R6.
     if (node.kind() == ir::NodeKind::FilterUpdateProject) {
@@ -15159,43 +15222,10 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // other aggregate is a migrated plan built by `build_physical_aggregate` at
     // the seam above.
 
-    if (node.kind() == ir::NodeKind::TopK) {
-        // Fused Head(Order(x)) / Tail(Order(x)) — canonicalize R16. The
-        // chunked implementation uses a partial heap-select (O(n log k)).
-        const auto& topk = static_cast<const ir::TopKNode&>(node);
-        if (topk.children().empty()) {
-            return std::unexpected("topk node missing child");
-        }
-        auto child_op =
-            build_operator(*topk.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        const auto keep = (topk.keep_mode() == ir::TopKNode::KeepMode::First)
-                              ? ChunkedOrderedLimitOperator::KeepMode::First
-                              : ChunkedOrderedLimitOperator::KeepMode::Last;
-        return std::make_unique<ChunkedOrderedLimitOperator>(
-            std::move(child_op.value()), &topk.keys(), topk.count(), &topk.group_by(), keep);
-    }
-
-    // No Head branch: every Head is a migrated plan, built by
-    // `build_physical_head` at the seam above.
-
-    if (node.kind() == ir::NodeKind::Tail) {
-        const auto& tail = static_cast<const ir::TailNode&>(node);
-        if (tail.children().empty()) {
-            return std::unexpected("tail node missing child");
-        }
-        auto count = evaluate_row_count_expr_impl(tail.count_expr(), scalars, externs);
-        if (!count.has_value()) {
-            return std::unexpected(count.error());
-        }
-        // Tail(Order(x)) → TopK via R16; Tail(Filter(x)) no-group_by → FilterTail via R8;
-        // Tail past Project/Rename via R4.
-        return build_unary_materializing_operator(
-            *tail.children().front(), registry, scalars, externs, exec, model_out,
-            [&](Table input) { return tail_table(input, *count, tail.group_by()); });
-    }
+    // No TopK / Head / Tail branch: each is a migrated plan built at the seam
+    // above (`build_physical_topk` / `build_physical_head` / `build_physical_tail`).
+    // TopK stays a serial bounded-heap select (O(n log k)); Tail materializes
+    // and calls `tail_table`; the plan just records that they are breakers.
 
     if (node.kind() == ir::NodeKind::Columns) {
         if (node.children().empty()) {

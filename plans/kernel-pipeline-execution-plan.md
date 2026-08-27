@@ -161,9 +161,13 @@ scheduled or measured separately.
    ordering / emission as phases. **Blocked-first:** the thread-count-invariance
    this must preserve is **already violated on the current tree** (see below) —
    reconcile that first; there is no test that would have caught it.
-4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail`** — same single-operator
-   shape as Order/Head/Distinct, ~30 min each, removes the ported/unported
-   sibling asymmetry.
+4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
+   single-operator shape as Order/Head: `plan_physical` marks each migrated,
+   `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
+   from the per-kind switch), the switch branches are deleted, and `explain
+   physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
+   fan-out point)`. TopK stays a serial bounded-heap select by design. No
+   behaviour change.
 5. **Phase 5 item 1 — split `chunked.cpp` by ownership** — easier the more of
    Phase 4 has landed.
 6. **Sweep process-global plan counters in tests** — one test passed while its
@@ -391,8 +395,8 @@ at all (a one-valued strategy enum would be ceremony).
 2. **Hash aggregate** — construction DONE; phase decomposition NOT started,
    blocked-first on the determinism divergence above.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
-   `FilterTail` NOT ported (same shape, sit in the per-kind switch beside ported
-   siblings — close cheaply).
+   `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
+   family and Distinct/Order now leave the per-kind switch.
 4. Delete the `chunked.cpp` classes only after the physical path handles every
    supported shape and the fallback is mutation-tested. Blocked on 1–2.
 

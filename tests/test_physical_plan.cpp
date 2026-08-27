@@ -938,3 +938,79 @@ TEST_CASE("Migrated pipelines handle every column representation", "[physical][e
     REQUIRE((*s)[1] == "z");
     REQUIRE((*b)[0]);
 }
+
+TEST_CASE("The plan describes the distinct dedup fan-out phase", "[physical][breaker]") {
+    SECTION("one phase, named, with the packed-key policy") {
+        const auto [tree, plan] = serial_plan("trades[distinct { price, symbol }];");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.breaker_phases.size() == 1);
+        const auto& phase = plan.breaker_phases.front();
+        REQUIRE(phase.name == "dedup");
+        REQUIRE(phase.parallelism.row_floor == (1U << 15U));
+        REQUIRE(phase.parallelism.breaker_max_workers == 64);
+        REQUIRE(phase.parallelism.strategy == runtime::physical::PartitionStrategy::PackedKey);
+        // Not resolved yet — no ExecutionContext ran here.
+        REQUIRE(phase.parallelism.worker_cap == 0);
+    }
+
+    SECTION("a bare registered scan gets a footer row estimate") {
+        const auto [tree, plan] = serial_plan("trades[distinct { price }];");
+        REQUIRE(plan.breaker_phases.size() == 1);
+        const auto& est = plan.breaker_phases.front().parallelism.estimate;
+        REQUIRE(est.source == runtime::physical::RowEstimate::Source::Footer);
+        REQUIRE(est.rows == 3);
+    }
+
+    SECTION("a filter under the distinct makes the count unknowable — no estimate") {
+        const auto [tree, plan] = serial_plan("trades[filter price > 5][distinct { price }];");
+        REQUIRE(plan.breaker_phases.size() == 1);
+        REQUIRE(plan.breaker_phases.front().parallelism.estimate.source ==
+                runtime::physical::RowEstimate::Source::None);
+    }
+
+    SECTION("explain physical prints the phase") {
+        const auto [tree, plan] = serial_plan("trades[distinct { price, symbol }];");
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("Breaker(Distinct)") != std::string::npos);
+        REQUIRE(text.find("dedup:") != std::string::npos);
+        REQUIRE(text.find("floor 32768") != std::string::npos);
+        REQUIRE(text.find("packed-key") != std::string::npos);
+    }
+}
+
+TEST_CASE("resolve_breaker_parallelism is the one place the worker cap is computed",
+          "[physical][breaker]") {
+    using runtime::physical::BreakerParallelism;
+    using runtime::physical::FanOutDecline;
+    using runtime::physical::resolve_breaker_parallelism;
+    using runtime::physical::RowEstimate;
+
+    SECTION("single core declines") {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 1;
+        BreakerParallelism bp{.row_floor = 32768, .breaker_max_workers = 64};
+        resolve_breaker_parallelism(bp, exec, 8);
+        REQUIRE(bp.decline == FanOutDecline::SingleCore);
+        REQUIRE(bp.worker_cap == 1);
+    }
+
+    SECTION("a confident estimate under the floor declines") {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        BreakerParallelism bp{.row_floor = 32768,
+                              .breaker_max_workers = 64,
+                              .estimate = {.rows = 100, .source = RowEstimate::Source::Footer}};
+        resolve_breaker_parallelism(bp, exec, 8);
+        REQUIRE(bp.decline == FanOutDecline::BelowFloor);
+        REQUIRE(bp.worker_cap == 1);
+    }
+
+    SECTION("the cap is the min of budget, pool, and the breaker's own ceiling") {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 6;
+        BreakerParallelism bp{.row_floor = 32768, .breaker_max_workers = 4};
+        resolve_breaker_parallelism(bp, exec, 8);
+        REQUIRE(bp.decline == FanOutDecline::None);
+        REQUIRE(bp.worker_cap == 4);  // min(6, 8, 4)
+    }
+}

@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,39 @@ namespace {
 std::atomic<std::uint64_t> g_plans_built{0};
 std::atomic<std::uint64_t> g_map_pipelines{0};
 std::atomic<std::uint64_t> g_materialized_calls{0};
+
+/// The row count below which `ChunkedDistinctOperator` stays serial. It has
+/// lived as a bare `1U << 15U` inside that operator — twice, once per dedup
+/// path. The plan is now the single owner (src/runtime/PARALLELISM.md); the
+/// operator will read it in the follow-up slice.
+constexpr std::size_t kDistinctRowFloor = 1U << 15U;
+
+/// The most workers the packed-key partition strategy will use, matching the
+/// `std::size_t{64}` cap the operator applies today.
+constexpr std::size_t kPackedKeyMaxWorkers = 64;
+
+/// A footer row estimate for `distinct`'s input, or `None` when the input is
+/// not a bare registered scan. Deliberately conservative: a Filter or Join
+/// under the Distinct makes the count unknowable at plan time, and the planner
+/// never guesses — `None` means the operator decides on its first chunk, which
+/// is exactly today's behaviour.
+auto distinct_row_estimate(const ir::Node& distinct, const TableRegistry& registry) -> RowEstimate {
+    const ir::Node* cur = distinct.children().empty() ? nullptr : distinct.children().front().get();
+    while (cur != nullptr &&
+           (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename)) {
+        cur = cur->children().empty() ? nullptr : cur->children().front().get();
+    }
+    if (cur == nullptr || cur->kind() != ir::NodeKind::Scan) {
+        return {};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+    const auto& scan = static_cast<const ir::ScanNode&>(*cur);
+    const auto it = registry.find(scan.source_name());
+    if (it == registry.end()) {
+        return {};
+    }
+    return {.rows = it->second.rows(), .source = RowEstimate::Source::Footer};
+}
 
 /// Fallbacks by node kind and by reason. `NodeKind` is a `std::uint8_t` enum, so
 /// 256 slots covers it by construction and no sentinel enumerator has to be
@@ -359,11 +394,26 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     // stay silent about 51% of the backlog until the day execution moves would
     // mean the description and the executor land together, untested against
     // each other.
-    if (root.kind() == ir::NodeKind::Head || root.kind() == ir::NodeKind::Distinct) {
-        // Single-implementation breakers, like Order: nothing to classify, the
-        // plan simply owns construction.
+    if (root.kind() == ir::NodeKind::Head) {
+        // Single-implementation breaker: nothing to classify, the plan owns
+        // construction. Head is `OrderedStream`, not a fan-out point.
         plan.migrated = true;
         plan.source_node = &root;
+        return plan;
+    }
+    if (root.kind() == ir::NodeKind::Distinct) {
+        // One fan-out phase, described. The operator still decides for now; the
+        // planner records the policy (floor, strategy, breaker ceiling) and the
+        // estimate so `explain physical` and a test can see it. See
+        // src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
+        plan.migrated = true;
+        plan.source_node = &root;
+        plan.breaker_phases.push_back(
+            {.name = "dedup",
+             .parallelism = {.row_floor = kDistinctRowFloor,
+                             .breaker_max_workers = kPackedKeyMaxWorkers,
+                             .strategy = PartitionStrategy::PackedKey,
+                             .estimate = distinct_row_estimate(root, registry)}});
         return plan;
     }
     if (root.kind() == ir::NodeKind::Order) {
@@ -528,6 +578,14 @@ auto serial_only_reason_name(SerialOnlyReason reason) -> std::string_view {
 
 auto explain_physical(const Plan& plan) -> std::string {
     std::string out;
+    if (!plan.breaker_phases.empty()) {
+        // A breaker whose parallelism the plan describes (Distinct today).
+        // `migrated` is true but there are no map steps — the breaker is its
+        // own operator, and the phases are what there is to explain.
+        const std::string_view kind =
+            plan.root != nullptr ? node_kind_name_impl(plan.root->kind()) : "?";
+        return explain_breaker(kind, plan.breaker_phases) + "\n";
+    }
     if (!plan.migrated) {
         out += "MaterializedCall(";
         out += fallback_reason_name(plan.reason);
@@ -647,6 +705,79 @@ auto explain_aggregate(const AggregatePlan& plan) -> std::string {
         out += " counted=" + plan.counted_column;
     }
     out += ")";
+    return out;
+}
+
+namespace {
+auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
+    switch (strategy) {
+        case PartitionStrategy::PackedKey:
+            return "packed-key";
+        case PartitionStrategy::RadixHash:
+            return "radix-hash";
+        case PartitionStrategy::Owned:
+            return "owned";
+    }
+    return "?";
+}
+}  // namespace
+
+void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
+                                 std::size_t pool_size) {
+    if (!exec.can_fan_out()) {
+        bp.decline = FanOutDecline::SingleCore;
+        bp.worker_cap = 1;
+        return;
+    }
+    if (bp.estimate.confident() && bp.estimate.rows < bp.row_floor) {
+        bp.decline = FanOutDecline::BelowFloor;
+        bp.worker_cap = 1;
+        return;
+    }
+    bp.decline = FanOutDecline::None;
+    // The one place the worker cap is computed. It used to be open-coded as
+    // `std::min({budget, pool_size, 64})` inside each breaker's next().
+    std::size_t cap = exec.compute_budget();
+    if (pool_size != 0) {
+        cap = std::min(cap, pool_size);
+    }
+    if (bp.breaker_max_workers != 0) {
+        cap = std::min(cap, bp.breaker_max_workers);
+    }
+    bp.worker_cap = std::max<std::size_t>(cap, 1);
+}
+
+auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& phases)
+    -> std::string {
+    std::string out = "Breaker(";
+    out += kind;
+    out += ")";
+    for (const auto& phase : phases) {
+        const BreakerParallelism& bp = phase.parallelism;
+        out += "\n  ";
+        out += phase.name;
+        out += ": ";
+        if (bp.worker_cap == 0) {
+            // Unresolved: printed straight off plan_physical, before a builder
+            // with an ExecutionContext ran resolve_breaker_parallelism.
+            out += "parallel-capable  cap=unresolved  floor " + std::to_string(bp.row_floor);
+        } else if (bp.decline == FanOutDecline::SingleCore) {
+            out += "serial (single core)";
+            continue;
+        } else if (bp.decline == FanOutDecline::BelowFloor) {
+            out += "serial (estimate " + std::to_string(bp.estimate.rows) + " < floor " +
+                   std::to_string(bp.row_floor) + ")";
+            continue;
+        } else {
+            out += "parallel-capable  cap<=" + std::to_string(bp.worker_cap) + "  floor " +
+                   std::to_string(bp.row_floor);
+        }
+        out += "  partitions=derived  ";
+        out += partition_strategy_name(bp.strategy);
+        out += bp.estimate.confident()
+                   ? "\n         estimate " + std::to_string(bp.estimate.rows) + " rows (footer)"
+                   : "\n         no row estimate -> decided on first chunk";
+    }
     return out;
 }
 

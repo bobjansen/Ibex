@@ -2669,8 +2669,9 @@ struct PackedKeyEncoder {
 
 class ChunkedDistinctOperator final : public Operator {
    public:
-    ChunkedDistinctOperator(OperatorPtr child, const ExecutionContext& exec)
-        : child_(std::move(child)), exec_(&exec) {}
+    ChunkedDistinctOperator(OperatorPtr child, const ExecutionContext& exec,
+                            physical::BreakerParallelism dedup_plan = {})
+        : child_(std::move(child)), dedup_plan_(dedup_plan), exec_(&exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -2827,6 +2828,25 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
+    /// Observability check for the dedup-phase parallelism slice: called once,
+    /// at the point the operator commits to fanning out over `count`
+    /// partitions. If `build_physical_distinct` resolved a plan for this
+    /// breaker, it must have permitted fan-out and its worker cap must bound
+    /// the operator's own choice. A disagreement means the planner and the
+    /// operator computed different things -- abort loudly rather than let the
+    /// follow-up slice inherit the divergence.
+    void check_dedup_plan(std::size_t count) const {
+        if (dedup_plan_.worker_cap == 0) {
+            return;  // no resolved plan (a hand-built ChunkedDistinctOperator)
+        }
+        if (dedup_plan_.decline != physical::FanOutDecline::None) {
+            invariant_violation("distinct: plan declined fan-out but the operator fanned out");
+        }
+        if (count > dedup_plan_.worker_cap) {
+            invariant_violation("distinct: operator partition count exceeds the plan's worker cap");
+        }
+    }
+
     /// A single-column typed dedup store: the serial set, and -- once the
     /// parallel path has run -- one set per partition. Exactly `PackedDedup`'s
     /// split, minus the key buffer, because for one column the column already
@@ -3050,6 +3070,7 @@ class ChunkedDistinctOperator final : public Operator {
             // `count <= pool.size()` by construction and the pool never
             // shrinks, so `submit(part_count, ...)` below is never clamped —
             // which it must not be, or a partition's rows would go unvisited.
+            check_dedup_plan(count);
             dedup_part_count_ = count;
             state.parts.resize(count);
             // Anything an earlier chunk deduped serially lives in `state.seen`,
@@ -3161,6 +3182,7 @@ class ChunkedDistinctOperator final : public Operator {
             while (count * 2 <= workers) {
                 count *= 2;  // a power of two, so the partition is a mask
             }
+            check_dedup_plan(count);
             dedup_part_count_ = count;
         }
         if (state.parts.size() != dedup_part_count_) {
@@ -3479,6 +3501,12 @@ class ChunkedDistinctOperator final : public Operator {
     /// silently move to the other.
     bool fast_dedup_seen_ = false;
     bool generic_dedup_seen_ = false;
+    /// The `dedup` phase's parallelism, resolved by `build_physical_distinct`
+    /// (src/runtime/PARALLELISM.md). This slice is observability only: the
+    /// operator still decides for itself below, and `check_dedup_plan` aborts
+    /// if the two ever disagree. The follow-up slice deletes the operator's
+    /// copy and reads `dedup_plan_` directly.
+    physical::BreakerParallelism dedup_plan_{};
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     TypedDedup<std::int64_t> seen_i64_;
     TypedDedup<double> seen_f64_;
@@ -14831,11 +14859,15 @@ auto build_physical_head(const ir::Node& node, const TableRegistry& registry,
                                                  &head.group_by());
 }
 
-/// Build a distinct breaker. As above: one operator, no decision.
-auto build_physical_distinct(const ir::Node& node, const TableRegistry& registry,
-                             const ScalarRegistry* scalars, const ExternRegistry* externs,
-                             const ExecutionContext& exec, ModelResult* model_out)
-    -> std::expected<OperatorPtr, std::string> {
+/// Build a distinct breaker. The plan describes the `dedup` fan-out phase
+/// (src/runtime/PARALLELISM.md); this resolves its worker cap here, where the
+/// `ExecutionContext` is in hand, and hands it to the operator. This slice is
+/// observability only -- the operator still decides for itself and aborts if
+/// the two disagree.
+auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
+                             const TableRegistry& registry, const ScalarRegistry* scalars,
+                             const ExternRegistry* externs, const ExecutionContext& exec,
+                             ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
     if (node.children().empty()) {
         return std::unexpected("distinct node missing child");
     }
@@ -14844,7 +14876,15 @@ auto build_physical_distinct(const ir::Node& node, const TableRegistry& registry
     if (!child_op.has_value()) {
         return std::unexpected(std::move(child_op.error()));
     }
-    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec);
+    physical::BreakerParallelism dedup_plan{};
+    if (!plan.breaker_phases.empty()) {
+        dedup_plan = plan.breaker_phases.front().parallelism;
+        // The pool is sized for decode and its threads spawn on first touch, so
+        // a serial query must not construct it just to learn it is serial.
+        const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
+        physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
+    }
+    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec, dedup_plan);
 }
 
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
@@ -14885,7 +14925,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
     if (plan.migrated && node.kind() == ir::NodeKind::Distinct) {
         physical::note_map_pipeline_executed();
-        return build_physical_distinct(node, registry, scalars, externs, exec, model_out);
+        return build_physical_distinct(plan, node, registry, scalars, externs, exec, model_out);
     }
     if (plan.migrated && node.kind() == ir::NodeKind::Order) {
         physical::note_map_pipeline_executed();

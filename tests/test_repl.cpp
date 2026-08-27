@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <csv.hpp>
+#include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <ranges>
 #include <set>
+#include <stdio.h>
 #include <string>
+#include <variant>
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>

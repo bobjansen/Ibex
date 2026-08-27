@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/scan_predicates.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/codegen/emitter.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/parser/lower.hpp>
@@ -10,8 +11,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace ibex;
 using namespace ibex::ops;
@@ -165,7 +171,7 @@ TEST_CASE("emitter: filter node - is not null predicate", "[codegen]") {
 
 TEST_CASE("emitter: project node", "[codegen]") {
     ir::Builder b;
-    auto proj = b.project({ir::ColumnRef{"symbol"}, ir::ColumnRef{"price"}});
+    auto proj = b.project({ir::ColumnRef{.name = "symbol"}, ir::ColumnRef{.name = "price"}});
     proj->add_child(make_source(b, "trades.csv"));
 
     auto out = emit_to_string(*proj);
@@ -198,9 +204,12 @@ TEST_CASE("emitter: order node", "[codegen]") {
 
 TEST_CASE("emitter: aggregate node", "[codegen]") {
     ir::Builder b;
-    auto agg = b.aggregate({ir::ColumnRef{"symbol"}},
-                           {ir::AggSpec{ir::AggFunc::Sum, ir::ColumnRef{"price"}, "total"},
-                            ir::AggSpec{ir::AggFunc::Count, ir::ColumnRef{"price"}, "n"}});
+    auto agg = b.aggregate(
+        {ir::ColumnRef{.name = "symbol"}},
+        {ir::AggSpec{
+             .func = ir::AggFunc::Sum, .column = ir::ColumnRef{.name = "price"}, .alias = "total"},
+         ir::AggSpec{
+             .func = ir::AggFunc::Count, .column = ir::ColumnRef{.name = "price"}, .alias = "n"}});
     agg->add_child(make_source(b, "trades.csv"));
 
     auto out = emit_to_string(*agg);
@@ -232,11 +241,17 @@ TEST_CASE("emitter: resample node - OHLC with group-by", "[codegen]") {
     ir::Builder b;
     // 1-minute bucket (60 * 10^9 ns), group by symbol, 4 aggs
     constexpr std::int64_t min_ns = 60LL * 1'000'000'000LL;
-    auto rs = b.resample(ir::Duration(min_ns), {ir::ColumnRef{"symbol"}},
-                         {ir::AggSpec{ir::AggFunc::First, ir::ColumnRef{"price"}, "open"},
-                          ir::AggSpec{ir::AggFunc::Max, ir::ColumnRef{"price"}, "high"},
-                          ir::AggSpec{ir::AggFunc::Min, ir::ColumnRef{"price"}, "low"},
-                          ir::AggSpec{ir::AggFunc::Last, ir::ColumnRef{"price"}, "close"}});
+    auto rs = b.resample(
+        ir::Duration(min_ns), {ir::ColumnRef{.name = "symbol"}},
+        {ir::AggSpec{
+             .func = ir::AggFunc::First, .column = ir::ColumnRef{.name = "price"}, .alias = "open"},
+         ir::AggSpec{
+             .func = ir::AggFunc::Max, .column = ir::ColumnRef{.name = "price"}, .alias = "high"},
+         ir::AggSpec{
+             .func = ir::AggFunc::Min, .column = ir::ColumnRef{.name = "price"}, .alias = "low"},
+         ir::AggSpec{.func = ir::AggFunc::Last,
+                     .column = ir::ColumnRef{.name = "price"},
+                     .alias = "close"}});
     rs->add_child(make_source(b, "ticks.csv"));
 
     auto out = emit_to_string(*rs);
@@ -255,8 +270,10 @@ TEST_CASE("emitter: resample node - OHLC with group-by", "[codegen]") {
 TEST_CASE("emitter: resample node - no group-by", "[codegen]") {
     ir::Builder b;
     constexpr std::int64_t hour_ns = 3600LL * 1'000'000'000LL;
-    auto rs = b.resample(ir::Duration(hour_ns), {},
-                         {ir::AggSpec{ir::AggFunc::Mean, ir::ColumnRef{"price"}, "avg"}});
+    auto rs = b.resample(
+        ir::Duration(hour_ns), {},
+        {ir::AggSpec{
+            .func = ir::AggFunc::Mean, .column = ir::ColumnRef{.name = "price"}, .alias = "avg"}});
     rs->add_child(make_source(b, "ticks.csv"));
 
     auto out = emit_to_string(*rs);
@@ -365,12 +382,14 @@ TEST_CASE("emitter: update node - simple expression", "[codegen]") {
 
     // mid = (bid + ask) / 2.0
     ir::FieldSpec field{
-        "mid", ir::Expr{ir::BinaryExpr{
-                   ir::ArithmeticOp::Div,
-                   ir::make_expr_ptr(ir::Expr{ir::BinaryExpr{
-                       ir::ArithmeticOp::Add, ir::make_expr_ptr(ir::Expr{ir::ColumnRef{"bid"}}),
-                       ir::make_expr_ptr(ir::Expr{ir::ColumnRef{"ask"}})}}),
-                   ir::make_expr_ptr(ir::Expr{ir::Literal{2.0}})}}};
+        .alias = "mid",
+        .expr = ir::Expr{ir::BinaryExpr{
+            .op = ir::ArithmeticOp::Div,
+            .left = ir::make_expr_ptr(ir::Expr{ir::BinaryExpr{
+                .op = ir::ArithmeticOp::Add,
+                .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "bid"}}),
+                .right = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "ask"}})}}),
+            .right = ir::make_expr_ptr(ir::Expr{ir::Literal{2.0}})}}};
 
     auto upd = b.update({std::move(field)});
     upd->add_child(make_source(b, "trades.csv"));
@@ -388,10 +407,10 @@ TEST_CASE("emitter: update node - simple expression", "[codegen]") {
 TEST_CASE("emitter: update node - literal types", "[codegen]") {
     ir::Builder b;
 
-    ir::FieldSpec f1{"label", ir::Expr{ir::Literal{std::string{"hello"}}}};
-    ir::FieldSpec f2{"count", ir::Expr{ir::Literal{std::int64_t{42}}}};
-    ir::FieldSpec f3{"day", ir::Expr{ir::Literal{Date{1}}}};
-    ir::FieldSpec f4{"ts", ir::Expr{ir::Literal{Timestamp{1000}}}};
+    ir::FieldSpec f1{.alias = "label", .expr = ir::Expr{ir::Literal{std::string{"hello"}}}};
+    ir::FieldSpec f2{.alias = "count", .expr = ir::Expr{ir::Literal{std::int64_t{42}}}};
+    ir::FieldSpec f3{.alias = "day", .expr = ir::Expr{ir::Literal{Date{1}}}};
+    ir::FieldSpec f4{.alias = "ts", .expr = ir::Expr{ir::Literal{Timestamp{1000}}}};
 
     auto upd = b.update({std::move(f1), std::move(f2), std::move(f3), std::move(f4)});
     upd->add_child(make_source(b, "t.csv"));
@@ -453,7 +472,7 @@ TEST_CASE("emitter: filter then project pipeline", "[codegen]") {
     ir::Builder b;
     auto filter = b.filter(filter_cmp(ir::CompareOp::Ge, filter_col("price"), filter_int(50)));
     filter->add_child(make_source(b, "trades.csv"));
-    auto proj = b.project({ir::ColumnRef{"symbol"}});
+    auto proj = b.project({ir::ColumnRef{.name = "symbol"}});
     proj->add_child(std::move(filter));
 
     auto out = emit_to_string(*proj);
@@ -749,7 +768,8 @@ TEST_CASE("emitter: negated like in a filter predicate", "[codegen][like]") {
 TEST_CASE("emitter: like as an update field emits a value-position call", "[codegen][like]") {
     ir::Builder b;
     auto update = b.update(
-        {{"is_green", ops::fn_call("like", {ops::col_ref("p_name"), ops::str_lit("%green%")})}});
+        {{.alias = "is_green",
+          .expr = ops::fn_call("like", {ops::col_ref("p_name"), ops::str_lit("%green%")})}});
     update->add_child(make_source(b, "part.csv"));
 
     auto out = emit_to_string(*update);
@@ -760,8 +780,8 @@ TEST_CASE("emitter: like as an update field emits a value-position call", "[code
 TEST_CASE("emitter: string length calls use the generic value-call path", "[codegen][string]") {
     ir::Builder b;
     auto update = b.update({
-        {"chars", ops::fn_call("length", {ops::col_ref("name")})},
-        {"bytes", ops::fn_call("byte_length", {ops::col_ref("name")})},
+        {.alias = "chars", .expr = ops::fn_call("length", {ops::col_ref("name")})},
+        {.alias = "bytes", .expr = ops::fn_call("byte_length", {ops::col_ref("name")})},
     });
     update->add_child(make_source(b, "part.csv"));
 
@@ -775,9 +795,9 @@ TEST_CASE("emitter: a boolean-valued field emits its predicate node", "[codegen]
     // interpreter builds a Bool column from them — codegen must emit the same
     // tree rather than rejecting the field.
     ir::Builder b;
-    auto update =
-        b.update({{"plain", ops::filter_not(ops::fn_call(
-                                "like", {ops::col_ref("p_name"), ops::str_lit("%green%")}))}});
+    auto update = b.update({{.alias = "plain",
+                             .expr = ops::filter_not(ops::fn_call(
+                                 "like", {ops::col_ref("p_name"), ops::str_lit("%green%")}))}});
     update->add_child(make_source(b, "part.csv"));
 
     auto out = emit_to_string(*update);

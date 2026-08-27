@@ -3,6 +3,8 @@
 
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/cardinality.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -32,7 +34,8 @@ TEST_CASE("cardinality makes filter selectivity explicit", "[ir][cardinality]") 
     filter->add_child(std::move(scan));
 
     const auto estimate =
-        ir::estimate_cardinality(*filter, {{"orders", 1'500}}, {}, {.filter_selectivity = 0.1});
+        ir::estimate_cardinality(*filter, {{"orders", 1'500}}, {},
+                                 {.filter_selectivity = 0.1, .absorbed_scan_selectivity = {}});
     REQUIRE(estimate.rows.has_value());
     CHECK(*estimate.rows == 150);
     CHECK(estimate.heuristic);
@@ -55,8 +58,9 @@ TEST_CASE("cardinality bounds a semi join by its left input", "[ir][cardinality]
     join->add_child(builder.scan("orders"));
     join->add_child(builder.scan("lineitem"));
 
-    const auto estimate = ir::estimate_cardinality(*join, {{"orders", 1'500}, {"lineitem", 6'000}},
-                                                   {}, {.filter_selectivity = 0.1});
+    const auto estimate =
+        ir::estimate_cardinality(*join, {{"orders", 1'500}, {"lineitem", 6'000}}, {},
+                                 {.filter_selectivity = 0.1, .absorbed_scan_selectivity = {}});
     REQUIRE(estimate.rows.has_value());
     CHECK(*estimate.rows == 150);
     CHECK(estimate.heuristic);
@@ -68,8 +72,9 @@ TEST_CASE("cardinality gives an anti join the complement of a semi join", "[ir][
     join->add_child(builder.scan("orders"));
     join->add_child(builder.scan("lineitem"));
 
-    const auto estimate = ir::estimate_cardinality(*join, {{"orders", 1'500}, {"lineitem", 6'000}},
-                                                   {}, {.filter_selectivity = 0.1});
+    const auto estimate =
+        ir::estimate_cardinality(*join, {{"orders", 1'500}, {"lineitem", 6'000}}, {},
+                                 {.filter_selectivity = 0.1, .absorbed_scan_selectivity = {}});
     REQUIRE(estimate.rows.has_value());
     CHECK(*estimate.rows == 1'350);
     CHECK(estimate.heuristic);

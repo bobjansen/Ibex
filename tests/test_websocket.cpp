@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_approx.hpp>
@@ -9,13 +10,19 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <netinet/in.h>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <variant>
 
 #include "websocket.hpp"
@@ -124,7 +131,7 @@ TEST_CASE("ws_send: handshake and single-row broadcast") {
     bool handshake_ok = false;
 
     std::thread client([&]() {
-        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
             if (errno == EPERM || errno == EACCES) {
                 return;
@@ -257,7 +264,7 @@ TEST_CASE("ws_recv: schema-driven receive skips malformed messages and honours e
     }
 
     std::thread client([&]() {
-        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0)
             return;
 

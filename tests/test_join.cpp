@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace ibex;
@@ -1330,7 +1338,7 @@ TEST_CASE("join: swapped-mode inner join emits in right-scan order", "[join]") {
         if (r == static_cast<std::size_t>(kRightNullRow)) {
             continue;
         }
-        for (std::size_t l : lefts_by_key[static_cast<std::size_t>(right_keys[r])]) {
+        for (const std::size_t l : lefts_by_key[static_cast<std::size_t>(right_keys[r])]) {
             want_lval.push_back(left_vals[l]);
             want_rval.push_back(right_vals[r]);
         }
@@ -1431,12 +1439,12 @@ TEST_CASE("join: inferred output names match the materialized ones for every kin
         const std::vector<std::string>* want;
     };
     const std::vector<Case> cases{
-        {R"(lhs join rhs on id suffix { "_l", "_r" };)", &both},
-        {R"(lhs left join rhs on id suffix { "_l", "_r" };)", &both},
-        {R"(lhs right join rhs on id suffix { "_l", "_r" };)", &both},
-        {R"(lhs outer join rhs on id suffix { "_l", "_r" };)", &both},
-        {R"(lhs semi join rhs on id suffix { "_l", "_r" };)", &left_only},
-        {R"(lhs anti join rhs on id suffix { "_l", "_r" };)", &left_only},
+        {.src = R"(lhs join rhs on id suffix { "_l", "_r" };)", .want = &both},
+        {.src = R"(lhs left join rhs on id suffix { "_l", "_r" };)", .want = &both},
+        {.src = R"(lhs right join rhs on id suffix { "_l", "_r" };)", .want = &both},
+        {.src = R"(lhs outer join rhs on id suffix { "_l", "_r" };)", .want = &both},
+        {.src = R"(lhs semi join rhs on id suffix { "_l", "_r" };)", .want = &left_only},
+        {.src = R"(lhs anti join rhs on id suffix { "_l", "_r" };)", .want = &left_only},
     };
 
     for (const auto& test : cases) {

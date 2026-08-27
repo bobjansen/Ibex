@@ -1,31 +1,52 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/query_lease.hpp>
 #include <ibex/runtime/rng.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_compare.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <initializer_list>
 #include <limits>
 #include <map>
+#include <memory>
+#include <optional>
 #include <sstream>
+#include <string>
 #include <thread>
+#include <tuple>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "interpreter_internal.hpp"
+#include "runtime_internal.hpp"
 
 namespace {
 

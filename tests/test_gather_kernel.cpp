@@ -20,8 +20,10 @@
 //      up under a stress loop.
 //   2. A parallel gather equals a serial one, for every column type.
 
+#include <ibex/core/column.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
@@ -31,9 +33,11 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "kernel_gather.hpp"
+#include "kernel_types.hpp"
 #include "runtime_internal.hpp"
 
 using namespace ibex;
@@ -217,7 +221,7 @@ TEST_CASE("a parallel validity gather equals a serial one", "[runtime][gather][p
 
 TEST_CASE("kernel validity gather packs selected bits and preserves false output bits",
           "[runtime][gather][kernel]") {
-    runtime::ValidityBitmap src{true, false, true, false, false, true, true, false, true};
+    const runtime::ValidityBitmap src{true, false, true, false, false, true, true, false, true};
     const std::uint64_t selected[] = {0b1111'0111};
     runtime::ValidityBitmap dst(7, false);
 

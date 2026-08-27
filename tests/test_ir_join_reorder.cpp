@@ -2,10 +2,15 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/join_reorder.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <string>
+#include <utility>
 
 using namespace ibex;
 
@@ -16,11 +21,13 @@ namespace {
 // would give: dense PKs exact, a foreign key's distinct == the parent's PK.
 auto misordered_stats() -> ir::SourceStats {
     ir::SourceStats stats;
-    stats.schemas = {{"customer", ir::SchemaInfo::known({{"c_custkey", ir::ColumnType::Int64}})},
-                     {"orders", ir::SchemaInfo::known({{"c_custkey", ir::ColumnType::Int64},
-                                                       {"o_orderkey", ir::ColumnType::Int64}})},
-                     {"lineitem", ir::SchemaInfo::known({{"o_orderkey", ir::ColumnType::Int64},
-                                                         {"l_price", ir::ColumnType::Float64}})}};
+    stats.schemas = {
+        {"customer", ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64}})},
+        {"orders", ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64},
+                                          {.name = "o_orderkey", .type = ir::ColumnType::Int64}})},
+        {"lineitem",
+         ir::SchemaInfo::known({{.name = "o_orderkey", .type = ir::ColumnType::Int64},
+                                {.name = "l_price", .type = ir::ColumnType::Float64}})}};
     stats.rows = {{"customer", 150'000}, {"orders", 1'500'000}, {"lineitem", 1'000}};
     stats.distinct = {{"customer", {{"c_custkey", 150'000}}},
                       {"orders", {{"c_custkey", 150'000}, {"o_orderkey", 1'500'000}}},
@@ -81,11 +88,13 @@ TEST_CASE("join reorder hands back the plan intact when it rejects a rewrite",
     // ambiguous. (Distinct estimates are inherited from misordered_stats and are
     // enough to reach the cost model, which is the point -- the ambiguity check
     // must fire regardless.)
-    stats.schemas["customer"] = ir::SchemaInfo::known(
-        {{"c_custkey", ir::ColumnType::Int64}, {"dup", ir::ColumnType::Int64}});
-    stats.schemas["orders"] = ir::SchemaInfo::known({{"c_custkey", ir::ColumnType::Int64},
-                                                     {"o_orderkey", ir::ColumnType::Int64},
-                                                     {"dup", ir::ColumnType::Int64}});
+    stats.schemas["customer"] =
+        ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64},
+                               {.name = "dup", .type = ir::ColumnType::Int64}});
+    stats.schemas["orders"] =
+        ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64},
+                               {.name = "o_orderkey", .type = ir::ColumnType::Int64},
+                               {.name = "dup", .type = ir::ColumnType::Int64}});
 
     ir::Builder builder;
     auto first = builder.join(ir::JoinKind::Inner, {"c_custkey"});
@@ -130,10 +139,12 @@ TEST_CASE("join reorder keeps First aggregates in source order", "[ir][join_reor
 TEST_CASE("join reorder rebuilds folded mapped keys with native input names",
           "[ir][join_reorder]") {
     ir::SourceStats stats = misordered_stats();
-    stats.schemas["orders"] = ir::SchemaInfo::known(
-        {{"o_custkey", ir::ColumnType::Int64}, {"o_orderkey", ir::ColumnType::Int64}});
-    stats.schemas["lineitem"] = ir::SchemaInfo::known(
-        {{"l_orderkey", ir::ColumnType::Int64}, {"l_price", ir::ColumnType::Float64}});
+    stats.schemas["orders"] =
+        ir::SchemaInfo::known({{.name = "o_custkey", .type = ir::ColumnType::Int64},
+                               {.name = "o_orderkey", .type = ir::ColumnType::Int64}});
+    stats.schemas["lineitem"] =
+        ir::SchemaInfo::known({{.name = "l_orderkey", .type = ir::ColumnType::Int64},
+                               {.name = "l_price", .type = ir::ColumnType::Float64}});
     stats.distinct["orders"] = {{"o_custkey", 150'000}, {"o_orderkey", 1'500'000}};
     stats.distinct["lineitem"] = {{"l_orderkey", 1'000}};
 

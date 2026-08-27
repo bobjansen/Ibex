@@ -15,23 +15,29 @@
 //
 // Both were invisible at one chunk and wrong at two.
 
+#include <ibex/core/column.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/env.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/table_compare.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace ibex;
@@ -81,13 +87,14 @@ class VectorSource final : public runtime::Operator {
     std::size_t pos_ = 0;
 };
 
-auto run_extern(const std::string& source, runtime::ExternRegistry& externs) -> runtime::Table {
+auto run_extern(const std::string& source, const runtime::ExternRegistry& externs)
+    -> runtime::Table {
     auto program = parser::parse(source);
     REQUIRE(program.has_value());
     auto ir = parser::lower(program.value());
     REQUIRE(ir.has_value());
     const runtime::TableRegistry registry;
-    runtime::ExecutionContext exec;
+    const runtime::ExecutionContext exec;
     auto result = runtime::interpret(*ir.value(), registry, nullptr, &externs, nullptr, exec);
     REQUIRE(result.has_value());
     return std::move(*result);
@@ -98,7 +105,7 @@ auto run(const std::string& source, const runtime::TableRegistry& registry) -> r
     REQUIRE(program.has_value());
     auto ir = parser::lower(program.value());
     REQUIRE(ir.has_value());
-    runtime::ExecutionContext exec;
+    const runtime::ExecutionContext exec;
     auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
     REQUIRE(result.has_value());
     return std::move(*result);

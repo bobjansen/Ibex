@@ -1,18 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <expected>
+#include <initializer_list>
 #include <interpreter_internal.hpp>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <robin_hood.h>
 #include <string>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace {
 
@@ -117,7 +129,9 @@ TEST_CASE("Arrow C Data export preserves zero-copy buffers and table metadata",
     table.add_column("trade_date", dates);
     table.add_column("ts", ts);
     table.set_properties(ibex::runtime::TableProperties::recovered(
-        std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}}, "ts", {}));
+        std::vector<ibex::ir::OrderKey>{{.name = "ts", .ascending = true},
+                                        {.name = "id", .ascending = false}},
+        "ts", {}));
 
     ArrowArray array{};
     ArrowSchema schema{};
@@ -217,7 +231,9 @@ TEST_CASE("Arrow C Data import round-trips values, validity, and table metadata"
     table.add_column("ts", ibex::Column<ibex::Timestamp>{
                                {ibex::Timestamp{100}, ibex::Timestamp{200}, ibex::Timestamp{300}}});
     table.set_properties(ibex::runtime::TableProperties::recovered(
-        std::vector<ibex::ir::OrderKey>{{"ts", true}, {"id", false}}, "ts", {}));
+        std::vector<ibex::ir::OrderKey>{{.name = "ts", .ascending = true},
+                                        {.name = "id", .ascending = false}},
+        "ts", {}));
 
     ArrowArray array{};
     ArrowSchema schema{};
@@ -1177,7 +1193,7 @@ TEST_CASE("Arrow import rejects an ordering the rows do not have", "[interop][ar
     ibex::runtime::Table table;
     table.add_column("k", ibex::Column<std::int64_t>{3, 1, 2});
     table.set_properties(ibex::runtime::TableProperties::recovered(
-        std::vector<ibex::ir::OrderKey>{{"k", true}}, std::nullopt, {}));
+        std::vector<ibex::ir::OrderKey>{{.name = "k", .ascending = true}}, std::nullopt, {}));
 
     auto imported = import_with_claim(std::move(table));
     REQUIRE_FALSE(imported.has_value());
@@ -1191,7 +1207,9 @@ TEST_CASE("Arrow import accepts an ordering the rows do have", "[interop][arrow]
     table.add_column("a", ibex::Column<std::int64_t>{1, 1, 2});
     table.add_column("b", ibex::Column<std::int64_t>{9, 4, 7});
     table.set_properties(ibex::runtime::TableProperties::recovered(
-        std::vector<ibex::ir::OrderKey>{{"a", true}, {"b", false}}, std::nullopt, {}));
+        std::vector<ibex::ir::OrderKey>{{.name = "a", .ascending = true},
+                                        {.name = "b", .ascending = false}},
+        std::nullopt, {}));
 
     auto imported = import_with_claim(std::move(table));
     REQUIRE(imported.has_value());
@@ -1210,7 +1228,7 @@ TEST_CASE("Arrow import puts nulls last when checking a claimed ordering",
         kv.set(null_first ? 0 : 1, false);
         table.add_column("k", ibex::Column<std::int64_t>{0, 0}, kv);
         table.set_properties(ibex::runtime::TableProperties::recovered(
-            std::vector<ibex::ir::OrderKey>{{"k", true}}, std::nullopt, {}));
+            std::vector<ibex::ir::OrderKey>{{.name = "k", .ascending = true}}, std::nullopt, {}));
         return table;
     };
     CHECK(import_with_claim(build(false)).has_value());

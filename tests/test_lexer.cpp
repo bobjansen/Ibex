@@ -3,9 +3,11 @@
 
 #include <ibex/parser/lexer.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -189,23 +191,38 @@ TEST_CASE("Lexer: all hard keywords", "[lexer]") {
         const char* text;
         TokenKind kind;
     };
-    KW keywords[] = {
-        {"let", TokenKind::KeywordLet},       {"mut", TokenKind::KeywordMut},
-        {"extern", TokenKind::KeywordExtern}, {"fn", TokenKind::KeywordFn},
-        {"from", TokenKind::KeywordFrom},     {"import", TokenKind::KeywordImport},
-        {"filter", TokenKind::KeywordFilter}, {"select", TokenKind::KeywordSelect},
-        {"update", TokenKind::KeywordUpdate}, {"distinct", TokenKind::KeywordDistinct},
-        {"order", TokenKind::KeywordOrder},   {"head", TokenKind::KeywordHead},
-        {"tail", TokenKind::KeywordTail},     {"by", TokenKind::KeywordBy},
-        {"window", TokenKind::KeywordWindow}, {"resample", TokenKind::KeywordResample},
-        {"rename", TokenKind::KeywordRename}, {"join", TokenKind::KeywordJoin},
-        {"left", TokenKind::KeywordLeft},     {"right", TokenKind::KeywordRight},
-        {"outer", TokenKind::KeywordOuter},   {"semi", TokenKind::KeywordSemi},
-        {"anti", TokenKind::KeywordAnti},     {"cross", TokenKind::KeywordCross},
-        {"asof", TokenKind::KeywordAsof},     {"on", TokenKind::KeywordOn},
-        {"is", TokenKind::KeywordIs},         {"null", TokenKind::KeywordNull},
-        {"not", TokenKind::KeywordNot},       {"asc", TokenKind::KeywordAsc},
-        {"desc", TokenKind::KeywordDesc},
+    KW const keywords[] = {
+        {.text = "let", .kind = TokenKind::KeywordLet},
+        {.text = "mut", .kind = TokenKind::KeywordMut},
+        {.text = "extern", .kind = TokenKind::KeywordExtern},
+        {.text = "fn", .kind = TokenKind::KeywordFn},
+        {.text = "from", .kind = TokenKind::KeywordFrom},
+        {.text = "import", .kind = TokenKind::KeywordImport},
+        {.text = "filter", .kind = TokenKind::KeywordFilter},
+        {.text = "select", .kind = TokenKind::KeywordSelect},
+        {.text = "update", .kind = TokenKind::KeywordUpdate},
+        {.text = "distinct", .kind = TokenKind::KeywordDistinct},
+        {.text = "order", .kind = TokenKind::KeywordOrder},
+        {.text = "head", .kind = TokenKind::KeywordHead},
+        {.text = "tail", .kind = TokenKind::KeywordTail},
+        {.text = "by", .kind = TokenKind::KeywordBy},
+        {.text = "window", .kind = TokenKind::KeywordWindow},
+        {.text = "resample", .kind = TokenKind::KeywordResample},
+        {.text = "rename", .kind = TokenKind::KeywordRename},
+        {.text = "join", .kind = TokenKind::KeywordJoin},
+        {.text = "left", .kind = TokenKind::KeywordLeft},
+        {.text = "right", .kind = TokenKind::KeywordRight},
+        {.text = "outer", .kind = TokenKind::KeywordOuter},
+        {.text = "semi", .kind = TokenKind::KeywordSemi},
+        {.text = "anti", .kind = TokenKind::KeywordAnti},
+        {.text = "cross", .kind = TokenKind::KeywordCross},
+        {.text = "asof", .kind = TokenKind::KeywordAsof},
+        {.text = "on", .kind = TokenKind::KeywordOn},
+        {.text = "is", .kind = TokenKind::KeywordIs},
+        {.text = "null", .kind = TokenKind::KeywordNull},
+        {.text = "not", .kind = TokenKind::KeywordNot},
+        {.text = "asc", .kind = TokenKind::KeywordAsc},
+        {.text = "desc", .kind = TokenKind::KeywordDesc},
     };
     for (const auto& kw : keywords) {
         auto tokens = tokenize(kw.text);
@@ -220,20 +237,20 @@ TEST_CASE("Lexer: all type keywords", "[lexer]") {
         const char* text;
         TokenKind kind;
     };
-    KW keywords[] = {
-        {"Int", TokenKind::KeywordInt},
-        {"Int32", TokenKind::KeywordInt32},
-        {"Int64", TokenKind::KeywordInt64},
-        {"Float32", TokenKind::KeywordFloat32},
-        {"Float64", TokenKind::KeywordFloat64},
-        {"Bool", TokenKind::KeywordBool},
-        {"String", TokenKind::KeywordString},
-        {"Date", TokenKind::KeywordDate},
-        {"Timestamp", TokenKind::KeywordTimestamp},
-        {"Series", TokenKind::KeywordSeries},
-        {"DataFrame", TokenKind::KeywordDataFrame},
-        {"TimeFrame", TokenKind::KeywordTimeFrame},
-        {"Stream", TokenKind::KeywordStream},
+    KW const keywords[] = {
+        {.text = "Int", .kind = TokenKind::KeywordInt},
+        {.text = "Int32", .kind = TokenKind::KeywordInt32},
+        {.text = "Int64", .kind = TokenKind::KeywordInt64},
+        {.text = "Float32", .kind = TokenKind::KeywordFloat32},
+        {.text = "Float64", .kind = TokenKind::KeywordFloat64},
+        {.text = "Bool", .kind = TokenKind::KeywordBool},
+        {.text = "String", .kind = TokenKind::KeywordString},
+        {.text = "Date", .kind = TokenKind::KeywordDate},
+        {.text = "Timestamp", .kind = TokenKind::KeywordTimestamp},
+        {.text = "Series", .kind = TokenKind::KeywordSeries},
+        {.text = "DataFrame", .kind = TokenKind::KeywordDataFrame},
+        {.text = "TimeFrame", .kind = TokenKind::KeywordTimeFrame},
+        {.text = "Stream", .kind = TokenKind::KeywordStream},
     };
     for (const auto& kw : keywords) {
         auto tokens = tokenize(kw.text);

@@ -2,12 +2,16 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/join_order.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ibex;
@@ -19,10 +23,12 @@ namespace {
 // would give (dense PKs exact; a foreign key's distinct == the parent's PK).
 auto q3_stats() -> ir::SourceStats {
     ir::SourceStats stats;
-    stats.schemas = {{"customer", ir::SchemaInfo::known({{"c_custkey", ir::ColumnType::Int64}})},
-                     {"orders", ir::SchemaInfo::known({{"c_custkey", ir::ColumnType::Int64},
-                                                       {"o_orderkey", ir::ColumnType::Int64}})},
-                     {"lineitem", ir::SchemaInfo::known({{"o_orderkey", ir::ColumnType::Int64}})}};
+    stats.schemas = {
+        {"customer", ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64}})},
+        {"orders", ir::SchemaInfo::known({{.name = "c_custkey", .type = ir::ColumnType::Int64},
+                                          {.name = "o_orderkey", .type = ir::ColumnType::Int64}})},
+        {"lineitem",
+         ir::SchemaInfo::known({{.name = "o_orderkey", .type = ir::ColumnType::Int64}})}};
     stats.rows = {{"customer", 150'000}, {"orders", 1'500'000}, {"lineitem", 6'000'000}};
     stats.distinct = {{"customer", {{"c_custkey", 150'000}}},
                       {"orders", {{"c_custkey", 150'000}, {"o_orderkey", 1'500'000}}},
@@ -61,10 +67,11 @@ TEST_CASE("join order ranks by the join it makes, not the table's own size", "[i
     // join big (1000 rows) before it can reach small -- building the 1000-row
     // intermediate the good order avoids.
     ir::SourceStats stats;
-    stats.schemas = {{"tiny", ir::SchemaInfo::known({{"k", ir::ColumnType::Int64}})},
-                     {"big", ir::SchemaInfo::known(
-                                 {{"k", ir::ColumnType::Int64}, {"j", ir::ColumnType::Int64}})},
-                     {"small", ir::SchemaInfo::known({{"j", ir::ColumnType::Int64}})}};
+    stats.schemas = {
+        {"tiny", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64}})},
+        {"big", ir::SchemaInfo::known({{.name = "k", .type = ir::ColumnType::Int64},
+                                       {.name = "j", .type = ir::ColumnType::Int64}})},
+        {"small", ir::SchemaInfo::known({{.name = "j", .type = ir::ColumnType::Int64}})}};
     stats.rows = {{"tiny", 2}, {"big", 1'000}, {"small", 10}};
     stats.distinct = {{"tiny", {{"k", 2}}}, {"big", {{"k", 2}, {"j", 10}}}, {"small", {{"j", 10}}}};
 
@@ -111,9 +118,11 @@ TEST_CASE("join order rejects an uncosted source", "[ir][join_order]") {
 
 TEST_CASE("join order costs folded mapped keys under each leaf's native name", "[ir][join_order]") {
     ir::SourceStats stats = q3_stats();
-    stats.schemas["orders"] = ir::SchemaInfo::known(
-        {{"o_custkey", ir::ColumnType::Int64}, {"o_orderkey", ir::ColumnType::Int64}});
-    stats.schemas["lineitem"] = ir::SchemaInfo::known({{"l_orderkey", ir::ColumnType::Int64}});
+    stats.schemas["orders"] =
+        ir::SchemaInfo::known({{.name = "o_custkey", .type = ir::ColumnType::Int64},
+                               {.name = "o_orderkey", .type = ir::ColumnType::Int64}});
+    stats.schemas["lineitem"] =
+        ir::SchemaInfo::known({{.name = "l_orderkey", .type = ir::ColumnType::Int64}});
     stats.distinct["orders"] = {{"o_custkey", 150'000}, {"o_orderkey", 1'500'000}};
     stats.distinct["lineitem"] = {{"l_orderkey", 1'500'000}};
 

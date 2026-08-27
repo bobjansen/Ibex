@@ -14,17 +14,21 @@
 // group-by, distinct, order, the preserving joins, dcast and asof. This file
 // covers the operators that sweep did not reach.
 
+#include <ibex/core/column.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <variant>
 #include <vector>
 
 using namespace ibex;

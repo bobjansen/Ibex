@@ -2,18 +2,22 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <arpa/inet.h>
+#include <cstddef>
 #include <cstdint>
 #include <netinet/in.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 #include "udp.hpp"

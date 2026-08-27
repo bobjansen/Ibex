@@ -2,8 +2,14 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace ibex;
 

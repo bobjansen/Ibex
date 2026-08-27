@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <schema_registry.hpp>
+#include <string>
 
 TEST_CASE("Schema registry entry parser handles Avro response") {
     auto parsed = ibex_kafka::parse_schema_registry_entry(

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <csv.hpp>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <json.hpp>
 #include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace {
 

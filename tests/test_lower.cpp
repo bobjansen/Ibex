@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <optional>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "physical_plan.hpp"

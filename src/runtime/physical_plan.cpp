@@ -47,14 +47,17 @@ constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
 /// A hash aggregate's two fan-out floors, matching the private constants in
-/// `chunked.cpp`. `kAggPartitionRowFloor` is `try_owned`'s `kPairOwnedMinRows`
-/// (65536) — the lowest row count at which any partitioned path is attempted;
-/// `try_discover_partitioned`'s stricter `kDefaultPartitionMinRows` (1U << 18U)
-/// is a per-strategy detail the authority slice unifies. `kAggFinalizeRowFloor`
-/// matches the `1U << 17U` group-count gate on `finalize_owned`'s parallel
-/// co-ranking merge. Both phases share the `min(budget, pool, 64)` worker cap
-/// that is open-coded at ~7 sites in `ChunkedAggregateOperator` today.
-constexpr std::size_t kAggPartitionRowFloor = 1U << 16U;
+/// `chunked.cpp`. `kAggPartitionRowFloor` is the general radix path's
+/// `kDefaultPartitionMinRows` -- the row count below which `try_discover_
+/// partitioned` stays serial. `try_owned`'s lower `kPairOwnedMinRows` (65536)
+/// is not the phase floor: it is the operator-resolved "is the owned
+/// specialization worth it" gate, the same kind of runtime strategy choice the
+/// join operator makes for its build orientation, and it stays in the operator.
+/// `kAggFinalizeRowFloor` matches the `1U << 17U` group-count gate on
+/// `finalize_owned`'s parallel co-ranking merge. Both phases share the
+/// `min(budget, pool, 64)` worker cap that is open-coded at ~7 sites in
+/// `ChunkedAggregateOperator` today.
+constexpr std::size_t kAggPartitionRowFloor = 1U << 18U;
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
 

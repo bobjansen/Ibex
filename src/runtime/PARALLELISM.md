@@ -513,5 +513,12 @@ Every slice:
    `plan_physical` fills the phases, `explain physical` prints them,
    `ChunkedAggregateOperator::check_agg_plan` aborts on planner/operator
    disagreement — byte-identical, full suite + q01/q10/q13/q18/q20/q21 at 1c/8c.
-   Slices 2–3 (authority) delete the operator's open-coded floors and
-   `min(budget, pool, 64)` caps.
+   Slice 2 (partition authority) LANDED: `try_owned` and `try_discover_
+   partitioned` read `par_.partition.{decline,worker_cap}` for fan-out
+   permission and the worker cap; the open-coded `!can_fan_out()` +
+   `min(budget, pool, 64)` are gone from both. The floors stay in the operator
+   — the radix `kDefaultPartitionMinRows` beside its constant, `try_owned`'s
+   lower `kPairOwnedMinRows` as the operator-resolved "owned specialization
+   worth it" gate (like the join's build orientation). Byte-identical vs base
+   on q01/q10/q13/q18/q20/q21, full suite. Slice 3 does the same for the
+   `finalize` phase.

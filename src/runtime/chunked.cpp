@@ -7244,6 +7244,37 @@ class ChunkedAggregateOperator final : public Operator {
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
+        // A non-null First value is fixed at the same row that creates its
+        // group. Record it during discovery and omit the later all-row scan.
+        // Group-key reduction turns q10's six descriptive keys into exactly
+        // this shape; scanning 229k rows once per carried field was redundant.
+        if (discovery_first_eligible_.empty()) {
+            discovery_first_eligible_.resize(n_aggs_, 0U);
+            for (std::size_t a = 0; a < n_aggs_; ++a) {
+                discovery_first_eligible_[a] = plan_[a].func == ir::AggFunc::First ? 1U : 0U;
+            }
+        }
+        std::vector<std::uint8_t> discovery_first(n_aggs_, 0U);
+        bool has_discovery_first = false;
+        if (std::getenv("IBEX_DISABLE_DISCOVERY_FIRST") == nullptr) {
+            for (std::size_t a = 0; a < n_aggs_; ++a) {
+                if (discovery_first_eligible_[a] == 0U) {
+                    continue;
+                }
+                if (agg_entries[a]->validity.has_value()) {
+                    // A group may still be waiting for its first non-null
+                    // value. Keep this field on the ordinary scan for every
+                    // later chunk too, even if that later chunk has no nulls.
+                    discovery_first_eligible_[a] = 0U;
+                    continue;
+                }
+                discovery_first[a] = 1U;
+                has_discovery_first = true;
+            }
+        }
+        const std::size_t groups_before = n_groups_;
+        std::vector<std::size_t> first_rows;
+
         // Partition-owned accumulation, the same shape the PairIntKey path
         // above takes. It fuses discovery and the sum/count into one pass over
         // partition-local state, so the global first-occurrence numbering --
@@ -7259,10 +7290,25 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         if (try_discover_partitioned<std::int64_t, robin_hood::hash<std::int64_t>>(
-                key_at, rows, gids, int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
-                [&](std::int64_t key, std::uint32_t gid, std::size_t) { int_order_[gid] = key; },
+                key_at, rows, gids, int_partitions_,
+                [&](std::size_t n) {
+                    int_order_.resize(n);
+                    if (has_discovery_first) {
+                        first_rows.resize(n - groups_before);
+                    }
+                },
+                [&](std::int64_t key, std::uint32_t gid, std::size_t row) {
+                    int_order_[gid] = key;
+                    if (has_discovery_first) {
+                        first_rows[gid - groups_before] = row;
+                    }
+                },
                 kDefaultPartitionMinRows, [&](std::uint32_t gid) { return int_order_[gid]; })) {
-            accumulate_gids(gids, agg_entries, rows);
+            if (has_discovery_first) {
+                seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+            }
+            accumulate_gids(gids, agg_entries, rows,
+                            has_discovery_first ? &discovery_first : nullptr);
             return std::nullopt;
         }
 
@@ -7284,6 +7330,9 @@ class ChunkedAggregateOperator final : public Operator {
                     int_order_.push_back(key);
                     ++n_groups_;
                     size_group_arrays();
+                    if (has_discovery_first) {
+                        first_rows.push_back(row);
+                    }
                 } else {
                     gid = it->second;
                 }
@@ -7294,7 +7343,10 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        if (has_discovery_first) {
+            seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
+        }
+        accumulate_gids(gids, agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
         return std::nullopt;
     }
 
@@ -9364,6 +9416,76 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
+    /// Store non-null First aggregates at the row that creates each new group.
+    /// `seeded[a]` is set only when the input column has no validity bitmap,
+    /// so the discovery row is necessarily the first value under First's
+    /// null-skipping semantics. The later accumulation pass may skip exactly
+    /// these fields; nullable First and every Last still scan normally.
+    void seed_discovery_first(std::size_t first_gid, const std::vector<std::size_t>& first_rows,
+                              const std::vector<const ColumnEntry*>& agg_entries,
+                              const std::vector<std::uint8_t>& seeded) {
+        bool has_text = false;
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            has_text = has_text || (seeded[a] != 0U && plan_[a].kind == ExprType::String);
+        }
+        if (has_text && text_store_.size() < flat_slots_.size()) {
+            text_store_.resize(flat_slots_.size());
+        }
+        const auto seed_one = [&](std::size_t gid, std::size_t row, std::size_t a) {
+            const auto& entry = *agg_entries[a];
+            auto& slot = flat_slots_[(gid * n_aggs_) + a];
+            if (plan_[a].kind == ExprType::Double) {
+                slot.double_value = std::get<Column<double>>(*entry.column)[row];
+            } else if (plan_[a].kind == ExprType::Int) {
+                slot.int_value = std::get<Column<std::int64_t>>(*entry.column)[row];
+            } else {
+                std::string value;
+                if (plan_[a].categorical) {
+                    value = std::string(std::get<Column<Categorical>>(*entry.column)[row]);
+                } else {
+                    value = std::string(std::get<Column<std::string>>(*entry.column)[row]);
+                }
+                text_store_[(gid * n_aggs_) + a] = std::move(value);
+            }
+            slot.mark_present();
+        };
+
+        std::size_t threads = 1;
+        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
+            first_rows.size() >= exec_->parallel_min_rows) {
+            threads = std::min(exec_->compute_budget(), process_worker_pool().size());
+        }
+        if (threads >= 2) {
+            const std::size_t grain = (first_rows.size() + threads - 1) / threads;
+            auto batch = process_worker_pool().submit(threads, [&](std::size_t worker) {
+                const std::size_t begin = worker * grain;
+                const std::size_t end = std::min(first_rows.size(), begin + grain);
+                for (std::size_t local = begin; local < end; ++local) {
+                    for (std::size_t a = 0; a < n_aggs_; ++a) {
+                        if (seeded[a] != 0U) {
+                            seed_one(first_gid + local, first_rows[local], a);
+                        }
+                    }
+                }
+            });
+            batch.wait();
+            if (exec_->parallel_stats != nullptr) {
+                exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+
+        // Field-major serial order keeps each source column's reads together.
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (seeded[a] == 0U) {
+                continue;
+            }
+            for (std::size_t local = 0; local < first_rows.size(); ++local) {
+                seed_one(first_gid + local, first_rows[local], a);
+            }
+        }
+    }
+
     /// Parallel scatter-accumulate of an already-assigned gid array — the
     /// shared back half of every hash group-by fast path (string, int,
     /// int-pair, generic). Returns false when the shape is not worth it and
@@ -9394,7 +9516,8 @@ class ChunkedAggregateOperator final : public Operator {
     /// pass entirely because a Categorical code is already a dense index.
     auto try_accumulate_parallel(const std::uint32_t* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
-                                 std::size_t rows) -> bool {
+                                 std::size_t rows, const std::vector<std::uint8_t>* skip = nullptr)
+        -> bool {
         // Partition on the data alone -- not `exec_->can_fan_out()`, the thread
         // budget, or whether this runs on a pool thread. Those choose who
         // executes the morsels; the cut decides the arithmetic, and a cut that
@@ -9405,6 +9528,9 @@ class ChunkedAggregateOperator final : public Operator {
             return false;
         }
         for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (skip != nullptr && (*skip)[a] != 0U) {
+                continue;
+            }
             if (!agg_is_combinable(plan_[a].func)) {
                 return false;
             }
@@ -9447,7 +9573,7 @@ class ChunkedAggregateOperator final : public Operator {
             const std::size_t end = std::min(rows, begin + grain);
             if (begin < end) {
                 accumulate_columns_into(gids, agg_entries, begin, end, &partials[m * stride],
-                                        partial_scratch.data() + (m * scratch_span));
+                                        partial_scratch.data() + (m * scratch_span), skip);
             }
         };
         const std::size_t threads =
@@ -9478,6 +9604,9 @@ class ChunkedAggregateOperator final : public Operator {
             for (std::size_t g = 0; g < n_groups_; ++g) {
                 AggSlotCore* dst = &flat_slots_[g * n_aggs_];
                 for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    if (skip != nullptr && (*skip)[a] != 0U) {
+                        continue;
+                    }
                     const std::size_t off = (g * scratch_stride_) + scratch_offset_[a];
                     agg_combine(dst[a], src[(g * n_aggs_) + a], plan_[a].func, plan_[a].kind,
                                 scratch_stride_ == 0 ? nullptr : scratch_.data() + off,
@@ -9497,10 +9626,11 @@ class ChunkedAggregateOperator final : public Operator {
     /// Accumulate `gids` either across workers or, when that is not worth it,
     /// serially — the one call every gid-assigning fast path ends with.
     void accumulate_gids(const std::uint32_t* gids,
-                         const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) {
-        if (!try_accumulate_parallel(gids, agg_entries, rows)) {
-            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(),
-                                    scratch_.data());
+                         const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
+                         const std::vector<std::uint8_t>* skip = nullptr) {
+        if (!try_accumulate_parallel(gids, agg_entries, rows, skip)) {
+            accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(), scratch_.data(),
+                                    skip);
         }
     }
 
@@ -9517,10 +9647,14 @@ class ChunkedAggregateOperator final : public Operator {
     void accumulate_columns_into(const GidT* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
                                  std::size_t begin, std::size_t end, AggSlotCore* base,
-                                 double* scratch_base) {
+                                 double* scratch_base,
+                                 const std::vector<std::uint8_t>* skip = nullptr) {
         AggSlotCore* fs = base;
         const std::size_t rows = end;
         for (std::size_t agg_i = 0; agg_i < n_aggs_; ++agg_i) {
+            if (skip != nullptr && (*skip)[agg_i] != 0U) {
+                continue;
+            }
             // Takes GidT so a signed Categorical code indexes without an
             // implicit narrowing conversion at each of the ~19 call sites.
             const auto slot_for = [&](GidT g) -> AggSlotCore& {
@@ -10554,6 +10688,7 @@ class ChunkedAggregateOperator final : public Operator {
     std::size_t n_groups_ = 0;
     std::vector<SlotPlan> plan_;
     std::vector<ColumnValue> group_templates_;
+    std::vector<std::uint8_t> discovery_first_eligible_;
 
     /// Per-group scratch for aggregates that declared `scratch_doubles`,
     /// laid out group-major: `scratch_[gid * scratch_stride_ + offset[agg]]`.

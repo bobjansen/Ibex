@@ -13,6 +13,13 @@ July-2026 fast-path work (single fixed-width-int key, packed multi-key distinct,
 in-place multi-key hashing). Those removed the *allocation* cost (a boxed `Key`
 per group). What is left is **memory-bandwidth** cost, which they cannot touch.
 
+2026-08-27 correction: q10 is no longer an example of the generic mixed-key
+ceiling. Functional-dependency reduction turns its seven logical keys into one
+Int64 key plus six carried `First` fields, and those fields are now gathered at
+group discovery rather than rescanning every input row (about -10.5% to -10.9%
+on q10). Radix partitioning remains relevant to genuinely high-cardinality
+group discovery such as q18, but is not the next q10 mechanism.
+
 ## The evidence
 
 Instrumenting PDS-H q18: the dominant stage is `sum(l_quantity) by l_orderkey`
@@ -31,7 +38,7 @@ remaining time is the map and slot access pattern, not the key representation.
 
 This is not a defect like the boxed-`Key` anti-patterns were — it is the
 intrinsic cost of touching 78 MB of hash-table + accumulator state in random
-order. q10 has the same shape at lower scale (114k rows → 38k groups).
+order.
 
 ## The fix: radix partitioning
 
@@ -67,9 +74,6 @@ Sketch:
 
 - **q18**: after semi-join pushdown (done, 668 → 246 ms) the big-orders group-by
   is the remaining wall.
-- **q10**: the 7-key customer group-by (26 ms) is smaller but the same class;
-  q10's larger cost is Parquet decode (see
-  [[project_filtered_scan_groupby_gap]]).
 - Any `sum/count by <high-cardinality id>` — a very common shape.
 
 Related: [[project_multikey_groupby_no_boxed_key]] (the allocation fixes this

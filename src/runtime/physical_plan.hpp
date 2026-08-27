@@ -249,6 +249,10 @@ enum class PartitionStrategy : std::uint8_t {
     Owned,      ///< partition-owned key maps + slots (`try_owned` / async hot table)
     RowRange,   ///< contiguous row ranges — the radix sort and `(column × range)` gather in
                 ///< `sort.cpp` that `order_table` runs
+    HeadTable,  ///< the join hash index's head map split into partitions by key hash
+                ///< (`PartitionedHeads`), one worker filling each — no merge afterwards
+    Range,      ///< a worker per contiguous slice of probe rows, output concatenated in
+                ///< range order (`ChunkedInnerJoinOperator::probe_ranges_parallel`)
 };
 
 /// A row-count estimate available at plan time, and where it came from. The
@@ -308,6 +312,16 @@ struct BreakerPhase {
 /// is descriptive: `ChunkedOrderOperator` buffers and calls `order_table`,
 /// which reads the knobs itself.
 [[nodiscard]] auto order_sort_parallelism() -> BreakerParallelism;
+
+/// A streaming join's two fan-out phases. Both already exist in `chunked.cpp` on
+/// private constants: the hash build's `1U << 17U` floor and the open-coded
+/// `min(budget, pool, 64)` cap in `ChunkedInnerJoinOperator::build_partitions`,
+/// and the probe's `1U << 14U` floor and matching cap in
+/// `probe_parallel_workers`. Slice 3 is descriptive only — the plan carries the
+/// two phases so `explain physical` is not silent about the 40 ms serial hash
+/// build on q21; a follow-up slice moves the authority the way distinct's did.
+[[nodiscard]] auto join_hash_build_parallelism() -> BreakerParallelism;
+[[nodiscard]] auto join_probe_parallelism() -> BreakerParallelism;
 
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one

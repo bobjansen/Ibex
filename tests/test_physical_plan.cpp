@@ -1064,4 +1064,48 @@ TEST_CASE("resolve_breaker_parallelism is the one place the worker cap is comput
         REQUIRE(bp.decline == FanOutDecline::None);
         REQUIRE(bp.worker_cap == 4);  // min(6, 8, 4)
     }
+
+    SECTION("a phase with no floor of its own inherits the shared parallel_min_rows") {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 65536;
+        BreakerParallelism bp{};  // row_floor 0
+        resolve_breaker_parallelism(bp, exec, 8);
+        REQUIRE(bp.row_floor == 65536);
+    }
+}
+
+TEST_CASE("The plan describes order's sort fan-out and explain physical is not silent",
+          "[physical][breaker]") {
+    SECTION("one 'sort' phase, row-range, no floor of its own") {
+        const auto [tree, plan] = serial_plan("trades[order { price }];");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.breaker_phases.size() == 1);
+        const auto& phase = plan.breaker_phases.front();
+        REQUIRE(phase.name == "sort");
+        REQUIRE(phase.parallelism.strategy == runtime::physical::PartitionStrategy::RowRange);
+        REQUIRE(phase.parallelism.row_floor == 0);  // inherits parallel_min_rows at resolve
+        REQUIRE(phase.parallelism.breaker_max_workers == 0);  // no per-breaker ceiling
+        REQUIRE(phase.parallelism.estimate.source == runtime::physical::RowEstimate::Source::None);
+    }
+
+    SECTION("explain physical renders Breaker(Order), not MapPipeline") {
+        const auto [tree, plan] = serial_plan("trades[order { price }];");
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("Breaker(Order)") != std::string::npos);
+        REQUIRE(text.find("sort:") != std::string::npos);
+        REQUIRE(text.find("row-range") != std::string::npos);
+        REQUIRE(text.find("MapPipeline") == std::string::npos);
+        REQUIRE(text.find("TableScan()") == std::string::npos);  // the old mislabel
+    }
+
+    SECTION("a migrated head is a serial single-operator breaker, not a MapPipeline") {
+        const auto [tree, plan] = serial_plan("trades[head 2];");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.breaker_phases.empty());
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("Breaker(Head)") != std::string::npos);
+        REQUIRE(text.find("serial (single-operator breaker") != std::string::npos);
+        REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
 }

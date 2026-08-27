@@ -401,9 +401,17 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     // stay silent about 51% of the backlog until the day execution moves would
     // mean the description and the executor land together, untested against
     // each other.
-    if (root.kind() == ir::NodeKind::Head) {
-        // Single-implementation breaker: nothing to classify, the plan owns
-        // construction. Head is `OrderedStream`, not a fan-out point.
+    // Single-implementation breakers: one operator runs each, nothing to
+    // classify, no fan-out point. The plan owns construction and `explain
+    // physical` names them; the per-kind switch's branch for each is deleted.
+    // `Head` is `ChunkedHeadOperator`; `Tail` materializes and calls
+    // `tail_table`; `TopK` is `ChunkedOrderedLimitOperator` (a serial
+    // bounded-heap select, O(n log k) -- deliberately not parallel, see
+    // src/runtime/PARALLELISM.md); `FilterHead` / `FilterTail` are the fused
+    // `ChunkedFilter{Head,Tail}Operator`.
+    if (root.kind() == ir::NodeKind::Head || root.kind() == ir::NodeKind::Tail ||
+        root.kind() == ir::NodeKind::TopK || root.kind() == ir::NodeKind::FilterHead ||
+        root.kind() == ir::NodeKind::FilterTail) {
         plan.migrated = true;
         plan.source_node = &root;
         return plan;

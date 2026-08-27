@@ -26,19 +26,25 @@
 // Requires nlohmann/json — link nlohmann_json::nlohmann_json in the plugin.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::plugin {
@@ -111,8 +117,8 @@ inline auto parse_schema(std::string_view spec)
             return std::unexpected(
                 "schema entries must use the form name:type with explicit field names");
         }
-        std::string_view name = trim(item.substr(0, colon));
-        std::string_view kind_text = trim(item.substr(colon + 1));
+        const std::string_view name = trim(item.substr(0, colon));
+        const std::string_view kind_text = trim(item.substr(colon + 1));
         if (name.empty()) {
             return std::unexpected("schema field names must not be empty");
         }

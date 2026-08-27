@@ -9,6 +9,8 @@
 // exported at all unless explicitly marked dllexport (unlike GCC/Clang, which
 // export by default), so without this a plugin DLL builds fine but the
 // loader reports "has no ibex_register symbol".
+#include <cstddef>
+#include <variant>
 #if defined(_WIN32)
 #define IBEX_PLUGIN_EXPORT __declspec(dllexport)
 #else

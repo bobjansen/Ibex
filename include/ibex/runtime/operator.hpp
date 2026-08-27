@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/interrupt.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -13,7 +16,9 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::runtime {

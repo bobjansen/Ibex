@@ -6,6 +6,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/compiler.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/core/time_zone.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
@@ -20,6 +21,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>

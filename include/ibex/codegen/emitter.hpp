@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 
 #include <cstddef>

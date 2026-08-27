@@ -12,6 +12,7 @@
 // are interchangeable with both without conversion).
 
 #include <ibex/core/time.hpp>
+#include <ibex/parser/ast.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 
@@ -84,10 +85,10 @@ using ScalarValue =
         const bool left_double = std::holds_alternative<double>(*left);
         const bool right_double = std::holds_alternative<double>(*right);
         if (left_double || right_double) {
-            double lhs = left_double ? std::get<double>(*left)
-                                     : static_cast<double>(std::get<std::int64_t>(*left));
-            double rhs = right_double ? std::get<double>(*right)
-                                      : static_cast<double>(std::get<std::int64_t>(*right));
+            const double lhs = left_double ? std::get<double>(*left)
+                                           : static_cast<double>(std::get<std::int64_t>(*left));
+            const double rhs = right_double ? std::get<double>(*right)
+                                            : static_cast<double>(std::get<std::int64_t>(*right));
             switch (binary->op) {
                 case BinaryOp::Add:
                     return ScalarValue{lhs + rhs};

@@ -730,7 +730,11 @@ auto utf8_substring(const std::string& s, std::int64_t start, std::optional<std:
 
     std::int64_t end = count;
     if (length.has_value()) {
-        end = *length <= 0 ? begin : std::min(begin + *length, count);
+        if (*length <= 0) {
+            end = begin;
+        } else if (*length < count - begin) {
+            end = begin + *length;
+        }
     }
     return s.substr(
         offsets[static_cast<std::size_t>(begin)],

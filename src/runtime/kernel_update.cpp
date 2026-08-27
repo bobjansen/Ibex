@@ -976,10 +976,10 @@ auto try_native_bool_update(const Chunk& input, const std::vector<ir::FieldSpec>
 /// formatters in both passes.
 auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateInput& input,
                                           const ScalarRegistry* scalars)
-    -> std::optional<StringInterpolationOperand> {
+    -> std::optional<DirectStringOperand> {
     if (const auto* literal = std::get_if<ir::Literal>(&expr.node)) {
         if (const auto* value = std::get_if<std::string>(&literal->value)) {
-            return StringInterpolationOperand{
+            return DirectStringOperand{
                 .column = std::nullopt, .categorical = {}, .literal = *value};
         }
         return std::nullopt;
@@ -991,38 +991,36 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     if (!ref->lexical) {
         if (const auto* entry = input.find(ref->name); entry != nullptr) {
             if (const auto* values = std::get_if<Column<std::string>>(entry->column.get())) {
-                return StringInterpolationOperand{
-                    .column = StringView{.offsets = values->offsets_data(),
-                                         .chars = values->chars_data(),
-                                         .rows = values->size()},
-                    .categorical = {},
-                    .dates = nullptr,
-                    .timestamps = nullptr,
-                    .literal = {}};
+                return DirectStringOperand{.column = StringView{.offsets = values->offsets_data(),
+                                                                .chars = values->chars_data(),
+                                                                .rows = values->size()},
+                                           .categorical = {},
+                                           .dates = nullptr,
+                                           .timestamps = nullptr,
+                                           .literal = {}};
             }
             if (const auto* values = std::get_if<Column<Categorical>>(entry->column.get())) {
-                return StringInterpolationOperand{
-                    .column = std::nullopt,
-                    .categorical = {.codes = values->codes_data(),
-                                    .dictionary = &values->dictionary(),
-                                    .rows = values->size()},
-                    .dates = nullptr,
-                    .timestamps = nullptr,
-                    .literal = {}};
+                return DirectStringOperand{.column = std::nullopt,
+                                           .categorical = {.codes = values->codes_data(),
+                                                           .dictionary = &values->dictionary(),
+                                                           .rows = values->size()},
+                                           .dates = nullptr,
+                                           .timestamps = nullptr,
+                                           .literal = {}};
             }
             if (const auto* values = std::get_if<Column<Date>>(entry->column.get())) {
-                return StringInterpolationOperand{.column = std::nullopt,
-                                                  .categorical = {},
-                                                  .dates = values->data(),
-                                                  .timestamps = nullptr,
-                                                  .literal = {}};
+                return DirectStringOperand{.column = std::nullopt,
+                                           .categorical = {},
+                                           .dates = values->data(),
+                                           .timestamps = nullptr,
+                                           .literal = {}};
             }
             if (const auto* values = std::get_if<Column<Timestamp>>(entry->column.get())) {
-                return StringInterpolationOperand{.column = std::nullopt,
-                                                  .categorical = {},
-                                                  .dates = nullptr,
-                                                  .timestamps = values->data(),
-                                                  .literal = {}};
+                return DirectStringOperand{.column = std::nullopt,
+                                           .categorical = {},
+                                           .dates = nullptr,
+                                           .timestamps = values->data(),
+                                           .literal = {}};
             }
             return std::nullopt;
         }
@@ -1030,7 +1028,7 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     if (scalars != nullptr) {
         if (const auto it = scalars->find(ref->name); it != scalars->end()) {
             if (const auto* value = std::get_if<std::string>(&it->second)) {
-                return StringInterpolationOperand{
+                return DirectStringOperand{
                     .column = std::nullopt, .categorical = {}, .literal = *value};
             }
         }
@@ -1038,15 +1036,14 @@ auto resolve_string_interpolation_operand(const ir::Expr& expr, const PredicateI
     return std::nullopt;
 }
 
-auto try_shared_string_interpolation_update(const Chunk& input,
-                                            const std::vector<ir::FieldSpec>& fields,
-                                            const ScalarRegistry* scalars) -> std::optional<Chunk> {
+auto try_shared_string_update(const Chunk& input, const std::vector<ir::FieldSpec>& fields,
+                              const ScalarRegistry* scalars) -> std::optional<Chunk> {
     if (fields.size() != 1) {
         return std::nullopt;
     }
     const ChunkView view(input);
     const auto source = predicate_input(view);
-    auto plan = make_string_interpolation_plan(fields.front().expr, source, scalars);
+    auto plan = make_direct_string_plan(fields.front().expr, source, scalars);
     if (!plan.has_value()) {
         return std::nullopt;
     }
@@ -1056,8 +1053,8 @@ auto try_shared_string_interpolation_update(const Chunk& input,
     // Pass one is precisely the string gather presize contract: establish the
     // single character slab before handing its raw window to the writer.
     const auto total_chars =
-        string_interpolation_bytes(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
-                                   validity.has_value() ? &*validity : nullptr);
+        direct_string_bytes(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
+                            validity.has_value() ? &*validity : nullptr);
     if (!total_chars.has_value()) {
         return std::nullopt;
     }
@@ -1070,8 +1067,8 @@ auto try_shared_string_interpolation_update(const Chunk& input,
                             .count = view.rows(),
                             .char_base = 0};
     output.offsets[0] = 0;
-    if (!write_string_interpolation(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
-                                    validity.has_value() ? &*validity : nullptr, output)) {
+    if (!write_direct_string(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
+                             validity.has_value() ? &*validity : nullptr, output)) {
         return std::nullopt;
     }
 
@@ -1218,19 +1215,50 @@ auto try_direct_update_field(const Chunk& input, const std::vector<ir::FieldSpec
     if (auto output = try_native_bool_update(input, fields, scalars); output.has_value()) {
         return output;
     }
-    return try_shared_string_interpolation_update(input, fields, scalars);
+    return try_shared_string_update(input, fields, scalars);
 }
 
 }  // namespace
 
-auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
-                                    const ScalarRegistry* scalars)
-    -> std::optional<StringInterpolationPlan> {
+auto make_direct_string_plan(const ir::Expr& expr, const PredicateInput& input,
+                             const ScalarRegistry* scalars) -> std::optional<DirectStringPlan> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
-    if (call == nullptr || call->callee != "__interp" || !call->named_args.empty()) {
+    if (call == nullptr || !call->named_args.empty()) {
         return std::nullopt;
     }
-    StringInterpolationPlan plan;
+    DirectStringPlan plan;
+    if (call->callee == "substring") {
+        if (call->args.size() < 2 || call->args.size() > 3) {
+            return std::nullopt;
+        }
+        auto source = resolve_string_interpolation_operand(*call->args[0], input, scalars);
+        const auto* start_literal = std::get_if<ir::Literal>(&call->args[1]->node);
+        const auto* start =
+            start_literal == nullptr ? nullptr : std::get_if<std::int64_t>(&start_literal->value);
+        if (!source.has_value() || start == nullptr || source->dates != nullptr ||
+            source->timestamps != nullptr) {
+            return std::nullopt;
+        }
+        std::optional<std::int64_t> length;
+        if (call->args.size() == 3) {
+            const auto* length_literal = std::get_if<ir::Literal>(&call->args[2]->node);
+            const auto* value = length_literal == nullptr
+                                    ? nullptr
+                                    : std::get_if<std::int64_t>(&length_literal->value);
+            if (value == nullptr) {
+                return std::nullopt;
+            }
+            length = *value;
+        }
+        plan.kind = DirectStringPlan::Kind::Substring;
+        plan.substring_source = std::move(*source);
+        plan.substring_start = *start;
+        plan.substring_length = length;
+        return plan;
+    }
+    if (call->callee != "__interp") {
+        return std::nullopt;
+    }
     plan.operands.reserve(call->args.size());
     for (const auto& arg : call->args) {
         auto operand = resolve_string_interpolation_operand(*arg, input, scalars);
@@ -1242,9 +1270,78 @@ auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& 
     return plan;
 }
 
-auto string_interpolation_bytes(const StringInterpolationPlan& plan,
-                                ::ibex::runtime::RowRange range, const ValidityBitmap* validity)
-    -> std::optional<std::uint32_t> {
+namespace {
+
+auto direct_string_value(const DirectStringOperand& operand, std::size_t row) -> std::string_view {
+    if (operand.column.has_value()) {
+        const auto begin = operand.column->offsets[row];
+        return {operand.column->chars + begin, operand.column->row_len(row)};
+    }
+    if (operand.categorical.dictionary != nullptr) {
+        return operand.categorical.value(row);
+    }
+    return operand.literal;
+}
+
+auto utf8_advance(std::string_view text, std::size_t offset) noexcept -> std::size_t {
+    const auto lead = static_cast<unsigned char>(text[offset]);
+    std::size_t advance = 1;
+    if (lead >= 0xF0U) {
+        advance = 4;
+    } else if (lead >= 0xE0U) {
+        advance = 3;
+    } else if (lead >= 0xC0U) {
+        advance = 2;
+    }
+    return std::min(advance, text.size() - offset);
+}
+
+/// Byte bounds for the scalar evaluator's codepoint-indexed substring rules,
+/// without allocating its temporary offset vector for every row.
+auto substring_byte_bounds(std::string_view text, std::int64_t start,
+                           std::optional<std::int64_t> length)
+    -> std::pair<std::size_t, std::size_t> {
+    std::int64_t count = 0;
+    for (std::size_t offset = 0; offset < text.size(); offset += utf8_advance(text, offset)) {
+        ++count;
+    }
+    std::int64_t begin_index = start < 0 ? start + count : start;
+    begin_index = std::clamp<std::int64_t>(begin_index, 0, count);
+    std::int64_t end_index = count;
+    if (length.has_value()) {
+        if (*length <= 0) {
+            end_index = begin_index;
+        } else if (*length < count - begin_index) {
+            end_index = begin_index + *length;
+        }
+    }
+
+    std::size_t begin = text.size();
+    std::size_t end = text.size();
+    std::int64_t index = 0;
+    for (std::size_t offset = 0; offset < text.size(); offset += utf8_advance(text, offset)) {
+        if (index == begin_index) {
+            begin = offset;
+        }
+        if (index == end_index) {
+            end = offset;
+            break;
+        }
+        ++index;
+    }
+    if (begin_index == count) {
+        begin = text.size();
+    }
+    if (end_index == count) {
+        end = text.size();
+    }
+    return {begin, end};
+}
+
+}  // namespace
+
+auto direct_string_bytes(const DirectStringPlan& plan, ::ibex::runtime::RowRange range,
+                         const ValidityBitmap* validity) -> std::optional<std::uint32_t> {
     std::size_t total = 0;
     for (std::size_t offset = 0; offset < range.count; ++offset) {
         if (validity != nullptr && !(*validity)[offset]) {
@@ -1252,17 +1349,24 @@ auto string_interpolation_bytes(const StringInterpolationPlan& plan,
         }
         const std::size_t row = range.begin + offset;
         std::size_t row_bytes = 0;
-        for (const auto& operand : plan.operands) {
-            if (operand.column.has_value()) {
-                row_bytes += operand.column->row_len(row);
-            } else if (operand.categorical.dictionary != nullptr) {
-                row_bytes += operand.categorical.value(row).size();
-            } else if (operand.dates != nullptr) {
-                row_bytes += format_date(operand.dates[row]).size();
-            } else if (operand.timestamps != nullptr) {
-                row_bytes += format_timestamp(operand.timestamps[row]).size();
-            } else {
-                row_bytes += operand.literal.size();
+        if (plan.kind == DirectStringPlan::Kind::Substring) {
+            const auto value = direct_string_value(plan.substring_source, row);
+            const auto [begin, end] =
+                substring_byte_bounds(value, plan.substring_start, plan.substring_length);
+            row_bytes = end - begin;
+        } else {
+            for (const auto& operand : plan.operands) {
+                if (operand.column.has_value()) {
+                    row_bytes += operand.column->row_len(row);
+                } else if (operand.categorical.dictionary != nullptr) {
+                    row_bytes += operand.categorical.value(row).size();
+                } else if (operand.dates != nullptr) {
+                    row_bytes += format_date(operand.dates[row]).size();
+                } else if (operand.timestamps != nullptr) {
+                    row_bytes += format_timestamp(operand.timestamps[row]).size();
+                } else {
+                    row_bytes += operand.literal.size();
+                }
             }
         }
         if (row_bytes > std::numeric_limits<std::uint32_t>::max() - total) {
@@ -1273,9 +1377,8 @@ auto string_interpolation_bytes(const StringInterpolationPlan& plan,
     return static_cast<std::uint32_t>(total);
 }
 
-auto write_string_interpolation(const StringInterpolationPlan& plan,
-                                ::ibex::runtime::RowRange range, const ValidityBitmap* validity,
-                                StringOutputSpan output) -> bool {
+auto write_direct_string(const DirectStringPlan& plan, ::ibex::runtime::RowRange range,
+                         const ValidityBitmap* validity, StringOutputSpan output) -> bool {
     if (range.count != output.count) {
         return false;
     }
@@ -1286,6 +1389,18 @@ auto write_string_interpolation(const StringInterpolationPlan& plan,
             continue;
         }
         const std::size_t row = range.begin + offset;
+        if (plan.kind == DirectStringPlan::Kind::Substring) {
+            const auto value = direct_string_value(plan.substring_source, row);
+            const auto [begin, end] =
+                substring_byte_bounds(value, plan.substring_start, plan.substring_length);
+            const std::size_t length = end - begin;
+            if (length != 0) {
+                std::memcpy(output.chars + cursor, value.data() + begin, length);
+            }
+            cursor += static_cast<std::uint32_t>(length);
+            output.offsets[output.begin + offset + 1] = cursor;
+            continue;
+        }
         for (const auto& operand : plan.operands) {
             const char* source_chars = operand.literal.data();
             std::size_t length = operand.literal.size();
@@ -2073,7 +2188,7 @@ auto write_direct_numeric_tree_range(const DirectNumericTreePlan& plan,
 auto plan_direct_field(const ir::Expr& expr, const PredicateInput& input,
                        const ScalarRegistry* scalars) -> DirectFieldRoute {
     DirectFieldRoute route;
-    route.string = make_string_interpolation_plan(expr, input, scalars);
+    route.string = make_direct_string_plan(expr, input, scalars);
     if (route.string.has_value()) {
         return route;
     }
@@ -2197,8 +2312,8 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
                 }
                 const auto range = range_of(index);
                 auto validity = collect_expr_validity(expr, input, range);
-                const auto count = string_interpolation_bytes(
-                    *route.string, range, validity.has_value() ? &*validity : nullptr);
+                const auto count = direct_string_bytes(*route.string, range,
+                                                       validity.has_value() ? &*validity : nullptr);
                 if (!count.has_value()) {
                     pieces[index] = std::unexpected(
                         "evaluate_field_windows: string output exceeds uint32 offsets");
@@ -2245,14 +2360,13 @@ auto evaluate_field_windows(const ir::Expr& expr, const DirectFieldRoute& route,
                     return;
                 }
                 const auto range = range_of(index);
-                if (!write_string_interpolation(
-                        *route.string, range,
-                        pieces[index]->has_value() ? &**pieces[index] : nullptr,
-                        StringOutputSpan{.offsets = offsets,
-                                         .chars = strings.chars_data(),
-                                         .begin = range.begin,
-                                         .count = range.count,
-                                         .char_base = char_prefix[index]})) {
+                if (!write_direct_string(*route.string, range,
+                                         pieces[index]->has_value() ? &**pieces[index] : nullptr,
+                                         StringOutputSpan{.offsets = offsets,
+                                                          .chars = strings.chars_data(),
+                                                          .begin = range.begin,
+                                                          .count = range.count,
+                                                          .char_base = char_prefix[index]})) {
                     write_failed.store(true, std::memory_order_relaxed);
                 }
             }

@@ -62,6 +62,7 @@ auto resolve_value(const Node& node, std::string name) -> ValueId {
         switch (current->kind()) {
             case NodeKind::Project:
             case NodeKind::Filter:
+            case NodeKind::Distinct:
                 break;  // neither renames nor computes
 
             case NodeKind::Rename: {
@@ -199,6 +200,11 @@ auto walk(NodePtr node, std::uint64_t& next) -> NodePtr {
 // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
+
+auto columns_have_same_value(const Node& root, std::string_view left, std::string_view right)
+    -> bool {
+    return resolve_value(root, std::string(left)) == resolve_value(root, std::string(right));
+}
 
 auto reduce_duplicate_distinct_columns(NodePtr root) -> NodePtr {
     if (root == nullptr) {

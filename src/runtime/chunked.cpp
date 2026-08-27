@@ -3627,6 +3627,104 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             left_rows += lcol->size();
         }
         if (!lcols.empty() && left_rows < rcol.size()) {
+            // A moderately dense integer key range does not need a hash lookup
+            // for every row on the large side. q22's 84k in-scope customer
+            // keys span only ~300k values: a byte-addressed candidate table is
+            // smaller than the hash map and turns the 3M-order intersection
+            // pass into two bounds checks plus array reads.
+            //
+            // Keep this a proved representation choice, not an assumption
+            // about TPC-H keys. Sparse or very wide ranges decline to the hash
+            // path below. Workers retain private hit arrays, so repeated right
+            // keys never race and the final OR is deterministic.
+            const auto try_dense_intersection = [&]() -> bool {
+                if (left_rows == 0) {
+                    return false;
+                }
+                std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
+                std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
+                for (const auto* lcol : lcols) {
+                    for (const std::int64_t value : *lcol) {
+                        min_key = std::min(min_key, value);
+                        max_key = std::max(max_key, value);
+                    }
+                }
+                const std::uint64_t difference =
+                    static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
+                if (difference == std::numeric_limits<std::uint64_t>::max()) {
+                    return false;  // the inclusive span is not representable
+                }
+                const std::uint64_t span64 = difference + 1;
+                constexpr std::size_t kMaxDenseSlots = 2UL << 20U;
+                constexpr std::size_t kMaxRangePerKey = 4;
+                const std::size_t density_limit =
+                    left_rows > std::numeric_limits<std::size_t>::max() / kMaxRangePerKey
+                        ? std::numeric_limits<std::size_t>::max()
+                        : left_rows * kMaxRangePerKey;
+                if (span64 > kMaxDenseSlots || span64 > density_limit) {
+                    return false;
+                }
+                const auto slots = static_cast<std::size_t>(span64);
+                const auto slot_of = [min_key](std::int64_t value) {
+                    return static_cast<std::size_t>(static_cast<std::uint64_t>(value) -
+                                                    static_cast<std::uint64_t>(min_key));
+                };
+                std::vector<char> candidates(slots, char{0});
+                for (const auto* lcol : lcols) {
+                    for (const std::int64_t value : *lcol) {
+                        candidates[slot_of(value)] = char{1};
+                    }
+                }
+                const auto scan_range = [&](std::size_t lo, std::size_t hi, char* hits) {
+                    for (std::size_t row = lo; row < hi; ++row) {
+                        if (rnull(row)) {
+                            continue;
+                        }
+                        const std::int64_t value = rcol[row];
+                        if (value < min_key || value > max_key) {
+                            continue;
+                        }
+                        const std::size_t slot = slot_of(value);
+                        if (candidates[slot] != char{0}) {
+                            hits[slot] = char{1};
+                        }
+                    }
+                };
+
+                std::vector<char> hits(slots, char{0});
+                const std::size_t workers = intersect_worker_count(rcol.size(), slots);
+                if (workers < 2) {
+                    scan_range(0, rcol.size(), hits.data());
+                } else {
+                    std::vector<std::vector<char>> parts(workers,
+                                                         std::vector<char>(slots, char{0}));
+                    const std::size_t grain = (rcol.size() + workers - 1) / workers;
+                    auto batch = process_worker_pool().submit(workers, [&](std::size_t worker) {
+                        const std::size_t begin = worker * grain;
+                        if (begin < rcol.size()) {
+                            scan_range(begin, std::min(rcol.size(), begin + grain),
+                                       parts[worker].data());
+                        }
+                    });
+                    batch.wait();
+                    for (const auto& part : parts) {
+                        for (std::size_t slot = 0; slot < slots; ++slot) {
+                            hits[slot] = static_cast<char>(hits[slot] | part[slot]);
+                        }
+                    }
+                }
+                // Retain the dense representation for the buffered-left probe
+                // too. Converting the hits back into a hash set would throw
+                // away the representation win just before probing q22's 84k
+                // customer rows.
+                dense_i64_min_ = min_key;
+                dense_i64_hits_ = std::move(hits);
+                return true;
+            };
+            if (try_dense_intersection()) {
+                return std::nullopt;
+            }
+
             // 57k inserts + 3.8M finds, versus 3.8M inserts the other way.
             //
             // The map stores a DENSE INDEX rather than a matched flag, which is
@@ -3914,7 +4012,17 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 return std::nullopt;
             }
             return filter_rows(std::move(t), [&](std::size_t row) {
-                const bool match = !probe_is_null(row) && right_i64_.contains((*col)[row]);
+                bool match = false;
+                if (!probe_is_null(row)) {
+                    if (dense_i64_min_.has_value()) {
+                        const std::uint64_t slot = static_cast<std::uint64_t>((*col)[row]) -
+                                                   static_cast<std::uint64_t>(*dense_i64_min_);
+                        match = slot < dense_i64_hits_.size() &&
+                                dense_i64_hits_[static_cast<std::size_t>(slot)] != char{0};
+                    } else {
+                        match = right_i64_.contains((*col)[row]);
+                    }
+                }
                 return keep_matches ? match : !match;
             });
         }
@@ -4008,6 +4116,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const ExecutionContext* exec_ = nullptr;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
+    std::optional<std::int64_t> dense_i64_min_;
+    std::vector<char> dense_i64_hits_;
     robin_hood::unordered_flat_set<double> right_f64_;
     robin_hood::unordered_flat_set<bool> right_bool_;
     robin_hood::unordered_flat_set<Date> right_date_;

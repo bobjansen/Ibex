@@ -934,7 +934,7 @@ the update family. The direct-field vocabulary is now stated once, in
 `kernel_update.hpp`, as plan/write pairs: `DirectFieldPlan` (numeric tree,
 temporal part, string length), `DirectPredicatePlan` (packed bool),
 `DirectValidityPlan` (fill_null/coalesce/CASE), `DirectCategoricalPlan`
-(dictionary + remaps), and `StringInterpolationPlan` (count/prefix/write). A
+(dictionary + remaps), and `DirectStringPlan` (count/prefix/write). A
 plan borrows the IR and owns no destination, so the same plan serves a serial
 chunk write and a parallel table-level window write. `try_direct_update_field`
 is the single ordered dispatch on the chunk side; `evaluate_field_maybe_parallel`

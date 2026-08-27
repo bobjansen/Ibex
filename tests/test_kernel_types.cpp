@@ -1379,19 +1379,22 @@ TEST_CASE("A parallel multi-field update folds inside the chunk kernel",
 // An expression outside the direct vocabulary entirely keeps the bridge,
 // deliberately: the table evaluator can still split it through its own range
 // writer, so declining is how such a field keeps its parallelism rather than
-// how it loses it. A string result is one -- no numeric window this splitter
-// can pre-size, and no route arm that writes bytes outside `__interp`.
+// how it loses it. A substring with row-varying bounds is one: the direct
+// string plan deliberately accepts literal bounds only.
 TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][parallel]") {
     constexpr std::size_t kRows = 40'000;
     Column<std::string> name;
+    Column<std::int64_t> start;
     for (std::size_t r = 0; r < kRows; ++r) {
         name.push_back("abcdef");
+        start.push_back(1);
     }
     runtime::Chunk chunk;
     chunk.add_column("name", std::move(name));
+    chunk.add_column("start", std::move(start));
     std::vector<ir::ExprPtr> args;
     args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "name"}}));
-    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}}));
+    args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "start"}}));
     args.push_back(ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{3}}}));
     const std::vector<ir::FieldSpec> fields{
         {.alias = "head",
@@ -1409,7 +1412,7 @@ TEST_CASE("An unplanned expression keeps the table bridge", "[kernel][update][pa
     auto updated =
         runtime::kernel::update_row_local_chunk(std::move(chunk), fields, nullptr, nullptr, exec);
     REQUIRE(updated.has_value());
-    const auto& head = std::get<Column<std::string>>(*updated->columns[1].column);
+    const auto& head = std::get<Column<std::string>>(*updated->columns[2].column);
     REQUIRE(head.size() == kRows);
     CHECK(head[0] == "bcd");
     CHECK(stats.chunk_direct_updates.load() == 0);

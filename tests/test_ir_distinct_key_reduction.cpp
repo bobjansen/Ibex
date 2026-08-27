@@ -112,6 +112,14 @@ TEST_CASE("distinct key reduction dedups on one copy of a duplicated column") {
     REQUIRE(output_columns(*plan) == std::vector<std::string>{"c_custkey", "o_custkey"});
 }
 
+TEST_CASE("value identity follows copied columns through a distinct") {
+    auto plan = distinct(project({"c_custkey", "o_custkey"},
+                                 update("c_custkey", column("o_custkey"), scan("orders"))));
+
+    CHECK(ir::columns_have_same_value(*plan, "c_custkey", "o_custkey"));
+    CHECK_FALSE(ir::columns_have_same_value(*plan, "c_custkey", "missing"));
+}
+
 TEST_CASE("distinct key reduction leaves genuinely different columns alone") {
     auto plan = distinct(project({"o_custkey", "o_orderkey"}, scan("orders")));
 

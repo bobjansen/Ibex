@@ -142,10 +142,11 @@ struct DirectNumericTreePlan {
 };
 
 /// A resolved `__interp` expression whose leaves can be copied without
-/// formatting or allocation.  It is deliberately internal to the update
+/// formatting or allocation. It is deliberately internal to the update
 /// kernels, but shared by chunk and table writers so their two-pass string
-/// contracts cannot drift.
-struct StringInterpolationOperand {
+/// contracts cannot drift. Interpolation and substring use the same operand
+/// representation and count/prefix/write protocol.
+struct DirectStringOperand {
     std::optional<StringView> column;
     /// Categorical values stay dictionary-coded until the interpolation writer
     /// needs their byte slab; resolving the code directly avoids a per-row
@@ -164,8 +165,14 @@ struct StringInterpolationOperand {
     std::string_view literal;
 };
 
-struct StringInterpolationPlan {
-    std::vector<StringInterpolationOperand> operands;
+struct DirectStringPlan {
+    enum class Kind : std::uint8_t { Interpolation, Substring };
+
+    Kind kind = Kind::Interpolation;
+    std::vector<DirectStringOperand> operands;
+    DirectStringOperand substring_source;
+    std::int64_t substring_start = 0;
+    std::optional<std::int64_t> substring_length;
 };
 
 /// Classify and write the simple binary numeric family shared by the ChunkView
@@ -237,20 +244,20 @@ struct StringInterpolationPlan {
                                                    ::ibex::runtime::RowRange range,
                                                    NumericOutputSpan output) -> bool;
 
-[[nodiscard]] auto make_string_interpolation_plan(const ir::Expr& expr, const PredicateInput& input,
-                                                  const ScalarRegistry* scalars)
-    -> std::optional<StringInterpolationPlan>;
+[[nodiscard]] auto make_direct_string_plan(const ir::Expr& expr, const PredicateInput& input,
+                                           const ScalarRegistry* scalars)
+    -> std::optional<DirectStringPlan>;
 /// Count the byte window and write it after the caller has assigned its
 /// prefix-summed `StringOutputSpan`. `validity`, when present, is dense in
 /// `range`; invalid rows remain empty and are never read.
-[[nodiscard]] auto string_interpolation_bytes(const StringInterpolationPlan& plan,
-                                              ::ibex::runtime::RowRange range,
-                                              const ValidityBitmap* validity)
+[[nodiscard]] auto direct_string_bytes(const DirectStringPlan& plan,
+                                       ::ibex::runtime::RowRange range,
+                                       const ValidityBitmap* validity)
     -> std::optional<std::uint32_t>;
-[[nodiscard]] auto write_string_interpolation(const StringInterpolationPlan& plan,
-                                              ::ibex::runtime::RowRange range,
-                                              const ValidityBitmap* validity,
-                                              StringOutputSpan output) -> bool;
+[[nodiscard]] auto write_direct_string(const DirectStringPlan& plan,
+                                       ::ibex::runtime::RowRange range,
+                                       const ValidityBitmap* validity, StringOutputSpan output)
+    -> bool;
 
 /// The direct-plan vocabulary for one field, resolved once. At most one member
 /// is engaged; `plan_direct_field` picks in the order the writers below
@@ -259,7 +266,7 @@ struct StringInterpolationPlan {
 /// and per-source code remaps), which is why callers pass a resolved route
 /// around instead of re-planning per execution mode.
 struct DirectFieldRoute {
-    std::optional<StringInterpolationPlan> string;
+    std::optional<DirectStringPlan> string;
     std::optional<DirectCategoricalPlan> categorical;
     std::optional<DirectPredicatePlan> predicate;
     std::optional<DirectValidityPlan> validity;

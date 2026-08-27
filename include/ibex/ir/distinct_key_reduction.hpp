@@ -5,6 +5,8 @@
 
 #include <ibex/ir/node.hpp>
 
+#include <string_view>
+
 namespace ibex::ir {
 
 /// Dedup on one copy of a duplicated column, and re-add the rest afterwards.
@@ -40,5 +42,11 @@ namespace ibex::ir {
 ///
 /// Declines silently and completely whenever the shape is anything else.
 [[nodiscard]] auto reduce_duplicate_distinct_columns(NodePtr root) -> NodePtr;
+
+/// Whether two output columns of `root` are provably copies of the same value.
+/// Walks only through value-preserving nodes and bare-column updates; an
+/// unmodelled or computed step conservatively makes the values different.
+[[nodiscard]] auto columns_have_same_value(const Node& root, std::string_view left,
+                                           std::string_view right) -> bool;
 
 }  // namespace ibex::ir

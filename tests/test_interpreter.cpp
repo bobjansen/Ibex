@@ -7795,6 +7795,61 @@ TEST_CASE("interpolation strings write parallel prefix-assigned slabs", "[update
     CHECK(stats.parallel_fields.load() > 0);
 }
 
+TEST_CASE("substring strings write parallel prefix-assigned slabs", "[update][parallel]") {
+    constexpr std::size_t kRows = 4096;
+    Column<std::string> text;
+    for (std::size_t row = 0; row < kRows; ++row) {
+        text.push_back(row % 3 == 0 ? "13-hello" : row % 3 == 1 ? "日本語" : "café9");
+    }
+    runtime::Table input;
+    input.add_column("text", std::move(text), std::vector<bool>(kRows, true));
+    input.columns.front().validity->set(513, false);
+    ir::CallExpr substring{
+        .callee = "substring",
+        .args = {ir::make_expr_ptr(ir::Expr{.node = ir::ColumnRef{.name = "text"}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{-2}}}),
+                 ir::make_expr_ptr(ir::Expr{.node = ir::Literal{.value = std::int64_t{1}}})},
+        .named_args = {}};
+    const std::vector<ir::FieldSpec> fields{
+        {.alias = "slice", .expr = ir::Expr{.node = std::move(substring)}}};
+
+    const auto run = [&](bool parallel, runtime::ParallelPipelineStats* stats) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = parallel ? 4 : 1;
+        exec.parallel_grain = 127;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        exec.parallel_stats = stats;
+        auto out = runtime::update_table(runtime::Table{input}, fields, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto* slices = std::get_if<Column<std::string>>(out->find("slice"));
+        REQUIRE(slices != nullptr);
+        const auto* entry = out->find_entry("slice");
+        REQUIRE(entry != nullptr);
+        REQUIRE(entry->validity.has_value());
+        std::vector<std::string> values;
+        values.reserve(kRows);
+        for (std::size_t row = 0; row < kRows; ++row) {
+            values.emplace_back((*slices)[row]);
+        }
+        return std::pair{std::move(values), *entry->validity};
+    };
+
+    const auto serial = run(false, nullptr);
+    runtime::ParallelPipelineStats stats;
+    const auto parallel = run(true, &stats);
+    CHECK(parallel.first == serial.first);
+    for (std::size_t row = 0; row < kRows; ++row) {
+        CHECK(parallel.second[row] == serial.second[row]);
+    }
+    CHECK(parallel.first[0] == "l");
+    CHECK(parallel.first[1] == "本");
+    CHECK(parallel.first[2] == "é");
+    CHECK(parallel.second[513] == false);
+    CHECK(parallel.first[513].empty());
+    CHECK(stats.parallel_fields.load() > 0);
+}
+
 TEST_CASE("nullable fixed-width writes return parallel range validity", "[update][parallel]") {
     constexpr std::size_t kRows = 4096;
     Column<std::int64_t> a;

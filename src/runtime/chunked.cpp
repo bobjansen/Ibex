@@ -7488,7 +7488,6 @@ class ChunkedAggregateOperator final : public Operator {
         }
         owned_finalized_ = true;
         const std::size_t part_count = partitions.size();
-        std::vector<std::size_t> cursors(part_count, 0);
         std::size_t total = 0;
         for (const auto& partition : partitions) {
             total += partition.keys.size();
@@ -7496,31 +7495,112 @@ class ChunkedAggregateOperator final : public Operator {
         n_groups_ = total;
         resize_order(total);
         AggSlotCore* fs = flat_slots_.grow_uninitialized(total * n_aggs_).data();
-        std::size_t g = 0;
-        while (true) {
-            std::size_t best = part_count;
-            std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
-            for (std::size_t p = 0; p < part_count; ++p) {
-                if (cursors[p] >= partitions[p].keys.size()) {
-                    continue;
-                }
-                if (partitions[p].first_rows[cursors[p]] < best_row) {
-                    best_row = partitions[p].first_rows[cursors[p]];
-                    best = p;
-                }
-            }
-            if (best == part_count) {
-                break;
-            }
-            const auto& partition = partitions[best];
-            const std::size_t local = cursors[best];
-            store_key(g, partition.keys[local]);
-            for (std::size_t a = 0; a < n_aggs_; ++a) {
-                fs[(g * n_aggs_) + a] = partition.slots[(local * n_aggs_) + a];
-            }
-            ++cursors[best];
-            ++g;
+        if (total == 0) {
+            return;
         }
+
+        // K-way merge of the `part_count` partition group-lists by `first_rows`
+        // into the output at ascending `g`. Every partition's `first_rows` is
+        // strictly ascending and the values are globally unique (they are row
+        // indices, and each row belongs to one partition), so this is a stable
+        // merge over a total order -- byte-identical however the segments below
+        // are split.
+        const auto merge_segment = [&](std::vector<std::size_t> cur,
+                                       const std::vector<std::size_t>& stop, std::size_t g) {
+            for (;;) {
+                std::size_t best = part_count;
+                std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
+                for (std::size_t p = 0; p < part_count; ++p) {
+                    if (cur[p] >= stop[p]) {
+                        continue;
+                    }
+                    const std::uint64_t fr = partitions[p].first_rows[cur[p]];
+                    if (fr < best_row) {
+                        best_row = fr;
+                        best = p;
+                    }
+                }
+                if (best == part_count) {
+                    break;
+                }
+                const auto& partition = partitions[best];
+                const std::size_t local = cur[best];
+                store_key(g, partition.keys[local]);
+                for (std::size_t a = 0; a < n_aggs_; ++a) {
+                    fs[(g * n_aggs_) + a] = partition.slots[(local * n_aggs_) + a];
+                }
+                ++cur[best];
+                ++g;
+            }
+        };
+
+        std::vector<std::size_t> part_end(part_count);
+        for (std::size_t p = 0; p < part_count; ++p) {
+            part_end[p] = partitions[p].keys.size();
+        }
+
+        // For q18's 3M groups the serial merge is ~24M comparisons plus 3M
+        // slot copies -- tens of ms on the calling thread. Split the OUTPUT
+        // into per-worker rank ranges via merge-path co-ranking: since every
+        // `first_rows` value is unique, `sum_p lower_bound(first_rows_p, v)`
+        // steps by exactly one at each value and so equals any target rank at
+        // exactly one `v`. Each worker then merges the disjoint input slices
+        // between two frontiers into its disjoint output slice.
+        std::size_t workers = 1;
+        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
+            part_count >= 2 && total >= std::size_t{1} << 17U) {
+            auto& pool = process_worker_pool();
+            workers = std::min(
+                {exec_->compute_budget(), pool.size(), part_count, total / 4096, std::size_t{64}});
+        }
+
+        if (workers < 2) {
+            merge_segment(std::vector<std::size_t>(part_count, 0), part_end, 0);
+            return;
+        }
+
+        const std::uint64_t hi = owned_rows_seen_ + 1;
+        const auto frontier = [&](std::size_t rank) {
+            std::uint64_t lo = 0;
+            std::uint64_t high = hi;
+            while (lo < high) {
+                const std::uint64_t mid = lo + ((high - lo) / 2);
+                std::size_t sum = 0;
+                for (std::size_t p = 0; p < part_count; ++p) {
+                    const auto& fr = partitions[p].first_rows;
+                    sum += static_cast<std::size_t>(std::lower_bound(fr.begin(), fr.end(), mid) -
+                                                    fr.begin());
+                }
+                if (sum < rank) {
+                    lo = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            std::vector<std::size_t> off(part_count);
+            for (std::size_t p = 0; p < part_count; ++p) {
+                const auto& fr = partitions[p].first_rows;
+                off[p] = static_cast<std::size_t>(std::lower_bound(fr.begin(), fr.end(), lo) -
+                                                  fr.begin());
+            }
+            return off;
+        };
+
+        std::vector<std::vector<std::size_t>> bounds(workers + 1);
+        bounds.front().assign(part_count, 0);
+        bounds.back() = part_end;
+        for (std::size_t w = 1; w < workers; ++w) {
+            bounds[w] = frontier(w * total / workers);
+        }
+
+        auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
+            std::size_t g = 0;
+            for (std::size_t p = 0; p < part_count; ++p) {
+                g += bounds[w][p];
+            }
+            merge_segment(bounds[w], bounds[w + 1], g);
+        });
+        batch.wait();
     }
 
     /// Dispatch the deferred merge to whichever key the owned run filled. Only

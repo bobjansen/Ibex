@@ -520,5 +520,18 @@ Every slice:
    — the radix `kDefaultPartitionMinRows` beside its constant, `try_owned`'s
    lower `kPairOwnedMinRows` as the operator-resolved "owned specialization
    worth it" gate (like the join's build orientation). Byte-identical vs base
-   on q01/q10/q13/q18/q20/q21, full suite. Slice 3 does the same for the
-   `finalize` phase.
+   on q01/q10/q13/q18/q20/q21, full suite.
+
+   Slice 3 (finalize authority + the async-hot partition gate slice 2 missed)
+   LANDED: `finalize_owned`'s co-ranking merge, the ordered-run merge, the
+   first-occurrence seed pass, and the async-hot cold build read
+   `par_.finalize.{decline,worker_cap}` for their ceiling and permission; the
+   data-derived cap terms (`part_count`, `total/4096`, `run_count/8192`) and the
+   three strategy floors (`1U<<17`, `1U<<16`, `parallel_min_rows`) stay in the
+   operator. `try_async_hot_int_sum` (the q18 path — a fourth `partition`
+   strategy slice 2 did not touch) reads `par_.partition` too now. New
+   `ParallelPipelineStats` counters `parallel_aggregate_partitions` /
+   `parallel_aggregate_finalizes` so a silently-stopped gate is a red test.
+   Byte-identical vs the slice-1 base on q01/q10/q13/q18/q20/q21, full suite
+   1814/1814. **The Aggregate step of "parallelism as a plan decision" is
+   complete.**

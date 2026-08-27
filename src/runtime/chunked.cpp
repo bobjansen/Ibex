@@ -2669,9 +2669,8 @@ struct PackedKeyEncoder {
 
 class ChunkedDistinctOperator final : public Operator {
    public:
-    ChunkedDistinctOperator(OperatorPtr child, const ExecutionContext& exec,
-                            physical::BreakerParallelism dedup_plan = {})
-        : child_(std::move(child)), dedup_plan_(dedup_plan), exec_(&exec) {}
+    ChunkedDistinctOperator(OperatorPtr child, physical::BreakerParallelism dedup_plan)
+        : child_(std::move(child)), dedup_plan_(dedup_plan) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         while (true) {
@@ -2828,23 +2827,22 @@ class ChunkedDistinctOperator final : public Operator {
     }
 
    private:
-    /// Observability check for the dedup-phase parallelism slice: called once,
-    /// at the point the operator commits to fanning out over `count`
-    /// partitions. If `build_physical_distinct` resolved a plan for this
-    /// breaker, it must have permitted fan-out and its worker cap must bound
-    /// the operator's own choice. A disagreement means the planner and the
-    /// operator computed different things -- abort loudly rather than let the
-    /// follow-up slice inherit the divergence.
-    void check_dedup_plan(std::size_t count) const {
-        if (dedup_plan_.worker_cap == 0) {
-            return;  // no resolved plan (a hand-built ChunkedDistinctOperator)
+    /// The dedup fan-out policy, resolved from `dedup_plan_` (which the plan
+    /// owns -- src/runtime/PARALLELISM.md). Returns 0 to stay serial, otherwise
+    /// the partition count. Both dedup paths call this; the two conditions that
+    /// stay here are the ones only the operator can judge -- whether it is
+    /// nested under another fan-out, and whether *this* chunk cleared the floor
+    /// (a streaming source's row count is not known until it arrives).
+    [[nodiscard]] auto dedup_partition_count(std::size_t rows) const -> std::size_t {
+        if (dedup_plan_.decline != physical::FanOutDecline::None || dedup_plan_.worker_cap < 2 ||
+            on_worker_pool_thread() || rows < dedup_plan_.row_floor) {
+            return 0;
         }
-        if (dedup_plan_.decline != physical::FanOutDecline::None) {
-            invariant_violation("distinct: plan declined fan-out but the operator fanned out");
+        std::size_t count = 1;
+        while (count * 2 <= dedup_plan_.worker_cap) {
+            count *= 2;  // a power of two, so the partition is a mask
         }
-        if (count > dedup_plan_.worker_cap) {
-            invariant_violation("distinct: operator partition count exceeds the plan's worker cap");
-        }
+        return count;
     }
 
     /// A single-column typed dedup store: the serial set, and -- once the
@@ -3049,28 +3047,14 @@ class ChunkedDistinctOperator final : public Operator {
         // for the whole query (the context and the pool are fixed) or, like the
         // row gate, guards only the first use.
         if (dedup_part_count_ == 0) {
-            constexpr std::size_t kMinRows = 1U << 15U;
-            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
-                rows < kMinRows) {
+            // `count <= pool.size()` by construction (the plan's worker cap was
+            // clamped to it) and the pool never shrinks, so `submit(part_count,
+            // ...)` below is never clamped -- which it must not be, or a
+            // partition's rows would go unvisited.
+            const std::size_t count = dedup_partition_count(rows);
+            if (count == 0) {
                 return false;
             }
-            // Bound to the eligibility check above: constructing the pool
-            // spawns its threads eagerly, and a serial (`IBEX_CORES=1`) query must
-            // not pay for them just to be told it is serial.
-            const std::size_t pool_size = process_worker_pool().size();
-            const std::size_t budget = exec_->compute_budget();
-            const std::size_t workers = std::min({budget, pool_size, std::size_t{64}});
-            if (workers < 2) {
-                return false;
-            }
-            std::size_t count = 1;
-            while (count * 2 <= workers) {
-                count *= 2;  // a power of two, so the partition is a mask
-            }
-            // `count <= pool.size()` by construction and the pool never
-            // shrinks, so `submit(part_count, ...)` below is never clamped —
-            // which it must not be, or a partition's rows would go unvisited.
-            check_dedup_plan(count);
             dedup_part_count_ = count;
             state.parts.resize(count);
             // Anything an earlier chunk deduped serially lives in `state.seen`,
@@ -3164,25 +3148,10 @@ class ChunkedDistinctOperator final : public Operator {
     auto try_typed_parallel(const Column<T>& col, std::size_t rows, TypedDedup<T>& state,
                             std::vector<std::uint8_t>& keep) -> bool {
         if (dedup_part_count_ == 0) {
-            // Below this the fan-out costs more than the serial probe it
-            // replaces. As in the packed path, cardinality is what the pass is
-            // about to discover, so row count is the only gate available.
-            constexpr std::size_t kMinRows = 1U << 15U;
-            if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread() ||
-                rows < kMinRows) {
+            const std::size_t count = dedup_partition_count(rows);
+            if (count == 0) {
                 return false;
             }
-            const std::size_t pool_size = process_worker_pool().size();
-            const std::size_t budget = exec_->compute_budget();
-            const std::size_t workers = std::min({budget, pool_size, std::size_t{64}});
-            if (workers < 2) {
-                return false;
-            }
-            std::size_t count = 1;
-            while (count * 2 <= workers) {
-                count *= 2;  // a power of two, so the partition is a mask
-            }
-            check_dedup_plan(count);
             dedup_part_count_ = count;
         }
         if (state.parts.size() != dedup_part_count_) {
@@ -3501,11 +3470,11 @@ class ChunkedDistinctOperator final : public Operator {
     /// silently move to the other.
     bool fast_dedup_seen_ = false;
     bool generic_dedup_seen_ = false;
-    /// The `dedup` phase's parallelism, resolved by `build_physical_distinct`
-    /// (src/runtime/PARALLELISM.md). This slice is observability only: the
-    /// operator still decides for itself below, and `check_dedup_plan` aborts
-    /// if the two ever disagree. The follow-up slice deletes the operator's
-    /// copy and reads `dedup_plan_` directly.
+    /// The `dedup` phase's parallelism, resolved by the caller
+    /// (`build_physical_distinct` from a footer estimate, `distinct_table` from
+    /// the input's exact row count). The operator reads it -- see
+    /// `dedup_partition_count` -- rather than deciding for itself.
+    /// src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
     physical::BreakerParallelism dedup_plan_{};
     robin_hood::unordered_flat_set<Key, KeyHash, KeyEq> seen_;
     TypedDedup<std::int64_t> seen_i64_;
@@ -3517,7 +3486,6 @@ class ChunkedDistinctOperator final : public Operator {
     robin_hood::unordered_flat_set<std::string_view, StringViewHash, StringViewEq> seen_strings_;
     std::deque<std::string> owned_strings_;
     const void* cat_dictionary_id_ = nullptr;
-    const ExecutionContext* exec_ = nullptr;
 };
 
 class ChunkedSemiAntiJoinOperator final : public Operator {
@@ -11652,7 +11620,14 @@ auto distinct_table(const Table& input, const ExecutionContext& exec)
     // empty column list still works: the operator passes such a chunk straight
     // through, which is what the old `columns.empty()` special case did.
     auto source = make_table_source(input);
-    return materialize_operator(std::make_unique<ChunkedDistinctOperator>(std::move(source), exec));
+    // The whole table is one chunk, so its row count is exact -- the dedup
+    // phase's fan-out is fully decided here rather than on the first chunk.
+    physical::BreakerParallelism dedup_plan = physical::distinct_dedup_parallelism(
+        {.rows = input.rows(), .source = physical::RowEstimate::Source::ChildExact});
+    const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
+    physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
+    return materialize_operator(
+        std::make_unique<ChunkedDistinctOperator>(std::move(source), dedup_plan));
 }
 
 auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
@@ -14861,9 +14836,8 @@ auto build_physical_head(const ir::Node& node, const TableRegistry& registry,
 
 /// Build a distinct breaker. The plan describes the `dedup` fan-out phase
 /// (src/runtime/PARALLELISM.md); this resolves its worker cap here, where the
-/// `ExecutionContext` is in hand, and hands it to the operator. This slice is
-/// observability only -- the operator still decides for itself and aborts if
-/// the two disagree.
+/// `ExecutionContext` is in hand, and hands it to the operator, which reads it
+/// rather than deciding for itself.
 auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
                              const TableRegistry& registry, const ScalarRegistry* scalars,
                              const ExternRegistry* externs, const ExecutionContext& exec,
@@ -14876,15 +14850,17 @@ auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
     if (!child_op.has_value()) {
         return std::unexpected(std::move(child_op.error()));
     }
-    physical::BreakerParallelism dedup_plan{};
-    if (!plan.breaker_phases.empty()) {
-        dedup_plan = plan.breaker_phases.front().parallelism;
-        // The pool is sized for decode and its threads spawn on first touch, so
-        // a serial query must not construct it just to learn it is serial.
-        const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
-        physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
-    }
-    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), exec, dedup_plan);
+    // Distinct always carries exactly one phase (`plan_physical`); guard anyway
+    // so a future planner change cannot silently hand the operator an
+    // unresolved plan (worker_cap 0), which would pin it serial.
+    physical::BreakerParallelism dedup_plan = plan.breaker_phases.empty()
+                                                  ? physical::distinct_dedup_parallelism({})
+                                                  : plan.breaker_phases.front().parallelism;
+    // The pool is sized for decode and its threads spawn on first touch, so a
+    // serial query must not construct it just to learn it is serial.
+    const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
+    physical::resolve_breaker_parallelism(dedup_plan, exec, pool_size);
+    return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), dedup_plan);
 }
 
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,

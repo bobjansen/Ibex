@@ -402,18 +402,15 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         return plan;
     }
     if (root.kind() == ir::NodeKind::Distinct) {
-        // One fan-out phase, described. The operator still decides for now; the
-        // planner records the policy (floor, strategy, breaker ceiling) and the
-        // estimate so `explain physical` and a test can see it. See
-        // src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision".
+        // One fan-out phase. The planner sets the policy (floor, strategy,
+        // ceiling) and the estimate; `build_physical_distinct` resolves the
+        // worker cap and the operator reads it. See src/runtime/PARALLELISM.md,
+        // "Target: parallelism as a plan decision".
         plan.migrated = true;
         plan.source_node = &root;
         plan.breaker_phases.push_back(
             {.name = "dedup",
-             .parallelism = {.row_floor = kDistinctRowFloor,
-                             .breaker_max_workers = kPackedKeyMaxWorkers,
-                             .strategy = PartitionStrategy::PackedKey,
-                             .estimate = distinct_row_estimate(root, registry)}});
+             .parallelism = distinct_dedup_parallelism(distinct_row_estimate(root, registry))});
         return plan;
     }
     if (root.kind() == ir::NodeKind::Order) {
@@ -721,6 +718,13 @@ auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
     return "?";
 }
 }  // namespace
+
+auto distinct_dedup_parallelism(RowEstimate estimate) -> BreakerParallelism {
+    return {.row_floor = kDistinctRowFloor,
+            .breaker_max_workers = kPackedKeyMaxWorkers,
+            .strategy = PartitionStrategy::PackedKey,
+            .estimate = estimate};
+}
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
                                  std::size_t pool_size) {

@@ -551,6 +551,12 @@ struct ParallelPipelineStats {
     /// gate that quietly stopped matching (a smaller probe chunk, a budget
     /// change) would cost the parallelism with every test still green.
     std::atomic<std::uint64_t> parallel_probes{0};
+    /// Inner-join hash builds that filled the head table across partitions
+    /// instead of one serial insert loop. Byte-identical to the serial build in
+    /// any partition count, so -- exactly like `parallel_probes` -- without this
+    /// a gate that silently stopped matching would lose the parallelism with
+    /// every test still green.
+    std::atomic<std::uint64_t> parallel_hash_builds{0};
     /// Row-local update fields a chunk executed through the direct kernel
     /// vocabulary, rather than converting to a Table so the established
     /// evaluator could run them. Counted per chunk and field, and counted for

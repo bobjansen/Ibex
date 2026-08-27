@@ -313,15 +313,24 @@ struct BreakerPhase {
 /// which reads the knobs itself.
 [[nodiscard]] auto order_sort_parallelism() -> BreakerParallelism;
 
-/// A streaming join's two fan-out phases. Both already exist in `chunked.cpp` on
-/// private constants: the hash build's `1U << 17U` floor and the open-coded
-/// `min(budget, pool, 64)` cap in `ChunkedInnerJoinOperator::build_partitions`,
-/// and the probe's `1U << 14U` floor and matching cap in
-/// `probe_parallel_workers`. Slice 3 is descriptive only — the plan carries the
-/// two phases so `explain physical` is not silent about the 40 ms serial hash
-/// build on q21; a follow-up slice moves the authority the way distinct's did.
+/// A streaming join's two fan-out phases: the hash build's `1U << 17U` floor and
+/// `min(budget, pool, 64)` cap, and the probe's `1U << 14U` floor and matching
+/// cap. Both used to be private constants in `chunked.cpp`
+/// (`ChunkedInnerJoinOperator::build_partitions`, `JoinProbe::probe_parallel_workers`);
+/// the operator now reads its resolved copy of each from the plan. The two
+/// checks that stay in the operator are the ones only it can make: a kill switch
+/// (`IBEX_JOIN_BUILD_SERIAL` / the `parallel_join_probe` toggle), nesting
+/// (`on_worker_pool_thread`), and whether this side/chunk cleared the floor.
 [[nodiscard]] auto join_hash_build_parallelism() -> BreakerParallelism;
 [[nodiscard]] auto join_probe_parallelism() -> BreakerParallelism;
+
+/// Both fan-out phases of a streaming join, resolved together — what every join
+/// construction site hands `ChunkedInnerJoinOperator`. Bundled so the two
+/// `BreakerParallelism` values cannot be passed in the wrong order.
+struct JoinParallelism {
+    BreakerParallelism build;
+    BreakerParallelism probe;
+};
 
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one

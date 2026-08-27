@@ -696,17 +696,24 @@ struct ExecutionContext {
     }
 };
 
-/// Apply the parallel-pipeline environment switches to `exec`: `IBEX_PARALLEL`
-/// enables pipelines, and `IBEX_MORSEL_ROWS` overrides the morsel grain (and,
-/// when set explicitly, drops the serial threshold to that grain so a
-/// deliberately small grain is honored). Unset variables leave `exec`
-/// untouched, so this never overrides a budget the caller chose.
+/// Apply the parallel-execution environment switches to `exec`, once, so no
+/// use site re-reads the environment (see `src/runtime/PARALLELISM.md`, "Who
+/// owns which decision").
 ///
-/// `IBEX_CORES` IS applied here, to `parallel_threads`: it is the compute
-/// budget, and the process pool it used to defer to is now sized for decode.
+/// - `IBEX_CORES` → `parallel_threads` (the compute budget). Parallel execution
+///   is enabled whenever `can_fan_out()` is true, i.e. the budget is ≥ 2 —
+///   which is the default on any multicore box. There is no separate on/off
+///   flag; `IBEX_PARALLEL` was removed precisely so a budget of one and
+///   "parallel off" could not drift into meaning different things.
+/// - `IBEX_STREAM_SCAN` → `stream_scans`, `IBEX_JOIN_PROBE` →
+///   `parallel_join_probe` (both default on; three seams each consult the
+///   field and must agree).
+/// - `IBEX_MORSEL_ROWS` → `parallel_grain`, and when set explicitly also drops
+///   `parallel_min_rows` to that grain so a deliberately small grain is honored.
 ///
-/// This is how a benchmark run turns the executor on: parallel pipelines stay off
-/// by default until Phase 1's acceptance measurements say otherwise.
+/// Unset variables leave `exec` untouched, so a context built by hand still
+/// means "ignore the environment" (contrast the `interpret()` overload with no
+/// `ExecutionContext`).
 void configure_parallel_from_env(ExecutionContext& exec);
 
 /// A process-lifetime pipeline counter when `IBEX_PARALLEL_STATS` is set in the

@@ -1,1754 +1,236 @@
-# Multi-core execution: how it actually works
+# Multi-core execution: the inconsistency catalogue
 
-Status: descriptive, updated 2026-08-18 in the worktree after `6f0a03e`. This is
-not a plan — it is the map of the machinery the plans keep adding to
-([runtime-multithreading-plan.md](runtime-multithreading-plan.md),
-[pipelined-execution-plan.md](pipelined-execution-plan.md),
-[beat-polars-plan.md](beat-polars-plan.md)). Part 1 describes the design in the
-vocabulary of the parallel-database literature; Part 2 lists where the
-implementation diverges from itself.
+**The design lives in [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md)**
+(the mental model, the three layers, who owns which decision, the determinism
+contract, the config surface — kept current with the code). This file is the
+companion *plan*: Part 2 below is the catalogue of places the implementation
+diverges from itself, with a suggested order of attack and the measured findings
+that closed or refused each track.
 
-Line references are `file:line` at the commit above and will drift; the names
-are the stable handle.
-
----
-
-## Part 1 — The design
-
-### 1.1 Classification in one paragraph
-
-Ibex is a **single-process, shared-everything, shared-memory** engine using
-**morsel-driven parallelism** (Leis et al., *Morsel-Driven Parallelism*, SIGMOD
-2014) in an **exchange-free** form: there is no Volcano-style `Exchange`
-operator, no partitioned re-distribution between operators, and no plan-level
-DOP. Parallelism is instead **operator-internal** — each operator decides for
-itself whether to fan its own row range out over a shared worker pool and
-rejoins before it returns. On top of that sit two coarser layers: a
-**bulk-synchronous parallel-map island** over a materialized table, and
-**pipeline (inter-operator) parallelism** between a scan and its consumer.
-Scheduling is **dynamic self-scheduling** off a shared atomic cursor (no work
-stealing, no deques, no priorities). The engine is **NUMA-oblivious**: no
-thread affinity, no local-memory allocation policy, no NUMA-aware partitioning.
-
-The invariant everything rests on is **one query at a time**
-(`query_lease.hpp`): the pool has no cross-query fairness, admission, or
-preemption to arbitrate, and inputs are immutable for a fan-out's lifetime.
-
-### 1.2 The substrate: `WorkerPool`
-
-`include/ibex/runtime/worker_pool.hpp`, `src/runtime/worker_pool.cpp`.
-
-A deliberately boring **fork–join / bulk-synchronous** pool: pre-spawned
-threads, one mutex+condvar FIFO task queue, a completion latch (`Batch`). No
-futures, no continuations, no DAG scheduler, no work stealing. `submit(n, body)`
-runs `body(worker_id)` for `id ∈ [0, n)` and returns immediately; `Batch::wait()`
-is the barrier and rethrows the first exception by worker id (deterministic
-error selection).
-
-Three properties are load-bearing:
-
-* **The calling thread is not a worker.** In an island it is the ordered
-  merger's consumer and must stay free.
-* **Non-reentrant.** `submit` from a pool thread *aborts* rather than deadlocks
-  against a saturated pool. Every fan-out site therefore guards on
-  `on_worker_pool_thread()`. This is the engine's entire nested-parallelism
-  policy: **outermost wins, inner levels degrade to serial.**
-* **Process-owned, lazily built, host-shutdownable.** `process_worker_pool()`
-  keeps mutable state in the host runtime TU rather than an `inline` variable —
-  bundled plugins statically link runtime code and would otherwise each get
-  their own pool under `RTLD_LOCAL`. `shutdown_process_worker_pool()` exists for
-  hosts that unload the library (R).
-
-#### Two thread budgets, on purpose
-
-| Number | Source | Governs |
-|---|---|---|
-| **Compute budget** | `IBEX_CORES` → `compute_thread_count()` → `ExecutionContext::parallel_threads` | every compute fan-out |
-| **Pool size** | `decode_thread_count()` (`IBEX_DECODE_THREADS`, `IBEX_DECODE_SATURATION`, default saturation 8) | thread count actually spawned; the scan pipeline is the only consumer sized against it |
-
-Decode is memory-latency bound and profits from **oversubscription** until the
-memory system saturates; compute is not and measurably regresses under it. The
-policy is `min(cores * 2, max(cores, saturation))`, backed by the measured table
-in `worker_pool.cpp:282`. `IBEX_THREADS` (which used to conflate the two) is
-read only to emit a one-time warning.
-
-### 1.3 Layer A — pipeline (inter-operator) parallelism
-
-Classic **producer–consumer pipelining with bounded buffers**, used to overlap
-I/O+decode with compute across a **pipeline breaker** (join build, aggregate,
-sort).
-
-* `PipelinedScanOperator` (`chunked.cpp:10810`) — the streaming scan. The source
-  publishes **source units** (Parquet row groups); N workers each run a private
-  copy of the row-local operator chain over one unit and deposit results into a
-  **bounded ring indexed by unit sequence**; the consumer releases them in
-  order. `scan_pipeline_worker_count` (`chunked.cpp:11254`) is the one place
-  sized against the *pool* rather than the compute budget, and it reserves one
-  thread when the unit count exceeds `3W` so a downstream breaker's own batch
-  cannot deadlock behind ring backpressure.
-* `PipelinedStageOperator` (`chunked.cpp:11102`) — a two-slot double buffer that
-  runs its child on a **raw `std::thread`**, not a pool thread, so a breaker's
-  probe input can be produced concurrently with the breaker consuming it.
-  Admitted only when the child can publish more than one unit
-  (`has_multi_unit_deferred_scan`).
-
-`IBEX_STREAM_SCAN=0` opts out.
-
-### 1.4 Layer B — parallel-map islands (morsel-driven, order-preserving)
-
-The Phase-1 executor. `pipeline.hpp` classifies each IR node's
-**execution capability** (`ParallelMap`, `OrderedStream`, `Barrier`,
-`ParallelBarrier`); `analyze_parallel_island()` finds a maximal bottom-up chain
-of row-local maps (filter / project / rename / row-local update / their fused
-forms) and the subtree that feeds it.
-
-`build_parallel_island` (`chunked.cpp:10339`):
-
-1. **Materialize the input subtree first, on the calling thread.** This is the
-   load-bearing invariant: a deferred/lazy source decodes exactly once,
-   serially, before any worker exists, so `LazyTable::cache_` and plugin decode
-   closures are never touched concurrently. Morsel sources take `const Table&`,
-   so the signature enforces it.
-2. Choose a **grain** (`island_grain`, `chunked.cpp:9273`): aim for 4 morsels
-   per thread, clamped to `[4096, 65536]`.
-3. Decide **whether to morselize at all** (`island_is_worth_morselizing`) — a
-   two-dimensional gate on rows *and* cells (rows × columns), because an
-   island's cost is dominated by copying rows out and so scales with table
-   width. A refusal must run the chain as **one whole-table chunk**, not as a
-   serial sweep of morsels; conflating "no workers" with "no morsels" measured
-   100ms vs 36ms.
-4. Build one **private operator chain per worker** and run
-   `ParallelIslandOperator` (`chunked.cpp:9627`): workers pull numbered morsels
-   off a shared cursor, and results land in a **bounded ring (window = 2×W)**
-   indexed by `sequence`. `next()` is an **order-preserving merge** — output is
-   byte-identical to the serial chain regardless of completion order. A worker
-   that runs a full window ahead of the consumer blocks (backpressure) instead
-   of buffering the island.
-5. Errors are **deterministic**: a failing morsel records its error under the
-   lock keeping the *lowest* sequence; workers abandon only morsels above it.
-   Interrupt outranks a recorded data error.
-
-Two specializations:
-
-* **Late-materialized head** — `RangeFilterMorselSource` absorbs a
-  range-native filter into the source, so the morsel is never gathered before
-  being filtered.
-* **`TwoPhaseFilterOperator`** (`chunked.cpp:9993`) — when the island is a
-  range-native filter plus metadata-only tail, it skips the merger entirely:
-  **phase A** counts survivors (and string bytes) per morsel, a serial
-  **exclusive prefix sum** turns counts into offsets, the output is presized
-  once, and **phase B** re-runs the morsels writing disjoint slices. This is the
-  standard count → prefix-sum → scatter shape, and it is the only place strings
-  are gathered in parallel.
-
-A serial island still runs the same morsels through `PartitionedTableSource`,
-and `SerialIslandOrderValidator` asserts morsel identity — the two executors are
-required to be byte-identical, which is what lets the threshold move without
-changing an answer.
-
-`ParallelIslandStats` (`IBEX_PARALLEL_STATS=1`) exists because an island and the
-serial chain are indistinguishable from the outside: without counters, an A/B
-showing no difference cannot separate "parallelism didn't pay" from "no island
-formed".
-
-### 1.5 Layer C — intra-operator parallelism
-
-The bulk of the wins. Every site is fork–join inside one operator call, with a
-private gate. Summarized by parallel axis:
-
-| Operator | Axis | Scheduling | Determinism device |
-|---|---|---|---|
-| Fused bounds scan (`filter.cpp:3273`) | row ranges, block-aligned to 4096 | shared cursor | per-range survivor lists concatenated in range order |
-| Filter gather (two-phase only) | morsel → disjoint output slice | static | prefix sum |
-| Group discovery (`chunked.cpp:6325` `try_discover_partitioned`) | **radix/hash partitioning** of rows by key hash, power-of-two mask | 3 passes: per-range histogram → exclusive prefix sum → scatter; then whole partitions per worker | partition-local ids, then a serial **first-occurrence merge** assigns global ids in row order |
-| Grouped aggregation (`chunked.cpp:7186`, `:7550`) | **partial pre-aggregation into per-morsel private slot arrays**, then merge | shared cursor | morsel count derived from **rows**, merged in ascending morsel order → float reduction order is machine-independent |
-| Ungrouped aggregation (`chunked.cpp:7860`) | same | shared cursor | same |
-| Aggregate slot-array fill (`chunked.cpp:6620`) | byte ranges of a fresh allocation | static | none needed (memset) — threaded for **page-fault** parallelism, worth ~1.3× |
-| Aggregate output emit (`chunked.cpp:8170`) | one output **column** per task | shared cursor | disjoint columns |
-| Hash join probe (`chunked.cpp:4640`, `join.cpp:1167`) | probe rows; build side is a **shared read-only index**, never threaded, never locked | static ranges | per-worker `(li, ri)` pairs concatenated in range order; the concat itself re-threads above 64k |
-| Semi/anti predicate (`chunked.cpp:3604`) | probe rows against a frozen set | static ranges | ascending concat |
-| Distinct (`chunked.cpp:3020`) | packed-key partitions | static | workers record a **keep flag at a row**, never a position; output rebuilt by scanning flags in row order |
-| Sort — gather (`sort.cpp:284`) | **(column × row range)** tasks, ranges aligned to 64 rows | shared cursor | permutation is already fixed; writes are disjoint |
-| Sort — per-group slice sort / rank sweep (`chunked.cpp:1189`, `:1376`) | one **group** per task | shared cursor | groups own disjoint row spans |
-| Grouped windowed update (`update.cpp:1633`) | one group per task | shared cursor | expression screened by `is_group_parallel_safe_expr` |
-| Update bucketing (`update.cpp:1587`, `:1920`) | row ranges; per-worker private histogram, then prefix-sum scatter | static | global ids handed out by walking workers in row order, so numbering is **independent of thread count** |
-| Row-local field eval (`update.cpp:2605`) | morsels writing into a presized destination | shared cursor | element-wise; no reduction |
-| Generic gather (`runtime_internal.hpp:119` `for_row_ranges`) | row ranges into a presized output | shared cursor | disjoint slices |
-| Parquet decode (`parquet.hpp:1866`) | `(column × row group)` tasks, one `FileReader` per worker | shared cursor (a string column can cost 10× an int one, so static assignment strands workers) | tasks write disjoint output ranges |
-| Parquet fused key scan (`parquet.hpp:2219`) | one row group per worker | shared cursor | **contiguous-prefix replay**: the abandon rule is evaluated only over the completed prefix under a mutex, so the decision does not depend on completion order |
-
-Recurring idioms worth naming:
-
-* **Private-state-then-merge** (partial aggregation) wherever a reduction
-  exists; **disjoint-slice writes** wherever one does not.
-* **Count → prefix sum → scatter** for anything variable-width.
-* **Per-worker output vectors, concatenated afterwards**, rather than
-  count-then-fill, wherever counting would repeat an expensive probe.
-* The merge cost gate: fan-out is admitted only when
-  `morsels × groups ≤ rows / 4` — partial aggregation pays only while the merge
-  (O(morsels × groups)) stays small against the scan it replaces (O(rows)).
-
-### 1.6 Determinism contract
-
-Every parallel path in the engine is required to produce **byte-identical**
-output to its serial counterpart. The devices are listed above; the general
-rules are:
-
-1. Row order is reconstructed positionally (sequence, range order, or a
-   prefix-summed offset) — never by completion order.
-2. Floating-point reduction order is fixed by a **data-derived** partition where
-   a reduction exists (the aggregate derives morsel count from rows, not
-   threads).
-3. Group ids are assigned by first occurrence in row order, after the parallel
-   phase, so ids do not vary with thread count.
-4. Errors are selected by lowest sequence / lowest worker id, and an interrupt
-   outranks a data error.
-
-### 1.7 Configuration surface
-
-| Variable | Reads | Meaning |
-|---|---|---|
-| `IBEX_CORES` | `compute_thread_count()` | compute budget (`auto` = `hardware_concurrency`) |
-| `IBEX_DECODE_THREADS` | `decode_thread_count()` | absolute pool size override |
-| `IBEX_DECODE_SATURATION` | `decode_thread_count()` | memory-system saturation point (default 8) |
-| ~~`IBEX_PARALLEL`~~ | removed 2026-08-24 | serial is `IBEX_CORES=1`; a budget of one *is* parallelism off, and there is no longer a second spelling that can disagree with it |
-| `IBEX_MORSEL_ROWS` | `morsel_rows_from_env()` | island grain override; also lowers `parallel_min_rows` |
-| `IBEX_CHUNK_ROWS` | `source_chunk_rows_from_env()` | forces multi-chunk sources (test-only) |
-| `IBEX_STREAM_SCAN` | `stream_scans_from_env()` | streaming scan on/off |
-| `IBEX_JOIN_PROBE` | `parallel_join_probe_from_env()` | parallel join probe on/off |
-| `IBEX_PARALLEL_STATS` | `process_island_stats()` | island/probe/stage counters at exit |
-| `IBEX_PROFILE_OPERATORS` | `execution_profile_requested()` | per-operator phase profile |
-| `IBEX_THREADS` | — | **ignored**, warns once |
-
-The principle is that the decoder and the operators must never read the
-environment directly — the `ExecutionContext` is the single authority, so there
-is no second copy free to disagree. As of I8's fix all three on/off switches obey
-it: `configure_parallel_from_env` reads them once through the shared `env_flag`
-parser and lands them in `parallel`, `stream_scans`, and `parallel_join_probe`,
-which is all any seam consults. An unset variable leaves the caller's choice
-alone, so building an `ExecutionContext` by hand remains the spelling for
-"ignore the environment" (contrast the `interpret()` overload that takes none).
+Part 1 (a from-scratch restatement of the design in parallel-database
+vocabulary) moved into `PARALLELISM.md` on 2026-08-27 rather than being kept in
+two places. Line references below are `file:line` at 2026-08-18 and have
+drifted — the names are the stable handle; re-`grep` before trusting a number.
 
 ---
 
 ## Part 2 — Inconsistencies
 
-Grouped by what they threaten. Most are *undocumented divergence* rather than
-bugs; the risk is that each new operator copies whichever neighbour it happened
-to be written next to, and the spread widens. Severity is about the cost of
-leaving it, not about correctness today.
+Undocumented divergence rather than bugs: each new operator copies whichever
+neighbour it was written next to, and the spread widens. Severity is the cost of
+leaving it, not correctness today. Several are RESOLVED; kept so they are not
+"re-fixed".
 
 ### Column-type divergence
-
-**I1 — Three different answers for "can this column type be gathered in
-parallel?"** — **RESOLVED**. Before:
-
-| Path | `bool` | `std::string` | `Categorical` | fixed-width |
-|---|---|---|---|---|
-| `gather_column` (`runtime_internal.hpp`) | **serial** (bitmap words are shared between ranges) | **serial** (cumulative offsets) | parallel | parallel |
-| `gather_rows_parallel` (`sort.cpp`) | **parallel** — ranges aligned to 64 rows so no word is shared | **one indivisible task** (still parallel *with* other columns) | parallel | parallel |
-| `filter_gather_is_thread_safe` (`filter.cpp`) | **parallel** — via `or_bits_into_word`'s shared-word rule | **parallel** — one offset per row, disjoint byte slabs, after a prefix pass | parallel | parallel |
-
-Three solutions to the same two hazards (bit-packed words, cumulative offsets),
-each with a good local justification, none aware of the others.
-
-`gather_column` was a second, divergent implementation of the kernel
-`gather_rows` already had. It is now written in terms of it —
-`make_gather_column` sizes the output, `gather_range_into` fills a range — so
-the per-type rules are stated once, in that kernel, and `bool` gathers in
-parallel everywhere rather than in one of the three places. The alignment rule
-moved into `for_row_ranges`, which now hands out 64-row-aligned boundaries; that
-is what makes a bit-packed destination safe, and `tests/test_gather_kernel.cpp`
-asserts the boundaries directly rather than hoping a race surfaces.
-
-The kernel also moved *down* a layer, from `interpreter_internal.hpp` to
-`runtime_internal.hpp`, because the duplicate lived in the lower one and the
-include direction is upward. `gather_rows` stayed put: it alone needs
-`ir::OrderKey` and `TableProperties`.
-
-`TwoPhaseFilterOperator` remains separate **by design**, and the kernel now says
-so: it writes into a caller-presized output at a prefix-summed offset, which is
-a genuinely different operation and is what lets it split strings this cannot.
-That is one documented exception, not a third answer.
-
-**I2 — String and Categorical columns are silently excluded from three
-different fan-out decisions, for three different reasons** (medium)
-
-* `stageable_conjunct_columns` (`lazy_table.cpp:1107`) rejects String/Categorical
-  *predicate* columns — width, not selectivity. Documented, measured (q10 +9.7%).
-* `evaluate_field_maybe_parallel` (`update.cpp:2605`) accepts only `Int`/`Double`
-  results — a Categorical result would need per-piece dictionary merging.
-* The parallel partial aggregation (`chunked.cpp:7196`) accepts only
-  `Int`/`Double` agg kinds, because boxed `First`/`Last` values live outside the
-  slot array.
-
-Each is reasonable; together they mean a string-heavy query loses parallelism in
-three places with no single place to look for why. There is no shared predicate
-answering "is this column type parallel-capable in role X".
-
-**I3 — Multi-key Categorical group discovery has no partitioned path**
-(medium). `try_discover_partitioned` is instantiated for `std::string`,
-`std::int64_t`, `PairIntKey`, and the packed key
-(`chunked.cpp:5797/5886/6022/6085/7085`), but the multi-Categorical path
-(`chunked.cpp:7010`) grouping through `multi_cat_find_or_insert` is serial. The
-gap is not marked anywhere.
-
-### Serial-path vs multi-core-path divergence
-
-**I4 — The whole-table operators and the chunked operators have very different
-parallelism, and the difference is not written down** (high)
-
-`src/runtime/{filter,aggregate,join,sort,update}.cpp` implement whole-table
-operators; `chunked.cpp` reimplements most of them for the streaming path.
-
-**Correction (verified 2026-08-17):** an earlier draft of this entry said the
-whole-table operators are what the `ops`/codegen layer, plugins and the REPL
-`:load` path reach, so that "the same query can be several times more parallel
-depending on which entry point reached it". That is **wrong**. `interpret()`
-routes unconditionally through `build_operator` -> the chunked operators ->
-`MaterializeOperator`, and `ops.hpp` is a thin `Table -> Table` wrapper over
-`interpret()`. Every entry point gets the chunked engine. The whole-table
-functions are reached only as `interpret_node` fallbacks for node kinds the
-chunked builder declines (complex aggregates such as Median), and as delegation
-targets from inside chunked operators.
-
-That matters for priority: this is a tax on future work and a drift hazard, not
-a user-facing performance gap. Note also that `ops.hpp` already demonstrates the
-fix — a whole-table SIGNATURE over a chunked IMPLEMENTATION.
-
-Three different relationships hide under one name:
-
-* **Delegating** — the chunked operator buffers and calls the whole-table
-  function: `order_table`, `filter_table` (+ `_range`/`_limit`), `update_table`,
-  `join_table_impl`. Not duplication; the whole-table function is the kernel.
-* **Fully reimplemented** — aggregate, distinct, and inner join. The sort was
-  listed here in an earlier inventory, but that is stale: `ChunkedOrderOperator`
-  concatenates an unsorted stream and calls `order_table`, while
-  `radix_sort_u64_asc` lives once in `sort.cpp` and is shared by rank. There is
-  no second order/radix implementation to collapse. `aggregate_table` appears
-  in `chunked.cpp` only in a comment. This is the real duplication.
-* **Escape hatch** — the chunked aggregate declines Median/quantile/EWMA and the
-  whole node runs via `interpret_node` -> `aggregate_table`. This is what lets
-  the streaming engine be incomplete, and it is why the aggregate is the LAST
-  operator that can be collapsed, not the first.
-
-Parallel coverage in the reimplemented set differs sharply:
-
-| Operator | whole-table | chunked |
-|---|---|---|
-| Aggregate | per-group reduce only (`aggregate.cpp:1157`) | partitioned discovery + partial pre-aggregation + parallel emit + parallel slot fill |
-| Filter | bounds scan parallel; gather now parallel (I5) | two-phase parallel gather |
-| Join | parallel probe (`join.cpp:1167`) | parallel probe + parallel concat + swapped-probe replay |
-| ~~Distinct~~ | ~~serial~~ | **collapsed — one implementation** |
-
-A fix applied to one side routinely does not exist on the other. I15 is the
-worked example: it had to be written into both engines, and doing only
-`join.cpp` would have "fixed" a benchmark regression without touching the code
-the benchmark runs.
-
-*Convergence:* keep the whole-table **signature** and delete the second
-**implementation**, per the split `ops.hpp` already uses — `filter_table(t, e)`
-becomes a `TableSource` run through the chunked operator and materialized.
-Sequencing constraint: an operator can only be collapsed once its chunked
-version is COMPLETE, because collapsing removes the decline-and-fall-back path.
-So distinct / inner join first, and the aggregate only after the chunked one
-covers Median, quantile, and EWMA. The former "sort's radix path" step is already
-converged, as above.
-
-The duplication tax on the task-scheduler work is avoidable without doing any
-of this first: port the chunked operators to the new primitive and leave the
-whole-table fallbacks on the old one. They are fallbacks, so lagging costs
-correctness nothing and measurable performance almost nothing.
-
-#### Second correction: how narrow the fallback actually is
-
-The entry above already corrected one wrong claim (that the entry point picks
-the engine). Doing the first collapse turned up a second thing this entry got
-wrong, in the same direction — the whole-table path is even less reachable than
-"an `interpret_node` fallback" suggests.
-
-**The whole-table functions run only for a subtree beneath a declined node
-within a single statement.** A `let` materializes, so in
-
-```
-let d = t[distinct { g, v }];
-d[select { m = median(v) }];      // aggregate declines...
-```
-
-the aggregate's child is a `Scan`, not a `Distinct`, and no whole-table
-`distinct` ever runs. Written as one statement it does:
-
-```
-t[distinct { g, v }][select { m = median(v) }];
-```
-
-This was not deduced, it was measured: a mutation making `distinct_table` return
-an error outright did **not** fire on the first shape. Which means a test written
-the natural way — bind, then aggregate — verifies nothing at all while appearing
-to pass. Any future collapse needs its coverage written as a single statement,
-and mutation-checked, or it is testing the operator it already had.
-
-It also lowers I4's remaining urgency another notch. The duplicate
-implementations are not just off the hot path; they are off almost every path.
-This is cleanup and a drift hazard, not latent performance.
-
-#### Progress
-
-**Distinct — COLLAPSED** (`74f6e32`). `interpreter.cpp`'s serial dedup loop
-boxed a `Key` per row; `ChunkedDistinctOperator` has single-column and
-packed-key fast paths. `distinct_table` keeps the whole-table signature and
-delegates: `make_table_source` -> the operator -> `materialize_operator`.
-
-Metadata was checkable rather than assumed: `distinct` is a `RowTransform::
-Subset` keeping every column, and `Subset` "derives exactly like `Preserve`", so
-the deleted `distinct_properties` was the identity the operator already relies on
-by passing properties through. Added the first coverage this path has ever had.
-
-**Inner join — COLLAPSED** (worktree after `6f0a03e`). The constrained
-single-key, predicate-free, `nulls never`, unconstrained inner join now keeps
-the whole-table signature but delegates to `ChunkedInnerJoinOperator`; joins
-with predicates, multiple keys, `nulls equal`, `expect`, or `take` remain in
-`join_table_impl`, which is the implementation of those richer semantics.
-
-The fallback test uses the same single-statement shape as distinct:
-`(lhs join rhs on k)[select { m = median(v) }]`. It caught an independent
-chunked bug: an all-unmatched join emitted no morsel, so a materializing sink
-lost the planned output schema. The operator now retains an empty schema carrier
-until EOF. This is required for the adapter to be equivalent to
-`join_table_impl`, not merely a test convenience — and since it changes the
-PRODUCTION operator rather than only the adapter, it was checked against all 22
-PDS-H outputs, which are byte-identical.
-
-The semantic gate is `is_streamable_inner_join`, called by both
-`build_operator` and `interpret_node`. It was written out twice at first, once
-per file, character-identical — the I4 failure mode in miniature. Collapsing the
-implementation while leaving a six-clause predicate duplicated across two files
-would have swapped one drift hazard for a subtler one: a clause added to one
-copy routes a join the operator cannot handle, and nothing would say so.
-
-Release check, against `6f0a03e`, used **three interleaved base/target repeats**
-with two warmups and five timed iterations, `IBEX_CORES=2`, and `taskset -c 2`.
-The direct joins were neutral-to-faster: `inner_join_symbol` **-0.27%**
-(8.786 → 8.762 ms) and `inner_join_user` **-2.45%** (12.259 → 11.959 ms).
-The derived join workloads were `join_filter_rank` **-2.91%** (27.292 →
-26.497 ms) and `join_update_group` **+2.43%** (14.591 → 14.945 ms), the latter
-within the run-level variation. `IBEX_THREADS` is obsolete and was not used in
-this corrected run.
-
-**Aggregate — NOT a collapse, and the entry above was wrong to imply it is.**
-`aggregate_table` is not near-dead fallback code the way `distinct_table` and the
-whole-table join were: a median aggregate is itself the *declining* node, so it
-runs at top level for every median/quantile/EWMA query. Collapsing it means
-implementing those three in a streaming operator — a median needs every value of
-a group retained, which the operator's fixed-size slots deliberately avoid, and
-EWMA's row-order coupling fights the partitioned discovery that makes the chunked
-aggregate fast. And it would not even remove the duplication: a node mixing
-`median(x)` with `sum(y)` needs both in ONE pass, so `aggregate_table` keeps its
-sum/mean/min/max code regardless.
-
-The escape hatch is therefore design, not debt, and I4 is **complete at 2 of 3**.
-The goal was zero DUPLICATED implementations, not zero whole-table ones.
-
-**Superseded synthetic aggregate measurement (2026-08-18).** An earlier
-median microbenchmark was useful only for finding the two-key hash bug below.
-It did not seed its random input, and it measures the deliberately whole-table
-Median path rather than the standard aggregates responsible for item 9. It is
-not evidence for an item-9 implementation decision.
-
-**Item-9 aggregate triage (2026-08-18).** Fresh `IBEX_PROFILE_OPERATORS=1`
-profiles of the actual PDS-H scripts, `build-release`, `IBEX_CORES=8`, identify
-one first target rather than three:
-
-| query | aggregate shape | result | conclusion |
-|---|---|---|---|
-| q13 | `count(o_orderkey)` by customer, then 42-bucket count | first aggregate: 18.9ms caller + 44.6ms pool work | already uses parallel discovery; the 42-row second aggregate is correctly serial |
-| q18 | `sum(l_quantity)` by `l_orderkey`, 1.5M groups | 85.7ms caller, 227.5ms pool work, 26 barriers | first aggregate target |
-| q10 | seven-key sum over 37,967 input rows | 20.6ms caller, no pool tasks | below the 262k partition-discovery gate; forcing fan-out is not credible |
-
-**q13 join/count fusion (2026-08-18).** The benchmark shape remains
-`filter orders -> left join customers -> count by customer -> count buckets`;
-the query was not rewritten to pre-aggregate orders. The engine now recognizes
-the first aggregate over that left join (including the lowered `count(column)`
-form, which appears as a derived sum), verifies that the left key is unique at
-runtime, and computes right-side counts directly instead of materializing the
-1.5M-row join result. Unsupported types, null keys, duplicate left keys, or
-other join semantics fall back to the existing implementation. `check_answers.py
-q13` remains green. The profiled 8-core statement fell from about **149ms to
-126ms**; three warm whole-script reruns had a median of **103.8ms**, versus the
-earlier roughly **121ms** baseline. The string scan remains the floor, but the
-join and first aggregate no longer pay for the expanded intermediate.
-
-The q18 aggregate profile over `IBEX_CORES={1,2,4,8}` was respectively
-136.2 / 143.8 / 111.0 / 85.7ms caller time (with 0 / 186.9 / 217.5 /
-227.5ms pool work). The single 2-core run is noisy and slightly worse than
-one core; the useful result is the shallow 1-to-8 improvement, only 1.59x.
-Its remaining caller time contains the deterministic first-occurrence merge
-and output/control work. The merge is independently sized at about 26ms at
-the larger 3M-group q18 case, so deleting it cannot by itself explain the
-whole 86ms. Do not lower q10's gate or tune thread counts on this evidence.
-
-**q18 perf attribution (2026-08-18).** The node profile was too coarse to
-separate the aggregate phases, so the measurement guide's `perf record` route
-was used. A controlled REPL replay materialized q18's two lineitem columns
-once, then ran eight syntactically distinct but grouping-equivalent
-`sum(l_quantity + constant) by l_orderkey` statements; each ended in `count()`
-to suppress the 1.5M-row intermediate. This makes the aggregate long enough
-for sampling without confounding it with Parquet decode. `perf record -F 999`
-got 913 task-clock samples at one core and 2K at eight, with zero lost samples.
-
-At **one core**, `robin_hood::Table<long,uint32_t>::insertKeyPrepareEmptySpot`
-is 30.7% of samples (and its rehash path another visible 8.0%); the aggregate
-is map construction, as expected. At **eight cores**, 52.9% of task-clock
-samples are pass 3 of `try_discover_partitioned`: the workers' per-partition
-`index.find` / `emplace` loop. Passes 1 (hash/histogram), 2 (scatter), and 4
-(local-to-global gid translation) are only 7.6%, 5.9%, and 2.3%; accumulation
-is 1.8% and parallel output emission 1.9%. The serial ordered merge does not
-appear as the dominant frame. This independently agrees with the shallow
-1-to-8 wall scaling: q18 is still dominated by random high-cardinality hash-map
-construction *inside the workers*, not by a missing fan-out.
-
-So the item-9 aggregate project is now specific: improve the high-cardinality
-partition table's locality/capacity strategy (and test it by wall-clock A/B),
-not a scheduler change or an order-elision-only change. The latter remains a
-bounded, separately correct optimisation, but is not q18's primary lever.
-
-**Rejected cheaply: pass-3 run shortcut.** Scatter retains source order inside
-each partition, and q18's lineitems have short same-order runs, so pass 3 was
-temporarily given the serial path's `previous key -> local gid` shortcut. It
-was semantically sound: the focused parallel aggregate tests passed and q18's
-parallel output was byte-identical to serial. The original 15-run report used
-the now-rejected fixed 13% band and is superseded. Under the paired signed-rank
-protocol, a 16-pair base-vs-base q18 control was `same` (+1.1%, p=0.469). The
-candidate was initially `unclear` at 16 pairs (-2.1%, p=0.301), so it was
-extended rather than dismissed. At 32 pairs it was `same` (+0.8%, p=0.466;
-16-16 pair direction). The branch was therefore removed. The profiler
-identified where CPU samples land, not a wall-clock lever; do not infer the
-latter from the former.
-
-**The larger q18 lever: physical order without a certificate.** `lineitem`
-is physically nondecreasing on `l_orderkey` (the file begins with six `1`s,
-then `2`, then a run of `3`s), but the source correctly makes no ordering
-claim. Temporarily bypassing only that proof sent q18 through the existing
-`ChunkedSortedAggregateOperator`; its output was byte-identical and 16 paired
-runs measured **-12.6%, p=0.001**. This is a lower bound, not a valid change:
-a later unsorted chunk would make the streaming aggregate wrong.
-
-An explicit `order { l_orderkey }` is sound but not the answer. The order
-operator must first materialize the source to check it, so the isolated
-aggregate was **+2.5%, p=0.005** at 32 pairs even though the file was already
-ordered. The Parquet footer offers no free proof either: all six row groups have
-an empty `sorting_columns` list. Thus the next real implementation is a
-source-level dynamic ordering certificate / ordered-scan path that validates
-the complete stream before the aggregate can rely on it. Do not encode the
-PDS-H file layout as an unconditional source property.
-
-**Hash-path experiments (2026-08-18).** With the order route excluded, two
-bounded locality ideas were tested and removed. Raising the partition count
-from 8 to 32 made q18 **8.3% slower, p<0.001**: the smaller per-partition maps
-did not repay the wider first-occurrence merge. Reserving each empty partition
-for one quarter of its rows was **-1.2%, p=0.215** (same) at 16 pairs. Neither
-is a lever, and the baseline eight-partition/no-reserve path is restored.
-
-The current SF-1 comparison is already **Ibex 102.95ms versus Polars 121.75ms**
-at eight cores (warm, five measured iterations), so the target is not to add a
-certificate that only this file happens to satisfy. The remaining gap is in the
-hash table itself: the eight-core profile puts 52.9% of samples in pass 3's
-partition-local `find`/`emplace`. A compact-domain direct-index experiment was
-also rejected: its extra domain scan and fallback bookkeeping made the query
-substantially slower, so no source change is retained. The next candidate must
-reduce pass-3 probe cost without assuming physical order or changing the
-partition/merge contract.
-
-The wider scaling check confirms this is not a lucky eight-core point (warm,
-eight Ibex iterations and three Polars iterations):
-
-| cores | Ibex q18 | Polars q18 |
-|---:|---:|---:|
-| 1 | 168.6ms | 512.9ms |
-| 2 | 132.3ms | 284.7ms |
-| 4 | 106.0ms | 183.7ms |
-| 8 | 93.2ms | 146.7ms |
-
-Ibex is faster at every tested width and within 19% of Polars at eight cores.
-
-### Largest remaining loss versus Polars at eight cores
-
-The full-suite screen was followed by isolated warm reruns (15 Ibex
-iterations; 10 for the next candidates; 10 Polars iterations after warmup):
-
-| query | Ibex | Polars | Ibex minus Polars | diagnosis |
-|---|---:|---:|---:|---|
-| q10 | 69.0ms | 43.6ms | **+25.4ms** | small result (38k rows); serial joins/aggregate and fixed scan/plan overhead |
-| q20 | 72.6ms | 47.4ms | **+25.2ms** | 543k-group two-key aggregate; aggregate node is ~63.5ms and dominates |
-| q13 | 115.7ms | 104.0ms | +11.7ms | join build and scan/decode dominate, not the small second aggregate |
-| q14 | 18.2ms | 10.4ms | +7.8ms | small filtered join; large relative loss but little absolute time |
-
-The first implementation target is **q20's aggregate**, despite q10 winning by
-0.2ms: q20 has a large, measurable operator-level loss rather than mostly fixed
-small-query overhead. The plan is:
-
-1. Capture a phase-level q20 baseline at 1/2/4/8 cores and with statements
-   separated, keeping the paired signed-rank protocol.
-2. Profile pass 3 and the two-key packed-key path; compare probe, merge, and
-   slot initialization costs against the q18 one-key path.
-3. Test one change at a time (packed-key table capacity/locality first), with
-   byte-identical output and the full q20 answer check as gates.
-4. Re-measure q10 separately. Only pursue its serial joins if the gap remains
-   after controlling for its fixed scan/REPL overhead; do not add fan-out to a
-   38k-row plan merely to match Polars' execution strategy.
-
-### q20 packed two-key path check
-
-The q20 aggregate is not taking the 64-bit packed form: both source columns are
-typed `Int64`, so `pair_packs_u64_` is false. It uses the exact `PairIntKey`
-(`uint64_t first, second`) partition path at
-`ChunkedAggregateOperator::process_rows_int_pair`. A controlled materialized
-replay isolates the cost: at eight cores, **63.4% of perf samples** land in
-pass 3's partition-local `find`/`emplace`; accumulation is only 4.1% and the
-merge is not dominant. This is the same shape as q18, but with the wider pair
-key and custom `PairIntKeyHash`.
-
-Two low-risk probes were rejected. Applying the generic final hash avalanche to
-`PairIntKeyHash` measured **73.3ms** for q20 versus the preceding **72.6ms**
-baseline (no gain), and reserving half of each partition's input rows regressed
-q20 to **77.5ms** and q18 to **127.9ms**. Both experiments are reverted.
-
-The implementation plan is therefore narrower: add a runtime-checked 32-bit
-domain path for two `Int64` columns (q20's part/supplier keys fit it), while
-retaining the exact `PairIntKey` fallback for wide or later chunks. The check
-must be stream-safe across chunks, preserve first-occurrence ordering, and be
-benchmarked against q20 and q18 before adoption; no source change is retained
-from the probes above.
-
-**First implementation attempt (2026-08-18).** The state machine described
-above was implemented and passed q20 execution, including the packed-to-exact
-transition design, but it measured **83.4ms** versus the ~72.6ms baseline at
-eight cores. The extra domain scan and the separate u64 state did not repay the
-smaller key. It was removed. A viable version needs the domain certificate from
-Parquet metadata or an existing decode pass, rather than a second row scan.
-
-**Footer retry (2026-08-18).** The certificate was then wired from deferred
-Parquet source statistics: q20's row-group metadata proves both keys are
-non-null and within `uint32_t`, and the packed path was selected without the
-second row scan. `check_answers.py` remained green, including q20. However, a
-controlled 15-run comparison measured **81.4ms with the certificate versus
-77.9ms without it** at eight cores. A cheaper high/low-word hash was also
-tested and measured **80.1ms**, still slower. The packed representation was
-therefore reverted; footer metadata is a valid certificate, but this table
-layout does not make the one-word probe path faster than `PairIntKey`.
-
-### Idea 2 check: two-level grouping
-
-The data shape is promising: across the full lineitem file there are 200,000
-part keys and 799,541 distinct `(part, supplier)` pairs; every part has four
-suppliers (median, p95, and maximum). A parallel two-level implementation was
-tested: it assigned rows by a hash of the first key, gave each worker its own
-first-key directory and tiny second-key vectors, and reused the existing
-first-occurrence merge. It was general (no footer, range, sort, or format
-assumption), but q20 answer verification was not enough to justify its cost.
-The SF-1 difference was small, so it was retested on the checked-in
-SF-4 Parquet fixture (24M lineitem rows). A first 1/2/4/8-core sweep measured
-the two-level path at **553.5/467.6/326.6/263.7ms**, versus
-**526.6/473.5/321.6/271.1ms** for the exact-pair control. Three additional
-8-core repeats gave medians of **270.5ms** and **269.1ms**, respectively.
-The larger fixture therefore did not establish a material win; the apparent
-8-core lead in the first sweep was within run-to-run noise. The two-level code
-was removed, leaving the exact-pair path as the current implementation.
-
-**Pass-3 software prefetch check (2026-08-18).** A local extension to the
-`robin_hood::unordered_flat_map` table exposed the initial probe bucket, and a
-six-row lookahead prefetched the control byte and entry before each pass-3
-probe. It was byte-semantics preserving, but q20 at eight cores regressed from
-**77.2ms to 86.5ms**. The lookahead recomputes the composite-key hash and adds
-work to every row; that cost exceeded the cache-miss latency hidden. The local
-header extension and call site were removed.
-
-**Pass-1 hash reuse check (2026-08-18).** The local table extension was then
-expanded with precomputed-hash lookup and insertion. Pass 1's hash was carried
-alongside each scattered row index, so pass 3 could avoid hashing the key a
-second time. The result remained byte-correct (`q20: OK`), but it was not a
-win: SF-1 at eight cores measured **78.7ms** versus the **77.2ms** control, and
-three SF-4 repeats had a **275.5ms** median versus the earlier **269.1ms**
-control. The extra hash buffer/scatter bandwidth outweighed the saved hash
-work. The extension and hash plumbing were removed.
-
-**Why Polars is not blocked by the same boundary.** Polars encodes the complete
-multi-column key, hashes that key to a partition, and gives each partition its
-own hash table. Group discovery and aggregate updates therefore happen inside
-partition-owned state; only the finished aggregate states need merging. The
-implementation describes one hash table per worker and routing by
-`hash_to_partition` ([source](https://raw.githubusercontent.com/pola-rs/polars/main/crates/polars-core/src/frame/group_by/hashing.rs));
-multi-column keys are encoded before grouping ([source](https://raw.githubusercontent.com/pola-rs/polars/main/crates/polars-core/src/frame/group_by/mod.rs)).
-
-Ibex's operator instead owns one mutable grouping state: the coordinator must
-assign global group IDs before workers can accumulate into private slots. The
-discarded two-level experiment added hash, scatter, local discovery, ID
-translation, and merge passes around that boundary. SF-4 showed those passes
-cancelled the saved probing time. A future win requires a partition-aware
-aggregate API that owns a partition from key discovery through mergeable
-aggregate state, rather than more parallelism after group IDs already exist.
-
-**Idea 4 check: fuse q20's filter into discovery (2026-08-18).** There is no
-remaining filter operator to fuse. The whole-plan profile contains no `filter`
-node under the q20 aggregate: the 1994 date predicate is already pushed into
-`scan __ibex_source_4`, which produces 909,455 rows across six chunks. The
-aggregate then consumes those rows and emits 543,210 groups; its 60.5ms caller
-time and 58.7ms pool work are the dominant block. Moving the predicate into
-pass 3 would duplicate work rather than remove it. Idea 4 is therefore closed;
-the next useful change must reduce pair-group discovery itself.
-
-### q20 shape correction and remeasurement (2026-08-18)
-
-The original q20 fixture was not the same relational shape as the Polars plan:
-it used two semi joins and a correlated `scalar(...)` expression. That made the
-comparison conflate execution strategy with query shape. The fixture now follows
-the explicit stages used by Polars: a filtered line-item aggregate by
-`(l_partkey, l_suppkey)`, a filtered nation and supplier/nation join, then the
-part → partsupp → aggregate → supplier join chain. The result remains byte-
-correct (`q20: OK`).
-
-On the SF-1 fixture, whole-script averages (warmup 2, 8 timed iterations) were:
-
-| cores | previous shape | Polars-shaped fixture | change |
-|---:|---:|---:|---:|
-| 1 | 143.34ms | 127.82ms | -10.8% |
-| 2 | 126.16ms | 108.02ms | -14.4% |
-| 4 | 91.39ms | 85.86ms | -6.1% |
-| 8 | 85.66ms | 81.38ms | -5.0% |
-
-This removes a shape artifact, but does not change the aggregate conclusion:
-the two-key group discovery remains the dominant q20 cost and the scaling curve
-still flattens between four and eight cores.
-
-### PDS query-shape alignment (2026-08-18)
-
-The checked-in Polars PDS repository is now the reference for benchmark source
-shape. q03, q05, and q10 were aligned to its lazy relation order: joins remain
-in the same sequence, predicates are applied on the joined relation, and the
-intermediate `let` bindings that had materialized filtered inputs were removed.
-The other fixtures were reviewed against the PDS sources; q13, q18, q20 and the
-named aggregate-subquery queries already have corresponding stages, while q07,
-q08 and q09 already use the same join order (with only Ibex-specific key
-renaming). The alignment is therefore structural, not a blanket removal of
-all useful projection pushdown.
-
-The changed fixtures execute successfully. A quick SF-1 sweep (warmup 1,
-three iterations) measured q03/q05/q10 respectively at 1/2/4/8 cores:
-
-| cores | q03 | q05 | q10 |
-|---:|---:|---:|---:|
-| 1 | 70.43ms | 65.75ms | 98.05ms |
-| 2 | 47.14ms | 45.16ms | 83.18ms |
-| 4 | 42.16ms | 39.37ms | 81.58ms |
-| 8 | 37.28ms | 35.58ms | 76.92ms |
-
-For a direct old/new comparison at eight cores (warmup 2, eight iterations),
-the pre-alignment fixture measured **43.51/66.59/82.57ms** for q03/q05/q10;
-the aligned fixture measured **34.74/33.76/70.15ms**. The local checkout of the
-Polars repository has no generated `data/tables` or Python environment, so fresh
-Polars numbers could not be reproduced in this shell; the historical q10 Polars
-reference above (43.6ms) is retained but is not presented as a new matched run.
-
-q02 was subsequently aligned as well: one `part → partsupp → supplier → nation
-→ region` relation, late predicates, then the minimum-cost subquery and reuse in
-the final join. Its eight-core whole-script timing changed from **49.10ms** in
-the old fixture to **464.05ms** in the aligned fixture. This is an intentional
-shape result, not a proposed optimization: Ibex materializes the reused joined
-relation, while Polars keeps the lazy plan and can push predicates and projection
-through both consumers. A fresh Polars number still requires the local PDS runner
-and data environment to be installed.
-
-### Full PDS query-shape audit (2026-08-18)
-
-Comparing every Ibex fixture with the checked-in Polars PDS source shows that
-logical equivalence alone was too weak a criterion. The audit tracks relation
-order, predicate placement, and whether a reused subquery is materialized:
-
-| query | status | remaining difference |
-|---|---|---|
-| q01 | aligned | single-table aggregate |
-| q02 | aligned | five-way chain and reused minimum relation; Ibex materializes lets |
-| q03 | aligned | customer → orders → lineitem chain and late filters |
-| q04 | aligned | orders semi join filtered lineitem, then late date filter |
-| q05 | aligned | region → nation → customer → orders → lineitem → supplier |
-| q06 | aligned | single-table filter/aggregate |
-| q07 | aligned | shared filtered nations, Polars join order, late nation/date filters |
-| q08 | aligned | part → lineitem → supplier → orders → customer → nation → region |
-| q09 | aligned | part → partsupp → supplier → lineitem → orders → nation |
-| q10 | aligned | customer → orders → lineitem → nation and late filters |
-| q11 | aligned | q1 aggregate, q2 threshold, cross join, late comparison |
-| q12 | aligned | orders-first join with late lineitem predicates |
-| q13 | aligned | filtered orders, left join, two aggregates |
-| q14 | aligned | part/lineitem join followed by late date filter |
-| q15 | aligned | supplier/revenue join with explicit global max relation |
-| q16 | aligned | part/partsupp filters, left supplier join, null test |
-| q17 | aligned | shared relevant-lineitem relation and quantity aggregate |
-| q18 | aligned | orders semi join aggregate, then lineitem and customer |
-| q19 | aligned | part-first join with late qualification predicates |
-| q20 | aligned | explicit q1/q2/q3 stages; Ibex materializes reused lets |
-| q21 | aligned | q1 late-line join, q2 per-order count, supplier/nation/order filters |
-| q22 | aligned | q1/q2/q3 stages, left join null test, cross aggregate |
-
-The alignment pass addressed the mismatches one at a time, with an execution
-check after each rewrite. q02 demonstrates that a source-shape match can expose
-a large materialization penalty in Ibex; that penalty is recorded as an engine
-boundary rather than hidden by reverting to a different query shape.
-
-After restoring the local Parquet fixture to SF-1 (the first full check had
-accidentally been run against SF-2), the complete implemented-answer check is
-green: q01–q09, q10–q13, and q14–q22 all report `OK`.
-
-q04 is the first follow-up: it now keeps the raw orders relation on the left of
-the semi join, filters only the lineitem side before joining, and applies the
-order-date predicate afterward. At eight cores it measured **69.24ms** before
-alignment and **393.22ms** after alignment; `q04` executes correctly. The gap is
-the same materialization boundary exposed by q02.
-
-### Pass-3 software-pipelined prefetch, second attempt (2026-08-18)
-
-The earlier "Pass-3 software prefetch check" above patched the vendored
-`robin_hood.h` directly to expose the probe bucket; this attempt instead kept
-the change entirely inside `chunked.cpp` (`ChunkedAggregateOperator`), to
-check whether the earlier result was specific to that implementation. A
-`RobinHoodShadow<Map>` struct mirrors `Table`'s private member layout (order
-and sizes taken from the vendored header's own "members are sorted so no
-padding occurs" comment: `mHashMultiplier`, `mKeyVals`, `mInfo`,
-`mNumElements`, `mMask`, `mMaxNumElementsAllowed`, `mInfoInc`,
-`mInfoHashShift`), `reinterpret_cast` onto the live map to read those fields,
-and a `static_assert(sizeof(RobinHoodShadow<Map>) == sizeof(Map))` plus a
-runtime check against the public `mask()` guard against a silent layout
-drift — a guard trip disables the prefetch rather than reading garbage, and a
-wrong address is inert (`PREFETCHh` never faults), so the failure mode is a
-wasted hint, not a correctness bug. The shadow was verified standalone first
-(a throwaway harness against the vendored header confirmed `mMask`/`size()`
-agreement and that the computed index matched a real key's found location).
-
-Pass 3's probe loop (the `KeyPartition` `find`/`emplace` loop, shared by
-`q18`'s single-int-key path and `q20`'s exact `PairIntKey` path) was changed
-to compute row `i+K`'s bucket via `prefetch_probe_hint` and issue
-`__builtin_prefetch` on it before the real `find`/`emplace` for row `i`,
-falling back to no prefetch for the loop's last `K` rows. `Hash{}` (the same
-hash type parameter the map itself uses) was reused so the prefetch computes
-the identical `keyToIdx` index arithmetic, minus the `*info` half that
-prefetching has no use for.
-
-For this experiment only, the working PairIntKey call site (q20) was left
-exercising the plain `try_discover_partitioned` path — the two-level
-experiment above was already reverted from the tree before this work started,
-so no bypass was needed; q20 and q18 both ran the same instantiation, just
-with prefetching added.
-
-**Correctness.** All 185 `ctest` cases under `-R "ggregat|roup"` passed, and
-`uv run benchmarking/tpch/check_answers.py q18 q20` reported `OK` for both.
-
-**Measurement.** `benchmarking/ab_queries.py` (base = pre-patch `ibex_eval`,
-target = patched, `IBEX_CORES=8`, SF-1 data, interleaved paired runs):
-
-| K | repeats | q18 delta | q20 delta | geomean | verdict |
-|---|---:|---:|---:|---:|---|
-| 8  | 12 | +2.7% | -2.2% | — | unclear (both queries) |
-| 8  | 26 | -0.6% | -0.2% | -0.4% | same (both under the 2% floor) |
-| 16 | 16 | +3.1% | +0.7% | +1.9% | unclear (q18), same (q20) |
-
-Output was byte-identical on every run. At `K=8` with enough repeats to
-resolve the noise (26 paired runs), both queries land inside the practical-
-effect floor and the paired signed-rank test calls both "same." `K=16` did not
-change the verdict — its q18 pairs were still statistically inconclusive at
-16 repeats, and its geomean is not distinguishable from zero given q18's own
-noise band.
-
-**Verdict: reverted, no material win.** This corroborates the earlier
-vendor-header attempt's conclusion (that one measured an outright regression;
-this one measures a wash) via an independent, in-tree-only implementation, so
-the result is not an artifact of the earlier header patch specifically. The
-shared explanation is the one already on record two sections up ("Why Polars
-is not blocked by the same boundary"): pass 3's cost is the group-discovery
-boundary itself — one shared mutable table per partition, one probe per row —
-and reordering *when* the probe happens does not change *how much* work each
-miss costs. Lookahead adds a second hash computation (`Hash{}(key_at(...))`)
-per row on top of the real probe's own hash, which eats into whatever latency
-the prefetch hides; that is consistent with `K=16`'s slight lean positive
-(q18 +3.1%, i.e. slower) rather than negative. `RobinHoodShadow`,
-`prefetch_probe_hint`, and the pass-3 lookahead loop were removed from
-`chunked.cpp`; the working tree's `src/runtime/chunked.cpp` is unchanged from
-`HEAD`. A future win here still needs the partition-owned aggregate API noted
-in that section, not a cheaper probe for the same access pattern.
-
-### What looking for the third collapse actually found
-
-Chasing "which grouping implementation should survive" turned up a hash
-pathology instead (`6215c88`). `median(v) by {a, b}` over 1M rows: **517ms at
-9800 groups, 20ms at 5000**, same row count. Not the aggregate, not the group
-count — the key hash.
-
-`hash_key_row` combines with boost's `hash_combine` over `std::hash<int64_t>`
-(the identity on libstdc++) and never finalizes. `hash_combine` does not diffuse
-into the low bits, and `KeyRowIndex` masks the low bits to pick a slot, then
-probes linearly. For two small integer keys the result is nearly `b + (a << 6)`,
-a linear function of the key, so probing degenerates into one cluster. One
-`fmix64` fixes it: **12.9x**, and the 6000→9800 ramp (29/102/258/411/523ms)
-flattens to 31/31/33/43ms.
-
-It hid because it needed **both** multiple keys and a particular table size. A
-single key was always fine — dense integers map to consecutive slots, the best
-case rather than the worst, 100k groups in 67ms. Two keys at 5000 groups in an
-8192-slot table were fine; the same load factor at 9800 in a 16384-slot table was
-not. Different mask width, different aliasing. Any sweep that varied only one of
-those two dimensions would have concluded there was no bug.
-
-Two lessons worth keeping:
-
-* **Three copies of one hash, and the drift bit immediately.** Adding the
-  finalizer to `hash_key_row` and `hash_key_value` left `chunked.cpp`'s
-  `mix_one` behind, and a test failed within one run with a duplicated group —
-  the exact failure the header comment predicts in as many words. The same
-  combine also feeds `multi_cat_find_or_insert`, the chunked aggregate's
-  open-addressed index over small dense categorical codes, which is the ideal
-  input for the pathology; it is finalized too. This is the I4 thesis in one
-  incident: the hazard is not that two implementations exist, it is that a
-  constant is written out more than once.
-* **Two hypotheses were measured and discarded first** — per-group heap
-  indirection (flattening the slot array changed nothing) and group count itself
-  (a single key handles 100k groups in 67ms). Both were plausible and both were
-  wrong, and each cost one build.
-
-**I5 — `gather_column`'s `exec` argument is optional, so half the callers gather
-serially by omission** — **RESOLVED**. `lazy_table.cpp` (5 sites) and the chunked
-join passed `exec_`; `filter.cpp` and `update.cpp` (2 sites) did not. Nothing in
-the signature said which was intended, and the serial ones carried no comment
-saying they were deliberate. A defaulted `nullptr` is the wrong shape for a
-decision this consequential.
-
-`exec` is now required, so every site states its choice:
-
-* the filter's staged compaction gather now passes the query's context — it had
-  one in scope all along and was serial purely by omission;
-* the two per-group slice gathers in `update.cpp` pass `nullptr` **with a
-  reason**: each is one task of a per-group fan-out, so a nested split would
-  only oversubscribe, and a single group's slice is far below the row floor;
-* `gather_column_with_nulls` and the join's `gather_entry` grew the parameter
-  too, which is what put the join's output-assembly gather on the parallel path.
-  Its sentinel-carrying branch stays serial — it branches per row and writes a
-  validity bit beside each value, which is a different kernel.
-
-### Gate and threshold divergence
-
-**I6 — Nine private row thresholds coexist with the two `ExecutionContext`
-knobs** (high)
-
-`parallel_min_rows` (65536) and `parallel_min_cells` (512k) are described as
-"the same knob the rest of the engine gates on". In practice:
-
-| Constant | Value | Site |
-|---|---|---|
-| `parallel_min_rows` | 65536 | islands, `for_row_ranges`, filter bounds, sort, update bucketing, lazy keep-rows |
-| `kMinProbeRows` | 16384 | join probe (both impls) |
-| `kMinParallelPredicateRows` | 262144 | semi/anti predicate |
-| `kMinRows` | 32768 | distinct packed |
-| `kMinRowsPerMorsel` | 65536 | filter bounds, aggregate (×3) |
-| `kDefaultPartitionMinRows` | 262144 | group discovery, int/string keys |
-| `kPackedPartitionMinRows` | 32768 | group discovery, packed key |
-| `kMinRowsPerWorker` / `kMinSplitRows` | 32768 | update bucketing |
-| `kParallelDecodeMinRows` | 65536 | parquet readers |
-| `kMinTailBytes` | 4 MiB | aggregate slot fill |
-| `kMinParallelConcatRows` | 65536 | join probe concat |
-
-Each was measured, and per-operator break-evens genuinely differ — that is not
-the problem. The problem is that a test or a benchmark cannot move them: setting
-`parallel_min_rows = 0` (which the tests do, to reach the worker path on small
-tables) turns on *some* fan-outs and not others, and there is no way to sweep the
-rest without recompiling. *Convergence:* keep per-operator break-evens, but
-express them as `ExecutionContext`-scaled multiples rather than free constants.
-
-**I7 — `parallel_min_cells` is consulted by exactly two of ~30 sites** (medium).
-Only `island_is_worth_morselizing` (`chunked.cpp:10292`) and
-`gather_rows_parallel` (`sort.cpp:294`) test width. The stated finding behind the
-knob — "131,072 rows won at 6 columns and *lost* at 2, on the same predicate;
-every row threshold puts those on the same side" — applies verbatim to the
-filter gather, the join concat, and the aggregate emit, none of which check it.
-
-**I8 — Two authorities on whether a query is parallel** — **RESOLVED**. The
-decoder's `parallel_readers` explicitly documented that it must never read the
-environment, because that would be a second authority free to disagree with the
-`ExecutionContext`. But `parallel_join_probe_enabled()` (`IBEX_JOIN_PROBE`) was
-called from three probe gates and `stream_scans_enabled()` (`IBEX_STREAM_SCAN`)
-from three scan seams — six `getenv`s behind two settings.
-
-Both are now `ExecutionContext` fields (`parallel_join_probe`, `stream_scans`)
-applied by `configure_parallel_from_env`, as `parallel` already was, and all
-three env readers share one `env_flag` parser so their accepted spellings cannot
-drift apart. The behavioural change is deliberate and follows the precedent
-documented at `interpreter.cpp`'s no-context `interpret()` overload: a caller
-that builds its own `ExecutionContext` now ignores these two variables, which is
-the only spelling for "ignore the environment". Every production entry point
-reaches `configure_parallel_from_env`, so nothing user-facing changes.
-
-**I9 — Worker-count caps differ arbitrarily** (low). `min(budget, pool, 64)` in
-the join probe, group discovery, and distinct; `min(..., 16)` in the aggregate
-slot fill; `min(budget, pool)` with no cap in sort, semi/anti, and the aggregate
-emit; `kMaxMorsels = 64` for morsel counts in filter and aggregate. The 64 and
-the 16 are undocumented.
-
-**I10 — The aggregate output emit gates group count against a rows
-threshold** (low). `chunked.cpp:8176` reads
-`n_groups_ >= exec_->parallel_min_rows` — the work there really is per group, so
-comparing to a row threshold is a unit mismatch that happens to be
-conservative. Either it wants its own constant or the knob wants a name that is
-not about rows.
-
-**I11 — Some gates construct the pool before deciding they do not want it**
-— **RESOLVED** (2026-08-21). The distinct packed partition gate and the
-semi/anti `select_rows` now test `exec.parallel` (and the other always-serial
-conditions) *before* touching `process_worker_pool()`, and
-`island_worker_count` returns 0 up front when `exec.parallel` is off — a
-serial island, which the contract already requires to be byte-identical.
-`IBEX_PARALLEL=0` no longer pays for N eager pool threads on a large query.
+- **I1 — three answers for "can this column type gather in parallel?"** —
+  **RESOLVED.** `gather_column` was a divergent second copy of the `gather_rows`
+  kernel; now written in terms of it, 64-row-aligned ranges via `for_row_ranges`
+  make bit-packed `bool` safe everywhere. `TwoPhaseFilterOperator` stays separate
+  by design (writes at a prefix-summed offset — a different operation).
+- **I2 — String/Categorical silently excluded from three fan-out decisions for
+  three reasons** (`stageable_conjunct_columns` width; `evaluate_field_maybe_parallel`
+  Int/Double only; parallel partial-agg Int/Double only). Each reasonable; no
+  shared "is this type parallel-capable in role X" predicate.
+- **I3 — multi-key Categorical group discovery has no partitioned path**
+  (`multi_cat_find_or_insert` is serial). Unmarked in code.
+
+### Serial-path vs chunked-path divergence
+- **I4 — whole-table operators (`filter/aggregate/join/sort/update.cpp`) vs the
+  chunked reimplementations; parallel coverage differs sharply.** Corrected twice:
+  every entry point routes through the chunked engine (`interpret()` →
+  `build_operator` → chunked → `MaterializeOperator`); the whole-table functions
+  run *only* for a subtree beneath a declined node (Median/quantile/EWMA) *within
+  one statement* — a `let` boundary means they almost never run. So this is a
+  drift hazard and a cleanup tax, not a user-facing perf gap.
+  - **Distinct COLLAPSED** (`74f6e32`); **inner join COLLAPSED** (worktree after
+    `6f0a03e`, kept whole-table signature, delegates to
+    `ChunkedInnerJoinOperator`); **sort** already converged (no duplicate radix).
+  - **Aggregate is NOT a collapse** — a median aggregate is itself the declining
+    node, so `aggregate_table` runs at top level for every median query, and a
+    mixed `median(x)+sum(y)` needs both in one pass. The escape hatch is design.
+    I4 is complete at 2 of 3; the goal was zero *duplicated* implementations.
+  - Coverage test lesson: write it as a **single statement** and mutation-check,
+    or it verifies the operator it already had (a bind-then-aggregate test hits
+    the chunked path and never the fallback).
+- **The `6215c88` hash pathology (LANDED, 12.9×).** `median(v) by {a,b}` over
+  1M rows: 517ms at 9800 groups, 20ms at 5000 — same row count. `hash_key_row`'s
+  `hash_combine` over identity `std::hash<int64_t>` never finalizes, so for two
+  small int keys the result is ~`b + (a<<6)`, linear, one probe cluster. One
+  `fmix64` fixes it; the 6000→9800 ramp flattens 29/102/258/411/523 → 31/31/33/43ms.
+  Needed *both* multi-key and a specific table size to show — a sweep varying one
+  dimension misses it. The finalizer had to be added in three places
+  (`hash_key_row`, `hash_key_value`, `mix_one`, `multi_cat_find_or_insert`) —
+  I4's thesis: the hazard is a constant written more than once.
+
+### Gate / threshold divergence
+- **I5 — `gather_column`'s `exec` was optional, so half the callers gathered
+  serially by omission** — **RESOLVED**, `exec` now required; surfaced I15.
+- **I6 — nine private row thresholds** (`parallel_min_rows` 65536, `kMinProbeRows`
+  16384, `kMinParallelPredicateRows` 262144, `kDefaultPartitionMinRows` 262144,
+  …) coexist with the two `ExecutionContext` knobs. Per-operator break-evens
+  genuinely differ; the problem is a test/benchmark can't sweep them without
+  recompiling. *Convergence:* express as `ExecutionContext`-scaled multiples.
+- **I7 — `parallel_min_cells` (width) consulted by 2 of ~30 sites**
+  (`island_is_worth_morselizing`, `gather_rows_parallel`). The finding behind it
+  ("131k rows won at 6 cols, lost at 2") applies verbatim to filter gather, join
+  concat, aggregate emit — none check it.
+- **I8 — two authorities on whether a query is parallel** — **RESOLVED.**
+  `IBEX_JOIN_PROBE` / `IBEX_STREAM_SCAN` are now `ExecutionContext` fields set by
+  `configure_parallel_from_env`, one shared `env_flag` parser.
+- **I9 — worker-count caps differ arbitrarily** (`min(...,64)` / `min(...,16)` /
+  uncapped). The 64 and 16 are undocumented. (low)
+- **I10 — aggregate emit gates group count against a *rows* threshold** — unit
+  mismatch, conservative. (low)
+- **I11 — some gates build the pool before deciding they don't want it** —
+  **RESOLVED** (2026-08-21): test `exec.parallel` before `process_worker_pool()`.
 
 ### Structural
-
-**I12 — The runtime has two species of thread and only one was accounted for**
-— **PARTLY RESOLVED**, and reframed. The original entry called the raw
-`std::thread` in `PipelinedStageOperator` an exception to the nesting policy. It
-is better understood as a *second kind of thread* that the runtime had no
-vocabulary for.
-
-`WorkerPool` runs short, independent, non-blocking bodies to completion and joins
-them. A **stage thread** is the opposite of all three: long-lived, and it parks
-on its consumer's ring backpressure before each child pull. Hosting that on the
-pool would be the actual bug — the producer's child chain (usually a scan
-pipeline, the most parallel thing in the query) would lose every fan-out to the
-`on_worker_pool_thread()` guard, and a fixed pool cannot safely hold occupants
-that block on another thread's progress: N producers parked on backpressure with
-a consumer that needs a pool batch to drain them is a deadlock.
-`scan_pipeline_worker_count`'s reserved thread already reasons about that hazard
-from the other side.
-
-So the raw thread stays. What was wrong is that nothing could tell it apart from
-the calling thread. Now `on_stage_thread()` names it, `StageThreadScope` marks it
-and keeps a live count plus a monotonic peak, and the profile header reports
-`pool_threads` and `stage_threads_peak` — the process runs
-`decode_thread_count()` plus one per staged breaker, and previously nothing
-bounded or reported the sum.
-
-**It had already corrupted a measurement.** `ExecutionProfileScope` split on a
-binary `on_worker_pool_thread()`, so a stage thread fell into the `else` and its
-work was charged to main-thread self time *concurrently with the real main
-thread*. That made `self_ms` exceed `wall_ms` on exactly the queries with
-`pipelined_stages > 0`, and inflated `serial_self_ms` — the number the scheduler
-decision is read from — by 79ms across PDS-H SF-1 (884.0 -> 805.0 once
-`stage_self_ns` was split out). Fixed.
-
-**What remains** is the design question: the two species should be explicit in
-the primitive, not one on the books and one beside it. Go hands off the M on a
-blocking syscall; Tokio keeps a separate `spawn_blocking` pool.
-
-This was filed as an INPUT to the scheduler track. With that track dropped, it
-stands on its own — and it shrank, because the accounting gap that motivated
-half of it is closed: a stage thread's lifetime, its work, and both kinds of
-park it can take are now measured, and they balance to 99.9%. What is left is
-ergonomics rather than a blind spot. (`stream_buffered.hpp`, which also
-detached a thread for in-process stream sources, was removed entirely on
-2026-08-22 — its only consumer was its own e2e test; the kafka plugin never
-used it — so the stage thread is now the runtime's only non-pool species.)
-
-**I13 — Cancellation reaches islands and scan pipelines, not intra-operator
-fan-outs** (medium). `interrupt_requested()` appears in
-`ParallelIslandOperator`, `PipelinedScanOperator`, and `PipelinedStageOperator`
-only. A long parallel gather, probe, group discovery, or partial aggregation is
-not interruptible — consistent with the documented "per node/chunk/statement,
-NOT mid-operator" contract, but the gap grows every time an operator gets a
-bigger parallel section.
-
-**I14 — Two island-grain philosophies, both correct, neither cross-referenced**
-(low). `island_grain` derives the grain from the **thread count** (4 morsels per
-thread), so island morsel boundaries vary with the machine — fine, because
-islands do only element-wise work. The aggregate deliberately derives its morsel
-count from the **row count** so the float reduction order does not vary with the
-machine. `evaluate_field_maybe_parallel` reuses `island_grain` and is safe only
-because its results are element-wise. Nothing warns the next author that reusing
-`island_grain` inside a reduction would make results machine-dependent.
-
-**I15 — The join's output assembly fans out once per COLUMN; the sort fans out
-once for the whole table** (medium). Found while resolving I1/I5, and measured
-rather than assumed.
-
-`gather_entry` (`join.cpp`) is called in a loop over output columns, so with
-`exec` threaded through it now submits and waits one batch **per column**.
-`gather_rows_parallel` (`sort.cpp`) avoids exactly this: it builds
-(column x range) tasks and submits **one** batch, precisely because a column
-count is a poor divisor and per-column barriers do not amortize.
-
-Measured on the local bench (9 interleaved repeats, 8 cores, base = the commit
-before I1/I5): `inner_join_user` +1.84% and `inner_join_symbol` +4.95%, both
-verdict `noise` and both well inside the ±13% per-query floor — so this is not a
-regression. But it is not a win either, on a 1M-row output that clears the
-65536-row gate and therefore *is* fanning out. The per-column barrier is
-plausibly eating the parallel gather it buys.
-
-**RESOLVED.** `gather_columns_batched` (`runtime_internal.hpp`) now holds the
-sort's task shape as a shared primitive: it builds (column x range) tasks across
-*all* the columns and submits **one** batch, with 64-aligned ranges, and takes a
-`gather_whole(j)` callback for the tasks that cannot be split — a string, or a
-job the caller marked `indivisible`. Those still run concurrently with the other
-columns, which is the point.
-
-It had **two** instances, which is I4 in miniature: `join_table_impl` in
-`join.cpp` *and* `ChunkedInnerJoinOperator`'s own `gather_with_validity` loop in
-`chunked.cpp`. The second is the one the `inner_join_*` benchmarks actually
-exercise, so fixing only the first would have left the measured symptom
-untouched — worth remembering as evidence for how much the duplicate engines
-cost. Both now call the one shared helper rather than growing a copy each.
-
-Two things fell out. `gather_entry` lost its `ExecutionContext` parameter
-entirely: with the fan-out decided once, one level up, every caller passed
-`nullptr`, and a parameter that is always null implies a choice that no longer
-exists. And the chunked join's `has_right_nulls` — computed and then dropped on
-the floor while `gather_column_with_nulls` rescanned inside every column's
-gather — is now the `indivisible` flag, scanned once per side.
-
-Measured (same harness, 9 interleaved repeats, 8 cores): geomean 1.021x, total
--1.96%, 34/34 `noise`. `inner_join_symbol` went +4.95% -> 0.00% and
-`inner_join_user` +1.84% -> -2.33% against their respective baselines, so the
-per-column barrier was indeed costing what it looked like. Sorts drifted the
-other way this run (+1.8% to +3.7%, having been -0.6% to -2.7% last run), which
-is the ±13% per-query floor doing its thing and not a signal.
-
-This is the same lever as [[project_join_parallelism]]'s "assemble_output is the
-other half"; the build side remains unthreaded on purpose.
+- **I12 — two thread species, one on the books** — **PARTLY RESOLVED.** The raw
+  `std::thread` in `PipelinedStageOperator` is a distinct kind: long-lived, parks
+  on consumer backpressure. Hosting it on the pool would deadlock (N producers
+  parked, consumer needs a pool batch to drain them). Now `on_stage_thread()`
+  names it, `StageThreadScope` counts it, the profile reports `stage_threads_peak`.
+  It had corrupted a measurement (stage work charged to main-thread self time,
+  `self_ms > wall_ms`; fixed by splitting `stage_self_ns`). Remaining: make the
+  two species explicit in the primitive. `stream_buffered.hpp` (also detached a
+  thread) removed 2026-08-22.
+- **I13 — cancellation reaches islands and scan pipelines, not intra-operator
+  fan-outs.** Consistent with the "per node/chunk/statement, not mid-op"
+  contract; the gap grows each time an operator gets a bigger parallel section.
+- **I14 — two island-grain philosophies** (island grain from thread count;
+  aggregate morsel count from row count for FP determinism). Nothing warns the
+  next author that reusing `island_grain` inside a reduction breaks determinism.
+- **I15 — join output assembly fanned out once per COLUMN; sort fans out once for
+  the table** — **RESOLVED.** `gather_columns_batched` now holds the sort's
+  single-batch (column × range) shape; had two instances (`join.cpp` +
+  `ChunkedInnerJoinOperator`), both collapsed. `gather_entry` lost its now-always-
+  null `exec` param. Measured neutral (the per-column barrier was eating the
+  gather it bought).
 
 ### Not inconsistencies (recorded so they are not "fixed")
-
-* Build side of a hash join is never threaded — measured at 1.5% of q10 against
-  the probe's ~15%.
-* The prefix sums in `TwoPhaseFilterOperator` and `try_discover_partitioned` are
-  serial on purpose: O(morsels), not O(rows).
-* A refused island runs as one whole-table chunk rather than a serial morsel
-  sweep. This looks like a missing code path; it is the fix for a measured 3×
-  regression.
-* `parallel_threads` deliberately does **not** cap the scan pipeline; that is
-  the one consumer the extra decode threads were added for.
+- Hash-join build side is never threaded — 1.5% of q10 vs the probe's ~15%.
+- Prefix sums in `TwoPhaseFilterOperator` / `try_discover_partitioned` are serial
+  on purpose: O(morsels), not O(rows).
+- A refused island runs as one whole-table chunk, not a serial morsel sweep —
+  fix for a measured 3× regression.
+- `parallel_threads` deliberately does not cap the scan pipeline.
 
 ---
 
-## Suggested order of attack
+## Status of the "order of attack"
 
-This list was originally sequenced against one larger track, a real task
-scheduler, with roughly half of Part 2 — **I6, I9, I10, I11, I12, I14**, and
-parts of **I7** and **I13** — deferred to it on the grounds that a scheduler
-where submitting is cheap and joining does not park a thread would rewrite the
-physics behind those numbers.
+Items 1–6 (I8 into context; I1+I5 one gather family; I15 single-batch assembly;
+barrier instrumentation; price the scheduler; close the accounting) — **all
+done**. Closure is 99.6% on the pool, 99.9% on stage threads.
 
-**That track is now dropped** (item 7), so those items are no longer waiting on
-anything. They are still low priority, but for the ordinary reason — they are
-small — rather than because a rewrite is coming. (A second track — weakening
-first-occurrence group ordering — was considered and REJECTED; see below.)
+**Item 7, the task scheduler — DROPPED, on measurement.** `pool_idle_ms` and
+`stage_park_ms` are ~0 across all 22 queries while ~67% of the pool sits with
+nothing queued: no thread is ever blocked behind another's work, so stealing has
+nothing to steal. Re-measured 2026-08-21 at `190235b` (39 commits on): occupancy
+30.4→32.8%, `pool_idle_ms` still ~0. Revisit only if occupancy rises far enough
+that queues build.
 
-1. ~~**I8** — move `IBEX_JOIN_PROBE` / `IBEX_STREAM_SCAN` into
-   `ExecutionContext`.~~ **Done.** Small, and it restores the "single authority"
-   property the decoder already relies on — which is also what gives a scheduler
-   A/B a context-level switch to bisect with instead of a `getenv`.
-2. ~~**I1 + I5** — one gather kernel family, `exec` non-optional.~~ **Done.**
-   Removed the largest single source of type-dependent divergence, and wanted
-   doing *before* the scheduler: a scheduler multiplies the number of
-   concurrently live gather sites, so shipping it on top of three disagreeing
-   rules is how a heisenbug gets in. Measured neutral-to-positive (geomean
-   1.012x over join/sort/filter/bool, 34/34 verdicts `noise`), and it surfaced
-   I15.
-3. ~~**I15** — give the join's output assembly the sort's single-batch
-   (column x range) task shape.~~ **Done**, in both engines, via a shared
-   `gather_columns_batched`. It needed doing twice, which is itself an argument
-   for the next item.
-4. ~~**Instrument the barriers.**~~ **Done.** Barrier count, barrier wait, ring
-   wait, stage self-time, worker backpressure park.
-5. ~~**Run the counters across PDS-H and price the scheduler.**~~ **Done**, and
-   it answered the question in the negative — see the measured section above.
-6. ~~**Close the accounting.**~~ **Done.** Pool threads parked with an empty
-   queue (`6350918`) and stage producers (`8f3b6d8`). Closure is 99.6% on the
-   pool and 99.9% on stage threads, so no further instrumentation is warranted
-   and none is planned. The stage work found and fixed a double-count that an
-   over-100% closure exposed.
-7. ~~**The task scheduler.**~~ **DROPPED.** Demoted four times and now refused
-   outright, on measurement rather than inference. `pool_idle_ms` and
-   `stage_park_ms` are both 0.0 across all 22 queries while 68.6% of the pool
-   sits with nothing queued: no thread is ever blocked behind another's work, so
-   there is nothing for stealing to steal. A scheduler redistributes
-   parallelism; it does not manufacture it. Revisit only if a future change
-   raises occupancy far enough that queues actually build.
+**Item 8, I4 collapse** — done at 2 of 3 (above).
 
-   **Re-measured 2026-08-21 at `190235b`** (39 commits after the `6f0a03e`
-   verdict above, `benchmarking/profile_suite.py 8`) after a question about
-   whether the 3-day-old numbers were stale enough to distrust — they were
-   worth re-checking, and the verdict survives:
+**Item 9, create parallel work in the five idle-dominant queries (q13/q21/q18/
+q10/q20)** — the standing structural lever in place of the scheduler. Sub-status:
+- Intra-operator fan-out (q04 semi-join build) — **DONE** `7fde36d`
+  (`init_int_swapped` parallelized; q04 ~−39% earlier, now decode-bound).
+- Join `assemble_output` (q21/q20/q09) — **not a live target**: I15 already made
+  it cheap and parallel; what dominates is `ring_wait` on the right-side scan, a
+  producer-side cost.
+- The aggregate (q13/q18/q10/q20) — the one genuinely open thread. Every
+  probe-cost trick tried and rejected (prefetch, hash reuse, packed-key domain
+  narrowing, two-level grouping, pass-3 shortcuts — see
+  memory: `project_reverted_perf_dead_ends`).
+  A real win needs a **partition-owned aggregate API** (owns a partition from key
+  discovery through mergeable state). First piece LANDED `4fedf2a4` (PairIntKey,
+  q20 −15-18%); Int64 single-key slice + the ordered-run finalize are the live
+  work — see `owned-agg-per-chunk-barrier-plan.md` and
+  memory: `project_q21_is_occupancy_bound`.
 
-   | | `6f0a03e` (2026-08-18) | `190235b` (2026-08-21) |
-   |---|---|---|
-   | occupancy (`pool_work_ms` / capacity) | 30.4% | 32.8% |
-   | parked with nothing queued (`pool_unqueued_ms` / capacity) | 69.2% | 66.9% |
-   | worker backpressure park (`pool_idle_ms` / capacity) | 0.0% | ~0.01% (2.1 of 15430.2ms) |
-   | closure | 99.6% | 99.7% |
-
-   Occupancy moved a couple points — real work landed in between (decode
-   threading, parallel fused Parquet filter scans, dictionary sharding) — but
-   `pool_idle_ms` is still, for all practical purposes, zero everywhere. The
-   fact the scheduler track's refusal rests on (nothing ever sits queued
-   behind a busy worker, so there is nothing to steal) is current, not stale.
-   Reentrant/work-stealing pool machinery is still not justified by measurement
-   as of this commit. This does NOT bear on the *separate* raw-thread-count
-   problem found the same day in the "Generalization attempt (2026-08-21)"
-   section below — `pool_idle_ms` only accounts for the pool's own workers,
-   and the runaway raw `std::thread`s from `build_binary_materializing_operator`
-   were never pool workers, so they don't show up in this number either way.
-8. **I4** — collapse the duplicated implementations, keeping the whole-table
-   signatures. **Promoted** from after the scheduler, since there is no longer a
-   scheduler to come after. It is no longer a gate on item 9: the standard
-   aggregates in q13/q18/q10 already use the chunked implementation. Order
-   within it is set by completeness:
-   ~~distinct~~ (done, `74f6e32`) / ~~inner join~~ (done, worktree after
-   `6f0a03e`) / ~~sort's radix path~~ (already converged; no duplicate), then
-   the aggregate once the chunked one covers Median, quantile, and EWMA.
-9. **Create parallel work, targeted at the five queries holding half the idle
-   machine.** q13, q21, q18, q10, q20 account for 3113 of 6486ms of unqueued
-   pool time — 48% of the waste in 22.7% of the queries. Attack per operator,
-   biggest first: the aggregate (q13/q18/q10, gated on item 8), then join
-   `assemble_output` (q21/q20/q09), then intra-operator fan-out for the 1:1
-   operators. This replaces the scheduler as the structural lever.
-
-   **Re-checked 2026-08-20, all three sub-targets found further along than
-   this entry suggests — do not restart any of them without re-reading
-   below.**
-   - **Intra-operator fan-out (the q04 case)**: DONE, see the q04 section
-     below — landed same-day as its own diagnosis, just never marked here.
-   - **Join `assemble_output` (q21/q20/q09)**: re-profiled fresh
-     (`IBEX_PROFILE_OPERATORS=1`, SF-1, 8 cores) — in all three queries the
-     join node's `pool_work_ms` is small and `ring_wait_ms` accounts for
-     essentially all of `next_self_ms` (q09: 48.1/48.2ms; q21: comparable
-     shape from this session's earlier q21 profiling). That means the join
-     itself already assembles its output cheaply and in parallel (this is
-     what I15's `gather_columns_batched` fix — item 3, already DONE — was
-     for); what actually dominates is the main thread parked waiting on the
-     right-side scan/decode, which is a **producer-side** cost per the
-     "Idle is not automatically reclaimable" section below, not a
-     reclaimable join-assembly gap. This sub-item is not a live target as
-     stated; if it's worth pursuing at all, it's really a decode-throughput
-     or multi-producer question (see the "Open structural question" below),
-     not a join fix.
-   - **The aggregate (q13/q18/q10/q20)**: unchanged — this is the one
-     sub-target genuinely still open, and it's already the most-explored
-     item in this document (prefetch, hash reuse, packed-key domain
-     narrowing, two-level grouping, pass-3 shortcuts — all tried, all
-     measured, all rejected, see the sections above). The document's own
-     conclusion stands: a real win needs a partition-owned aggregate API,
-     not another probe-cost trick. Treat every previously-tried idea here as
-     closed; re-attempting one without new evidence repeats
-     [[project_query_shape_conformance_regression]]'s Mechanism-3/5 mistake
-     from the same session this note was written in.
-
-     **Partition-owned status (2026-08-22).** The first production piece of
-     that API landed (`4fedf2a4`): the PairIntKey shape runs default-on for
-     q20's `by { l_partkey, l_suppkey }` shape (-14.9% to -18.1% at 8 cores,
-     kill switch `IBEX_DISABLE_OWNED_PAIR_AGG=1`). The Int64 single-key
-     prototype (q18's shape) measured only -7.6% row-wise / flat
-     partition-outer against the ≥10% bar, was never promoted past its
-     `IBEX_AGG_PARTITION_MODE` env gate, and has been **removed** from the
-     tree — recoverable from `4fedf2a4` if a widening of the owned path ever
-     wants its two-ordering comparison back.
-
-   **Net effect: item 9 as originally scoped is now much closer to done than
-   open.** The one real remaining thread is the aggregate's partition-owned
-   architecture question, which is a bigger project than "create parallel
-   work" implied — and the producer/consumer ring-wait pattern surfacing in
-   q04/q09/q21 alike points at the "Open structural question" below
-   (multiple producers per staged breaker) as the more promising next
-   direction than another operator-level pass.
-10. **I2 + I3** — the type exclusions and the missing multi-Categorical
-    partitioned discovery, once there is a shared predicate to hang them on.
-11. **Elide the first-occurrence merge when nothing downstream reads the order**
-    — see below. Small, and last, because it is worth less than it looks.
-
-### Open structural question
-
-Every ring in the engine runs dry and none ever runs full — producers park on a
-child's ring for 42% of their lifetime and on their own output ring for 0.0ms.
-So ring *depth* is irrelevant and producer *count* is the constraint. Worth
-settling whether a staged breaker should have several producers before tuning
-any single operator inside one.
-
-### First pass at the multiple-producers question (2026-08-20) — refined, not answered; STOPPED before writing code
-
-Asked to dig into the question above. Session context: this followed the
-[[project_query_shape_conformance_regression]] investigation, and a fresh
-Ibex-vs-Polars core-scaling measurement (published artifact, SF-2, PDS-H)
-showed Ibex winning single-threaded (0.85x Polars) but losing badly by 8
-cores (1.46x Polars' time; suite speedup 1->8 cores 1.83x vs Polars' 3.15x)
-— independent, suite-level confirmation of this document's own "machine is
-mostly idle" diagnosis, which is what motivated returning to this plan
-instead of chasing more individual queries.
-
-**First checked whether this document's other findings were still current
-before trusting them** (a lesson learned the hard way earlier the same
-session, see [[feedback_engine_owns_join_order]] and the
-query-shape-conformance plan's own corrections). Two were stale:
-
-- The **q04 finding** ("q04, the query that exposed both errors" section
-  above — semi-join build side fully serial, unimplemented) turned out to
-  already be fixed, commit `7fde36d`, landed the same day the diagnosis was
-  written but never marked done here. See that section's own addendum.
-- **Item 9's "join `assemble_output` (q21/q20/q09)" sub-target** turned out
-  to already be resolved too (I15's `gather_columns_batched`, already
-  landed) — re-profiled fresh and those joins' `assemble_output` is cheap
-  and parallel; what dominates their wall time is `ring_wait_ms` on the
-  right-side scan, a producer-side cost, not a join-assembly gap. See the
-  addendum on item 9 above.
-
-**Then investigated the actual question — "should a staged breaker have
-several producers" — and it turned out to need reframing, not a yes/no.**
-`IBEX_PARALLEL_STATS=1` across q04/q09/q13/q18/q10/q20/q21 shows
-`stage_threads_peak`/`pipelined_stages` already reaching 2-3 concurrently
-(q09: 2, q18: 3, q10: 2), and q09 also shows `parallel_probes=5` — the
-architecture already runs multiple concurrent producers when the plan
-shape naturally produces them (nested streamable joins, deferred/dynamic-key
-probes). So "only one producer, ever" is not quite the finding.
-
-**The real gap, found by comparing occupancy across sibling scans/filters
-within one query, not by re-deriving the suite-wide 70% figure**: in q10,
-the lineitem-derived filter (node 47) runs at **65% pool occupancy** — real,
-already-parallel work — while a much smaller, logically-independent filter
-on `orders` (node 46) runs at only **18.5% occupancy** in its own separate
-time window (13.3ms of q10's 39.9ms wall). Nothing in `orders` depends on
-lineitem's result — they only combine at the join afterward — but
-`build_operator` recurses depth-first through a left-deep join chain, so
-each right-hand table's decode only *starts* when that specific join node is
-reached in the recursion; `orders`' decode doesn't begin until the lineitem
-side of the chain ahead of it has resolved. 65% + 18.5% = 83.5% < 100%, so
-there is real, quantifiable slack for the two to run concurrently instead of
-back-to-back. Rough sizing against q10's own wall time: up to ~10-30% wall
-reduction on queries with more than one meaningfully-sized non-dominant
-scan, if that overlap were realized — real, not the whole gap, and every
-table read through this repo's own pattern query files at SF-1/SF-2 sizing
-suggests most PDS-H tables besides lineitem/orders are small enough that
-the win concentrates in queries touching lineitem AND orders AND a third
-sizeable table together (q10, q03, q09 are the closest matches measured so
-far; q05/q07/q08 not yet checked).
-
-**The concrete mechanism, not yet implemented**: every table's `LazyTable`
-is already resolved (schema known, ready to decode) before query execution
-begins — the driver builds `lazy_sources` for every source up front (see
-`repl.cpp`'s `evaluate` lambda, referenced earlier in this document). What
-never happens is starting a table's *decode* before the join that consumes
-it is actually reached. The fix shape would be: kick off the next
-not-yet-consumed base table's decode on a background thread (the same
-raw-`std::thread` pattern `PipelinedStageOperator` already uses, not a pool
-submission — nesting a pool submission inside another would hit
-`WorkerPool`'s non-reentrant guard) as soon as its `LazyTable` is known,
-rather than waiting for `build_operator`'s depth-first recursion to reach
-that join node. This is architecturally different from what
-`PipelinedStageOperator` already does (overlap ONE scan's decode with ITS
-OWN immediate consumer) — this would overlap decode of table N+1 with the
-join/build work for tables 1..N, a genuinely new axis of overlap.
-
-**STOPPED here, deliberately, before writing any code.** This exact
-subsystem (`chunked.cpp`'s pipelining and materialize boundaries) has a
-five-times-reverted track record in this same session
-([[project_ascribe_pipeline_barrier]] / Mechanism 5 in the
-query-shape-conformance plan) — every attempt at "let something run more
-eagerly/concurrently" hit a subtle multi-consumer or
-materialize-then-drain interaction that cost more than it won, including
-one unreproduced hang. A "prefetch the next table's decode" change touches
-the same territory (when a lazy source's `cache_` gets written, from which
-thread, consumed by whom) and deserves the same caution.
-
-**Two candidate next steps for whoever resumes this, not yet chosen
-between:**
-1. **De-risk the estimate first**: a controlled synthetic benchmark — two
-   independent large Parquet scans, decoded sequentially vs. deliberately
-   concurrently via a throwaway harness outside any real query plan or
-   `chunked.cpp` code path — to confirm the ~65%-occupancy-leaves-~35%-slack
-   arithmetic actually delivers real wall-clock savings on this box before
-   any production code changes.
-2. **Scope narrowly against a real query**: pick ONE query where the
-   opportunity is clearest (q10, per the measurement above) and design the
-   minimal, single-call-site version of "prefetch the next table" rather
-   than a general mechanism, following this session's now-repeated lesson
-   (Mechanism 3, Mechanism 5) that a heuristic checked against one or two
-   cases and generalized too early has repeatedly cost more than it won on
-   this codebase.
-
-Neither was started. **This is the correct resume point for the next
-session on this specific thread** — do not re-derive the above from
-scratch; start from "de-risk via synthetic benchmark" or "scope against
-q10," whichever the session decides, with this section's numbers as the
-starting evidence.
-
-### De-risk synthetic benchmark (2026-08-20) — result: real, ~15%
-
-Chose option 1. `libs/parquet/bench_multi_producer.cpp` (+ its
-`add_executable` in `libs/parquet/CMakeLists.txt`, target
-`ibex_bench_multi_producer`) decodes `lineitem`'s and `orders`' actual q10
-columns via `LazyTable::project()` — the real Parquet decode path — outside
-any query plan or `chunked.cpp` code path: sequential (lineitem then orders)
-vs. concurrent (orders decoded on a raw `std::thread`, matching
-`PipelinedStageOperator`'s own pattern, while the main thread decodes
-lineitem), interleaved A/B per this repo's own methodology
-([[project_bench_interleaved_methodology]]), against SF-2 Parquet.
-
-**Result, three independent runs (`IBEX_CORES=8`, 15-20 interleaved reps
-each):**
-
-    sequential median  concurrent median  delta
-    72.33 ms            61.13 ms          15.5% faster
-    73.08 ms            61.13 ms          16.4% faster
-    72.19 ms            61.85 ms          14.3% faster
-    70.75 ms            59.22 ms          16.3% faster
-
-Consistently ~14-16%, squarely inside the ~10-30% estimate the occupancy
-arithmetic (65% + 18.5% = 83.5% < 100%) predicted, and reproducible across
-runs on the same box — not noise. **The slack is real and does convert to
-wall-clock savings**, which was the open question this experiment existed to
-answer before touching `chunked.cpp`.
-
-This does not by itself validate the *production* mechanism sketched above —
-it shows the two decodes CAN overlap productively, not that wiring
-"start table N+1's decode as soon as its `LazyTable` is known" into
-`build_operator`'s recursion is safe or captures the same win once real
-join/build work, ring backpressure, and the worker pool's own contention are
-in the loop. That is exactly the part this session's five-times-reverted
-history warns about (see the STOPPED note above) and is still unstarted.
-
-The throwaway harness was left in the tree after this experiment ("cheap to
-keep, useful for re-checking"), and has since been **deleted** (2026-08-21):
-the thread it de-risked is abandoned — the production overlap was removed
-entirely — which is exactly the "delete it" condition. Its measurement lives
-here; `git log` has the file if the number ever needs re-checking.
-
-**Resume point, updated:** the de-risk step is done and passed. The next
-step is "scope narrowly against q10" (option 2 above), still unstarted —
-design the minimal single-call-site "prefetch the next table" change in
-`build_operator`/`chunked.cpp`, with the same caution as every other attempt
-in this territory this session.
-
-### POC against q10 (2026-08-20) — landed, real but smaller than the synthetic estimate; not generalized
-
-Scoped to exactly one call site: the `is_streamable_inner_join` branch of
-`build_operator_impl`'s `Join` case (`chunked.cpp`). When the right side has
-no deferred probe registered (that path stays sequential by necessity — its
-filter is derived FROM the left/build side, so it cannot start early), a raw
-`std::thread` now runs the right side's `materialize_row_local` concurrently
-with `build_operator(left)`, joining before the `ChunkedInnerJoinOperator` is
-constructed — same pattern `PipelinedStageOperator` already uses, not a pool
-submission.
-
-**Guarded, not unconditional.** Two real hazards, not hypothetical ones:
-`ModelResult*` isn't thread-safe (skip when `model_out != nullptr`), and
-`LazyTable::cache_` is a plain, unsynchronized `robin_hood::unordered_map` —
-confirmed by reading `lazy_table.cpp`, not assumed — so decoding the same
-`LazyTable` from two threads at once would race. The right side must resolve
-to a single base `Scan` (peeled through Project/Rename/Update/Filter — a new
-`through_filter` flag on the existing `base_scan_of` helper, shared with
-`deferred_probe_scan_of`, defaulted off there so its own matching semantics
-don't silently widen) whose source name does not already appear anywhere in
-the left subtree (`subtree_scans_source`, new) — which rules out self-joins
-and repeated bindings.
-
-**First landed version was a silent no-op** — worth recording since it
-wasted a benchmarking round: `base_scan_of` originally didn't peel through
-`Filter`, and q10's `orders`/`customer` right-hand sides are `Filter(Scan)`
-after predicate pushdown, not bare scans. The guard evaluated false on every
-join and the "before/after" comparison showed no difference, which read as
-"doesn't help in practice" until a one-line `IBEX_DEBUG_OVERLAP` stderr print
-(added, used, then removed) showed `overlap=0` on all three joins. Lesson:
-when a guarded fast path shows zero measured effect, check whether it fired
-before concluding it doesn't help — this one hadn't run at all.
-
-**Result, once actually firing** (`right=__ibex_source_2`/`__ibex_source_1`
-confirmed via the same debug print, i.e. 2 of q10's 3 joins — the third,
-`…join lineitem`, correctly stays sequential because it legitimately holds a
-deferred probe): correctness — `IBEX_PARALLEL=1` vs `=0` byte-identical
-diff, all 22 `check_answers.py`, full `ctest` (1643/1643) twice, the second
-run specifically to catch intermittent concurrency flakiness now that the
-path is real. Performance — interleaved A/B against a separately-built
-baseline binary (not just before/after in place, to avoid exactly the
-mistake above from recurring), SF-1, `IBEX_CORES=8`, `IBEX_PROFILE_OPERATORS=1`
-wall_ms for the query's top-level entry, 8 paired runs:
-
-    base:    162.2 143.3 197.5 177.3 129.1 138.3 136.8 127.0   median 140.8
-    patched: 139.3 147.0 166.2 130.3 117.6 129.6 123.1 119.1   median 129.9
-
-Patched faster in **8 of 8** paired runs (binomial p ≈ 0.008, one-sided) —
-consistent despite a noisy box (the run-3 outliers on both sides), median
-**~8% faster**. Smaller than the synthetic harness's ~15%: expected, not a
-red flag — only 2 of 3 joins are eligible here (the deferred-probe join is
-correctly excluded), and the two producers now compete with the rest of the
-query's own pool work rather than having the whole 8-core pool to themselves
-the way the isolated benchmark did.
-
-**Explicitly not generalized, per this session's decision.** Left untouched:
-the `streamable_semi_anti` sibling branch (same shape, same argument would
-apply), `build_binary_materializing_operator` (the non-streaming join
-fallback and `Matmul`'s shared choke point — touching it would cover more
-operators at once but was deliberately out of scope for a POC), and any
-attempt to widen `overlap`'s eligibility beyond "right resolves to one base
-scan" (e.g. letting the right side itself be a small join). Next session:
-decide whether to generalize now that the mechanism is proven, or stop here
-— this section plus the diff in `chunked.cpp` (search `POC` there) is the
-resume point either way.
-
-**Generalization attempt (2026-08-21) — two of three reverted, net result
-flat.** Tried all three items above. Landed one, reverted two, after full-suite
-measurement (not just q10) showed why:
-
-1. *Widened `overlap`'s eligibility* at the original `is_streamable_inner_join`
-   site: dropped "right resolves to one base scan" in favor of a general
-   `subtrees_share_source(a, b)` (walks both arbitrary subtrees, checks for a
-   common `Scan` source) — kept. Full-suite interleaved A/B, 6 paired rounds,
-   SF-1, `IBEX_CORES=8`: geomean **-0.16%**, i.e. flat within noise. q10 itself
-   showed ~-3% here (smaller than the original isolated ~-8%, as expected —
-   more of the pool is contended once the whole suite, not just one query,
-   competes for it). No query regressed outside the noise band once re-checked
-   with more rounds (q11/q21 both looked like +5-7% "regressions" on a first
-   6-round pass and shrank to noise — -1.6%/+3.6% — on a second, dedicated
-   5-round pass; q06, which the diff doesn't touch at all, moved +4.4% on the
-   same first pass, confirming that band is box noise, not signal).
-2. *Same overlap in `streamable_semi_anti`*: added, then reverted. Isolated via
-   interleaved A/B (same methodology): q04 regressed **+19%**, reproduced
-   cleanly on a dedicated re-run of just q04/q06/q07/q08/q09/q19 with the
-   inner-join widening alone active (q04 was the only one of those still
-   moved; the rest were back to noise). q04's `exists` semi join's right side
-   is not the cheap single-scan case the original POC was scoped to, and
-   competing with the left side's own pool work for the join's build lost more
-   than the overlap gained.
-3. *Same overlap in `build_binary_materializing_operator`* (join fallback +
-   `Matmul`): added, then reverted — this was the dominant loss. q09 alone
-   went **+57%** with all three generalizations active; disabling only this
-   one dropped it back to ~+5% (within noise once re-measured interleaved).
-   Root cause: this choke point is where deeply nested join chains land (q09's
-   6-way join lowers to nested binary joins that *each* hit this function), so
-   each nesting level spawned another producer thread that itself recursed
-   into more pool submissions — oversubscribing the pool rather than
-   overlapping two genuinely idle cores the way the single-scan q10 case does.
-   The POC's "no model output, no shared source" safety gate says nothing
-   about *how much pool work* either side does, and at this choke point that
-   turned out to be the thing that mattered.
-
-**Lesson for next time a `chunked.cpp` change generalizes past its original,
-measured call site: re-measure the full suite, not the query that motivated
-the POC, and interleave — a first-pass 6-round full-suite table flagged two
-queries as regressed that were noise, and would have flagged q04 as fine
-had q04 not been in the initial per-query breakdown at all.** Net state after
-this session: item 1 kept (flat-to-slightly-positive, no measured downside),
-items 2 and 3 reverted with the reasoning above left in `chunked.cpp` as
-comments at both call sites, so a future attempt starts from what already
-failed rather than re-discovering it.
-
-**Root cause, restated precisely, and the proposed fix for next time.** The
-regression is not "the pool schedules badly" — item 7 above, re-measured the
-same day, confirms `pool_idle_ms` is still ~0 everywhere, so there is no
-demand-side scheduling problem for a smarter/reentrant pool to solve here.
-The actual defect is that the overlap's raw `std::thread`s live entirely
-outside `WorkerPool`'s accounting. `submit()` refuses reentrant calls from a
-pool worker (`on_worker_pool_thread()`, `worker_pool.cpp:408` —
-non-reentrant, "outermost wins, inner levels degrade to serial" by design),
-which is exactly why the overlap used a raw thread instead: it needed to run
-concurrently with a *non-pool-worker* caller. But nothing bounds how many of
-those raw threads pile up — `build_binary_materializing_operator` is
-recursive, so q09's 6-way join spawns up to one raw thread per nesting level,
-each also submitting its own decode/compute work into the same fixed
-`threads_`, oversubscribing physical cores under deep join trees even though
-`WorkerPool` itself never grows.
-
-**Suggested fix (not yet built): give the pool a global cap on concurrently-
-live "helper" threads, budgeted against the *compute* budget
-(`compute_thread_count()`, not decode's deliberately-oversubscribed
-`threads_` — compute measurably regresses under oversubscription per §1.2's
-"two thread budgets" table).** Concretely: `WorkerPool::try_acquire_helper()
--> bool` / `release_helper()` backed by one atomic counter. Every raw-thread
-overlap site calls `try_acquire_helper()` before spawning; on failure it
-falls back to the existing sequential path, exactly the way inner pool
-submissions already degrade under the non-reentrant guard. Recursion then
-self-limits — q09's join tree spawns helpers until the budget's exhausted,
-then serializes — instead of growing unboundedly with tree depth. This is
-deliberately NOT reentrant/work-stealing submission machinery (item 7's
-"nothing to steal" finding argues against building that), and it does not
-touch `submit()`'s contract at all; it is a second, independent budget
-sitting next to the pool rather than a change to how the pool schedules its
-own queue. Still a `WorkerPool`-adjacent core-file change with whole-engine
-blast radius (every parallel path shares the same pool/header), so it should
-land and be verified on its own — full ctest + full-suite A/B against the
-existing decode/compute fan-outs, checking nothing already-working regresses
-— *before* re-attempting the two reverted generalizations (items 2 and 3
-above) under the new cap.
-
-**Built (2026-08-21), and the diagnosis above was wrong about q09's actual
-mechanism.** `HelperThreadSlot` landed as designed — an RAII budget slot,
-one atomic counter, budgeted against `compute_thread_count()`, only
-acquired when a call site's other structural-safety checks already pass
-(an earlier version acquired unconditionally, wasting a slot on
-structurally-ineligible calls; tightened before this measurement). Wired
-into the surviving `is_streamable_inner_join` site as a pure refactor
-first — full-suite interleaved A/B confirmed behavior-neutral (+0.15%
-geomean) after tracking down one persistent-looking regression (q22, +4%
-in two separate runs including with binary-swap order reversed) to pure
-noise, proven with a temporary debug counter showing `HelperThreadSlot` is
-never even constructed during q22's execution (its only join is `left
-join`, not `Inner`).
-
-Then re-enabled both reverted sites (`streamable_semi_anti`,
-`build_binary_materializing_operator`) under the budget. **Both still
-regressed** — q09 +47.5%, q04/q18 also worse — and this time the budget's
-absence wasn't a plausible excuse: a temporary entry-count trace showed
-`build_binary_materializing_operator` is hit **exactly once** for q09 (the
-lineitem join is its only 2-key join; everything else in the 5-way chain
-is single-key and goes through `is_streamable_inner_join` instead), and
-`streamable_semi_anti` is hit exactly once each for q04 and q18. There was
-never a recursive pile-up for the budget to bound at any of these three
-queries — re-testing at budget=1, 2, and 8 all gave q09 the same
-~230–250ms, conclusively ruling out thread-count as the mechanism.
-
-So the original diagnosis — "recursion spawns one raw thread per nesting
-level, oversubscribing the machine" — was wrong, or at least incomplete,
-for these specific queries. The actual cost is structural:
-`build_binary_materializing_operator` fully materializes **both** sides
-(unlike `is_streamable_inner_join`, which builds the left as a cheap lazy
-operator and only materializes the right), so overlapping two
-already-expensive full materializations contends for the same
-cores/memory bandwidth instead of filling idle ones. Why `streamable_semi_anti`
-loses despite sharing the asymmetric lazy-left shape is still unexplained —
-worth a similar profiling pass if this is revisited, rather than assuming
-it is the same mechanism.
-
-Both re-enablements reverted a second time; `HelperThreadSlot` and the
-tightened `is_streamable_inner_join` site are kept, since that part is
-verified real and safe. Net state: exactly the same reachable behavior as
-before this sub-investigation, plus a budget mechanism that is correct and
-tested but has, so far, not found a case it actually helps. A future
-attempt at the two reverted sites needs a **cost-aware** gate (e.g. skip
-when both sides are large/expensive to materialize), not a thread-count
-one — and should profile *why* before generalizing again, not just
-re-measure after.
-
-**Removed entirely (2026-08-21), ahead of the kernel-pipeline restructure.**
-With both generalizations dead and the surviving site worth only ~3% on q10
-in-suite, the whole remnant went: the `is_streamable_inner_join` overlap
-(raw `std::thread` + `subtrees_share_source` + `subtree_scans_source`) and
-`HelperThreadSlot` itself. The join builder is back to serial
-left-build-then-right-materialize. The measurement record above is the
-durable asset; recover the code from `38d6b307`/`190235b2`/`a3b39c6d` if a
-cost-aware gate is ever justified. Branch concurrency now has zero
-footprint in the builder — the kernel-pipeline plan's "no concurrent
-independent branches until measured worthwhile" starts from a clean slate.
-`PipelinedStageOperator`'s stage thread is untouched: it is the
-source-to-breaker overlap the pipeline executor wants to keep, not a
-branch-concurrency experiment.
+**Items 10–11** (type exclusions; elide the first-occurrence merge when the
+consumer provably ignores order) — small, unstarted, worth less than they look.
 
 ---
 
-## Deferred-probe streaming: stopped, code removed, reopening conditions
+## Multiple producers per staged breaker — investigated, largely reverted
 
-The deferred-probe streaming plan (and its selectivity-cost-model scoping
-follow-up) were removed from the tree on 2026-08-22 after this sequence;
-this section is the durable residue. Full history: git history at the
-removal commit's parent (`deferred-probe-streaming-plan.md`,
-`deferred-probe-selectivity-cost-model-plan.md`).
+The suite-wide "70% idle, producers are the bottleneck everywhere" motivated
+asking whether a staged breaker should have several producers. Findings:
 
-**What happened.** Stage 1 (mapping `LazyTable`/deferred-probe/`DeferredScanSourceOperator`
-onto the existing demand machinery) landed and is production. Stage 2 (a
-streaming probe path for bare, unwrapped probe scans, `c5ab31ca`) was
-instrumented as unreachable — every registering query resolves via
-`try_two_phase_probe` first — and was removed. Stage 3 (admitting a row-local
-`Filter` above the probe scan) was measured and reverted: q03 won 2.6–3.2×
-at 1 core by finally reaching the *existing* two-phase mechanism, but q12
-collapsed at 2/8 cores because its build side (`orders`, unfiltered,
-referentially complete) covers the probe key domain — the Bloom rejects
-nothing and the whole apparatus is pure overhead. Stage 4 was never started.
+- The engine already runs 2–3 concurrent producers when the plan shape produces
+  them (nested streamable joins, deferred-key probes: q09 peak 2, q18 3).
+- The real gap is **sibling scans that could overlap but don't**: in q10 the
+  `orders` filter runs at 18.5% occupancy in its own 13ms window while the
+  independent lineitem filter runs at 65% — `build_operator` recurses depth-first
+  through the left-deep join chain, so `orders`' decode doesn't start until the
+  lineitem side resolves. Synthetic A/B (`bench_multi_producer.cpp`, since
+  deleted) confirmed **~15%** real wall savings from decoding the two
+  concurrently.
+- **POC against q10** (`is_streamable_inner_join` branch, raw `std::thread` runs
+  the right side's materialize concurrently with `build_operator(left)`, guarded
+  on single-base-scan + no shared source + no `ModelResult`): landed, ~8% on q10
+  in isolation, ~3% in-suite.
+- **Generalization — reverted.** Widening eligibility (`subtrees_share_source`):
+  kept, flat. Same overlap in `streamable_semi_anti`: q04 +19%. In
+  `build_binary_materializing_operator`: q09 +57% — that choke point materializes
+  **both** sides, so overlapping two expensive full materializations contends for
+  bandwidth instead of filling idle cores.
+- **`HelperThreadSlot`** (RAII budget slot vs `compute_thread_count()`) was built
+  to bound the raw threads — but a trace showed q09 hits the choke point exactly
+  once, so thread count was never the mechanism. The cost is structural
+  (both-sides materialization), not oversubscription.
+- **All of it removed 2026-08-21** ahead of the kernel-pipeline restructure. The
+  join builder is serial left-build-then-right-materialize again; branch
+  concurrency has zero footprint. Recover from `38d6b307`/`190235b2`/`a3b39c6d`
+  if a **cost-aware** gate (skip when both sides are large) is ever justified.
+  `PipelinedStageOperator`'s stage thread is untouched.
 
-**The trap worth keeping verbatim.** Stage 3's first cut had a real
-correctness bug caught by `check_answers.py` before any benchmarking:
-`try_two_phase_probe`'s `Precomputed` branch computes its `li`/`ri` output
-indices from a hash probe over candidate rows *before*
-`interpret_wrapped_right` runs the wrapper chain — sound while the chain is
-Project/Rename/Update (always 1:1), wrong the moment a newly-admitted Filter
-can drop rows there, desyncing precomputed indices from the shorter
-`right_`. This class — an old "this scan is never Filter-wrapped" invariant
-silently baked into a hash-probe-then-materialize shortcut — will recur
-anytime probe-side eligibility widens.
+## Deferred-probe streaming — stopped, code removed
 
-**Reopening conditions (the selectivity cost model, scoped but unbuilt).**
-The registration gate is a row-count proxy
-(`build_side_worth_deferring`: estimated build rows × 2 < probe rows); it
-cannot see key-domain coverage, which is what the decision needs. Three
-prior attempts already rule out the obvious designs: a structural
-"was this side filtered" proxy (reverted, −10.3% suite — wrongly declines
-q08's unfiltered-but-genuinely-small `part`); sampled distinct counts; and
-footer distinct counts (inflated on `l_orderkey`-shaped columns). The
-surviving candidate: trace the build key's origin table via
-`column_origin_of` and compare that table's own row count to the build
-side's estimated filtered rows — q03-shaped joins (filtered build side over
-a larger domain) pass, q12-shaped (unfiltered, referentially complete)
-decline at registration time. Validation gates if built: q03/q12/q08 as the
-pass/decline/decline trio, `check_answers.py` both `IBEX_PARALLEL`
-settings, and the full-suite interleaved A/B that killed Stage 3.
+Stage 1 (mapping onto the demand machinery) landed and is production. Stage 2
+(streaming probe for bare probe scans) was instrumented unreachable, removed.
+Stage 3 (admitting a row-local Filter above the probe scan): q03 won 2.6–3.2× at
+1 core by finally reaching the *existing* two-phase mechanism, but q12 collapsed
+— its unfiltered `orders` build side covers the probe key domain, so the Bloom
+rejects nothing. **Trap worth keeping:** `try_two_phase_probe`'s `Precomputed`
+branch computes `li`/`ri` from a hash probe *before* the wrapper chain runs —
+sound while that chain is 1:1, wrong the moment a Filter can drop rows there.
+Reopening needs the selectivity cost model — see
+memory: `project_deferred_probe_selectivity_scoping`.
 
 ---
 
 ## Rejected: weakening first-occurrence group ordering
 
-Considered and turned down on 2026-08-17. Recorded because the argument for it
-is genuinely tempting from inside the engine, and someone will make it again.
+Turned down 2026-08-17. Recorded because the argument is tempting from inside the
+engine and someone will make it again.
 
-**The proposal.** A group-by currently emits groups in first-occurrence order.
-The partitioned discovery path (`try_discover_partitioned`) therefore ends with
-a SERIAL first-occurrence merge that assigns global ids in row order. Declare
-the output order unspecified — at least for the hash case — and that merge
-disappears, the partitioned path can emit partition-by-partition, and grouped
-aggregation can stream its output instead of materializing every group first.
+**Proposal:** declare group-by output order unspecified (at least for the hash
+case) → the serial first-occurrence merge in `try_discover_partitioned`
+disappears, the partitioned path emits partition-by-partition, grouped
+aggregation streams its output.
 
-**Why not.** The prize is far smaller than the framing suggests. Measured on
-q18 at 3M groups, which is the worst case because the merge is O(groups) and
-not O(rows) (see `fill_slots_parallel`'s comment):
+**Why not:** the prize is ~26ms of ~172ms on q18 at 3M groups (O(groups), the
+worst case) and proportionally less everywhere. Against it: (1) it **spends the
+determinism contract** — byte-identical serial/parallel output is what makes
+every threshold in Part 1 a free parameter; (2) it blunts the main verification
+method (`diff <(IBEX_CORES=1) <(IBEX_CORES=8)`); (3) it is a breaking change to
+user scripts — Ibex is `data.table`-inspired, where `by=` preserves first
+appearance.
 
-    80ms  parallel discovery probe
-    44ms  slot fill
-    26ms  serial first-occurrence merge   <- the prize
-    12ms  key-array growth
-    10ms  accumulate
-
-That is ~15% of one operator at extreme cardinality, and proportionally less
-everywhere else. Against it:
-
-* **It spends the determinism contract**, which is the best property this
-  codebase has. Byte-identical serial/parallel output is what makes every
-  threshold in Part 1 a free parameter — movable at any time without a
-  correctness argument. Trading that for 26ms is a bad trade.
-* **It blunts the main verification method.** `diff <(IBEX_PARALLEL=1 ...)
-  <(IBEX_PARALLEL=0 ...)` is how I8, I1/I5 and I15 were each checked. Under
-  unspecified group order that degrades to "sort both, then diff", which still
-  catches a wrong value but no longer catches a row misassociated with its key.
-* **It is a breaking change to user scripts**, and Hyrum's Law applies with
-  force to a default that has held since day one. Ibex is `data.table`-inspired,
-  where `by=` preserves first appearance and `keyby=` sorts, so users arrive
-  expecting exactly this. The repo has already been bitten from the other
-  direction — see the note about `data.table`'s `merge()` sorting the join key.
-
-**What to do instead (item 9).** The win is available with no language change:
-elide the merge at PLAN level when the consumer provably does not read the
-order. A group-by feeding an `order`, a scalar aggregate, or a join has dead
-output ordering, and that instance can emit partition-by-partition. Mechanically
-this is a *required-ordering* property propagating DOWN the plan, mirroring the
-`ordering` property that already propagates up through `TableProperties`.
-Strictly better than the language change: no user decision, nothing breaks, the
-test methodology survives, and it captures the cost exactly where it is free.
+**Do instead:** elide the merge at PLAN level when the consumer provably ignores
+order (feeds an `order`, a scalar aggregate, or a join) — a *required-ordering*
+property propagating DOWN the plan. No language change, nothing breaks, captures
+the cost where it is free. This is item 11.
 
 ---
 
-## Measured: where the main thread's time actually goes
+## Measured: where the main thread's time goes (PDS-H SF-1, 8 cores)
 
-PDS-H SF-1, `IBEX_CORES=8`, `build-release`, quiet box, two runs per query with
-only the second parsed.
-
-**This table was wrong twice before it was right.** Both errors inflated
-"serial", and both were misattributed idle: stage-thread work (79ms, fixed by
-`stage_self_ns`) and ring parks (374ms, fixed by `RingWaitScope`). The first
-version of this section reported 805ms serial and concluded that the residue was
-mostly serial algorithms. It is not.
+This table was wrong twice before it was right — both errors inflated "serial"
+and were misattributed idle (stage-thread work 79ms; ring parks 374ms).
 
 | | ms | share of self |
 |---|---|---|
@@ -1759,194 +241,26 @@ mostly serial algorithms. It is not.
 | — parked on a pipeline ring | **386.2** | 31.1% |
 | pool worker work | 3053.2 | |
 | pool worker backpressure park | **0.0** | |
-| barriers issued | 249 | |
 
-**64% of the main thread's non-worker time is idle, not serial.**
+**64% of the main thread's non-worker time is idle, not serial. The machine is
+~70% empty** — pool occupancy 29.7%, `pool_unqueued_ms` 69.2% of capacity,
+closure 99.6%. Total real work `(3053 + 443) / 1286.9` = **2.72× on 8 cores**.
 
-**And the machine is 70% empty.** Pool capacity is `8 x 1286.9` = 10295 thread-ms;
-3053 is used. Occupancy is **29.7%**, and that figure is now trustworthy —
-`pool_idle_ms` measures 0.0 on all 22 queries, so no worker ever parked on
-backpressure and `pool_work_ms` was never inflated. Total real work
-(3053 + 443) / 1286.9 wall = **2.72x achieved on 8 cores**.
+Per-query spread: q02 97.1% empty, q16 85.1%, q22 89.5% (small queries run on one
+thread); q06, the most parallel, still 38.8% empty.
 
-The 70% is pool threads sitting in the pool's own `work.wait()` with **nothing
-queued**. That is a different thing from a parked worker.
+Stage producers: `stage_park_ms` is 0.0 on all 22 queries — a producer never
+once filled its ring and waited for the consumer. Combined with `pool_idle_ms ==
+0.0`: **nothing in this engine is ever blocked by a downstream consumer being too
+slow. Consumers wait on producers, never the reverse.**
 
-### The empty pool, measured rather than inferred
+**The three idle kinds want different treatment:**
+- **Barrier park** (~420ms) — a work-participating `join` recovers only ~47ms
+  (3.6% of wall); the work still has to be done.
+- **Ring park** (~374ms) — mostly the producer side being the bottleneck, often
+  correct not wasteful (q06 is 98.7% idle because the query genuinely has nothing
+  for the main thread to do).
+- **Serial work** (~443ms) — the only part needing algorithmic attention.
 
-The paragraph above derived the 70% by subtraction: capacity minus what the
-counters saw. Given that this profiler had already misreported the serial figure
-three times, a number nothing measures directly was not a number to plan on. It
-is now measured, by `pool_idle_between` over a per-thread park ledger sampled at
-query start and end. Sampled rather than accumulated for one specific reason: a
-thread parked before the query and still parked when it ends never wakes inside
-the window, so it never gets a chance to add to any counter — the fully-idle
-thread, the one that matters most, is exactly the one a counter cannot see.
-
-The report now prints `pool_unqueued_ms` next to `pool_capacity_ms`, so the
-accounting closes or visibly fails to:
-
-| | ms | share of pool capacity |
-|---|---|---|
-| pool capacity (`wall x pool_threads`) | 9853.6 | 100% |
-| — worker work (`pool_work_ms`) | 2997.9 | 30.4% |
-| — worker backpressure park (`pool_idle_ms`) | 0.0 | 0.0% |
-| — **parked with nothing queued** (`pool_unqueued_ms`) | **6815.2** | **69.2%** |
-| unaccounted | 40.5 | 0.4% |
-
-**Closure: 99.6%.** The inferred 70% was right, and there is no fourth bucket.
-The residual 0.4% is sampling skew — a park that closes between reading a
-thread's two ledger fields — and it lands on both sides across queries (a few
-rows read slightly over 100%), so it is noise, not a missing term.
-
-This is the first number in this document that was confirmed rather than
-corrected. It also makes the per-query spread visible, which the subtraction
-could not: **q02 is 97.1% empty, q16 85.1%, q22 89.5%** — the small queries are
-running almost entirely on one thread — while q06, the most parallel query in the
-suite, is still 38.8% empty. Nothing here is anywhere near saturating the pool.
-
-### The other thread species: stage producers
-
-The pool is one of two kinds of runtime thread, and the same question applies to
-the other. A `PipelinedStageOperator`'s producer is long-lived and blocks on
-another thread's progress, so it cannot live in the pool — and having its own
-thread meant having its own accounting hole. `stage_self_ms` measured its work;
-nothing measured its idle.
-
-It parks on **two different rings**, and the distinction turns out to be the
-whole story:
-
-| | ms | |
-|---|---|---|
-| stage thread lifetime (`stage_live_ms`) | 184.4 | 100% |
-| — producing (`stage_self_ms`) | 107.1 | 58.1% |
-| — parked on its CHILD's ring (`stage_ring_wait_ms`) | 77.1 | 41.8% |
-| — parked on its OWN output ring (`stage_park_ms`) | **0.0** | **0.0%** |
-
-**Closure: 99.9%.**
-
-The two need opposite treatment, which is why conflating them showed up
-immediately. A park on the child's ring happens *inside* the producer's profile
-scope, so it is already inside `stage_self_ms` and has to be **subtracted**, like
-every other park. A park on its own output ring happens between pulls, outside
-every scope, so it has to be **added** from the ledger. The first version of this
-measurement added both, and the stage accounting closed at **144%** with
-`stage_self_ms` equal to `stage_live_ms` to one decimal — an over-100% closure
-is what caught it, which is the argument for printing the denominator at all.
-
-**`stage_park_ms` is 0.0 on all 22 queries.** A producer never once filled its
-ring and waited for the consumer to drain it. Combined with `pool_idle_ms == 0.0`
-this is the same result from a third angle: *nothing in this engine is ever
-blocked by a downstream consumer being too slow.* Every ring in the system runs
-dry, never full. The producers are the bottleneck, everywhere, without exception.
-
-And it revises the producer's own numbers: what was reported as 178ms of producer
-work is really **107ms of work and 77ms of waiting on its child**. 42% of stage
-thread lifetime is inherited idle, passed up from a scan that cannot fill the ring
-fast enough.
-
-### What the zero tells us
-
-`pool_idle_ms == 0.0` everywhere is the useful negative result: workers never run
-a full window ahead of their consumer, so the bottleneck direction is
-unambiguous — **consumers wait on producers, never the reverse.** The large
-`ring_wait_ms` said the same thing; this confirms it from the other side.
-
-Which reframes the whole scheduler question. **The problem is not that threads
-block badly; it is that there is not enough queued work to fill them.** A
-scheduler redistributes parallelism, it does not manufacture it. So the lever is
-*more and finer parallel work* — parallelizing serial blocks like q04's
-semi-join, finer grain, more operators running concurrently — rather than better
-scheduling of the work that already exists. That is an argument for demoting the
-scheduler relative to the concrete serial blocks.
-
-### Idle is not automatically reclaimable
-
-The three kinds want different things, and conflating them is what produced two
-wrong conclusions in a row:
-
-* **Barrier park (419.6ms)** — the caller waiting on a batch it submitted. A
-  work-participating `join` makes it a W+1th worker, shortening each batch by
-  ~1/9 at W=8, so the recoverable slice is **~47ms, 3.6% of wall**. The park is
-  large; the recovery is bounded by the work still having to be done.
-* **Ring park (373.6ms)** — the consumer waiting on a producer it does not
-  control. This mostly means **the producer side is the bottleneck**, and is often
-  correct rather than wasteful: q06 is 98.7% idle because a scan-filter-sum
-  query's main thread genuinely has nothing to do. A scheduler only reclaims it
-  where there is other ready work, and a sequential plan often has none.
-* **Serial work (443.5ms)** — the only part that needs algorithmic attention, and
-  now half what it appeared to be.
-
-### The open question this leaves
-
-Not the accounting any more — all four kinds of park are measured, and the
-producer-side fix turned out to change nothing. What is unmeasured is **pool
-threads with no task queued at all**, which is 70% of the machine. Instrumenting
-that means timing the pool's own `work.wait()` and attributing it to the query
-rather than to an operator, since an empty pool belongs to no operator.
-
-That number would say whether the 70% is unavoidable (the plan genuinely has no
-parallel work available at that moment) or addressable (work exists but is not
-being queued). Until it is measured, "the scheduler is worth X" remains
-unanswerable — but the 2.72x against a 8x machine, with zero worker
-backpressure, already points at supply of work rather than its scheduling.
-
-### q04, the query that exposed both errors
-
-Reported as 100% serial. It is not, and Polars gets 1.94x on it where Ibex gets
-1.55x (SF-1 recorded suite: polars 39.9ms / polars-st 77.5ms, ibex 53.5ms /
-ibex-st 82.8ms — note Ibex is also 6.8% slower single-threaded here, one of the
-few PDS-H queries where it is).
-
-Warm per-node profile:
-
-| node | build_self | next_self | ring_wait | pool_work |
-|---|---|---|---|---|
-| `join semi keys=1` | 16.7 | 28.4 | 28.3 | **0.0** |
-| `scan __ibex_source_1` | 0.0 | 20.3 | 20.2 | 113.3 |
-
-So q04 is decode-bound — 125ms of parallel decode, with the main thread parked on
-the ring — plus **one genuinely serial block: the semi-join's build, 16.7ms of a
-63.9ms wall (26%), with zero pool work and zero barriers.**
-
-That block is `init_int_swapped` (`chunked.cpp:3476`), a serial loop over
-3,793,296 right-side keys probing a 57,218-entry map:
-
-    for (std::size_t i = 0; i < rcol.size(); ++i) {
-        if (rnull(i)) continue;
-        if (auto it = seen.find(rcol[i]); it != seen.end()) it->second = char{1};
-    }
-
-Two gates decline, for different reasons. The left-side parallel predicate path
-(`select_rows`) needs `kMinParallelPredicateRows` = 262144 and q04's left is
-57,218 rows — a correct decline. The right-side intersection pass has **no
-parallel path at all**; it was never written. The documented position that "the
-build side is never threaded, 1.5% of q10 against the probe's 15%" was measured
-on q10, where the build is small; after the build-side swap that made q04 -39%,
-q04's build IS the query.
-
-It parallelizes cleanly and deterministically: the pass only ever sets a flag,
-never inserts, so `seen` is immutable throughout. Store a dense index instead of
-a flag, give each worker a `vector<char>` over 57k slots (~57KB), and OR them —
-byte-identical, no atomics. Sizing: 16.7ms of 63.9ms wall.
-
-**DONE — landed same-day as this diagnosis, commit `7fde36d` ("Parallelize the
-semi-join's swapped-build intersection scan"), never marked here.** Caught
-2026-08-20 when asked to resume this plan: the design above is implemented
-verbatim in `init_int_swapped` (`chunked.cpp`, `intersect_worker_count` +
-per-worker `vector<char>` + OR-merge, gated the same way `kMinParallelPredicateRows`
-gates the left-side pass). Re-profiled fresh rather than trusted stale:
-`join semi keys=1` now shows `pool_tasks=8`, real `pool_work_ms`, and the
-node's remaining time is essentially all `ring_wait_ms` (waiting on the
-right-side scan/decode, not the build) — the genuinely-serial block this
-section identified is gone. Wall-clock also moved: SF-1/8-core Ibex q04
-53.5ms → **~31.5-33ms** (warmup 3/iters 8), Polars 39.9ms → **~22-28ms**
-same conditions (both engines faster than this doc's numbers for unrelated
-reasons — box/version drift over two days of other work — so the ratio,
-not the absolute figures, is the fair comparison: ~1.34x then, ~1.3-1.4x
-now, roughly unchanged). **No further action here** — this specific,
-fully-scoped item is closed. Lesson for reading the rest of this document:
-verify a "next step" against the current tree before starting it, the same
-way [[project_query_shape_conformance_regression]] had to re-learn twice in
-one session — this plan is old enough that other items below may have the
-same problem.
+**The lever is more and finer parallel work, not better scheduling of what
+exists** — see memory: `project_serial_fraction_is_the_ceiling`.

@@ -122,14 +122,14 @@ TEST_CASE("Physical plan declines breakers and grouped updates with reasons", "[
     const auto [order_tree, order] = serial_plan("trades[order { price }];");
     REQUIRE(order.migrated);
 
-    // `tail` is the declining stand-in, chosen because it is still unported --
-    // not because it was convenient. Order, Head and Distinct each played this
-    // role and each stopped declining when it was ported, breaking these tests
-    // in turn. When Tail is ported this must move again; pick the next one the
-    // same way, from what the migration has not reached.
-    const auto [tail_tree, tail] = serial_plan("trades[tail 2];");
-    REQUIRE_FALSE(tail.migrated);
-    REQUIRE(tail.reason == runtime::physical::FallbackReason::NotMapChain);
+    // `melt` is the declining stand-in, chosen because it is still unported --
+    // not because it was convenient. Order, Head, Distinct and the Head/Tail/TopK
+    // family each played this role and each stopped declining when it was ported,
+    // breaking these tests in turn. When `melt` is ported this must move again;
+    // pick the next one the same way, from what the migration has not reached.
+    const auto [melt_tree, melt] = serial_plan("trades[melt symbol];");
+    REQUIRE_FALSE(melt.migrated);
+    REQUIRE(melt.reason == runtime::physical::FallbackReason::NotMapChain);
 
     // Distinct is migrated now, like Order above.
     const auto [distinct_tree, distinct] = serial_plan("trades[distinct symbol];");
@@ -517,11 +517,13 @@ TEST_CASE("Pipeline mode applies the parallel-map rules", "[physical][plan][para
         REQUIRE((runtime::physical::parallel_input_node(plan) != nullptr) == test.parallel);
     }
 
-    // Roots that are no pipeline at all never claim a mode.
-    for (const char* source : {"trades[tail 2];", "trades;"}) {
+    // Roots that are no pipeline at all never claim a mode. A migrated
+    // single-operator breaker (Tail) and an unmigrated one (melt) both qualify:
+    // neither has `steps`, so `mode` stays `Serial` regardless.
+    for (const char* source : {"trades[tail 2];", "trades[melt symbol];", "trades;"}) {
         INFO(source);
         const auto [tree, plan] = serial_plan(source);
-        REQUIRE_FALSE(plan.migrated);
+        REQUIRE(plan.steps.empty());
         REQUIRE(plan.mode == PipelineMode::Serial);
     }
 }
@@ -558,9 +560,18 @@ TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical]
     REQUIRE(text.find("  source signature: fixed-width/all-valid string-slabs/all-valid "
                       "packed-bool/all-valid\n") != std::string::npos);
 
-    const auto [fallback_tree, fallback] = serial_plan("trades[tail 2];");
+    const auto [fallback_tree, fallback] = serial_plan("trades[melt symbol];");
     const std::string declined = runtime::physical::explain_physical(fallback);
     REQUIRE(declined.find("MaterializedCall(root is not a row-local map)") != std::string::npos);
+
+    // A migrated single-operator breaker renders as a Breaker line, not a
+    // pipeline and not a MaterializedCall.
+    const auto [tail_tree, tail] = serial_plan("trades[tail 2];");
+    const std::string tail_text = runtime::physical::explain_physical(tail);
+    REQUIRE(tail_text.find("Breaker(Tail)") != std::string::npos);
+    REQUIRE(tail_text.find("serial (single-operator breaker, no fan-out point)") !=
+            std::string::npos);
+    REQUIRE(tail_text.find("MapPipeline") == std::string::npos);
 }
 
 TEST_CASE("Migrated pipelines execute through the physical planner serially",
@@ -1107,6 +1118,54 @@ TEST_CASE("The plan describes order's sort fan-out and explain physical is not s
         REQUIRE(text.find("Breaker(Head)") != std::string::npos);
         REQUIRE(text.find("serial (single-operator breaker") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
+
+    SECTION("Tail / TopK / FilterHead / FilterTail are migrated single-operator breakers") {
+        struct Case {
+            const char* source;
+            const char* kind;
+        };
+        for (const Case c : {Case{"trades[tail 2];", "Breaker(Tail)"},
+                             Case{"trades[order { price }][head 2];", "Breaker(TopK)"},
+                             Case{"trades[filter price > 10][head 2];", "Breaker(FilterHead)"},
+                             Case{"trades[filter price > 10][tail 2];", "Breaker(FilterTail)"}}) {
+            INFO(c.source);
+            const auto [tree, plan] = serial_plan(c.source);
+            REQUIRE(plan.migrated);
+            REQUIRE(plan.steps.empty());
+            REQUIRE(plan.breaker_phases.empty());
+            const std::string text = runtime::physical::explain_physical(plan);
+            REQUIRE(text.find(c.kind) != std::string::npos);
+            REQUIRE(text.find("serial (single-operator breaker") != std::string::npos);
+            REQUIRE(text.find("MapPipeline") == std::string::npos);
+            REQUIRE(text.find("MaterializedCall") == std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("Migrated Tail / TopK / FilterHead / FilterTail execute through the plan",
+          "[physical][breaker][execute]") {
+    const auto registry = trades_registry();
+    // trades has 3 rows: price {10,20,30} (Int64), symbol {A,B,A}.
+    for (const char* source : {"trades[tail 2];", "trades[order { price }][head 2];",
+                               "trades[filter price > 15][head 2];",
+                               "trades[filter price > 15][tail 2];"}) {
+        INFO(source);
+        auto ir = require_ir(source);
+        runtime::ExecutionContext serial;
+        serial.parallel_threads = 1;
+        runtime::ExecutionContext parallel;
+        parallel.parallel_threads = 8;
+        const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+        const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+        REQUIRE(s.has_value());
+        REQUIRE(p.has_value());
+        REQUIRE(s->rows() == 2);
+        REQUIRE(s->rows() == p->rows());
+        const auto& sp = std::get<Column<std::int64_t>>(*s->find_entry("price")->column);
+        const auto& pp = std::get<Column<std::int64_t>>(*p->find_entry("price")->column);
+        REQUIRE(sp[0] == pp[0]);
+        REQUIRE(sp[1] == pp[1]);
     }
 }
 

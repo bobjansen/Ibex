@@ -26,6 +26,15 @@ namespace ibex::runtime {
 /// The one-query-at-a-time invariant (Phase 0 item 6, `query_lease.hpp`) is
 /// what lets this stay simple: there is no cross-query fairness, priority, or
 /// preemption to arbitrate.
+///
+/// **Nested `submit` is safe.** A pool worker that blocks in `wait()` runs
+/// queued tasks cooperatively while it waits (`wait_for_batch`), so a saturated
+/// set of parents each forking a child batch cannot deadlock. The
+/// `on_worker_pool_thread()` check at the ~29 compute fan-out sites is therefore
+/// a **performance gate, not a correctness one**: it declines to re-divide a
+/// pool an outer fan-out already saturated. What genuinely cannot live here is a
+/// *long-lived thread that blocks on another thread's progress* — those get a
+/// raw `std::thread` (`PipelinedStageOperator`). See `src/runtime/PARALLELISM.md`.
 class WorkerPool {
    public:
     /// A submitted batch of worker bodies. Move-only; `wait()` must complete

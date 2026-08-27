@@ -12,6 +12,19 @@ Status: **landed in worktree, measured** (2026-08-27). Prereq context: Phase 1a
 [[project_agg_partition_count_dead_end]]. Do not touch `part_count`; it stays at
 `workers`.
 
+## UPDATE 6 2026-08-27 — q10 follow-up corrected the old profile attribution
+
+The recommendation below to pursue q10's "36ms serial hash-join build" was
+based on inclusive build attribution: node 31 recursively builds the lower
+join tree, so that number is not the cost of hashing its tiny dimension side.
+Fresh runtime instrumentation also shows q10's seven logical group keys have
+already been reduced to one integer key plus six carried `First` aggregates.
+The q10 work that followed therefore optimized those carried fields during
+gid discovery (measured about -10.5% to -10.9%), rather than revisiting the
+generic mixed-key grouper or lowering its partition threshold. The remaining
+q10 wall is source decode and join materialization; the q18 hot-table work in
+this document is unchanged.
+
 ## UPDATE 5 2026-08-27 — 4096-slot hot sink + async task group: LANDED, q18 -33%
 
 The two remaining Polars mechanisms are now implemented together for the

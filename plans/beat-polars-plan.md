@@ -13,6 +13,42 @@ Absorbed `pds.md` (the 2026-08-11 status snapshot this grew out of) on
 2026-08-22: §5 and §6 took its still-unique traps and dead ends, §8 keeps
 its baseline record.
 
+## 2026-08-27 update — q10 no longer rescans carried group fields
+
+Fresh SF-2 profiling corrected two stale diagnoses. Q10's outer aggregation
+does not use the generic seven-key grouper: functional-dependency reduction
+has already rewritten it to `keys=1 aggs=7` — `c_custkey`, the revenue sum,
+and six `First` fields carrying the descriptive group columns. The apparent
+37ms join build at node 31 is also inclusive of recursively building the join
+subtree, not a 37ms hash-table build over `nation`.
+
+The real aggregate waste was simpler. Integer-key discovery already knows the
+first source row of every new group, but each non-null `First` aggregate then
+rescanned all 229,871 input rows and probed the gid-indexed slot array. Q10 did
+that six times. The integer path now records first rows while assigning gids,
+gathers those fields once per new group, and skips them in the ordinary
+accumulation pass. Large first-row gathers split disjoint gid ranges across the
+worker pool; nullable `First` stays on the old null-skipping scan permanently,
+including when validity disappears in a later chunk.
+
+Same-binary A/B via `IBEX_DISABLE_DISCOVERY_FIRST=1`, pinned to cores 0-7:
+
+- six 25-iteration paired blocks: **-10.9% median**, 6/6 wins;
+- eight independent 15-iteration paired blocks: **-10.5% median**, 8/8 wins
+  (two-sided sign p=0.0078);
+- four 15-iteration one-core blocks: **-2.5% median**, 4/4 wins;
+- control queries q02/q03/q18: +1.4% / +1.4% / +0.6% medians, inconsistent in
+  direction and below the practical floor.
+
+The required 88-case engine gate (`HEAD` vs worktree, 15 interleaved repeats)
+classified every individual result as noise; aggregate Ibex time was 0.77%
+lower in the worktree.
+
+A forced fact-first join order saved only about 2-3ms and is not the main
+lever. The remaining q10 gap is upstream decode/join materialization, not
+mixed-key grouping; do not lower the generic partition gate or rebuild the
+discarded mixed-key anchor for this query.
+
 ## 2026-08-27 update — q22 is effectively closed
 
 The SF-2 run at `92e47974` made q22 the largest matched Polars-streaming gap:

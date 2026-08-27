@@ -13068,6 +13068,53 @@ TEST_CASE("String first/last accumulates across chunk boundaries on the hash pat
     REQUIRE((*la)[1] == "y2");
 }
 
+TEST_CASE("Hash first keeps scanning after a nullable chunk") {
+    runtime::TableRegistry registry;
+    runtime::ExternRegistry externs;
+
+    const auto make_chunk = [](std::vector<std::int64_t> keys, std::vector<std::string> values,
+                               std::optional<runtime::ValidityBitmap> validity) {
+        runtime::Chunk chunk;
+        runtime::ColumnEntry key;
+        key.name = "k";
+        key.column = std::make_shared<runtime::ColumnValue>(Column<std::int64_t>{std::move(keys)});
+        chunk.columns.push_back(std::move(key));
+
+        runtime::ColumnEntry value;
+        value.name = "who";
+        value.column = std::make_shared<runtime::ColumnValue>(Column<std::string>{});
+        auto& strings = std::get<Column<std::string>>(*value.column);
+        for (const auto& item : values) {
+            strings.push_back(item);
+        }
+        value.validity = std::move(validity);
+        chunk.columns.push_back(std::move(value));
+        return chunk;
+    };
+
+    externs.register_chunked_table("nullable_first_src", [&](const runtime::ExternArgs&) {
+        std::vector<runtime::Chunk> chunks;
+        chunks.push_back(make_chunk({1, 2}, {"", "b"}, runtime::ValidityBitmap{false, true}));
+        // The second chunk has no validity bitmap. Group 1 must still accept
+        // its first real value rather than being treated as already seeded.
+        chunks.push_back(make_chunk({1, 2, 3}, {"a", "later", "c"}, std::nullopt));
+        return std::expected<runtime::OperatorPtr, std::string>{
+            std::make_unique<VectorSource>(std::move(chunks))};
+    });
+
+    auto ir = require_ir(
+        "extern fn nullable_first_src() -> DataFrame from \"x.hpp\"; "
+        "nullable_first_src()[by k, select { k, fi = first(who) }][order k asc];");
+    auto result = runtime::interpret(*ir, registry, nullptr, &externs);
+    REQUIRE(result.has_value());
+    const auto* first = std::get_if<Column<std::string>>(result->find("fi"));
+    REQUIRE(first != nullptr);
+    REQUIRE(first->size() == 3);
+    CHECK((*first)[0] == "a");
+    CHECK((*first)[1] == "b");
+    CHECK((*first)[2] == "c");
+}
+
 TEST_CASE("Streaming first/last match the materializing path (parity)") {
     runtime::Table t;
     t.add_column("g", Column<std::int64_t>{2, 1, 2, 1, 1, 2});

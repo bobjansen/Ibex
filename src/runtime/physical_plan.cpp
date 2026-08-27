@@ -86,6 +86,8 @@ auto join_decline_name(JoinDeclineReason reason) -> std::string_view {
             return "AssertsCardinality";
         case JoinDeclineReason::TakeSelection:
             return "TakeSelection";
+        case JoinDeclineReason::KeyTypesUnsupported:
+            return "KeyTypesUnsupported";
     }
     return "?";
 }

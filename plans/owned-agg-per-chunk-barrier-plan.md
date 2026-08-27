@@ -7,10 +7,54 @@ metadata:
 
 # Owned aggregation: kill the per-chunk barrier pipeline
 
-Status: **scoped, not built** (2026-08-27). Prereq context: Phase 1a
+Status: **landed in worktree, measured** (2026-08-27). Prereq context: Phase 1a
 (over-partitioning) is a measured dead end —
 [[project_agg_partition_count_dead_end]]. Do not touch `part_count`; it stays at
 `workers`.
+
+## UPDATE 5 2026-08-27 — 4096-slot hot sink + async task group: LANDED, q18 -33%
+
+The two remaining Polars mechanisms are now implemented together for the
+single-Int64 `Sum(Double)` owned path (q18), without widening the PairIntKey
+path used by q20:
+
+1. **4096-slot two-choice, second-chance hot table per streamed chunk.** It is
+   the same fixed-table policy as Polars: two hash-derived candidate slots,
+   tag-first hit checks, random candidate selection, and second-chance
+   admission/eviction. A one-record recent cache avoids re-hashing the other
+   rows in q18's mean-run-4 key clusters. Hot and cold records are created at
+   their first source row and updated in place, then routed stably to cold
+   partitions, preserving first-occurrence output order without a sort.
+2. **Async, no-per-chunk-barrier sink.** `WorkerPool::TaskGroup` accepts one
+   chunk task at a time while the pull loop immediately requests the next
+   chunk. It records and performs one end-of-stream join, rather than treating
+   every task publication as a fork/join barrier. After that join, one task per
+   cold partition reserves and builds its persistent map in parallel; the
+   already-landed parallel finalize merge emits first-seen order.
+
+This removes `part_of_row_`, histogram/prefix/scatter, the random gather back
+into the key/value columns, and the per-chunk accumulate barrier from q18's
+path. Decoded column owners are released by each task as soon as its compact
+pre-aggregates are ready, so async execution does not retain all input chunks.
+The old owned path remains behind `IBEX_DISABLE_ASYNC_HOT_AGG=1` for isolated
+A/B and as a kill switch.
+
+Measured SF-2, pinned 8 cores, same release binary with the kill switch as
+base, interleaved 20 paired rounds:
+
+- **q18: 206.1ms -> 132.2ms min, -33.0% paired median, 20/20 wins, p<0.001.**
+- q18 aggregate profile: **38 -> 4 barriers**, pool work 645ms -> 425ms.
+- q11/q13/q20, 40 paired rounds: all within 0.3%, statistically and
+  practically neutral; q20 113.4ms -> 113.1ms min, -0.3% paired median.
+- Full 22-query, 12 paired rounds: byte-identical on 22/22, no significant
+  regression, q18 the only significant movement.
+- Cached `compare_ibex_git.sh`, 85 core benchmarks + 3 parse benchmarks: two
+  runs bracketed zero (-0.76% / +1.68% aggregate total; 1.008x / 0.987x
+  geometric speedup), with every individual verdict noise.
+
+Correctness gates: 22/22 PDS-H answers, dedicated 131,074-row two-chunk test
+covering a cross-chunk run, fixed-table churn, first-seen order and nullable
+sum input; 1792/1792 fast ctest and 1793/1793 full ctest including parity.
 
 ## The problem, measured
 

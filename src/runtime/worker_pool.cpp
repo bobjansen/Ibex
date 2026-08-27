@@ -42,6 +42,18 @@ struct WorkerPool::Batch::State {
     std::exception_ptr error;
     std::size_t error_worker = 0;
     ExecutionProfileEntry* profile_entry = nullptr;
+    bool account_wait = true;
+};
+
+struct WorkerPool::TaskGroup::State {
+    explicit State(WorkerPool* owner)
+        : pool(owner), profile_entry(current_execution_profile_entry()) {}
+
+    WorkerPool* pool = nullptr;
+    std::vector<WorkerPool::Batch> batches;
+    ExecutionProfileEntry* profile_entry = nullptr;
+    bool barrier_recorded = false;
+    bool waited = false;
 };
 
 namespace {
@@ -421,9 +433,10 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
         run_task(task);
         return true;
     };
-    // One submit is one fork-join round trip: every batch is waited on before
-    // its captures die, so counting here needs no matching hook in `wait()`
-    // (which is idempotent, and which the destructor may call again).
+    // A public submit is one fork-join round trip. TaskGroup uses the private
+    // unbarriered submission below and accounts its single join at group wait.
+    // Counting here needs no matching hook in Batch::wait() (which is
+    // idempotent, and which the destructor may call again).
     record_execution_profile_barrier(state->profile_entry);
     {
         const std::lock_guard lock(impl_->mutex);
@@ -450,7 +463,7 @@ namespace {
 /// run pays one null check per wait rather than two `steady_clock::now()`.
 void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex>& lock) {
     if (!on_worker_pool_thread()) {
-        if (state.profile_entry == nullptr) {
+        if (state.profile_entry == nullptr || !state.account_wait) {
             state.done.wait(lock, [&state] { return state.remaining == 0; });
             return;
         }
@@ -470,7 +483,7 @@ void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex
         if (helped || state.remaining == 0) {
             continue;
         }
-        if (state.profile_entry == nullptr) {
+        if (state.profile_entry == nullptr || !state.account_wait) {
             state.done.wait(lock, [&state] { return state.remaining == 0; });
         } else {
             const auto start = std::chrono::steady_clock::now();
@@ -479,7 +492,7 @@ void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex
                 std::chrono::steady_clock::now() - start);
         }
     }
-    if (state.profile_entry != nullptr) {
+    if (state.profile_entry != nullptr && state.account_wait) {
         record_execution_profile_barrier_wait(state.profile_entry, parked);
     }
 }
@@ -522,6 +535,93 @@ void WorkerPool::Batch::wait() {
     if (error != nullptr) {
         std::rethrow_exception(error);
     }
+}
+
+WorkerPool::TaskGroup::TaskGroup(TaskGroup&&) noexcept = default;
+
+auto WorkerPool::TaskGroup::operator=(TaskGroup&& other) noexcept -> TaskGroup& {
+    if (this != &other) {
+        if (state_ != nullptr) {
+            try {
+                wait();
+            } catch (...) {
+                // Move assignment has the same no-throw ownership contract as
+                // Batch: explicit wait() is where task errors are observed.
+            }
+        }
+        state_ = std::move(other.state_);
+    }
+    return *this;
+}
+
+WorkerPool::TaskGroup::~TaskGroup() {
+    if (state_ != nullptr) {
+        try {
+            wait();
+        } catch (...) {
+            // Destruction is a lifetime join, not an error-observation point.
+        }
+    }
+}
+
+void WorkerPool::TaskGroup::submit(std::function<void()> body) {
+    if (state_ == nullptr || state_->waited) {
+        invariant_violation("WorkerPool::TaskGroup::submit after wait");
+    }
+    state_->batches.push_back(state_->pool->submit_unbarriered(std::move(body)));
+}
+
+void WorkerPool::TaskGroup::wait() {
+    if (state_ == nullptr || state_->waited) {
+        return;
+    }
+    state_->waited = true;
+    if (!state_->barrier_recorded && !state_->batches.empty()) {
+        record_execution_profile_barrier(state_->profile_entry);
+        state_->barrier_recorded = true;
+    }
+    const auto start = state_->profile_entry == nullptr ? std::chrono::steady_clock::time_point{}
+                                                        : std::chrono::steady_clock::now();
+    for (auto& batch : state_->batches) {
+        batch.wait();
+    }
+    if (state_->profile_entry != nullptr && !state_->batches.empty()) {
+        record_execution_profile_barrier_wait(state_->profile_entry,
+                                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - start));
+    }
+}
+
+auto WorkerPool::task_group() -> TaskGroup {
+    return TaskGroup{std::make_shared<TaskGroup::State>(this)};
+}
+
+auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
+    const std::size_t count = 1;
+    auto state = std::make_shared<Batch::State>();
+    state->body = [body = std::move(body)](std::size_t) { body(); };
+    state->remaining = count;
+    state->profile_entry = current_execution_profile_entry();
+    state->account_wait = false;
+    state->assist_one = [this] {
+        Task task;
+        {
+            const std::lock_guard pool_lock(impl_->mutex);
+            if (impl_->queue.empty()) {
+                return false;
+            }
+            task = std::move(impl_->queue.front());
+            impl_->queue.pop_front();
+        }
+        run_task(task);
+        return true;
+    };
+    {
+        const std::lock_guard lock(impl_->mutex);
+        impl_->queue.push_back(Task{.state = state, .worker_id = 0});
+    }
+    impl_->work.notify_one();
+    return Batch{std::move(state)};
 }
 
 auto ExecutionContext::can_fan_out() const -> bool {

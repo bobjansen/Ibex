@@ -6562,7 +6562,6 @@ class ChunkedInnerJoinOperator final : public Operator {
     std::optional<Table> left_materialized_;
     bool use_materialized_left_ = false;
     std::optional<Table> empty_schema_;
-    bool emitted_nonempty_ = false;
 
     // Swapped mode: materialized left held for later gather.
     std::optional<Table> left_table_;
@@ -7121,6 +7120,17 @@ class ChunkedAggregateOperator final : public Operator {
             return 0;
         };
 
+        // The q18 shape (one Int64 key and one Double sum) is a streaming sink,
+        // not a sequence of per-chunk fork/join pipelines. Each chunk becomes
+        // one independent hot-table task; the caller immediately pulls the
+        // next chunk, and all tasks join once at end-of-stream. Besides removing
+        // the three barriers per chunk, this keeps the common clustered key in
+        // a 4096-slot cache-resident reduction and sends only cold/pre-aggregated
+        // records to the persistent partition maps.
+        if (try_async_hot_int_sum(group_entries[0]->column, agg_entries, rows)) {
+            return std::nullopt;
+        }
+
         gids_buf_.resize(rows);
         auto* gids = gids_buf_.data();
 
@@ -7176,6 +7186,229 @@ class ChunkedAggregateOperator final : public Operator {
 
         accumulate_gids(gids, agg_entries, rows);
         return std::nullopt;
+    }
+
+    static constexpr std::size_t kOwnedHotSlots = 4096;
+
+    struct OwnedHotRecord {
+        std::int64_t key = 0;
+        std::uint64_t first_row = 0;
+        AggSlotCore slot;
+    };
+
+    struct OwnedHotChunk {
+        std::shared_ptr<ColumnValue> key_column;
+        std::shared_ptr<ColumnValue> sum_column;
+        std::optional<ValidityBitmap> sum_validity;
+        std::uint64_t row_base = 0;
+        std::size_t rows = 0;
+        std::size_t part_count = 0;
+        std::vector<std::vector<OwnedHotRecord>> records_by_partition;
+        std::optional<std::string> error;
+    };
+
+    struct OwnedHotSlot {
+        std::uint32_t tag = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t last_access_tag = std::numeric_limits<std::uint32_t>::max();
+        std::uint32_t record = std::numeric_limits<std::uint32_t>::max();
+    };
+
+    [[nodiscard]] static auto owned_hot_hash(std::int64_t key) noexcept -> std::uint64_t {
+        // robin_hood's Int64 hash preserves too much of a sequential key's bit
+        // pattern for a high-bit fixed table. SplitMix's finalizer gives both
+        // candidate slots and the tag independent-looking bits at tiny cost.
+        std::uint64_t x = static_cast<std::uint64_t>(key);
+        x ^= x >> 30U;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27U;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31U;
+        return x;
+    }
+
+    static void process_owned_hot_chunk(OwnedHotChunk& job) noexcept {
+        try {
+            const auto* keys = std::get<Column<std::int64_t>>(*job.key_column).data();
+            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const ValidityBitmap* validity =
+                job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
+            constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
+            constexpr unsigned kShift = 64U - 12U;
+            constexpr std::uint64_t kH2Mult = 0xf1357aea2e62a9c5ULL;
+
+            std::array<OwnedHotSlot, kOwnedHotSlots> table{};
+            std::vector<OwnedHotRecord> records;
+            records.reserve(std::max<std::size_t>(kOwnedHotSlots, job.rows / 3));
+            std::size_t filled = 0;
+            std::uint64_t prng = 0;
+            std::int64_t last_key = 0;
+            std::uint32_t last_record = kEmpty;
+            bool have_last = false;
+
+            const auto append_record = [&](std::size_t row) -> std::uint32_t {
+                const auto index = static_cast<std::uint32_t>(records.size());
+                OwnedHotRecord record;
+                record.key = keys[row];
+                record.first_row = job.row_base + row;
+                if (validity == nullptr || (*validity)[row]) {
+                    record.slot.double_value = values[row];
+                    record.slot.mark_present();
+                }
+                records.push_back(record);
+                return index;
+            };
+            const auto update_record = [&](std::uint32_t record, std::size_t row) {
+                if (validity == nullptr || (*validity)[row]) {
+                    auto& slot = records[record].slot;
+                    slot.double_value += values[row];
+                    slot.mark_present();
+                }
+            };
+
+            for (std::size_t row = 0; row < job.rows; ++row) {
+                const std::int64_t key = keys[row];
+                // HashKeys in Polars computes hashes as a column kernel before
+                // probing. Here keys arrive as raw Int64s, and q18's useful
+                // locality is specifically runs of the same key. Retain the
+                // most recent hot/cold record so the other rows in a run avoid
+                // both the SplitMix hash and the two fixed-table probes.
+                if (have_last && key == last_key) {
+                    update_record(last_record, row);
+                    continue;
+                }
+                const std::uint64_t hash = owned_hot_hash(key);
+                const std::uint32_t tag = static_cast<std::uint32_t>(hash);
+                const std::size_t h1 = static_cast<std::size_t>(hash >> kShift);
+                const std::size_t h2 = static_cast<std::size_t>((hash * kH2Mult) >> kShift);
+                auto& s1 = table[h1];
+                auto& s2 = table[h2];
+
+                if (s1.tag == tag && s1.record != kEmpty && records[s1.record].key == key) {
+                    s1.last_access_tag = tag;
+                    update_record(s1.record, row);
+                    last_key = key;
+                    last_record = s1.record;
+                    have_last = true;
+                    continue;
+                }
+                if (s2.tag == tag && s2.record != kEmpty && records[s2.record].key == key) {
+                    s2.last_access_tag = tag;
+                    update_record(s2.record, row);
+                    last_key = key;
+                    last_record = s2.record;
+                    have_last = true;
+                    continue;
+                }
+
+                if (filled < kOwnedHotSlots) {
+                    OwnedHotSlot* empty = s1.record == kEmpty ? &s1 : nullptr;
+                    if (empty == nullptr && s2.record == kEmpty) {
+                        empty = &s2;
+                    }
+                    if (empty != nullptr) {
+                        empty->tag = tag;
+                        empty->last_access_tag = tag;
+                        empty->record = append_record(row);
+                        last_key = key;
+                        last_record = empty->record;
+                        have_last = true;
+                        ++filled;
+                        continue;
+                    }
+                }
+
+                // Polars' second chance: a miss first marks one candidate as
+                // recently considered and stays cold. Seeing the same tag
+                // again earns admission, evicting that candidate's mapping;
+                // its record already contains the complete pre-aggregate.
+                OwnedHotSlot& chosen = (prng >> 63U) != 0 ? s1 : s2;
+                prng += hash;
+                if (chosen.last_access_tag == tag) {
+                    chosen.tag = tag;
+                    chosen.last_access_tag = tag;
+                    chosen.record = append_record(row);
+                    last_record = chosen.record;
+                } else {
+                    chosen.last_access_tag = tag;
+                    last_record = append_record(row);
+                }
+                last_key = key;
+                have_last = true;
+            }
+
+            // Records were appended at their first source row and only updated
+            // in place, so this stable routing preserves global first-seen
+            // order without a histogram/scatter phase or a sort.
+            job.records_by_partition.resize(job.part_count);
+            std::vector<std::size_t> counts(job.part_count, 0);
+            robin_hood::hash<std::int64_t> partition_hash;
+            const std::size_t mask = job.part_count - 1;
+            for (const auto& record : records) {
+                ++counts[partition_hash(record.key) & mask];
+            }
+            for (std::size_t p = 0; p < job.part_count; ++p) {
+                job.records_by_partition[p].reserve(counts[p]);
+            }
+            for (auto& record : records) {
+                const std::size_t p = partition_hash(record.key) & mask;
+                job.records_by_partition[p].push_back(std::move(record));
+            }
+
+            // Release decoded buffers as soon as this task is done. The job's
+            // compact pre-aggregates remain until the one final cold merge.
+            job.key_column.reset();
+            job.sum_column.reset();
+            job.sum_validity.reset();
+        } catch (const std::exception& error) {
+            job.error = "async hot aggregate: " + std::string(error.what());
+        } catch (...) {
+            job.error = "async hot aggregate: non-standard worker exception";
+        }
+    }
+
+    auto try_async_hot_int_sum(const std::shared_ptr<ColumnValue>& key_column,
+                               const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> bool {
+        if (!owned_async_hot_mode_) {
+            if (std::getenv("IBEX_DISABLE_OWNED_PAIR_AGG") != nullptr ||
+                std::getenv("IBEX_DISABLE_ASYNC_HOT_AGG") != nullptr || n_groups_ > 0 ||
+                partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
+                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
+                !exec_->can_fan_out() || on_worker_pool_thread() ||
+                std::max(rows_offered_, rows) < kIntOwnedMinRows) {
+                return false;
+            }
+            auto& pool = process_worker_pool();
+            const std::size_t workers =
+                std::min({exec_->compute_budget(), pool.size(), std::size_t{64}});
+            if (workers < 2) {
+                return false;
+            }
+            owned_async_part_count_ = 1;
+            while (owned_async_part_count_ * 2 <= workers) {
+                owned_async_part_count_ *= 2;
+            }
+            owned_int_partitions_.resize(owned_async_part_count_);
+            owned_async_group_.emplace(pool.task_group());
+            owned_async_hot_mode_ = true;
+            owned_mode_ = true;
+        }
+
+        auto job = std::make_unique<OwnedHotChunk>();
+        job->key_column = key_column;
+        job->sum_column = agg_entries[0]->column;
+        if (agg_entries[0]->validity.has_value()) {
+            job->sum_validity = *agg_entries[0]->validity;
+        }
+        job->row_base = owned_rows_seen_;
+        job->rows = rows;
+        job->part_count = owned_async_part_count_;
+        auto* const raw_job = job.get();
+        owned_async_jobs_.push_back(std::move(job));
+        owned_async_group_->submit([raw_job] { process_owned_hot_chunk(*raw_job); });
+        owned_rows_seen_ += rows;
+        return true;
     }
 
     /// Production ownership threshold for the narrow PairIntKey path below,
@@ -7607,7 +7840,9 @@ class ChunkedAggregateOperator final : public Operator {
     /// one can be non-empty: the gate admits an owned run only before any group
     /// exists, so a single operator commits to one key and keeps it.
     void finalize_owned_active() {
-        if (owned_ordered_run_mode_) {
+        if (owned_async_hot_mode_) {
+            finalize_owned_async_hot();
+        } else if (owned_ordered_run_mode_) {
             finalize_owned_ordered_runs();
         } else if (!owned_pair_partitions_.empty()) {
             finalize_owned(
@@ -7621,6 +7856,96 @@ class ChunkedAggregateOperator final : public Operator {
                 owned_int_partitions_, [&](std::size_t n) { int_order_.resize(n); },
                 [&](std::size_t g, std::int64_t key) { int_order_[g] = key; });
         }
+    }
+
+    /// Join the streaming hot-table tasks once, then let one worker own each
+    /// cold partition for its complete lifetime. There is no chunk-local
+    /// histogram, scatter, or accumulate barrier: chunks only publish tasks;
+    /// the two synchronization points here are whole-stream hot completion and
+    /// whole-stream cold completion.
+    void finalize_owned_async_hot() {
+        if (owned_finalized_) {
+            return;
+        }
+        owned_finalized_ = true;
+        try {
+            owned_async_group_->wait();
+        } catch (const std::exception& error) {
+            owned_async_error_ = "async hot aggregate join: " + std::string(error.what());
+            return;
+        } catch (...) {
+            owned_async_error_ = "async hot aggregate join: non-standard worker exception";
+            return;
+        }
+        for (const auto& job : owned_async_jobs_) {
+            if (job->error.has_value()) {
+                owned_async_error_ = *job->error;
+                return;
+            }
+        }
+
+        auto& partitions = owned_int_partitions_;
+        const std::size_t part_count = owned_async_part_count_;
+        try {
+            auto batch = process_worker_pool().submit(part_count, [&](std::size_t p) {
+                auto& partition = partitions[p];
+                std::size_t records = 0;
+                for (const auto& job : owned_async_jobs_) {
+                    records += job->records_by_partition[p].size();
+                }
+
+                // This reserve runs concurrently per owner. Unlike the failed
+                // calling-thread reserve experiment, it neither serializes the
+                // partitions nor guesses from total input rows; the exact
+                // pre-aggregate count is a safe upper bound on distinct keys.
+                partition.index.reserve(records);
+                partition.keys.reserve(records);
+                partition.first_rows.reserve(records);
+                partition.slots.reserve(records);
+
+                for (const auto& job : owned_async_jobs_) {
+                    for (const auto& record : job->records_by_partition[p]) {
+                        auto it = partition.index.find(record.key);
+                        std::uint32_t local{};
+                        if (it == partition.index.end()) {
+                            local = static_cast<std::uint32_t>(partition.keys.size());
+                            partition.index.emplace(record.key, local);
+                            partition.keys.push_back(record.key);
+                            partition.first_rows.push_back(record.first_row);
+                            partition.slots.push_back(record.slot);
+                        } else {
+                            local = it->second;
+                            if (record.slot.present()) {
+                                auto& slot = partition.slots[local];
+                                slot.double_value += record.slot.double_value;
+                                slot.mark_present();
+                            }
+                        }
+                    }
+                }
+            });
+            batch.wait();
+        } catch (const std::exception& error) {
+            owned_async_error_ = "async cold aggregate: " + std::string(error.what());
+            return;
+        } catch (...) {
+            owned_async_error_ = "async cold aggregate: non-standard worker exception";
+            return;
+        }
+
+        // Pre-aggregate payloads are no longer needed. Release them before the
+        // output arrays are allocated so peak memory is cold state + output,
+        // rather than cold state + every streamed record + output.
+        owned_async_jobs_.clear();
+        owned_async_group_.reset();
+
+        // Reuse the already-parallel first-occurrence merge. `first_rows` in
+        // every cold partition is ascending because hot records are created at
+        // their first source row and jobs are consumed in input order.
+        owned_finalized_ = false;
+        finalize_owned(
+            partitions, [&](std::size_t n) { int_order_.resize(n); },
+            [&](std::size_t g, std::int64_t key) { int_order_[g] = key; });
     }
 
     /// A clustered single-Int64 Count is summarized as contiguous runs while
@@ -9775,6 +10100,9 @@ class ChunkedAggregateOperator final : public Operator {
         // pair_order_/flat_slots_/n_groups_ it always has.
         if (owned_mode_) {
             finalize_owned_active();
+            if (owned_async_error_.has_value()) {
+                return std::unexpected(*owned_async_error_);
+            }
         }
 
         Chunk out;
@@ -10237,6 +10565,15 @@ class ChunkedAggregateOperator final : public Operator {
     };
     std::vector<OwnedPartition<PairIntKey, PairIntKeyHash>> owned_pair_partitions_;
     std::vector<OwnedPartition<std::int64_t, robin_hood::hash<std::int64_t>>> owned_int_partitions_;
+    // q18's Polars-style sink: per-chunk 4096-slot hot reducers publish compact
+    // pre-aggregates asynchronously; one final owner task per cold partition
+    // builds the persistent maps. Jobs are declared before the task group so
+    // reverse destruction joins every capture before releasing its storage.
+    std::vector<std::unique_ptr<OwnedHotChunk>> owned_async_jobs_;
+    std::optional<WorkerPool::TaskGroup> owned_async_group_;
+    std::optional<std::string> owned_async_error_;
+    std::size_t owned_async_part_count_ = 0;
+    bool owned_async_hot_mode_ = false;
     std::vector<std::size_t> owned_run_rows_;
     std::vector<std::size_t> owned_run_lengths_;
     std::vector<std::int64_t> owned_ordered_run_keys_;

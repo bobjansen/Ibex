@@ -4,6 +4,7 @@
 #pragma once
 
 #include <ibex/repl/repl.hpp>
+#include <ibex/runtime/extern_registry.hpp>
 
 #include <cstdint>
 #include <filesystem>

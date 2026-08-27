@@ -6,6 +6,7 @@
 #include <ibex/ir/node.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <optional>
 #include <span>

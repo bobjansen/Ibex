@@ -5,6 +5,7 @@
 
 #include <ibex/parser/ast.hpp>
 
+#include <cstddef>
 #include <expected>
 #include <string>
 #include <string_view>

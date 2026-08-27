@@ -1296,8 +1296,8 @@ class Column<std::string> {
         auto operator==(const Iterator& o) const -> bool { return i == o.i; }
         auto operator!=(const Iterator& o) const -> bool { return i != o.i; }
     };
-    [[nodiscard]] auto begin() const noexcept -> Iterator { return {this, 0}; }
-    [[nodiscard]] auto end() const noexcept -> Iterator { return {this, size()}; }
+    [[nodiscard]] auto begin() const noexcept -> Iterator { return {.col = this, .i = 0}; }
+    [[nodiscard]] auto end() const noexcept -> Iterator { return {.col = this, .i = size()}; }
 
    private:
     void drop_external() noexcept {
@@ -1627,8 +1627,8 @@ class Column<bool> {
         auto operator!=(const Iterator& other) const -> bool { return i != other.i; }
     };
 
-    [[nodiscard]] auto begin() const noexcept -> Iterator { return {this, 0}; }
-    [[nodiscard]] auto end() const noexcept -> Iterator { return {this, size()}; }
+    [[nodiscard]] auto begin() const noexcept -> Iterator { return {.col = this, .i = 0}; }
+    [[nodiscard]] auto end() const noexcept -> Iterator { return {.col = this, .i = size()}; }
 
    private:
     void drop_external() noexcept {

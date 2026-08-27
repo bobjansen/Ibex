@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ibex::runtime::physical {
@@ -229,6 +230,76 @@ struct AggregatePlan {
 /// `strategy=... fused=Join counted=<col>` for tests and `explain physical`.
 [[nodiscard]] auto explain_aggregate(const AggregatePlan& plan) -> std::string;
 
+// --- Breaker parallelism (src/runtime/PARALLELISM.md, "Target: parallelism as
+// a plan decision"). A breaker's fan-out was private to its operator in
+// `chunked.cpp` — invisible to `explain physical`, un-A/B-able except through
+// `IBEX_CORES`. These types move the *decision* and the *tunable* onto the
+// plan, one phase at a time; the determinism devices and the kernels stay in
+// the operator. This slice is observability only: the planner fills these in
+// and `explain physical` prints them, while the operator keeps its own
+// identical logic plus a debug assert that the two agree.
+
+enum class PartitionStrategy : std::uint8_t {
+    PackedKey,  ///< hash-partition a packed key, one map per partition (Distinct, string/int
+                ///< group-by)
+    RadixHash,  ///< histogram → prefix-sum → scatter, then whole partitions
+                ///< (`try_discover_partitioned`)
+    Owned,      ///< partition-owned key maps + slots (`try_owned` / async hot table)
+};
+
+/// A row-count estimate available at plan time, and where it came from. The
+/// planner never guesses: `Footer` is a registered scan's row count, `None`
+/// means the operator will decide on its first chunk (today's behaviour).
+struct RowEstimate {
+    std::size_t rows = 0;
+    enum class Source : std::uint8_t { None, Footer, ChildExact } source = Source::None;
+
+    [[nodiscard]] auto confident() const noexcept -> bool { return source != Source::None; }
+};
+
+enum class FanOutDecline : std::uint8_t {
+    None,  ///< may fan out (the operator still checks `on_worker_pool_thread()` and the floor)
+    SingleCore,  ///< `exec.can_fan_out()` is false
+    BelowFloor,  ///< a confident estimate is under `row_floor`
+};
+
+/// One fan-out point's parallelism. The capability half (`row_floor`,
+/// `breaker_max_workers`, `strategy`, `estimate`) is set by `plan_physical`,
+/// which has no `ExecutionContext`. The resolved half (`decline`,
+/// `worker_cap`) is filled by `resolve_breaker_parallelism` from
+/// `build_physical_*`, which does. `worker_cap == 0` means "not resolved yet"
+/// — the state a plan is in when `explain physical` runs straight off
+/// `plan_physical` in a test.
+struct BreakerParallelism {
+    std::size_t row_floor = 0;
+    std::size_t breaker_max_workers = 0;
+    PartitionStrategy strategy = PartitionStrategy::PackedKey;
+    RowEstimate estimate{};
+
+    FanOutDecline decline = FanOutDecline::None;
+    std::size_t worker_cap = 0;
+};
+
+/// A breaker is one or more named phases, each with a fan-out point. Distinct /
+/// Order / TopK have one; a decomposed Join has two (hash-build, probe); a
+/// decomposed Aggregate has three (discovery, accumulate, finalize).
+struct BreakerPhase {
+    std::string_view name;
+    BreakerParallelism parallelism;
+};
+
+/// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
+/// 0 when the caller declined to construct the pool for a serial query. The one
+/// implementation of the worker-cap clamp that used to be open-coded per
+/// operator.
+void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
+                                 std::size_t pool_size);
+
+/// `Breaker(Distinct) keys={...}` plus one indented line per phase, for tests
+/// and `explain physical`.
+[[nodiscard]] auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& phases)
+    -> std::string;
+
 struct Plan {
     bool migrated = false;
     FallbackReason reason = FallbackReason::NotMapChain;
@@ -271,6 +342,9 @@ struct Plan {
     JoinPlan join;
     /// Set when `root` is an `Aggregate`.
     AggregatePlan aggregate;
+    /// Set when `root` is a breaker whose parallelism the plan describes.
+    /// Empty otherwise. One entry per fan-out phase (see `BreakerPhase`).
+    std::vector<BreakerPhase> breaker_phases;
 };
 
 /// Lower `root` into a Phase 1 plan. Read-only over the IR, the registry, and

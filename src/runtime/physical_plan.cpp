@@ -39,6 +39,13 @@ constexpr std::size_t kDistinctRowFloor = 1U << 15U;
 /// `std::size_t{64}` cap the operator applies today.
 constexpr std::size_t kPackedKeyMaxWorkers = 64;
 
+/// A streaming join's two fan-out floors, matching the private constants in
+/// `chunked.cpp`: `build_partitions`'s `1U << 17U` and `probe_parallel_workers`'s
+/// `1U << 14U`. Both phases share the same `min(budget, pool, 64)` worker cap.
+constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
+constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
+constexpr std::size_t kJoinMaxWorkers = 64;
+
 /// A footer row estimate for `distinct`'s input, or `None` when the input is
 /// not a bare registered scan. Deliberately conservative: a Filter or Join
 /// under the Distinct makes the count unknowable at plan time, and the planner
@@ -449,6 +456,14 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (plan.join.strategy == JoinStrategy::StreamingProbe) {
             plan.migrated = true;
             plan.source_node = &root;
+            // Describe the two fan-out points the join operator already has.
+            // Descriptive only (slice 3): `build_physical_join` does not read
+            // these; the constants still live in `chunked.cpp`. A follow-up
+            // slice moves the authority, the way distinct's dedup phase did.
+            plan.breaker_phases.push_back(
+                {.name = "hash-build", .parallelism = join_hash_build_parallelism()});
+            plan.breaker_phases.push_back(
+                {.name = "probe", .parallelism = join_probe_parallelism()});
             return plan;
         }
     }
@@ -577,6 +592,11 @@ auto serial_only_reason_name(SerialOnlyReason reason) -> std::string_view {
     return "unknown";
 }
 
+namespace {
+// Defined below, next to the other `explain_breaker` helpers.
+void append_phase_lines(std::string& out, const std::vector<BreakerPhase>& phases);
+}  // namespace
+
 auto explain_physical(const Plan& plan) -> std::string {
     std::string out;
     if (!plan.migrated) {
@@ -601,11 +621,16 @@ auto explain_physical(const Plan& plan) -> std::string {
     // -- a lie, since the root is not a scan and there is no pipeline.
     if (plan.steps.empty() && plan.root != nullptr) {
         const std::string_view kind = node_kind_name_impl(plan.root->kind());
+        if (plan.join.describes) {
+            // The strategy line, then one line per fan-out phase (a streaming
+            // join carries hash-build + probe; see `plan_physical`).
+            out += "Breaker(Join)\n  " + explain_join(plan.join);
+            append_phase_lines(out, plan.breaker_phases);
+            out += '\n';
+            return out;
+        }
         if (!plan.breaker_phases.empty()) {
             return explain_breaker(kind, plan.breaker_phases) + "\n";
-        }
-        if (plan.join.describes) {
-            return "Breaker(Join)\n  " + explain_join(plan.join) + "\n";
         }
         if (plan.aggregate.describes) {
             return "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate) + "\n";
@@ -734,6 +759,10 @@ auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
             return "owned";
         case PartitionStrategy::RowRange:
             return "row-range (sort + gather)";
+        case PartitionStrategy::HeadTable:
+            return "head-table (partition by key hash)";
+        case PartitionStrategy::Range:
+            return "range (contiguous probe-row slices)";
     }
     return "?";
 }
@@ -750,6 +779,18 @@ auto order_sort_parallelism() -> BreakerParallelism {
     // row_floor 0 -> resolve fills it from exec.parallel_min_rows; no per-breaker
     // ceiling; no plan-time estimate (order's input is buffered, not sampled).
     return {.strategy = PartitionStrategy::RowRange};
+}
+
+auto join_hash_build_parallelism() -> BreakerParallelism {
+    return {.row_floor = kJoinBuildRowFloor,
+            .breaker_max_workers = kJoinMaxWorkers,
+            .strategy = PartitionStrategy::HeadTable};
+}
+
+auto join_probe_parallelism() -> BreakerParallelism {
+    return {.row_floor = kJoinProbeRowFloor,
+            .breaker_max_workers = kJoinMaxWorkers,
+            .strategy = PartitionStrategy::Range};
 }
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
@@ -782,11 +823,10 @@ void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext&
     bp.worker_cap = std::max<std::size_t>(cap, 1);
 }
 
-auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& phases)
-    -> std::string {
-    std::string out = "Breaker(";
-    out += kind;
-    out += ")";
+namespace {
+/// One indented line per fan-out phase, appended to whatever header the caller
+/// already built (`Breaker(Distinct)`, or a join's strategy line).
+void append_phase_lines(std::string& out, const std::vector<BreakerPhase>& phases) {
     for (const auto& phase : phases) {
         const BreakerParallelism& bp = phase.parallelism;
         out += "\n  ";
@@ -815,6 +855,15 @@ auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& pha
                    ? "\n         estimate " + std::to_string(bp.estimate.rows) + " rows (footer)"
                    : "\n         no row estimate -> decided on first chunk";
     }
+}
+}  // namespace
+
+auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& phases)
+    -> std::string {
+    std::string out = "Breaker(";
+    out += kind;
+    out += ")";
+    append_phase_lines(out, phases);
     return out;
 }
 

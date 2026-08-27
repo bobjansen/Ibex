@@ -170,7 +170,7 @@ category has a single clean owner today.
 | Category | Whether parallel + how | Represented in `physical::Plan`? | `explain physical` shows it? |
 |---|---|---|---|
 | **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
-| **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`). The **probe fan-out, hash-build threading, and output assembly are inside `ChunkedInnerJoinOperator`** with private gates. | Partial (structure only). | Structure only. |
+| **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and now **describes** the two fan-out phases (`hash-build`, `probe`) with their floors and strategies (slice 3). The gates that act on those floors, plus output assembly, are still **inside `ChunkedInnerJoinOperator`**. | Partial (structure + phase description). | Structure + phase floors/strategies. |
 | **Aggregate** | The plan owns `AggregatePlan` (which construction path). **Discovery, per-partition slots, the owned-aggregate hot table, and the finalize merge are inside `ChunkedAggregateOperator`.** | Partial. | Which path, not the phases. |
 | **Distinct / Order / TopK / Head / Tail** | **Nothing in the plan.** `execution_capability(Distinct)` returns `ParallelBarrier`, but that value is **never read to make a decision** — it names what a future executor *could* do. `build_physical_distinct` just constructs `ChunkedDistinctOperator`, which owns the entire decision internally: the `can_fan_out()` / `on_worker_pool_thread()` guard, a private `kMinRows` (hardcoded, and twice — accumulate and finalize), the partition count from `compute_budget()`, the two-pass "one worker per partition scans the whole chunk" model. | **No.** | **No.** |
 | **Layer C fan-out inside any operator** (group discovery, sort gather, decode, semi/anti predicate) | Always the operator's, each with its own private row threshold and its own `min(budget, pool, cap)` worker count. | No. | No. |
@@ -407,13 +407,16 @@ Breaker(Head)
   serial (single-operator breaker, no fan-out point)
 ```
 
-Join, once decomposed:
+Join (slice 3, descriptive) — the strategy line, then one line per fan-out
+phase. The floors are the private constants `chunked.cpp` already applies
+(`build_partitions`'s `1U << 17U`, `probe_parallel_workers`'s `1U << 14U`); the
+operator still owns them, `build_physical_join` does not read the phases yet.
 
 ```
 Breaker(Join)
-  inner keys=1  strategy=StreamingProbe  inputs=[lineitem, orders]
-  hash-build: parallel-capable  cap=unresolved  floor 65536  partitions=derived  head-table
-  probe:      parallel-capable  cap=unresolved  floor 16384  partitions=derived  range
+  Join(StreamingProbe branch=SingleKeyInner) keys=1
+  hash-build: parallel-capable  cap=unresolved  floor 131072  partitions=derived  head-table (partition by key hash)
+  probe:      parallel-capable  cap=unresolved  floor 16384  partitions=derived  range (contiguous probe-row slices)
 ```
 
 (Distinct/Order do not print their key list — `DistinctNode`/`OrderNode` do not
@@ -470,10 +473,16 @@ Every slice:
    the plan records "serial, by design", like `Head`. Parallelizing it (per-range
    local heaps + merge) is barely worth it for small k, and Ibex already wins
    top-k ~12×. Do not fold it into the Order port.
-3. **Join** — `JoinPlan` gains `phases` for hash-build and probe;
-   `build_join_hash_index`'s threading becomes a phase decision. This is where
-   the measured cost is (q21's 40 ms serial hash build) — decomposition here is
-   a speed lever, not deferred speed.
+3. **Join** — **slice 3 landed (descriptive).** A streaming join's plan carries
+   two phases, `hash-build` (`PartitionStrategy::HeadTable`, floor `1U << 17U`)
+   and `probe` (`PartitionStrategy::Range`, floor `1U << 14U`), and `explain
+   physical` prints the strategy line plus both. `build_physical_join` does not
+   read them yet — the floors and the `min(budget, pool, 64)` cap still live in
+   `ChunkedInnerJoinOperator::build_partitions` / `probe_parallel_workers`.
+   Follow-up slices move the authority the way distinct's did (assert-then-read),
+   then make `build_join_hash_index`'s threading a scheduled-`HashBuild`
+   decision. This is where the measured cost is (q21's 40 ms serial hash build)
+   — decomposition here is a speed lever, not deferred speed.
 4. **Aggregate** — `AggregatePlan` gains discovery / accumulate / finalize
    phases. **Blocked-first:** `try_owned_pair` and the serial path re-associate
    differently and disagree bit-for-bit at ≥65536 rows, with no test. That

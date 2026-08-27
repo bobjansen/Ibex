@@ -1109,3 +1109,40 @@ TEST_CASE("The plan describes order's sort fan-out and explain physical is not s
         REQUIRE(text.find("MapPipeline") == std::string::npos);
     }
 }
+
+TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical][breaker]") {
+    SECTION("hash-build then probe, each with its own floor and strategy") {
+        const auto [tree, plan] = serial_plan("(a join b on k);");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.join.strategy == runtime::physical::JoinStrategy::StreamingProbe);
+        REQUIRE(plan.breaker_phases.size() == 2);
+
+        const auto& build = plan.breaker_phases[0];
+        REQUIRE(build.name == "hash-build");
+        REQUIRE(build.parallelism.strategy == runtime::physical::PartitionStrategy::HeadTable);
+        REQUIRE(build.parallelism.row_floor == (1U << 17U));      // chunked.cpp build_partitions
+        REQUIRE(build.parallelism.breaker_max_workers == 64);
+
+        const auto& probe = plan.breaker_phases[1];
+        REQUIRE(probe.name == "probe");
+        REQUIRE(probe.parallelism.strategy == runtime::physical::PartitionStrategy::Range);
+        REQUIRE(probe.parallelism.row_floor == (1U << 14U));      // probe_parallel_workers
+        REQUIRE(probe.parallelism.breaker_max_workers == 64);
+    }
+
+    SECTION("explain physical renders the strategy line and both phases") {
+        const auto [tree, plan] = serial_plan("(a join b on k);");
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("Breaker(Join)") != std::string::npos);
+        REQUIRE(text.find("StreamingProbe") != std::string::npos);
+        REQUIRE(text.find("hash-build:") != std::string::npos);
+        REQUIRE(text.find("probe:") != std::string::npos);
+        REQUIRE(text.find("head-table") != std::string::npos);
+        REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
+
+    SECTION("a materializing join carries no fan-out phases") {
+        const auto [tree, plan] = serial_plan("(a left join b on k);");
+        REQUIRE(plan.breaker_phases.empty());
+    }
+}

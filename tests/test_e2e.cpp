@@ -5,25 +5,38 @@
 ///
 /// These tests exercise the full pipeline in a single step, ensuring that the
 /// parser, lowerer, and interpreter all agree on the semantics of each query.
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/core/time_zone.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/interrupt.hpp>
 #include <ibex/runtime/ops.hpp>
 #include <ibex/runtime/pipeline.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "physical_plan.hpp"
@@ -1134,7 +1147,7 @@ TEST_CASE("E2E: filter produces empty result", "[e2e]") {
 // --- Error handling ----------------------------------------------------------
 
 TEST_CASE("E2E: unknown table produces error", "[e2e]") {
-    runtime::TableRegistry empty;
+    const runtime::TableRegistry empty;
     auto error = run_error("no_such_table[select { x }];", empty);
     CHECK(!error.empty());
 }
@@ -1828,8 +1841,8 @@ days[update = gen_correlated_returns(symbols)];
         double va = 0;
         double vb = 0;
         for (std::size_t i = 0; i < n_days; ++i) {
-            double da = ca[i] - ma;
-            double db = cb[i] - mb;
+            const double da = ca[i] - ma;
+            const double db = cb[i] - mb;
             cov += da * db;
             va += da * da;
             vb += db * db;
@@ -2895,7 +2908,7 @@ TEST_CASE("E2E: a grouped update writes back overwritten columns", "[e2e][update
     runtime::Table t;
     t.add_column("sym", Column<std::string>{"a", "a", "b", "b"});
     t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     SECTION("overwrite alongside a new column") {
         auto out = run("t[update { p = 99.0, r = cumsum(p) }, by sym];", tables);
@@ -2925,7 +2938,7 @@ TEST_CASE("E2E: a grouped windowed update writes back overwritten columns",
     t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
                                          Timestamp{60'000'000'000}});
     t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     SECTION("overwrite alongside a new column") {
         auto out =
@@ -2959,7 +2972,7 @@ TEST_CASE("E2E: an overwritten grouping key keeps the row-order guard armed",
     t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
                                          Timestamp{60'000'000'000}});
     t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     const std::string grouped =
         "let tf = as_timeframe(t, \"ts\");\n"
@@ -2990,7 +3003,7 @@ TEST_CASE("E2E: distinct preserves every claim its input made", "[e2e][distinct]
     runtime::Table t;
     t.add_column("k", Column<std::int64_t>{2, 1, 1, 3});
     t.add_column("p", Column<double>{1.0, 2.0, 2.0, 4.0});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     SECTION("an ordering survives") {
         auto out = run("t[order k][distinct { k }];", tables);
@@ -3005,7 +3018,7 @@ TEST_CASE("E2E: distinct preserves every claim its input made", "[e2e][distinct]
         ts_table.add_column(
             "ts", Column<Timestamp>{Timestamp{0}, Timestamp{0}, Timestamp{60'000'000'000}});
         ts_table.add_column("p", Column<double>{1.0, 1.0, 2.0});
-        runtime::TableRegistry ts_tables{{"t", ts_table}};
+        const runtime::TableRegistry ts_tables{{"t", ts_table}};
 
         auto out = run("let tf = as_timeframe(t, \"ts\");\ntf[distinct { ts, p }];", ts_tables);
         CHECK(out.rows() == 2);
@@ -3022,7 +3035,7 @@ TEST_CASE("E2E: distinct keeps the row-order guard armed", "[e2e][distinct][guar
     t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{60'000'000'000}, Timestamp{0},
                                          Timestamp{60'000'000'000}});
     t.add_column("p", Column<double>{1.0, 2.0, 3.0, 4.0});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto err = run_error(
         "let tf = as_timeframe(t, \"ts\");\n"
@@ -3043,7 +3056,7 @@ TEST_CASE("E2E: with_timezone converts wall clocks to instants", "[e2e][timezone
                            Timestamp{1'357'083'000'000'000'000},  // 2013-01-01 23:30 (EST)
                            Timestamp{1'372'929'300'000'000'000},  // 2013-07-04 09:15 (EDT)
                        });
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto out = run("t[update { utc = with_timezone(ts, \"America/New_York\") }];", tables);
     const auto* utc = std::get_if<Column<Timestamp>>(out.find("utc"));
@@ -3059,7 +3072,7 @@ TEST_CASE("E2E: with_timezone handles the two irregular local times", "[e2e][tim
                            Timestamp{1'362'882'600'000'000'000},  // 2013-03-10 02:30, skipped
                            Timestamp{1'383'442'200'000'000'000},  // 2013-11-03 01:30, repeated
                        });
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto out = run("t[update { utc = with_timezone(ts, \"America/New_York\") }];", tables);
     const auto* entry = out.find_entry("utc");
@@ -3077,7 +3090,7 @@ TEST_CASE("E2E: with_timezone handles the two irregular local times", "[e2e][tim
 TEST_CASE("E2E: with_timezone rejects an unknown zone", "[e2e][timezone]") {
     runtime::Table t;
     t.add_column("ts", Column<Timestamp>{Timestamp{0}});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto err = run_error("t[update { x = with_timezone(ts, \"Mars/Olympus\") }];", tables);
     CHECK(err.find("unknown time zone") != std::string::npos);
@@ -3093,7 +3106,7 @@ TEST_CASE("E2E: in_timezone relabels without shifting", "[e2e][timezone]") {
                            Timestamp{1'357'083'000'000'000'000},  // January, zone is UTC-5
                            Timestamp{1'372'929'300'000'000'000},  // July, zone is UTC-4
                        });
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto out =
         run("t[update { tagged = in_timezone(ts, \"America/New_York\"),\n"
@@ -3122,7 +3135,7 @@ TEST_CASE("E2E: in_timezone is total across DST transitions", "[e2e][timezone]")
                            Timestamp{1'362'882'600'000'000'000},  // 02:30 local, skipped that day
                            Timestamp{1'383'442'200'000'000'000},  // 01:30 local, repeated that day
                        });
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto out = run("t[update { x = in_timezone(ts, \"America/New_York\") }];", tables);
     const auto* entry = out.find_entry("x");
@@ -3142,7 +3155,7 @@ TEST_CASE("E2E: in_timezone preserves nulls and rejects bad arguments", "[e2e][t
     runtime::Table t;
     t.add_column("ts", Column<Timestamp>{Timestamp{0}, Timestamp{0}}, ts_valid);
     t.add_column("n", Column<std::int64_t>{1, 2});
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     auto out = run("t[update { x = in_timezone(ts, \"Europe/Amsterdam\") }];", tables);
     const auto* entry = out.find_entry("x");
@@ -3169,7 +3182,7 @@ TEST_CASE("E2E: resample cuts on local boundaries for a zoned index", "[e2e][tim
                            Timestamp{1'357'106'400'000'000'000},  // 01-02 06:00 UTC / 01:00 local
                            Timestamp{1'357'128'000'000'000'000},  // 01-02 12:00 UTC / 07:00 local
                        });
-    runtime::TableRegistry tables{{"t", t}};
+    const runtime::TableRegistry tables{{"t", t}};
 
     SECTION("an unzoned index keeps the UTC grid") {
         auto out = run(

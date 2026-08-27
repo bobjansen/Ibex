@@ -3,9 +3,14 @@
 
 #include <ibex/ir/builder.hpp>
 #include <ibex/ir/extern_sources.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <set>
+#include <utility>
+#include <vector>
 
 using namespace ibex;
 

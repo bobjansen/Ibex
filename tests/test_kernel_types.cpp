@@ -2,13 +2,21 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kernel_filter.hpp"
@@ -1045,17 +1053,23 @@ TEST_CASE("gather_selected over every selection shape agrees", "[kernel][gather]
 
     std::vector<std::int64_t> a(4), b(4), c(4), d(4);
     ibex::runtime::kernel::gather_selected(
-        view, Selection{ibex::runtime::kernel::RowIndices{indices.data(), indices.size()}},
-        OutputSpan<std::int64_t>{a.data(), 0, 4});
-    ibex::runtime::kernel::gather_selected(view, Selection{ibex::runtime::kernel::RowBitmap{&keep}},
-                                           OutputSpan<std::int64_t>{b.data(), 0, 4});
+        view,
+        Selection{
+            ibex::runtime::kernel::RowIndices{.data = indices.data(), .count = indices.size()}},
+        OutputSpan<std::int64_t>{.data = a.data(), .begin = 0, .count = 4});
     ibex::runtime::kernel::gather_selected(
-        view, Selection{ibex::runtime::kernel::RowWordBlocks{blocks.data(), blocks.size(), 0}},
-        OutputSpan<std::int64_t>{c.data(), 0, 4});
+        view, Selection{ibex::runtime::kernel::RowBitmap{&keep}},
+        OutputSpan<std::int64_t>{.data = b.data(), .begin = 0, .count = 4});
+    ibex::runtime::kernel::gather_selected(
+        view,
+        Selection{ibex::runtime::kernel::RowWordBlocks{
+            .words = blocks.data(), .word_count = blocks.size(), .row_base = 0}},
+        OutputSpan<std::int64_t>{.data = c.data(), .begin = 0, .count = 4});
     // A contiguous range: rows 2..5 (4 rows) — same count, different rows, to
     // prove the copy arm does not just agree with the others by accident.
-    ibex::runtime::kernel::gather_selected(view, Selection{ibex::runtime::kernel::RowRange{2, 6}},
-                                           OutputSpan<std::int64_t>{d.data(), 0, 4});
+    ibex::runtime::kernel::gather_selected(
+        view, Selection{ibex::runtime::kernel::RowRange{.begin = 2, .end = 6}},
+        OutputSpan<std::int64_t>{.data = d.data(), .begin = 0, .count = 4});
 
     REQUIRE(a[0] == 102);
     REQUIRE(a[1] == 103);
@@ -1079,12 +1093,12 @@ TEST_CASE("gather_selected honours the output offset for disjoint windows", "[ke
     // offset 0, rows [3,6) at offset 3 — the two-phase filter's shape.
     ibex::runtime::kernel::gather_selected(
         ColumnView<std::int64_t>(col.data(), col.size(), nullptr),
-        Selection{ibex::runtime::kernel::RowRange{0, 3}},
-        OutputSpan<std::int64_t>{out.data(), 0, 3});
+        Selection{ibex::runtime::kernel::RowRange{.begin = 0, .end = 3}},
+        OutputSpan<std::int64_t>{.data = out.data(), .begin = 0, .count = 3});
     ibex::runtime::kernel::gather_selected(
         ColumnView<std::int64_t>(col.data(), col.size(), nullptr),
-        Selection{ibex::runtime::kernel::RowRange{3, 6}},
-        OutputSpan<std::int64_t>{out.data(), 3, 3});
+        Selection{ibex::runtime::kernel::RowRange{.begin = 3, .end = 6}},
+        OutputSpan<std::int64_t>{.data = out.data(), .begin = 3, .count = 3});
     REQUIRE(out == std::vector<std::int64_t>{1, 2, 3, 4, 5, 6});
 }
 
@@ -1126,11 +1140,11 @@ TEST_CASE("Bool gather kernel: disjoint windows OR without clobbering", "[kernel
     // Window A: rows [10, 20) at bit offset 10; window B: rows [20, 30) at 20.
     ibex::runtime::kernel::gather_selected_bool(
         ibex::runtime::kernel::BoolView(src),
-        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{10, 20}},
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{.begin = 10, .end = 20}},
         ibex::runtime::kernel::BoolOutputSpan{.words = out_words.data(), .begin = 10, .count = 10});
     ibex::runtime::kernel::gather_selected_bool(
         ibex::runtime::kernel::BoolView(src),
-        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{20, 30}},
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{.begin = 20, .end = 30}},
         ibex::runtime::kernel::BoolOutputSpan{.words = out_words.data(), .begin = 20, .count = 10});
     // Output bits [10, 30) hold source rows 10..29: even rows are true.
     for (std::size_t i = 10; i < 30; ++i) {
@@ -1181,7 +1195,7 @@ TEST_CASE("String gather kernel: offset window continues a prior run", "[kernel]
     ibex::runtime::kernel::gather_selected_strings(
         ibex::runtime::kernel::StringView{
             .offsets = src.offsets_data(), .chars = src.chars_data(), .rows = src.size()},
-        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{2, 3}},
+        ibex::runtime::kernel::Selection{ibex::runtime::kernel::RowRange{.begin = 2, .end = 3}},
         ibex::runtime::kernel::StringOutputSpan{.offsets = offsets.data(),
                                                 .chars = chars.data(),
                                                 .begin = 1,

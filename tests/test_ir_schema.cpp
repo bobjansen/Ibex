@@ -6,6 +6,7 @@
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using ibex::ir::ColumnType;
@@ -325,7 +327,7 @@ TEST_CASE("schema: a Table literal is known from its column literals", "[ir][sch
 }
 
 TEST_CASE("schema: scan resolves from the source environment", "[ir][schema]") {
-    ibex::ir::ScanNode scan(ibex::ir::NodeId{1}, "t");
+    const ibex::ir::ScanNode scan(ibex::ir::NodeId{1}, "t");
     REQUIRE_FALSE(ibex::ir::infer_schema(scan).is_known());  // empty env -> Unknown
     auto s = ibex::ir::infer_schema(scan, base_sources());
     REQUIRE(s.is_known());
@@ -408,8 +410,8 @@ TEST_CASE("schema: cov yields 'column' plus one Float64 per numeric column", "[i
 }
 
 TEST_CASE("schema: resample is open when the input has no known time index", "[ir][schema]") {
-    std::vector<ibex::ir::ColumnRef> group_by{{.name = "a"}};
-    std::vector<ibex::ir::AggSpec> aggs{
+    const std::vector<ibex::ir::ColumnRef> group_by{{.name = "a"}};
+    const std::vector<ibex::ir::AggSpec> aggs{
         {.func = ibex::ir::AggFunc::Sum, .column = {.name = "b"}, .alias = "total", .param = 0.0}};
     ibex::ir::ResampleNode rs(ibex::ir::NodeId{2}, std::chrono::seconds{1}, group_by, aggs);
     rs.add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "t"));
@@ -442,8 +444,8 @@ TEST_CASE("schema: resample over a time-indexed input is closed", "[ir][schema]"
     auto atf = std::make_unique<ibex::ir::AsTimeframeNode>(ibex::ir::NodeId{2}, "ts");
     atf->add_child(std::make_unique<ibex::ir::ScanNode>(ibex::ir::NodeId{1}, "src"));
 
-    std::vector<ibex::ir::ColumnRef> group_by{{.name = "sym"}};
-    std::vector<ibex::ir::AggSpec> aggs{
+    const std::vector<ibex::ir::ColumnRef> group_by{{.name = "sym"}};
+    const std::vector<ibex::ir::AggSpec> aggs{
         {.func = ibex::ir::AggFunc::Mean, .column = {.name = "px"}, .alias = "avg", .param = 0.0}};
     ibex::ir::ResampleNode rs(ibex::ir::NodeId{3}, std::chrono::seconds{1}, group_by, aggs);
     rs.add_child(std::move(atf));
@@ -1007,24 +1009,45 @@ TEST_CASE("schema: join nullability across every kind, inputs proved", "[ir][sch
     // Both inputs arrive fully null-free, so anything Maybe here was produced
     // by the join: a side that may be unmatched is filled with nulls.
     const JoinNullabilityCase cases[] = {
-        {ibex::ir::JoinKind::Inner, "inner", Nullability::Never, Nullability::Never,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Left, "left", Nullability::Never, Nullability::Never,
-         Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Inner,
+         .label = "inner",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Left,
+         .label = "left",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Maybe},
         // The folded key survives a right join only because *both* sides are
         // proved: unmatched right rows take their key from the right column.
-        {ibex::ir::JoinKind::Right, "right", Nullability::Never, Nullability::Maybe,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Outer, "outer", Nullability::Never, Nullability::Maybe,
-         Nullability::Maybe},
-        {ibex::ir::JoinKind::Semi, "semi", Nullability::Never, Nullability::Never,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Anti, "anti", Nullability::Never, Nullability::Never,
-         Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Right,
+         .label = "right",
+         .key = Nullability::Never,
+         .left_value = Nullability::Maybe,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Outer,
+         .label = "outer",
+         .key = Nullability::Never,
+         .left_value = Nullability::Maybe,
+         .right_value = Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Semi,
+         .label = "semi",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Anti,
+         .label = "anti",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
         // `asof` keeps every left row whether or not a right row precedes it,
         // so its right columns null out exactly as a left join's do.
-        {ibex::ir::JoinKind::Asof, "asof", Nullability::Never, Nullability::Never,
-         Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Asof,
+         .label = "asof",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Maybe},
     };
 
     const auto sources = join_matrix_sources(Nullability::Never);
@@ -1049,22 +1072,43 @@ TEST_CASE("schema: join nullability across every kind, key unproved", "[ir][sche
     // under `nulls never` a null key matches nothing, so a join that emits only
     // matched rows has a value in every key it emitted.
     const JoinNullabilityCase cases[] = {
-        {ibex::ir::JoinKind::Inner, "inner", Nullability::Never, Nullability::Never,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Semi, "semi", Nullability::Never, Nullability::Never,
-         Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Inner,
+         .label = "inner",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Semi,
+         .label = "semi",
+         .key = Nullability::Never,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
         // Anti keeps the rows that matched *nothing*, which is what a null key
         // does. The proof must not carry over.
-        {ibex::ir::JoinKind::Anti, "anti", Nullability::Maybe, Nullability::Never,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Left, "left", Nullability::Maybe, Nullability::Never,
-         Nullability::Maybe},
-        {ibex::ir::JoinKind::Right, "right", Nullability::Maybe, Nullability::Maybe,
-         Nullability::Never},
-        {ibex::ir::JoinKind::Outer, "outer", Nullability::Maybe, Nullability::Maybe,
-         Nullability::Maybe},
-        {ibex::ir::JoinKind::Asof, "asof", Nullability::Maybe, Nullability::Never,
-         Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Anti,
+         .label = "anti",
+         .key = Nullability::Maybe,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Left,
+         .label = "left",
+         .key = Nullability::Maybe,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Right,
+         .label = "right",
+         .key = Nullability::Maybe,
+         .left_value = Nullability::Maybe,
+         .right_value = Nullability::Never},
+        {.kind = ibex::ir::JoinKind::Outer,
+         .label = "outer",
+         .key = Nullability::Maybe,
+         .left_value = Nullability::Maybe,
+         .right_value = Nullability::Maybe},
+        {.kind = ibex::ir::JoinKind::Asof,
+         .label = "asof",
+         .key = Nullability::Maybe,
+         .left_value = Nullability::Never,
+         .right_value = Nullability::Maybe},
     };
 
     const auto sources = join_matrix_sources(Nullability::Maybe);

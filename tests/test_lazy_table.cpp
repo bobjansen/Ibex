@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -15,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace ibex;
@@ -574,7 +580,7 @@ TEST_CASE("lazy table carries source column stats without decoding", "[lazy_tabl
     FakeSource source;
     runtime::SourceColumnStats stats;
     stats.emplace("a", runtime::ColumnStats{.min = 1, .max = 3, .null_count = 0});
-    runtime::LazyTable lazy(
+    const runtime::LazyTable lazy(
         source.schema(), 3,
         [&](const std::vector<std::string>& names, const runtime::Selection* selection) {
             return source.decode(names, selection);
@@ -595,7 +601,7 @@ TEST_CASE("lazy table carries source column stats without decoding", "[lazy_tabl
 
 TEST_CASE("lazy table defaults to knowing no column stats", "[lazy_table]") {
     FakeSource source;
-    runtime::LazyTable lazy(
+    const runtime::LazyTable lazy(
         source.schema(), 3,
         [&](const std::vector<std::string>& names, const runtime::Selection* selection) {
             return source.decode(names, selection);
@@ -1017,7 +1023,7 @@ TEST_CASE("LazyTable: join_key_selection declines without membership or on a non
     FakeSource source;
     auto lazy = make_lazy(source);
 
-    runtime::DynamicScanFilter empty_filter;
+    const runtime::DynamicScanFilter empty_filter;
     auto no_membership = lazy.join_key_selection({}, kExec, nullptr, empty_filter, "a");
     REQUIRE(no_membership);
     CHECK_FALSE(no_membership->has_value());

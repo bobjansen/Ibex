@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
 #include <ibex/ir/builder.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/morsel.hpp>
 #include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/ops.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -311,7 +319,7 @@ TEST_CASE("PartitionedTableSource round-trips a multi-type table at every grain"
                                               std::vector<std::int32_t>{0, 1, 0, 1, 1, 0, 1}});
 
     // Grains that divide evenly, don't divide evenly, equal the size, and exceed it.
-    for (std::size_t grain :
+    for (const std::size_t grain :
          {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{7}, std::size_t{100}}) {
         require_roundtrip(input, grain);
     }

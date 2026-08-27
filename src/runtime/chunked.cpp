@@ -8127,24 +8127,130 @@ class ChunkedAggregateOperator final : public Operator {
         }
 
         if (owned_ordered_runs_nondecreasing_) {
-            std::size_t total = 1;
-            for (std::size_t i = 1; i < owned_ordered_run_keys_.size(); ++i) {
-                total += owned_ordered_run_keys_[i] == owned_ordered_run_keys_[i - 1] ? 0 : 1;
+            const bool ord_timing = std::getenv("IBEX_ORDERED_RUN_TIMING") != nullptr;
+            const auto ord_t0 = std::chrono::steady_clock::now();
+            const std::size_t run_count = owned_ordered_run_keys_.size();
+            const std::int64_t* const rk = owned_ordered_run_keys_.data();
+            const std::size_t* const rc = owned_ordered_run_counts_.data();
+
+            // How many workers can help. The build loop below is a segmented
+            // reduction over `run_count` sorted (key, count) runs: keys are
+            // nondecreasing so a group boundary is just `rk[i] != rk[i-1]`.
+            // Each worker owns a contiguous run slice; a key straddling a slice
+            // boundary has its leading partial count carried back to the group
+            // the previous worker finished (at most `workers - 1` fixups).
+            std::size_t workers = 1;
+            if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
+                run_count >= (std::size_t{1} << 16U) &&
+                std::getenv("IBEX_DISABLE_PARALLEL_ORDERED_MERGE") == nullptr) {
+                auto& pool = process_worker_pool();
+                workers = std::min(
+                    {exec_->compute_budget(), pool.size(), run_count / 8192, std::size_t{64}});
             }
-            n_groups_ = total;
-            int_order_.resize(total);
-            AggSlotCore* slots = flat_slots_.grow_uninitialized(total).data();
-            std::size_t group = 0;
-            int_order_[0] = owned_ordered_run_keys_[0];
-            slots[0] = AggSlotCore{};
-            slots[0].count = static_cast<std::int64_t>(owned_ordered_run_counts_[0]);
-            for (std::size_t i = 1; i < owned_ordered_run_keys_.size(); ++i) {
-                if (owned_ordered_run_keys_[i] != int_order_[group]) {
-                    ++group;
-                    int_order_[group] = owned_ordered_run_keys_[i];
-                    slots[group] = AggSlotCore{};
+
+            std::size_t total = 0;
+            if (workers < 2) {
+                total = run_count == 0 ? 0 : 1;
+                for (std::size_t i = 1; i < run_count; ++i) {
+                    total += rk[i] == rk[i - 1] ? 0 : 1;
                 }
-                slots[group].count += static_cast<std::int64_t>(owned_ordered_run_counts_[i]);
+                n_groups_ = total;
+                int_order_.resize(total);
+                AggSlotCore* slots = flat_slots_.grow_uninitialized(total).data();
+                if (total != 0) {
+                    std::size_t group = 0;
+                    int_order_[0] = rk[0];
+                    slots[0] = AggSlotCore{};
+                    slots[0].count = static_cast<std::int64_t>(rc[0]);
+                    for (std::size_t i = 1; i < run_count; ++i) {
+                        if (rk[i] != int_order_[group]) {
+                            ++group;
+                            int_order_[group] = rk[i];
+                            slots[group] = AggSlotCore{};
+                        }
+                        slots[group].count += static_cast<std::int64_t>(rc[i]);
+                    }
+                }
+            } else {
+                auto& pool = process_worker_pool();
+                const std::size_t grain = (run_count + workers - 1) / workers;
+                std::vector<std::size_t> local_groups(workers, 0);
+                std::vector<char> boundary_open(workers, 0);
+                {
+                    auto batch = pool.submit(workers, [&](std::size_t w) {
+                        const std::size_t begin = w * grain;
+                        const std::size_t end = std::min(run_count, begin + grain);
+                        if (begin >= end) {
+                            return;
+                        }
+                        std::size_t g = 0;
+                        for (std::size_t i = begin; i < end; ++i) {
+                            if (i == 0 || rk[i] != rk[i - 1]) {
+                                ++g;
+                            }
+                        }
+                        local_groups[w] = g;
+                        boundary_open[w] = (begin > 0 && rk[begin] == rk[begin - 1]) ? 1 : 0;
+                    });
+                    batch.wait();
+                }
+                std::vector<std::size_t> group_base(workers + 1, 0);
+                for (std::size_t w = 0; w < workers; ++w) {
+                    group_base[w + 1] = group_base[w] + local_groups[w];
+                }
+                total = group_base[workers];
+                n_groups_ = total;
+                int_order_.resize(total);
+                AggSlotCore* slots = flat_slots_.grow_uninitialized(total).data();
+                std::vector<std::int64_t> carry(workers, 0);
+                {
+                    auto batch = pool.submit(workers, [&](std::size_t w) {
+                        const std::size_t begin = w * grain;
+                        const std::size_t end = std::min(run_count, begin + grain);
+                        if (begin >= end) {
+                            return;
+                        }
+                        std::size_t i = begin;
+                        if (boundary_open[w] != 0) {
+                            const std::int64_t k0 = rk[begin];
+                            std::int64_t c = 0;
+                            while (i < end && rk[i] == k0) {
+                                c += static_cast<std::int64_t>(rc[i]);
+                                ++i;
+                            }
+                            carry[w] = c;
+                        }
+                        std::size_t g = group_base[w];
+                        while (i < end) {
+                            const std::int64_t k = rk[i];
+                            std::int64_t c = 0;
+                            while (i < end && rk[i] == k) {
+                                c += static_cast<std::int64_t>(rc[i]);
+                                ++i;
+                            }
+                            int_order_[g] = k;
+                            slots[g] = AggSlotCore{};
+                            slots[g].count = c;
+                            ++g;
+                        }
+                    });
+                    batch.wait();
+                }
+                for (std::size_t w = 0; w < workers; ++w) {
+                    if (boundary_open[w] != 0) {
+                        slots[group_base[w] - 1].count += carry[w];
+                    }
+                }
+            }
+
+            if (ord_timing) {
+                const auto ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - ord_t0)
+                                    .count();
+                std::fprintf(stderr,
+                             "[ord_run] finalize nondecreasing runs=%zu groups=%zu "
+                             "workers=%zu %.3fms\n",
+                             run_count, total, workers, ms);
             }
             return;
         }

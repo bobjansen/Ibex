@@ -6899,24 +6899,22 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
    private:
-    /// Observability check for the breaker-parallelism slice
-    /// (src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision").
-    /// Called once at each point the operator commits to fanning a phase out
-    /// over `count` workers. If `build_physical_aggregate` resolved a plan for
-    /// this breaker, that phase must have permitted fan-out and its worker cap
-    /// must bound the operator's own choice. A disagreement means the planner
-    /// and the operator computed different things -- abort loudly rather than
-    /// let the authority slice inherit the divergence. `phase` is
-    /// `par_.partition` or `par_.finalize`.
-    static void check_agg_plan(const physical::BreakerParallelism& phase, std::size_t count) {
-        if (phase.worker_cap == 0) {
-            return;  // no resolved plan (a hand-built ChunkedAggregateOperator)
+    /// Telemetry for the breaker-parallelism slice (src/runtime/PARALLELISM.md).
+    /// The plan owns each phase's worker cap and fan-out permission now; the
+    /// fan-out output is byte-identical to serial, so without a counter a gate
+    /// that silently stopped matching would lose the parallelism with every
+    /// test green. Counted once per fan-out commit (per chunk for `partition`,
+    /// once for `finalize`, which runs once).
+    void note_partition_fanout() const {
+        if (exec_ != nullptr && exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_aggregate_partitions.fetch_add(
+                1, std::memory_order_relaxed);
         }
-        if (phase.decline != physical::FanOutDecline::None) {
-            invariant_violation("aggregate: plan declined fan-out but the operator fanned out");
-        }
-        if (count > phase.worker_cap) {
-            invariant_violation("aggregate: operator worker count exceeds the plan's cap");
+    }
+    void note_finalize_fanout() const {
+        if (exec_ != nullptr && exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_aggregate_finalizes.fetch_add(
+                1, std::memory_order_relaxed);
         }
     }
 
@@ -7587,16 +7585,19 @@ class ChunkedAggregateOperator final : public Operator {
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
                 plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
-                !exec_->can_fan_out() || on_worker_pool_thread() ||
+                on_worker_pool_thread() ||
                 std::max(rows_offered_, rows) < kIntOwnedMinRows) {
                 return false;
             }
-            auto& pool = process_worker_pool();
-            const std::size_t workers =
-                std::min({exec_->compute_budget(), pool.size(), std::size_t{64}});
-            if (workers < 2) {
+            // As `try_owned`: fan-out permission and the worker cap are the
+            // plan's `partition` phase (src/runtime/PARALLELISM.md);
+            // `kIntOwnedMinRows` stays as this specialization's admission gate.
+            if (par_.partition.decline != physical::FanOutDecline::None ||
+                par_.partition.worker_cap < 2) {
                 return false;
             }
+            auto& pool = process_worker_pool();
+            const std::size_t workers = par_.partition.worker_cap;
             owned_async_part_count_ = 1;
             while (owned_async_part_count_ * 2 <= workers) {
                 owned_async_part_count_ *= 2;
@@ -7605,6 +7606,7 @@ class ChunkedAggregateOperator final : public Operator {
             owned_async_group_.emplace(pool.task_group());
             owned_async_hot_mode_ = true;
             owned_mode_ = true;
+            note_partition_fanout();
         }
 
         auto job = std::make_unique<OwnedHotChunk>();
@@ -7708,6 +7710,7 @@ class ChunkedAggregateOperator final : public Operator {
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
         }
+        note_partition_fanout();
 
         // A clustered count key should not pay the partition/scatter/hash
         // pipeline once per ROW. Compress contiguous equal-key runs first and
@@ -7992,19 +7995,21 @@ class ChunkedAggregateOperator final : public Operator {
         // steps by exactly one at each value and so equals any target rank at
         // exactly one `v`. Each worker then merges the disjoint input slices
         // between two frontiers into its disjoint output slice.
+        // The `finalize` phase's worker ceiling and fan-out permission are the
+        // plan's (src/runtime/PARALLELISM.md); `part_count` and `total / 4096`
+        // stay here -- they need the group count discovery just produced. The
+        // `1U << 17U` group floor is this merge's own threshold, beside it.
         std::size_t workers = 1;
-        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-            part_count >= 2 && total >= std::size_t{1} << 17U) {
-            auto& pool = process_worker_pool();
-            workers = std::min(
-                {exec_->compute_budget(), pool.size(), part_count, total / 4096, std::size_t{64}});
+        if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+            !on_worker_pool_thread() && part_count >= 2 && total >= std::size_t{1} << 17U) {
+            workers = std::min({par_.finalize.worker_cap, part_count, total / 4096});
         }
 
         if (workers < 2) {
             merge_segment(std::vector<std::size_t>(part_count, 0), part_end, 0);
             return;
         }
-        check_agg_plan(par_.finalize, workers);
+        note_finalize_fanout();
 
         const std::uint64_t hi = owned_rows_seen_ + 1;
         const auto frontier = [&](std::size_t rank) {
@@ -8100,6 +8105,9 @@ class ChunkedAggregateOperator final : public Operator {
 
         auto& partitions = owned_int_partitions_;
         const std::size_t part_count = owned_async_part_count_;
+        if (part_count >= 2) {
+            note_finalize_fanout();
+        }
         try {
             auto batch = process_worker_pool().submit(part_count, [&](std::size_t p) {
                 auto& partition = partitions[p];
@@ -8191,16 +8199,14 @@ class ChunkedAggregateOperator final : public Operator {
             // Each worker owns a contiguous run slice; a key straddling a slice
             // boundary has its leading partial count carried back to the group
             // the previous worker finished (at most `workers - 1` fixups).
+            // Ceiling and permission from the plan; `run_count / 8192` and this
+            // path's own `1U << 16U` run floor stay here (the ordered-run merge
+            // is a strategy specialization, floor beside its code).
             std::size_t workers = 1;
-            if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-                run_count >= (std::size_t{1} << 16U) &&
+            if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+                !on_worker_pool_thread() && run_count >= (std::size_t{1} << 16U) &&
                 std::getenv("IBEX_DISABLE_PARALLEL_ORDERED_MERGE") == nullptr) {
-                auto& pool = process_worker_pool();
-                workers = std::min(
-                    {exec_->compute_budget(), pool.size(), run_count / 8192, std::size_t{64}});
-            }
-            if (workers >= 2) {
-                check_agg_plan(par_.finalize, workers);
+                workers = std::min({par_.finalize.worker_cap, run_count / 8192});
             }
 
             std::size_t total = 0;
@@ -8227,6 +8233,7 @@ class ChunkedAggregateOperator final : public Operator {
                     }
                 }
             } else {
+                note_finalize_fanout();
                 auto& pool = process_worker_pool();
                 const std::size_t grain = (run_count + workers - 1) / workers;
                 std::vector<std::size_t> local_groups(workers, 0);
@@ -8805,6 +8812,7 @@ class ChunkedAggregateOperator final : public Operator {
         while (part_count * 2 <= workers) {
             part_count *= 2;  // a power of two, so the partition is a mask
         }
+        note_partition_fanout();
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
@@ -9618,13 +9626,16 @@ class ChunkedAggregateOperator final : public Operator {
             slot.mark_present();
         };
 
+        // Ceiling and permission from the plan; the `parallel_min_rows` floor on
+        // the first-occurrence count stays here (the shared knob, not a phase
+        // constant).
         std::size_t threads = 1;
-        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() &&
-            first_rows.size() >= exec_->parallel_min_rows) {
-            threads = std::min(exec_->compute_budget(), process_worker_pool().size());
+        if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+            !on_worker_pool_thread() && first_rows.size() >= exec_->parallel_min_rows) {
+            threads = par_.finalize.worker_cap;
         }
         if (threads >= 2) {
-            check_agg_plan(par_.finalize, threads);
+            note_finalize_fanout();
             const std::size_t grain = (first_rows.size() + threads - 1) / threads;
             auto batch = process_worker_pool().submit(threads, [&](std::size_t worker) {
                 const std::size_t begin = worker * grain;
@@ -11008,11 +11019,12 @@ class ChunkedAggregateOperator final : public Operator {
     /// group first-rows a global base.
     std::size_t rows_offered_ = 0;
     /// The `partition` and `finalize` fan-out policies, resolved by
-    /// `build_physical_aggregate` (src/runtime/PARALLELISM.md). This slice is
-    /// observability only: the operator still decides for itself and
-    /// `check_agg_plan` aborts if the two ever disagree. The authority slices
-    /// delete the operator's open-coded floors and `min(budget, pool, 64)` caps
-    /// and read `par_` instead.
+    /// `build_physical_aggregate` (src/runtime/PARALLELISM.md). The operator
+    /// reads `par_.<phase>.{decline, worker_cap}` for fan-out permission and the
+    /// worker ceiling; it keeps only what the plan cannot know -- nesting
+    /// (`on_worker_pool_thread`), the data-derived partition/run terms of each
+    /// cap, and the strategy-specific admission floors (`kPairOwnedMinRows`, the
+    /// ordered-run `1U << 16U`, `parallel_min_rows`).
     physical::AggregateParallelism par_{};
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
@@ -12079,13 +12091,17 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                 "pipeline stats: parallel={} serial={} morsels={} "
                 "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
                 "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
+                "parallel_hash_builds={} parallel_aggregate_partitions={} "
+                "parallel_aggregate_finalizes={} "
                 "grouped_lifted_group_state={} chunk_direct_updates={}\n",
                 stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
                 stats.morsels.load(), stats.pipelined_scans.load(), stats.pipelined_stages.load(),
                 stats.range_heads.load(), stats.two_phase_filters.load(),
                 stats.parallel_fields.load(), stats.parallel_direct_numeric_fields.load(),
-                stats.parallel_probes.load(), stats.grouped_lifted_group_state.load(),
-                stats.chunk_direct_updates.load());
+                stats.parallel_probes.load(), stats.parallel_hash_builds.load(),
+                stats.parallel_aggregate_partitions.load(),
+                stats.parallel_aggregate_finalizes.load(),
+                stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load());
         }
     };
     static const Reporter reporter;

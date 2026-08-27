@@ -5768,10 +5768,12 @@ class ChunkedInnerJoinOperator final : public Operator {
    public:
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
-                             const std::vector<ir::OrderKey>* pending_order = nullptr)
+                             const std::vector<ir::OrderKey>* pending_order = nullptr,
+                             physical::BreakerParallelism build_plan = {})
         : left_(std::move(left)),
           right_(std::make_shared<Table>(std::move(right))),
           keys_(keys),
+          build_plan_(build_plan),
           pending_order_(pending_order) {
         bind_probe(keys, std::move(suffix), exec);
     }
@@ -5786,7 +5788,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const ExternRegistry* externs, const ExecutionContext& exec,
                              const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
                              std::string probe_name, ir::JoinSuffixPolicy suffix = {},
-                             const std::vector<ir::OrderKey>* pending_order = nullptr)
+                             const std::vector<ir::OrderKey>* pending_order = nullptr,
+                             physical::BreakerParallelism build_plan = {})
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
@@ -5796,6 +5799,7 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_scalars_(scalars),
           deferred_externs_(externs),
           deferred_exec_(&exec),
+          build_plan_(build_plan),
           pending_order_(pending_order) {
         bind_probe(keys, std::move(suffix), exec);
     }
@@ -5960,27 +5964,29 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// How many partitions this join's hash build may fill concurrently, or 1
     /// to build it serially.
     ///
-    /// Same admission shape as `probe_parallel_workers`, and for the same
-    /// reasons: no nested pool submissions, and below a floor the scatter and
-    /// the two counting passes cost more than the inserts they spread. The
-    /// floor is higher than the probe's because a partitioned build makes
-    /// three passes over the keys where a serial build makes one.
+    /// The floor (`1U << 17U`) and the worker cap (`min(compute_budget, pool,
+    /// 64)`) used to be computed here; they are now the `hash-build` phase of
+    /// the physical plan (`physical::join_hash_build_parallelism`), resolved by
+    /// the builder and read from `build_plan_`. src/runtime/PARALLELISM.md,
+    /// "Target: parallelism as a plan decision". The two conditions that stay
+    /// here are the ones only the operator can judge: the `IBEX_JOIN_BUILD_SERIAL`
+    /// kill switch, whether it is nested under another fan-out
+    /// (`on_worker_pool_thread` -- no nested pool submissions), and whether
+    /// *this* build side cleared the floor (its row count is not known until
+    /// the side is materialized). The floor is higher than the probe's because
+    /// a partitioned build makes three passes over the keys where a serial
+    /// build makes one.
     [[nodiscard]] auto build_partitions(std::size_t n) const -> std::size_t {
-        constexpr std::size_t kMinBuildRows = 1U << 17U;  // 131072
         // Kill switch, and the A/B handle: with it set, the same binary runs
         // the serial build, so the two can be interleaved without rebuilding.
         if (std::getenv("IBEX_JOIN_BUILD_SERIAL") != nullptr) {
             return 1;
         }
-        const ExecutionContext* exec = probe_.exec_;
-        if (exec == nullptr || !exec->can_fan_out() || on_worker_pool_thread() ||
-            n < kMinBuildRows) {
+        if (build_plan_.decline != physical::FanOutDecline::None || build_plan_.worker_cap < 2 ||
+            on_worker_pool_thread() || n < build_plan_.row_floor) {
             return 1;
         }
-        auto& pool = process_worker_pool();
-        const std::size_t workers =
-            std::min({exec->compute_budget(), pool.size(), std::size_t{64}});
-        return workers < 2 ? 1 : workers;
+        return build_plan_.worker_cap;
     }
 
     /// Publish what a build produced, and hand back the orientation it chose.
@@ -6658,6 +6664,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     const ExecutionContext* deferred_exec_ = nullptr;
     bool initialized_ = false;
     Mode mode_ = Mode::Stream;
+
+    /// The `hash-build` phase's parallelism, resolved by the caller
+    /// (`build_physical_join` / `inner_join_table` build it from
+    /// `physical::join_hash_build_parallelism` and `resolve_breaker_parallelism`).
+    /// `build_partitions` reads it rather than deciding for itself.
+    /// src/runtime/PARALLELISM.md. Default-constructed (`worker_cap == 0`) only
+    /// on a hand-built operator, where `build_partitions` then stays serial.
+    physical::BreakerParallelism build_plan_{};
 
     // What an `order` above this join will ask for, or null. Only ever shifts
     // which side is indexed; see `initialize`.
@@ -11610,6 +11624,10 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
+/// Defined next to `build_physical_join`; the join construction sites above it
+/// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
+auto resolved_join_build_plan(const ExecutionContext& exec) -> physical::BreakerParallelism;
+
 auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     // I4 convergence: one implementation, reached through both shapes. The
@@ -11722,7 +11740,8 @@ auto inner_join_table(const Table& left, const Table& right, const std::vector<i
     // semantic subset. Table sources copy only their column handles.
     auto source = make_table_source(left);
     return materialize_operator(std::make_unique<ChunkedInnerJoinOperator>(
-        std::move(source), right, &keys, exec, suffix, &pending_order));
+        std::move(source), right, &keys, exec, suffix, &pending_order,
+        resolved_join_build_plan(exec)));
 }
 
 namespace {
@@ -13287,7 +13306,7 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
     }
     auto op = std::make_unique<ChunkedInnerJoinOperator>(
         std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-        &join.pending_order());
+        &join.pending_order(), resolved_join_build_plan(exec));
     if (auto err = op->run_build()) {
         return std::unexpected(std::move(*err));
     }
@@ -14553,14 +14572,29 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 /// rather than the per-kind switch. What is still ahead is decomposing the
 /// build and the probe into separate pipeline stages with a barrier between
 /// them, so a probe can be a step inside a map pipeline.
-/// Run a join's build phase here, at plan-execution time, instead of leaving
-/// it to fire inside the probe's first `next()`.
+
+/// The `hash-build` phase's parallelism, resolved for this query. The capability
+/// half is `physical::join_hash_build_parallelism` (floor + worker ceiling); the
+/// resolved half needs the `ExecutionContext` and the pool size, both in hand at
+/// build time. One definition, shared by every join construction site, the way
+/// `distinct_table` and `build_physical_distinct` share the dedup policy.
+auto resolved_join_build_plan(const ExecutionContext& exec) -> physical::BreakerParallelism {
+    physical::BreakerParallelism bp = physical::join_hash_build_parallelism();
+    // The pool is sized for decode and spawns its threads on first touch, so a
+    // serial query must not construct it just to learn it is serial.
+    const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
+    physical::resolve_breaker_parallelism(bp, exec, pool_size);
+    return bp;
+}
+
+/// Run a join's build phase here, at plan-execution time, instead of leaving it
+/// to fire inside the probe's first `next()`.
 ///
 /// This is what makes the build *scheduled*: it has a caller that is not the
-/// probe, and its completion is a point in the plan rather than a flag the
-/// probe checks. `IBEX_JOIN_BUILD_LAZY=1` restores the old timing, which is
-/// both a kill switch and the A/B handle for the one thing this changes that
-/// is not free -- when the build side's child is drained.
+/// probe, and its completion is a point in the plan rather than a flag the probe
+/// checks. `IBEX_JOIN_BUILD_LAZY=1` restores the old timing, which is both a kill
+/// switch and the A/B handle for the one thing this changes that is not free --
+/// when the build side's child is drained.
 auto scheduled_join_build(std::unique_ptr<ChunkedInnerJoinOperator> op)
     -> std::expected<OperatorPtr, std::string> {
     static const bool lazy = std::getenv("IBEX_JOIN_BUILD_LAZY") != nullptr;
@@ -14636,7 +14670,8 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         if (probe.scan != nullptr) {
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
-                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order()));
+                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
+                resolved_join_build_plan(exec)));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14650,7 +14685,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order()));
+            &join.pending_order(), resolved_join_build_plan(exec)));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }
@@ -14679,7 +14714,8 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         if (probe.scan != nullptr) {
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
-                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order()));
+                exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
+                resolved_join_build_plan(exec)));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14693,7 +14729,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order()));
+            &join.pending_order(), resolved_join_build_plan(exec)));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }

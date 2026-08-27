@@ -1146,3 +1146,60 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
         REQUIRE(plan.breaker_phases.empty());
     }
 }
+
+TEST_CASE("The join operator reads the hash-build plan: parallel output equals serial",
+          "[physical][breaker][execute]") {
+    // Both sides over the 131072 hash-build floor and over kStreamRightThreshold
+    // (65536), so the operator materializes the left, indexes the right, and its
+    // build fans out -- the path build_partitions now takes from build_plan_.
+    // Heavy key repetition so the partitioned and serial hash builds must agree
+    // on chain order (the join's output row order is a contract).
+    constexpr std::int64_t kLeft = 200000;
+    constexpr std::int64_t kRight = 160000;
+    constexpr std::int64_t kKeys = 40000;
+    runtime::TableRegistry registry;
+    {
+        runtime::Table left;
+        Column<std::int64_t> lk;
+        Column<std::int64_t> lv;
+        for (std::int64_t r = 0; r < kLeft; ++r) {
+            lk.push_back(r % kKeys);
+            lv.push_back(r);
+        }
+        left.add_column("k", std::move(lk));
+        left.add_column("lv", std::move(lv));
+        registry.emplace("big_left", left);
+
+        runtime::Table right;
+        Column<std::int64_t> rk;
+        Column<std::int64_t> rv;
+        for (std::int64_t r = 0; r < kRight; ++r) {
+            rk.push_back(r % kKeys);
+            rv.push_back(r * 10);
+        }
+        right.add_column("k", std::move(rk));
+        right.add_column("rv", std::move(rv));
+        registry.emplace("big_right", right);
+    }
+
+    auto ir = require_ir("(big_left join big_right on k)[order { lv, rv }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(s->rows() == p->rows());
+    REQUIRE(s->rows() == static_cast<std::size_t>(kLeft) / kKeys * kRight);
+    for (const char* col : {"lv", "rv"}) {
+        const auto& sc = std::get<Column<std::int64_t>>(*s->find_entry(col)->column);
+        const auto& pc = std::get<Column<std::int64_t>>(*p->find_entry(col)->column);
+        for (std::size_t i = 0; i < s->rows(); ++i) {
+            REQUIRE(sc[i] == pc[i]);
+        }
+    }
+}

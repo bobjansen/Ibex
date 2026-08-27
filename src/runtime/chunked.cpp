@@ -13102,8 +13102,7 @@ class TwoPhaseFilterOperator final : public Operator {
             case ir::NodeKind::Project:
                 return project_table(input, static_cast<const ir::ProjectNode&>(node).columns());
             case ir::NodeKind::Rename:
-                return rename_table(std::move(input),
-                                    static_cast<const ir::RenameNode&>(node).renames());
+                return rename_table(input, static_cast<const ir::RenameNode&>(node).renames());
             default:
                 // The pipeline builder only admits `is_metadata_only_node` kinds
                 // into `tail_`, so reaching this means the two have drifted.

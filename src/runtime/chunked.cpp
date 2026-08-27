@@ -6002,7 +6002,7 @@ class ChunkedInnerJoinOperator final : public Operator {
         // the four call sites, which all route the result straight into the build.
         if (probe_.exec_ != nullptr && probe_.exec_->parallel_stats != nullptr) {
             probe_.exec_->parallel_stats->parallel_hash_builds.fetch_add(1,
-                                                                        std::memory_order_relaxed);
+                                                                         std::memory_order_relaxed);
         }
         return par_.build.worker_cap;
     }
@@ -7585,8 +7585,7 @@ class ChunkedAggregateOperator final : public Operator {
                 partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
                 plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
                 int_key_kind_ != IntKeyKind::Int64 || scratch_stride_ != 0 || exec_ == nullptr ||
-                on_worker_pool_thread() ||
-                std::max(rows_offered_, rows) < kIntOwnedMinRows) {
+                on_worker_pool_thread() || std::max(rows_offered_, rows) < kIntOwnedMinRows) {
                 return false;
             }
             // As `try_owned`: fan-out permission and the worker cap are the
@@ -12100,8 +12099,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
                 stats.parallel_fields.load(), stats.parallel_direct_numeric_fields.load(),
                 stats.parallel_probes.load(), stats.parallel_hash_builds.load(),
                 stats.parallel_aggregate_partitions.load(),
-                stats.parallel_aggregate_finalizes.load(),
-                stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load());
+                stats.parallel_aggregate_finalizes.load(), stats.grouped_lifted_group_state.load(),
+                stats.chunk_direct_updates.load());
         }
     };
     static const Reporter reporter;
@@ -14668,7 +14667,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 /// and `build_physical_distinct` share the dedup policy.
 auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism {
     physical::JoinParallelism par{.build = physical::join_hash_build_parallelism(),
-                                 .probe = physical::join_probe_parallelism()};
+                                  .probe = physical::join_probe_parallelism()};
     // The pool is sized for decode and spawns its threads on first touch, so a
     // serial query must not construct it just to learn it is serial.
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
@@ -14682,7 +14681,8 @@ auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinPa
 /// `aggregate_{partition,finalize}_parallelism`; the resolved half needs the
 /// `ExecutionContext` and pool size, both in hand here at build time. One
 /// definition, shared by every aggregate construction site.
-auto resolved_aggregate_parallelism(const ExecutionContext& exec) -> physical::AggregateParallelism {
+auto resolved_aggregate_parallelism(const ExecutionContext& exec)
+    -> physical::AggregateParallelism {
     physical::AggregateParallelism par{.partition = physical::aggregate_partition_parallelism(),
                                        .finalize = physical::aggregate_finalize_parallelism()};
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
@@ -15126,8 +15126,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
         physical::note_map_pipeline_executed();
         return build_physical_topk(node, registry, scalars, externs, exec, model_out);
     }
-    if (plan.migrated && (node.kind() == ir::NodeKind::FilterHead ||
-                          node.kind() == ir::NodeKind::FilterTail)) {
+    if (plan.migrated &&
+        (node.kind() == ir::NodeKind::FilterHead || node.kind() == ir::NodeKind::FilterTail)) {
         physical::note_map_pipeline_executed();
         return build_physical_filter_head_tail(node, registry, scalars, externs, exec, model_out);
     }

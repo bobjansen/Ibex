@@ -1255,6 +1255,58 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
     }
 }
 
+TEST_CASE("The aggregate reads the plan: parallel output equals serial and the fan-out fires",
+          "[physical][breaker][execute]") {
+    // A high-cardinality single-Int64 group-by: past kPairOwnedMinRows so the
+    // partition-owned path's `partition` phase fires, and over 131072 groups so
+    // its co-ranking `finalize` merge fans out too. Both now read their worker
+    // cap and fan-out permission from the plan.
+    constexpr std::int64_t kRows = 500'000;
+    constexpr std::int64_t kKeys = 200'000;  // 2.5 rows/group, order-sensitive sum
+    runtime::TableRegistry registry;
+    {
+        runtime::Table t;
+        Column<std::int64_t> g;
+        Column<double> v;
+        for (std::int64_t r = 0; r < kRows; ++r) {
+            g.push_back(r % kKeys);
+            v.push_back(1e9 + static_cast<double>(r % 991) * 0.125);
+        }
+        t.add_column("g", std::move(g));
+        t.add_column("v", std::move(v));
+        registry.emplace("big", t);
+    }
+
+    auto ir = require_ir("big[select { s = sum(v) }, by { g }];");
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ParallelPipelineStats stats;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 8;
+    parallel.parallel_min_rows = 0;
+    parallel.parallel_stats = &stats;
+
+    const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(stats.parallel_aggregate_partitions.load() > 0);  // the radix partition phase fired
+    REQUIRE(stats.parallel_aggregate_finalizes.load() > 0);   // and its merge phase
+    REQUIRE(s->rows() == p->rows());
+    REQUIRE(s->rows() == static_cast<std::size_t>(kKeys));
+
+    // Byte-identical: group order (first occurrence) and the float sums.
+    const auto& sg = std::get<Column<std::int64_t>>(*s->find_entry("g")->column);
+    const auto& pg = std::get<Column<std::int64_t>>(*p->find_entry("g")->column);
+    const auto& sv = std::get<Column<double>>(*s->find_entry("s")->column);
+    const auto& pv = std::get<Column<double>>(*p->find_entry("s")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(sg[i] == pg[i]);
+        REQUIRE(sv[i] == pv[i]);
+    }
+}
+
 TEST_CASE("The join operator reads the hash-build plan: parallel output equals serial",
           "[physical][breaker][execute]") {
     // Both sides over the 131072 hash-build floor and over kStreamRightThreshold

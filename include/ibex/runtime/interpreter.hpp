@@ -557,6 +557,16 @@ struct ParallelPipelineStats {
     /// a gate that silently stopped matching would lose the parallelism with
     /// every test still green.
     std::atomic<std::uint64_t> parallel_hash_builds{0};
+    /// Hash-aggregate `partition` phases (radix scatter+accumulate or the
+    /// partition-owned path) that fanned out across workers, and `finalize`
+    /// phases (the co-ranking / ordered-run / first-row-seed merges) that did.
+    /// The plan now owns the worker cap and fan-out permission for both
+    /// (src/runtime/PARALLELISM.md); the output is byte-identical to the serial
+    /// path in any worker count, so -- like `parallel_probes` -- a gate that
+    /// silently stopped matching would lose the parallelism with every test
+    /// still green.
+    std::atomic<std::uint64_t> parallel_aggregate_partitions{0};
+    std::atomic<std::uint64_t> parallel_aggregate_finalizes{0};
     /// Row-local update fields a chunk executed through the direct kernel
     /// vocabulary, rather than converting to a Table so the established
     /// evaluator could run them. Counted per chunk and field, and counted for

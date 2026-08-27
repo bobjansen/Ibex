@@ -6868,11 +6868,12 @@ class ChunkedAggregateOperator final : public Operator {
 
     ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                              const std::vector<ir::AggSpec>* aggregations,
-                             const ExecutionContext& exec)
+                             const ExecutionContext& exec, physical::AggregateParallelism par = {})
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
-          exec_(&exec) {}
+          exec_(&exec),
+          par_(par) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (emitted_) {
@@ -6898,6 +6899,27 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
    private:
+    /// Observability check for the breaker-parallelism slice
+    /// (src/runtime/PARALLELISM.md, "Target: parallelism as a plan decision").
+    /// Called once at each point the operator commits to fanning a phase out
+    /// over `count` workers. If `build_physical_aggregate` resolved a plan for
+    /// this breaker, that phase must have permitted fan-out and its worker cap
+    /// must bound the operator's own choice. A disagreement means the planner
+    /// and the operator computed different things -- abort loudly rather than
+    /// let the authority slice inherit the divergence. `phase` is
+    /// `par_.partition` or `par_.finalize`.
+    static void check_agg_plan(const physical::BreakerParallelism& phase, std::size_t count) {
+        if (phase.worker_cap == 0) {
+            return;  // no resolved plan (a hand-built ChunkedAggregateOperator)
+        }
+        if (phase.decline != physical::FanOutDecline::None) {
+            invariant_violation("aggregate: plan declined fan-out but the operator fanned out");
+        }
+        if (count > phase.worker_cap) {
+            invariant_violation("aggregate: operator worker count exceeds the plan's cap");
+        }
+    }
+
     auto process_chunk(const Chunk& chunk) -> std::optional<std::string> {
         if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
             std::fprintf(stderr, "[agg_process_chunk] rows=%zu group_by_size=%zu\n", chunk.rows(),
@@ -7682,6 +7704,9 @@ class ChunkedAggregateOperator final : public Operator {
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
         }
+        if (workers >= 2) {
+            check_agg_plan(par_.partition, workers);  // the owned specialization of the phase
+        }
 
         // A clustered count key should not pay the partition/scatter/hash
         // pipeline once per ROW. Compress contiguous equal-key runs first and
@@ -7978,6 +8003,7 @@ class ChunkedAggregateOperator final : public Operator {
             merge_segment(std::vector<std::size_t>(part_count, 0), part_end, 0);
             return;
         }
+        check_agg_plan(par_.finalize, workers);
 
         const std::uint64_t hi = owned_rows_seen_ + 1;
         const auto frontier = [&](std::size_t rank) {
@@ -8171,6 +8197,9 @@ class ChunkedAggregateOperator final : public Operator {
                 auto& pool = process_worker_pool();
                 workers = std::min(
                     {exec_->compute_budget(), pool.size(), run_count / 8192, std::size_t{64}});
+            }
+            if (workers >= 2) {
+                check_agg_plan(par_.finalize, workers);
             }
 
             std::size_t total = 0;
@@ -8768,6 +8797,7 @@ class ChunkedAggregateOperator final : public Operator {
         while (part_count * 2 <= workers) {
             part_count *= 2;  // a power of two, so the partition is a mask
         }
+        check_agg_plan(par_.partition, workers);  // the radix-hash discovery + accumulate phase
         const std::uint64_t part_mask = part_count - 1;
         if (partitions.size() < part_count) {
             partitions.resize(part_count);
@@ -9587,6 +9617,7 @@ class ChunkedAggregateOperator final : public Operator {
             threads = std::min(exec_->compute_budget(), process_worker_pool().size());
         }
         if (threads >= 2) {
+            check_agg_plan(par_.finalize, threads);
             const std::size_t grain = (first_rows.size() + threads - 1) / threads;
             auto batch = process_worker_pool().submit(threads, [&](std::size_t worker) {
                 const std::size_t begin = worker * grain;
@@ -10969,6 +11000,13 @@ class ChunkedAggregateOperator final : public Operator {
     /// counts only rows the partitioned path itself consumed and exists to give
     /// group first-rows a global base.
     std::size_t rows_offered_ = 0;
+    /// The `partition` and `finalize` fan-out policies, resolved by
+    /// `build_physical_aggregate` (src/runtime/PARALLELISM.md). This slice is
+    /// observability only: the operator still decides for itself and
+    /// `check_agg_plan` aborts if the two ever disagree. The authority slices
+    /// delete the operator's open-coded floors and `min(budget, pool, 64)` caps
+    /// and read `par_` instead.
+    physical::AggregateParallelism par_{};
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
     /// The two paths are mutually exclusive, so sharing that map is safe.
@@ -11027,11 +11065,13 @@ class ChunkedSortedAggregateOperator final : public Operator {
    public:
     ChunkedSortedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                                    const std::vector<ir::AggSpec>* aggregations,
-                                   const ExecutionContext& exec)
+                                   const ExecutionContext& exec,
+                                   physical::AggregateParallelism par = {})
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
-          exec_(&exec) {}
+          exec_(&exec),
+          par_(par) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (fallback_) {
@@ -11093,7 +11133,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 fallback_ = std::make_unique<ChunkedAggregateOperator>(
                     std::make_unique<PrependChunkOperator>(std::move(*schema_only),
                                                            std::move(child_)),
-                    group_by_, aggregations_, *exec_);
+                    group_by_, aggregations_, *exec_, par_);
                 return {};
             }
             done_ = true;
@@ -11103,7 +11143,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = std::make_unique<ChunkedAggregateOperator>(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
-                group_by_, aggregations_, *exec_);
+                group_by_, aggregations_, *exec_, par_);
             return {};
         }
         if (auto err = init_plan(first)) {
@@ -11602,6 +11642,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
     const ExecutionContext* exec_;
+    /// Forwarded verbatim to the hash `ChunkedAggregateOperator` fallback --
+    /// the sorted stream itself has no fan-out point (it emits group-at-a-time).
+    physical::AggregateParallelism par_{};
 
     bool decided_ = false;
     bool done_ = false;
@@ -11645,6 +11688,10 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
 /// Defined next to `build_physical_join`; the join construction sites above it
 /// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
 auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism;
+
+/// The hash aggregate's `partition` and `finalize` fan-out policies, resolved
+/// together. Defined next to `build_physical_aggregate`.
+auto resolved_aggregate_parallelism(const ExecutionContext& exec) -> physical::AggregateParallelism;
 
 auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
@@ -14608,6 +14655,20 @@ auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinPa
     return par;
 }
 
+/// As `resolved_join_parallelism`, for the hash aggregate. The capability half
+/// (floors, `min(budget, pool, 64)` ceiling, strategy) comes from
+/// `aggregate_{partition,finalize}_parallelism`; the resolved half needs the
+/// `ExecutionContext` and pool size, both in hand here at build time. One
+/// definition, shared by every aggregate construction site.
+auto resolved_aggregate_parallelism(const ExecutionContext& exec) -> physical::AggregateParallelism {
+    physical::AggregateParallelism par{.partition = physical::aggregate_partition_parallelism(),
+                                       .finalize = physical::aggregate_finalize_parallelism()};
+    const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
+    physical::resolve_breaker_parallelism(par.partition, exec, pool_size);
+    physical::resolve_breaker_parallelism(par.finalize, exec, pool_size);
+    return par;
+}
+
 /// Run a join's build phase here, at plan-execution time, instead of leaving it
 /// to fire inside the probe's first `next()`.
 ///
@@ -14830,8 +14891,13 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // stage in that shape buys no overlap and only creates a thread.
         // A join below it is staged instead: its probe stream can fill the
         // aggregate while it keeps pulling the next probe chunk.
+        // The plan describes the hash fallback's two fan-out phases; resolve
+        // them here, where the ExecutionContext is in hand, and hand them down.
+        // Observability only (slice 1): the operator still decides for itself
+        // and `check_agg_plan` aborts on disagreement.
         return std::make_unique<ChunkedSortedAggregateOperator>(
-            std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec);
+            std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec,
+            resolved_aggregate_parallelism(exec));
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

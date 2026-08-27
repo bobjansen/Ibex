@@ -1206,6 +1206,55 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
     }
 }
 
+TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical][breaker]") {
+    SECTION("partition then finalize, each with its own floor and strategy") {
+        const auto [tree, plan] =
+            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.aggregate.strategy ==
+                runtime::physical::AggregateStrategy::StreamingSorted);
+        REQUIRE(plan.breaker_phases.size() == 2);
+
+        const auto& partition = plan.breaker_phases[0];
+        REQUIRE(partition.name == "partition");
+        REQUIRE(partition.parallelism.strategy ==
+                runtime::physical::PartitionStrategy::RadixHash);
+        REQUIRE(partition.parallelism.row_floor == (1U << 16U));  // try_owned's admission floor
+        REQUIRE(partition.parallelism.breaker_max_workers == 64);
+
+        const auto& finalize = plan.breaker_phases[1];
+        REQUIRE(finalize.name == "finalize");
+        REQUIRE(finalize.parallelism.strategy == runtime::physical::PartitionStrategy::Owned);
+        REQUIRE(finalize.parallelism.row_floor == (1U << 17U));  // finalize_owned's merge gate
+        REQUIRE(finalize.parallelism.breaker_max_workers == 64);
+    }
+
+    SECTION("explain physical renders the strategy line and both phases") {
+        const auto [tree, plan] =
+            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("Breaker(Aggregate)") != std::string::npos);
+        REQUIRE(text.find("partition:") != std::string::npos);
+        REQUIRE(text.find("finalize:") != std::string::npos);
+        REQUIRE(text.find("radix-hash") != std::string::npos);
+        REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
+
+    SECTION("a fused left-join count carries no fan-out phases") {
+        // COUNT(*) grouped by the left key over a left join fuses to one step
+        // that runs whole-table -- no ChunkedAggregateOperator, nothing to fan.
+        const auto [tree, plan] = serial_plan(
+            "(orders as DataFrame<{ o_orderkey: Int64 }> "
+            " left join lineitem as DataFrame<{ l_orderkey: Int64 }> "
+            " on { o_orderkey = l_orderkey })"
+            "[select { n = count() }, by { o_orderkey }];");
+        if (plan.aggregate.strategy ==
+            runtime::physical::AggregateStrategy::FusedLeftJoinCount) {
+            REQUIRE(plan.breaker_phases.empty());
+        }
+    }
+}
+
 TEST_CASE("The join operator reads the hash-build plan: parallel output equals serial",
           "[physical][breaker][execute]") {
     // Both sides over the 131072 hash-build floor and over kStreamRightThreshold

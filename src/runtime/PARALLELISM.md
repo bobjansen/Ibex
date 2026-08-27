@@ -495,9 +495,23 @@ Every slice:
    onto the plan, byte-identical throughout. The `probe_parallel_workers`
    `on_worker_pool_thread()` veto was measured to fire 0/52 on PDS-H, so folding
    it changed nothing.
-4. **Aggregate** — `AggregatePlan` gains discovery / accumulate / finalize
-   phases. **Blocked-first:** `try_owned_pair` and the serial path re-associate
-   differently and disagree bit-for-bit at ≥65536 rows, with no test. That
-   divergence must be reconciled and an exact-equality grouped-path test written
-   *before* the decomposition — otherwise it inherits a determinism bug it will
-   be blamed for. See `kernel-pipeline-execution-plan.md`.
+4. **Aggregate** — `AggregatePlan` gains `partition` + `finalize` phases (the
+   two fan-out points `ChunkedAggregateOperator` has today; discovery and
+   accumulate are one `pool.submit`, so they are one phase until that region is
+   actually decomposed in Phase 5). **Determinism blocker cleared (2026-08-27):**
+   the `try_owned` vs serial re-association divergence recorded below does not
+   reproduce on the current tree — the serial probe path, the owned path, and a
+   strict-row-order reference all agree bit-for-bit at every thread count
+   (verified two ways: unit-test `==` comparison + an interleaved-A/B byte hash,
+   1c vs 8c vs base). The Aug-25→27 aggregate commits (`04d56853` parallel
+   sorted-key first-occurrence merge, `d1cfcaa0` async hot table, `f675397e`,
+   `d5928ee2`) reconciled it. Removing `try_owned`'s schedule gate outright was
+   also tried and reverted — correctness stayed byte-identical but 1-core q20/q18
+   regressed +25%/+40%. The guard test now exists: `tests/test_interpreter.cpp`
+   "two-key grouped aggregate is deterministic across thread counts". Slice 1
+   (observability) LANDED: `aggregate_{partition,finalize}_parallelism`,
+   `plan_physical` fills the phases, `explain physical` prints them,
+   `ChunkedAggregateOperator::check_agg_plan` aborts on planner/operator
+   disagreement — byte-identical, full suite + q01/q10/q13/q18/q20/q21 at 1c/8c.
+   Slices 2–3 (authority) delete the operator's open-coded floors and
+   `min(budget, pool, 64)` caps.

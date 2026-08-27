@@ -332,6 +332,30 @@ struct JoinParallelism {
     BreakerParallelism probe;
 };
 
+/// A hash aggregate's fan-out points. The operator has two today:
+///
+/// - `partition` — the histogram → prefix-sum → scatter → per-partition
+///   accumulate region shared by `try_discover_partitioned` (radix-hash) and
+///   `try_owned` (partition-owned key maps). Discovery and accumulation are one
+///   `pool.submit` here, not two; the spec's separate "discovery" / "accumulate"
+///   phases appear only once that region is actually decomposed (Phase 5).
+///   `row_floor` is the *lower* admission floor (65536, `try_owned`'s
+///   `kPairOwnedMinRows`); the radix path's stricter 262144
+///   (`kDefaultPartitionMinRows`) is a strategy-internal detail slice 2 folds in.
+/// - `finalize` — the K-way first-occurrence merge (`finalize_owned`'s
+///   co-ranking merge, the ordered-run finalize, the non-owned first-row seed
+///   pass). `row_floor` 131072 (`1U << 17U`).
+[[nodiscard]] auto aggregate_partition_parallelism() -> BreakerParallelism;
+[[nodiscard]] auto aggregate_finalize_parallelism() -> BreakerParallelism;
+
+/// Both fan-out phases of a hash aggregate, resolved together — what
+/// `build_physical_aggregate` hands the operator. Bundled like `JoinParallelism`
+/// so the two cannot be passed in the wrong order.
+struct AggregateParallelism {
+    BreakerParallelism partition;
+    BreakerParallelism finalize;
+};
+
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one
 /// implementation of the worker-cap clamp that used to be open-coded per

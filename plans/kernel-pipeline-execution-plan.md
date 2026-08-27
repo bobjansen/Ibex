@@ -158,9 +158,12 @@ scheduled or measured separately.
      resolved right falls under `kStreamRightThreshold`. `check_answers.py`
      caught it 21/22. Close before the morsel-chain work.
 3. **Phase 4 aggregate decomposition** — discovery / per-partition slots / final
-   ordering / emission as phases. **Blocked-first:** the thread-count-invariance
-   this must preserve is **already violated on the current tree** (see below) —
-   reconcile that first; there is no test that would have caught it.
+   ordering / emission as phases. **Determinism blocker cleared 2026-08-27**
+   (see below — the divergence no longer reproduces; guard test landed). Slice 1
+   (observability: `partition` + `finalize` phases on the plan, `explain
+   physical` prints them, `check_agg_plan` aborts on disagreement) LANDED.
+   Slices 2–3 move the authority (delete the operator's open-coded floors +
+   `min(budget, pool, 64)` caps).
 4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
    single-operator shape as Order/Head: `plan_physical` marks each migrated,
    `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
@@ -227,7 +230,19 @@ Joins are 96.7% of q05's wall, 80.2% of q08, 74.9% of q21, 67.1% of q19.
   `project_q21_is_occupancy_bound` — possibly the same finding from three
   directions; check before working any.)
 
-### The determinism constraint is already broken (2026-08-25)
+### The determinism constraint — recorded broken 2026-08-25, RESOLVED 2026-08-27
+
+**Update 2026-08-27:** the divergence below does not reproduce on the current
+tree. The serial probe path, the `try_owned` path, and a strict-row-order
+reference all agree bit-for-bit at every thread count — verified via
+unit-test `==` (`tests/test_interpreter.cpp` "two-key grouped aggregate is
+deterministic across thread counts", the guard test this section called for)
+and via an interleaved-A/B result hash (1c vs 8c vs base) on q18/q20/q21.
+Reconciled by the Aug-25→27 aggregate commits (`04d56853`, `d1cfcaa0`,
+`f675397e`, `d5928ee2`). Removing `try_owned`'s schedule gate outright was
+tried and reverted (1-core q20/q18 +25%/+40%, correctness byte-identical).
+Slice 1 of the decomposition landed on top. Original finding, kept for the
+record:
 
 `3f923086`, before any decomposition. `t[select { s = sum(v) }, by { g1, g2 }]`,
 400k rows, 221 groups, ~1 ULP of 1.8e12:

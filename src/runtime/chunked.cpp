@@ -3035,7 +3035,7 @@ class ChunkedDistinctOperator final : public Operator {
                 return false;
             }
             // Bound to the eligibility check above: constructing the pool
-            // spawns its threads eagerly, and a `IBEX_PARALLEL=0` query must
+            // spawns its threads eagerly, and a serial (`IBEX_CORES=1`) query must
             // not pay for them just to be told it is serial.
             const std::size_t pool_size = process_worker_pool().size();
             const std::size_t budget = exec_->compute_budget();
@@ -14485,7 +14485,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     // several workers over it. With a budget of one there is no second worker
     // to buy, and the payment is pure loss -- the serial composer streams the
     // same steps chunk by chunk instead. Measured at one core on PDS-H SF-1
-    // against `IBEX_PARALLEL=0`, byte-identical output on all 22 queries:
+    // against `IBEX_CORES=1`, byte-identical output on all 22 queries:
     // q14 +150%, q19 +110%, q12 +80%, q03/q10 +50%.
     //
     // It is the materialize that costs, not the split. Declining only the split

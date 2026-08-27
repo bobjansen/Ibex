@@ -280,3 +280,156 @@ in role X" predicate (I2/I3); nine private row thresholds beside the two
 `ExecutionContext` knobs, none sweepable without recompiling (I6);
 `parallel_min_cells` consulted by 2 of ~30 sites (I7); worker-count caps that
 differ arbitrarily (I9); cancellation reaching Layers A/B but not Layer C (I13).
+
+---
+
+# Target: parallelism as a plan decision
+
+Status: **spec, not built** (2026-08-27). This is the end state the breaker
+decomposition (`kernel-pipeline-execution-plan.md` Phase 4) builds toward. It is
+written before the code so it can be checked once rather than argued during
+every slice. Nothing here changes a determinism device or a kernel — it moves
+*who decides* and *where the tunable lives*, not *how the work is done*.
+
+## The principle
+
+**Every fan-out point in the engine is described by the physical plan.** The
+planner computes the policy; `explain physical` prints it; a test asserts it; a
+benchmark gates it. The operator becomes an executor of that policy plus two
+genuinely-runtime checks it alone can make.
+
+Map chains already meet this (`plan.mode`, `parallel_begin/end`, per-step
+`MapStep`). The target extends the same treatment to every breaker.
+
+## What the planner decides vs. what the operator decides
+
+The split is the same one `JoinPlan` already made deliberately (it names the two
+inputs and leaves *which side is hashed* to the build phase, because that
+depends on measured row counts a plan cannot know):
+
+| Decided by the **planner**, at plan time | Decided by the **operator**, at run time |
+|---|---|
+| Is this fan-out permitted by the query's budget? (`exec.can_fan_out()`) | Am I running nested under another fan-out? (`on_worker_pool_thread()`) |
+| The worker **cap** — `min(compute_budget, pool_size, this-breaker's-own-max)`, computed **once, here**, not open-coded per operator | Did this input clear the row floor? (`rows >= floor`, checked on the first chunk of a streaming source) |
+| The row **floor** — a named constant per breaker category, in `physical_plan.hpp`, not in `chunked.cpp` | The partition count, when the plan left it "derive": `min(cap, …)` from the actual first-chunk row count |
+| The partition **strategy** (packed-key / radix-hash / owned) | — |
+| A row **estimate** when one is available (footer stats for a bare scan; child's exact count for `Distinct(Distinct(…))`), and the fan-out **prediction** that follows from it | — |
+
+`on_worker_pool_thread()` cannot move to the plan: the plan is built once, but
+the same operator can be constructed and pulled from a nested context (a join's
+build side). It stays a runtime check. So does "did this chunk clear the floor",
+because a streaming source's row count is not known until it arrives.
+
+Everything else that is currently inside a breaker's `next()` — the `32768`
+hardcoded twice in `ChunkedDistinctOperator`, the `min(budget, pool, 64)`
+repeated at ~10 sites with three different caps — moves to the planner.
+
+## The descriptor
+
+```cpp
+// physical_plan.hpp
+struct RowEstimate {
+    std::size_t rows = 0;
+    enum class Source { None, Footer, ChildExact, Guess } source = Source::None;
+};
+
+enum class FanOutDecline : std::uint8_t {
+    None,          // may fan out
+    SingleCore,    // exec.can_fan_out() is false
+    BelowFloor,    // a confident estimate is under the row floor
+    // (OnPoolThread and the first-chunk floor check are runtime, not here)
+};
+
+struct BreakerParallelism {
+    FanOutDecline decline = FanOutDecline::None;
+    std::size_t   worker_cap = 1;        // the ONE place this is computed
+    std::size_t   partition_count = 0;   // 0 = operator derives from first-chunk rows, ≤ cap
+    std::size_t   row_floor = 0;         // the plan value; default from a named constant
+    PartitionStrategy strategy = PartitionStrategy::PackedKey;
+    RowEstimate   estimate{};
+};
+
+// One breaker = one or more named phases, each with its own fan-out point.
+// Distinct/Order/TopK have one; a decomposed Aggregate has three
+// (discovery / accumulate / finalize); a Join has two (hash-build / probe).
+struct BreakerPhase {
+    std::string_view    name;
+    BreakerParallelism  parallelism;
+};
+
+// Hangs off physical::Plan for a breaker root; JoinPlan/AggregatePlan gain a
+// `std::vector<BreakerPhase> phases` beside their existing structural fields
+// rather than a second parallel struct.
+```
+
+## `explain physical` output
+
+Distinct, parallel, no estimate (streaming filtered input):
+
+```
+Breaker(Distinct) keys={g,v}
+  dedup: parallel-capable  cap≤6  floor 32768  partitions=derived  packed-key
+         no row estimate → decided on first chunk
+```
+
+Distinct, parallel, footer estimate (bare `Distinct(Scan)`):
+
+```
+Breaker(Distinct) keys={g,v}
+  dedup: parallel-capable  cap≤6  floor 32768  partitions=4  packed-key
+         estimate 3,200,000 rows (footer) → fan out
+```
+
+Distinct, serial:
+
+```
+Breaker(Distinct) keys={g,v}
+  dedup: serial (single core)
+```
+
+Join, once decomposed:
+
+```
+Breaker(Join) inner keys=1  strategy=StreamingProbe  inputs=[lineitem, orders]
+  hash-build: parallel-capable  cap≤6  floor 65536  partitions=derived  head-table
+  probe:      parallel-capable  cap≤6  floor 16384  partitions=derived  range
+```
+
+## Migration invariants
+
+Every slice:
+- **Byte-identical** serial and parallel output — `diff <(IBEX_CORES=1) <(IBEX_CORES=8)` on all 22 PDS-H answers, plus the full 1800-test suite.
+- **`ParallelPipelineStats` counters unchanged** for every PDS-H query (the fan-out happened the same number of times).
+- **The `BreakerParallelism` for a query is deterministic** — same across runs, same across thread counts (it's a function of `ExecutionContext` + footer stats, both stable).
+- **Observability before authority.** For each breaker: land the planner computing `BreakerParallelism` + `explain physical` printing it, with the operator keeping its existing logic and a *debug assert* that its runtime decision matches the plan's prediction where the plan could predict. Only once that has run clean (full suite, both core counts) does the second slice delete the operator's copy and have it read the plan.
+
+## Non-goals
+
+- **Not a scheduler.** The plan still does not schedule anything; `WorkerPool`
+  still just runs batches. This describes decisions, it does not sequence them.
+- **Not per-morsel.** One `BreakerParallelism` per operator instance, decided
+  once.
+- **Not removing the runtime checks.** `on_worker_pool_thread()` and the
+  first-chunk floor check are the operator's, permanently.
+- **Not the `chunked.cpp` split.** That is Phase 5, and it is deliberately
+  *after* this — the plan says decomposition makes the split easier.
+- **Not a row-count estimator project.** The estimate is opportunistic (footer
+  stats, exact child counts). `partition_count = 0 / derive` is the honest
+  default and preserves today's behavior exactly.
+
+## Sequence and blockers
+
+1. **`BreakerParallelism` + Distinct** — the smallest case (one phase, no
+   eligibility gate, self-contained fan-out). Observability slice, then
+   authority slice.
+2. **Order, TopK** — same one-phase shape.
+3. **Join** — `JoinPlan` gains `phases` for hash-build and probe;
+   `build_join_hash_index`'s threading becomes a phase decision. This is where
+   the measured cost is (q21's 40 ms serial hash build) — decomposition here is
+   a speed lever, not deferred speed.
+4. **Aggregate** — `AggregatePlan` gains discovery / accumulate / finalize
+   phases. **Blocked-first:** `try_owned_pair` and the serial path re-associate
+   differently and disagree bit-for-bit at ≥65536 rows, with no test. That
+   divergence must be reconciled and an exact-equality grouped-path test written
+   *before* the decomposition — otherwise it inherits a determinism bug it will
+   be blamed for. See `kernel-pipeline-execution-plan.md`.

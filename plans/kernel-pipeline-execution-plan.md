@@ -363,7 +363,17 @@ Order `ececc75f`, Head/Distinct `49ca33c1`). **Decomposition NOT started** — t
 operators are unchanged; the branches moved into `build_physical_join` /
 `build_physical_aggregate` rather than dissolving into pipeline stages, so the
 exit criterion ("fast paths no longer depend on special builder branches") is
-**not met**.
+**not met**. A breaker's parallelism (fan-out decision, worker cap, row floor,
+partition strategy) is still private to `chunked.cpp`, invisible to `explain
+physical`.
+
+**The decomposition target is specified in
+[`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md), "Target:
+parallelism as a plan decision"** — the `BreakerParallelism` descriptor, the
+planner-vs-operator split (same one `JoinPlan` already made), the `explain
+physical` format, the observability-before-authority slicing, and the sequence
+(Distinct → Order/TopK → Join → Aggregate, the last blocked on the determinism
+reconciliation).
 
 *Method note (decided the outcome twice):* each port = name the builder's own
 predicates + de-duplicate, have the planner **relay** them, have the seam

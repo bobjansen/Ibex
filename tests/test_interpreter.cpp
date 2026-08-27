@@ -8851,6 +8851,85 @@ TEST_CASE("global aggregate is deterministic across thread counts", "[agg][paral
     }
 }
 
+// A two-Int64-key grouped `sum(Double)` is the shape `try_owned`'s PairIntKey
+// ownership path claims (single aggregate, Sum(Double) or Count, >= 65536
+// estimated rows). That path accumulates each group's rows in ascending row
+// order; the serial grouped accumulator it used to fall back to below its old
+// fan-out gate re-associates the reduction. Admission is now data-derived
+// only, so 1 core takes the same owned path (at part_count == 1, inline) and
+// the float sum must be bit-identical at every thread count. Reverting that
+// gate reinstates the serial fallback at 1 core and this fails: the values
+// chosen below (large running total, small stride, each pair's rows sprayed
+// across the whole row space) make the re-association visible in the low bits.
+// Row count is over `kDefaultPartitionMinRows` (262144) so the serial fallback
+// actually engages its partition-and-merge shape -- below that it is a plain
+// running total in row order and there is nothing to diverge from.
+TEST_CASE("two-key grouped aggregate is deterministic across thread counts",
+          "[agg][groupby][parallel][reduction]") {
+    constexpr std::size_t kRows = 500'000;
+    Column<std::int64_t> g1;
+    Column<std::int64_t> g2;
+    Column<double> v;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        // 40 x 50 coprime moduli => 200 distinct (g1, g2) pairs, each with
+        // 2500 rows at stride 200 across the full range.
+        g1.push_back(static_cast<std::int64_t>(r % 40));
+        g2.push_back(static_cast<std::int64_t>(r % 50));
+        v.push_back(1e9 + (static_cast<double>(r % 997) * 0.125));
+    }
+    runtime::Table t;
+    t.add_column("g1", std::move(g1));
+    t.add_column("g2", std::move(g2));
+    t.add_column("v", std::move(v));
+    runtime::TableRegistry registry;
+    registry.emplace("t", t);
+
+    // Exactly one aggregate: a second would disqualify the owned path.
+    auto ir = require_ir("t[select { s = sum(v) }, by { g1, g2 }];");
+
+    const auto run = [&](bool parallel, std::size_t threads) {
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = (parallel) ? threads : 1;
+        exec.parallel_min_rows = 0;
+        exec.parallel_min_cells = 0;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        const auto& s = std::get<Column<double>>(*out->find("s"));
+        return std::vector<double>(s.begin(), s.end());
+    };
+
+    // Strict ascending-row-order reference: each pair's rows added in the order
+    // they appear, groups emitted in first-occurrence order. This is the answer
+    // the owned path produces; a schedule-dependent re-association (the failure
+    // this test guards) would drift from it in the low bits.
+    std::vector<std::pair<std::int64_t, std::int64_t>> key_order;
+    std::map<std::pair<std::int64_t, std::int64_t>, double> acc;
+    for (std::size_t r = 0; r < kRows; ++r) {
+        const std::pair<std::int64_t, std::int64_t> key{static_cast<std::int64_t>(r % 40),
+                                                        static_cast<std::int64_t>(r % 50)};
+        if (acc.emplace(key, 0.0).second) {
+            key_order.push_back(key);
+        }
+        acc[key] += 1e9 + (static_cast<double>(r % 997) * 0.125);
+    }
+    std::vector<double> reference;
+    reference.reserve(key_order.size());
+    for (const auto& key : key_order) {
+        reference.push_back(acc[key]);
+    }
+
+    const std::vector<double> serial = run(false, 0);
+    REQUIRE(serial.size() == 200);
+    CHECK(serial == reference);
+
+    for (const std::size_t threads : {1U, 2U, 3U, 5U, 8U}) {
+        CAPTURE(threads);
+        // Bit-identical, not Approx: the reduction order is the data's row
+        // order at every thread count, so nothing may drift from the reference.
+        CHECK(run(true, threads) == reference);
+    }
+}
+
 // A single-key Categorical group-by fans out across workers, each accumulating
 // into a private slot array indexed by code, then merges in ascending row
 // order. The property that is easy to lose and invisible in a values-only

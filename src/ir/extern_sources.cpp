@@ -66,8 +66,7 @@ void rewrite(NodePtr& node, const std::set<std::string>& eligible,
         return;
     }
     if (node->kind() == NodeKind::ExternCall) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& call = static_cast<const ExternCallNode&>(*node);
+        const auto& call = node_cast<ExternCallNode>(*node);
         if (!eligible.contains(call.callee())) {
             return;
         }
@@ -85,8 +84,7 @@ void rewrite(NodePtr& node, const std::set<std::string>& eligible,
     }
 
     if (node->kind() == NodeKind::Program) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        auto& program = static_cast<ProgramNode&>(*node);
+        auto& program = node_cast<ProgramNode>(*node);
         for (auto& preamble : program.mutable_preamble()) {
             rewrite(preamble, eligible, names, sources);
         }

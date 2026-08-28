@@ -183,6 +183,10 @@ echo "Fixing includes, const-correctness, and designated initializers in: ${file
 # `UnusedIncludes: false` — see the note at the top of this script. Spelled as
 # --config rather than .clang-tidy so the repo-wide advisory CI sweep still
 # *reports* unused includes; it is only automatic removal that is unsafe.
+# `IgnoreHeaders` rejects libstdc++ implementation headers as missing-include
+# providers. They are not part of the C++ interface and MSVC does not ship
+# them; when a standard declaration has such a provider, use its public
+# standard-library header instead.
 tidy_failed_files=()
 for f in "${files[@]}"; do
     # A header often has no standalone compile command. clang-tidy can report
@@ -199,7 +203,8 @@ for f in "${files[@]}"; do
     cp -- "$f" "$backup_file"
     if "$CLANG_TIDY_BIN" -p "$BUILD_DIR" --header-filter='' \
         --config="{Checks: '-*,misc-include-cleaner,modernize-use-designated-initializers',
-                   CheckOptions: {misc-include-cleaner.UnusedIncludes: false}}" \
+                   CheckOptions: {misc-include-cleaner.UnusedIncludes: false,
+                                  misc-include-cleaner.IgnoreHeaders: '(^|.*/)bits/.*'}}" \
         "${tidy_extra_args[@]}" \
         --fix "$f"; then
         :

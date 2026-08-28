@@ -286,7 +286,7 @@ class ChunkedProjectOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        auto projected = kernel::project_chunk(std::move(*chunk_res.value()), *columns_);
+        auto projected = kernel::project_chunk(*chunk_res.value(), *columns_);
         if (!projected.has_value()) {
             return std::unexpected(std::move(projected.error()));
         }
@@ -621,7 +621,7 @@ class ChunkedRenameOperator final : public Operator {
         if (!chunk_res.value().has_value()) {
             return std::optional<Chunk>{};
         }
-        Chunk input = std::move(*chunk_res.value());
+        const Chunk input = std::move(*chunk_res.value());
         const kernel::ChunkView view(input);
         const ir::ColumnNameMap names(*renames_);
         std::vector<std::string_view> input_names;
@@ -1244,7 +1244,7 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     // key's kind — none of which a single non-null numeric key needs. That is
     // exactly the shape the radix path above requires, so when it ran the
     // comparison is one array read per side.
-    const FlatCol* solo_key = radix_order ? &order_flat[0] : nullptr;
+    const FlatCol* solo_key = radix_order ? order_flat.data() : nullptr;
     auto same_rank_keys = [&](std::size_t lhs, std::size_t rhs) -> bool {
         if (solo_key != nullptr) {
             return solo_key->kind == FlatKind::F64 ? solo_key->f64[lhs] == solo_key->f64[rhs]
@@ -2434,7 +2434,6 @@ struct PackedKeyEncoder {
     /// per-column values (fast-path migration); packing itself never reads a
     /// cell back out, so this has no hot-path cost.
     template <typename Packed>
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     [[nodiscard]] static auto extract_cell(const Packed& key, unsigned shift, unsigned width_bits)
         -> std::uint64_t {
         const std::uint64_t mask =
@@ -2870,6 +2869,7 @@ class ChunkedDistinctOperator final : public Operator {
         // win.
         constexpr bool kExactIdentity = std::is_same_v<T, std::int64_t> ||
                                         std::is_same_v<T, Date> || std::is_same_v<T, Timestamp>;
+        // NOLINTNEXTLINE(misc-const-correctness) // threaded changes behind constexpr
         bool threaded = false;
         if constexpr (kExactIdentity) {
             threaded = try_typed_parallel(col, rows, state, keep_);
@@ -3166,7 +3166,7 @@ class ChunkedDistinctOperator final : public Operator {
             // exactly that. Same hasher and mask the workers use below, or a
             // seeded value lands in a partition nobody probes for it.
             state.parts.resize(dedup_part_count_);
-            robin_hood::hash<T> seed_hasher;
+            const robin_hood::hash<T> seed_hasher;
             for (const T& value : state.seen) {
                 state.parts[seed_hasher(value) & (dedup_part_count_ - 1)].insert(value);
             }
@@ -3185,7 +3185,7 @@ class ChunkedDistinctOperator final : public Operator {
             auto batch = pool.submit(ranges, [&](std::size_t r) {
                 const std::size_t begin = r * grain;
                 const std::size_t end = std::min(rows, begin + grain);
-                robin_hood::hash<T> hasher;
+                const robin_hood::hash<T> hasher;
                 for (std::size_t row = begin; row < end; ++row) {
                     part_of_row_[row] = static_cast<std::uint8_t>(hasher(col[row]) & part_mask);
                 }
@@ -4147,8 +4147,7 @@ auto base_scan_of(const ir::Node& node) -> const ir::ScanNode* {
     if (cur->kind() != ir::NodeKind::Scan) {
         return nullptr;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    return &static_cast<const ir::ScanNode&>(*cur);
+    return &ir::node_cast<ir::ScanNode>(*cur);
 }
 
 /// If `right` is a chain of Project/Rename nodes over a Scan whose name the
@@ -5495,8 +5494,8 @@ struct JoinProbe {
             if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
                 return kNil;
             }
-            JoinHashIndex::PairKey key{.a = static_cast<std::uint64_t>(d0[r]),
-                                       .b = static_cast<std::uint64_t>(d1[r])};
+            const JoinHashIndex::PairKey key{.a = static_cast<std::uint64_t>(d0[r]),
+                                             .b = static_cast<std::uint64_t>(d1[r])};
             return index().pair_heads.find_head(key);
         };
 
@@ -5625,6 +5624,7 @@ struct JoinProbe {
                 const auto& lc = left_side.columns[i];
                 if (gathered[i].second.has_value()) {
                     output.add_column(left_name(i, lc), std::move(gathered[i].first),
+                                      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
                                       std::move(*gathered[i].second));
                 } else {
                     output.add_column(left_name(i, lc), std::move(gathered[i].first));
@@ -5657,6 +5657,7 @@ struct JoinProbe {
                 std::string name = right_emit_names_[e];
                 if (gathered[e].second.has_value()) {
                     output.add_column(std::move(name), std::move(gathered[e].first),
+                                      // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
                                       std::move(*gathered[e].second));
                 } else {
                     output.add_column(std::move(name), std::move(gathered[e].first));
@@ -6256,8 +6257,9 @@ class ChunkedInnerJoinOperator final : public Operator {
         *right_ = std::move(*right);
         deferred_probe_ = nullptr;
         if (std::getenv("IBEX_DEBUG_PAIR_DEFER") != nullptr) {
-            std::fprintf(stderr, "[pair_defer] filter_published=%d right_rows_after_filter=%zu\n",
-                         static_cast<int>(use_materialized_left_), right_->rows());
+            ibex::formatting::print(stderr,
+                                    "[pair_defer] filter_published={} right_rows_after_filter={}\n",
+                                    static_cast<int>(use_materialized_left_), right_->rows());
         }
         return initialize_pair();
     }
@@ -6546,8 +6548,8 @@ class ChunkedInnerJoinOperator final : public Operator {
     // (`resolve_deferred_probe_pair`): publishes a filter over exactly one
     // named build-side column instead of always `keys_->front().left`, since
     // the pair join's scan filter only ever covers one of the two keys.
-    void publish_build_filter_column(const Table& build, const std::string& key_name,
-                                     DynamicScanFilter& slot) const {
+    static void publish_build_filter_column(const Table& build, const std::string& key_name,
+                                            DynamicScanFilter& slot) {
         const auto* entry = build.find_entry(key_name);
         if (entry == nullptr) {
             return;
@@ -6598,8 +6600,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                 }
                 keys.push_back(data[r]);
             }
-            std::sort(keys.begin(), keys.end());
-            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+            std::ranges::sort(keys);
+            keys.erase(std::ranges::unique(keys).begin(), keys.end());
             if (keys.size() <= kInListMax) {
                 slot.in_list = std::move(keys);
             }
@@ -6746,6 +6748,10 @@ class ChunkedInnerJoinOperator final : public Operator {
 ///
 /// Deliberately minimal: no shrink, no insert, no iterators. It is a slot array
 /// indexed by group id, and every use it has is `resize` / `data` / `[]`.
+///
+/// The `realloc`/`free` calls are the whole reason this class exists (in-place
+/// `mremap` growth, no copy) -- it is itself the RAII wrapper the check wants.
+// NOLINTBEGIN(cppcoreguidelines-no-malloc)
 template <typename T>
 class SlotArray {
    public:
@@ -6839,7 +6845,8 @@ class SlotArray {
         }
         const T prototype{};
         alignas(T) std::array<unsigned char, sizeof(T)> zero{};
-        // NOLINTNEXTLINE(cert-exp42-c,bugprone-suspicious-memory-comparison) -- padding note above.
+        // prototype{} zeroes padding too (see the class comment), so this is well defined.
+        // NOLINTNEXTLINE(cert-exp42-c,cert-flp37-c,bugprone-suspicious-memory-comparison)
         if (std::memcmp(&prototype, zero.data(), sizeof(T)) == 0) {
             // Through `void*`: `T` has default member initializers, so it is not
             // trivially default-constructible and -Wclass-memaccess objects to
@@ -6860,6 +6867,7 @@ class SlotArray {
     std::size_t size_ = 0;
     std::size_t capacity_ = 0;
 };
+// NOLINTEND(cppcoreguidelines-no-malloc)
 
 class ChunkedAggregateOperator final : public Operator {
    public:
@@ -6923,8 +6931,8 @@ class ChunkedAggregateOperator final : public Operator {
 
     auto process_chunk(const Chunk& chunk) -> std::optional<std::string> {
         if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            std::fprintf(stderr, "[agg_process_chunk] rows=%zu group_by_size=%zu\n", chunk.rows(),
-                         group_by_->size());
+            ibex::formatting::print(stderr, "[agg_process_chunk] rows={} group_by_size={}\n",
+                                    chunk.rows(), group_by_->size());
         }
         // Counted here, once per chunk, because the partition gate below asks
         // how much input this OPERATOR has — a question the per-call row count
@@ -7177,7 +7185,6 @@ class ChunkedAggregateOperator final : public Operator {
         return process_rows_generic(group_entries, agg_entries, rows);
     }
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_str(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -7243,7 +7250,6 @@ class ChunkedAggregateOperator final : public Operator {
     // Single fixed-width-integer key: probe a value -> gid map directly, the way
     // process_rows_str does for strings. Date/Timestamp are read as their raw
     // integer (days / nanos), which is order- and equality-faithful.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_int(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -7430,7 +7436,7 @@ class ChunkedAggregateOperator final : public Operator {
         // robin_hood's Int64 hash preserves too much of a sequential key's bit
         // pattern for a high-bit fixed table. SplitMix's finalizer gives both
         // candidate slots and the tag independent-looking bits at tiny cost.
-        std::uint64_t x = static_cast<std::uint64_t>(key);
+        auto x = static_cast<std::uint64_t>(key);
         x ^= x >> 30U;
         x *= 0xbf58476d1ce4e5b9ULL;
         x ^= x >> 27U;
@@ -7490,9 +7496,9 @@ class ChunkedAggregateOperator final : public Operator {
                     continue;
                 }
                 const std::uint64_t hash = owned_hot_hash(key);
-                const std::uint32_t tag = static_cast<std::uint32_t>(hash);
-                const std::size_t h1 = static_cast<std::size_t>(hash >> kShift);
-                const std::size_t h2 = static_cast<std::size_t>((hash * kH2Mult) >> kShift);
+                const auto tag = static_cast<std::uint32_t>(hash);
+                const auto h1 = static_cast<std::size_t>(hash >> kShift);
+                const auto h2 = static_cast<std::size_t>((hash * kH2Mult) >> kShift);
                 auto& s1 = table[h1];
                 auto& s2 = table[h2];
 
@@ -7554,7 +7560,7 @@ class ChunkedAggregateOperator final : public Operator {
             // order without a histogram/scatter phase or a sort.
             job.records_by_partition.resize(job.part_count);
             std::vector<std::size_t> counts(job.part_count, 0);
-            robin_hood::hash<std::int64_t> partition_hash;
+            const robin_hood::hash<std::int64_t> partition_hash;
             const std::size_t mask = job.part_count - 1;
             for (const auto& record : records) {
                 ++counts[partition_hash(record.key) & mask];
@@ -7564,7 +7570,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
             for (auto& record : records) {
                 const std::size_t p = partition_hash(record.key) & mask;
-                job.records_by_partition[p].push_back(std::move(record));
+                job.records_by_partition[p].push_back(record);
             }
 
             // Release decoded buffers as soon as this task is done. The job's
@@ -7611,17 +7617,23 @@ class ChunkedAggregateOperator final : public Operator {
             note_partition_fanout();
         }
 
+        const ColumnEntry& agg0 = *agg_entries[0];
         auto job = std::make_unique<OwnedHotChunk>();
         job->key_column = key_column;
-        job->sum_column = agg_entries[0]->column;
-        if (agg_entries[0]->validity.has_value()) {
-            job->sum_validity = *agg_entries[0]->validity;
+        job->sum_column = agg0.column;
+        if (agg0.validity.has_value()) {
+            job->sum_validity = *agg0.validity;
         }
         job->row_base = owned_rows_seen_;
         job->rows = rows;
         job->part_count = owned_async_part_count_;
         auto* const raw_job = job.get();
         owned_async_jobs_.push_back(std::move(job));
+        // Engaged since the block above either emplaced it or `owned_async_hot_mode_`
+        // was already set (the two only ever change together).
+        if (!owned_async_group_.has_value()) {
+            invariant_violation("async hot aggregate: task group missing while accepting chunks");
+        }
         owned_async_group_->submit([raw_job] { process_owned_hot_chunk(*raw_job); });
         owned_rows_seen_ += rows;
         return true;
@@ -7722,6 +7734,7 @@ class ChunkedAggregateOperator final : public Operator {
         // expensive part of the pipeline by roughly their mean run length.
         // Sample before committing because all-unique keys would only add two
         // equality passes and retain the original item count.
+        // NOLINTNEXTLINE(misc-const-correctness) -- mutated in the int64 instantiation below
         [[maybe_unused]] bool compress_runs = false;
         if constexpr (std::is_same_v<Key, std::int64_t>) {
             compress_runs = owned_ordered_run_mode_;
@@ -7872,9 +7885,9 @@ class ChunkedAggregateOperator final : public Operator {
                 is_count[a] = 1;
                 continue;
             }
-            sum_cols[a] = std::get<Column<double>>(*agg_entries[a]->column).data();
-            sum_validity[a] =
-                agg_entries[a]->validity.has_value() ? &*agg_entries[a]->validity : nullptr;
+            const ColumnEntry& entry = *agg_entries[a];
+            sum_cols[a] = std::get<Column<double>>(*entry.column).data();
+            sum_validity[a] = entry.validity.has_value() ? &*entry.validity : nullptr;
         }
 
         const std::uint64_t row_base = owned_rows_seen_;
@@ -7920,9 +7933,9 @@ class ChunkedAggregateOperator final : public Operator {
         owned_rows_seen_ += rows;
         owned_mode_ = true;
         if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
-            std::fprintf(stderr, "[agg_owned] chunk rows=%zu part_count=%zu total_rows=%llu\n",
-                         rows, partitions.size(),
-                         static_cast<unsigned long long>(owned_rows_seen_));
+            ibex::formatting::print(
+                stderr, "[agg_owned] chunk rows={} part_count={} total_rows={}\n", rows,
+                partitions.size(), static_cast<unsigned long long>(owned_rows_seen_));
         }
         return true;
     }
@@ -8089,6 +8102,9 @@ class ChunkedAggregateOperator final : public Operator {
             return;
         }
         owned_finalized_ = true;
+        if (!owned_async_group_.has_value()) {
+            invariant_violation("async hot aggregate join: task group already released");
+        }
         try {
             owned_async_group_->wait();
         } catch (const std::exception& error) {
@@ -8311,10 +8327,10 @@ class ChunkedAggregateOperator final : public Operator {
                 const auto ms = std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - ord_t0)
                                     .count();
-                std::fprintf(stderr,
-                             "[ord_run] finalize nondecreasing runs=%zu groups=%zu "
-                             "workers=%zu %.3fms\n",
-                             run_count, total, workers, ms);
+                ibex::formatting::print(stderr,
+                                        "[ord_run] finalize nondecreasing runs={} groups={} "
+                                        "workers={} {}ms\n",
+                                        run_count, total, workers, ms);
             }
             return;
         }
@@ -8346,7 +8362,6 @@ class ChunkedAggregateOperator final : public Operator {
     // Two fixed-width-integer keys, grouped as one composite. Mirrors
     // process_rows_int exactly, packing (key_a, key_b) into a two-word key so
     // a single hash probe replaces the generic path's per-key Key comparison.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_int_pair(const std::vector<const ColumnEntry*>& group_entries,
                                const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -8587,7 +8602,6 @@ class ChunkedAggregateOperator final : public Operator {
     template <typename ReaderA, typename ReaderB>
     auto try_process_rows_pair_dense(const ReaderA& key_a_at, const ReaderB& key_b_at,
                                      // One caller
-                                     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                                      const std::vector<const ColumnEntry*>& group_entries,
                                      const std::vector<const ColumnEntry*>& agg_entries,
                                      std::size_t rows) -> bool {
@@ -9257,7 +9271,6 @@ class ChunkedAggregateOperator final : public Operator {
         return multi_cat_codes_flat_.data() + (group * n_keys);
     }
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void multi_cat_rehash_slots(std::size_t capacity, std::size_t n_keys) {
         multi_cat_slots_.assign(capacity, 0U);
         const std::size_t mask = capacity - 1;
@@ -9306,7 +9319,6 @@ class ChunkedAggregateOperator final : public Operator {
         }
     }
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -9474,7 +9486,6 @@ class ChunkedAggregateOperator final : public Operator {
         return std::nullopt;
     }
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     /// Row count below which partitioned discovery is not worth its fan-out,
     /// for the int/string keys it was originally tuned against.
     static constexpr std::size_t kDefaultPartitionMinRows = 1U << 18U;
@@ -9815,9 +9826,6 @@ class ChunkedAggregateOperator final : public Operator {
                                     skip);
         }
     }
-
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-    // We need AggSlotCore to be a POD
 
     /// Scatter-accumulate rows [begin, end) into `base`, indexed by
     /// `gids[row] * n_aggs_ + agg_i`. `base` is the caller's slot array —
@@ -10800,8 +10808,6 @@ class ChunkedAggregateOperator final : public Operator {
         return std::optional<Chunk>{std::move(out)};
     }
 
-    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
-
     struct SlotPlan {
         ir::AggFunc func = ir::AggFunc::Sum;
         ExprType kind = ExprType::Int;
@@ -11472,9 +11478,6 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
     }
 
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-    // We need AggSlotCore to be a POD
-
     template <typename T>
     /// `scratch` is this aggregate's per-group scratch (2 doubles for the
     /// higher moments); it stays a parameter so this helper remains static and
@@ -11632,8 +11635,6 @@ class ChunkedSortedAggregateOperator final : public Operator {
         ++pending_rows_;
     }
 
-    // NOLINTEND(cppcoreguidelines-pro-type-union-access)
-
     auto take_pending() -> Chunk {
         for (std::size_t i = 0; i < n_aggs_; ++i) {
             if (track_validity_[i] == 0U || out_validity_[i].empty()) {
@@ -11706,6 +11707,8 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
+namespace {
+
 /// Defined next to `build_physical_join`; the join construction sites above it
 /// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
 auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism;
@@ -11713,6 +11716,8 @@ auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinPa
 /// The hash aggregate's `partition` and `finalize` fan-out policies, resolved
 /// together. Defined next to `build_physical_aggregate`.
 auto resolved_aggregate_parallelism(const ExecutionContext& exec) -> physical::AggregateParallelism;
+
+}  // namespace
 
 auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
@@ -11806,6 +11811,7 @@ auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
     if (!left_schema.is_known() || !right_schema.is_known()) {
         return false;
     }
+    // NOLINTNEXTLINE(readability-use-anyofallof)
     for (const ir::JoinKey& key : join.keys()) {
         const ir::SchemaField* lf = left_schema.find(key.left);
         const ir::SchemaField* rf = right_schema.find(key.right);
@@ -11974,8 +11980,7 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
         if (node->kind() != ir::NodeKind::ExternCall) {
             return std::unexpected("program preamble only supports extern calls");
         }
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& ec = static_cast<const ir::ExternCallNode&>(*node);
+        const auto& ec = ir::node_cast<ir::ExternCallNode>(*node);
         auto result = invoke_extern_call(ec, scalars, externs);
         if (!result.has_value()) {
             return std::unexpected(std::move(result.error()));
@@ -11990,13 +11995,14 @@ auto execute_program_preamble(const std::vector<ir::NodePtr>& preamble,
 /// node kind falls back to the full-table `interpret_node` path and
 /// is wrapped in a `TableSourceOperator` so downstream chunked
 /// operators see a uniform pull-based interface.
-// NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 // Order-delay past Filter/Project/Rename, and Head/Tail pushdown past
 // Project/Rename, are handled by the IR canonicalize pass
 // (src/ir/canonicalize.cpp). IR arrives here in canonical form, so
 // build_operator only needs one branch per NodeKind and the shapes it
 // matches are the post-canonicalization shapes (e.g. Project(Filter(x))
 // for the fused operator, not Project(Filter(Order(x)))).
+
+namespace {
 
 // Runtime-multithreading Phase 1, serial morsel slice. Owns the materialized
 // input `Table` that the pipeline's `PartitionedTableSource` reads by pointer.
@@ -12054,6 +12060,8 @@ class SerialMorselOrderValidator final : public Operator {
     std::size_t grain_ = 1;
 };
 
+}  // namespace
+
 auto morsel_grain(const ExecutionContext& exec, std::size_t rows) -> std::size_t {
     if (exec.parallel_grain != 0) {
         return exec.parallel_grain;  // explicit override, used as given
@@ -12083,6 +12091,8 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
     // above it, which outlive it by declaration order.
     static const bool enabled = std::getenv("IBEX_PARALLEL_STATS") != nullptr;
     static ParallelPipelineStats stats;
+    // Function-local exit reporter, instantiated once below; never copied or moved.
+    // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
     struct Reporter {
         ~Reporter() {
             if (!enabled) {
@@ -12157,6 +12167,8 @@ void configure_parallel_from_env(ExecutionContext& exec) {
     // used to default to is now sized for decode instead.
 }
 
+namespace {
+
 // One construction point for every row-local map operator that can live in a
 // morsel pipeline. The serial planner uses the same factory: only the pipeline
 // asks maps to retain zero-row morsels, because its ordered merger needs one
@@ -12196,41 +12208,42 @@ auto physical_filter_route(const ir::Expr& predicate,
 }
 
 auto build_filter_gather_map(const MapStep& step, OperatorPtr child, const ScalarRegistry* scalars,
-                             const ExternRegistry*, const ExecutionContext&,
+                             const ExternRegistry* /*unused*/, const ExecutionContext& /*unused*/,
                              const std::vector<ColumnKernelSignature>* source_signature,
                              bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    const auto& filter = static_cast<const ir::FilterNode&>(*step.node);
+    const auto& filter = ir::node_cast<ir::FilterNode>(*step.node);
     return std::make_unique<ChunkedFilterOperator>(
         std::move(child), &filter.predicate(), scalars,
         physical_filter_route(filter.predicate(), source_signature), preserve_empty_morsels);
 }
 
-auto build_metadata_map(const MapStep& step, OperatorPtr child, const ScalarRegistry*,
-                        const ExternRegistry*, const ExecutionContext&,
-                        const std::vector<ColumnKernelSignature>*, bool)
+auto build_metadata_map(const MapStep& step, OperatorPtr child, const ScalarRegistry* /*unused*/,
+                        const ExternRegistry* /*unused*/, const ExecutionContext& /*unused*/,
+                        const std::vector<ColumnKernelSignature>* /*unused*/, bool /*unused*/)
     -> std::expected<OperatorPtr, std::string> {
     if (step.node->kind() == ir::NodeKind::Project) {
-        const auto& project = static_cast<const ir::ProjectNode&>(*step.node);
+        const auto& project = ir::node_cast<ir::ProjectNode>(*step.node);
         return std::make_unique<ChunkedProjectOperator>(std::move(child), &project.columns());
     }
-    const auto& rename = static_cast<const ir::RenameNode&>(*step.node);
+    const auto& rename = ir::node_cast<ir::RenameNode>(*step.node);
     return std::make_unique<ChunkedRenameOperator>(std::move(child), &rename.renames());
 }
 
 auto build_row_local_update_map(const MapStep& step, OperatorPtr child,
                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
                                 const ExecutionContext& exec,
-                                const std::vector<ColumnKernelSignature>*, bool)
-    -> std::expected<OperatorPtr, std::string> {
-    const auto& update = static_cast<const ir::UpdateNode&>(*step.node);
+                                const std::vector<ColumnKernelSignature>* /*unused*/,
+                                bool /*unused*/) -> std::expected<OperatorPtr, std::string> {
+    const auto& update = ir::node_cast<ir::UpdateNode>(*step.node);
     return std::make_unique<ChunkedUpdateOperator>(std::move(child), &update.fields(), scalars,
                                                    externs, exec);
 }
 
 auto build_filter_project_gather_map(const MapStep& step, OperatorPtr child,
-                                     const ScalarRegistry* scalars, const ExternRegistry*,
-                                     const ExecutionContext&,
+                                     const ScalarRegistry* scalars,
+                                     const ExternRegistry* /*unused*/,
+                                     const ExecutionContext& /*unused*/,
                                      const std::vector<ColumnKernelSignature>* source_signature,
                                      bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
@@ -12273,6 +12286,8 @@ auto build_filter_update_project_gather_map(
         physical_filter_route(*step.filter_predicate, source_signature), preserve_empty_morsels);
 }
 
+}  // namespace
+
 auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory {
     static constexpr std::array<MapKernelFactory, 5> factories{
         &build_filter_gather_map,
@@ -12284,6 +12299,8 @@ auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFac
     const auto index = static_cast<std::size_t>(capability);
     return index < factories.size() ? factories[index] : nullptr;
 }
+
+namespace {
 
 auto build_row_local_map_operator(const MapStep& step, OperatorPtr child,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
@@ -12435,7 +12452,7 @@ struct RangeHead {
         if (step.fused_update != nullptr) {
             return std::nullopt;
         }
-        const auto& predicate = static_cast<const ir::FilterNode&>(*step.node).predicate();
+        const auto& predicate = ir::node_cast<ir::FilterNode>(*step.node).predicate();
         if (!is_range_native_expr(predicate)) {
             return std::nullopt;
         }
@@ -12443,7 +12460,7 @@ struct RangeHead {
         // column list does below: same head, same absorbed projection.
         const std::vector<ir::ColumnRef>* project =
             step.fused_project != nullptr
-                ? &static_cast<const ir::ProjectNode&>(*step.fused_project).columns()
+                ? &ir::node_cast<ir::ProjectNode>(*step.fused_project).columns()
                 : nullptr;
         return RangeHead{.predicate = &predicate, .project = project};
     }
@@ -12547,6 +12564,7 @@ class OrderedChunkRing {
     auto operator=(const OrderedChunkRing&) -> OrderedChunkRing& = delete;
     OrderedChunkRing(OrderedChunkRing&&) = delete;
     auto operator=(OrderedChunkRing&&) -> OrderedChunkRing& = delete;
+    ~OrderedChunkRing() = default;
 
     /// What a producer should do with the sequence it just claimed.
     enum class Acquire : std::uint8_t {
@@ -12774,6 +12792,8 @@ class MorselPipelineOperator final : public Operator {
     void run_worker(std::size_t worker_id) noexcept {
         // Cleanup runs however this scope is left, so no path can leave the
         // consumer waiting on a worker that is gone.
+        // One-shot scope guard: aggregate-initialised, never copied or moved.
+        // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
         struct ExitGuard {
             MorselPipelineOperator* self;
             ~ExitGuard() { self->worker_exited(); }
@@ -13079,9 +13099,9 @@ class TwoPhaseFilterOperator final : public Operator {
         -> std::expected<Table, std::string> {
         switch (node.kind()) {
             case ir::NodeKind::Project:
-                return project_table(input, static_cast<const ir::ProjectNode&>(node).columns());
+                return project_table(input, ir::node_cast<ir::ProjectNode>(node).columns());
             case ir::NodeKind::Rename:
-                return rename_table(input, static_cast<const ir::RenameNode&>(node).renames());
+                return rename_table(input, ir::node_cast<ir::RenameNode>(node).renames());
             default:
                 // The pipeline builder only admits `is_metadata_only_node` kinds
                 // into `tail_`, so reaching this means the two have drifted.
@@ -13324,6 +13344,8 @@ class TwoPhaseFilterOperator final : public Operator {
                                         const ExternRegistry* externs, const ExecutionContext& exec)
     -> std::expected<OperatorPtr, std::string>;
 
+}  // namespace
+
 // Internal linkage to match the forward declarations beside the join, which
 // sit inside this TU's anonymous namespace; the definitions must live down
 // here because they use the morsel executor, which is defined below the join.
@@ -13355,8 +13377,7 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
          jp.branch != physical::JoinBranch::PairIntInner)) {
         return std::optional<ChunkedInnerJoinOperator::FusibleProbe>{};
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& join = static_cast<const ir::JoinNode&>(node);
+    const auto& join = ir::node_cast<ir::JoinNode>(node);
     if (deferred_probe_scan_of(*join.children()[1], exec).scan != nullptr) {
         return std::optional<ChunkedInnerJoinOperator::FusibleProbe>{};
     }
@@ -13439,6 +13460,8 @@ auto build_probe_morsel_pipeline(Table input, const JoinProbe& probe, std::size_
 
 }  // namespace
 
+namespace {
+
 /// The steps of a plan's parallel prefix, ordered source-to-sink. A plan
 /// records steps sink-first; every executor here composes bottom-up.
 auto parallel_pipeline_operators(const physical::Plan& plan) -> std::vector<MapStep> {
@@ -13476,8 +13499,7 @@ auto build_map_pipeline_parallel(const physical::Plan& plan, const TableRegistry
     // filter timing (a null filter slot is what distinguishes them) and so do
     // not stream here.
     if (exec.stream_scans && input_node->kind() == ir::NodeKind::Scan) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& scan = static_cast<const ir::ScanNode&>(*input_node);
+        const auto& scan = ir::node_cast<ir::ScanNode>(*input_node);
         if (!registry.contains(scan.source_name())) {
             if (const auto* deferred = exec.deferred_scan(scan.source_name());
                 deferred != nullptr && deferred->filter == nullptr) {
@@ -14093,6 +14115,8 @@ class PipelinedScanOperator final : public Operator {
     void run_worker(std::size_t worker_id) noexcept {
         // However this worker leaves, it must stop counting as a producer, or
         // the consumer waits for a unit that is never coming.
+        // One-shot scope guard: aggregate-initialised, never copied or moved.
+        // NOLINTNEXTLINE(cppcoreguidelines-special-member-functions)
         struct ExitGuard {
             OrderedChunkRing* ring;
             ~ExitGuard() { ring->producer_exited(); }
@@ -14531,8 +14555,7 @@ class PipelinedStageOperator final : public Operator {
 [[nodiscard]] auto has_multi_unit_deferred_scan(const ir::Node& node, const TableRegistry& registry,
                                                 const ExecutionContext& exec) -> bool {
     if (node.kind() == ir::NodeKind::Scan) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        const auto& scan = ir::node_cast<ir::ScanNode>(node);
         if (registry.contains(scan.source_name())) {
             return false;
         }
@@ -14612,7 +14635,7 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
     {
-        ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_child();
         if (result.has_value()) {
             result = step.factory(step, std::move(result.value()), scalars, externs, exec,
@@ -14694,8 +14717,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
                          const TableRegistry& registry, const ScalarRegistry* scalars,
                          const ExternRegistry* externs, const ExecutionContext& exec,
                          ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& join = static_cast<const ir::JoinNode&>(node);
+    const auto& join = ir::node_cast<ir::JoinNode>(node);
     const physical::JoinPlan& jp = plan.join;
     if (jp.branch == physical::JoinBranch::SemiAnti) {
         const bool stage_probe = has_multi_unit_deferred_scan(*join.children()[0], registry, exec);
@@ -14834,8 +14856,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
                               const TableRegistry& registry, const ScalarRegistry* scalars,
                               const ExternRegistry* externs, const ExecutionContext& exec,
                               ModelResult* model_out) -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& agg = static_cast<const ir::AggregateNode&>(node);
+    const auto& agg = ir::node_cast<ir::AggregateNode>(node);
     if (agg.children().empty()) {
         return std::unexpected("aggregate node missing child");
     }
@@ -14849,8 +14870,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // planned nor counted separately. The skip is a consequence of who
         // calls whom -- the same way a fused `MapStep` partner is skipped
         // by the plan's walk simply never descending to it.
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& join = static_cast<const ir::JoinNode&>(*ap.fused_join);
+        const auto& join = ir::node_cast<ir::JoinNode>(*ap.fused_join);
         const std::string& counted_column = ap.counted_column;
         auto left =
             materialize_row_local(*join.children()[0], registry, scalars, externs, exec, model_out);
@@ -14916,8 +14936,7 @@ auto build_physical_order(const ir::Node& node, const TableRegistry& registry,
                           const ScalarRegistry* scalars, const ExternRegistry* externs,
                           const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& order = static_cast<const ir::OrderNode&>(node);
+    const auto& order = ir::node_cast<ir::OrderNode>(node);
     if (order.children().empty()) {
         return std::unexpected("order node missing child");
     }
@@ -14936,8 +14955,7 @@ auto build_physical_head(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& head = static_cast<const ir::HeadNode&>(node);
+    const auto& head = ir::node_cast<ir::HeadNode>(node);
     if (head.children().empty()) {
         return std::unexpected("head node missing child");
     }
@@ -14967,8 +14985,7 @@ auto build_physical_tail(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& tail = static_cast<const ir::TailNode&>(node);
+    const auto& tail = ir::node_cast<ir::TailNode>(node);
     if (tail.children().empty()) {
         return std::unexpected("tail node missing child");
     }
@@ -14978,7 +14995,7 @@ auto build_physical_tail(const ir::Node& node, const TableRegistry& registry,
     }
     return build_unary_materializing_operator(
         *tail.children().front(), registry, scalars, externs, exec, model_out,
-        [&](Table input) { return tail_table(input, *count, tail.group_by()); });
+        [&](const Table& input) { return tail_table(input, *count, tail.group_by()); });
 }
 
 /// Build a `TopK` breaker (fused `Head(Order(x))` / `Tail(Order(x))`, canonicalize
@@ -14989,8 +15006,7 @@ auto build_physical_topk(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& topk = static_cast<const ir::TopKNode&>(node);
+    const auto& topk = ir::node_cast<ir::TopKNode>(node);
     if (topk.children().empty()) {
         return std::unexpected("topk node missing child");
     }
@@ -15022,13 +15038,11 @@ auto build_physical_filter_head_tail(const ir::Node& node, const TableRegistry& 
         return std::unexpected(std::move(child_op.error()));
     }
     if (node.kind() == ir::NodeKind::FilterHead) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+        const auto& fh = ir::node_cast<ir::FilterHeadNode>(node);
         return std::make_unique<ChunkedFilterHeadOperator>(std::move(child_op.value()),
                                                            &fh.predicate(), fh.count(), scalars);
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+    const auto& ft = ir::node_cast<ir::FilterTailNode>(node);
     return std::make_unique<ChunkedFilterTailOperator>(std::move(child_op.value()), &ft.predicate(),
                                                        ft.count(), scalars);
 }
@@ -15151,8 +15165,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // through to the whole-table path at the bottom of this function, so
     // declining here costs nothing but the whole-table behaviour.
     if (node.kind() == ir::NodeKind::Scan && exec.stream_scans) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        const auto& scan = ir::node_cast<ir::ScanNode>(node);
         if (!registry.contains(scan.source_name())) {
             // A null filter slot is what distinguishes a scan registered for
             // streaming from a deferred *probe* scan. A probe's decode belongs
@@ -15176,7 +15189,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Filter) {
-        const auto& filter = static_cast<const ir::FilterNode&>(node);
+        const auto& filter = ir::node_cast<ir::FilterNode>(node);
         if (filter.children().empty()) {
             return std::unexpected("filter node missing child");
         }
@@ -15190,7 +15203,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Project) {
-        const auto& project = static_cast<const ir::ProjectNode&>(node);
+        const auto& project = ir::node_cast<ir::ProjectNode>(node);
         if (project.children().empty()) {
             return std::unexpected("project node missing child");
         }
@@ -15208,7 +15221,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // `build_physical_filter_head_tail` at the seam above.
 
     if (node.kind() == ir::NodeKind::Rename) {
-        const auto& rename = static_cast<const ir::RenameNode&>(node);
+        const auto& rename = ir::node_cast<ir::RenameNode>(node);
         if (rename.children().empty()) {
             return std::unexpected("rename node missing child");
         }
@@ -15222,7 +15235,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::ExternCall && externs != nullptr) {
-        const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+        const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
         const auto* fn = externs->find(ec.callee());
         if (fn != nullptr && fn->chunked_table_func) {
             ExternArgs args;
@@ -15275,7 +15288,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Melt) {
-        const auto& mn = static_cast<const ir::MeltNode&>(node);
+        const auto& mn = ir::node_cast<ir::MeltNode>(node);
         if (mn.children().empty()) {
             return std::unexpected("melt node missing child");
         }
@@ -15285,7 +15298,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Dcast) {
-        const auto& dn = static_cast<const ir::DcastNode&>(node);
+        const auto& dn = ir::node_cast<ir::DcastNode>(node);
         if (dn.children().empty()) {
             return std::unexpected("dcast node missing child");
         }
@@ -15323,7 +15336,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Join) {
-        const auto& join = static_cast<const ir::JoinNode&>(node);
+        const auto& join = ir::node_cast<ir::JoinNode>(node);
         if (join.children().size() != 2) {
             return std::unexpected("join node expects exactly two children");
         }
@@ -15350,7 +15363,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Update) {
-        const auto& update = static_cast<const ir::UpdateNode&>(node);
+        const auto& update = ir::node_cast<ir::UpdateNode>(node);
         if (update.children().empty()) {
             return std::unexpected("update node missing child");
         }
@@ -15457,7 +15470,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Resample) {
-        const auto& rs = static_cast<const ir::ResampleNode&>(node);
+        const auto& rs = ir::node_cast<ir::ResampleNode>(node);
         if (node.children().empty()) {
             return std::unexpected("resample node missing child");
         }
@@ -15469,7 +15482,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Window) {
-        const auto& win = static_cast<const ir::WindowNode&>(node);
+        const auto& win = ir::node_cast<ir::WindowNode>(node);
         if (node.children().empty()) {
             return std::unexpected("window node missing child");
         }
@@ -15478,7 +15491,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected(
                 "window: only 'update' is currently supported inside a window block");
         }
-        const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+        const auto& update_node = ir::node_cast<ir::UpdateNode>(child_node);
         if (child_node.children().empty()) {
             return std::unexpected("window: update node missing child");
         }
@@ -15540,7 +15553,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::AsTimeframe) {
-        const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+        const auto& atf = ir::node_cast<ir::AsTimeframeNode>(node);
         if (node.children().empty()) {
             return std::unexpected("as_timeframe node missing child");
         }
@@ -15554,7 +15567,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Model) {
-        const auto& mn = static_cast<const ir::ModelNode&>(node);
+        const auto& mn = ir::node_cast<ir::ModelNode>(node);
         if (mn.children().empty()) {
             return std::unexpected("model node missing child");
         }
@@ -15593,7 +15606,7 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     }
 
     if (node.kind() == ir::NodeKind::Program) {
-        const auto& program = static_cast<const ir::ProgramNode&>(node);
+        const auto& program = ir::node_cast<ir::ProgramNode>(node);
         auto preamble = execute_program_preamble(program.preamble(), scalars, externs);
         if (!preamble.has_value()) {
             return std::unexpected(std::move(preamble.error()));
@@ -15610,6 +15623,8 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     return make_table_source(std::move(table.value()));
 }
 
+}  // namespace
+
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
@@ -15620,7 +15635,7 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
     auto* entry = execution_profile_entry(exec.execution_profile, node);
     std::expected<OperatorPtr, std::string> result;
     {
-        ExecutionProfileScope scope(entry, ProfilePhase::Build);
+        const ExecutionProfileScope scope(entry, ProfilePhase::Build);
         result = build_operator_impl(node, registry, scalars, externs, exec, model_out);
     }
     if (!result.has_value()) {
@@ -15628,6 +15643,5 @@ auto build_operator(const ir::Node& node, const TableRegistry& registry,
     }
     return profile_operator(std::move(result.value()), exec.execution_profile, node);
 }
-// NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
 }  // namespace ibex::runtime

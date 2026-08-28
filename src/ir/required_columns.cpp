@@ -144,17 +144,15 @@ void visit_children_widened(const Node& node, DemandSink& out) {
     visit_children(node, all, out);
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-// guarded by the switch on node.kind() matching the target node type.
 void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
     switch (node.kind()) {
         case NodeKind::Scan: {
-            out.sources[static_cast<const ScanNode&>(node).source_name()].merge(need);
+            out.sources[node_cast<ScanNode>(node).source_name()].merge(need);
             return;
         }
 
         case NodeKind::Program: {
-            const auto& program = static_cast<const ProgramNode&>(node);
+            const auto& program = node_cast<ProgramNode>(node);
             // Preamble entries are side-effecting calls (write_csv, …) whose
             // results are discarded; each consumes its own subtree in full.
             ColumnDemand all;
@@ -175,7 +173,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             // only as the predicate's marker.
             out.filters[&node].merge(need);
             ColumnDemand below = need;
-            collect_refs(static_cast<const FilterNode&>(node).predicate(), below);
+            collect_refs(node_cast<FilterNode>(node).predicate(), below);
             visit_children(node, below, out);
             return;
         }
@@ -184,7 +182,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         // the input demand is exactly the projected columns.
         case NodeKind::Project: {
             ColumnDemand below;
-            add_refs(static_cast<const ProjectNode&>(node).columns(), below);
+            add_refs(node_cast<ProjectNode>(node).columns(), below);
             visit_children(node, below, out);
             return;
         }
@@ -192,7 +190,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         // Aggregate likewise fixes its output: the group keys plus whatever the
         // aggregations read.
         case NodeKind::Aggregate: {
-            const auto& agg = static_cast<const AggregateNode&>(node);
+            const auto& agg = node_cast<AggregateNode>(node);
             ColumnDemand below;
             add_refs(agg.group_by(), below);
             for (const auto& spec : agg.aggregations()) {
@@ -206,7 +204,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::Update: {
-            const auto& update = static_cast<const UpdateNode&>(node);
+            const auto& update = node_cast<UpdateNode>(node);
             ColumnDemand below;
             if (need.all) {
                 // Update passes every input column through, so "all of the
@@ -252,7 +250,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::Rename: {
-            const auto& rename = static_cast<const RenameNode&>(node);
+            const auto& rename = node_cast<RenameNode>(node);
             const ColumnNameMap names(rename.renames());
             ColumnDemand below;
             if (need.all) {
@@ -268,7 +266,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
 
         case NodeKind::Order: {
             ColumnDemand below = need;
-            for (const auto& key : static_cast<const OrderNode&>(node).keys()) {
+            for (const auto& key : node_cast<OrderNode>(node).keys()) {
                 below.add(key.name);
             }
             visit_children(node, below, out);
@@ -276,7 +274,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::TopK: {
-            const auto& topk = static_cast<const TopKNode&>(node);
+            const auto& topk = node_cast<TopKNode>(node);
             ColumnDemand below = need;
             for (const auto& key : topk.keys()) {
                 below.add(key.name);
@@ -287,7 +285,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::Head: {
-            const auto& head = static_cast<const HeadNode&>(node);
+            const auto& head = node_cast<HeadNode>(node);
             ColumnDemand below = need;
             collect_refs(head.count_expr(), below);
             add_refs(head.group_by(), below);
@@ -296,7 +294,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         }
 
         case NodeKind::Tail: {
-            const auto& tail = static_cast<const TailNode&>(node);
+            const auto& tail = node_cast<TailNode>(node);
             ColumnDemand below = need;
             collect_refs(tail.count_expr(), below);
             add_refs(tail.group_by(), below);
@@ -306,20 +304,20 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
 
         case NodeKind::FilterHead: {
             ColumnDemand below = need;
-            collect_refs(static_cast<const FilterHeadNode&>(node).predicate(), below);
+            collect_refs(node_cast<FilterHeadNode>(node).predicate(), below);
             visit_children(node, below, out);
             return;
         }
 
         case NodeKind::FilterTail: {
             ColumnDemand below = need;
-            collect_refs(static_cast<const FilterTailNode&>(node).predicate(), below);
+            collect_refs(node_cast<FilterTailNode>(node).predicate(), below);
             visit_children(node, below, out);
             return;
         }
 
         case NodeKind::Join: {
-            const auto& join = static_cast<const JoinNode&>(node);
+            const auto& join = node_cast<JoinNode>(node);
             // An asof join matches on each side's time index, which the node
             // does not name — so it cannot be bounded here.
             if (join.kind() == JoinKind::Asof) {
@@ -377,7 +375,7 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
         // what the parent wants plus the names the check itself reads, and no
         // more -- naming a column asserts its shape, it does not ask for data.
         case NodeKind::Ascribe: {
-            const auto& asc = static_cast<const AscribeNode&>(node);
+            const auto& asc = node_cast<AscribeNode>(node);
             if (asc.checked()) {
                 // Already proven against the input's schema, so it reads nothing
                 // at all: pass the parent's demand straight through.
@@ -404,7 +402,6 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             return;
     }
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

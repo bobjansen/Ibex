@@ -191,20 +191,20 @@ thread_local std::uint64_t t_pool_park_ns = 0;
 
 [[nodiscard]] auto node_label(const ir::Node& node) -> std::string {
     if (node.kind() == ir::NodeKind::Scan) {
-        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        const auto& scan = ir::node_cast<ir::ScanNode>(node);
         return ibex::formatting::format("scan {}", scan.source_name());
     }
     if (node.kind() == ir::NodeKind::ExternCall) {
-        const auto& call = static_cast<const ir::ExternCallNode&>(node);
+        const auto& call = ir::node_cast<ir::ExternCallNode>(node);
         return ibex::formatting::format("extern {}", call.callee());
     }
     if (node.kind() == ir::NodeKind::Join) {
-        const auto& join = static_cast<const ir::JoinNode&>(node);
+        const auto& join = ir::node_cast<ir::JoinNode>(node);
         return ibex::formatting::format("join {} keys={}", join_kind_name(join.kind()),
                                         join.keys().size());
     }
     if (node.kind() == ir::NodeKind::Aggregate) {
-        const auto& aggregate = static_cast<const ir::AggregateNode&>(node);
+        const auto& aggregate = ir::node_cast<ir::AggregateNode>(node);
         return ibex::formatting::format("aggregate keys={} aggs={}", aggregate.group_by().size(),
                                         aggregate.aggregations().size());
     }

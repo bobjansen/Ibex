@@ -16,7 +16,6 @@
 // Setting dirty_decay_ms:-1 keeps all freed pages in jemalloc's dirty cache so
 // subsequent iterations reuse physical pages at full DRAM bandwidth.
 // jemalloc reads this symbol during its C++ static-init phase, before main().
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 extern "C" {
 const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 }

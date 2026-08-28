@@ -40,15 +40,12 @@ struct JoinEdge {
 /// shape this misses just gets the blind heuristic selectivity, same as
 /// before this existed.
 auto leaf_predicate(const Node& node) -> const Expr* {
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-    // guarded by the switch on node.kind() matching the target node type.
     switch (node.kind()) {
         case NodeKind::Filter:
-            return &static_cast<const FilterNode&>(node).predicate();
+            return &node_cast<FilterNode>(node).predicate();
         default:
             return nullptr;
     }
-    // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 }
 
 /// The single lazy source a relation leaf ultimately reads, walking down
@@ -62,8 +59,7 @@ auto leaf_source_name(const Node& node) -> const std::string* {
     while (true) {
         switch (cur->kind()) {
             case NodeKind::Scan:
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                return &static_cast<const ScanNode&>(*cur).source_name();
+                return &node_cast<ScanNode>(*cur).source_name();
             case NodeKind::Filter:
             case NodeKind::Project:
             case NodeKind::Update:
@@ -129,8 +125,7 @@ auto collect_left_deep(const Node& node, const SourceStats& stats, std::vector<R
                                      .key_inputs = {}});
         return true;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& join = static_cast<const JoinNode&>(node);
+    const auto& join = node_cast<JoinNode>(node);
     // Each edge needs one logical key name across the whole chain.
     // `normalize_mapped_join_keys` supplies that name for safe mapped keys;
     // one that remains non-folded keeps its source order rather than being

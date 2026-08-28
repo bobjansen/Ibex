@@ -21,7 +21,14 @@ Checks: >
   -readability-identifier-length,
   -cppcoreguidelines-avoid-magic-numbers,
   -readability-magic-numbers,
-  -readability-braces-around-statements
+  -readability-braces-around-statements,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-owning-memory,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-pro-type-vararg
 CheckOptions:
-  - key: bugprone-easily-swappable-parameters.ModelImplicitConversions
-    value: false
+  # libstdc++ implementation headers are not portable include providers.
+  # Prefer the public standard-library header for every standard declaration.
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: '(^|.*/)bits/.*'

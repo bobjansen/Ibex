@@ -17,8 +17,6 @@
 namespace ibex::ir {
 namespace {
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
-
 /// Where a value was produced: the node that made it, and the name it had
 /// there. Two columns hold the same value exactly when this is equal for both.
 struct ValueId {
@@ -36,7 +34,7 @@ void collect_max_id(const Node& node, std::uint64_t& max) {
         }
     }
     if (node.kind() == NodeKind::Program) {
-        const auto& program = static_cast<const ProgramNode&>(node);
+        const auto& program = node_cast<ProgramNode>(node);
         collect_max_id(program.main_node(), max);
         for (const auto& statement : program.preamble()) {
             if (statement != nullptr) {
@@ -69,13 +67,13 @@ auto resolve_value(const Node& node, std::string name) -> ValueId {
                 break;  // neither renames nor computes
 
             case NodeKind::Rename: {
-                const ColumnNameMap names(static_cast<const RenameNode&>(*current).renames());
+                const ColumnNameMap names(node_cast<RenameNode>(*current).renames());
                 name = names.input_name(name);
                 break;
             }
 
             case NodeKind::Update: {
-                const auto& update = static_cast<const UpdateNode&>(*current);
+                const auto& update = node_cast<UpdateNode>(*current);
                 // A guarded update (`where <p> update { ... }`) writes the field
                 // on some rows and leaves the old value on the others, so the
                 // alias is not a copy of anything. A grouped one is left alone
@@ -125,7 +123,7 @@ auto rewrite_distinct(NodePtr node, std::uint64_t& next) -> NodePtr {
         distinct.children()[0]->kind() != NodeKind::Project) {
         return node;
     }
-    auto& project = static_cast<ProjectNode&>(*distinct.mutable_children()[0]);
+    auto& project = node_cast<ProjectNode>(*distinct.mutable_children()[0]);
     const std::vector<ColumnRef> columns = project.columns();
     if (columns.size() < 2 || project.children().empty() || project.children()[0] == nullptr) {
         return node;
@@ -186,7 +184,7 @@ auto walk(NodePtr node, std::uint64_t& next) -> NodePtr {
     }
     // A program's statements hang off the node separately from its children.
     if (node->kind() == NodeKind::Program) {
-        auto& program = static_cast<ProgramNode&>(*node);
+        auto& program = node_cast<ProgramNode>(*node);
         if (program.mutable_main_node() != nullptr) {
             program.mutable_main_node() = walk(std::move(program.mutable_main_node()), next);
         }
@@ -199,8 +197,6 @@ auto walk(NodePtr node, std::uint64_t& next) -> NodePtr {
     }
     return node;
 }
-
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

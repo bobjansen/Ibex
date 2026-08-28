@@ -47,9 +47,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <signal.h>
-#include <stdio.h>
-#include <string.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -1543,8 +1540,8 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
         }
         if (unique) {
             if (std::getenv("IBEX_UNIQUE_KEY_STATS") != nullptr) {
-                std::fprintf(stderr, "[unique] %s rows=%zu span=%llu\n", name.c_str(), rows,
-                             static_cast<unsigned long long>(span));
+                (void)std::fprintf(stderr, "[unique] %s rows=%zu span=%llu\n", name.c_str(), rows,
+                                   static_cast<unsigned long long>(span));
             }
             proved.push_back(name);
         }
@@ -3833,9 +3830,9 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                 break;
             }
             case parser::Type::Kind::Series:
-                if (auto value =
-                        eval_expr_value(arg, tables, lazy_tables, scalars, columns, models,
-                                        functions, compile_time_lists, extern_decls, externs)) {
+                auto value = eval_expr_value(arg, tables, lazy_tables, scalars, columns, models,
+                                             functions, compile_time_lists, extern_decls, externs);
+                if (value) {
                     if (auto* col = std::get_if<runtime::ColumnValue>(&value.value())) {
                         if (auto err = validate_column_type(*col, param.type)) {
                             return std::unexpected(call.callee + ": type mismatch for parameter '" +
@@ -3857,9 +3854,8 @@ auto eval_function_call(parser::CallExpr& call, runtime::TableRegistry& tables,
                         break;
                     }
                     return std::unexpected("Column argument must be a column or table");
-                } else {
-                    return std::unexpected(value.error());
                 }
+                return std::unexpected(value.error());
         }
     }
 
@@ -5877,7 +5873,6 @@ auto execution_capture_mutex() -> std::mutex& {
 class StdoutCapture {
    public:
     // C FILE ownership is acquired from tmpfile() and released with fclose().
-    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     StdoutCapture() : file_(std::tmpfile()) {
         static_cast<void>(std::fflush(stdout));
         std::cout.flush();
@@ -5910,7 +5905,7 @@ class StdoutCapture {
             return {};
         }
         if (std::fseek(file_, 0, SEEK_SET) != 0) {
-            static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
+            static_cast<void>(std::fclose(file_));
             file_ = nullptr;
             return {};
         }
@@ -5919,7 +5914,7 @@ class StdoutCapture {
         while (const auto count = std::fread(buffer.data(), 1, buffer.size(), file_)) {
             output.append(buffer.data(), count);
         }
-        static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
+        static_cast<void>(std::fclose(file_));
         file_ = nullptr;
         return output;
     }
@@ -5940,7 +5935,7 @@ class StdoutCapture {
             active_ = false;
         }
         if (close_file && file_ != nullptr) {
-            static_cast<void>(std::fclose(file_));  // NOLINT(cppcoreguidelines-owning-memory)
+            static_cast<void>(std::fclose(file_));
             file_ = nullptr;
         }
     }

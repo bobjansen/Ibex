@@ -33,6 +33,7 @@ Diagnostics:
       - readability-braces-around-statements
     CheckOptions:
       bugprone-easily-swappable-parameters.ModelImplicitConversions: false
+      misc-include-cleaner.IgnoreHeaders: '(^|.*/)bits/.*'
   UnusedIncludes: Strict
 
 InlayHints:

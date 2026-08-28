@@ -6,6 +6,7 @@
 #include <ibex/core/time.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1329,5 +1330,76 @@ class TopKNode final : public Node {
     std::vector<ColumnRef> group_by_;
     KeepMode keep_mode_;
 };
+
+/// The `NodeKind` tag a concrete node type carries. Specialized for every type
+/// usable with `node_cast`; adding a row here opts a type in.
+template <typename T>
+inline constexpr NodeKind node_kind_v = T::kind_is_not_registered_for_node_cast;
+// clang-format off
+template <> inline constexpr NodeKind node_kind_v<ScanNode>        = NodeKind::Scan;
+template <> inline constexpr NodeKind node_kind_v<FilterNode>      = NodeKind::Filter;
+template <> inline constexpr NodeKind node_kind_v<ProjectNode>     = NodeKind::Project;
+template <> inline constexpr NodeKind node_kind_v<DistinctNode>    = NodeKind::Distinct;
+template <> inline constexpr NodeKind node_kind_v<OrderNode>       = NodeKind::Order;
+template <> inline constexpr NodeKind node_kind_v<HeadNode>        = NodeKind::Head;
+template <> inline constexpr NodeKind node_kind_v<TailNode>        = NodeKind::Tail;
+template <> inline constexpr NodeKind node_kind_v<AggregateNode>   = NodeKind::Aggregate;
+template <> inline constexpr NodeKind node_kind_v<UpdateNode>      = NodeKind::Update;
+template <> inline constexpr NodeKind node_kind_v<RenameNode>      = NodeKind::Rename;
+template <> inline constexpr NodeKind node_kind_v<WindowNode>      = NodeKind::Window;
+template <> inline constexpr NodeKind node_kind_v<ResampleNode>    = NodeKind::Resample;
+template <> inline constexpr NodeKind node_kind_v<AsTimeframeNode> = NodeKind::AsTimeframe;
+template <> inline constexpr NodeKind node_kind_v<AscribeNode>     = NodeKind::Ascribe;
+template <> inline constexpr NodeKind node_kind_v<ColumnsNode>     = NodeKind::Columns;
+template <> inline constexpr NodeKind node_kind_v<ExternCallNode>  = NodeKind::ExternCall;
+template <> inline constexpr NodeKind node_kind_v<JoinNode>        = NodeKind::Join;
+template <> inline constexpr NodeKind node_kind_v<MeltNode>        = NodeKind::Melt;
+template <> inline constexpr NodeKind node_kind_v<DcastNode>       = NodeKind::Dcast;
+template <> inline constexpr NodeKind node_kind_v<StreamNode>      = NodeKind::Stream;
+template <> inline constexpr NodeKind node_kind_v<ConstructNode>   = NodeKind::Construct;
+template <> inline constexpr NodeKind node_kind_v<ProgramNode>     = NodeKind::Program;
+template <> inline constexpr NodeKind node_kind_v<CovNode>         = NodeKind::Cov;
+template <> inline constexpr NodeKind node_kind_v<CorrNode>        = NodeKind::Corr;
+template <> inline constexpr NodeKind node_kind_v<TransposeNode>   = NodeKind::Transpose;
+template <> inline constexpr NodeKind node_kind_v<MatmulNode>      = NodeKind::Matmul;
+template <> inline constexpr NodeKind node_kind_v<RbindNode>       = NodeKind::Rbind;
+template <> inline constexpr NodeKind node_kind_v<ModelNode>       = NodeKind::Model;
+template <> inline constexpr NodeKind node_kind_v<FilterHeadNode>  = NodeKind::FilterHead;
+template <> inline constexpr NodeKind node_kind_v<FilterTailNode>  = NodeKind::FilterTail;
+template <> inline constexpr NodeKind node_kind_v<TopKNode>        = NodeKind::TopK;
+// clang-format on
+
+/// Checked downcast from the `Node` base to a concrete node type. The IR is a
+/// tagged tree, so `kind()` is the discriminant: a caller that has already
+/// established the kind uses this instead of a bare `static_cast`, keeping the
+/// invariant check next to the cast rather than trusting a distant one. The
+/// check is `assert`-only -- release builds pay nothing over `static_cast`.
+template <typename T>
+[[nodiscard]] auto node_cast(const Node& node) noexcept -> const T& {
+    assert(node.kind() == node_kind_v<T> && "node_cast: kind mismatch");
+    return static_cast<const T&>(node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+}
+
+template <typename T>
+[[nodiscard]] auto node_cast(const Node* node) noexcept -> const T* {
+    if (node == nullptr) {
+        return nullptr;
+    }
+    return &node_cast<T>(*node);
+}
+
+template <typename T>
+[[nodiscard]] auto node_cast(Node& node) noexcept -> T& {
+    assert(node.kind() == node_kind_v<T> && "node_cast: kind mismatch");
+    return static_cast<T&>(node);  // NOLINT(cppcoreguidelines-pro-type-static-cast-downcast)
+}
+
+template <typename T>
+[[nodiscard]] auto node_cast(Node* node) noexcept -> T* {
+    if (node == nullptr) {
+        return nullptr;
+    }
+    return &node_cast<T>(*node);
+}
 
 }  // namespace ibex::ir

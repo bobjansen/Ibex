@@ -11,8 +11,6 @@
 
 #include <algorithm>
 #include <array>
-#include <asm-generic/int-ll64.h>
-#include <asm-generic/socket.h>
 #include <cctype>
 #include <chrono>
 #include <concepts>
@@ -25,7 +23,6 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
-#include <linux/prctl.h>
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -45,6 +42,7 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <linux/landlock.h>
+#include <linux/prctl.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #endif
@@ -185,9 +183,7 @@ auto mime_type(const std::filesystem::path& path) -> std::string_view {
     return "text/html; charset=utf-8";
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto send_response(Socket socket, int status, std::string_view status_text, const std::string& body,
-                   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                    std::string_view content_type = "application/json; charset=utf-8",
                    std::string_view cookie = {}) -> void {
     std::ostringstream response;
@@ -294,7 +290,6 @@ auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
         *entry.column);
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto table_page(const runtime::Table& table, std::size_t offset, std::size_t limit) -> json {
     const std::size_t start = std::min(offset, table.rows());
     const std::size_t end = std::min(table.rows(), start + limit);
@@ -319,7 +314,6 @@ auto bounded_limit(const json& body) -> std::size_t {
     return std::clamp<std::size_t>(requested, 1, 1000);
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto query_size(std::string_view target, std::string_view key, std::size_t fallback)
     -> std::size_t {
     const auto question = target.find('?');
@@ -373,7 +367,6 @@ auto url_decode(std::string_view encoded) -> std::optional<std::string> {
     return decoded;
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto query_value(std::string_view target, std::string_view key) -> std::optional<std::string> {
     const auto question = target.find('?');
     if (question == std::string_view::npos)
@@ -514,26 +507,26 @@ auto static_file(const StaticAssets& assets, std::string_view target) -> const S
 }
 
 #if defined(__linux__)
-constexpr __u64 kLandlockFilesystemAccess =
+constexpr std::uint64_t kLandlockFilesystemAccess =
     LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE |
     LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
     LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
     LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
     LANDLOCK_ACCESS_FS_MAKE_SYM | LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE;
 
-constexpr __u64 kLandlockReadExecuteAccess =
+constexpr std::uint64_t kLandlockReadExecuteAccess =
     LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
 
 auto add_landlock_path_rule(int ruleset_fd, const std::filesystem::path& directory,
-                            __u64 allowed_access) -> std::optional<std::string> {
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): POSIX open(2).
+                            std::uint64_t allowed_access) -> std::optional<std::string> {
+    // POSIX open(2).
     const int directory_fd = open(directory.c_str(), O_PATH | O_CLOEXEC);
     if (directory_fd < 0) {
         return "could not open a Landlock allow-list directory";
     }
     landlock_path_beneath_attr rule{.allowed_access = allowed_access, .parent_fd = directory_fd};
     const int add_result = static_cast<int>(
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
+        // Linux syscall(2).
         syscall(SYS_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0));
     close(directory_fd);
     if (add_result != 0) {
@@ -546,7 +539,7 @@ auto enable_landlock(const std::filesystem::path& data_directory,
                      const std::vector<std::filesystem::path>& read_only_directories)
     -> std::optional<std::string> {
     const int abi = static_cast<int>(
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
+        // Linux syscall(2).
         syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION));
     if (abi < 3) {
         return "Landlock ABI 3 or newer is required to confine reads and writes";
@@ -554,7 +547,7 @@ auto enable_landlock(const std::filesystem::path& data_directory,
     landlock_ruleset_attr ruleset_attr{};
     ruleset_attr.handled_access_fs = kLandlockFilesystemAccess;
     const int ruleset_fd = static_cast<int>(
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
+        // Linux syscall(2).
         syscall(SYS_landlock_create_ruleset, &ruleset_attr, sizeof(ruleset_attr), 0));
     if (ruleset_fd < 0)
         return "could not create the Landlock ruleset";
@@ -570,9 +563,9 @@ auto enable_landlock(const std::filesystem::path& data_directory,
             return error;
         }
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux prctl(2) and syscall(2).
+    // Linux prctl(2) and syscall(2).
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): Linux syscall(2).
+        // Linux syscall(2).
         syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0) {
         close(ruleset_fd);
         return "could not enforce the Landlock ruleset";

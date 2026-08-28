@@ -437,7 +437,6 @@ namespace {
 
 // `off` is the source offset of `col` and `validity` (a borrowed column under a
 // non-whole RowRange); the produced mask is always dense.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto compare_col_scalar(ir::CompareOp op, const ColumnValue& col, std::size_t off,
                         const LitVal& lit, std::size_t n, const ValidityBitmap* validity = nullptr)
     -> std::expected<Mask, std::string> {
@@ -2433,6 +2432,13 @@ void gather_selection_into(Table& output, const Table& input,
         // false bits clear in the zero-filled destination, making its writes
         // monotonic and therefore safe at shared output-word boundaries.
         if (src_entry.validity.has_value()) {
+            if (!dst_entry.validity.has_value()) {
+                // The presize pass emplaces the destination validity under the
+                // same src-has-validity condition, so this holds once presize
+                // has run -- but the compiler cannot see across the two calls.
+                invariant_violation(
+                    "filter_table: destination validity missing where source has it");
+            }
             kernel::gather_selected_validity(
                 kernel::ValidityView(*src_entry.validity),
                 kernel::Selection{kernel::RowWordBlocks{

@@ -16,7 +16,6 @@ namespace ibex::ir {
 
 namespace {
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
 // Node kind is checked immediately before every downcast below.
 
 /// The kinds whose right key column can be folded into the left's without
@@ -31,7 +30,7 @@ auto foldable_kind(JoinKind kind) -> bool {
 
 void rewrite_join(Node& node, const SourceSchemas& sources,
                   const std::map<const Node*, ColumnDemand>& demand) {
-    auto& join = static_cast<JoinNode&>(node);
+    auto& join = node_cast<JoinNode>(node);
     if (!foldable_kind(join.kind()) || join.keys().empty() ||
         join_keys_are_same_named(join.keys())) {
         return;
@@ -107,7 +106,7 @@ void walk(Node& node, const SourceSchemas& sources,
         }
     }
     if (node.kind() == NodeKind::Program) {
-        auto& program = static_cast<ProgramNode&>(node);
+        auto& program = node_cast<ProgramNode>(node);
         for (auto& entry : program.mutable_preamble()) {
             if (entry != nullptr) {
                 walk(*entry, sources, demand);
@@ -121,8 +120,6 @@ void walk(Node& node, const SourceSchemas& sources,
         rewrite_join(node, sources, demand);
     }
 }
-
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

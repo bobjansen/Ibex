@@ -2008,16 +2008,14 @@ auto plan_fused_left_join_count(const ir::AggregateNode& aggregate)
            (child->kind() == ir::NodeKind::Project || child->kind() == ir::NodeKind::Update) &&
            !child->children().empty()) {
         if (child->kind() == ir::NodeKind::Update) {
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            skipped_updates.push_back(static_cast<const ir::UpdateNode*>(child));
+            skipped_updates.push_back(ir::node_cast<ir::UpdateNode>(child));
         }
         child = child->children().front().get();
     }
     if (child == nullptr || child->kind() != ir::NodeKind::Join) {
         return std::nullopt;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& join = static_cast<const ir::JoinNode&>(*child);
+    const auto& join = ir::node_cast<ir::JoinNode>(*child);
     auto counted = fused_left_join_counted_column(aggregate, skipped_updates);
     const bool candidate = join.kind() == ir::JoinKind::Left && join.keys().size() == 1 &&
                            !join.predicate().has_value() && aggregate.group_by().size() == 1 &&
@@ -2073,8 +2071,8 @@ auto left_join_count_table(const ir::JoinNode& join, const ir::AggregateNode& ag
         !join.pending_order().empty() || aggregate.group_by().size() != 1 ||
         aggregate.aggregations().size() != 1 ||
         (aggregate.aggregations().front().func != ir::AggFunc::Count &&
-         !(aggregate.aggregations().front().func == ir::AggFunc::Sum &&
-           counted_column != aggregate.aggregations().front().column.name)) ||
+         (aggregate.aggregations().front().func != ir::AggFunc::Sum ||
+          counted_column == aggregate.aggregations().front().column.name)) ||
         aggregate.aggregations().front().column.name.empty() ||
         aggregate.group_by().front().name != join.keys().front().left) {
         return std::nullopt;

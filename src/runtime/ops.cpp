@@ -28,9 +28,9 @@ namespace {
 // It is intentionally internal and never exposed to users.
 constexpr const char* kSrcKey = "__ibex__";
 
-// Function-local static (not a namespace-scope global) so the pointer set by
-// set_scalars() can still be mutated from a single place without tripping
-// cppcoreguidelines-avoid-non-const-global-variables.
+// Function-local static rather than a namespace-scope global: the pointer set
+// by set_scalars() is mutated from this one accessor, with no static-init
+// ordering to reason about.
 auto scalars_ptr() -> const runtime::ScalarRegistry*& {
     static const runtime::ScalarRegistry* scalars = nullptr;
     return scalars;

@@ -5,7 +5,6 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/ir/optimizer.hpp>
 #include <ibex/ir/pending_order.hpp>
-#include <ibex/ir/predicate_pushdown_pass.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -32,19 +31,9 @@ auto resources_overlap(const robin_hood::unordered_set<std::string>& lhs,
         return false;
     }
     if (lhs.size() < rhs.size()) {
-        for (const auto& value : lhs) {
-            if (rhs.contains(value)) {
-                return true;
-            }
-        }
-        return false;
+        return std::ranges::any_of(lhs, [&rhs](const auto& value) { return rhs.contains(value); });
     }
-    for (const auto& value : rhs) {
-        if (lhs.contains(value)) {
-            return true;
-        }
-    }
-    return false;
+    return std::ranges::any_of(rhs, [&lhs](const auto& value) { return lhs.contains(value); });
 }
 
 auto io_conflict(const EffectSummary& read_side, const EffectSummary& write_side) -> bool {
@@ -82,23 +71,23 @@ class DeadPurePreamblePass final : public OptimizationPass {
 
         auto& preamble = program->mutable_preamble();
         preamble.erase(
-            std::remove_if(preamble.begin(), preamble.end(),
-                           [&](const NodePtr& node) {
-                               if (!node || node->kind() != NodeKind::ExternCall) {
-                                   return false;
-                               }
-                               // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                               const auto& call = static_cast<const ExternCallNode&>(*node);
-                               const auto it = context.callee_summaries.find(call.callee());
-                               const auto& summary = it != context.callee_summaries.end()
-                                                         ? it->second
-                                                         : context.unknown_callee;
-                               if (!is_elidable(summary.effects)) {
-                                   return false;
-                               }
-                               ++stats.removed_dead_preamble_calls;
-                               return true;
-                           }),
+            std::ranges::remove_if(preamble,
+                                   [&](const NodePtr& node) {
+                                       if (!node || node->kind() != NodeKind::ExternCall) {
+                                           return false;
+                                       }
+                                       const auto& call = node_cast<ExternCallNode>(*node);
+                                       const auto it = context.callee_summaries.find(call.callee());
+                                       const auto& summary = it != context.callee_summaries.end()
+                                                                 ? it->second
+                                                                 : context.unknown_callee;
+                                       if (!is_elidable(summary.effects)) {
+                                           return false;
+                                       }
+                                       ++stats.removed_dead_preamble_calls;
+                                       return true;
+                                   })
+                .begin(),
             preamble.end());
 
         if (preamble.empty() && program->mutable_main_node()) {

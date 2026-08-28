@@ -20,7 +20,6 @@ namespace ibex::runtime {
 
 namespace detail {
 // Mutable by design: the whole point is a signal handler can set it.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline std::atomic<bool> interrupt_flag{false};
 }  // namespace detail
 

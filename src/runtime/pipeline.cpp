@@ -11,7 +11,6 @@
 #include <array>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <variant>
 
 namespace ibex::runtime {
@@ -34,7 +33,7 @@ auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKe
         }
     }
     if (node.kind() == ir::NodeKind::Update) {
-        const auto& update = static_cast<const ir::UpdateNode&>(node);
+        const auto& update = ir::node_cast<ir::UpdateNode>(node);
         if (update.guard() == nullptr && update.group_by().empty() &&
             update.tuple_fields().empty() &&
             std::ranges::all_of(update.fields(), [](const ir::FieldSpec& field) {
@@ -49,20 +48,18 @@ auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKe
 auto column_kernel_signature(const ColumnValue& column,
                              const std::optional<ValidityBitmap>& validity) noexcept
     -> ColumnKernelSignature {
-    const auto representation = std::visit(
-        [](const auto& value) -> ColumnRepresentation {
-            using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, Column<bool>>) {
-                return ColumnRepresentation::PackedBool;
-            } else if constexpr (std::is_same_v<T, Column<std::string>>) {
-                return ColumnRepresentation::StringSlabs;
-            } else if constexpr (std::is_same_v<T, Column<Categorical>>) {
-                return ColumnRepresentation::CategoricalCodes;
-            } else {
-                return ColumnRepresentation::FixedWidth;
-            }
-        },
-        column);
+    const auto representation = [&] {
+        if (std::holds_alternative<Column<bool>>(column)) {
+            return ColumnRepresentation::PackedBool;
+        }
+        if (std::holds_alternative<Column<std::string>>(column)) {
+            return ColumnRepresentation::StringSlabs;
+        }
+        if (std::holds_alternative<Column<Categorical>>(column)) {
+            return ColumnRepresentation::CategoricalCodes;
+        }
+        return ColumnRepresentation::FixedWidth;
+    }();
     return {.representation = representation,
             .null_policy =
                 validity.has_value() ? KernelNullPolicy::Nullable : KernelNullPolicy::AllValid};
@@ -100,8 +97,7 @@ auto is_metadata_only_node(ir::NodeKind kind) noexcept -> bool {
 auto map_step_expressions_are_subset_evaluable(const ir::Node& node) -> bool {
     switch (node.kind()) {
         case ir::NodeKind::Filter:
-            return ir::is_subset_evaluable_expr(
-                static_cast<const ir::FilterNode&>(node).predicate());
+            return ir::is_subset_evaluable_expr(ir::node_cast<ir::FilterNode>(node).predicate());
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
             return true;

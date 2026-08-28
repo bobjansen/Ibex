@@ -32,7 +32,6 @@
 #include <functional>
 #include <optional>
 #include <robin_hood.h>
-#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -707,9 +706,6 @@ static_assert(std::is_trivially_copyable_v<AggSlotCore>);
 // scratch — that is what moved Σ(x-mean)^k out of here.
 static_assert(sizeof(AggSlotCore) == 16);
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-union-access)
-// We need AggSlotCore to be a POD
-
 // Online central-moment accumulators (Welford / Pébay), shared by the chunked
 // aggregate operators. `double_value` holds the running mean; m2/m3/m4 hold
 // Σ(x-mean)^k. These match the two-pass central moments the materializing
@@ -903,8 +899,6 @@ inline void agg_combine(AggSlotCore& dst, const AggSlotCore& src, ir::AggFunc fu
             invariant_violation("agg_combine: aggregate is not combinable");
     }
 }
-
-// NOLINTEND(cppcoreguidelines-pro-type-union-access)
 
 struct AggState {
     std::vector<AggSlot> slots;
@@ -1732,7 +1726,7 @@ enum class FloatCleanMode : std::uint8_t {
 // honours a partial range yet — see `is_range_native_expr`, which is the
 // authority on which expressions may be given one, and `evaluate_field`'s own
 // asserts for what happens if that gate and this function disagree.
-[[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange rows,
+[[nodiscard]] auto evaluate_field(const ir::Expr& expr, const Table& input, RowRange range,
                                   const ColumnEvalCtx& ctx)
     -> std::expected<ComputedColumn, std::string>;
 [[nodiscard]] auto eval_lag_lead_column(const ir::CallExpr& call, const Table& input, bool is_lag,

@@ -26,9 +26,10 @@ namespace {
 
 // Counter for synthesizing fresh NodeIds during a canonicalize pass. Seeded at
 // canonicalize() entry to (max id in tree + 1) so it never collides with
-// existing IDs in the input. Function-local static (not a namespace-scope
-// global) so it doesn't trip cppcoreguidelines-avoid-non-const-global-variables;
-// mirrors the scalars_ptr() fix in src/runtime/ops.cpp.
+// existing IDs in the input. Behind a function-local-static accessor rather
+// than a bare namespace global: one entry point owns the mutation and there is
+// no static-init ordering to worry about. Mirrors scalars_ptr() in
+// src/runtime/ops.cpp.
 auto next_id_counter() -> std::uint64_t& {
     thread_local std::uint64_t next_id = 0;
     return next_id;
@@ -38,7 +39,6 @@ auto fresh_id() -> NodeId {
     return NodeId{next_id_counter()++};
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
 // Node kind is checked immediately before every downcast below; see the
 // same convention in interpreter.cpp / chunked.cpp / emitter.cpp.
 
@@ -51,7 +51,7 @@ auto collect_max_id(Node& n, std::uint64_t& m) -> void {
         collect_max_id(*c, m);
     }
     if (n.kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(n);
+        auto& prog = node_cast<ProgramNode>(n);
         for (const auto& p : prog.mutable_preamble()) {
             if (p) {
                 collect_max_id(*p, m);
@@ -376,7 +376,7 @@ auto try_simplify_predicate(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Filter || node->children().empty()) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& filter = static_cast<FilterNode&>(*node);
+    auto& filter = node_cast<FilterNode>(*node);
     Expr pred = filter.take_predicate();
     bool changed = false;
     pred = simplify_expr(std::move(pred), &changed);
@@ -429,8 +429,8 @@ auto try_project_past_order(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Order) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& proj = static_cast<const ProjectNode&>(*node);
-    const auto& order = static_cast<const OrderNode&>(*node->children().front());
+    const auto& proj = node_cast<ProjectNode>(*node);
+    const auto& order = node_cast<OrderNode>(*node->children().front());
     if (!keys_preserved_by_project(order.keys(), proj)) {
         return {.changed = false, .node = std::move(node)};
     }
@@ -449,8 +449,8 @@ auto try_order_past_rename(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Rename) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& order_n = static_cast<OrderNode&>(*node);
-    const auto& rename = static_cast<const RenameNode&>(*node->children().front());
+    auto& order_n = node_cast<OrderNode>(*node);
+    const auto& rename = node_cast<RenameNode>(*node->children().front());
     auto remapped = remap_keys_through_rename(order_n.keys(), rename.renames());
     NodePtr order_owned = std::move(node);
     NodePtr rename_owned = take_unique_child(*order_owned);
@@ -468,8 +468,8 @@ auto try_rename_compose(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Rename) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& outer = static_cast<const RenameNode&>(*node);
-    const auto& inner = static_cast<const RenameNode&>(*node->children().front());
+    const auto& outer = node_cast<RenameNode>(*node);
+    const auto& inner = node_cast<RenameNode>(*node->children().front());
     auto composed = ColumnNameMap::compose(outer.renames(), inner.renames());
     const auto merged_id = node->id();
     NodePtr outer_owned = std::move(node);
@@ -488,7 +488,7 @@ auto try_rename_drop_identity(NodePtr node) -> TryResult {
     if (node->kind() != NodeKind::Rename || node->children().empty()) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& rn = static_cast<const RenameNode&>(*node);
+    const auto& rn = node_cast<RenameNode>(*node);
     const bool all_identity =
         std::all_of(rn.renames().begin(), rn.renames().end(),
                     [](const RenameSpec& rs) { return rs.new_name == rs.old_name; });
@@ -505,8 +505,8 @@ auto try_filter_past_rename(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Rename) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& filter = static_cast<FilterNode&>(*node);
-    const auto& rename = static_cast<const RenameNode&>(*node->children().front());
+    auto& filter = node_cast<FilterNode>(*node);
+    const auto& rename = node_cast<RenameNode>(*node->children().front());
     Expr pred = filter.take_predicate();
     ColumnNameMap(rename.renames()).remap_expr_to_input(pred);
     const auto filter_id = node->id();
@@ -527,19 +527,15 @@ auto try_limit_collapse(NodePtr node) -> TryResult {
         node->children().front()->kind() != kind) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto outer_count = (kind == NodeKind::Head)
-                                 ? static_cast<const HeadNode&>(*node).count_literal()
-                                 : static_cast<const TailNode&>(*node).count_literal();
-    const auto& outer_gb = (kind == NodeKind::Head)
-                               ? static_cast<const HeadNode&>(*node).group_by()
-                               : static_cast<const TailNode&>(*node).group_by();
+    const auto outer_count = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).count_literal()
+                                                      : node_cast<TailNode>(*node).count_literal();
+    const auto& outer_gb = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).group_by()
+                                                    : node_cast<TailNode>(*node).group_by();
     const auto& inner = *node->children().front();
-    const auto inner_count = (kind == NodeKind::Head)
-                                 ? static_cast<const HeadNode&>(inner).count_literal()
-                                 : static_cast<const TailNode&>(inner).count_literal();
-    const auto& inner_gb = (kind == NodeKind::Head)
-                               ? static_cast<const HeadNode&>(inner).group_by()
-                               : static_cast<const TailNode&>(inner).group_by();
+    const auto inner_count = (kind == NodeKind::Head) ? node_cast<HeadNode>(inner).count_literal()
+                                                      : node_cast<TailNode>(inner).count_literal();
+    const auto& inner_gb = (kind == NodeKind::Head) ? node_cast<HeadNode>(inner).group_by()
+                                                    : node_cast<TailNode>(inner).group_by();
     if (!outer_gb.empty() || !inner_gb.empty() || !outer_count.has_value() ||
         !inner_count.has_value()) {
         return {.changed = false, .node = std::move(node)};
@@ -565,8 +561,8 @@ auto try_order_drop_pinned_keys(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Filter) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& order_n = static_cast<const OrderNode&>(*node);
-    const auto& filter = static_cast<const FilterNode&>(*node->children().front());
+    const auto& order_n = node_cast<OrderNode>(*node);
+    const auto& filter = node_cast<FilterNode>(*node->children().front());
     robin_hood::unordered_set<std::string> pinned;
     collect_equality_pinned_cols(filter.predicate(), pinned);
     if (pinned.empty()) {
@@ -600,8 +596,8 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Update) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& filter = static_cast<FilterNode&>(*node);
-    const auto& upd = static_cast<const UpdateNode&>(*node->children().front());
+    auto& filter = node_cast<FilterNode>(*node);
+    const auto& upd = node_cast<UpdateNode>(*node->children().front());
     const bool update_eligible =
         !upd.children().empty() && upd.group_by().empty() && upd.tuple_fields().empty() &&
         std::all_of(upd.fields().begin(), upd.fields().end(),
@@ -674,7 +670,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     if (child_kind == NodeKind::Project) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& agg = static_cast<AggregateNode&>(*node);
+    auto& agg = node_cast<AggregateNode>(*node);
     std::vector<ColumnRef> needed;
     robin_hood::unordered_set<std::string> seen;
     needed.reserve(agg.group_by().size() + agg.aggregations().size());
@@ -715,8 +711,8 @@ auto try_filter_merge(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Filter) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& outer = static_cast<FilterNode&>(*node);
-    auto& inner = static_cast<FilterNode&>(*node->children().front());
+    auto& outer = node_cast<FilterNode>(*node);
+    auto& inner = node_cast<FilterNode>(*node->children().front());
     Expr p1 = outer.take_predicate();
     Expr p2 = inner.take_predicate();
     Expr combined{.node = LogicalExpr{.op = LogicalOp::And,
@@ -736,8 +732,8 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Aggregate) {
         return {.changed = false, .node = std::move(node)};
     }
-    auto& filter = static_cast<FilterNode&>(*node);
-    const auto& agg = static_cast<const AggregateNode&>(*node->children().front());
+    auto& filter = node_cast<FilterNode>(*node);
+    const auto& agg = node_cast<AggregateNode>(*node->children().front());
     if (agg.children().empty() || agg.group_by().empty()) {
         // No group_by ⇒ exactly one output row; predicate either keeps it or
         // drops it, but that's a HAVING-style filter — not pushable.
@@ -786,22 +782,20 @@ auto try_fuse_filter_limit(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Filter) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& group_by = (kind == NodeKind::Head)
-                               ? static_cast<const HeadNode&>(*node).group_by()
-                               : static_cast<const TailNode&>(*node).group_by();
+    const auto& group_by = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).group_by()
+                                                    : node_cast<TailNode>(*node).group_by();
     if (!group_by.empty()) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head)
-                           ? static_cast<const HeadNode&>(*node).count_literal()
-                           : static_cast<const TailNode&>(*node).count_literal();
+    const auto count = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).count_literal()
+                                                : node_cast<TailNode>(*node).count_literal();
     if (!count.has_value()) {
         return {.changed = false, .node = std::move(node)};
     }
     const auto fused_id = node->id();
     NodePtr limit_owned = std::move(node);
     NodePtr filter_owned = take_unique_child(*limit_owned);
-    auto& filter = static_cast<FilterNode&>(*filter_owned);
+    auto& filter = node_cast<FilterNode>(*filter_owned);
     if (filter.children().empty()) {
         limit_owned->add_child(std::move(filter_owned));
         return {.changed = false, .node = std::move(limit_owned)};
@@ -828,21 +822,20 @@ auto try_fuse_topk(NodePtr node) -> TryResult {
         node->children().front()->kind() != NodeKind::Order) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head)
-                           ? static_cast<const HeadNode&>(*node).count_literal()
-                           : static_cast<const TailNode&>(*node).count_literal();
+    const auto count = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).count_literal()
+                                                : node_cast<TailNode>(*node).count_literal();
     if (!count.has_value()) {
         return {.changed = false, .node = std::move(node)};
     }
     std::vector<ColumnRef> group_by = (kind == NodeKind::Head)
-                                          ? static_cast<const HeadNode&>(*node).group_by()
-                                          : static_cast<const TailNode&>(*node).group_by();
+                                          ? node_cast<HeadNode>(*node).group_by()
+                                          : node_cast<TailNode>(*node).group_by();
     const auto keep_mode =
         (kind == NodeKind::Head) ? TopKNode::KeepMode::First : TopKNode::KeepMode::Last;
     const auto fused_id = node->id();
     NodePtr limit_owned = std::move(node);
     NodePtr order_owned = take_unique_child(*limit_owned);
-    auto& order_n = static_cast<OrderNode&>(*order_owned);
+    auto& order_n = node_cast<OrderNode>(*order_owned);
     if (order_n.children().empty()) {
         limit_owned->add_child(std::move(order_owned));
         return {.changed = false, .node = std::move(limit_owned)};
@@ -865,24 +858,23 @@ auto try_limit_past_metadata(NodePtr node) -> TryResult {
     if (child_kind != NodeKind::Project && child_kind != NodeKind::Rename) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto& group_by = (kind == NodeKind::Head)
-                               ? static_cast<const HeadNode&>(*node).group_by()
-                               : static_cast<const TailNode&>(*node).group_by();
+    const auto& group_by = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).group_by()
+                                                    : node_cast<TailNode>(*node).group_by();
     bool safe = false;
     std::vector<ColumnRef> remapped_group_by = group_by;
     if (child_kind == NodeKind::Project) {
-        const auto& proj = static_cast<const ProjectNode&>(*node->children().front());
+        const auto& proj = node_cast<ProjectNode>(*node->children().front());
         safe = group_by.empty() || group_by_preserved_by_project(group_by, proj);
     } else {
-        const auto& ren = static_cast<const RenameNode&>(*node->children().front());
+        const auto& ren = node_cast<RenameNode>(*node->children().front());
         remapped_group_by = remap_group_by_through_rename(group_by, ren.renames());
         safe = true;
     }
     if (!safe) {
         return {.changed = false, .node = std::move(node)};
     }
-    const auto count = (kind == NodeKind::Head) ? static_cast<const HeadNode&>(*node).count_expr()
-                                                : static_cast<const TailNode&>(*node).count_expr();
+    const auto count = (kind == NodeKind::Head) ? node_cast<HeadNode>(*node).count_expr()
+                                                : node_cast<TailNode>(*node).count_expr();
     const auto limit_id = node->id();
     NodePtr limit = std::move(node);
     NodePtr wrapper = take_unique_child(*limit);
@@ -966,7 +958,7 @@ auto canon(NodePtr node) -> NodePtr {
     }
     // ProgramNode's main is stored separately; descend into it too.
     if (node->kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(*node);
+        auto& prog = node_cast<ProgramNode>(*node);
         if (prog.mutable_main_node()) {
             prog.mutable_main_node() = canon(std::move(prog.mutable_main_node()));
         }
@@ -976,7 +968,6 @@ auto canon(NodePtr node) -> NodePtr {
     }
     return rewrite_root(std::move(node));
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

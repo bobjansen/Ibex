@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -24,13 +23,13 @@
 #include <variant>
 #include <vector>
 
+#include "ibex/format.hpp"
+
 namespace ibex::ir {
 /// Above this fraction of its own base table, a build side covers too much of
 /// the join key's domain for a published Bloom/bounds filter to reject
 /// anything worth the apparatus. Calibrated below, not chosen blind.
 constexpr double kMaxBuildDomainCoverage = 0.9;
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast in this file
-// is guarded by a node.kind() check (or switch) matching the target node type.
 namespace {
 
 auto append_conjuncts(const Expr& expr, std::vector<Expr>& out) -> bool {
@@ -59,7 +58,7 @@ auto projected_scan(const Node& node, std::vector<const RenameNode*>* renames = 
                 return nullptr;
             }
             if (renames != nullptr) {
-                renames->push_back(static_cast<const RenameNode*>(child));
+                renames->push_back(node_cast<RenameNode>(child));
             }
             child = child->children().front().get();
             continue;
@@ -78,8 +77,7 @@ auto projected_scan(const Node& node, std::vector<const RenameNode*>* renames = 
         // verified it against the real source schema before this pass runs.
         // An unchecked one has no such guarantee (its schema may not be the
         // physical scan's), so it stays opaque, same as any other node kind.
-        if (child->kind() == NodeKind::Ascribe &&
-            static_cast<const AscribeNode&>(*child).checked()) {
+        if (child->kind() == NodeKind::Ascribe && node_cast<AscribeNode>(*child).checked()) {
             if (child->children().size() != 1 || child->children().front() == nullptr) {
                 return nullptr;
             }
@@ -91,17 +89,17 @@ auto projected_scan(const Node& node, std::vector<const RenameNode*>* renames = 
     if (child->kind() != NodeKind::Scan) {
         return nullptr;
     }
-    return static_cast<const ScanNode*>(child);
+    return node_cast<ScanNode>(child);
 }
 
 auto filter_predicate(const Node& node) -> const Expr* {
     switch (node.kind()) {
         case NodeKind::Filter:
-            return &static_cast<const FilterNode&>(node).predicate();
+            return &node_cast<FilterNode>(node).predicate();
         case NodeKind::FilterHead:
-            return &static_cast<const FilterHeadNode&>(node).predicate();
+            return &node_cast<FilterHeadNode>(node).predicate();
         case NodeKind::FilterTail:
-            return &static_cast<const FilterTailNode&>(node).predicate();
+            return &node_cast<FilterTailNode>(node).predicate();
         default:
             return nullptr;
     }
@@ -132,7 +130,7 @@ auto remove_filter(NodePtr node) -> NodePtr {
             return take_unique_child(*node);
 
         case NodeKind::FilterHead: {
-            const auto count = static_cast<const FilterHeadNode&>(*node).count();
+            const auto count = node_cast<FilterHeadNode>(*node).count();
             NodePtr child = take_unique_child(*node);
             auto head = std::make_unique<HeadNode>(id, count);
             head->add_child(std::move(child));
@@ -140,7 +138,7 @@ auto remove_filter(NodePtr node) -> NodePtr {
         }
 
         case NodeKind::FilterTail: {
-            const auto count = static_cast<const FilterTailNode&>(*node).count();
+            const auto count = node_cast<FilterTailNode>(*node).count();
             NodePtr child = take_unique_child(*node);
             auto tail = std::make_unique<TailNode>(id, count);
             tail->add_child(std::move(child));
@@ -160,7 +158,7 @@ auto remove_applied_filters(NodePtr node, const std::set<std::string>& applied_s
         child = remove_applied_filters(std::move(child), applied_sources);
     }
     if (node->kind() == NodeKind::Program) {
-        auto& program = static_cast<ProgramNode&>(*node);
+        auto& program = node_cast<ProgramNode>(*node);
         for (auto& preamble : program.mutable_preamble()) {
             preamble = remove_applied_filters(std::move(preamble), applied_sources);
         }
@@ -176,7 +174,7 @@ auto remove_applied_filters(NodePtr node, const std::set<std::string>& applied_s
 void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
            ScanPredicateMap& candidates) {
     if (node.kind() == NodeKind::Scan) {
-        ++scan_counts[static_cast<const ScanNode&>(node).source_name()];
+        ++scan_counts[node_cast<ScanNode>(node).source_name()];
     }
 
     if (const auto* predicate = filter_predicate(node)) {
@@ -204,13 +202,13 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
 void count_scans(const Node& node, const std::set<std::string>& sources,
                  std::map<std::string, std::size_t>& counts) {
     if (node.kind() == NodeKind::Scan) {
-        const auto& name = static_cast<const ScanNode&>(node).source_name();
+        const auto& name = node_cast<ScanNode>(node).source_name();
         if (sources.contains(name)) {
             ++counts[name];
         }
     }
     if (node.kind() == NodeKind::Program) {
-        const auto& program = static_cast<const ProgramNode&>(node);
+        const auto& program = node_cast<ProgramNode>(node);
         for (const auto& preamble : program.preamble()) {
             if (preamble != nullptr) {
                 count_scans(*preamble, sources, counts);
@@ -232,7 +230,7 @@ void rename_scans(NodePtr& node, const std::map<std::string, std::size_t>& count
         return;
     }
     if (node->kind() == NodeKind::Scan) {
-        const auto& name = static_cast<const ScanNode&>(*node).source_name();
+        const auto& name = node_cast<ScanNode>(*node).source_name();
         if (const auto counted = counts.find(name);
             counted != counts.end() && counted->second > 1) {
             auto instance = name + "#" + std::to_string(++next_instance[name]);
@@ -242,7 +240,7 @@ void rename_scans(NodePtr& node, const std::map<std::string, std::size_t>& count
         return;
     }
     if (node->kind() == NodeKind::Program) {
-        auto& program = static_cast<ProgramNode&>(*node);
+        auto& program = node_cast<ProgramNode>(*node);
         for (auto& preamble : program.mutable_preamble()) {
             rename_scans(preamble, counts, next_instance, instances);
         }
@@ -288,7 +286,7 @@ namespace {
 
 void count_scan_occurrences(const Node& node, std::map<std::string, std::size_t>& counts) {
     if (node.kind() == NodeKind::Scan) {
-        ++counts[static_cast<const ScanNode&>(node).source_name()];
+        ++counts[node_cast<ScanNode>(node).source_name()];
     }
     for (const auto& child : node.children()) {
         if (child != nullptr) {
@@ -309,9 +307,9 @@ auto match_probe_chain(const Node& node, std::string key)
     while (true) {
         switch (cur->kind()) {
             case NodeKind::Scan:
-                return std::pair{static_cast<const ScanNode&>(*cur).source_name(), std::move(key)};
+                return std::pair{node_cast<ScanNode>(*cur).source_name(), std::move(key)};
             case NodeKind::Project: {
-                const auto& cols = static_cast<const ProjectNode&>(*cur).columns();
+                const auto& cols = node_cast<ProjectNode>(*cur).columns();
                 const bool keeps_key =
                     std::any_of(cols.begin(), cols.end(),
                                 [&](const ColumnRef& col) { return col.name == key; });
@@ -321,12 +319,12 @@ auto match_probe_chain(const Node& node, std::string key)
                 break;
             }
             case NodeKind::Rename: {
-                const ColumnNameMap names(static_cast<const RenameNode&>(*cur).renames());
+                const ColumnNameMap names(node_cast<RenameNode>(*cur).renames());
                 key = names.input_name(key);
                 break;
             }
             case NodeKind::Update: {
-                const auto& update = static_cast<const UpdateNode&>(*cur);
+                const auto& update = node_cast<UpdateNode>(*cur);
                 if (!update.tuple_fields().empty() || !update.group_by().empty()) {
                     return std::nullopt;
                 }
@@ -442,10 +440,12 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
     if (std::getenv("IBEX_PROBE_GATE_DEBUG") != nullptr) {
         const auto origin =
             column_origin_of(*join.children()[0], join.keys().front().left, schemas);
-        std::fprintf(stderr, "[probe-gate] probe=%s key=%s build_rows=%zu origin=%s ratio=%s\n",
-                     probe_source.c_str(), join.keys().front().left.c_str(), *build_est.rows,
-                     origin.has_value() ? origin->source.c_str() : "<none>",
-                     ratio.has_value() ? std::to_string(*ratio).c_str() : "<none>");
+
+        ibex::formatting::print(
+            stderr, "[probe-gate] probe={} key={} build_rows={} origin={} ratio={}\n",
+            probe_source.c_str(), join.keys().front().left.c_str(), *build_est.rows,
+            origin.has_value() ? origin->source.c_str() : "<none>",
+            ratio.has_value() ? std::to_string(*ratio).c_str() : "<none>");
     }
     return !ratio.has_value() || *ratio < kMaxBuildDomainCoverage;
 }
@@ -456,7 +456,7 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         const std::map<std::string, double>& absorbed,
                         std::map<std::string, DeferrableProbeScan>& out) {
     if (node.kind() == NodeKind::Join) {
-        const auto& join = static_cast<const JoinNode&>(node);
+        const auto& join = node_cast<JoinNode>(node);
         // The build side publishes its key values under the LEFT name and the
         // deferred scan is bounded under the RIGHT one. The runtime handles
         // that mapping directly, so a mapped key is as eligible as a
@@ -501,7 +501,7 @@ auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
     robin_hood::unordered_map<std::string, std::set<std::string>> out;
     const auto walk = [&](const Node& node, const auto& self) -> void {
         if (node.kind() == NodeKind::Join && node.children().size() >= 2) {
-            const auto& join = static_cast<const JoinNode&>(node);
+            const auto& join = node_cast<JoinNode>(node);
             // Each side's keys name columns of THAT side's output, so each is
             // resolved against that side's origins.
             for (std::size_t side = 0; side < 2; ++side) {
@@ -562,6 +562,5 @@ auto remove_applied_scan_filters(NodePtr root, const std::set<std::string>& appl
 
     return remove_applied_filters(std::move(root), safe_sources);
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace ibex::ir

@@ -15,7 +15,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <ranges>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -138,6 +137,7 @@ void presize_filter_chunk_output(Chunk& output, const ChunkView& input,
                     dst.resize_for_gather(rows_total, chars_total[d]);
                     dst.offsets_data()[0] = 0;
                 } else if constexpr (std::is_same_v<ColT, Column<bool>> ||
+                                     // NOLINTNEXTLINE(bugprone-branch-clone)
                                      std::is_same_v<ColT, Column<Categorical>>) {
                     dst.resize(rows_total);
                 } else if constexpr (std::is_trivially_default_constructible_v<
@@ -199,6 +199,13 @@ void gather_chunk_selection_into(Chunk& output, const ChunkView& input,
             },
             *src_entry.column);
         if (src_entry.validity.has_value()) {
+            if (!dst_entry.validity.has_value()) {
+                // presize_filter_chunk_output emplaces the destination validity
+                // under the same src-has-validity condition, so this cannot fire
+                // once presize has run -- but the compiler cannot see that.
+                invariant_violation(
+                    "filter_chunk: destination validity missing where source has it");
+            }
             gather_selected_validity(ValidityView(*src_entry.validity), selected,
                                      BoolOutputSpan{.words = dst_entry.validity->words_data(),
                                                     .begin = 0,
@@ -246,7 +253,7 @@ auto chunk_from_filtered(std::expected<Table, std::string> filtered, std::uint64
     return output;
 }
 
-auto filter_chunk_range_native(Chunk input, const ir::Expr& predicate,
+auto filter_chunk_range_native(const Chunk& input, const ir::Expr& predicate,
                                const std::vector<ir::ColumnRef>* project, std::size_t row_limit,
                                const ScalarRegistry* scalars) -> std::expected<Chunk, std::string> {
     const std::uint64_t sequence = input.sequence;
@@ -280,7 +287,7 @@ auto filter_chunk(Chunk input, const ir::Expr& predicate, const ScalarRegistry* 
     if ((route == FilterChunkRoute::NativePredicate &&
          supports_native_chunk_predicate(predicate)) ||
         is_chunk_predicate_native(predicate)) {
-        return filter_chunk_range_native(std::move(input), predicate, nullptr, 0, scalars);
+        return filter_chunk_range_native(input, predicate, nullptr, 0, scalars);
     }
     return chunk_from_filtered(filter_table(chunk_to_table(std::move(input)), predicate, scalars),
                                sequence, row_offset);
@@ -294,7 +301,7 @@ auto filter_project_chunk(Chunk input, const ir::Expr& predicate,
     if ((route == FilterChunkRoute::NativePredicate &&
          supports_native_chunk_predicate(predicate)) ||
         is_chunk_predicate_native(predicate)) {
-        return filter_chunk_range_native(std::move(input), predicate, &columns, 0, scalars);
+        return filter_chunk_range_native(input, predicate, &columns, 0, scalars);
     }
     return chunk_from_filtered(
         filter_project_table(chunk_to_table(std::move(input)), predicate, columns, scalars),
@@ -306,14 +313,14 @@ auto filter_limit_chunk(Chunk input, const ir::Expr& predicate, std::size_t row_
     const std::uint64_t sequence = input.sequence;
     const std::size_t row_offset = input.row_offset;
     if (is_chunk_predicate_native(predicate)) {
-        return filter_chunk_range_native(std::move(input), predicate, nullptr, row_limit, scalars);
+        return filter_chunk_range_native(input, predicate, nullptr, row_limit, scalars);
     }
     return chunk_from_filtered(
         filter_table_limit(chunk_to_table(std::move(input)), predicate, row_limit, scalars),
         sequence, row_offset);
 }
 
-auto project_chunk(Chunk input, const std::vector<ir::ColumnRef>& columns)
+auto project_chunk(const Chunk& input, const std::vector<ir::ColumnRef>& columns)
     -> std::expected<Chunk, std::string> {
     const ChunkView view(input);
     std::vector<MappedChunkColumn> map;
@@ -362,7 +369,7 @@ auto filter_update_project_chunk(Chunk input, const ir::Expr& predicate,
         update_row_local_chunk(std::move(filtered.value()), fields, scalars, externs, exec);
     if (!updated.has_value())
         return std::unexpected(std::move(updated.error()));
-    return project_chunk(std::move(updated.value()), project_columns);
+    return project_chunk(updated.value(), project_columns);
 }
 
 }  // namespace ibex::runtime::kernel

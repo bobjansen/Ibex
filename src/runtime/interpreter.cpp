@@ -174,6 +174,8 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
     return output;
 }
 
+namespace {
+
 /// Whether synthesizing `[min, max]` bound conjuncts is worth it for this
 /// scan: only when the estimated pruning against the source's footer range is
 /// at least ~20% (uniform-distribution estimate — the only one a min/max pair
@@ -181,20 +183,27 @@ auto project_table(const Table& input, const std::vector<ir::ColumnRef>& columns
 /// gather-decode path, slower than the dense decode it replaces; no stats
 /// means no proof, so no bounds. The publisher records raw bounds always —
 /// this is the consumer-side policy.
-static auto bounds_worth_applying(const DeferredScan& scan) -> bool {
+auto bounds_worth_applying(const DeferredScan& scan) -> bool {
     const auto& stats = scan.lazy->column_stats();
     const auto stat = stats.find(scan.key_column);
-    if (stat == stats.end() || !stat->second.min.has_value() || !stat->second.max.has_value()) {
+    if (stat == stats.end() || scan.filter == nullptr) {
         return false;
     }
-    const double source_min = static_cast<double>(*stat->second.min);
-    const double source_max = static_cast<double>(*stat->second.max);
+    const auto& col_stat = stat->second;
+    if (!col_stat.min.has_value() || !col_stat.max.has_value() || !scan.filter->min.has_value() ||
+        !scan.filter->max.has_value()) {
+        return false;
+    }
+    const auto source_min = static_cast<double>(*col_stat.min);
+    const auto source_max = static_cast<double>(*col_stat.max);
     const double kept_min = std::max(static_cast<double>(*scan.filter->min), source_min);
     const double kept_max = std::min(static_cast<double>(*scan.filter->max), source_max);
     const double source_span = source_max - source_min + 1.0;
     const double kept_span = std::max(0.0, kept_max - kept_min + 1.0);
     return kept_span / source_span <= 0.8;
 }
+
+}  // namespace
 
 auto plan_deferred_scan(const DeferredScan& scan) -> DeferredScanPlan {
     DeferredScanPlan plan;
@@ -356,7 +365,6 @@ auto expr_type_for_column(const ColumnValue& column) -> ExprType {
     return ExprType::String;
 }
 
-// NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
 auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,
                     const ExecutionContext& exec, ModelResult* model_out)
@@ -368,7 +376,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
     }
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
-            const auto& scan = static_cast<const ir::ScanNode&>(node);
+            const auto& scan = ir::node_cast<ir::ScanNode>(node);
             auto it = registry.find(scan.source_name());
             if (it == registry.end()) {
                 // A deferred lazy source has no registry entry; decode it here
@@ -390,7 +398,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return output;
         }
         case ir::NodeKind::Filter: {
-            const auto& filter = static_cast<const ir::FilterNode&>(node);
+            const auto& filter = ir::node_cast<ir::FilterNode>(node);
             if (filter.children().empty()) {
                 return std::unexpected("filter node missing child");
             }
@@ -402,7 +410,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return filter_table(child.value(), filter.predicate(), scalars);
         }
         case ir::NodeKind::Project: {
-            const auto& project = static_cast<const ir::ProjectNode&>(node);
+            const auto& project = ir::node_cast<ir::ProjectNode>(node);
             if (project.children().empty()) {
                 return std::unexpected("project node missing child");
             }
@@ -424,7 +432,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return distinct_table(child.value(), exec);
         }
         case ir::NodeKind::Order: {
-            const auto& order = static_cast<const ir::OrderNode&>(node);
+            const auto& order = ir::node_cast<ir::OrderNode>(node);
             if (order.children().empty()) {
                 return std::unexpected("order node missing child");
             }
@@ -436,7 +444,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return order_table(child.value(), order.keys(), exec);
         }
         case ir::NodeKind::Head: {
-            const auto& head = static_cast<const ir::HeadNode&>(node);
+            const auto& head = ir::node_cast<ir::HeadNode>(node);
             if (head.children().empty()) {
                 return std::unexpected("head node missing child");
             }
@@ -451,7 +459,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return head_table(child.value(), *count, head.group_by());
         }
         case ir::NodeKind::Tail: {
-            const auto& tail = static_cast<const ir::TailNode&>(node);
+            const auto& tail = ir::node_cast<ir::TailNode>(node);
             if (tail.children().empty()) {
                 return std::unexpected("tail node missing child");
             }
@@ -466,7 +474,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return tail_table(child.value(), *count, tail.group_by());
         }
         case ir::NodeKind::Update: {
-            const auto& update = static_cast<const ir::UpdateNode&>(node);
+            const auto& update = ir::node_cast<ir::UpdateNode>(node);
             if (update.children().empty()) {
                 return std::unexpected("update node missing child");
             }
@@ -548,7 +556,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return result;
         }
         case ir::NodeKind::Rename: {
-            const auto& rename = static_cast<const ir::RenameNode&>(node);
+            const auto& rename = ir::node_cast<ir::RenameNode>(node);
             if (rename.children().empty()) {
                 return std::unexpected("rename node missing child");
             }
@@ -560,14 +568,14 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return rename_table(std::move(child.value()), rename.renames());
         }
         case ir::NodeKind::Aggregate: {
-            const auto& agg = static_cast<const ir::AggregateNode&>(node);
+            const auto& agg = ir::node_cast<ir::AggregateNode>(node);
             if (agg.children().empty()) {
                 return std::unexpected("aggregate node missing child");
             }
             // Fast path: Aggregate(Scan) — pass the registry table by const ref to skip the copy.
             const ir::Node& child_node = *agg.children().front();
             if (child_node.kind() == ir::NodeKind::Scan) {
-                const auto& scan = static_cast<const ir::ScanNode&>(child_node);
+                const auto& scan = ir::node_cast<ir::ScanNode>(child_node);
                 auto it = registry.find(scan.source_name());
                 if (it == registry.end()) {
                     return std::unexpected("unknown table: " + scan.source_name());
@@ -600,21 +608,21 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return aggregate_table(child.value(), agg.group_by(), agg.aggregations(), &exec);
         }
         case ir::NodeKind::Resample: {
-            const auto& rs = static_cast<const ir::ResampleNode&>(node);
+            const auto& rs = ir::node_cast<ir::ResampleNode>(node);
             auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value())
                 return child;
             return resample_table(child.value(), rs.duration(), rs.group_by(), rs.aggregations());
         }
         case ir::NodeKind::Window: {
-            const auto& win = static_cast<const ir::WindowNode&>(node);
+            const auto& win = ir::node_cast<ir::WindowNode>(node);
             const ir::Node& child_node = *node.children().front();
             // The child must be an UpdateNode produced by the `update` clause.
             if (child_node.kind() != ir::NodeKind::Update) {
                 return std::unexpected(
                     "window: only 'update' is currently supported inside a window block");
             }
-            const auto& update_node = static_cast<const ir::UpdateNode&>(child_node);
+            const auto& update_node = ir::node_cast<ir::UpdateNode>(child_node);
             // Evaluate the source (grandchild) without the window context.
             auto source =
                 interpret_node(*child_node.children().front(), registry, scalars, externs, exec);
@@ -664,7 +672,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return project_table(windowed.value(), keep);
         }
         case ir::NodeKind::AsTimeframe: {
-            const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+            const auto& atf = ir::node_cast<ir::AsTimeframeNode>(node);
             auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value()) {
                 return child;
@@ -717,7 +725,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return sorted;
         }
         case ir::NodeKind::Ascribe: {
-            const auto& asc = static_cast<const ir::AscribeNode&>(node);
+            const auto& asc = ir::node_cast<ir::AscribeNode>(node);
             auto child = interpret_node(*node.children().front(), registry, scalars, externs, exec);
             if (!child.has_value()) {
                 return child;
@@ -780,7 +788,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return columns_table(child.value());
         }
         case ir::NodeKind::ExternCall: {
-            const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+            const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
             auto result = invoke_extern_call(ec, scalars, externs);
             if (!result.has_value()) {
                 return std::unexpected(std::move(result.error()));
@@ -798,7 +806,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return std::unexpected("extern function did not return a table: " + ec.callee());
         }
         case ir::NodeKind::Join: {
-            const auto& join = static_cast<const ir::JoinNode&>(node);
+            const auto& join = ir::node_cast<ir::JoinNode>(node);
             if (join.children().size() != 2) {
                 return std::unexpected("join node expects exactly two children");
             }
@@ -820,7 +828,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                                    join.null_match(), join.expect(), join.take(), &exec);
         }
         case ir::NodeKind::Melt: {
-            const auto& mn = static_cast<const ir::MeltNode&>(node);
+            const auto& mn = ir::node_cast<ir::MeltNode>(node);
             if (mn.children().empty()) {
                 return std::unexpected("melt node missing child");
             }
@@ -831,7 +839,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return melt_table(child.value(), mn.id_columns(), mn.measure_columns());
         }
         case ir::NodeKind::Dcast: {
-            const auto& dn = static_cast<const ir::DcastNode&>(node);
+            const auto& dn = ir::node_cast<ir::DcastNode>(node);
             if (dn.children().empty()) {
                 return std::unexpected("dcast node missing child");
             }
@@ -929,7 +937,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return result;
         }
         case ir::NodeKind::Stream: {
-            const auto& sn = static_cast<const ir::StreamNode&>(node);
+            const auto& sn = ir::node_cast<ir::StreamNode>(node);
             if (externs == nullptr) {
                 return std::unexpected("stream node requires an extern registry");
             }
@@ -1165,7 +1173,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return Table{};
         }
         case ir::NodeKind::Construct: {
-            const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            const auto& cn = ir::node_cast<ir::ConstructNode>(node);
             // `Table(n)` form: an empty frame carrying an explicit row count.
             if (cn.row_count().has_value()) {
                 auto n = evaluate_row_count_expr_impl(*cn.row_count(), scalars, externs);
@@ -1242,7 +1250,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return result;
         }
         case ir::NodeKind::Model: {
-            const auto& mn = static_cast<const ir::ModelNode&>(node);
+            const auto& mn = ir::node_cast<ir::ModelNode>(node);
             if (mn.children().empty()) {
                 return std::unexpected("model node missing child");
             }
@@ -1269,7 +1277,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return primary;
         }
         case ir::NodeKind::Program: {
-            const auto& program = static_cast<const ir::ProgramNode&>(node);
+            const auto& program = ir::node_cast<ir::ProgramNode>(node);
             auto preamble = execute_program_preamble(program.preamble(), scalars, externs);
             if (!preamble.has_value()) {
                 return std::unexpected(std::move(preamble.error()));
@@ -1277,7 +1285,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return interpret_node(program.main_node(), registry, scalars, externs, exec, model_out);
         }
         case ir::NodeKind::TopK: {
-            const auto& topk = static_cast<const ir::TopKNode&>(node);
+            const auto& topk = ir::node_cast<ir::TopKNode>(node);
             if (topk.children().empty()) {
                 return std::unexpected("topk node missing child");
             }
@@ -1295,7 +1303,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return tail_table(sorted.value(), topk.count(), topk.group_by());
         }
         case ir::NodeKind::FilterHead: {
-            const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+            const auto& fh = ir::node_cast<ir::FilterHeadNode>(node);
             if (fh.children().empty()) {
                 return std::unexpected("filter_head node missing child");
             }
@@ -1310,7 +1318,7 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             return head_table(filtered.value(), fh.count(), {});
         }
         case ir::NodeKind::FilterTail: {
-            const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+            const auto& ft = ir::node_cast<ir::FilterTailNode>(node);
             if (ft.children().empty()) {
                 return std::unexpected("filter_tail node missing child");
             }
@@ -1327,7 +1335,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
     }
     return std::unexpected("unknown node kind");
 }
-// NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
 auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
                              const ExternRegistry* externs)

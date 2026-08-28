@@ -165,10 +165,6 @@ auto map_step_kind_name(ir::NodeKind kind) -> std::string_view {
             return "Rename";
         case ir::NodeKind::Update:
             return "Update";
-        case ir::NodeKind::FilterProject:
-            return "FilterProject";
-        case ir::NodeKind::FilterUpdateProject:
-            return "FilterUpdateProject";
         default:
             return "Unknown";
     }
@@ -228,10 +224,6 @@ auto node_kind_name_impl(ir::NodeKind kind) -> std::string_view {
             return "Project";
         case ir::NodeKind::Rename:
             return "Rename";
-        case ir::NodeKind::FilterProject:
-            return "FilterProject";
-        case ir::NodeKind::FilterUpdateProject:
-            return "FilterUpdateProject";
         case ir::NodeKind::ExternCall:
             return "ExternCall";
         case ir::NodeKind::Program:
@@ -525,22 +517,26 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         }
         // Physical fusion: a Project over a Filter, or over a row-local Update
         // over a Filter, is one gather pass rather than two or three.
-        // Canonicalize R5/R6 already fuse these shapes into FilterProject and
-        // FilterUpdateProject *nodes*, so today this fires only on IR that
-        // reached the runtime unfused; expressing it here is what lets those
-        // logical rewrites be retired, since fusion becomes a property of the
-        // pipeline rather than of the tree (plan Phase 2 item 5).
+        // Fusion is a property of the pipeline, not of the logical tree.
         if (const FusibleChain fusible = fusible_chain_below(*cur); fusible.filter != nullptr) {
             const MapKernelCapability fused_capability =
                 fusible.update != nullptr ? MapKernelCapability::FilterUpdateProjectGather
                                           : MapKernelCapability::FilterProjectGather;
             const MapKernelFactory fused_factory = map_kernel_factory(fused_capability);
             if (fused_factory != nullptr) {
-                plan.steps.push_back({.node = fusible.filter,
-                                      .fused_update = fusible.update,
-                                      .fused_project = cur,
-                                      .capability = fused_capability,
-                                      .factory = fused_factory});
+                plan.steps.push_back(
+                    {.node = fusible.filter,
+                     .fused_update = fusible.update,
+                     .fused_project = cur,
+                     .filter_predicate =
+                         &static_cast<const ir::FilterNode&>(*fusible.filter).predicate(),
+                     .update_fields =
+                         fusible.update == nullptr
+                             ? nullptr
+                             : &static_cast<const ir::UpdateNode&>(*fusible.update).fields(),
+                     .project_columns = &static_cast<const ir::ProjectNode&>(*cur).columns(),
+                     .capability = fused_capability,
+                     .factory = fused_factory});
                 cur = fusible.filter->children().front().get();
                 continue;
             }

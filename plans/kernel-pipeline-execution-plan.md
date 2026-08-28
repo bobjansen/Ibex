@@ -296,8 +296,8 @@ a migrated plan composes the identical operator chain through
   pipeline's executor (an island *is* the parallel mode of a map pipeline); a
   chain the seam declines at its root does not route into the planner (the old
   recursion may still form an island around a shorter eligible sub-chain).
-- Fused kinds (`FilterProject` / `FilterUpdateProject` from canonicalize R5/R6)
-  are first-class steps — the planner lowers the tree as built.
+- Filter/project fusion is physical: the planner lowers the ordinary tree into
+  one fused map step.
 - **Update row-locality mirrors the switch, not `execution_capability`** —
   capability declines a bare row-local update for island copy-cost reasons (an
   execution choice the plan must not inherit as a shape decision). `is_map_step`
@@ -318,7 +318,7 @@ is a **raw pointer** on the view, never `const std::optional<ValidityBitmap>&`
 | 2. Port filter/project/rename/row-local update kernels | Filter: **every representation** (`kernel_gather.hpp` — `gather_selected` over all four `Selection` shapes; bit-packing helpers moved verbatim from `filter.cpp`, shared with the two-phase filter). Project/rename: `map_chunk` metadata map (shares `ColumnEntry` handles, no `Table` round-trip). Row-local update: one `try_direct_update_field` dispatch (`kernel_update.hpp`) shared by both executors — `DirectFieldPlan` (compiled numeric TREE, temporal, string-length), `DirectPredicatePlan`, `DirectValidityPlan`, `DirectCategoricalPlan`, `DirectStringPlan` (count/prefix/write); multi-field folding + parallel-mode splitting in the kernel; grouped `update …, by k` off an immutable `GroupedRowPlan` (CSR, no per-group `Table`). **Remaining gap: legacy null-handling arms + anything only the general evaluator reaches (a string result has no numeric window to pre-size) still convert to a `Table` in parallel mode.** |
 | 3. Static dispatch tables + capability declarations | Landed: `MapKernelCapability` + `MapKernelFactory` stored per step in `physical::Plan`; `ColumnKernelSignature` recorded for resolved scan sources; `build_row_local_map_operator` consumes the capability (one vocabulary across serial + parallel paths). |
 | 4. Run the physical map pipeline serially, then on the morsel executor | **DONE** (`32f62261`, `0b4150d6`, `8e31700a`). A breaker is a source kind (`SourceKind::MaterializedInput`); the plan owns `PipelineMode` (Serial / MorselParallel) + `parallel_begin`/`parallel_end`; `analyze_parallel_island` / `ParallelIslandCandidate` **deleted**. |
-| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **DONE** (`918be2d3`, `8156caac`, `7c8936d5`) — the planner fuses both shapes, canonicalize R5/R6 deleted, nothing in the optimizer produces the fused kinds. The types remain constructible for tools/serialized trees — deleting them is Phase 5 item 2. |
+| 5. Retire `FilterProject`/`FilterUpdateProject` as execution node kinds | **DONE** — the planner fuses both ordinary shapes; canonicalize R5/R6 are deleted and the legacy node kinds/types are deleted. |
 
 Lessons from the port: a `MapStep` naming two nodes (`Filter` + fused `Project`)
 must carry the fusion all the way to the worker or `range_filter_head` absorbs
@@ -419,9 +419,9 @@ at all (a one-valued strategy enum would be ceremony).
 
 1. Split by ownership: `physical_planner`, `pipeline_executor`, `kernels/`, one
    file/family per breaker.
-2. Move logical fusion/selection out of `ir::NodeKind` (compatibility lowering
-   only until serialized tests + tools no longer need it — the `FilterProject` /
-   `FilterUpdateProject` types).
+2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
+   `FilterProject` / `FilterUpdateProject`: both legacy types and their
+   compatibility lowering are deleted.
 3. Remove obsolete `build_operator` recursion; migrate `interpret_node` to an
    explicit physical fallback adapter.
 4. Make planner / executor / kernel tests independently runnable.

@@ -635,14 +635,14 @@ auto try_filter_past_update(NodePtr node) -> TryResult {
 // below the aggregate the input is typically much larger (every row), so the
 // filter eliminates work for the aggregate itself. Predicates referencing
 // aggregation aliases (HAVING-style) cannot push down and are left in place.
-// R21: collapse a redundant Project below a Project / FilterProject. The outer
+// R21: collapse a redundant Project below a Project. The outer
 // node already restricts columns to its own list; the inner Project's column
 // list must be a superset (otherwise the outer would reference missing cols),
 // so dropping it is always sound and removes a needless schema-shuffle pass.
 auto try_project_collapse(NodePtr node) -> TryResult {
     const auto kind = node->kind();
-    if ((kind != NodeKind::Project && kind != NodeKind::FilterProject) ||
-        node->children().empty() || node->children().front()->kind() != NodeKind::Project) {
+    if (kind != NodeKind::Project || node->children().empty() ||
+        node->children().front()->kind() != NodeKind::Project) {
         return {.changed = false, .node = std::move(node)};
     }
     auto& outer_kids = node->mutable_children();
@@ -671,8 +671,7 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
         descendant = descendant->children().front().get();
     }
     const auto child_kind = descendant->kind();
-    if (child_kind == NodeKind::Project || child_kind == NodeKind::FilterProject ||
-        child_kind == NodeKind::FilterUpdateProject) {
+    if (child_kind == NodeKind::Project) {
         return {.changed = false, .node = std::move(node)};
     }
     auto& agg = static_cast<AggregateNode&>(*node);
@@ -701,8 +700,8 @@ auto try_project_prune_above_aggregate(NodePtr node) -> TryResult {
     NodePtr child = take_unique_child(*agg_owned);
     auto proj = std::make_unique<ProjectNode>(fresh_id(), std::move(needed));
     proj->add_child(std::move(child));
-    // Rewrite the freshly inserted Project at root so any pending rules (e.g.
-    // R5 Project(Filter) → FilterProject) fire before the Aggregate sees it.
+    // Rewrite the freshly inserted Project at root so any pending rules fire
+    // before the Aggregate sees it.
     NodePtr proj_canon = rewrite_root(std::move(proj));
     agg_owned->add_child(std::move(proj_canon));
     return {.changed = true, .node = std::move(agg_owned)};
@@ -769,8 +768,7 @@ auto try_filter_past_aggregate(NodePtr node) -> TryResult {
     return {.changed = true, .node = std::move(agg_owned)};
 }
 
-// R5 (Project(Filter(x)) → FilterProject) and R6 (Project(Update(Filter(x)))
-// → FilterUpdateProject) used to live here. They are gone: fusion is an
+// Logical filter/project fusion used to live here. It is gone: fusion is an
 // execution choice, and the physical planner now makes it — `plan_physical`
 // emits one MapStep naming the Filter and the Project (and Update) above it,
 // resolving the same fused kernel. Keeping them here would have meant two

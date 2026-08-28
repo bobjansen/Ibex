@@ -148,18 +148,6 @@ auto is_row_wise(const Node& node) -> bool {
                 return is_row_local_update_expr(field.expr);
             });
         }
-        case NodeKind::FilterProject:
-            return is_row_local_update_expr(
-                static_cast<const FilterProjectNode&>(node).predicate());
-        case NodeKind::FilterUpdateProject: {
-            const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
-            if (!is_row_local_update_expr(fused.predicate())) {
-                return false;
-            }
-            return std::ranges::all_of(fused.fields(), [](const FieldSpec& field) {
-                return is_row_local_update_expr(field.expr);
-            });
-        }
         default:
             return false;
     }

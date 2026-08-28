@@ -284,11 +284,12 @@ TEST_CASE("scan_predicates: reaches a scan through a column-only projection",
     CHECK(predicates.at("t").size() == 1);
 }
 
-TEST_CASE("scan_predicates: removes a fully applied fused filter while retaining projection",
+TEST_CASE("scan_predicates: removes a fully applied filter while retaining projection",
           "[ir][scan_predicates]") {
-    auto plan = std::make_unique<ir::FilterProjectNode>(ir::NodeId{2}, gt_zero("predicate"),
-                                                        refs({"payload"}));
-    plan->add_child(make_scan("t"));
+    auto filter = with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("predicate")),
+                             make_scan("t"));
+    auto plan = with_child(std::make_unique<ir::ProjectNode>(ir::NodeId{3}, refs({"payload"})),
+                           std::move(filter));
 
     auto rewritten = ir::remove_applied_scan_filters(std::move(plan), {"t"});
     REQUIRE(rewritten->kind() == ir::NodeKind::Project);

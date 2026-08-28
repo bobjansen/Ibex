@@ -564,19 +564,17 @@ enum class NodeKind : std::uint8_t {
     Melt,
     Dcast,
     Stream,
-    Construct,      ///< Build a Table from inline literal column vectors.
-    Program,        ///< Top-level program: zero or more preamble side-effect calls + one main node.
-    Cov,            ///< Covariance matrix of all numeric columns.
-    Corr,           ///< Pearson correlation matrix of all numeric columns.
-    Transpose,      ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
-    Matmul,         ///< Matrix multiply: (m×k) × (k×n) → (m×n).
-    Rbind,          ///< Row-bind: vertically concatenate operands with matching schemas.
-    Model,          ///< Model fitting: formula → ModelResult.
-    FilterProject,  ///< Fused Project(Filter(x)) — produced by canonicalize R5.
-    FilterUpdateProject,  ///< Fused Project(Update(Filter(x))) — produced by canonicalize R6.
-    FilterHead,           ///< Fused Head(Filter(x)) — produced by canonicalize R7.
-    FilterTail,           ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
-    TopK,                 ///< Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
+    Construct,   ///< Build a Table from inline literal column vectors.
+    Program,     ///< Top-level program: zero or more preamble side-effect calls + one main node.
+    Cov,         ///< Covariance matrix of all numeric columns.
+    Corr,        ///< Pearson correlation matrix of all numeric columns.
+    Transpose,   ///< Transpose: swap rows and columns (homogeneous-type DataFrames).
+    Matmul,      ///< Matrix multiply: (m×k) × (k×n) → (m×n).
+    Rbind,       ///< Row-bind: vertically concatenate operands with matching schemas.
+    Model,       ///< Model fitting: formula → ModelResult.
+    FilterHead,  ///< Fused Head(Filter(x)) — produced by canonicalize R7.
+    FilterTail,  ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
+    TopK,        ///< Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
 };
 
 /// How a StreamNode triggers output emission.
@@ -1269,52 +1267,6 @@ class ModelNode final : public Node {
     ModelFormula formula_;
     std::string method_;
     std::vector<ModelParamSpec> params_;
-};
-
-/// Fused Project(Filter(x)) — produced by the canonicalize pass (rule R5).
-/// The single child is the pre-filter input `x`; the filter predicate and
-/// the final projection list are carried by this node.
-class FilterProjectNode final : public Node {
-   public:
-    FilterProjectNode(NodeId id, Expr predicate, std::vector<ColumnRef> columns)
-        : Node(NodeKind::FilterProject, id),
-          predicate_(std::move(predicate)),
-          columns_(std::move(columns)) {}
-
-    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
-    [[nodiscard]] auto columns() const noexcept -> const std::vector<ColumnRef>& {
-        return columns_;
-    }
-
-   private:
-    Expr predicate_;
-    std::vector<ColumnRef> columns_;
-};
-
-/// Fused Project(Update(Filter(x))) — produced by the canonicalize pass (rule R6).
-/// The single child is the pre-filter input `x`. The node carries the filter
-/// predicate, the row-local update field list, and the final projection list.
-/// Only emitted when the underlying Update is row-local (no tuple_fields or
-/// group_by and no cross-row callees in any field expression).
-class FilterUpdateProjectNode final : public Node {
-   public:
-    FilterUpdateProjectNode(NodeId id, Expr predicate, std::vector<FieldSpec> fields,
-                            std::vector<ColumnRef> project_columns)
-        : Node(NodeKind::FilterUpdateProject, id),
-          predicate_(std::move(predicate)),
-          fields_(std::move(fields)),
-          project_columns_(std::move(project_columns)) {}
-
-    [[nodiscard]] auto predicate() const noexcept -> const Expr& { return predicate_; }
-    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
-    [[nodiscard]] auto project_columns() const noexcept -> const std::vector<ColumnRef>& {
-        return project_columns_;
-    }
-
-   private:
-    Expr predicate_;
-    std::vector<FieldSpec> fields_;
-    std::vector<ColumnRef> project_columns_;
 };
 
 /// Fused Head(Filter(x)) — produced by canonicalize R7 when the Head has

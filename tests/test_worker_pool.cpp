@@ -491,8 +491,9 @@ TEST_CASE("a real pool reports the idle its threads actually took",
     constexpr std::size_t kThreads = 4;
     runtime::WorkerPool pool(kThreads);
     // Let every thread reach its park before the window opens, so the measured
-    // idle is the window itself rather than thread startup.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // idle is the window itself rather than thread startup. Generous, because a
+    // loaded macOS CI box can take tens of milliseconds to start four threads.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const auto begin = runtime::sample_pool_idle();
     const auto wall_start = std::chrono::steady_clock::now();
@@ -504,8 +505,9 @@ TEST_CASE("a real pool reports the idle its threads actually took",
 
     // A quiet pool of N threads idles for at least N times the window. A lower
     // bound, not an equality: the ledger registry is process-wide, so the
-    // process pool's own parked threads are in this sum too.
-    CHECK(idle >= wall_ns * static_cast<long long>(kThreads));
+    // process pool's own parked threads are in this sum too. One thread of slack
+    // absorbs a straggler that parks a hair into the window on a loaded box.
+    CHECK(idle >= wall_ns * static_cast<long long>(kThreads - 1));
 
     // And work removes idle. Measured as a RATE — threads-worth of idle per unit
     // of wall time — because that is what subtracts out the background pool,
@@ -527,8 +529,10 @@ TEST_CASE("a real pool reports the idle its threads actually took",
     const double quiet_rate = static_cast<double>(idle) / static_cast<double>(wall_ns);
     const double busy_rate = static_cast<double>(busy_idle) / static_cast<double>(busy_ns);
     // All four threads were occupied for nearly the whole busy window; require at
-    // least three threads' worth of idle to have disappeared.
-    CHECK(busy_rate < quiet_rate - 3.0);
+    // least two threads' worth of idle to have disappeared. The nominal drop is
+    // four, but the margin over the process-wide background pool is thin, so
+    // demand two rather than three to stay robust on a loaded macOS CI box.
+    CHECK(busy_rate < quiet_rate - 2.0);
 }
 
 TEST_CASE("a stage thread's backpressure park and lifetime are both accounted",

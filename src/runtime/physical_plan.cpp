@@ -29,9 +29,27 @@ namespace ibex::runtime::physical {
 
 namespace {
 
-std::atomic<std::uint64_t> g_plans_built{0};
-std::atomic<std::uint64_t> g_map_pipelines{0};
-std::atomic<std::uint64_t> g_materialized_calls{0};
+/// Fallbacks by node kind and by reason. `NodeKind` is a `std::uint8_t` enum, so
+/// 256 slots covers it by construction and no sentinel enumerator has to be
+/// maintained alongside the IR.
+constexpr std::size_t kKindSlots = 256;
+
+/// Process-wide observability counters for the physical planner. Monotonic,
+/// relaxed atomics, read only as `after - before` deltas (tests) or dumped in
+/// `physical_fallback_report()`. Bundled behind a function-local static so the
+/// state has one owner and dodges the global-mutable-state lint.
+struct PlanStats {
+    std::atomic<std::uint64_t> plans_built{0};
+    std::atomic<std::uint64_t> map_pipelines{0};
+    std::atomic<std::uint64_t> materialized_calls{0};
+    std::array<std::atomic<std::uint64_t>, kKindSlots> fallback_by_kind{};
+    std::array<std::atomic<std::uint64_t>, kKindSlots> fallback_by_reason{};
+};
+
+auto plan_stats() -> PlanStats& {
+    static PlanStats stats;
+    return stats;
+}
 
 /// The row count below which `ChunkedDistinctOperator` stays serial. It has
 /// lived as a bare `1U << 15U` inside that operator — twice, once per dedup
@@ -79,21 +97,13 @@ auto distinct_row_estimate(const ir::Node& distinct, const TableRegistry& regist
     if (cur == nullptr || cur->kind() != ir::NodeKind::Scan) {
         return {};
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& scan = static_cast<const ir::ScanNode&>(*cur);
+    const auto& scan = ir::node_cast<ir::ScanNode>(*cur);
     const auto it = registry.find(scan.source_name());
     if (it == registry.end()) {
         return {};
     }
     return {.rows = it->second.rows(), .source = RowEstimate::Source::Footer};
 }
-
-/// Fallbacks by node kind and by reason. `NodeKind` is a `std::uint8_t` enum, so
-/// 256 slots covers it by construction and no sentinel enumerator has to be
-/// maintained alongside the IR.
-constexpr std::size_t kKindSlots = 256;
-std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_kind{};
-std::array<std::atomic<std::uint64_t>, kKindSlots> g_fallback_by_reason{};
 
 auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
     switch (strategy) {
@@ -287,14 +297,12 @@ auto is_map_step(const ir::Node& node) -> bool {
 auto classify_source(const ir::Node& node, const TableRegistry& registry,
                      const ExternRegistry* externs, SourceKind& kind) -> bool {
     if (node.kind() == ir::NodeKind::Scan) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& scan = static_cast<const ir::ScanNode&>(node);
+        const auto& scan = ir::node_cast<ir::ScanNode>(node);
         kind = registry.contains(scan.source_name()) ? SourceKind::TableScan : SourceKind::LazyScan;
         return true;
     }
     if (node.kind() == ir::NodeKind::ExternCall && externs != nullptr) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& call = static_cast<const ir::ExternCallNode&>(node);
+        const auto& call = ir::node_cast<ir::ExternCallNode>(node);
         const auto* fn = externs->find(call.callee());
         if (fn != nullptr && fn->chunked_table_func != nullptr) {
             kind = SourceKind::ExternSource;
@@ -319,8 +327,8 @@ auto single_child(const ir::Node& node, ir::NodeKind kind) -> const ir::Node* {
 /// the `Update` between them. An already-fused IR kind is one step and is not
 /// re-fused here.
 struct FusibleChain {
-    const ir::Node* filter = nullptr;
-    const ir::Node* update = nullptr;
+    const ir::FilterNode* filter = nullptr;
+    const ir::UpdateNode* update = nullptr;
 };
 
 auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
@@ -330,12 +338,13 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
     }
     if (below->kind() == ir::NodeKind::Filter && below->children().size() == 1 &&
         below->children().front() != nullptr) {
-        return {.filter = below};
+        return {.filter = ir::node_cast<ir::FilterNode>(below)};
     }
     // The update must be one the row-local kernel owns; a guarded or grouped
     // one is a different operator entirely and `map_kernel_capability` is the
     // authority on which.
     if (!map_kernel_capability(*below).has_value() ||
+        // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
         *map_kernel_capability(*below) != MapKernelCapability::RowLocalUpdate) {
         return {};
     }
@@ -344,7 +353,8 @@ auto fusible_chain_below(const ir::Node& node) -> FusibleChain {
         filter->children().size() != 1 || filter->children().front() == nullptr) {
         return {};
     }
-    return {.filter = filter, .update = below};
+    return {.filter = ir::node_cast<ir::FilterNode>(filter),
+            .update = ir::node_cast<ir::UpdateNode>(below)};
 }
 
 /// Decide the pipeline's execution mode from its own steps. These are the
@@ -405,7 +415,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                    const ExternRegistry* externs) -> Plan {
     Plan plan;
     plan.root = &root;
-    g_plans_built.fetch_add(1, std::memory_order_relaxed);
+    plan_stats().plans_built.fetch_add(1, std::memory_order_relaxed);
 
     // Describe a join even though the plan does not execute one yet. The plan
     // is meant to be the single description of what a query does; letting it
@@ -454,8 +464,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         // Described, not executed: `migrated` stays false and the per-kind
         // switch still builds every aggregate. The description is proven equal
         // to the builder's branches first, exactly as the join's was.
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        plan.aggregate = plan_aggregate(static_cast<const ir::AggregateNode&>(root));
+        plan.aggregate = plan_aggregate(ir::node_cast<ir::AggregateNode>(root));
         // Streaming and fused aggregates are executed by the plan now.
         // `MaterializeAll` is not: it still falls back and still counts, which
         // is what keeps the backlog measuring the port rather than the label.
@@ -481,8 +490,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         }
     }
     if (root.kind() == ir::NodeKind::Join) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        plan.join = plan_join(static_cast<const ir::JoinNode&>(root));
+        plan.join = plan_join(ir::node_cast<ir::JoinNode>(root));
         // A streaming join is executed by the plan now: `build_physical_join`
         // builds it, not the per-kind switch. A materializing one is still a
         // fallback and says so, which is why the backlog drops by the streaming
@@ -528,20 +536,23 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                     {.node = fusible.filter,
                      .fused_update = fusible.update,
                      .fused_project = cur,
-                     .filter_predicate =
-                         &static_cast<const ir::FilterNode&>(*fusible.filter).predicate(),
+                     .filter_predicate = &fusible.filter->predicate(),
                      .update_fields =
-                         fusible.update == nullptr
-                             ? nullptr
-                             : &static_cast<const ir::UpdateNode&>(*fusible.update).fields(),
-                     .project_columns = &static_cast<const ir::ProjectNode&>(*cur).columns(),
+                         fusible.update == nullptr ? nullptr : &fusible.update->fields(),
+                     .project_columns = &ir::node_cast<ir::ProjectNode>(*cur).columns(),
                      .capability = fused_capability,
                      .factory = fused_factory});
                 cur = fusible.filter->children().front().get();
                 continue;
             }
         }
-        const MapKernelCapability capability = *map_kernel_capability(*cur);
+        const auto step_capability = map_kernel_capability(*cur);
+        if (!step_capability.has_value()) {
+            // `is_map_step` is `map_kernel_capability(...).has_value()`; the loop
+            // condition already proved this. Restated so the deref stays checked.
+            invariant_violation("physical plan: is_map_step admitted a node with no capability");
+        }
+        const MapKernelCapability capability = *step_capability;
         const MapKernelFactory factory = map_kernel_factory(capability);
         if (factory == nullptr) {
             // Keep a malformed internal dispatch table on the established
@@ -580,8 +591,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
     }
     plan.source = source;
     if (source == SourceKind::TableScan) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& scan = static_cast<const ir::ScanNode&>(*cur);
+        const auto& scan = ir::node_cast<ir::ScanNode>(*cur);
         const auto source_it = registry.find(scan.source_name());
         if (source_it != registry.end()) {
             plan.source_signature.reserve(source_it->second.columns.size());
@@ -693,14 +703,14 @@ auto explain_physical(const Plan& plan) -> std::string {
         // the first would make the plan look like it dropped the rest.
         for (const ir::Node* fused : {step.fused_update, step.fused_project}) {
             if (fused != nullptr) {
-                out += "+";
+                out += '+';
                 out += map_step_kind_name(fused->kind());
             }
         }
         if (step.fused_update != nullptr || step.fused_project != nullptr) {
             out += "(fused)";
         }
-        out += "\n";
+        out += '\n';
     }
     out += "  source: ";
     switch (plan.source) {
@@ -708,19 +718,17 @@ auto explain_physical(const Plan& plan) -> std::string {
         case SourceKind::LazyScan:
             out += plan.source == SourceKind::TableScan ? "TableScan(" : "LazyScan(";
             if (plan.source_node != nullptr && plan.source_node->kind() == ir::NodeKind::Scan) {
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                out += static_cast<const ir::ScanNode&>(*plan.source_node).source_name();
+                out += ir::node_cast<ir::ScanNode>(*plan.source_node).source_name();
             }
-            out += ")";
+            out += ')';
             break;
         case SourceKind::ExternSource:
             out += "ExternSource(";
             if (plan.source_node != nullptr &&
                 plan.source_node->kind() == ir::NodeKind::ExternCall) {
-                // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-                out += static_cast<const ir::ExternCallNode&>(*plan.source_node).callee();
+                out += ir::node_cast<ir::ExternCallNode>(*plan.source_node).callee();
             }
-            out += ")";
+            out += ')';
             break;
         case SourceKind::MaterializedInput:
             // Naming the breaker's kind is what makes this plan inspectable:
@@ -728,10 +736,10 @@ auto explain_physical(const Plan& plan) -> std::string {
             out += "MaterializedInput(";
             out +=
                 plan.source_node != nullptr ? node_kind_name_impl(plan.source_node->kind()) : "?";
-            out += ")";
+            out += ')';
             break;
     }
-    out += "\n";
+    out += '\n';
     out += "  mode: ";
     if (plan.mode == PipelineMode::MorselParallel) {
         out += "morsel-parallel(steps ";
@@ -740,22 +748,22 @@ auto explain_physical(const Plan& plan) -> std::string {
         out += std::to_string(plan.parallel_end);
         out += " of ";
         out += std::to_string(plan.steps.size());
-        out += ")";
+        out += ')';
     } else {
         out += "serial(";
         out += serial_only_reason_name(plan.serial_reason);
-        out += ")";
+        out += ')';
     }
-    out += "\n";
+    out += '\n';
     if (!plan.source_signature.empty()) {
         out += "  source signature:";
         for (const auto& signature : plan.source_signature) {
-            out += " ";
+            out += ' ';
             out += representation_name(signature.representation);
-            out += "/";
+            out += '/';
             out += kernel_null_policy_name(signature.null_policy);
         }
-        out += "\n";
+        out += '\n';
     }
     return out;
 }
@@ -788,7 +796,7 @@ auto explain_aggregate(const AggregatePlan& plan) -> std::string {
         out += node_kind_name_impl(plan.fused_join->kind());
         out += " counted=" + plan.counted_column;
     }
-    out += ")";
+    out += ')';
     return out;
 }
 
@@ -922,7 +930,7 @@ auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& pha
     -> std::string {
     std::string out = "Breaker(";
     out += kind;
-    out += ")";
+    out += ')';
     append_phase_lines(out, phases);
     return out;
 }
@@ -962,6 +970,7 @@ auto plan_join(const ir::JoinNode& join) -> JoinPlan {
         out.decline = JoinDeclineReason::UnsupportedKind;
     } else if (join.predicate().has_value()) {
         out.decline = JoinDeclineReason::HasPredicate;
+        // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (join.keys().size() > 2) {
         out.decline = JoinDeclineReason::MultipleKeys;
     } else if (join.keys().size() == 2 && !is_streamable_pair_int_join(join)) {
@@ -1029,34 +1038,37 @@ auto explain_join(const JoinPlan& plan) -> std::string {
         out += node_kind_name_impl(plan.right_input->kind());
         out += " orientation=runtime";
     }
-    out += ")";
+    out += ')';
     return out;
 }
 
 auto physical_plans_built() -> std::uint64_t {
-    return g_plans_built.load(std::memory_order_relaxed);
+    return plan_stats().plans_built.load(std::memory_order_relaxed);
 }
 
 auto physical_map_pipelines() -> std::uint64_t {
-    return g_map_pipelines.load(std::memory_order_relaxed);
+    return plan_stats().map_pipelines.load(std::memory_order_relaxed);
 }
 
 auto physical_materialized_calls() -> std::uint64_t {
-    return g_materialized_calls.load(std::memory_order_relaxed);
+    return plan_stats().materialized_calls.load(std::memory_order_relaxed);
 }
 
 void note_map_pipeline_executed() {
-    g_map_pipelines.fetch_add(1, std::memory_order_relaxed);
+    plan_stats().map_pipelines.fetch_add(1, std::memory_order_relaxed);
 }
 
 void note_materialized_call(FallbackReason reason, ir::NodeKind kind) {
-    g_materialized_calls.fetch_add(1, std::memory_order_relaxed);
-    g_fallback_by_kind[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
-    g_fallback_by_reason[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    auto& stats = plan_stats();
+    stats.materialized_calls.fetch_add(1, std::memory_order_relaxed);
+    stats.fallback_by_kind[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    stats.fallback_by_reason[static_cast<std::size_t>(reason)].fetch_add(1,
+                                                                         std::memory_order_relaxed);
 }
 
 auto physical_fallbacks_for(ir::NodeKind kind) -> std::uint64_t {
-    return g_fallback_by_kind[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+    return plan_stats().fallback_by_kind[static_cast<std::size_t>(kind)].load(
+        std::memory_order_relaxed);
 }
 
 auto node_kind_name(ir::NodeKind kind) -> std::string_view {
@@ -1068,7 +1080,7 @@ auto physical_fallback_report() -> std::string {
     // is the whole point of keeping this by kind.
     std::vector<std::pair<std::uint64_t, ir::NodeKind>> rows;
     for (std::size_t i = 0; i < kKindSlots; ++i) {
-        const std::uint64_t n = g_fallback_by_kind[i].load(std::memory_order_relaxed);
+        const std::uint64_t n = plan_stats().fallback_by_kind[i].load(std::memory_order_relaxed);
         if (n != 0) {
             rows.emplace_back(n, static_cast<ir::NodeKind>(i));
         }
@@ -1094,26 +1106,40 @@ namespace {
 /// not in place, and Phase 4's port order stayed the a-priori guess it was
 /// drafted as.
 struct FallbackReporter {
-    const bool enabled = std::getenv("IBEX_PLAN_STATS") != nullptr;
+    // The struct is only declared const in this file.
+    bool enabled = std::getenv("IBEX_PLAN_STATS") != nullptr;
 
-    ~FallbackReporter() {
+    FallbackReporter() = default;
+    FallbackReporter(const FallbackReporter&) = delete;
+    FallbackReporter& operator=(const FallbackReporter&) = delete;
+    FallbackReporter(FallbackReporter&&) = delete;
+    FallbackReporter& operator=(FallbackReporter&&) = delete;
+
+    ~FallbackReporter() noexcept {
         if (!enabled) {
             return;
         }
-        ibex::formatting::print(
-            stderr,
-            "plan stats: plans={} pipelines={} fallbacks={} not_map_chain={} "
-            "empty_chain={} malformed={}\n",
-            physical_plans_built(), physical_map_pipelines(), physical_materialized_calls(),
-            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::NotMapChain)].load(
-                std::memory_order_relaxed),
-            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::EmptyChain)].load(
-                std::memory_order_relaxed),
-            g_fallback_by_reason[static_cast<std::size_t>(FallbackReason::MalformedMapNode)].load(
-                std::memory_order_relaxed));
-        const std::string report = physical_fallback_report();
-        if (!report.empty()) {
-            ibex::formatting::print(stderr, "{}", report);
+        try {
+            ibex::formatting::print(
+                stderr,
+                "plan stats: plans={} pipelines={} fallbacks={} not_map_chain={} "
+                "empty_chain={} malformed={}\n",
+                physical_plans_built(), physical_map_pipelines(), physical_materialized_calls(),
+                plan_stats()
+                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::NotMapChain)]
+                    .load(std::memory_order_relaxed),
+                plan_stats()
+                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::EmptyChain)]
+                    .load(std::memory_order_relaxed),
+                plan_stats()
+                    .fallback_by_reason[static_cast<std::size_t>(FallbackReason::MalformedMapNode)]
+                    .load(std::memory_order_relaxed));
+            const std::string report = physical_fallback_report();
+            if (!report.empty()) {
+                ibex::formatting::print(stderr, "{}", report);
+            }
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- best-effort exit diagnostics
+            // Exit-time diagnostics are best effort; never unwind from a destructor.
         }
     }
 };

@@ -242,6 +242,10 @@ jobs:
             -DIBEX_BUILD_LIGHTGBM=OFF
 
       - name: Run clang-tidy (repo-wide, advisory)
+        # The changed-line gate below is sufficient for pull requests. Keep
+        # the expensive whole-tree trend sweep on main, where it still gives
+        # us visibility without making every PR re-analyze the entire repo.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           if command -v clang-tidy-20 >/dev/null 2>&1; then TIDY=clang-tidy-20; else TIDY=clang-tidy-18; fi
           # Run one clang-tidy process per core. Analyze only our .cpp TUs;
@@ -306,6 +310,7 @@ jobs:
           git diff -U0 "${{ steps.diff_base.outputs.base }}"...HEAD -- src \
             | python3 "$DIFF_SCRIPT" -p1 -path build -clang-tidy-binary "$TIDY" \
                 -iregex '.*\.cpp$' -checks='-misc-include-cleaner' -quiet \
+                -j "$(nproc)" -timeout 900 \
             | tee /tmp/clang-tidy-diff.out
           if grep -qE ': (warning|error): ' /tmp/clang-tidy-diff.out; then
             echo "::error::clang-tidy found issues in changed lines" >&2

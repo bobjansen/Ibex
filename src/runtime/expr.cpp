@@ -195,7 +195,7 @@ struct LikeArg {
 
 /// The arguments common to the two zone casts, already validated and resolved.
 struct ZoneCallArgs {
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
     const std::chrono::time_zone* zone = nullptr;
 #endif
     const std::string* zone_text = nullptr;  // borrowed from the literal in `call`
@@ -235,7 +235,7 @@ auto resolve_zone_call(std::string_view fn, const ir::CallExpr& call, const Tabl
         return std::unexpected(prefix + ": '" + col_ref->name + "' is not a Timestamp column");
     }
     ZoneCallArgs result{.zone_text = zone_text, .entry = entry, .stamps = stamps};
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
     result.zone = std::chrono::locate_zone(*zone_text);
 #endif
     return result;
@@ -304,7 +304,7 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
     // so the last answer is cached and reused while the value still falls inside
     // the local interval it covers. Timestamp columns are usually sorted, which
     // makes that nearly every row.
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
     const std::chrono::time_zone* zone = args->zone;
     std::chrono::nanoseconds cached_offset{};
     std::chrono::local_time<std::chrono::nanoseconds> cache_begin{};
@@ -313,7 +313,7 @@ auto eval_with_timezone(const ir::CallExpr& call, const Table& input)
 #endif
 
     for (std::size_t row = 0; row < stamps->size(); ++row) {
-#if defined(IBEX_HAS_STD_CHRONO_TIME_ZONES)
+#ifdef IBEX_HAS_STD_CHRONO_TIME_ZONES
 
         const std::chrono::local_time<std::chrono::nanoseconds> wall{
             std::chrono::nanoseconds{(*stamps)[row].nanos}};
@@ -1520,9 +1520,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                           const bool categorical = std::ranges::any_of(
                               a, [](ExprType type) { return type == ExprType::Categorical; });
                           for (const auto& t : a) {
-                              if (t != a[0] &&
-                                  !((t == ExprType::String && categorical) ||
-                                    (t == ExprType::Categorical && a[0] == ExprType::String))) {
+                              if (t != a[0] && (t != ExprType::String || !categorical) &&
+                                  (t != ExprType::Categorical || a[0] != ExprType::String)) {
                                   return std::unexpected("coalesce: arguments must share one type");
                               }
                           }
@@ -1865,9 +1864,9 @@ auto infer_expr_type(const ir::Expr& expr, const Table& input, const ScalarRegis
                     result = *type;
                 } else if (*result == ExprType::Int && *type == ExprType::Double) {
                     result = ExprType::Double;
-                } else if (!(*result == ExprType::Double && *type == ExprType::Int) &&
-                           !((*result == ExprType::Categorical && *type == ExprType::String) ||
-                             (*result == ExprType::String && *type == ExprType::Categorical)) &&
+                } else if ((*result != ExprType::Double || *type != ExprType::Int) &&
+                           (*result != ExprType::Categorical || *type != ExprType::String) &&
+                           (*result != ExprType::String || *type != ExprType::Categorical) &&
                            *result != *type) {
                     return std::unexpected(
                         "case: all value arms must have the same type (or Int/Float)");

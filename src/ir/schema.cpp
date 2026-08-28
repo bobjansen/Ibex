@@ -47,7 +47,6 @@ namespace {
 
 // haystack/needles is self-documenting; UniqueKey is only a std::vector<std::string> alias,
 // not a genuinely confusable role.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto contains_all(const std::vector<std::string>& haystack, const UniqueKey& needles) -> bool {
     return std::ranges::all_of(needles, [&](const std::string& needle) {
         return std::ranges::find(haystack, needle) != haystack.end();
@@ -598,8 +597,7 @@ auto check_ascriptions(Node& root, const SourceSchemas& sources)
         // Nothing to prove it against; the interpreter checks it against data.
         return {};
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    auto& asc = static_cast<AscribeNode&>(root);
+    auto& asc = node_cast<AscribeNode>(root);
     if (auto ok = check_one(asc, input); !ok.has_value()) {
         return ok;
     }
@@ -620,15 +618,13 @@ auto fuse_checked_ascriptions(NodePtr root) -> NodePtr {
     if (root->kind() != NodeKind::Ascribe) {
         return root;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& asc = static_cast<const AscribeNode&>(*root);
+    const auto& asc = node_cast<AscribeNode>(*root);
     if (!asc.checked() || kids.size() != 1 || kids.front() == nullptr ||
         kids.front()->kind() != NodeKind::Scan) {
         return root;
     }
     NodePtr scan_owned = std::move(kids.front());
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    auto& scan = static_cast<ScanNode&>(*scan_owned);
+    auto& scan = node_cast<ScanNode>(*scan_owned);
     scan.set_ascribed_schema(asc.schema(), asc.open());
     return scan_owned;
 }
@@ -738,8 +734,7 @@ auto check_one_join(const JoinNode& join, const SchemaInfo& left, const SchemaIn
 
 auto check_joins(const Node& node, const SourceSchemas& sources) -> std::optional<std::string> {
     if (node.kind() == NodeKind::Program) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& program = static_cast<const ProgramNode&>(node);
+        const auto& program = node_cast<ProgramNode>(node);
         for (const auto& pre : program.preamble()) {
             if (auto err = check_joins(*pre, sources)) {
                 return err;
@@ -764,8 +759,7 @@ auto check_joins(const Node& node, const SourceSchemas& sources) -> std::optiona
     if (!left.is_known() || !right.is_known()) {
         return std::nullopt;  // nothing to prove it against; the runtime checks the data
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    return check_one_join(static_cast<const JoinNode&>(node), left, right);
+    return check_one_join(node_cast<JoinNode>(node), left, right);
 }
 
 auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& args)
@@ -800,15 +794,13 @@ auto extern_call_site_key(const std::string& callee, const std::vector<Expr>& ar
     return key;
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-// guarded by the switch on node.kind() matching the target node type.
 auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo {
     switch (node.kind()) {
         case NodeKind::Program:
-            return infer_schema(static_cast<const ProgramNode&>(node).main_node(), sources);
+            return infer_schema(node_cast<ProgramNode>(node).main_node(), sources);
 
         case NodeKind::Scan: {
-            const auto& scan = static_cast<const ScanNode&>(node);
+            const auto& scan = node_cast<ScanNode>(node);
             if (const auto& asc = scan.ascribed_schema(); asc.has_value()) {
                 // Mirrors the Ascribe case below: the ascription fixes names
                 // and types, the underlying source (when known) still fixes
@@ -829,7 +821,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             return SchemaInfo::unknown();
         }
         case NodeKind::ExternCall: {
-            const auto& call = static_cast<const ExternCallNode&>(node);
+            const auto& call = node_cast<ExternCallNode>(node);
             // A call-site schema is what this specific reader call returns, and
             // beats the callee's declared one, which is per-function and so
             // cannot describe a generic reader like read_parquet.
@@ -855,7 +847,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         // predicate that reached `true` read a value from every column it
         // propagated null through.
         case NodeKind::Filter:
-            return filtered_schema(static_cast<const FilterNode&>(node).predicate(),
+            return filtered_schema(node_cast<FilterNode>(node).predicate(),
                                    child_schema(node, sources));
 
         case NodeKind::Distinct: {
@@ -880,14 +872,14 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         // one operand can repeat across them. Window's row multiplicity is not
         // modelled here.
         case NodeKind::Window: {
-            const auto& win = static_cast<const WindowNode&>(node);
+            const auto& win = node_cast<WindowNode>(node);
             SchemaInfo child = without_unique_keys(child_schema(node, sources));
             if (!win.select_only() || !child.is_known()) {
                 return child;
             }
             // `window` + `select`: the child Update computes S ∪ fields; the
             // result keeps only [time index, group keys, listed fields].
-            const auto& update = static_cast<const UpdateNode&>(*node.children().front());
+            const auto& update = node_cast<UpdateNode>(*node.children().front());
             std::vector<ColumnRef> keep;
             robin_hood::unordered_set<std::string> seen;
             auto keep_col = [&](const std::string& name) {
@@ -931,7 +923,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         case NodeKind::AsTimeframe: {
             // Designates the time-index column. The index column is materialised
             // as a Timestamp (integer time columns are converted at run time).
-            const auto& atf = static_cast<const AsTimeframeNode&>(node);
+            const auto& atf = node_cast<AsTimeframeNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             if (!input.is_known()) {
                 return SchemaInfo::unknown();
@@ -948,11 +940,11 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Project:
-            return project_schema(static_cast<const ProjectNode&>(node).columns(),
+            return project_schema(node_cast<ProjectNode>(node).columns(),
                                   child_schema(node, sources));
 
         case NodeKind::Rename: {
-            const auto& rename = static_cast<const RenameNode&>(node);
+            const auto& rename = node_cast<RenameNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             if (!input.is_known()) {
                 return SchemaInfo::unknown();
@@ -985,7 +977,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Update: {
-            const auto& update = static_cast<const UpdateNode&>(node);
+            const auto& update = node_cast<UpdateNode>(node);
             return update_schema(update.fields(), update.tuple_fields(),
                                  child_schema(node, sources));
         }
@@ -994,7 +986,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // Output: group-by key columns followed by one column per aggregate.
             // Known even from an Unknown child (the output column set is fixed),
             // though key/aggregate types may be unresolved.
-            const auto& agg = static_cast<const AggregateNode&>(node);
+            const auto& agg = node_cast<AggregateNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             std::vector<SchemaField> out;
             out.reserve(agg.group_by().size() + agg.aggregations().size());
@@ -1030,7 +1022,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Join: {
-            const auto& join = static_cast<const JoinNode&>(node);
+            const auto& join = node_cast<JoinNode>(node);
             const SchemaInfo left = child_schema(node, sources, 0);
             const SchemaInfo right = child_schema(node, sources, 1);
             if (!left.is_known() || !right.is_known()) {
@@ -1077,7 +1069,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         }
 
         case NodeKind::Construct: {
-            const auto& construct = static_cast<const ConstructNode&>(node);
+            const auto& construct = node_cast<ConstructNode>(node);
             std::vector<SchemaField> out;
             out.reserve(construct.columns().size());
             for (const auto& col : construct.columns()) {
@@ -1111,7 +1103,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // carried is still true of the rows that come out. Assertion and
             // preservation are different questions, and answering the first
             // with "no" is not a reason to answer the second with it.
-            const auto& asc = static_cast<const AscribeNode&>(node);
+            const auto& asc = node_cast<AscribeNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             std::vector<SchemaField> out = asc.schema();
             for (auto& field : out) {
@@ -1132,7 +1124,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // Output: the id columns (types from input), then `variable: String`
             // and `value` (the common type of the melted measure columns, when
             // statically determinable). The column set is fixed -> closed.
-            const auto& melt = static_cast<const MeltNode&>(node);
+            const auto& melt = node_cast<MeltNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             std::vector<SchemaField> out;
             for (const auto& id : melt.id_columns()) {
@@ -1225,7 +1217,7 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
             // input's time index is known the column set is fully pinned down
             // (closed); otherwise the bucket column cannot be named, so the
             // result is left OPEN.
-            const auto& rs = static_cast<const ResampleNode&>(node);
+            const auto& rs = node_cast<ResampleNode>(node);
             const SchemaInfo input = child_schema(node, sources);
             const std::optional<std::string>& bucket = input.time_index();
             std::vector<SchemaField> out;
@@ -1276,10 +1268,10 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         // time index and unique constraints pass through -- and the filter's
         // proofs come through with them, as they do for the unfused shapes.
         case NodeKind::FilterHead:
-            return filtered_schema(static_cast<const FilterHeadNode&>(node).predicate(),
+            return filtered_schema(node_cast<FilterHeadNode>(node).predicate(),
                                    child_schema(node, sources));
         case NodeKind::FilterTail:
-            return filtered_schema(static_cast<const FilterTailNode&>(node).predicate(),
+            return filtered_schema(node_cast<FilterTailNode>(node).predicate(),
                                    child_schema(node, sources));
         // Head(Order(x)): no predicate, so nothing to prove.
         case NodeKind::TopK:
@@ -1295,7 +1287,6 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
     }
     return SchemaInfo::unknown();
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 namespace {
 
@@ -1350,10 +1341,8 @@ void collect_expr_columns(const Expr& expr, std::vector<ColumnRef>& out) {
 auto check_column_refs(const Node& node, const SourceSchemas& sources,
                        const robin_hood::unordered_set<std::string>& lexical_names,
                        bool check_expressions) -> std::optional<std::string> {
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-    // guarded by a node.kind() check (or switch) matching the target node type.
     if (node.kind() == NodeKind::Program) {
-        const auto& program = static_cast<const ProgramNode&>(node);
+        const auto& program = node_cast<ProgramNode>(node);
         for (const auto& pre : program.preamble()) {
             if (auto err = check_column_refs(*pre, sources, lexical_names, check_expressions)) {
                 return err;
@@ -1404,14 +1393,14 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
 
     if (check_expressions && node.kind() == NodeKind::Filter) {
         std::vector<ColumnRef> refs;
-        collect_expr_columns(static_cast<const FilterNode&>(node).predicate(), refs);
+        collect_expr_columns(node_cast<FilterNode>(node).predicate(), refs);
         if (auto err = check_refs("filter", refs)) {
             return err;
         }
     }
     if (check_expressions && node.kind() == NodeKind::Update) {
         std::vector<ColumnRef> refs;
-        for (const auto& field : static_cast<const UpdateNode&>(node).fields()) {
+        for (const auto& field : node_cast<UpdateNode>(node).fields()) {
             collect_expr_columns(field.expr, refs);
         }
         if (auto err = check_refs("update", refs)) {
@@ -1421,7 +1410,7 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
 
     switch (node.kind()) {
         case NodeKind::Project:
-            for (const auto& ref : static_cast<const ProjectNode&>(node).columns()) {
+            for (const auto& ref : node_cast<ProjectNode>(node).columns()) {
                 if (ref.name.empty()) {
                     continue;  // internal runtime-time-index projection marker
                 }
@@ -1431,7 +1420,7 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
             }
             break;
         case NodeKind::Order:
-            for (const auto& key : static_cast<const OrderNode&>(node).keys()) {
+            for (const auto& key : node_cast<OrderNode>(node).keys()) {
                 if (input.find(key.name) == nullptr) {
                     return missing_column("order", key.name);
                 }
@@ -1443,14 +1432,14 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
             for (const auto& field : input.fields()) {
                 input_names.push_back(field.name);
             }
-            const ColumnNameMap names(static_cast<const RenameNode&>(node).renames());
+            const ColumnNameMap names(node_cast<RenameNode>(node).renames());
             if (auto valid = names.validate_input(input_names); !valid.has_value()) {
                 return valid.error();
             }
             break;
         }
         case NodeKind::Aggregate: {
-            const auto& agg = static_cast<const AggregateNode&>(node);
+            const auto& agg = node_cast<AggregateNode>(node);
             for (const auto& key : agg.group_by()) {
                 if (input.find(key.name) == nullptr) {
                     return missing_column("by", key.name);
@@ -1469,21 +1458,21 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
             break;
         }
         case NodeKind::Head:
-            for (const auto& ref : static_cast<const HeadNode&>(node).group_by()) {
+            for (const auto& ref : node_cast<HeadNode>(node).group_by()) {
                 if (input.find(ref.name) == nullptr) {
                     return missing_column("by", ref.name);
                 }
             }
             break;
         case NodeKind::Tail:
-            for (const auto& ref : static_cast<const TailNode&>(node).group_by()) {
+            for (const auto& ref : node_cast<TailNode>(node).group_by()) {
                 if (input.find(ref.name) == nullptr) {
                     return missing_column("by", ref.name);
                 }
             }
             break;
         case NodeKind::Update:
-            for (const auto& ref : static_cast<const UpdateNode&>(node).group_by()) {
+            for (const auto& ref : node_cast<UpdateNode>(node).group_by()) {
                 if (input.find(ref.name) == nullptr) {
                     return missing_column("by", ref.name);
                 }
@@ -1492,7 +1481,6 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
         default:
             break;
     }
-    // NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
     return std::nullopt;
 }
 

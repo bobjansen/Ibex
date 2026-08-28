@@ -29,8 +29,7 @@ namespace {
 auto join_below(Node& node) -> JoinNode* {
     switch (node.kind()) {
         case NodeKind::Join:
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            return static_cast<JoinNode*>(&node);
+            return node_cast<JoinNode>(&node);
         case NodeKind::Filter:
         case NodeKind::Project:
         case NodeKind::Distinct:
@@ -53,8 +52,7 @@ auto join_below(Node& node) -> JoinNode* {
 
 void annotate_pending_orders(Node& root) {
     if (root.kind() == NodeKind::Program) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        auto& program = static_cast<ProgramNode&>(root);
+        auto& program = node_cast<ProgramNode>(root);
         for (const auto& pre : program.mutable_preamble()) {
             if (pre != nullptr) {
                 annotate_pending_orders(*pre);
@@ -76,8 +74,7 @@ void annotate_pending_orders(Node& root) {
         root.children().front() == nullptr) {
         return;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& order = static_cast<const OrderNode&>(root);
+    const auto& order = node_cast<OrderNode>(root);
     if (order.keys().empty()) {
         // A bare `order` sorts by the whole schema, resolved against the input
         // at execution. There is nothing to hand the join that it could compare

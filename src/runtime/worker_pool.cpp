@@ -214,7 +214,6 @@ struct LedgerRegistry {
 /// library, and it writes to its ledger on every park.
 template <typename Ledger>
 auto ledger_registry() -> LedgerRegistry<Ledger>& {
-    // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
     static auto* registry = new LedgerRegistry<Ledger>();
     return *registry;
 }
@@ -266,8 +265,7 @@ thread_local StageLedger* t_stage_ledger = nullptr;
 }  // namespace
 
 auto sample_pool_idle() -> IdleSample {
-    return sample_ledgers<IntervalLedger>(
-        [](const IntervalLedger& ledger) -> const IntervalLedger& { return ledger; });
+    return sample_ledgers<IntervalLedger>(std::identity{});
 }
 
 auto sample_stage_park() -> IdleSample {
@@ -544,7 +542,7 @@ auto WorkerPool::TaskGroup::operator=(TaskGroup&& other) noexcept -> TaskGroup& 
         if (state_ != nullptr) {
             try {
                 wait();
-            } catch (...) {
+            } catch (...) {  // NOLINT(bugprone-empty-catch) -- see comment
                 // Move assignment has the same no-throw ownership contract as
                 // Batch: explicit wait() is where task errors are observed.
             }
@@ -558,7 +556,7 @@ WorkerPool::TaskGroup::~TaskGroup() {
     if (state_ != nullptr) {
         try {
             wait();
-        } catch (...) {
+        } catch (...) {  // NOLINT(bugprone-empty-catch) -- see comment
             // Destruction is a lifetime join, not an error-observation point.
         }
     }
@@ -671,6 +669,8 @@ auto compute_thread_count() -> std::size_t {
     return hardware == 0 ? 1 : static_cast<std::size_t>(hardware);
 }
 
+namespace {
+
 /// Positive integer from `name`, or `fallback` when unset/unparseable/zero.
 /// Every pool-sizing knob goes through this so they all answer the same way.
 auto env_size(const char* name, std::size_t fallback) -> std::size_t {
@@ -683,6 +683,8 @@ auto env_size(const char* name, std::size_t fallback) -> std::size_t {
     const auto result = std::from_chars(raw.data(), end, parsed);
     return (result.ec == std::errc{} && result.ptr == end && parsed > 0) ? parsed : fallback;
 }
+
+}  // namespace
 
 auto decode_thread_count() -> std::size_t {
     // How many threads the process pool gets. Sized for DECODE, which is
@@ -746,7 +748,7 @@ auto process_worker_pool_state() -> ProcessWorkerPool& {
     // shutdown_process_worker_pool() first, which joins and releases `pool`.
     // The heap registry itself must outlive the DLL's static destruction so
     // that process exit does not perform a second, unsafe teardown.
-    static auto* state = new ProcessWorkerPool();  // NOLINT(cppcoreguidelines-owning-memory)
+    static auto* state = new ProcessWorkerPool();
     return *state;
 }
 

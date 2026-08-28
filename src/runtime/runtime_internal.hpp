@@ -62,7 +62,6 @@ struct Mask {
 
     /// Adopt `v` as this mask's 3VL validity. `off` is the source offset — the
     /// mask itself is always dense, so row `i` reads `(*v)[off + i]`.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters) — source offset, then row count
     void apply_validity(const ValidityBitmap* v, std::size_t off, std::size_t n) {
         if (v == nullptr) {
             return;
@@ -371,12 +370,10 @@ void gather_validity_range(ValidityBitmap& dst, const ValidityBitmap& src,
 /// that receive default values. Returns the new column plus a validity bitmap if any nulls exist.
 // n is the array length, kNull the sentinel value; distinct roles, not realistically
 // confusable at the handful of call sites.
-// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 [[nodiscard]] inline auto gather_column_with_nulls(const ColumnValue& src,
                                                    const std::size_t* indices, std::size_t n,
                                                    std::size_t kNull, const ExecutionContext* exec)
     -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
-    // NOLINTEND(bugprone-easily-swappable-parameters)
     auto gathered = std::visit(
         [&](const auto& col) -> std::pair<ColumnValue, std::optional<ValidityBitmap>> {
             using ColT = std::decay_t<decltype(col)>;

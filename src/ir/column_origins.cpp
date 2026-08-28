@@ -133,11 +133,11 @@ auto join_origins(const JoinNode& join, const SourceSchemas& sources) -> ColumnO
 auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOriginMap {
     switch (node.kind()) {
         case NodeKind::Program:
-            return column_origins(static_cast<const ProgramNode&>(node).main_node(), sources);
+            return column_origins(node_cast<ProgramNode>(node).main_node(), sources);
 
         case NodeKind::Scan: {
             // The seed: a scan's columns ARE its source's columns.
-            const auto& scan = static_cast<const ScanNode&>(node);
+            const auto& scan = node_cast<ScanNode>(node);
             const auto it = sources.find(scan.source_name());
             if (it == sources.end() || !it->second.is_known()) {
                 return {};
@@ -161,11 +161,11 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
             return child_origins(node, sources);
 
         case NodeKind::Project:
-            return project_origins(static_cast<const ProjectNode&>(node).columns(),
+            return project_origins(node_cast<ProjectNode>(node).columns(),
                                    child_origins(node, sources));
 
         case NodeKind::Rename: {
-            const auto& rename = static_cast<const RenameNode&>(node);
+            const auto& rename = node_cast<RenameNode>(node);
             const ColumnNameMap names(rename.renames());
             const ColumnOriginMap input = child_origins(node, sources);
             ColumnOriginMap out;
@@ -177,7 +177,7 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
         }
 
         case NodeKind::Update: {
-            const auto& update = static_cast<const UpdateNode&>(node);
+            const auto& update = node_cast<UpdateNode>(node);
             return update_origins(update.fields(), update.tuple_fields(),
                                   child_origins(node, sources));
         }
@@ -185,7 +185,7 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
         case NodeKind::Aggregate: {
             // A group key column holds one of the values that grouped, so it is
             // still that base column. The aggregates are computed and are not.
-            const auto& agg = static_cast<const AggregateNode&>(node);
+            const auto& agg = node_cast<AggregateNode>(node);
             const ColumnOriginMap input = child_origins(node, sources);
             ColumnOriginMap out;
             for (const auto& key : agg.group_by()) {
@@ -197,7 +197,7 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
         }
 
         case NodeKind::Join: {
-            const auto& join = static_cast<const JoinNode&>(node);
+            const auto& join = node_cast<JoinNode>(node);
             if (join.children().size() < 2 || join.children()[0] == nullptr ||
                 join.children()[1] == nullptr) {
                 return {};

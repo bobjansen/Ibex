@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <expected>
 #include <limits>
 #include <memory>
@@ -62,7 +63,8 @@ auto predicate_input(const ChunkView& view) -> PredicateInput {
 auto write_direct_update(const Chunk& input, std::string alias, std::shared_ptr<ColumnValue> column,
                          std::optional<ValidityBitmap> validity) -> std::optional<Chunk> {
     const ChunkView view(input);
-    if (view.properties().time_index().has_value() && alias == *view.properties().time_index()) {
+    const auto time_index = view.properties().time_index();
+    if (time_index.has_value() && alias == time_index.value()) {
         return std::nullopt;
     }
 
@@ -559,7 +561,7 @@ auto try_coalesce_update(const Chunk& input, const std::vector<ir::FieldSpec>& f
     return std::visit(
         [&](const auto& first) -> std::optional<Chunk> {
             using Col = std::decay_t<decltype(first)>;
-            using Value = typename Col::value_type;
+            using Value = Col::value_type;
             std::vector<std::optional<Value>> literals;
             literals.reserve(operands.size());
             for (const auto& operand : operands) {
@@ -628,7 +630,13 @@ struct DirectCasePlan {
     std::optional<ColumnValue> literal_type;
 
     [[nodiscard]] auto type_source() const -> const ColumnValue& {
-        return type_column != nullptr ? *type_column->column : *literal_type;
+        if (type_column != nullptr) {
+            return *type_column->column;
+        }
+        if (literal_type.has_value()) {
+            return literal_type.value();
+        }
+        std::terminate();
     }
 
     [[nodiscard]] auto selected_arm(std::size_t row) const noexcept -> std::size_t {
@@ -715,7 +723,7 @@ auto write_fixed_width_case(const Chunk& input, const ir::FieldSpec& field,
     return std::visit(
         [&](const auto& type_values) -> std::optional<Chunk> {
             using Col = std::decay_t<decltype(type_values)>;
-            using Value = typename Col::value_type;
+            using Value = Col::value_type;
             if constexpr (std::is_same_v<Col, Column<std::string>> ||
                           std::is_same_v<Col, Column<Categorical>>) {
                 return std::nullopt;
@@ -782,9 +790,9 @@ auto write_string_case(const Chunk& input, const ir::FieldSpec& field, const Dir
             if (!literal.has_value()) {
                 return std::nullopt;
             }
-            literals.push_back(std::move(literal));
+            literals.push_back(literal);
         } else {
-            literals.push_back(std::nullopt);
+            literals.emplace_back(std::nullopt);
         }
     }
     const auto selected_value = [&](std::size_t row) -> std::optional<std::string_view> {
@@ -794,7 +802,7 @@ auto write_string_case(const Chunk& input, const ir::FieldSpec& field, const Dir
             return std::nullopt;
         }
         if (value.literal != nullptr) {
-            return *literals[selected];
+            return literals[selected];
         }
         const auto* column = std::get_if<Column<std::string>>(value.column->column.get());
         if (column == nullptr ||
@@ -854,9 +862,9 @@ auto write_categorical_case(const Chunk& input, const ir::FieldSpec& field,
             if (!literal.has_value()) {
                 return std::nullopt;
             }
-            literals.push_back(std::move(literal));
+            literals.push_back(literal);
         } else {
-            literals.push_back(std::nullopt);
+            literals.emplace_back(std::nullopt);
         }
         if (value.column != nullptr) {
             const auto* column = std::get_if<Column<Categorical>>(value.column->column.get());
@@ -873,7 +881,7 @@ auto write_categorical_case(const Chunk& input, const ir::FieldSpec& field,
             return std::nullopt;
         }
         if (value.literal != nullptr) {
-            return *literals[selected];
+            return literals[selected];
         }
         const auto& source = std::get<Column<Categorical>>(*value.column->column);
         if (value.column->validity.has_value() && !(*value.column->validity)[row]) {
@@ -1079,11 +1087,11 @@ auto try_shared_string_update(const Chunk& input, const std::vector<ir::FieldSpe
 
     Column<std::string> values;
     values.resize_for_gather(view.rows(), *total_chars);
-    StringOutputSpan output{.offsets = values.offsets_data(),
-                            .chars = values.chars_data(),
-                            .begin = 0,
-                            .count = view.rows(),
-                            .char_base = 0};
+    const StringOutputSpan output{.offsets = values.offsets_data(),
+                                  .chars = values.chars_data(),
+                                  .begin = 0,
+                                  .count = view.rows(),
+                                  .char_base = 0};
     output.offsets[0] = 0;
     if (!write_direct_string(*plan, ::ibex::runtime::RowRange::whole(view.rows()),
                              validity.has_value() ? &*validity : nullptr, output)) {
@@ -1269,7 +1277,7 @@ auto make_direct_string_plan(const ir::Expr& expr, const PredicateInput& input,
             length = *value;
         }
         plan.kind = DirectStringPlan::Kind::Substring;
-        plan.substring_source = std::move(*source);
+        plan.substring_source = *source;
         plan.substring_start = *start;
         plan.substring_length = length;
         return plan;
@@ -1283,7 +1291,7 @@ auto make_direct_string_plan(const ir::Expr& expr, const PredicateInput& input,
         if (!operand.has_value()) {
             return std::nullopt;
         }
-        plan.operands.push_back(std::move(*operand));
+        plan.operands.push_back(*operand);
     }
     return plan;
 }
@@ -1496,6 +1504,7 @@ auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& 
     if (source == nullptr || source->lexical) {
         return std::nullopt;
     }
+    // NOLINTBEGIN(readability-avoid-nested-conditional-operator)
     const auto part = call->callee == "year"     ? std::optional{TemporalPart::Year}
                       : call->callee == "month"  ? std::optional{TemporalPart::Month}
                       : call->callee == "day"    ? std::optional{TemporalPart::Day}
@@ -1503,6 +1512,7 @@ auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& 
                       : call->callee == "minute" ? std::optional{TemporalPart::Minute}
                       : call->callee == "second" ? std::optional{TemporalPart::Second}
                                                  : std::nullopt;
+    // NOLINTEND(readability-avoid-nested-conditional-operator)
     if (!part.has_value()) {
         return std::nullopt;
     }
@@ -1620,17 +1630,20 @@ auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput&
     for (std::size_t offset = 0; offset < range.count; ++offset) {
         const std::size_t row = range.begin + offset;
         if (plan.dates != nullptr) {
+            // NOLINTBEGIN(readability-avoid-nested-conditional-operator)
             const year_month_day ymd{sys_days{days{plan.dates[row].days}}};
             output.numeric.ints[offset] =
                 plan.temporal_part == TemporalPart::Year    ? static_cast<int>(ymd.year())
                 : plan.temporal_part == TemporalPart::Month ? static_cast<unsigned>(ymd.month())
                                                             : static_cast<unsigned>(ymd.day());
             continue;
+            // NOLINTEND(readability-avoid-nested-conditional-operator)
         }
         const sys_time<nanoseconds> time{nanoseconds{plan.timestamps[row].nanos}};
         const auto day_point = floor<days>(time);
         const year_month_day ymd{day_point};
         const hh_mm_ss<nanoseconds> hms{time - day_point};
+        // NOLINTBEGIN(readability-avoid-nested-conditional-operator)
         output.numeric.ints[offset] =
             plan.temporal_part == TemporalPart::Year     ? static_cast<int>(ymd.year())
             : plan.temporal_part == TemporalPart::Month  ? static_cast<unsigned>(ymd.month())
@@ -1638,6 +1651,7 @@ auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput&
             : plan.temporal_part == TemporalPart::Hour   ? hms.hours().count()
             : plan.temporal_part == TemporalPart::Minute ? hms.minutes().count()
                                                          : hms.seconds().count();
+        // NOLINTEND(readability-avoid-nested-conditional-operator)
     }
     return true;
 }
@@ -1725,7 +1739,7 @@ auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& 
             if (!source_kind.has_value() || (kind.has_value() && *kind != *source_kind)) {
                 return false;
             }
-            kind = *source_kind;
+            kind = source_kind;
             plan.values.push_back(
                 {.column = entry, .literal = {}, .is_literal = false, .is_null = false});
             return true;
@@ -1739,7 +1753,7 @@ auto try_plan_direct_validity_field(const ir::Expr& expr, const PredicateInput& 
             if (!literal_kind.has_value() || (kind.has_value() && *kind != *literal_kind)) {
                 return false;
             }
-            kind = *literal_kind;
+            kind = literal_kind;
             plan.values.push_back({.column = nullptr,
                                    .literal = scalar_from_literal(*literal),
                                    .is_literal = true,
@@ -1814,6 +1828,7 @@ auto write_direct_validity_field_range(const DirectValidityPlan& plan, const Pre
                 return std::unexpected(
                     "write_direct_validity_field_range: malformed fill_null plan");
             }
+            // NOLINTNEXTLINE(readability-container-data-pointer)
             selected = available(plan.values[0], row) ? &plan.values[0] : &plan.values[1];
         } else if (plan.kind == DirectValidityKind::Coalesce) {
             for (const auto& value : plan.values) {
@@ -1825,8 +1840,9 @@ auto write_direct_validity_field_range(const DirectValidityPlan& plan, const Pre
         } else {
             std::size_t arm = conditions.size();
             for (std::size_t index = 0; index < conditions.size(); ++index) {
+                const auto& condition_valid = conditions[index].valid;
                 if (conditions[index].value[offset] != 0 &&
-                    (!conditions[index].valid.has_value() || (*conditions[index].valid)[offset])) {
+                    (!condition_valid.has_value() || condition_valid.value()[offset])) {
                     arm = index;
                     break;
                 }
@@ -2001,17 +2017,26 @@ auto write_direct_categorical_field_range(const DirectCategoricalPlan& plan,
         } else {
             selected = conditions.size();
             for (std::size_t index = 0; index < conditions.size(); ++index) {
+                const auto& condition_valid = conditions[index].valid;
                 if (conditions[index].value[offset] != 0 &&
-                    (!conditions[index].valid.has_value() || (*conditions[index].valid)[offset])) {
+                    (!condition_valid.has_value() || condition_valid.value()[offset])) {
                     selected = index;
                     break;
                 }
             }
         }
-        if (selected >= plan.values.size() || plan.values[selected].is_null ||
-            (!plan.values[selected].is_literal &&
-             plan.values[selected].column->validity.has_value() &&
-             !(*plan.values[selected].column->validity)[row])) {
+        if (selected >= plan.values.size()) {
+            output.codes[offset] = 0;
+            validity.set(offset, false);
+            any_invalid = true;
+            continue;
+        }
+        const auto& selected_value = plan.values[selected];
+        const auto* selected_validity =
+            selected_value.column != nullptr ? &selected_value.column->validity : nullptr;
+        if (selected_value.is_null ||
+            (!selected_value.is_literal && selected_validity != nullptr &&
+             selected_validity->has_value() && !selected_validity->value()[row])) {
             output.codes[offset] = 0;
             validity.set(offset, false);
             any_invalid = true;
@@ -2257,11 +2282,13 @@ auto merge_range_validity(
     }
     ValidityBitmap merged(rows, true);
     for (std::size_t index = 0; index < pieces.size(); ++index) {
-        if (!pieces[index]->has_value()) {
+        const auto& piece_result = pieces[index];
+        const auto& piece = piece_result.value();
+        if (!piece.has_value()) {
             continue;
         }
         const std::size_t begin = index * grain;
-        const ValidityBitmap& source = **pieces[index];
+        const ValidityBitmap& source = piece.value();
         for (std::size_t offset = 0; offset < source.size(); ++offset) {
             merged.set(begin + offset, source[offset]);
         }

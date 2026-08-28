@@ -37,7 +37,7 @@ enum class FilterChunkRoute : std::uint8_t { Auto, NativePredicate };
 [[nodiscard]] auto filter_limit_chunk(Chunk input, const ir::Expr& predicate, std::size_t row_limit,
                                       const ScalarRegistry* scalars)
     -> std::expected<Chunk, std::string>;
-[[nodiscard]] auto project_chunk(Chunk input, const std::vector<ir::ColumnRef>& columns)
+[[nodiscard]] auto project_chunk(const Chunk& input, const std::vector<ir::ColumnRef>& columns)
     -> std::expected<Chunk, std::string>;
 [[nodiscard]] auto filter_update_project_chunk(
     Chunk input, const ir::Expr& predicate, const std::vector<ir::FieldSpec>& fields,

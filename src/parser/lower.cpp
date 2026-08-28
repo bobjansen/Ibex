@@ -802,10 +802,9 @@ auto extract_string_list(const Expr& expr) -> std::optional<std::vector<std::str
 auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vector<std::string>> {
     using ir::NodeKind;
 
-    // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     switch (node.kind()) {
         case NodeKind::Project: {
-            const auto& project = static_cast<const ir::ProjectNode&>(node);
+            const auto& project = ir::node_cast<ir::ProjectNode>(node);
             std::vector<std::string> names;
             names.reserve(project.columns().size());
             for (const auto& col : project.columns()) {
@@ -814,7 +813,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::Aggregate: {
-            const auto& agg = static_cast<const ir::AggregateNode&>(node);
+            const auto& agg = ir::node_cast<ir::AggregateNode>(node);
             std::vector<std::string> names;
             names.reserve(agg.group_by().size() + agg.aggregations().size());
             for (const auto& col : agg.group_by()) {
@@ -826,7 +825,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::Update: {
-            const auto& update = static_cast<const ir::UpdateNode&>(node);
+            const auto& update = ir::node_cast<ir::UpdateNode>(node);
             if (update.children().empty()) {
                 return std::nullopt;
             }
@@ -848,7 +847,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::Rename: {
-            const auto& rename = static_cast<const ir::RenameNode&>(node);
+            const auto& rename = ir::node_cast<ir::RenameNode>(node);
             if (rename.children().empty()) {
                 return std::nullopt;
             }
@@ -867,7 +866,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::Resample: {
-            const auto& rs = static_cast<const ir::ResampleNode&>(node);
+            const auto& rs = ir::node_cast<ir::ResampleNode>(node);
             std::vector<std::string> names;
             names.reserve(rs.group_by().size() + rs.aggregations().size() + 1);
             names.push_back("_bucket");
@@ -899,7 +898,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
         case NodeKind::Columns:
             return std::vector<std::string>{"name"};
         case NodeKind::Construct: {
-            const auto& cn = static_cast<const ir::ConstructNode&>(node);
+            const auto& cn = ir::node_cast<ir::ConstructNode>(node);
             std::vector<std::string> names;
             names.reserve(cn.columns().size());
             for (const auto& col : cn.columns()) {
@@ -908,7 +907,7 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             return names;
         }
         case NodeKind::Program: {
-            const auto& program = static_cast<const ir::ProgramNode&>(node);
+            const auto& program = ir::node_cast<ir::ProgramNode>(node);
             return infer_output_column_names(program.main_node());
         }
         case NodeKind::Scan:
@@ -924,7 +923,6 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
         case NodeKind::Model:
             return std::nullopt;
     }
-    // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
     return std::nullopt;
 }
 
@@ -4788,7 +4786,6 @@ class Lowerer {
         return std::nullopt;
     }
 
-    // NOLINTBEGIN cppcoreguidelines-pro-type-static-cast-downcast
     auto clone_node(const ir::Node& node) -> ir::NodePtr {
         auto clone_tuple_fields = [&](const std::vector<ir::TupleFieldSpec>& tuple_fields) {
             std::vector<ir::TupleFieldSpec> cloned;
@@ -4819,23 +4816,23 @@ class Lowerer {
         ir::NodePtr clone;
         switch (node.kind()) {
             case ir::NodeKind::Scan: {
-                const auto& scan = static_cast<const ir::ScanNode&>(node);
+                const auto& scan = ir::node_cast<ir::ScanNode>(node);
                 clone = builder_.scan(scan.source_name());
                 if (const auto& asc = scan.ascribed_schema(); asc.has_value()) {
                     // Fusion (fuse_checked_ascriptions) folds a proven
                     // ascription into the Scan itself; a clone that dropped it
                     // would silently regress to the unfused, unproven schema.
-                    static_cast<ir::ScanNode&>(*clone).set_ascribed_schema(asc->fields, asc->open);
+                    ir::node_cast<ir::ScanNode>(*clone).set_ascribed_schema(asc->fields, asc->open);
                 }
                 break;
             }
             case ir::NodeKind::Filter: {
-                const auto& filter = static_cast<const ir::FilterNode&>(node);
+                const auto& filter = ir::node_cast<ir::FilterNode>(node);
                 clone = builder_.filter(filter.predicate());
                 break;
             }
             case ir::NodeKind::Project: {
-                const auto& project = static_cast<const ir::ProjectNode&>(node);
+                const auto& project = ir::node_cast<ir::ProjectNode>(node);
                 clone = builder_.project(project.columns());
                 break;
             }
@@ -4844,53 +4841,53 @@ class Lowerer {
                 break;
             }
             case ir::NodeKind::Order: {
-                const auto& order = static_cast<const ir::OrderNode&>(node);
+                const auto& order = ir::node_cast<ir::OrderNode>(node);
                 clone = builder_.order(order.keys());
                 break;
             }
             case ir::NodeKind::Head: {
-                const auto& head = static_cast<const ir::HeadNode&>(node);
+                const auto& head = ir::node_cast<ir::HeadNode>(node);
                 clone = builder_.head(head.count_expr(), head.group_by());
                 break;
             }
             case ir::NodeKind::Tail: {
-                const auto& tail = static_cast<const ir::TailNode&>(node);
+                const auto& tail = ir::node_cast<ir::TailNode>(node);
                 clone = builder_.tail(tail.count_expr(), tail.group_by());
                 break;
             }
             case ir::NodeKind::Aggregate: {
-                const auto& agg = static_cast<const ir::AggregateNode&>(node);
+                const auto& agg = ir::node_cast<ir::AggregateNode>(node);
                 clone = builder_.aggregate(agg.group_by(), agg.aggregations());
                 break;
             }
             case ir::NodeKind::Update: {
-                const auto& update = static_cast<const ir::UpdateNode&>(node);
+                const auto& update = ir::node_cast<ir::UpdateNode>(node);
                 clone = builder_.update(update.fields(), clone_tuple_fields(update.tuple_fields()),
                                         update.group_by());
                 break;
             }
             case ir::NodeKind::Rename: {
-                const auto& rename = static_cast<const ir::RenameNode&>(node);
+                const auto& rename = ir::node_cast<ir::RenameNode>(node);
                 clone = builder_.rename(rename.renames());
                 break;
             }
             case ir::NodeKind::Window: {
-                const auto& window = static_cast<const ir::WindowNode&>(node);
+                const auto& window = ir::node_cast<ir::WindowNode>(node);
                 clone = builder_.window(window.duration(), window.select_only(), window.aligned());
                 break;
             }
             case ir::NodeKind::Resample: {
-                const auto& rs = static_cast<const ir::ResampleNode&>(node);
+                const auto& rs = ir::node_cast<ir::ResampleNode>(node);
                 clone = builder_.resample(rs.duration(), rs.group_by(), rs.aggregations());
                 break;
             }
             case ir::NodeKind::AsTimeframe: {
-                const auto& atf = static_cast<const ir::AsTimeframeNode&>(node);
+                const auto& atf = ir::node_cast<ir::AsTimeframeNode>(node);
                 clone = builder_.as_timeframe(atf.column());
                 break;
             }
             case ir::NodeKind::Ascribe: {
-                const auto& asc = static_cast<const ir::AscribeNode&>(node);
+                const auto& asc = ir::node_cast<ir::AscribeNode>(node);
                 clone = builder_.ascribe(asc.schema(), asc.open());
                 break;
             }
@@ -4899,24 +4896,24 @@ class Lowerer {
                 break;
             }
             case ir::NodeKind::ExternCall: {
-                const auto& ec = static_cast<const ir::ExternCallNode&>(node);
+                const auto& ec = ir::node_cast<ir::ExternCallNode>(node);
                 clone = builder_.extern_call(ec.callee(), ec.args());
                 break;
             }
             case ir::NodeKind::Join: {
-                const auto& join = static_cast<const ir::JoinNode&>(node);
+                const auto& join = ir::node_cast<ir::JoinNode>(node);
                 std::optional<ir::Expr> pred_clone = join.predicate();
                 clone = builder_.join(join.kind(), join.keys(), std::move(pred_clone),
                                       join.suffix(), join.null_match(), join.expect(), join.take());
                 break;
             }
             case ir::NodeKind::Melt: {
-                const auto& mn = static_cast<const ir::MeltNode&>(node);
+                const auto& mn = ir::node_cast<ir::MeltNode>(node);
                 clone = builder_.melt(mn.id_columns(), mn.measure_columns());
                 break;
             }
             case ir::NodeKind::Dcast: {
-                const auto& dn = static_cast<const ir::DcastNode&>(node);
+                const auto& dn = ir::node_cast<ir::DcastNode>(node);
                 clone = builder_.dcast(dn.pivot_column(), dn.value_column(), dn.row_keys());
                 break;
             }
@@ -4941,25 +4938,25 @@ class Lowerer {
                 break;
             }
             case ir::NodeKind::Model: {
-                const auto& mn = static_cast<const ir::ModelNode&>(node);
+                const auto& mn = ir::node_cast<ir::ModelNode>(node);
                 clone = builder_.model(mn.formula(), mn.method(),
                                        std::vector<ir::ModelParamSpec>(mn.params()));
                 break;
             }
             case ir::NodeKind::Construct: {
-                const auto& cn = static_cast<const ir::ConstructNode&>(node);
+                const auto& cn = ir::node_cast<ir::ConstructNode>(node);
                 clone = builder_.construct(clone_construct_columns(cn.columns()));
                 break;
             }
             case ir::NodeKind::Stream: {
-                const auto& stream = static_cast<const ir::StreamNode&>(node);
+                const auto& stream = ir::node_cast<ir::StreamNode>(node);
                 clone = builder_.stream(stream.source_callee(), stream.source_args(),
                                         stream.sink_callee(), stream.sink_args(),
                                         stream.stream_kind(), stream.bucket_duration());
                 break;
             }
             case ir::NodeKind::Program: {
-                const auto& prog = static_cast<const ir::ProgramNode&>(node);
+                const auto& prog = ir::node_cast<ir::ProgramNode>(node);
                 std::vector<ir::NodePtr> preamble;
                 preamble.reserve(prog.preamble().size());
                 for (const auto& preamble_node : prog.preamble()) {
@@ -4969,17 +4966,17 @@ class Lowerer {
                 break;
             }
             case ir::NodeKind::FilterHead: {
-                const auto& fh = static_cast<const ir::FilterHeadNode&>(node);
+                const auto& fh = ir::node_cast<ir::FilterHeadNode>(node);
                 clone = builder_.filter_head(fh.predicate(), fh.count());
                 break;
             }
             case ir::NodeKind::FilterTail: {
-                const auto& ft = static_cast<const ir::FilterTailNode&>(node);
+                const auto& ft = ir::node_cast<ir::FilterTailNode>(node);
                 clone = builder_.filter_tail(ft.predicate(), ft.count());
                 break;
             }
             case ir::NodeKind::TopK: {
-                const auto& topk = static_cast<const ir::TopKNode&>(node);
+                const auto& topk = ir::node_cast<ir::TopKNode>(node);
                 clone =
                     builder_.top_k(topk.keys(), topk.count(), topk.group_by(), topk.keep_mode());
                 break;
@@ -4998,7 +4995,6 @@ class Lowerer {
         }
         return clone;
     }
-    // NOLINTEND cppcoreguidelines-pro-type-static-cast-downcast
 
     /// Recursively walk an IR tree and return true if any node has the given kind.
     static auto contains_node_kind(const ir::Node& node, ir::NodeKind target) -> bool {
@@ -5013,8 +5009,7 @@ class Lowerer {
     /// Walk an IR tree and return the Duration of the first ResampleNode found.
     static auto find_resample_duration(const ir::Node& node) -> std::optional<ir::Duration> {
         if (node.kind() == ir::NodeKind::Resample) {
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-            return static_cast<const ir::ResampleNode&>(node).duration();
+            return ir::node_cast<ir::ResampleNode>(node).duration();
         }
         for (const auto& child : node.children()) {
             if (auto dur = find_resample_duration(*child)) {

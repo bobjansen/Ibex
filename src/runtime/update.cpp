@@ -41,8 +41,6 @@
 #include <variant>
 #include <vector>
 
-#include "kernel_filter.hpp"
-#include "kernel_gather.hpp"
 #include "kernel_update.hpp"
 #include "zorro.hpp"
 
@@ -1397,12 +1395,15 @@ auto simd_transcendental_supported(std::string_view name) -> bool {
 
 }  // namespace
 #else
+namespace {
+
 auto simd_transcendental(std::string_view, const double*, double*, std::size_t) -> bool {
     return false;
 }
 auto simd_transcendental_supported(std::string_view) -> bool {
     return false;
 }
+}  // namespace
 #endif
 
 // Packed IEEE sqrt over a column: vsqrtpd on AVX2 chunks + a scalar tail.
@@ -1428,11 +1429,14 @@ void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
 
 }  // namespace
 #else
+namespace {
+
 void simd_sqrt(const double* src, double* dst, std::size_t n) noexcept {
     for (std::size_t i = 0; i < n; ++i) {
         dst[i] = std::sqrt(src[i]);
     }
 }
+}  // namespace
 #endif
 
 // Forward declaration: try_fast_update_unary materialises a computed log/exp
@@ -1610,6 +1614,8 @@ auto try_fast_update_numeric_expr(const ir::Expr& expr, const Table& input, RowR
     return eval_numeric_update_blocks(nodes, *root, rows, output_kind);
 }
 
+namespace {
+
 /// The parallel field splitter owns a full destination column before it starts
 /// its morsels.  Compile the same range-native numeric tree used by the serial
 /// evaluator, but let its root write straight into this morsel's disjoint
@@ -1636,8 +1642,6 @@ auto try_write_compiled_numeric_update_expr(const ir::Expr& expr, const Table& i
     return true;
 }
 
-namespace {
-
 // Append a computed field column, carrying its validity bitmap when present.
 auto add_computed_column(Table& table, const std::string& alias, ComputedColumn col) -> void {
     if (col.validity.has_value()) {
@@ -1648,6 +1652,8 @@ auto add_computed_column(Table& table, const std::string& alias, ComputedColumn 
 }
 
 }  // namespace
+
+namespace {
 
 // Like update_table but passes the window clause's duration to the shared
 // field evaluator, so rolling aggregates without a per-call window use it.
@@ -1695,6 +1701,8 @@ auto check_row_order(const Table& input, const std::vector<ir::FieldSpec>& field
     }
     return {};
 }
+
+}  // namespace
 
 auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                            ir::Duration duration, const ScalarRegistry* scalars,
@@ -1755,6 +1763,8 @@ auto windowed_update_table(Table input, const std::vector<ir::FieldSpec>& fields
     normalize_time_index(output);
     return output;
 }
+
+namespace {
 
 /// Clear one bit of a shared validity bitmap.
 ///
@@ -1902,6 +1912,10 @@ inline void clear_validity_bit(std::uint64_t* words, std::size_t bit) noexcept {
 /// overwrite them immediately is what made the previous attempt at threading
 /// this slower than the serial loop it replaced.
 struct GroupedRows {
+    // Runtime-sized, deliberately uninitialised, filled by a parallel index
+    // scatter -- see the struct comment for why a resize-then-overwrite vector
+    // regressed this. `unique_ptr<T[]>` is the idiom for exactly that.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     std::unique_ptr<std::size_t[]> flat;
     std::vector<std::size_t> offsets;  // group_count + 1 entries
 
@@ -2218,6 +2232,9 @@ struct GroupedRows {
 /// owns the CSR inverse mapping used by every later group-local reader and
 /// scatter.
 struct GroupedRowPlan {
+    // One uninitialised id per absolute input row, written once by
+    // `assign_group_ids`; `unique_ptr<T[]>` avoids the value-init a vector forces.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     std::unique_ptr<std::uint32_t[]> row_gid_storage;
     GroupedRows rows;
 
@@ -2244,6 +2261,8 @@ auto make_grouped_row_plan(const Table& input, const std::vector<ir::ColumnRef>&
     }
     const std::size_t row_count = input.rows();
     GroupedRowPlan plan;
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays) -- uninit owning
+    // buffer
     plan.row_gid_storage = std::make_unique_for_overwrite<std::uint32_t[]>(row_count);
     const auto validity = collect_key_validity(input, group_by);
     const std::size_t group_count =
@@ -2404,7 +2423,7 @@ auto compute_grouped_reduction_broadcast(const NativeGroupedReductionField& item
                 if (validity != nullptr && !(*validity)[row]) {
                     continue;
                 }
-                const Result next = static_cast<Result>(source[row]);
+                const auto next = static_cast<Result>(source[row]);
                 if (item.reduction == NativeGroupedReduction::MinInt ||
                     item.reduction == NativeGroupedReduction::MinDouble) {
                     value = count == 0 ? next : std::min(value, next);
@@ -2755,6 +2774,7 @@ auto lift_group_state(ir::Expr& expr, const Table& input, std::size_t& counter,
             if constexpr (std::is_same_v<NodeT, ir::ColumnRef> ||
                           std::is_same_v<NodeT, ir::Literal>) {
                 return true;
+                // NOLINTNEXTLINE(bugprone-branch-clone) -- distinct constexpr case, same verdict
             } else if constexpr (std::is_same_v<NodeT, ir::RankExpr>) {
                 return false;
             } else if constexpr (std::is_same_v<NodeT, ir::IsNullExpr>) {
@@ -2961,7 +2981,7 @@ auto broadcast_general_group_aggregates(const Table& staged,
     std::vector<std::size_t> position(group_count, 0);
     for (std::size_t i = 0; i < group_count; ++i) {
         const auto id = (*key_values)[i];
-        if (id < 0 || static_cast<std::size_t>(id) >= group_count) {
+        if (id < 0 || std::cmp_greater_equal(id, group_count)) {
             return std::optional<std::vector<ColumnEntry>>{};
         }
         position[static_cast<std::size_t>(id)] = i;
@@ -3238,23 +3258,32 @@ class TimeIndexTicks {
         if (!table.time_index().has_value()) {
             return std::nullopt;
         }
-        const auto* column = table.find(*table.time_index());
+        const std::string& index_name = *table.time_index();
+        const auto* column = table.find(index_name);
         if (column == nullptr) {
             return std::nullopt;
         }
         TimeIndexTicks ticks;
+        ticks.name_ = index_name;
         if (const auto* ts = std::get_if<Column<Timestamp>>(column)) {
             static_assert(sizeof(Timestamp) == sizeof(std::int64_t));
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- Timestamp is {int64
+            // nanos}
             ticks.nanos_ = reinterpret_cast<const std::int64_t*>(ts->data());
             return ticks;
         }
         if (const auto* date = std::get_if<Column<Date>>(column)) {
             static_assert(sizeof(Date) == sizeof(std::int32_t));
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- Date is {int32 days}
             ticks.days_ = reinterpret_cast<const std::int32_t*>(date->data());
             return ticks;
         }
         return std::nullopt;
     }
+
+    /// The time-index column name this was built from. Always set on a live
+    /// instance -- `of()` returns `nullopt` before reaching here without one.
+    [[nodiscard]] auto name() const noexcept -> std::string_view { return name_; }
 
     [[nodiscard]] auto operator[](std::size_t row) const noexcept -> std::int64_t {
         return nanos_ != nullptr ? nanos_[row] : std::int64_t{days_[row]};
@@ -3279,6 +3308,7 @@ class TimeIndexTicks {
    private:
     const std::int64_t* nanos_ = nullptr;
     const std::int32_t* days_ = nullptr;
+    std::string_view name_;
 };
 
 /// Does the table's stated ordering already prove that each group's rows are
@@ -3363,6 +3393,7 @@ class TimeIndexTicks {
                     key.name + "=" +
                     (entry == nullptr ? std::string("?") : format_cell(*entry, indices[local]));
             }
+            // NOLINTBEGIN(performance-inefficient-string-concatenation) -- cold diagnostic path
             return std::unexpected(
                 "window + by: rows are not time-ascending within group (" + values + "): row " +
                 std::to_string(indices[local]) + " is earlier in time than row " +
@@ -3370,9 +3401,10 @@ class TimeIndexTicks {
                 ", which precedes it in this group — a duration window over them would read a "
                 "later row into an earlier row's window"
                 "\n  hint: `order { " +
-                keys + ", " + *input.time_index() +
+                keys + ", " + std::string(ticks->name()) +
                 " }` first. An upstream grouped `window`/`resample` leaves its rows group-major, "
                 "so they are time-ascending only within ITS keys, not within these.");
+            // NOLINTEND(performance-inefficient-string-concatenation)
         }
     }
     return {};
@@ -3495,7 +3527,9 @@ struct WindowTask {
         aligned && std::ranges::all_of(fields, [](const ir::FieldSpec& field) {
             return ir::is_bucket_local_window_expr(field.expr);
         });
-    if (bucket_local) {
+    // `bucket_local` implies an aligned time frame, so the time index is set;
+    // the `has_value()` here is what lets the deref below stay checked.
+    if (bucket_local && input.time_index().has_value()) {
         const auto* tcv = input.find(*input.time_index());
         std::vector<std::span<const std::size_t>> split;
         // Each piece holds at least `target` rows, so this bound is never exceeded.
@@ -3611,6 +3645,8 @@ struct WindowTask {
     return split;
 }
 
+}  // namespace
+
 /// Per-group windowed update: partition the input by `group_by`, run the
 /// regular `windowed_update_table` on each per-group slice, then scatter the
 /// new field columns back into a single full-sized output. The rolling
@@ -3660,6 +3696,8 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays) -- uninit owning
+    // buffer
     auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
     const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
     const std::size_t group_count =
@@ -4444,6 +4482,8 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
     return output;
 }
 
+namespace {
+
 struct GuardedWriteTarget {
     std::optional<std::size_t> existing;
 };
@@ -4462,8 +4502,8 @@ auto preserve_categorical_target(const ColumnEntry* target, std::shared_ptr<Colu
     const auto& strings = std::get<Column<std::string>>(*values);
     Column<Categorical> categorical;
     categorical.reserve(strings.size());
-    for (std::size_t row = 0; row < strings.size(); ++row) {
-        categorical.push_back(strings[row]);
+    for (auto string : strings) {
+        categorical.push_back(string);
     }
     return std::make_shared<ColumnValue>(std::move(categorical));
 }
@@ -4534,6 +4574,8 @@ auto write_guarded_update(Table& output, const std::string& alias, GuardedWriteT
                                        },
                                        RowTransform::Preserve));
 }
+
+}  // namespace
 
 /// Execute a guarded update `where <predicate> update { ... }`: rows matching
 /// the predicate get the field assignments; non-matching rows keep their values
@@ -5017,6 +5059,8 @@ auto apply_guarded_update(Table input, const ir::UpdateNode& update, const Scala
     return output;
 }
 
+namespace {
+
 /// A `by` clause is semantically inert for a wholly row-local update: every
 /// field reads only its own absolute row, and `update_table` already owns the
 /// direct ChunkView output protocols (numeric windows, predicates, strings,
@@ -5058,11 +5102,13 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     if (auto ordered = try_native_grouped_ordered_field(input, fields, group_rows, exec);
         !ordered) {
         return std::unexpected(ordered.error());
+        // NOLINTNEXTLINE(readability-else-after-return) // ordered is defined in the if
     } else if (ordered->has_value()) {
         return std::move(**ordered);
     }
     if (auto native = try_native_grouped_reductions(input, fields, group_rows, exec); !native) {
         return std::unexpected(native.error());
+        // NOLINTNEXTLINE(readability-else-after-return) // native is defined in the if
     } else if (native->has_value()) {
         return std::move(**native);
     }
@@ -5073,6 +5119,7 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
                                                             externs, exec);
             !lifted) {
             return std::unexpected(lifted.error());
+            // NOLINTNEXTLINE(readability-else-after-return) // lifted is defined in the if
         } else if (lifted->has_value()) {
             return std::move(**lifted);
         }
@@ -5430,6 +5477,8 @@ auto grouped_update_table_with_plan(Table input, const std::vector<ir::FieldSpec
     normalize_time_index(output);
     return output;
 }
+
+}  // namespace
 
 auto grouped_update_table(Table input, const std::vector<ir::FieldSpec>& fields,
                           const std::vector<ir::ColumnRef>& group_by, const ScalarRegistry* scalars,

@@ -48,7 +48,7 @@ void collect_join_edges(const Node& node, const SourceSchemas& sources,
                         std::vector<JoinEdge>& out) {
     if (node.kind() == NodeKind::Join && node.children().size() >= 2 &&
         node.children()[0] != nullptr && node.children()[1] != nullptr) {
-        const auto& join = static_cast<const JoinNode&>(node);
+        const auto& join = node_cast<JoinNode>(node);
         if (join.kind() == JoinKind::Inner || join.kind() == JoinKind::Left) {
             const ColumnOriginMap left = column_origins(*node.children()[0], sources);
             const ColumnOriginMap right = column_origins(*node.children()[1], sources);
@@ -141,7 +141,7 @@ auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>&
 }
 
 auto rewrite_aggregate(NodePtr node, const SourceSchemas& sources) -> NodePtr {
-    auto& agg = static_cast<AggregateNode&>(*node);
+    auto& agg = node_cast<AggregateNode>(*node);
     const auto& group_by = agg.group_by();
     if (group_by.size() < 2 || agg.children().empty() || agg.children().front() == nullptr) {
         return node;

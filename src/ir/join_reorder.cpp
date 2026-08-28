@@ -41,8 +41,7 @@ void max_id(const Node& node, std::uint64_t& value) {
         }
     }
     if (node.kind() == NodeKind::Program) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& program = static_cast<const ProgramNode&>(node);
+        const auto& program = node_cast<ProgramNode>(node);
         for (const auto& preamble : program.preamble()) {
             if (preamble != nullptr) {
                 max_id(*preamble, value);
@@ -64,8 +63,7 @@ auto scan_left_deep(const Node& node, std::vector<const Node*>& leaves, std::vec
         leaf_key_names.emplace_back();
         return true;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    const auto& join = static_cast<const JoinNode&>(node);
+    const auto& join = node_cast<JoinNode>(node);
     // `Edge::keys` are logical folded-output names. A mapped key that
     // `normalize_mapped_join_keys` could not safely fold keeps the order its
     // author wrote.
@@ -92,8 +90,7 @@ auto take_left_deep(NodePtr node, std::vector<NodePtr>& leaves, std::vector<Edge
         leaves.push_back(std::move(node));
         return true;
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    auto* join = static_cast<JoinNode*>(node.get());
+    auto* join = node_cast<JoinNode>(node.get());
     // Must stay in lockstep with `scan_left_deep` above, including its reason
     // for rejecting mapped keys.
     if (join->kind() != JoinKind::Inner || join->predicate().has_value() || join->keys().empty() ||
@@ -130,17 +127,15 @@ auto aggregate_order_insensitive(const AggregateNode& aggregate) -> bool {
 /// the order the join happens to emit. `is_row_local_update_expr` is the
 /// existing front door for that question. A grouped `update ... by {...}` is
 /// excluded for the same reason.
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-// guarded by the switch on node.kind() matching the target node type.
 auto is_row_wise(const Node& node) -> bool {
     switch (node.kind()) {
         case NodeKind::Project:
         case NodeKind::Rename:
             return true;  // pure column plumbing
         case NodeKind::Filter:
-            return is_row_local_update_expr(static_cast<const FilterNode&>(node).predicate());
+            return is_row_local_update_expr(node_cast<FilterNode>(node).predicate());
         case NodeKind::Update: {
-            const auto& update = static_cast<const UpdateNode&>(node);
+            const auto& update = node_cast<UpdateNode>(node);
             if (!update.group_by().empty() || !update.tuple_fields().empty()) {
                 return false;
             }
@@ -152,7 +147,6 @@ auto is_row_wise(const Node& node) -> bool {
             return false;
     }
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 /// The slot holding the aggregate's inner-join chain, which is only rarely the
 /// aggregate's immediate child: the aggregate block's own `select` lowers to a
@@ -338,8 +332,7 @@ auto walk(NodePtr node, const SourceStats& stats) -> NodePtr {
     }
     if (node->kind() == NodeKind::Aggregate && node->mutable_children().size() == 1 &&
         node->mutable_children()[0] != nullptr) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        const auto& aggregate = static_cast<const AggregateNode&>(*node);
+        const auto& aggregate = node_cast<AggregateNode>(*node);
         if (aggregate_order_insensitive(aggregate)) {
             if (NodePtr* chain = find_join_chain(node->mutable_children()[0])) {
                 NodePtr reordered = reorder_aggregate_child(std::move(*chain), stats);

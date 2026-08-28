@@ -891,7 +891,6 @@ auto finalize_schema(ArrowSchema* out, std::unique_ptr<SchemaExportState> state)
     out->private_data = state.release();
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 auto finalize_array(ArrowArray* out, std::unique_ptr<ArrayExportState> state, std::int64_t length,
                     std::int64_t null_count, std::int64_t offset = 0) -> void {
     out->length = length;
@@ -1211,7 +1210,7 @@ auto release_arrow_schema(ArrowSchema* schema) noexcept -> void {
                 child->release(child.get());
             }
         }
-        delete state;  // NOLINT(cppcoreguidelines-owning-memory)
+        delete state;
     }
     clear_schema(schema);
 }
@@ -1238,7 +1237,7 @@ auto release_arrow_array(ArrowArray* array) noexcept -> void {
                 child->release(child.get());
             }
         }
-        delete state;  // NOLINT(cppcoreguidelines-owning-memory)
+        delete state;
     }
     clear_array(array);
 }

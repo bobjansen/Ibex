@@ -37,8 +37,6 @@ auto count_conjuncts(const Expr& expr) -> int {
     return 1;
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-// guarded by the switch on node.kind() matching the target node type.
 auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSchemas& schemas,
               CardinalityOptions options) -> CardinalityEstimate {
     const auto child = [&](std::size_t index = 0) -> CardinalityEstimate {
@@ -49,7 +47,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
     };
     switch (node.kind()) {
         case NodeKind::Scan: {
-            const auto& scan = static_cast<const ScanNode&>(node);
+            const auto& scan = node_cast<ScanNode>(node);
             const auto found = sources.find(scan.source_name());
             if (found == sources.end()) {
                 return CardinalityEstimate{};
@@ -65,8 +63,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                     .heuristic = true};
         }
         case NodeKind::Program:
-            return estimate(static_cast<const ProgramNode&>(node).main_node(), sources, schemas,
-                            options);
+            return estimate(node_cast<ProgramNode>(node).main_node(), sources, schemas, options);
 
         // These operators retain row count exactly.
         case NodeKind::Project:
@@ -82,8 +79,8 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
             if (!input.rows.has_value()) {
                 return input;
             }
-            const auto selectivity = compound_selectivity(
-                static_cast<const FilterNode&>(node).predicate(), options.filter_selectivity);
+            const auto selectivity = compound_selectivity(node_cast<FilterNode>(node).predicate(),
+                                                          options.filter_selectivity);
             const auto selected = static_cast<std::size_t>(
                 std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
@@ -94,7 +91,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                 return input;
             }
             const auto selectivity = compound_selectivity(
-                static_cast<const FilterHeadNode&>(node).predicate(), options.filter_selectivity);
+                node_cast<FilterHeadNode>(node).predicate(), options.filter_selectivity);
             const auto selected = static_cast<std::size_t>(
                 std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
@@ -105,14 +102,14 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                 return input;
             }
             const auto selectivity = compound_selectivity(
-                static_cast<const FilterTailNode&>(node).predicate(), options.filter_selectivity);
+                node_cast<FilterTailNode>(node).predicate(), options.filter_selectivity);
             const auto selected = static_cast<std::size_t>(
                 std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
         }
         case NodeKind::Head: {
             auto input = child();
-            const auto& head = static_cast<const HeadNode&>(node);
+            const auto& head = node_cast<HeadNode>(node);
             if (!input.rows.has_value() || !head.count_literal().has_value()) {
                 return input;
             }
@@ -121,7 +118,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         }
         case NodeKind::Tail: {
             auto input = child();
-            const auto& tail = static_cast<const TailNode&>(node);
+            const auto& tail = node_cast<TailNode>(node);
             if (!input.rows.has_value() || !tail.count_literal().has_value()) {
                 return input;
             }
@@ -133,7 +130,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         // do not have, so a grouped aggregate goes unestimated. An UNgrouped
         // one collapses to a single row by construction, whatever it reads.
         case NodeKind::Aggregate:
-            if (!static_cast<const AggregateNode&>(node).group_by().empty()) {
+            if (!node_cast<AggregateNode>(node).group_by().empty()) {
                 return {};
             }
             return {.rows = 1};
@@ -150,7 +147,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         // the honest outcome -- a cost model that reorders on an invented
         // number regresses individual queries to improve an average.
         case NodeKind::Join: {
-            const auto& join = static_cast<const JoinNode&>(node);
+            const auto& join = node_cast<JoinNode>(node);
             switch (join.kind()) {
                 case JoinKind::Semi:
                 case JoinKind::Anti: {
@@ -228,7 +225,6 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
             return {};
     }
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 /// The column `alias` is computed from, when a field simply renames one --
 /// `select { o_orderkey = l_orderkey }`. Anything computed (`a * b`, a call) has
@@ -261,13 +257,11 @@ auto distinct_through(const Node& node, const std::string& column, const SourceS
     return distinct_below(*node.children().front(), column, stats);
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast) -- every cast below is
-// guarded by the switch on node.kind() matching the target node type.
 auto distinct_below(const Node& node, const std::string& column, const SourceStats& stats)
     -> std::optional<std::size_t> {
     switch (node.kind()) {
         case NodeKind::Scan: {
-            const auto& scan = static_cast<const ScanNode&>(node);
+            const auto& scan = node_cast<ScanNode>(node);
             // A real sample beats the footer: `stats.distinct` below is a
             // `min(rows, max-min+1)` span estimate, exact for a dense key but
             // far too high for a sparse or skip-patterned one (TPC-H's
@@ -314,11 +308,11 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
             return distinct_through(node, column, stats);
 
         case NodeKind::Update: {
-            const auto below = renamed_from(static_cast<const UpdateNode&>(node).fields(), column);
+            const auto below = renamed_from(node_cast<UpdateNode>(node).fields(), column);
             return below ? distinct_through(node, *below, stats) : std::nullopt;
         }
         case NodeKind::Rename: {
-            const ColumnNameMap names(static_cast<const RenameNode&>(node).renames());
+            const ColumnNameMap names(node_cast<RenameNode>(node).renames());
             const std::string below(names.input_name(column));
             return distinct_through(node, below, stats);
         }
@@ -328,7 +322,6 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
             return std::nullopt;
     }
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

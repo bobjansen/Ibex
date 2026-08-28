@@ -1164,7 +1164,6 @@ class Column<std::string> {
         offsets_.push_back(static_cast<std::uint32_t>(chars_.size()));
     }
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void reserve(size_type n, size_type chars_hint = 0) {
         detach_external();
         offsets_.reserve(n + 1);
@@ -1202,7 +1201,6 @@ class Column<std::string> {
         }
     };
 
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     [[nodiscard]] auto begin_bulk_append(size_type rows, size_type chars_upper_bound)
         -> BulkAppender {
         detach_external();
@@ -1277,7 +1275,6 @@ class Column<std::string> {
 #endif
 
     // Allocate output storage for a gather of n_rows rows with total_chars bytes.
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void resize_for_gather(size_type n_rows, size_type total_chars) {
         drop_external();
         offsets_.resize(n_rows + 1);

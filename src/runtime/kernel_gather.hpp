@@ -91,7 +91,6 @@ auto gather_selected(ColumnView<T> src, const Selection& selection, OutputSpan<T
 // compute_filter_selection.
 
 // values/mask mirror the _pext_u64(values, mask) intrinsic's own calling convention.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline auto pack_selected_bool_bits(std::uint64_t values, std::uint64_t mask) noexcept
     -> std::uint64_t {
 #ifdef __BMI2__
@@ -170,7 +169,6 @@ inline void or_bits_into_word(std::uint64_t* words, std::size_t index, std::uint
     }
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline auto append_packed_bool_bits(std::uint64_t packed, std::size_t count,
                                     std::uint64_t* dst_words, std::size_t& out_bit,
                                     SharedBitWords shared) noexcept -> void {

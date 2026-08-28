@@ -31,7 +31,6 @@
 // can briefly materialize very large outputs. Keep a short decay so warm
 // iterations can still reuse pages, but do not retain them indefinitely across
 // benchmark cases.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 extern "C" {
 const char* malloc_conf = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000";
 }

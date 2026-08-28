@@ -37,8 +37,7 @@ void collect_max_id(Node& n, std::uint64_t& m) {
         }
     }
     if (n.kind() == NodeKind::Program) {
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-        auto& prog = static_cast<ProgramNode&>(n);
+        auto& prog = node_cast<ProgramNode>(n);
         for (const auto& pre : prog.mutable_preamble()) {
             if (pre) {
                 collect_max_id(*pre, m);
@@ -65,7 +64,7 @@ auto field_names(const SchemaInfo& schema) -> std::vector<std::string> {
 }
 
 auto contains(const std::vector<std::string>& names, const std::string& name) -> bool {
-    return std::find(names.begin(), names.end(), name) != names.end();
+    return std::ranges::find(names, name) != names.end();
 }
 
 auto field_views(const SchemaInfo& schema) -> std::vector<std::string_view> {
@@ -107,12 +106,9 @@ auto dropped_side_is_unread(const ColumnDemand& demand, const std::vector<std::s
     if (demand.all) {
         return false;
     }
-    for (const auto& name : demand.names) {
-        if (contains(dropped, name) && !contains(kept, name)) {
-            return false;
-        }
-    }
-    return true;
+    return std::ranges::none_of(demand.names, [&dropped, &kept](const auto& name) {
+        return contains(dropped, name) && !contains(kept, name);
+    });
 }
 
 /// The join shapes whose pair count and column set this pass can reason about.
@@ -208,8 +204,8 @@ auto expression_reads_right_output(const Expr& expr, const std::vector<JoinOutpu
 auto rewrite_left_null_filter_to_anti(NodePtr node, const SourceSchemas& sources,
                                       const std::map<const Node*, ColumnDemand>& filter_demand)
     -> NodePtr {
-    auto& filter = static_cast<FilterNode&>(*node);
-    auto& join = static_cast<JoinNode&>(*node->mutable_children().front());
+    auto& filter = node_cast<FilterNode>(*node);
+    auto& join = node_cast<JoinNode>(*node->mutable_children().front());
     if (!default_existence_join(join)) {
         return node;
     }
@@ -283,13 +279,10 @@ auto make_semi(NodePtr kept, NodePtr dropped, std::vector<JoinKey> keys, std::ui
     return semi;
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
-// Node kind is checked immediately before every downcast below.
-
 auto rewrite_join(NodePtr node, const SourceSchemas& sources,
                   const std::map<const Node*, ColumnDemand>& demand, std::uint64_t& next)
     -> NodePtr {
-    const auto& join = static_cast<const JoinNode&>(*node);
+    const auto& join = node_cast<JoinNode>(*node);
     if (!reducible_shape(join)) {
         return node;
     }
@@ -335,7 +328,7 @@ auto walk(NodePtr node, const SourceSchemas& sources,
         child = walk(std::move(child), sources, demand, filter_demand, next);
     }
     if (node->kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(*node);
+        auto& prog = node_cast<ProgramNode>(*node);
         if (prog.mutable_main_node()) {
             prog.mutable_main_node() =
                 walk(std::move(prog.mutable_main_node()), sources, demand, filter_demand, next);
@@ -351,14 +344,12 @@ auto walk(NodePtr node, const SourceSchemas& sources,
     if (node->kind() == NodeKind::Join) {
         NodePtr rewritten = rewrite_join(std::move(node), sources, demand, next);
         if (rewritten->kind() == NodeKind::Join) {
-            drop_redundant_right_distinct(static_cast<JoinNode&>(*rewritten));
+            drop_redundant_right_distinct(node_cast<JoinNode>(*rewritten));
         }
         return rewritten;
     }
     return node;
 }
-
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

@@ -625,14 +625,6 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     }
                     break;
                 case ir::AggFunc::First:
-                    if (slot.kind == ExprType::Int) {
-                        append_scalar(*column, slot.int_value);
-                    } else if (slot.kind == ExprType::Double) {
-                        append_scalar(*column, slot.double_value);
-                    } else {
-                        append_scalar(*column, slot.text_value);
-                    }
-                    break;
                 case ir::AggFunc::Last:
                     if (slot.kind == ExprType::Int) {
                         append_scalar(*column, slot.int_value);

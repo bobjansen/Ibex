@@ -34,7 +34,6 @@ auto fresh_id() -> NodeId {
     return NodeId{next_id_counter()++};
 }
 
-// NOLINTBEGIN(cppcoreguidelines-pro-type-static-cast-downcast)
 // Node kind is checked immediately before every downcast below.
 
 void collect_max_id(Node& n, std::uint64_t& m) {
@@ -45,7 +44,7 @@ void collect_max_id(Node& n, std::uint64_t& m) {
         }
     }
     if (n.kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(n);
+        auto& prog = node_cast<ProgramNode>(n);
         for (const auto& p : prog.mutable_preamble()) {
             if (p) {
                 collect_max_id(*p, m);
@@ -150,8 +149,8 @@ auto remap_folded_key_refs_to_right(Expr expr, const std::vector<JoinKey>& keys)
 /// Rewrite one `Filter(pred, Join(a, b))` root. Children are assumed already
 /// processed. Returns the (possibly unchanged) root.
 auto rewrite_filter_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
-    auto& filter = static_cast<FilterNode&>(*node);
-    auto& join = static_cast<JoinNode&>(*node->mutable_children().front());
+    auto& filter = node_cast<FilterNode>(*node);
+    auto& join = node_cast<JoinNode>(*node->mutable_children().front());
     const JoinKind kind = join.kind();
     if (kind != JoinKind::Inner && kind != JoinKind::Left && kind != JoinKind::Right &&
         kind != JoinKind::Semi && kind != JoinKind::Anti) {
@@ -256,7 +255,7 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
         child = walk(std::move(child), sources);
     }
     if (node->kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(*node);
+        auto& prog = node_cast<ProgramNode>(*node);
         if (prog.mutable_main_node()) {
             prog.mutable_main_node() = walk(std::move(prog.mutable_main_node()), sources);
         }
@@ -282,7 +281,7 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 /// join then materialises far fewer rows: PDS-H q18 joins all 6M line items and
 /// keeps 57 orders, versus filtering to 57 orders and joining a few hundred.
 auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodePtr {
-    auto& outer = static_cast<JoinNode&>(*node);
+    auto& outer = node_cast<JoinNode>(*node);
     // Same-named keys: the push moves the semi join onto X or Y, and the key
     // names it carries have to mean the same column there. Mapped keys that
     // could be folded already were, by `normalize_mapped_join_keys`; one still
@@ -296,7 +295,7 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
         outer.children()[1] == nullptr || outer.children()[0]->kind() != NodeKind::Join) {
         return node;
     }
-    auto& inner = static_cast<JoinNode&>(*outer.mutable_children()[0]);
+    auto& inner = node_cast<JoinNode>(*outer.mutable_children()[0]);
     // Only an equi Inner join is safe to push through: Left/Right/Outer decide
     // which left rows survive, which the semi/anti filter would then race.
     if (inner.kind() != JoinKind::Inner || inner.predicate().has_value() ||
@@ -335,7 +334,7 @@ auto rewrite_semi_over_join(NodePtr node, const SourceSchemas& sources) -> NodeP
     NodePtr inner_owned = std::move(outer.mutable_children()[0]);
     NodePtr z = std::move(outer.mutable_children()[1]);
     outer.mutable_children().clear();
-    auto& inner_ref = static_cast<JoinNode&>(*inner_owned);
+    auto& inner_ref = node_cast<JoinNode>(*inner_owned);
     NodePtr x = std::move(inner_ref.mutable_children()[0]);
     NodePtr y = std::move(inner_ref.mutable_children()[1]);
     inner_ref.mutable_children().clear();
@@ -372,7 +371,7 @@ auto semi_walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
         child = semi_walk(std::move(child), sources);
     }
     if (node->kind() == NodeKind::Program) {
-        auto& prog = static_cast<ProgramNode&>(*node);
+        auto& prog = node_cast<ProgramNode>(*node);
         if (prog.mutable_main_node()) {
             prog.mutable_main_node() = semi_walk(std::move(prog.mutable_main_node()), sources);
         }
@@ -385,7 +384,6 @@ auto semi_walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     }
     return node;
 }
-// NOLINTEND(cppcoreguidelines-pro-type-static-cast-downcast)
 
 }  // namespace
 

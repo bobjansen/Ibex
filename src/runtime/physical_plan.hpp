@@ -25,8 +25,7 @@ namespace ibex::runtime::physical {
 ///
 /// Scope (deliberately tiny, per the plan's "first vocabulary"):
 /// a `MapPipeline` is a non-empty top-down chain of row-local map nodes
-/// (Filter, Project, Rename, row-local Update, and the fused FilterProject /
-/// FilterUpdateProject forms canonicalize produces) over a source. A source is
+/// (Filter, Project, Rename, and row-local Update) over a source. A source is
 /// a Scan, a chunked extern call, or the materialized output of a subtree that
 /// keeps the existing executor — a pipeline breaker feeding this pipeline.
 /// Everything else is a `MaterializedCall` placeholder naming the logical

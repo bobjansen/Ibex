@@ -156,10 +156,6 @@ thread_local std::uint64_t t_pool_park_ns = 0;
             return "rbind";
         case Model:
             return "model";
-        case FilterProject:
-            return "filter_project";
-        case FilterUpdateProject:
-            return "filter_update_project";
         case FilterHead:
             return "filter_head";
         case FilterTail:

@@ -65,10 +65,15 @@ struct MapStep {
     /// Further IR nodes this step executes in the same pass, fused by the
     /// planner rather than by canonicalize. Both null for an unfused step,
     /// including one whose node is already a fused IR kind. The shapes are
-    /// `Project(Filter(x))` and `Project(Update(Filter(x)))` — the same two
-    /// canonicalize R5 and R6 rewrite, expressed physically.
+    /// `Project(Filter(x))` and `Project(Update(Filter(x)))`, expressed
+    /// physically.
     const ir::Node* fused_update = nullptr;
     const ir::Node* fused_project = nullptr;
+    /// Normalized operands for a physically fused gather kernel. Physical
+    /// lowering fills these from the ordinary Filter / Update / Project chain.
+    const ir::Expr* filter_predicate = nullptr;
+    const std::vector<ir::FieldSpec>* update_fields = nullptr;
+    const std::vector<ir::ColumnRef>* project_columns = nullptr;
     MapKernelCapability capability = MapKernelCapability::FilterGather;
     MapKernelFactory factory = nullptr;
 

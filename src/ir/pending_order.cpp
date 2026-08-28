@@ -37,7 +37,6 @@ auto join_below(Node& node) -> JoinNode* {
         case NodeKind::Head:
         case NodeKind::Tail:
         case NodeKind::Ascribe:
-        case NodeKind::FilterProject:
         case NodeKind::FilterHead:
         case NodeKind::FilterTail:
             break;

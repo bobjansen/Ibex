@@ -279,13 +279,11 @@ class EffectAnalyzer {
                     for (const auto& named : node.named_args) {
                         collect_expr_effects(*named.value, direct, deps);
                     }
-                } else if constexpr (std::is_same_v<T, UnaryExpr>) {
+                } else if constexpr (std::is_same_v<T, UnaryExpr> || std::is_same_v<T, GroupExpr>) {
                     collect_expr_effects(*node.expr, direct, deps);
                 } else if constexpr (std::is_same_v<T, BinaryExpr>) {
                     collect_expr_effects(*node.left, direct, deps);
                     collect_expr_effects(*node.right, direct, deps);
-                } else if constexpr (std::is_same_v<T, GroupExpr>) {
-                    collect_expr_effects(*node.expr, direct, deps);
                 } else if constexpr (std::is_same_v<T, BlockExpr>) {
                     if (node.base) {
                         collect_expr_effects(*node.base, direct, deps);
@@ -372,7 +370,7 @@ class EffectAnalyzer {
         }
     }
 
-    auto verify_annotations() const -> std::optional<ParseError> {
+    [[nodiscard]] auto verify_annotations() const -> std::optional<ParseError> {
         for (const auto& [name, fn] : user_functions_) {
             (void)name;
             if (!fn->effects.has_value()) {
@@ -394,7 +392,7 @@ class EffectAnalyzer {
         return std::nullopt;
     }
 
-    auto build_analysis() const -> EffectAnalysis {
+    [[nodiscard]] auto build_analysis() const -> EffectAnalysis {
         EffectAnalysis analysis;
         analysis.externs = externs_;
         analysis.builtins = builtin_summaries();
@@ -412,7 +410,8 @@ class EffectAnalyzer {
         return analysis;
     }
 
-    const Program& program_;
+    // Program is a ref everywhere in the code
+    const Program& program_;  // NOLINT(cppcoreguidelines-avoid-const-or-ref-data-members)
     robin_hood::unordered_map<std::string, const FunctionDecl*> user_functions_;
     robin_hood::unordered_map<std::string, CallableSummary> externs_;
     robin_hood::unordered_map<std::string, EffectSummary> direct_effects_;

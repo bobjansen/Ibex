@@ -3400,7 +3400,7 @@ class Lowerer {
         if (const auto* case_expr = std::get_if<CaseExpr>(&expr.node)) {
             ir::CallExpr lowered;
             lowered.callee = "__case";
-            lowered.args.reserve(case_expr->arms.size() * 2 + 1);
+            lowered.args.reserve((case_expr->arms.size() * 2) + 1);
             for (const auto& arm : case_expr->arms) {
                 auto condition = lower_expr_to_ir(*arm.condition);
                 if (!condition.has_value()) {

@@ -211,16 +211,16 @@ class Parser {
                     return std::nullopt;
                 }
                 if (std::holds_alternative<TupleLetStmt>(*stmt)) {
-                    body.push_back(std::get<TupleLetStmt>(std::move(*stmt)));
+                    body.emplace_back(std::get<TupleLetStmt>(std::move(*stmt)));
                 } else {
-                    body.push_back(std::get<LetStmt>(std::move(*stmt)));
+                    body.emplace_back(std::get<LetStmt>(std::move(*stmt)));
                 }
             } else {
                 auto stmt = parse_expr_stmt();
                 if (!stmt.has_value()) {
                     return std::nullopt;
                 }
-                body.push_back(std::get<ExprStmt>(std::move(*stmt)));
+                body.emplace_back(std::get<ExprStmt>(std::move(*stmt)));
             }
         }
         if (!consume(TokenKind::RBrace, "expected '}' after function body")) {
@@ -1717,7 +1717,7 @@ class Parser {
         return std::nullopt;
     }
 
-    auto starts_implicit_select_clause() const -> bool {
+    [[nodiscard]] auto starts_implicit_select_clause() const -> bool {
         return check(TokenKind::Identifier) || check(TokenKind::QuotedIdentifier) ||
                check(TokenKind::LBrace);
     }
@@ -2370,7 +2370,7 @@ class Parser {
         return std::nullopt;
     }
 
-    auto check(TokenKind kind) const -> bool {
+    [[nodiscard]] auto check(TokenKind kind) const -> bool {
         if (is_at_end()) {
             return kind == TokenKind::Eof;
         }
@@ -2402,18 +2402,18 @@ class Parser {
         return previous();
     }
 
-    auto is_at_end() const -> bool { return peek().kind == TokenKind::Eof; }
+    [[nodiscard]] auto is_at_end() const -> bool { return peek().kind == TokenKind::Eof; }
 
-    auto peek() const -> const Token& { return tokens_[current_]; }
+    [[nodiscard]] auto peek() const -> const Token& { return tokens_[current_]; }
 
-    auto peek_next() const -> const Token& {
+    [[nodiscard]] auto peek_next() const -> const Token& {
         if (current_ + 1 < tokens_.size()) {
             return tokens_[current_ + 1];
         }
         return tokens_.back();  // EOF token
     }
 
-    auto previous() const -> const Token& { return tokens_[current_ - 1]; }
+    [[nodiscard]] auto previous() const -> const Token& { return tokens_[current_ - 1]; }
 
     static auto make_error(const Token& token, std::string_view message) -> ParseError {
         return ParseError{
@@ -2526,9 +2526,7 @@ class Parser {
 
     // True if a backtick-string body uses `${...}` interpolation (vs. being a
     // plain quoted column identifier like `Sepal.Length`).
-    static auto is_interpolated(std::string_view content) -> bool {
-        return content.find("${") != std::string_view::npos;
-    }
+    static auto is_interpolated(std::string_view content) -> bool { return content.contains("${"); }
 
     // Parse one embedded `${...}` expression (the text between the braces) by
     // re-lexing and parsing it as a standalone expression.
@@ -2709,8 +2707,8 @@ class Parser {
         constexpr std::int64_t kNanosPerDay = 86'400 * kNanosPerSecond;
         const auto day_count = static_cast<std::int64_t>(day_point.time_since_epoch().count());
         const auto time_of_day_nanos =
-            ((static_cast<std::int64_t>(*hour) * 3600 + static_cast<std::int64_t>(*minute) * 60 +
-              static_cast<std::int64_t>(*second)) *
+            (((static_cast<std::int64_t>(*hour) * 3600) +
+              (static_cast<std::int64_t>(*minute) * 60) + static_cast<std::int64_t>(*second)) *
              kNanosPerSecond) +
             nanos;
 

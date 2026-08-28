@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -37,6 +38,7 @@
 #include <deque>
 #include <exception>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -44,6 +46,7 @@
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
+#include <ratio>
 #include <robin_hood.h>
 #include <span>
 #include <string>
@@ -4546,8 +4549,8 @@ auto build_join_pair_index(const Column<std::int64_t>& col0, const Column<std::i
     fill_partitioned_heads(
         index.pair_heads, n,
         [d0, d1](std::size_t r) {
-            return JoinHashIndex::PairKey{static_cast<std::uint64_t>(d0[r]),
-                                          static_cast<std::uint64_t>(d1[r])};
+            return JoinHashIndex::PairKey{.a = static_cast<std::uint64_t>(d0[r]),
+                                          .b = static_cast<std::uint64_t>(d1[r])};
         },
         [v0, v1](std::size_t r) {
             return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
@@ -5268,8 +5271,8 @@ struct JoinProbe {
             return (v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r]);
         };
         const auto get_key = [&](std::size_t r) {
-            return JoinHashIndex::PairKey{static_cast<std::uint64_t>(d0[r]),
-                                          static_cast<std::uint64_t>(d1[r])};
+            return JoinHashIndex::PairKey{.a = static_cast<std::uint64_t>(d0[r]),
+                                          .b = static_cast<std::uint64_t>(d1[r])};
         };
         const bool li_identity = probe_pair(n, is_null, get_key, li, ri);
 
@@ -5492,8 +5495,8 @@ struct JoinProbe {
             if ((v0 != nullptr && !(*v0)[r]) || (v1 != nullptr && !(*v1)[r])) {
                 return kNil;
             }
-            JoinHashIndex::PairKey key{static_cast<std::uint64_t>(d0[r]),
-                                       static_cast<std::uint64_t>(d1[r])};
+            JoinHashIndex::PairKey key{.a = static_cast<std::uint64_t>(d0[r]),
+                                       .b = static_cast<std::uint64_t>(d1[r])};
             return index().pair_heads.find_head(key);
         };
 

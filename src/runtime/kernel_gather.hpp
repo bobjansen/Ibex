@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <ibex/core/column.hpp>
+#include <ibex/runtime/interpreter.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <variant>

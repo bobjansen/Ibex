@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <mutex>

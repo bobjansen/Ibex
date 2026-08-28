@@ -7,6 +7,7 @@
 // Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/worker_pool.hpp>
@@ -30,8 +31,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/core/time.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>

@@ -4,7 +4,9 @@
 #pragma once
 
 #include <ibex/core/column.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <concepts>
 #include <cstddef>

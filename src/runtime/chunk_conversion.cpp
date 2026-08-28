@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
+
+#include <cstddef>
+#include <utility>
+
 #include "chunk_conversion_internal.hpp"
 
 namespace ibex::runtime {

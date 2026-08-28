@@ -4,6 +4,7 @@
 #include <ibex/runtime/env.hpp>
 
 #include <cstdlib>
+#include <stdlib.h>
 #include <string>
 
 namespace ibex::runtime {

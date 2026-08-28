@@ -3,11 +3,14 @@
 
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>
+#include <ibex/ir/node.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 

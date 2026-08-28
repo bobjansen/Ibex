@@ -3,9 +3,24 @@
 
 #include "kernel_filter.hpp"
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
+#include <ibex/runtime/table_properties.hpp>
+
+#include <algorithm>
 #include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <ranges>
+#include <string>
 #include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"

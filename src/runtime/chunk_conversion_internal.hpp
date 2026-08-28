@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
 namespace ibex::runtime {

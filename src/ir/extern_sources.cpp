@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/extern_sources.hpp>
+#include <ibex/ir/node.hpp>
 
 #include <cstdint>
 #include <map>
@@ -13,8 +14,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

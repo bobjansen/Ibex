@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/join_output.hpp>
+#include <ibex/ir/node.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -14,8 +15,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

@@ -14,6 +14,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
+#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -40,7 +41,6 @@
 #include <variant>
 #include <vector>
 
-#include "ibex/runtime/table_properties.hpp"
 #include "kernel_filter.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_update.hpp"
@@ -694,7 +694,7 @@ auto try_splice_column_leaf(const ir::Expr& expr, const Table& input, const Scal
     if (kernel == nullptr) {
         return std::nullopt;
     }
-    ColumnEvalCtx const ctx{.scalars = scalars, .externs = nullptr, .window = std::nullopt};
+    const ColumnEvalCtx ctx{.scalars = scalars, .externs = nullptr, .window = std::nullopt};
     auto col = kernel(*kernel_call, input, input.rows(), ctx);
     if (!col.has_value()) {
         return std::nullopt;
@@ -4383,7 +4383,7 @@ auto update_table(Table input, const std::vector<ir::FieldSpec>& fields,
             }
         }
     }
-    std::size_t const rows = output.rows();
+    const std::size_t rows = output.rows();
     for (const auto& field : fields) {
         if (const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node)) {
             auto res = evaluate_rank_column(output, *rank, {}, exec);

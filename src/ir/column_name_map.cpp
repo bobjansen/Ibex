@@ -2,11 +2,18 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/column_name_map.hpp>
+#include <ibex/ir/node.hpp>
 
 #include <algorithm>
+#include <expected>
 #include <robin_hood.h>
+#include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace ibex::ir {
 
@@ -46,7 +53,7 @@ auto ColumnNameMap::validate_input(std::span<const std::string_view> input_names
     if (auto valid = validate(); !valid.has_value()) {
         return valid;
     }
-    robin_hood::unordered_set<std::string_view> input(input_names.begin(), input_names.end());
+    const robin_hood::unordered_set<std::string_view> input(input_names.begin(), input_names.end());
     robin_hood::unordered_set<std::string_view> moving_sources;
     moving_sources.reserve(renames_.size());
     for (const auto& spec : renames_) {

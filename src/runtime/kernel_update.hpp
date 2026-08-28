@@ -3,21 +3,27 @@
 
 #pragma once
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "interpreter_internal.hpp"
 #include "kernel_gather.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime {
 class PredicateInput;

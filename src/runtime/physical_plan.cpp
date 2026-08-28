@@ -5,13 +5,17 @@
 
 #include <ibex/format.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/schema.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <string_view>

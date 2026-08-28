@@ -13,6 +13,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/safe_arith.hpp>
+#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
@@ -40,8 +41,8 @@
 #include <variant>
 #include <vector>
 
-#include "ibex/runtime/table_properties.hpp"
 #include "kernel_gather.hpp"
+#include "kernel_types.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>

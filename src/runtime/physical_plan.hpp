@@ -8,6 +8,7 @@
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>

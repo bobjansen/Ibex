@@ -3,6 +3,8 @@
 
 #include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/column_name_map.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -13,9 +15,6 @@
 #include <string>
 #include <variant>
 #include <vector>
-
-#include "ibex/ir/node.hpp"
-#include "ibex/ir/schema.hpp"
 
 namespace ibex::ir {
 namespace {
@@ -350,7 +349,7 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
         }
         case NodeKind::Rename: {
             const ColumnNameMap names(static_cast<const RenameNode&>(node).renames());
-            std::string below(names.input_name(column));
+            const std::string below(names.input_name(column));
             return distinct_through(node, below, stats);
         }
         default:

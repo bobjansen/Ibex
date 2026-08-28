@@ -4,7 +4,11 @@
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/join_output.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>

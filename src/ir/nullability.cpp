@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/join_output.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/nullability.hpp>
 #include <ibex/ir/schema.hpp>
 
@@ -11,9 +13,6 @@
 #include <string>
 #include <variant>
 #include <vector>
-
-#include "ibex/ir/join_output.hpp"
-#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 namespace {

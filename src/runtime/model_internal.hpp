@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 

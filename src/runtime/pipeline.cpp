@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
+#include <algorithm>
 #include <array>
+#include <optional>
+#include <string>
 #include <type_traits>
+#include <variant>
 
 namespace ibex::runtime {
 
@@ -18,11 +24,13 @@ auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKe
     // The unconditional members of the closed family.  This is consulted once
     // at pipeline construction and copied into physical::Plan, never per row.
     static constexpr std::array kTable{
-        Entry{ir::NodeKind::Filter, MapKernelCapability::FilterGather},
-        Entry{ir::NodeKind::Project, MapKernelCapability::MetadataMap},
-        Entry{ir::NodeKind::Rename, MapKernelCapability::MetadataMap},
-        Entry{ir::NodeKind::FilterProject, MapKernelCapability::FilterProjectGather},
-        Entry{ir::NodeKind::FilterUpdateProject, MapKernelCapability::FilterUpdateProjectGather},
+        Entry{.kind = ir::NodeKind::Filter, .capability = MapKernelCapability::FilterGather},
+        Entry{.kind = ir::NodeKind::Project, .capability = MapKernelCapability::MetadataMap},
+        Entry{.kind = ir::NodeKind::Rename, .capability = MapKernelCapability::MetadataMap},
+        Entry{.kind = ir::NodeKind::FilterProject,
+              .capability = MapKernelCapability::FilterProjectGather},
+        Entry{.kind = ir::NodeKind::FilterUpdateProject,
+              .capability = MapKernelCapability::FilterUpdateProjectGather},
     };
     for (const auto& entry : kTable) {
         if (entry.kind == node.kind()) {

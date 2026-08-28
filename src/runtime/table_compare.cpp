@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_compare.hpp>
 
 #include <cmath>
@@ -12,10 +15,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/core/column.hpp"
-#include "ibex/ir/node.hpp"
-#include "ibex/runtime/interpreter.hpp"
 
 namespace ibex::runtime {
 

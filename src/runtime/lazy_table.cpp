@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/lazy_table.hpp>
+#include <ibex/runtime/like.hpp>
+#include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -20,9 +25,6 @@
 #include <vector>
 
 #include "execution_profile_internal.hpp"
-#include "ibex/core/column.hpp"
-#include "ibex/ir/node.hpp"
-#include "ibex/runtime/interpreter.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -57,7 +59,7 @@ auto LazyTable::decode_columns(const std::vector<std::string>& names, const Sele
             ? nullptr
             : exec.execution_profile->stage(selection == nullptr ? "source decode whole"
                                                                  : "source decode selected");
-    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+    const ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {
@@ -93,7 +95,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
                               : exec.execution_profile->stage("source dynamic key scan");
-    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+    const ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
     if (reader_factory_) {
         auto reader = acquire_reader();
         if (!reader) {
@@ -110,7 +112,7 @@ auto LazyTable::scan_key_filter(const std::string& key, const DynamicScanFilter&
 
 auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::string> {
     {
-        std::lock_guard const lock(reader_pool_->mutex);
+        const std::lock_guard lock(reader_pool_->mutex);
         if (!reader_pool_->available.empty()) {
             auto reader = std::move(reader_pool_->available.back());
             reader_pool_->available.pop_back();
@@ -128,7 +130,7 @@ auto LazyTable::acquire_reader() -> std::expected<LazySourceReaderPtr, std::stri
 }
 
 void LazyTable::release_reader(LazySourceReaderPtr reader) {
-    std::lock_guard const lock(reader_pool_->mutex);
+    const std::lock_guard lock(reader_pool_->mutex);
     reader_pool_->available.push_back(std::move(reader));
 }
 
@@ -469,7 +471,7 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
     auto* profile_entry = exec.execution_profile == nullptr
                               ? nullptr
                               : exec.execution_profile->stage("source string filter scan");
-    ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
+    const ExecutionProfileScope profile_scope(profile_entry, ProfilePhase::Source);
 
     auto reader = acquire_reader();
     if (!reader) {
@@ -587,7 +589,7 @@ auto LazyTable::project_where(const std::set<std::string>& names,
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
-    Table const& predicates = *predicates_res;
+    const Table& predicates = *predicates_res;
 
     const auto key =
         membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
@@ -870,7 +872,7 @@ auto LazyTable::project_where_unit(const std::set<std::string>& names,
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
-    Table const& predicates = *predicates_res;
+    const Table& predicates = *predicates_res;
 
     const auto key =
         membership ? int64_key_column(predicates, *dynamic_key) : std::optional<KeyColumn>{};
@@ -1241,7 +1243,7 @@ auto LazyTable::join_key_selection(const std::vector<ir::Expr>& conjuncts,
     if (!predicates_res) {
         return std::unexpected(predicates_res.error());
     }
-    Table const& predicates = *predicates_res;
+    const Table& predicates = *predicates_res;
 
     const auto key = int64_key_column(predicates, key_name);
     if (!key.has_value()) {

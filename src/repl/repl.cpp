@@ -4,6 +4,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
+#include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/extern_sources.hpp>
@@ -38,18 +39,21 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#include "ibex/ir/cardinality.hpp"
 #ifdef _WIN32
 #define NOMINMAX
 #include <io.h>

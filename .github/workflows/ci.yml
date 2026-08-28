@@ -63,6 +63,7 @@ jobs:
 
   build-and-test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-14]
         build_type: [Debug, Release]

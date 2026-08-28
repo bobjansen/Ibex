@@ -5,9 +5,11 @@
 // NOLINTBEGIN(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/core/time_zone.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/table_properties.hpp>
 
 #include <bit>
 #include <cstddef>
@@ -23,9 +25,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/core/time_zone.hpp"
-#include "ibex/runtime/table_properties.hpp"
 
 namespace ibex::interop {
 

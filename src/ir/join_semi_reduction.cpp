@@ -5,13 +5,17 @@
 #include <ibex/ir/expr_predicates.hpp>
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/join_semi_reduction.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
 #include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <utility>

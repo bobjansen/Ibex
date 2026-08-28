@@ -1,29 +1,46 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/repl/repl.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_format.hpp>
 #include <ibex/ui/server.hpp>
 
 #include <algorithm>
 #include <array>
+#include <asm-generic/int-ll64.h>
+#include <asm-generic/socket.h>
 #include <cctype>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <iterator>
+#include <linux/prctl.h>
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <random>
+#include <ratio>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #if defined(__linux__)
 #include <fcntl.h>

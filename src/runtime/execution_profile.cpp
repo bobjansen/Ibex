@@ -2,14 +2,22 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/format.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -218,7 +226,7 @@ class ProfiledOperator final : public Operator {
         if (on_worker_pool_thread()) {
             entry_->pool_thread_calls.fetch_add(1, std::memory_order_relaxed);
         }
-        ExecutionProfileScope scope(entry_, ProfilePhase::Next);
+        const ExecutionProfileScope scope(entry_, ProfilePhase::Next);
         auto result = child_->next();
         if (result.has_value() && result->has_value()) {
             entry_->chunks.fetch_add(1, std::memory_order_relaxed);

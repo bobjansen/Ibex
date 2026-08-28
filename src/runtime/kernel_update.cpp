@@ -3,24 +3,42 @@
 
 #include "kernel_update.hpp"
 
+#include <ibex/core/column.hpp>
+#include <ibex/core/time.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/runtime/extern_registry.hpp>
+#include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/operator.hpp>
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
+#include <ibex/runtime/table_properties.hpp>
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <expected>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "kernel_filter.hpp"
 #include "kernel_gather.hpp"
 #include "kernel_types.hpp"
+#include "runtime_internal.hpp"
 
 namespace ibex::runtime::kernel {
 

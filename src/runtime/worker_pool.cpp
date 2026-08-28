@@ -67,7 +67,7 @@ struct Task {
 /// captured rather than propagated: a throw out of a pool thread would
 /// terminate the process, and the batch's owner rethrows deterministically
 /// (lowest worker id wins) from `wait()`.
-void run_task(Task const& task) {
+void run_task(const Task& task) {
     auto& state = *task.state;
     const auto profile_start = state.profile_entry == nullptr
                                    ? std::chrono::steady_clock::time_point{}

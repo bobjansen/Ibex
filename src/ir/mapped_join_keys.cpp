@@ -2,16 +2,15 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/ir/mapped_join_keys.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/required_columns.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <algorithm>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include "ibex/ir/node.hpp"
-#include "ibex/ir/schema.hpp"
 
 namespace ibex::ir {
 

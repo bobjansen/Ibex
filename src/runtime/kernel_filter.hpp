@@ -4,8 +4,10 @@
 #pragma once
 
 #include <ibex/ir/node.hpp>
+#include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/operator.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>

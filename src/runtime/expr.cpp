@@ -29,6 +29,7 @@
 #include <cstring>
 #include <ctime>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <random>
 #include <robin_hood.h>

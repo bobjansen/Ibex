@@ -5,21 +5,24 @@
 #include <ibex/ir/column_name_map.hpp>
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/expr_predicates.hpp>
+#include <ibex/ir/node.hpp>
 #include <ibex/ir/scan_predicates.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
+#include <robin_hood.h>
 #include <set>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "ibex/ir/node.hpp"
 
 namespace ibex::ir {
 /// Above this fraction of its own base table, a build side covers too much of

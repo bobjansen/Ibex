@@ -3,8 +3,12 @@
 
 #include <ibex/ir/column_origins.hpp>
 #include <ibex/ir/group_key_reduction.hpp>
+#include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>

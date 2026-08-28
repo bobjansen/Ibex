@@ -5,7 +5,11 @@
 #include <ibex/ir/optimizer.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace ibex::ir {
@@ -51,7 +55,7 @@ namespace {
 }
 
 [[nodiscard]] auto get_column_prefix(const std::string& col_name) -> std::string {
-    size_t underscore = col_name.find('_');
+    const size_t underscore = col_name.find('_');
     if (underscore != std::string::npos && underscore > 0) {
         return col_name.substr(0, underscore);
     }
@@ -70,10 +74,10 @@ namespace {
 }
 
 [[nodiscard]] auto extract_table_from_path(const std::string& path) -> std::string {
-    size_t slash = path.rfind('/');
-    size_t start = (slash != std::string::npos) ? slash + 1 : 0;
-    size_t dot = path.rfind('.');
-    size_t end = (dot != std::string::npos && dot > start) ? dot : path.length();
+    const size_t slash = path.rfind('/');
+    const size_t start = (slash != std::string::npos) ? slash + 1 : 0;
+    const size_t dot = path.rfind('.');
+    const size_t end = (dot != std::string::npos && dot > start) ? dot : path.length();
     return path.substr(start, end - start);
 }
 
@@ -106,7 +110,7 @@ namespace {
             if (!args.empty()) {
                 if (const auto* lit = std::get_if<ir::Literal>(&args[0].node)) {
                     if (const auto* path_str = std::get_if<std::string>(&lit->value)) {
-                        std::string table = extract_table_from_path(*path_str);
+                        const std::string table = extract_table_from_path(*path_str);
                         if (table == "part")
                             return {"p"};
                         if (table == "partsupp")
@@ -165,9 +169,9 @@ namespace {
     }
 
     for (const auto& prefix : filter_prefixes) {
-        bool in_left =
+        const bool in_left =
             std::find(left_prefixes.begin(), left_prefixes.end(), prefix) != left_prefixes.end();
-        bool in_right =
+        const bool in_right =
             std::find(right_prefixes.begin(), right_prefixes.end(), prefix) != right_prefixes.end();
 
         if (!in_left || in_right) {
@@ -193,9 +197,9 @@ namespace {
     }
 
     for (const auto& prefix : filter_prefixes) {
-        bool in_left =
+        const bool in_left =
             std::find(left_prefixes.begin(), left_prefixes.end(), prefix) != left_prefixes.end();
-        bool in_right =
+        const bool in_right =
             std::find(right_prefixes.begin(), right_prefixes.end(), prefix) != right_prefixes.end();
 
         if (!in_right || in_left) {

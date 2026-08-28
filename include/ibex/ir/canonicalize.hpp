@@ -23,15 +23,6 @@ namespace ibex::ir {
 ///        `Tail(Project(x))` → `Project(Tail(x))`     Only applied when group_by is
 ///        `Tail(Rename(x))`  → `Rename(Tail(x))`      empty (matches current Filter-head
 ///                                                    fusion precondition).
-///   R5. `Project(Filter(x))`         → `FilterProject(x)`        — fused node so
-///                                                                   build_operator dispatches
-///                                                                   on NodeKind rather than
-///                                                                   pattern-matching the shape.
-///   R6. `Project(Update(Filter(x)))` → `FilterUpdateProject(x)`  — fired only when the
-///                                                                   Update is row-local
-///                                                                   (no tuple_fields, no
-///                                                                   group_by, no cross-row
-///                                                                   callees).
 ///   R7. `Head(Filter(x))`            → `FilterHead(x)`            — only when the Head has
 ///                                                                   no group_by.
 ///   R8. `Tail(Filter(x))`            → `FilterTail(x)`            — only when the Tail has
@@ -45,7 +36,7 @@ namespace ibex::ir {
 ///  R12. `Filter(Update(x))`          → `Update(Filter(x))`        — only when the Update is
 ///                                                                   row-local AND the predicate
 ///                                                                   references no column the
-///                                                                   Update produces. Feeds R6.
+///                                                                   Update produces.
 ///  R13. `Head(m, Head(n, x))`        → `Head(min(m,n), x)`         — both group_by empty.
 ///  R14. `Tail(m, Tail(n, x))`        → `Tail(min(m,n), x)`         — both group_by empty.
 ///  R15. `Order(Filter(... AND col==K AND ..., x))` drops `col` from Order keys (pinned by
@@ -70,14 +61,11 @@ namespace ibex::ir {
 ///  R20. `Aggregate(gb, aggs, x)` → `Aggregate(gb, aggs, Project(needed, x))` —
 ///       inserts a column-pruning Project below the aggregate, where `needed`
 ///       is the union of `gb` and each agg's input column. Skipped when `x` is
-///       already Project / FilterProject / FilterUpdateProject (avoids redundant
-///       projection and rule-driver loops). The Project then composes with R5
-///       (FilterProject fusion) when `x` is a Filter.
-///  R21. `Project(c, Project(_, x))` → `Project(c, x)` (and same for
-///       `FilterProject(c, p, Project(_, x))`). The outer node's columns are a
+///       already Project (avoids redundant projection and rule-driver loops).
+///  R21. `Project(c, Project(_, x))` → `Project(c, x)`. The outer node's columns are a
 ///       subset of the inner Project's, so dropping the inner Project is sound
 ///       and removes a redundant schema pass — particularly useful after R20
-///       inserts a pruning Project that R5 fuses with into a FilterProject.
+///       inserts a pruning Project below a Filter.
 ///
 /// Pure on IR: takes ownership and returns the rewritten tree. The emitted
 /// operator tree is identical to what `build_operator` would produce via its

@@ -62,17 +62,6 @@ class Builder {
                                           keep_mode);
     }
 
-    [[nodiscard]] auto filter_project(Expr predicate, std::vector<ColumnRef> columns) -> NodePtr {
-        return std::make_unique<FilterProjectNode>(next_id(), std::move(predicate),
-                                                   std::move(columns));
-    }
-
-    [[nodiscard]] auto filter_update_project(Expr predicate, std::vector<FieldSpec> fields,
-                                             std::vector<ColumnRef> project_columns) -> NodePtr {
-        return std::make_unique<FilterUpdateProjectNode>(
-            next_id(), std::move(predicate), std::move(fields), std::move(project_columns));
-    }
-
     [[nodiscard]] auto filter_head(Expr predicate, std::size_t count) -> NodePtr {
         return std::make_unique<FilterHeadNode>(next_id(), std::move(predicate), count);
     }

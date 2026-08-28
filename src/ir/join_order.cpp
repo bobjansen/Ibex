@@ -45,10 +45,6 @@ auto leaf_predicate(const Node& node) -> const Expr* {
     switch (node.kind()) {
         case NodeKind::Filter:
             return &static_cast<const FilterNode&>(node).predicate();
-        case NodeKind::FilterProject:
-            return &static_cast<const FilterProjectNode&>(node).predicate();
-        case NodeKind::FilterUpdateProject:
-            return &static_cast<const FilterUpdateProjectNode&>(node).predicate();
         default:
             return nullptr;
     }
@@ -57,8 +53,8 @@ auto leaf_predicate(const Node& node) -> const Expr* {
 
 /// The single lazy source a relation leaf ultimately reads, walking down
 /// through the row-wise, cardinality-preserving operators PDS-H's aligned
-/// query shapes actually use above a scan (Project/Update/Rename, and the
-/// fused Filter variants). Returns nullptr for anything wider (a leaf that
+/// query shapes actually use above a scan (Filter/Project/Update/Rename).
+/// Returns nullptr for anything wider (a leaf that
 /// isn't one source, or an operator shape not walked here) -- same "decline,
 /// don't guess" contract as `leaf_predicate`.
 auto leaf_source_name(const Node& node) -> const std::string* {
@@ -69,8 +65,6 @@ auto leaf_source_name(const Node& node) -> const std::string* {
                 // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
                 return &static_cast<const ScanNode&>(*cur).source_name();
             case NodeKind::Filter:
-            case NodeKind::FilterProject:
-            case NodeKind::FilterUpdateProject:
             case NodeKind::Project:
             case NodeKind::Update:
             case NodeKind::Rename:

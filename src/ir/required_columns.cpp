@@ -189,15 +189,6 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             return;
         }
 
-        case NodeKind::FilterProject: {
-            const auto& fp = static_cast<const FilterProjectNode&>(node);
-            ColumnDemand below;
-            add_refs(fp.columns(), below);
-            collect_refs(fp.predicate(), below);
-            visit_children(node, below, out);
-            return;
-        }
-
         // Aggregate likewise fixes its output: the group keys plus whatever the
         // aggregations read.
         case NodeKind::Aggregate: {
@@ -256,26 +247,6 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
                     visit(*tuple.source, all, out);
                 }
             }
-            visit_children(node, below, out);
-            return;
-        }
-
-        case NodeKind::FilterUpdateProject: {
-            const auto& fup = static_cast<const FilterUpdateProjectNode&>(node);
-            ColumnDemand below;
-            for (const auto& column : fup.project_columns()) {
-                bool produced = false;
-                for (const auto& field : fup.fields()) {
-                    produced = produced || field.alias == column.name;
-                }
-                if (!produced) {
-                    below.add(column.name);
-                }
-            }
-            for (const auto& field : fup.fields()) {
-                collect_refs(field.expr, below);
-            }
-            collect_refs(fup.predicate(), below);
             visit_children(node, below, out);
             return;
         }

@@ -88,30 +88,6 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
                 std::llround(static_cast<double>(*input.rows) * selectivity));
             return {.rows = selected, .heuristic = true};
         }
-        case NodeKind::FilterProject: {
-            auto input = child();
-            if (!input.rows.has_value()) {
-                return input;
-            }
-            const auto selectivity =
-                compound_selectivity(static_cast<const FilterProjectNode&>(node).predicate(),
-                                     options.filter_selectivity);
-            const auto selected = static_cast<std::size_t>(
-                std::llround(static_cast<double>(*input.rows) * selectivity));
-            return {.rows = selected, .heuristic = true};
-        }
-        case NodeKind::FilterUpdateProject: {
-            auto input = child();
-            if (!input.rows.has_value()) {
-                return input;
-            }
-            const auto selectivity =
-                compound_selectivity(static_cast<const FilterUpdateProjectNode&>(node).predicate(),
-                                     options.filter_selectivity);
-            const auto selected = static_cast<std::size_t>(
-                std::llround(static_cast<double>(*input.rows) * selectivity));
-            return {.rows = selected, .heuristic = true};
-        }
         case NodeKind::FilterHead: {
             auto input = child();
             if (!input.rows.has_value()) {
@@ -330,7 +306,6 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
         case NodeKind::Tail:
         case NodeKind::Distinct:
         case NodeKind::Project:
-        case NodeKind::FilterProject:
         case NodeKind::FilterHead:
         case NodeKind::FilterTail:
         case NodeKind::TopK:
@@ -340,11 +315,6 @@ auto distinct_below(const Node& node, const std::string& column, const SourceSta
 
         case NodeKind::Update: {
             const auto below = renamed_from(static_cast<const UpdateNode&>(node).fields(), column);
-            return below ? distinct_through(node, *below, stats) : std::nullopt;
-        }
-        case NodeKind::FilterUpdateProject: {
-            const auto below =
-                renamed_from(static_cast<const FilterUpdateProjectNode&>(node).fields(), column);
             return below ? distinct_through(node, *below, stats) : std::nullopt;
         }
         case NodeKind::Rename: {

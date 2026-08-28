@@ -866,24 +866,6 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             }
             return names;
         }
-        case NodeKind::FilterProject: {
-            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
-            std::vector<std::string> names;
-            names.reserve(fp.columns().size());
-            for (const auto& col : fp.columns()) {
-                names.push_back(col.name);
-            }
-            return names;
-        }
-        case NodeKind::FilterUpdateProject: {
-            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-            std::vector<std::string> names;
-            names.reserve(fup.project_columns().size());
-            for (const auto& col : fup.project_columns()) {
-                names.push_back(col.name);
-            }
-            return names;
-        }
         case NodeKind::Resample: {
             const auto& rs = static_cast<const ir::ResampleNode&>(node);
             std::vector<std::string> names;
@@ -4984,17 +4966,6 @@ class Lowerer {
                     preamble.push_back(preamble_node ? clone_node(*preamble_node) : nullptr);
                 }
                 clone = builder_.program(std::move(preamble), clone_node(prog.main_node()));
-                break;
-            }
-            case ir::NodeKind::FilterProject: {
-                const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
-                clone = builder_.filter_project(fp.predicate(), fp.columns());
-                break;
-            }
-            case ir::NodeKind::FilterUpdateProject: {
-                const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-                clone = builder_.filter_update_project(fup.predicate(), fup.fields(),
-                                                       fup.project_columns());
                 break;
             }
             case ir::NodeKind::FilterHead: {

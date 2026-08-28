@@ -1276,45 +1276,6 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return interpret_node(program.main_node(), registry, scalars, externs, exec, model_out);
         }
-        case ir::NodeKind::FilterProject: {
-            // Fused shape produced by canonicalize R5. Materializing fallback
-            // for contexts where chunked build_operator is bypassed: evaluate
-            // filter then project sequentially.
-            const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
-            if (fp.children().empty()) {
-                return std::unexpected("filter_project node missing child");
-            }
-            auto child = interpret_node(*fp.children().front(), registry, scalars, externs, exec);
-            if (!child) {
-                return std::unexpected(child.error());
-            }
-            auto filtered = filter_table(child.value(), fp.predicate(), scalars);
-            if (!filtered) {
-                return std::unexpected(filtered.error());
-            }
-            return project_table(filtered.value(), fp.columns());
-        }
-        case ir::NodeKind::FilterUpdateProject: {
-            // Fused shape produced by canonicalize R6. Materializing fallback.
-            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-            if (fup.children().empty()) {
-                return std::unexpected("filter_update_project node missing child");
-            }
-            auto child = interpret_node(*fup.children().front(), registry, scalars, externs, exec);
-            if (!child) {
-                return std::unexpected(child.error());
-            }
-            auto filtered = filter_table(child.value(), fup.predicate(), scalars);
-            if (!filtered) {
-                return std::unexpected(filtered.error());
-            }
-            auto updated =
-                update_table(std::move(filtered.value()), fup.fields(), scalars, externs, exec);
-            if (!updated) {
-                return std::unexpected(updated.error());
-            }
-            return project_table(updated.value(), fup.project_columns());
-        }
         case ir::NodeKind::TopK: {
             const auto& topk = static_cast<const ir::TopKNode&>(node);
             if (topk.children().empty()) {

@@ -164,10 +164,6 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
             return project_origins(static_cast<const ProjectNode&>(node).columns(),
                                    child_origins(node, sources));
 
-        case NodeKind::FilterProject:
-            return project_origins(static_cast<const FilterProjectNode&>(node).columns(),
-                                   child_origins(node, sources));
-
         case NodeKind::Rename: {
             const auto& rename = static_cast<const RenameNode&>(node);
             const ColumnNameMap names(rename.renames());
@@ -184,13 +180,6 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
             const auto& update = static_cast<const UpdateNode&>(node);
             return update_origins(update.fields(), update.tuple_fields(),
                                   child_origins(node, sources));
-        }
-
-        case NodeKind::FilterUpdateProject: {
-            const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
-            return project_origins(
-                fused.project_columns(),
-                update_origins(fused.fields(), {}, child_origins(node, sources)));
         }
 
         case NodeKind::Aggregate: {

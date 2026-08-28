@@ -1272,23 +1272,6 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
         // input (the join-order cost model, ambiguity checks) silently declined
         // on every query. R5/R6/R7/R8/R16 in canonicalize.cpp define the
         // equivalences these mirror.
-        case NodeKind::FilterProject: {
-            // Project(Filter(x)): the projection fixes the output columns.
-            const auto& fused = static_cast<const FilterProjectNode&>(node);
-            return project_schema(fused.columns(),
-                                  filtered_schema(fused.predicate(), child_schema(node, sources)));
-        }
-        case NodeKind::FilterUpdateProject: {
-            // Project(Update(Filter(x))). The update's computed fields are only
-            // observable through the projection, and a projected name resolves
-            // against the update's output -- so type the update first, then
-            // project it.
-            const auto& fused = static_cast<const FilterUpdateProjectNode&>(node);
-            const SchemaInfo filtered =
-                filtered_schema(fused.predicate(), child_schema(node, sources));
-            const SchemaInfo updated = update_schema(fused.fields(), {}, filtered);
-            return project_schema(fused.project_columns(), updated);
-        }
         // Head(Filter(x)) / Tail(Filter(x)): row-subsetting only, so schema,
         // time index and unique constraints pass through -- and the filter's
         // proofs come through with them, as they do for the unfused shapes.

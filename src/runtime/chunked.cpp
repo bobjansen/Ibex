@@ -12234,23 +12234,12 @@ auto build_filter_project_gather_map(const MapStep& step, OperatorPtr child,
                                      const std::vector<ColumnKernelSignature>* source_signature,
                                      bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    // Two shapes reach one kernel: canonicalize's fused node, and a Filter the
-    // planner fused with the Project above it. The operator only ever wanted a
-    // predicate and a column list, which is why physical fusion needs no new
-    // kernel -- only a step able to name both nodes.
-    const ir::Expr* predicate = nullptr;
-    const std::vector<ir::ColumnRef>* columns = nullptr;
-    if (step.fused_project != nullptr) {
-        predicate = &static_cast<const ir::FilterNode&>(*step.node).predicate();
-        columns = &static_cast<const ir::ProjectNode&>(*step.fused_project).columns();
-    } else {
-        const auto& fp = static_cast<const ir::FilterProjectNode&>(*step.node);
-        predicate = &fp.predicate();
-        columns = &fp.columns();
+    if (step.filter_predicate == nullptr || step.project_columns == nullptr) {
+        return std::unexpected("filter-project map step missing normalized operands");
     }
     return std::make_unique<ChunkedFilterProjectOperator>(
-        std::move(child), predicate, columns, scalars,
-        physical_filter_route(*predicate, source_signature), preserve_empty_morsels);
+        std::move(child), step.filter_predicate, step.project_columns, scalars,
+        physical_filter_route(*step.filter_predicate, source_signature), preserve_empty_morsels);
 }
 
 auto build_filter_update_project_gather_map(
@@ -12258,29 +12247,17 @@ auto build_filter_update_project_gather_map(
     const ExternRegistry* externs, const ExecutionContext& exec,
     const std::vector<ColumnKernelSignature>* source_signature, bool preserve_empty_morsels)
     -> std::expected<OperatorPtr, std::string> {
-    // Two shapes, one kernel: canonicalize's fused node, and a Filter the
-    // planner fused with the Update and Project above it. The operator wants a
-    // predicate, the update fields, and a column list wherever they come from.
-    const ir::Expr* predicate = nullptr;
-    const std::vector<ir::FieldSpec>* fields = nullptr;
-    const std::vector<ir::ColumnRef>* project_columns = nullptr;
-    if (step.fused_project != nullptr) {
-        predicate = &static_cast<const ir::FilterNode&>(*step.node).predicate();
-        fields = &static_cast<const ir::UpdateNode&>(*step.fused_update).fields();
-        project_columns = &static_cast<const ir::ProjectNode&>(*step.fused_project).columns();
-    } else {
-        const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(*step.node);
-        predicate = &fup.predicate();
-        fields = &fup.fields();
-        project_columns = &fup.project_columns();
+    if (step.filter_predicate == nullptr || step.update_fields == nullptr ||
+        step.project_columns == nullptr) {
+        return std::unexpected("filter-update-project map step missing normalized operands");
     }
     robin_hood::unordered_set<std::string> update_outputs;
     robin_hood::unordered_set<std::string> needed;
-    for (const auto& field : *fields) {
+    for (const auto& field : *step.update_fields) {
         update_outputs.insert(field.alias);
         collect_expr_column_refs(field.expr, needed);
     }
-    for (const auto& column : *project_columns) {
+    for (const auto& column : *step.project_columns) {
         if (!update_outputs.contains(column.name)) {
             needed.insert(column.name);
         }
@@ -12291,8 +12268,9 @@ auto build_filter_update_project_gather_map(
         gather_columns.push_back(ir::ColumnRef{.name = name});
     }
     return std::make_unique<ChunkedFilterUpdateProjectOperator>(
-        std::move(child), predicate, fields, project_columns, std::move(gather_columns), scalars,
-        externs, exec, physical_filter_route(*predicate, source_signature), preserve_empty_morsels);
+        std::move(child), step.filter_predicate, step.update_fields, step.project_columns,
+        std::move(gather_columns), scalars, externs, exec,
+        physical_filter_route(*step.filter_predicate, source_signature), preserve_empty_morsels);
 }
 
 auto map_kernel_factory(MapKernelCapability capability) noexcept -> MapKernelFactory {
@@ -12424,9 +12402,7 @@ class RangeFilterMorselSource final : public MorselSource {
 
 /// How a head operator is evaluated by range, when it can be. A filter head is
 /// where gathering costs most — it copies rows the predicate is about to throw
-/// away — and `FilterProject` is included because that is what `filter …,
-/// select …` canonicalizes to, so restricting this to a bare `Filter` would
-/// miss the shape most real queries take.
+/// away — and the physically fused filter/project form is included as well.
 struct RangeHead {
     const ir::Expr* predicate = nullptr;
     const std::vector<ir::ColumnRef>* project = nullptr;  ///< null when unfused
@@ -12450,7 +12426,7 @@ struct RangeHead {
     if (input.columns.empty()) {
         return std::nullopt;
     }
-    if (step.node->kind() == ir::NodeKind::Filter) {
+    if (step.capability == MapKernelCapability::FilterGather) {
         // A head absorbs a filter and, at most, the projection directly above
         // it. A fused step that also carries an Update computes columns between
         // the two, and absorbing the projection here would skip that
@@ -12471,12 +12447,13 @@ struct RangeHead {
                 : nullptr;
         return RangeHead{.predicate = &predicate, .project = project};
     }
-    if (step.node->kind() == ir::NodeKind::FilterProject) {
-        const auto& fp = static_cast<const ir::FilterProjectNode&>(*step.node);
-        if (!is_range_native_expr(fp.predicate())) {
+    if (step.capability == MapKernelCapability::FilterProjectGather &&
+        step.update_fields == nullptr && step.filter_predicate != nullptr &&
+        step.project_columns != nullptr) {
+        if (!is_range_native_expr(*step.filter_predicate)) {
             return std::nullopt;
         }
-        return RangeHead{.predicate = &fp.predicate(), .project = &fp.columns()};
+        return RangeHead{.predicate = step.filter_predicate, .project = step.project_columns};
     }
     return std::nullopt;
 }
@@ -15226,39 +15203,9 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                                             exec, false);
     }
 
-    // Fused Project(Filter(x)) produced by canonicalize R5.
-    if (node.kind() == ir::NodeKind::FilterProject) {
-        const auto& fp = static_cast<const ir::FilterProjectNode&>(node);
-        if (fp.children().empty()) {
-            return std::unexpected("filter_project node missing child");
-        }
-        auto child_op =
-            build_operator(*fp.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
-                                            exec, false);
-    }
-
     // No FilterHead / FilterTail branch: fused Head(Filter(x)) / Tail(Filter(x))
     // (canonicalize R7/R8) is a migrated plan built by
     // `build_physical_filter_head_tail` at the seam above.
-
-    // Fused Project(Update(Filter(x))) produced by canonicalize R6.
-    if (node.kind() == ir::NodeKind::FilterUpdateProject) {
-        const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-        if (fup.children().empty()) {
-            return std::unexpected("filter_update_project node missing child");
-        }
-        auto child_op =
-            build_operator(*fup.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return build_row_local_map_operator(node, std::move(child_op.value()), scalars, externs,
-                                            exec, false);
-    }
 
     if (node.kind() == ir::NodeKind::Rename) {
         const auto& rename = static_cast<const ir::RenameNode&>(node);

@@ -27,10 +27,6 @@ auto map_kernel_capability(const ir::Node& node) noexcept -> std::optional<MapKe
         Entry{.kind = ir::NodeKind::Filter, .capability = MapKernelCapability::FilterGather},
         Entry{.kind = ir::NodeKind::Project, .capability = MapKernelCapability::MetadataMap},
         Entry{.kind = ir::NodeKind::Rename, .capability = MapKernelCapability::MetadataMap},
-        Entry{.kind = ir::NodeKind::FilterProject,
-              .capability = MapKernelCapability::FilterProjectGather},
-        Entry{.kind = ir::NodeKind::FilterUpdateProject,
-              .capability = MapKernelCapability::FilterUpdateProjectGather},
     };
     for (const auto& entry : kTable) {
         if (entry.kind == node.kind()) {
@@ -77,8 +73,6 @@ auto execution_capability(ir::NodeKind kind) noexcept -> ExecutionCapability {
         case ir::NodeKind::Filter:
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
-        case ir::NodeKind::FilterProject:
-        case ir::NodeKind::FilterUpdateProject:
             return ExecutionCapability::ParallelMap;
 
         case ir::NodeKind::Head:
@@ -108,18 +102,6 @@ auto map_step_expressions_are_subset_evaluable(const ir::Node& node) -> bool {
         case ir::NodeKind::Filter:
             return ir::is_subset_evaluable_expr(
                 static_cast<const ir::FilterNode&>(node).predicate());
-        case ir::NodeKind::FilterProject:
-            return ir::is_subset_evaluable_expr(
-                static_cast<const ir::FilterProjectNode&>(node).predicate());
-        case ir::NodeKind::FilterUpdateProject: {
-            const auto& fup = static_cast<const ir::FilterUpdateProjectNode&>(node);
-            if (!ir::is_subset_evaluable_expr(fup.predicate())) {
-                return false;
-            }
-            return std::ranges::all_of(fup.fields(), [](const ir::FieldSpec& field) {
-                return ir::is_subset_evaluable_expr(field.expr);
-            });
-        }
         case ir::NodeKind::Project:
         case ir::NodeKind::Rename:
             return true;

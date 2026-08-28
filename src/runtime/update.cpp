@@ -55,6 +55,17 @@ namespace ibex::runtime {
 
 namespace {
 
+// Uninitialised owning array buffer. Wraps the one unavoidable C-array spelling
+// (the `T[]` argument to make_unique_for_overwrite) so the NOLINT lives here
+// once instead of at every call site, where clang-format keeps wrapping the
+// directive off its statement.
+template <typename T>
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+std::unique_ptr<T[]> make_owned_array(std::size_t n) {
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    return std::make_unique_for_overwrite<T[]>(n);
+}
+
 struct FastOperand {
     bool is_column = false;
     const ColumnValue* column = nullptr;
@@ -2154,7 +2165,7 @@ struct GroupedRows {
     const std::size_t rows = row_gid.size();
     GroupedRows out;
     out.offsets.assign(group_count + 1, 0);
-    out.flat = std::make_unique_for_overwrite<std::size_t[]>(rows);
+    out.flat = make_owned_array<std::size_t>(rows);
 
     // The private histograms are a workers x groups matrix, so threading only
     // pays while that stays small. High cardinality keeps the serial pass,
@@ -2261,9 +2272,7 @@ auto make_grouped_row_plan(const Table& input, const std::vector<ir::ColumnRef>&
     }
     const std::size_t row_count = input.rows();
     GroupedRowPlan plan;
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays) -- uninit owning
-    // buffer
-    plan.row_gid_storage = std::make_unique_for_overwrite<std::uint32_t[]>(row_count);
+    plan.row_gid_storage = make_owned_array<std::uint32_t>(row_count);
     const auto validity = collect_key_validity(input, group_by);
     const std::size_t group_count =
         assign_group_ids(group_columns, validity, row_count, exec,
@@ -3267,8 +3276,7 @@ class TimeIndexTicks {
         ticks.name_ = index_name;
         if (const auto* ts = std::get_if<Column<Timestamp>>(column)) {
             static_assert(sizeof(Timestamp) == sizeof(std::int64_t));
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- Timestamp is {int64
-            // nanos}
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- {int64 nanos}
             ticks.nanos_ = reinterpret_cast<const std::int64_t*>(ts->data());
             return ticks;
         }
@@ -3696,9 +3704,7 @@ auto grouped_windowed_update_table(Table input, const std::vector<ir::FieldSpec>
     // Bucket rows by group key — the row indices land in original
     // (time-sorted) order within each group, which is the precondition the
     // single-buffer rolling implementation relies on.
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays) -- uninit owning
-    // buffer
-    auto row_gid_buf = std::make_unique_for_overwrite<std::uint32_t[]>(rows);
+    auto row_gid_buf = make_owned_array<std::uint32_t>(rows);
     const std::span<std::uint32_t> row_gid{row_gid_buf.get(), rows};
     const std::size_t group_count =
         assign_group_ids(group_columns, group_validity, rows, exec, row_gid);

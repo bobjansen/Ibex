@@ -619,7 +619,6 @@ class ChunkedRenameOperator final : public Operator {
 };
 
 using ir::collect_expr_column_refs;
-using ir::is_row_local_update_expr;
 
 /// Per-chunk update for row-local field expressions. `build_operator()` only
 /// routes here when all of the UpdateNode's field expressions are row-local
@@ -3866,8 +3865,9 @@ auto is_streamable_inner_join(const ir::JoinNode& join) -> bool {
 /// motivating case). Same structural gate as `is_streamable_inner_join`
 /// plus a static schema check -- both keys, on both sides, must be provably
 /// `Int64` -- so an ineligible pair (a string key, an unascribed/Unknown
-/// schema) falls through to `build_binary_materializing_operator` exactly
-/// as it does today, never into a code path that could fail at runtime.
+/// schema) falls through to the materialized-call fallback (`interpret_node`'s
+/// `Join` branch) exactly as it does today, never into a code path that could
+/// fail at runtime.
 /// `ChunkedInnerJoinOperator::initialize_pair` re-checks the actual runtime
 /// column type regardless -- this is a routing optimization, not the sole
 /// guarantee of correctness.
@@ -4012,45 +4012,15 @@ auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materiali
 
 namespace {
 
-template <typename Fn>
-
-auto build_binary_materializing_operator(const ir::Node& left_node, const ir::Node& right_node,
-                                         const TableRegistry& registry,
-                                         const ScalarRegistry* scalars,
-                                         const ExternRegistry* externs,
-                                         const ExecutionContext& exec, ModelResult* model_out,
-                                         Fn fn) -> std::expected<OperatorPtr, std::string> {
-    // Multiple producers (plans/parallelism-overview.md): tried overlapping
-    // `left_node`/`right_node`'s materializations on a raw std::thread here,
-    // twice. First attempt (unbudgeted): net regression on the full PDS-H
-    // suite (q09 +57%, q04/q06/q07/q08/q19 also worse). Second attempt,
-    // under a since-removed helper-thread budget: q09 STILL regressed
-    // (+47.5%), and the budget provably wasn't the reason -- q09 hits this
-    // function exactly once (verified with a temporary entry-count trace),
-    // so there was never a recursive pile-up here for a budget to bound in
-    // the first place, and re-testing at budget=1/2/8 all gave the same
-    // ~230-250ms. The actual cost is structural, not concurrency-count: this
-    // function materializes BOTH sides fully (unlike is_streamable_inner_join,
-    // which builds the left as a cheap lazy operator and only materializes
-    // the right), so overlapping two already-expensive full materializations
-    // contends for the same cores/memory bandwidth rather than filling idle
-    // ones. Reverted a second time; a future attempt here needs a
-    // cost-aware gate (e.g. skip when both sides are large), not a
-    // thread-count budget.
-    auto left = materialize_row_local(left_node, registry, scalars, externs, exec, model_out);
-    if (!left.has_value()) {
-        return std::unexpected(std::move(left.error()));
-    }
-    auto right = materialize_row_local(right_node, registry, scalars, externs, exec, model_out);
-    if (!right.has_value()) {
-        return std::unexpected(std::move(right.error()));
-    }
-    auto result = fn(std::move(left.value()), std::move(right.value()));
-    if (!result.has_value()) {
-        return std::unexpected(std::move(result.error()));
-    }
-    return make_table_source(std::move(result.value()));
-}
+// A materializing binary breaker (non-streamable join, matmul) now resolves in
+// `interpret_node`, which drains both sides whole-table and serially.
+// Overlapping the two materializations on a raw std::thread was tried twice
+// (once unbudgeted, once under a since-removed helper-thread budget) and
+// regressed the PDS-H suite both times (q09 +57% / +47.5%): the cost is
+// structural -- both sides are already-expensive full materializations
+// contending for the same cores/bandwidth -- not a concurrency count a budget
+// could bound. A future attempt needs a cost-aware gate (skip when both sides
+// are large), and belongs wherever that breaker is lifted onto the physical plan.
 
 auto eval_extern_args(const std::vector<ir::Expr>& exprs, const ScalarRegistry* scalars,
                       const ExternRegistry* externs) -> std::expected<ExternArgs, std::string> {
@@ -5059,344 +5029,18 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // TopK stays a serial bounded-heap select (O(n log k)); Tail materializes
     // and calls `tail_table`; the plan just records that they are breakers.
 
-    if (node.kind() == ir::NodeKind::Columns) {
-        if (node.children().empty()) {
-            return std::unexpected("columns node missing child");
-        }
-        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, exec, model_out,
-                                                  [](Table input) { return columns_table(input); });
-    }
-
-    if (node.kind() == ir::NodeKind::Melt) {
-        const auto& mn = ir::node_cast<ir::MeltNode>(node);
-        if (mn.children().empty()) {
-            return std::unexpected("melt node missing child");
-        }
-        return build_unary_materializing_operator(
-            *mn.children().front(), registry, scalars, externs, exec, model_out,
-            [&](Table input) { return melt_table(input, mn.id_columns(), mn.measure_columns()); });
-    }
-
-    if (node.kind() == ir::NodeKind::Dcast) {
-        const auto& dn = ir::node_cast<ir::DcastNode>(node);
-        if (dn.children().empty()) {
-            return std::unexpected("dcast node missing child");
-        }
-        return build_unary_materializing_operator(
-            *dn.children().front(), registry, scalars, externs, exec, model_out, [&](Table input) {
-                return dcast_table(input, dn.pivot_column(), dn.value_column(), dn.row_keys());
-            });
-    }
-
-    if (node.kind() == ir::NodeKind::Cov) {
-        if (node.children().empty()) {
-            return std::unexpected("cov node missing child");
-        }
-        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, exec, model_out,
-                                                  [](Table input) { return cov_table(input); });
-    }
-
-    if (node.kind() == ir::NodeKind::Corr) {
-        if (node.children().empty()) {
-            return std::unexpected("corr node missing child");
-        }
-        return build_unary_materializing_operator(*node.children().front(), registry, scalars,
-                                                  externs, exec, model_out,
-                                                  [](Table input) { return corr_table(input); });
-    }
-
-    if (node.kind() == ir::NodeKind::Transpose) {
-        if (node.children().empty()) {
-            return std::unexpected("transpose node missing child");
-        }
-        return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, exec, model_out,
-            [](Table input) { return transpose_table(input); });
-    }
-
-    if (node.kind() == ir::NodeKind::Join) {
-        const auto& join = ir::node_cast<ir::JoinNode>(node);
-        if (join.children().size() != 2) {
-            return std::unexpected("join node expects exactly two children");
-        }
-        // Only the materializing join reaches here now. A streaming one is a
-        // migrated plan and was built by `build_physical_join` at the seam
-        // above, the same way a migrated map chain never reaches this switch.
-        const ir::Expr* pred = join.predicate().has_value() ? &*join.predicate() : nullptr;
-        return build_binary_materializing_operator(
-            *join.children()[0], *join.children()[1], registry, scalars, externs, exec, model_out,
-            [&](Table left, Table right) {
-                return join_table_impl(left, right, join.kind(), join.keys(), pred, scalars,
-                                       compute_mask, join.suffix(), join.pending_order(),
-                                       join.null_match(), join.expect(), join.take(), &exec);
-            });
-    }
-
-    if (node.kind() == ir::NodeKind::Matmul) {
-        if (node.children().size() != 2) {
-            return std::unexpected("matmul node expects exactly two children");
-        }
-        return build_binary_materializing_operator(
-            *node.children()[0], *node.children()[1], registry, scalars, externs, exec, model_out,
-            [](Table left, Table right) { return matmul_table(left, right); });
-    }
-
-    if (node.kind() == ir::NodeKind::Update) {
-        const auto& update = ir::node_cast<ir::UpdateNode>(node);
-        if (update.children().empty()) {
-            return std::unexpected("update node missing child");
-        }
-        if (update.guard() != nullptr) {
-            return build_unary_materializing_operator(
-                *update.children().front(), registry, scalars, externs, exec, model_out,
-                [&](Table input) -> std::expected<Table, std::string> {
-                    return apply_guarded_update(std::move(input), update, scalars, externs, exec);
-                });
-        }
-        if (!update.group_by().empty()) {
-            const bool all_rank = std::all_of(
-                update.fields().begin(), update.fields().end(), [](const ir::FieldSpec& f) {
-                    return std::holds_alternative<ir::RankExpr>(f.expr.node);
-                });
-            if (!all_rank && update.tuple_fields().empty()) {
-                return build_unary_materializing_operator(
-                    *update.children().front(), registry, scalars, externs, exec, model_out,
-                    [&](Table input) -> std::expected<Table, std::string> {
-                        return grouped_update_table(std::move(input), update.fields(),
-                                                    update.group_by(), scalars, externs, exec);
-                    });
-            }
-            if (!all_rank || !update.tuple_fields().empty()) {
-                return std::unexpected(
-                    "update + by: tuple-bound fields are not yet supported in grouped updates");
-            }
-            return build_unary_materializing_operator(
-                *update.children().front(), registry, scalars, externs, exec, model_out,
-                [&](Table input) -> std::expected<Table, std::string> {
-                    Table result = std::move(input);
-                    for (const auto& field : update.fields()) {
-                        const auto* rank = std::get_if<ir::RankExpr>(&field.expr.node);
-                        auto res = evaluate_rank_column(result, *rank, update.group_by(), exec);
-                        if (!res) {
-                            return std::unexpected(res.error());
-                        }
-                        if (res->validity.has_value()) {
-                            result.add_column(field.alias, std::move(res->column),
-                                              std::move(*res->validity));
-                        } else {
-                            result.add_column(field.alias, std::move(res->column));
-                        }
-                    }
-                    return std::expected<Table, std::string>{std::move(result)};
-                });
-        }
-        // Route to a streaming ChunkedUpdateOperator when every field is
-        // row-local and there are no table-valued tuple assignments.
-        const bool all_row_local =
-            std::all_of(update.fields().begin(), update.fields().end(),
-                        [](const ir::FieldSpec& f) { return is_row_local_update_expr(f.expr); });
-        if (all_row_local && update.tuple_fields().empty()) {
-            auto child_op = build_operator(*update.children().front(), registry, scalars, externs,
-                                           exec, model_out);
-            if (!child_op.has_value()) {
-                return std::unexpected(std::move(child_op.error()));
-            }
-            return std::make_unique<ChunkedUpdateOperator>(
-                std::move(child_op.value()), &update.fields(), scalars, externs, exec);
-        }
-        auto child = build_unary_materializing_operator(
-            *update.children().front(), registry, scalars, externs, exec, model_out,
-            [&](Table input) {
-                return update_table(std::move(input), update.fields(), scalars, externs, exec);
-            });
-        if (!child.has_value()) {
-            return std::unexpected(std::move(child.error()));
-        }
-        auto result = materialize_operator(std::move(child.value()));
-        if (!result.has_value()) {
-            return std::unexpected(std::move(result.error()));
-        }
-        for (const auto& tspec : update.tuple_fields()) {
-            auto src = interpret_node(*tspec.source, registry, scalars, externs, exec);
-            if (!src.has_value()) {
-                return std::unexpected(std::move(src.error()));
-            }
-            if (tspec.aliases.empty()) {
-                for (const auto& entry : src->columns) {
-                    if (entry.validity) {
-                        result->add_column(entry.name, *entry.column, *entry.validity);
-                    } else {
-                        result->add_column(entry.name, *entry.column);
-                    }
-                }
-            } else {
-                if (src->columns.size() != tspec.aliases.size()) {
-                    return std::unexpected(
-                        "tuple assignment: expected " + std::to_string(tspec.aliases.size()) +
-                        " column(s), got " + std::to_string(src->columns.size()));
-                }
-                for (std::size_t i = 0; i < tspec.aliases.size(); ++i) {
-                    const auto& entry = src->columns[i];
-                    if (entry.validity) {
-                        result->add_column(tspec.aliases[i], *entry.column, *entry.validity);
-                    } else {
-                        result->add_column(tspec.aliases[i], *entry.column);
-                    }
-                }
-            }
-        }
-        return make_table_source(std::move(result.value()));
-    }
-
-    if (node.kind() == ir::NodeKind::Resample) {
-        const auto& rs = ir::node_cast<ir::ResampleNode>(node);
-        if (node.children().empty()) {
-            return std::unexpected("resample node missing child");
-        }
-        return build_unary_materializing_operator(
-            *node.children().front(), registry, scalars, externs, exec, model_out,
-            [&](Table input) {
-                return resample_table(input, rs.duration(), rs.group_by(), rs.aggregations());
-            });
-    }
-
-    if (node.kind() == ir::NodeKind::Window) {
-        const auto& win = ir::node_cast<ir::WindowNode>(node);
-        if (node.children().empty()) {
-            return std::unexpected("window node missing child");
-        }
-        const ir::Node& child_node = *node.children().front();
-        if (child_node.kind() != ir::NodeKind::Update) {
-            return std::unexpected(
-                "window: only 'update' is currently supported inside a window block");
-        }
-        const auto& update_node = ir::node_cast<ir::UpdateNode>(child_node);
-        if (child_node.children().empty()) {
-            return std::unexpected("window: update node missing child");
-        }
-        auto source_op = build_operator(*child_node.children().front(), registry, scalars, externs,
-                                        exec, model_out);
-        if (!source_op.has_value()) {
-            return std::unexpected(std::move(source_op.error()));
-        }
-        auto source = materialize_operator(std::move(source_op.value()));
-        if (!source.has_value()) {
-            return std::unexpected(std::move(source.error()));
-        }
-        if (!source->time_index().has_value()) {
-            return std::unexpected(
-                "window requires a TimeFrame — use as_timeframe() to designate a timestamp column");
-        }
-        auto result =
-            update_node.group_by().empty()
-                ? windowed_update_table(std::move(source.value()), update_node.fields(),
-                                        win.duration(), scalars, externs, exec, win.aligned())
-                : grouped_windowed_update_table(std::move(source.value()), update_node.fields(),
-                                                win.duration(), update_node.group_by(), scalars,
-                                                externs, exec, win.aligned());
-        if (!result.has_value()) {
-            return std::unexpected(std::move(result.error()));
-        }
-        if (win.select_only()) {
-            // `window` + `select`: keep only the time index, group keys, and the
-            // listed fields (time index first so the result stays a TimeFrame).
-            std::vector<ir::ColumnRef> keep;
-            robin_hood::unordered_set<std::string> seen;
-            auto keep_col = [&](const std::string& name) {
-                if (seen.insert(name).second) {
-                    keep.push_back(ir::ColumnRef{.name = name});
-                }
-            };
-            if (result->time_index().has_value()) {
-                keep_col(*result->time_index());
-            }
-            for (const auto& key : update_node.group_by()) {
-                keep_col(key.name);
-            }
-            for (const auto& field : update_node.fields()) {
-                keep_col(field.alias);
-            }
-            // A grouped window leaves the rows group-major, and `project_table`
-            // preserves that: it derives with `RowTransform::Preserve`, which
-            // carries `grouped_by` through and drops the ordering only if the
-            // projection removes one of its keys, and the TimeFrame invariant
-            // leaves a group-major ordering alone rather than rewriting it to
-            // the (false) "time index ascending".
-            auto projected = project_table(result.value(), keep);
-            if (!projected.has_value()) {
-                return std::unexpected(std::move(projected.error()));
-            }
-            result = std::move(projected);
-        }
-        return make_table_source(std::move(result.value()));
-    }
-
-    if (node.kind() == ir::NodeKind::AsTimeframe) {
-        const auto& atf = ir::node_cast<ir::AsTimeframeNode>(node);
-        if (node.children().empty()) {
-            return std::unexpected("as_timeframe node missing child");
-        }
-        auto child_op =
-            build_operator(*node.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        return std::make_unique<ChunkedAsTimeframeOperator>(std::move(child_op.value()),
-                                                            atf.column(), exec);
-    }
-
-    if (node.kind() == ir::NodeKind::Model) {
-        const auto& mn = ir::node_cast<ir::ModelNode>(node);
-        if (mn.children().empty()) {
-            return std::unexpected("model node missing child");
-        }
-        auto child_op =
-            build_operator(*mn.children().front(), registry, scalars, externs, exec, model_out);
-        if (!child_op.has_value()) {
-            return std::unexpected(std::move(child_op.error()));
-        }
-        auto input = materialize_operator(std::move(child_op.value()));
-        if (!input.has_value()) {
-            return std::unexpected(std::move(input.error()));
-        }
-        auto result =
-            fit_model(input.value(), mn.formula(), mn.method(), mn.params(), scalars, externs);
-        if (!result.has_value()) {
-            return std::unexpected(std::move(result.error()));
-        }
-        // Linear methods expose coefficients; tree models expose importance;
-        // unsupervised models (e.g. kmeans) have neither, so fall back to the
-        // per-row fitted output (e.g. cluster ids).
-        Table primary = !result.value().coefficients.columns.empty() ? result.value().coefficients
-                        : !result.value().importance.columns.empty() ? result.value().importance
-                                                                     : result.value().fitted_values;
-        if (model_out != nullptr) {
-            *model_out = std::move(result.value());
-        }
-        return make_table_source(std::move(primary));
-    }
-
-    if (node.kind() == ir::NodeKind::Construct || node.kind() == ir::NodeKind::Stream) {
-        auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
-        if (!table.has_value()) {
-            return std::unexpected(std::move(table.error()));
-        }
-        return make_table_source(std::move(table.value()));
-    }
-
-    if (node.kind() == ir::NodeKind::Program) {
-        const auto& program = ir::node_cast<ir::ProgramNode>(node);
-        auto preamble = execute_program_preamble(program.preamble(), scalars, externs);
-        if (!preamble.has_value()) {
-            return std::unexpected(std::move(preamble.error()));
-        }
-        return build_operator(program.main_node(), registry, scalars, externs, exec, model_out);
-    }
-
-    // Remaining node kinds fall through to interpret_node. Scan is already
-    // handled as a source by the caller.
+    // Every other node kind is a materialized-call fallback: not migrated by
+    // `plan_physical`, counted just above, and executed by one whole-table
+    // `interpret_node` call rather than a per-kind branch that re-enters
+    // `build_operator` for each child. `interpret_node` recurses through
+    // itself, so a fallback subtree is planned once, here, not per node.
+    // Construct / Stream / Program (preamble), Model (`model_out`), and the
+    // reshape / stat / window / update / matmul / materializing-join kinds all
+    // resolve there. The input side of these breakers is no longer built
+    // through the fused physical path; `physical_fallbacks_for(kind)` buckets
+    // the backlog so a kind can later be lifted to a migrated breaker-over-
+    // pipeline the way Join / Aggregate / Order were. Scan is handled as a
+    // source by the caller.
     auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
     if (!table.has_value()) {
         return std::unexpected(std::move(table.error()));

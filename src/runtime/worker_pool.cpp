@@ -377,8 +377,7 @@ auto stage_thread_peak() noexcept -> std::size_t {
 }
 
 WorkerPool::WorkerPool(std::size_t threads)
-    : impl_(std::make_unique<Impl>()),
-      threads_(kInlinePool ? 1 : (threads == 0 ? 1 : threads)) {
+    : impl_(std::make_unique<Impl>()), threads_(kInlinePool ? 1 : (threads == 0 ? 1 : threads)) {
     if constexpr (kInlinePool) {
         return;  // no worker threads; `submit()` runs bodies inline
     }

@@ -261,14 +261,13 @@ disagree.
 
 ## Where the model is still muddy
 
-**The structural one:** breaker parallelism has no owner above the operator (see
-"Who owns which decision"). A breaker's fan-out decision, its partition count,
-and its worker cap are private to `chunked.cpp`, invisible to `explain
-physical`, and un-A/B-able except through `IBEX_CORES`. Every other item below is
-a symptom of that — the private thresholds and worker caps exist because there
-is no plan-level place to put them. Fixing the altitude (decomposing breakers
-into planned phases, `kernel-pipeline` Phase 4) is what makes the rest
-tractable; fixing the symptoms first just moves nine constants into one header.
+**The structural owner now exists for migrated breakers.** Distinct, streaming
+Join, and streaming Aggregate take their fan-out policies from explicit
+physical nodes and expose those decisions through `explain physical`.
+Aggregate's four phases additionally live outside `chunked.cpp`. Remaining
+operator-private decisions belong to breaker families that have not completed
+that migration; do not generalize their local thresholds into a second policy
+system.
 
 **The symptoms** (`plans/parallelism-overview.md` Part 2 is the live
 catalogue): type-exclusion rules with no shared "is this type parallel-capable
@@ -436,8 +435,9 @@ Every slice:
   once.
 - **Not removing the runtime checks.** `on_worker_pool_thread()` and the
   first-chunk floor check are the operator's, permanently.
-- **Not the `chunked.cpp` split.** That is Phase 5, and it is deliberately
-  *after* this — the plan says decomposition makes the split easier.
+- **Not ownership of the remaining `chunked.cpp` split.** This contract enabled
+  Phase 5; Aggregate has now moved, while join/planner/executor extraction is
+  tracked by the kernel-pipeline plan.
 - **Not a row-count estimator project.** The estimate is opportunistic (footer
   stats, exact child counts). `partition_count = 0 / derive` is the honest
   default and preserves today's behavior exactly.

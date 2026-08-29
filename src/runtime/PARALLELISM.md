@@ -154,8 +154,9 @@ scatter** for anything variable-width.
 
 ## Who owns which decision
 
-The honest answer is **it depends on the operator category**, and only one
-category has a single clean owner today.
+The answer depends on the operator category. Map chains and the promoted
+Distinct, Join, and Aggregate policies have a clean plan/executor split;
+several remaining breaker internals do not.
 
 ### The stable parts
 
@@ -171,52 +172,48 @@ category has a single clean owner today.
 |---|---|---|---|
 | **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
 | **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases. |
-| **Aggregate** | The plan owns `AggregatePlan` (which construction path). **Discovery, per-partition slots, the owned-aggregate hot table, and the finalize merge are inside `ChunkedAggregateOperator`.** | Partial. | Which path, not the phases. |
-| **Distinct / Order / TopK / Head / Tail** | **Nothing in the plan.** `execution_capability(Distinct)` returns `ParallelBarrier`, but that value is **never read to make a decision** — it names what a future executor *could* do. `build_physical_distinct` just constructs `ChunkedDistinctOperator`, which owns the entire decision internally: the `can_fan_out()` / `on_worker_pool_thread()` guard, a private `kMinRows` (hardcoded, and twice — accumulate and finalize), the partition count from `compute_budget()`, the two-pass "one worker per partition scans the whole chunk" model. | **No.** | **No.** |
-| **Layer C fan-out inside any operator** (group discovery, sort gather, decode, semi/anti predicate) | Always the operator's, each with its own private row threshold and its own `min(budget, pool, cap)` worker count. | No. | No. |
+| **Aggregate** | The plan owns the adaptive aggregate strategy, positional `AggregateColumnMapping`, and both current fan-out policies (`partition`, `finalize`). The executor consumes them; discovery, accumulation, final ordering, and emission are still structurally inside one operator. | **Yes for current policy; not yet for structural decomposition.** | Strategy + both policy phases. |
+| **Distinct** | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions. | **Yes, authoritative.** | Yes. |
+| **Order** | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative. | **Yes, descriptive.** | Yes. |
+| **TopK / Head / Tail / FilterHead / FilterTail** | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort. | **Yes; no parallel policy.** | Serial-by-design reason. |
+| **Remaining Layer C fan-out inside operators** (sort gather, decode, semi/anti predicate, and data-dependent aggregate specialization gates) | The operator owns decisions not yet promoted. Migrated Distinct, Join, and Aggregate paths instead read their resolved plan policy and retain only runtime/data-dependent admission checks. | Mixed. | Only promoted phases. |
 
-**So: there is no single owner of "distinct parallelism" — and the same is true
-of every barrier operator's parallelism.** For map chains the physical plan is
-that owner; for breakers it owns construction (and for join/aggregate,
-structure), and the parallel-execution decisions live inside the operator,
-unrepresented, un-inspectable, and tunable only by editing the operator. Closing
-that gap — decomposing the breakers into planned phases — is
-`kernel-pipeline-execution-plan.md` Phase 4, which is why that plan distinguishes
-"construction ownership done" (backlog 116→6) from "decomposition not started".
+**There is not yet one owner for every breaker's parallelism.** The physical
+plan owns map chains and the promoted Distinct, Join, and Aggregate policies;
+other breaker internals remain unrepresented and tunable only at their use
+sites. Closing the remaining gap — and turning aggregate's two policy records
+into separately scheduled structural phases — is
+`kernel-pipeline-execution-plan.md` Phase 4.
 
-### The one rule that already holds everywhere
+### The split enforced by migrated parallel paths
 
-**The plan says whether parallel execution is *permitted*; the operator says
-whether it is *desirable* here** (`exec.can_fan_out()`, row/cell floors, morsel
-count, `on_worker_pool_thread()`). `plan.mode == MorselParallel` is a
-capability, and a serial execution of that plan (`can_fan_out()` false) must
-still be correct — a q19 crash under `IBEX_CORES=1` came from an executor that
-checked only `plan.mode`. For breakers, both halves currently live in the
-operator.
+**The plan says whether parallel execution is *permitted*; the operator handles
+facts available only at runtime** (actual rows/cells, morsel count,
+`on_worker_pool_thread()`, and data-dependent specialization gates).
+`plan.mode == MorselParallel` is a capability, and a serial execution of that
+plan (`can_fan_out()` false) must still be correct — a q19 crash under
+`IBEX_CORES=1` came from an executor that checked only `plan.mode`. Breakers not
+yet promoted still combine these halves at their use sites.
 
 ## Worked example: `t[distinct { g, v }]`
 
 1. **Logical IR** — a `Distinct` node over a `Scan`. The optimizer decides
    column demand (`g`, `v`), nothing about execution.
-2. **`plan_physical`** — the root is `Distinct`, not a map chain, so
-   `plan.migrated == false`, `reason == NotMapChain`. `plan.mode` is irrelevant
-   (it's for map chains). No `DistinctPlan` field exists. `explain physical`
-   prints `MaterializedCall(Distinct)` — or, since `49ca33c1`, records it as a
-   plan-built breaker — and says nothing about how it will run.
-3. **`build_physical_distinct`** — constructs `ChunkedDistinctOperator(child,
-   exec)`. Passes the `ExecutionContext` in; makes no parallelism decision.
-4. **`ChunkedDistinctOperator`, first chunk** — decides *everything*: if
-   `!exec.can_fan_out() || on_worker_pool_thread() || rows < 32768` it stays
-   serial and pins `dedup_part_count_ = 1` for all later chunks; otherwise it
-   derives `part_count` from `compute_budget()`, hash-partitions by packed key,
-   and runs one worker per partition (each scanning the whole chunk, skipping
-   rows not in its partition — the proven Pass-2 model). Determinism device:
-   workers record a keep-flag at a row, never a position, so the output is
-   rebuilt by scanning flags in row order.
+2. **`plan_physical`** — records a migrated `Breaker(Distinct)` with one
+   `dedup` phase: packed-key strategy, 32768-row floor, worker ceiling, and any
+   available row estimate. `explain physical` renders that unresolved policy.
+3. **`build_physical_distinct`** — resolves the policy against the
+   `ExecutionContext` and worker pool, then passes it to
+   `ChunkedDistinctOperator`.
+4. **`ChunkedDistinctOperator`, first chunk** — reads the resolved permission
+   and cap, applies the facts only it knows (nesting and actual rows), and pins
+   a derived partition count for later chunks. Each worker scans the chunk for
+   its partition. Workers record keep-flags by row, so output is rebuilt in
+   input order rather than completion order.
 
-The only externally visible knob is `IBEX_CORES` (via `can_fan_out()` and
-`compute_budget()`). The `32768` floor and the partition strategy are editable
-only in `chunked.cpp`.
+The externally visible compute knob is `IBEX_CORES`; the 32768-row floor and
+packed-key strategy are named once by `distinct_dedup_parallelism` and carried
+by the physical plan.
 
 ## The determinism contract
 
@@ -237,11 +234,10 @@ The devices:
 
 The only legitimate exceptions: PDS-H q01/q09/q15 differ by ≤1 ulp from parallel
 float reduction order (itself thread-count-independent), enumerated in
-`beat-polars-plan.md` §5. Anything else that differs is a bug. **Known standing
-violation:** the two-Int64-key owned aggregate (`try_owned_pair`) and the serial
-path re-associate differently and disagree bit-for-bit at ≥65536 rows, with no
-test covering it — `kernel-pipeline-execution-plan.md` "The determinism
-constraint is already broken".
+`beat-polars-plan.md` §5. Anything else that differs is a bug. The former
+two-Int64-key owned-aggregate divergence no longer reproduces; the
+"two-key grouped aggregate is deterministic across thread counts" regression
+test now guards the serial and parallel paths.
 
 ## Configuration surface
 
@@ -350,8 +346,9 @@ struct BreakerParallelism {
 };
 
 // One breaker = one or more named phases, each with its own fan-out point.
-// Distinct/Order/TopK have one; a decomposed Aggregate has three
-// (discovery / accumulate / finalize); a Join has two (hash-build / probe).
+// Distinct/Order/TopK have one; Join has two (hash-build / probe); Aggregate
+// currently has partition + finalize policies and will gain structural
+// discovery / accumulation / final-ordering / emission phases when decomposed.
 struct BreakerPhase {
     std::string_view    name;
     BreakerParallelism  parallelism;
@@ -510,9 +507,8 @@ Every slice:
    regressed +25%/+40%. The guard test now exists: `tests/test_interpreter.cpp`
    "two-key grouped aggregate is deterministic across thread counts". Slice 1
    (observability) LANDED: `aggregate_{partition,finalize}_parallelism`,
-   `plan_physical` fills the phases, `explain physical` prints them,
-   `ChunkedAggregateOperator::check_agg_plan` aborts on planner/operator
-   disagreement — byte-identical, full suite + q01/q10/q13/q18/q20/q21 at 1c/8c.
+   `plan_physical` fills the phases, and `explain physical` prints them —
+   byte-identical, full suite + q01/q10/q13/q18/q20/q21 at 1c/8c.
    Slice 2 (partition authority) LANDED: `try_owned` and `try_discover_
    partitioned` read `par_.partition.{decline,worker_cap}` for fan-out
    permission and the worker cap; the open-coded `!can_fan_out()` +
@@ -534,4 +530,6 @@ Every slice:
    `parallel_aggregate_finalizes` so a silently-stopped gate is a red test.
    Byte-identical vs the slice-1 base on q01/q10/q13/q18/q20/q21, full suite
    1814/1814. **The Aggregate step of "parallelism as a plan decision" is
-   complete.**
+   complete.** The executor now has an explicit physical-plan seam; mutation
+   tests alter mapped positions, phase order, and worker ceilings and prove the
+   changed plan is consumed or rejected rather than reconstructed locally.

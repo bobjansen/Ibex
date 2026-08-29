@@ -4,9 +4,9 @@
 2026-08-22; Phase 2 complete except `KernelContext` (deliberately unbuilt);
 Phase 3's handoff/island/raw-thread work is complete, with accounting and
 DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
-authority are done, while true operator decomposition remains open; Phase 5 is
-in progress: fused logical node kinds are retired and the aggregate and
-streaming inner-join execution families are now outside the monolith. **Compacted
+authority are done, and the targeted join and aggregate decomposition is
+complete; Phase 5 is in progress: fused logical node kinds are retired and the
+aggregate and streaming inner-join execution families are now outside the monolith. **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -26,11 +26,12 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 ## Why
 
-`src/runtime/chunked.cpp` remains the physical planner, most streaming operator
-implementations, parallel pipelines, pipelined stages, and a large set of
-operator-specific eligibility rules. Aggregate and streaming inner join have
-moved to family-owned translation units, but the remaining responsibilities
-are still grown together because
+`src/runtime/chunked.cpp` remains the physical-plan execution adapter, most
+streaming operator implementations, parallel pipelines, pipelined stages, and
+a large set of operator-specific eligibility rules. Planning itself already
+lives in `physical_plan.cpp`. Aggregate and streaming inner join have moved to
+family-owned translation units, but the remaining responsibilities are still
+grown together because
 `build_operator(const ir::Node&)` lowers logical nodes directly into mutable
 `Operator::next()` objects. Three costs: (1) a physical choice has no
 representation ("stream this join", "materialize this aggregate" are builder
@@ -114,12 +115,13 @@ parser AST  →  typed logical IR  →  physical plan  →  pipeline executable 
 ported, fusion is physical, fused node kinds retired as an execution concern);
 Phase 3 items 1/3/4 (one executor-owned ordered handoff, islands dissolved into
 a pipeline mode, no raw-thread branch concurrency); Phase 4 **construction
-ownership and parallelism authority** (every breaker PDS-H reaches is built
-from the plan — backlog 116→6 breakers, plan describes 97% of real-work nodes;
-Distinct, streaming Join, and streaming Aggregate read resolved fan-out policy
-from the plan).
+ownership, parallelism authority, and targeted decomposition** (every breaker
+PDS-H reaches is built from the plan — backlog 116→6 breakers, plan describes
+97% of real-work nodes; Distinct, streaming Join, and streaming Aggregate read
+resolved fan-out policy from the plan; join and aggregate expose explicit
+execution phases).
 
-**The 97% still flatters it:** the streaming inner join is shaped as explicit
+**What the 97% contains:** the streaming inner join is shaped as explicit
 `HashBuild` and `HashProbe` nodes across a typed runtime-oriented barrier. The
 hash-aggregate fallback now has typed discovery, accumulation, final-ordering,
 and emission plan nodes. A serial coordinator invokes all four: discovery
@@ -215,12 +217,14 @@ separate streaming operator.
    and streaming inner join are extracted behind private factories. Their hot
    templates, state, and kernels remain together in family-owned translation
    units; the generic morsel executor sees only a copyable join-probe factory.
-   Semi/anti and materializing joins remain in their existing owners. Next:
-   separate the physical planner and pipeline executor from the residual
+   Semi/anti and materializing joins remain in their existing owners. Next,
+   as two separately validated moves: extract the physical-plan execution
+   adapter, then extract the generic pipeline/morsel executor from the residual
    operator families.
-6. **Sweep process-global plan counters in tests** — one test passed while its
-   premise was false (`physical_materialized_calls` is process-wide, other tests
-   in the binary bump it). Others may lean the same way.
+6. **Sweep process-global plan counters in tests — DONE 2026-08-29.** The
+   formerly false-premise test now checks the migrated pipeline counter. All
+   three remaining counter assertions take a local before/after delta, and no
+   test reads `physical_materialized_calls`; no counter redesign is required.
 7. **Phase 3 item 5 — per-pipeline scheduling accounting** — small, worth more
    once the join and aggregate phases have independent identities to attribute.
 8. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked**
@@ -428,11 +432,12 @@ predicates — porting them ports the semantics, not the construction).
 Order `ececc75f`, Head/Distinct `49ca33c1`). **Parallelism authority is also
 DONE**: Distinct, streaming Join, and streaming Aggregate receive resolved
 `BreakerParallelism` from the plan rather than deriving their worker caps and
-fan-out permission privately. **Decomposition remains open** — the operators
-are still largely unchanged; the branches moved into `build_physical_join` /
-`build_physical_aggregate` rather than dissolving into pipeline stages, so the
-exit criterion ("fast paths no longer depend on special builder branches") is
-**not met**.
+fan-out permission privately. **Targeted decomposition is DONE**: streaming
+inner join is an explicit HashBuild → HashProbe execution shape, and aggregate
+is an explicit Discovery → Accumulation → FinalOrdering → Emission lifecycle.
+Both execution families now live outside `chunked.cpp`; the remaining Phase 5
+work is separating the generic physical-plan adapter and morsel executor from
+the residual operator families.
 
 **The decomposition target is specified in
 [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md), "Target:
@@ -497,9 +502,11 @@ at all (a one-valued strategy enum would be ceremony).
 
 ### Phase 5 — retire the monolith, simplify IR
 
-1. Split by ownership: `physical_planner`, `pipeline_executor`, `kernels/`, one
-   file/family per breaker. **IN PROGRESS:** aggregate and streaming inner join
-   complete; physical planner / pipeline executor separation next.
+1. Split by ownership: `physical_plan`, `physical_executor`,
+   `pipeline_executor`, `kernels/`, one file/family per breaker. **IN
+   PROGRESS:** aggregate and streaming inner join complete; planning already
+   lives in `physical_plan.cpp`. Extract the physical-plan execution adapter
+   next, then the generic pipeline/morsel executor as a separate move.
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
@@ -553,8 +560,9 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    were byte-identical and a wash (geomean −0.3%, every query under the 2%
    practical floor). The opt-in `IBEX_PROBE_MORSELS=1` POC retains a
    pre-existing SF4 q09 stall in both baseline and extracted trees; it remains
-   disabled and is a separate correctness follow-up. Next: physical planner /
-   pipeline executor separation.
+   disabled and is a separate correctness follow-up. Next: physical-plan
+   execution-adapter extraction, followed separately by pipeline/morsel-executor
+   extraction.
 
 ## Acceptance gates (every phase, before the next starts)
 

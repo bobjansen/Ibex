@@ -43,6 +43,10 @@ are bundled at `bin/ui`; Node.js is only needed when building Ibex from source.
 The `--data-dir` directory is the sandbox the UI can read and write. Press
 Ctrl+C in the terminal to stop the server.
 
+Each result can be viewed as a table or a quick chart (line / area / bar /
+scatter, axes auto-picked), exported to CSV, or inspected per column (click a
+header for min / max / mean / distinct over the loaded rows).
+
 Notable language features:
   - compact bracket syntax for filtering, selecting, updating, grouping, ordering, joining, and reshaping tables
   - excellent columnar execution, with parallelism for eligible large operations

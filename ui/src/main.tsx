@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import type {
@@ -332,8 +339,554 @@ function displayCellValue(value: unknown, type: string): string {
     : floatFormatter.format(value);
 }
 
+// ---- charts, stats, CSV -------------------------------------------------------
+
+const NUMERIC_TYPES = new Set(["Int64", "Float64"]);
+const TEMPORAL_TYPES = new Set(["Date", "Timestamp"]);
+
+const compactNumber = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 2,
+});
+
+function parseTime(value: unknown): number {
+  if (typeof value !== "string") return NaN;
+  return Date.parse(value.replace(" ", "T").replace(/(\.\d{3})\d+/, "$1"));
+}
+
+// Evenly spaced "nice" tick values across [min, max].
+function niceTicks(min: number, max: number, count: number): number[] {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max)
+    return [min];
+  const step0 = (max - min) / count;
+  const mag = 10 ** Math.floor(Math.log10(step0));
+  const norm = step0 / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const ticks: number[] = [];
+  for (
+    let t = Math.ceil(min / step) * step;
+    t <= max + step * 1e-9;
+    t += step
+  ) {
+    ticks.push(Number(t.toFixed(10)));
+  }
+  return ticks;
+}
+
+// Largest-Triangle-Three-Buckets downsample, keeping visual shape.
+function lttb(
+  points: { x: number; y: number; label: string }[],
+  threshold: number,
+): typeof points {
+  const n = points.length;
+  if (threshold >= n || threshold < 3) return points;
+  const sampled = [points[0]];
+  const bucket = (n - 2) / (threshold - 2);
+  let a = 0;
+  for (let i = 0; i < threshold - 2; i += 1) {
+    const start = Math.floor((i + 1) * bucket) + 1;
+    const end = Math.min(Math.floor((i + 2) * bucket) + 1, n);
+    let avgX = 0;
+    let avgY = 0;
+    for (let j = start; j < end; j += 1) {
+      avgX += points[j].x;
+      avgY += points[j].y;
+    }
+    const len = end - start || 1;
+    avgX /= len;
+    avgY /= len;
+    const rangeStart = Math.floor(i * bucket) + 1;
+    const rangeEnd = Math.floor((i + 1) * bucket) + 1;
+    const pa = points[a];
+    let best = rangeStart;
+    let bestArea = -1;
+    for (let j = rangeStart; j < rangeEnd; j += 1) {
+      const area = Math.abs(
+        (pa.x - avgX) * (points[j].y - pa.y) -
+          (pa.x - points[j].x) * (avgY - pa.y),
+      );
+      if (area > bestArea) {
+        bestArea = area;
+        best = j;
+      }
+    }
+    sampled.push(points[best]);
+    a = best;
+  }
+  sampled.push(points[n - 1]);
+  return sampled;
+}
+
+function useElementWidth() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(720);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const observer = new ResizeObserver((entries) => {
+      const measured = entries[0]?.contentRect.width;
+      if (measured) setWidth(measured);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, width] as const;
+}
+
+type Mark = "line" | "area" | "bar" | "scatter";
+
+function Chart({ page }: { page: Page }) {
+  const tagged = page.columns.map((column, index) => ({ ...column, index }));
+  const numeric = tagged.filter((column) => NUMERIC_TYPES.has(column.type));
+  const temporal = tagged.filter((column) => TEMPORAL_TYPES.has(column.type));
+  const categorical = tagged.filter(
+    (column) =>
+      !NUMERIC_TYPES.has(column.type) && !TEMPORAL_TYPES.has(column.type),
+  );
+
+  const defaultX = temporal[0]?.index ?? categorical[0]?.index ?? -1;
+  const [xIndex, setXIndex] = useState(defaultX);
+  const [yIndex, setYIndex] = useState(
+    numeric.find((column) => column.index !== defaultX)?.index ??
+      numeric[0]?.index ??
+      -1,
+  );
+  const xColumn = xIndex >= 0 ? page.columns[xIndex] : null;
+  const xIsCategory =
+    !!xColumn &&
+    !NUMERIC_TYPES.has(xColumn.type) &&
+    !TEMPORAL_TYPES.has(xColumn.type);
+  const [mark, setMark] = useState<Mark>(xIsCategory ? "bar" : "line");
+
+  const [wrapRef, width] = useElementWidth();
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [hover, setHover] = useState<{
+    px: number;
+    py: number;
+    label: string;
+    y: number;
+  } | null>(null);
+
+  if (yIndex < 0) {
+    return (
+      <div className="chart" ref={wrapRef}>
+        <p className="chart-empty">
+          No numeric column to plot — add an aggregate to the query.
+        </p>
+      </div>
+    );
+  }
+
+  const xValue = (row: unknown[], position: number): number => {
+    if (xIndex < 0) return position;
+    const cell = row[xIndex];
+    if (TEMPORAL_TYPES.has(xColumn!.type)) return parseTime(cell);
+    return typeof cell === "number" ? cell : NaN;
+  };
+
+  const collected: { x: number; y: number; label: string }[] = [];
+  page.rows.forEach((row, position) => {
+    const y = row[yIndex];
+    if (typeof y !== "number" || !Number.isFinite(y)) return;
+    const x = xIsCategory ? position : xValue(row, position);
+    if (!xIsCategory && !Number.isFinite(x)) return;
+    collected.push({
+      x,
+      y,
+      label: xIndex >= 0 ? rawCellValue(row[xIndex]) : String(position + 1),
+    });
+  });
+
+  let points = collected;
+  let truncated = 0;
+  if (xIsCategory) {
+    if (points.length > 60) {
+      truncated = points.length - 60;
+      points = points.slice(0, 60);
+    }
+  } else {
+    points = [...collected].sort((a, b) => a.x - b.x);
+    if (points.length > 2000) points = lttb(points, 2000);
+  }
+
+  const height = Math.min(460, Math.max(240, Math.round(width * 0.5)));
+  const margin = { top: 12, right: 18, bottom: 42, left: 62 };
+  const innerW = Math.max(1, width - margin.left - margin.right);
+  const innerH = Math.max(1, height - margin.top - margin.bottom);
+
+  if (points.length === 0) {
+    return (
+      <div className="chart" ref={wrapRef}>
+        <ChartToolbar
+          {...{ xIndex, setXIndex, yIndex, setYIndex, mark, setMark }}
+          columns={page.columns}
+          numeric={numeric}
+        />
+        <p className="chart-empty">No plottable rows in this result.</p>
+      </div>
+    );
+  }
+
+  const ys = points.map((point) => point.y);
+  let yMin = Math.min(...ys);
+  let yMax = Math.max(...ys);
+  if (yMin === yMax) {
+    yMin -= 1;
+    yMax += 1;
+  }
+  if (mark === "bar" || mark === "area") {
+    if (yMin > 0) yMin = 0;
+    if (yMax < 0) yMax = 0;
+  } else {
+    const pad = (yMax - yMin) * 0.06;
+    yMin -= pad;
+    yMax += pad;
+  }
+  const yTicks = niceTicks(yMin, yMax, 4);
+  const yScale = (value: number) =>
+    margin.top + innerH - ((value - yMin) / (yMax - yMin)) * innerH;
+
+  const step = innerW / points.length;
+  const xs = points.map((point) => point.x);
+  let xMin = Math.min(...xs);
+  let xMax = Math.max(...xs);
+  if (xMin === xMax) {
+    xMin -= 1;
+    xMax += 1;
+  }
+  const linearX = (value: number) =>
+    margin.left + ((value - xMin) / (xMax - xMin)) * innerW;
+
+  const plotted = points.map((point, index) => ({
+    ...point,
+    px: xIsCategory ? margin.left + step * (index + 0.5) : linearX(point.x),
+    py: yScale(point.y),
+  }));
+
+  const baselineY = yScale(Math.max(yMin, Math.min(0, yMax)));
+  const linePath = plotted
+    .map((point, index) => `${index ? "L" : "M"}${point.px},${point.py}`)
+    .join(" ");
+
+  const isTime = !!xColumn && TEMPORAL_TYPES.has(xColumn.type);
+  const spanMs = xMax - xMin;
+  const formatX = (value: number, label: string): string => {
+    if (xIsCategory)
+      return label.length > 12 ? `${label.slice(0, 11)}…` : label;
+    if (xIndex < 0) return String(Math.round(value));
+    if (isTime) {
+      const date = new Date(value);
+      return spanMs < 86_400_000
+        ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : date.toLocaleDateString();
+    }
+    return compactNumber.format(value);
+  };
+
+  const xTicks = xIsCategory
+    ? plotted
+        .filter(
+          (_, index) =>
+            index % Math.ceil(plotted.length / 12) === 0 ||
+            plotted.length <= 12,
+        )
+        .map((point) => ({ x: point.px, text: formatX(point.x, point.label) }))
+    : niceTicks(xMin, xMax, 6).map((value) => ({
+        x: linearX(value),
+        text: formatX(value, ""),
+      }));
+  const rotateX = xIsCategory && plotted.length > 8;
+
+  const handleMove = (event: ReactMouseEvent) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const mx = event.clientX - svg.getBoundingClientRect().left;
+    let nearest = plotted[0];
+    for (const point of plotted) {
+      if (Math.abs(point.px - mx) < Math.abs(nearest.px - mx)) nearest = point;
+    }
+    setHover({
+      px: nearest.px,
+      py: nearest.py,
+      label: nearest.label,
+      y: nearest.y,
+    });
+  };
+
+  return (
+    <div className="chart" ref={wrapRef}>
+      <ChartToolbar
+        {...{ xIndex, setXIndex, yIndex, setYIndex, mark, setMark }}
+        columns={page.columns}
+        numeric={numeric}
+      />
+      <div className="chart-canvas">
+        <svg
+          ref={svgRef}
+          width={width}
+          height={height}
+          onMouseMove={handleMove}
+          onMouseLeave={() => setHover(null)}
+        >
+          {yTicks.map((tick) => {
+            const y = yScale(tick);
+            return (
+              <g key={tick}>
+                <line
+                  className="chart-grid"
+                  x1={margin.left}
+                  x2={width - margin.right}
+                  y1={y}
+                  y2={y}
+                />
+                <text
+                  className="chart-axis"
+                  x={margin.left - 8}
+                  y={y + 3}
+                  textAnchor="end"
+                >
+                  {compactNumber.format(tick)}
+                </text>
+              </g>
+            );
+          })}
+          {xTicks.map((tick, index) => (
+            <text
+              key={index}
+              className="chart-axis"
+              x={tick.x}
+              y={height - margin.bottom + 16}
+              textAnchor={rotateX ? "end" : "middle"}
+              transform={
+                rotateX
+                  ? `rotate(-30 ${tick.x} ${height - margin.bottom + 16})`
+                  : undefined
+              }
+            >
+              {tick.text}
+            </text>
+          ))}
+
+          {mark === "area" && (
+            <path
+              className="chart-area"
+              d={`${linePath} L${plotted[plotted.length - 1].px},${baselineY} L${plotted[0].px},${baselineY} Z`}
+            />
+          )}
+          {(mark === "line" || mark === "area") && (
+            <path className="chart-line" d={linePath} />
+          )}
+          {mark === "bar" &&
+            plotted.map((point, index) => (
+              <rect
+                key={index}
+                className="chart-bar"
+                x={point.px - Math.min(step * 0.4, 22)}
+                width={Math.min(step * 0.8, 44)}
+                y={Math.min(point.py, baselineY)}
+                height={Math.abs(baselineY - point.py)}
+              />
+            ))}
+          {mark === "scatter" &&
+            plotted.map((point, index) => (
+              <circle
+                key={index}
+                className="chart-dot"
+                cx={point.px}
+                cy={point.py}
+                r={2.5}
+              />
+            ))}
+
+          {hover && (
+            <line
+              className="chart-crosshair"
+              x1={hover.px}
+              x2={hover.px}
+              y1={margin.top}
+              y2={margin.top + innerH}
+            />
+          )}
+        </svg>
+        {hover && (
+          <div
+            className="chart-tip"
+            style={{ left: hover.px + 10, top: hover.py }}
+          >
+            <strong>
+              {displayCellValue(hover.y, page.columns[yIndex].type)}
+            </strong>
+            <span>{hover.label}</span>
+          </div>
+        )}
+      </div>
+      {truncated > 0 && (
+        <p className="chart-note">
+          Showing the first 60 categories (+{truncated} more).
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ChartToolbar({
+  columns,
+  numeric,
+  xIndex,
+  setXIndex,
+  yIndex,
+  setYIndex,
+  mark,
+  setMark,
+}: {
+  columns: Column[];
+  numeric: { name: string; index: number }[];
+  xIndex: number;
+  setXIndex: (value: number) => void;
+  yIndex: number;
+  setYIndex: (value: number) => void;
+  mark: Mark;
+  setMark: (value: Mark) => void;
+}) {
+  return (
+    <div className="chart-toolbar">
+      <label>
+        x
+        <select
+          value={xIndex}
+          onChange={(event) => setXIndex(Number(event.target.value))}
+        >
+          <option value={-1}>(row index)</option>
+          {columns.map((column, index) => (
+            <option key={column.name} value={index}>
+              {column.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        y
+        <select
+          value={yIndex}
+          onChange={(event) => setYIndex(Number(event.target.value))}
+        >
+          {numeric.map((column) => (
+            <option key={column.name} value={column.index}>
+              {column.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        mark
+        <select
+          value={mark}
+          onChange={(event) => setMark(event.target.value as Mark)}
+        >
+          <option value="line">line</option>
+          <option value="area">area</option>
+          <option value="bar">bar</option>
+          <option value="scatter">scatter</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
+function csvField(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const text = String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsv(page: Page): string {
+  const header = page.columns.map((column) => csvField(column.name)).join(",");
+  const body = page.rows.map((row) => row.map(csvField).join(",")).join("\r\n");
+  return `${header}\r\n${body}`;
+}
+
+function computeStats(page: Page, index: number): [string, string][] {
+  const type = page.columns[index].type;
+  const values = page.rows.map((row) => row[index]);
+  const present = values.filter((value) => value !== null);
+  const stats: [string, string][] = [
+    ["n", String(present.length)],
+    ["nulls", String(values.length - present.length)],
+  ];
+  if (NUMERIC_TYPES.has(type)) {
+    const nums = present.filter(
+      (value): value is number => typeof value === "number",
+    );
+    if (nums.length) {
+      const sorted = [...nums].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const median =
+        sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
+      stats.push(
+        ["min", displayCellValue(sorted[0], type)],
+        ["max", displayCellValue(sorted[sorted.length - 1], type)],
+        ["mean", displayCellValue(mean, "Float64")],
+        ["median", displayCellValue(median, "Float64")],
+      );
+    }
+  } else if (TEMPORAL_TYPES.has(type)) {
+    const sorted = present.map(String).sort();
+    if (sorted.length) {
+      stats.push(["min", sorted[0]], ["max", sorted[sorted.length - 1]]);
+    }
+  } else {
+    const counts = new Map<string, number>();
+    for (const value of present) {
+      const key = String(value);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    let top = "";
+    let topCount = 0;
+    for (const [key, count] of counts) {
+      if (count > topCount) {
+        top = key;
+        topCount = count;
+      }
+    }
+    stats.push(["distinct", String(counts.size)]);
+    if (top) stats.push(["top", `${top} (${topCount})`]);
+  }
+  return stats;
+}
+
+function ColumnStats({
+  page,
+  index,
+  onClose,
+}: {
+  page: Page;
+  index: number;
+  onClose: () => void;
+}) {
+  const stats = computeStats(page, index);
+  const partial = page.rows.length < page.total_rows;
+  return (
+    <div className="column-stats">
+      <strong>{page.columns[index].name}</strong>
+      {stats.map(([key, value]) => (
+        <span key={key}>
+          <i>{key}</i> {value}
+        </span>
+      ))}
+      {partial && (
+        <span className="column-stats-scope">
+          over {page.rows.length.toLocaleString()} loaded rows
+        </span>
+      )}
+      <button onClick={onClose}>×</button>
+    </div>
+  );
+}
+
 function Grid({ page }: { page: Page }) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const [statsColumn, setStatsColumn] = useState<number | null>(null);
   const virtualizer = useVirtualizer({
     count: page.rows.length,
     getScrollElement: () => parentRef.current,
@@ -385,26 +938,42 @@ function Grid({ page }: { page: Page }) {
     </div>
   );
   return (
-    <div className="result-grid" ref={parentRef}>
-      <div className="grid-header" style={columns}>
-        {page.columns.map((column) => (
-          <strong key={column.name}>
-            {column.name} <small>{column.type}</small>
-          </strong>
-        ))}
-      </div>
-      <div className="grid-body" style={bodyStyle}>
-        {isBoundedPage
-          ? page.rows.map((row, index) => renderRow(row, index))
-          : virtualizer
-              .getVirtualItems()
-              .map((item) =>
-                renderRow(
-                  page.rows[item.index],
-                  String(item.key),
-                  `translateY(${item.start}px)`,
-                ),
-              )}
+    <div className="grid-wrap">
+      {statsColumn !== null && (
+        <ColumnStats
+          page={page}
+          index={statsColumn}
+          onClose={() => setStatsColumn(null)}
+        />
+      )}
+      <div className="result-grid" ref={parentRef}>
+        <div className="grid-header" style={columns}>
+          {page.columns.map((column, index) => (
+            <button
+              className={statsColumn === index ? "active" : ""}
+              key={column.name}
+              title={`Column stats for ${column.name}`}
+              onClick={() =>
+                setStatsColumn(statsColumn === index ? null : index)
+              }
+            >
+              {column.name} <small>{column.type}</small>
+            </button>
+          ))}
+        </div>
+        <div className="grid-body" style={bodyStyle}>
+          {isBoundedPage
+            ? page.rows.map((row, index) => renderRow(row, index))
+            : virtualizer
+                .getVirtualItems()
+                .map((item) =>
+                  renderRow(
+                    page.rows[item.index],
+                    String(item.key),
+                    `translateY(${item.start}px)`,
+                  ),
+                )}
+        </div>
       </div>
     </div>
   );
@@ -426,6 +995,8 @@ function App() {
   const [demoLoading, setDemoLoading] = useState(false);
   const [showWelcome, setShowWelcome] = useState(() => !welcomeDismissed());
   const [showCheatsheet, setShowCheatsheet] = useState(false);
+  const [resultView, setResultView] = useState<"table" | "chart">("table");
+  const [copied, setCopied] = useState(false);
   const runRef = useRef<() => void>(() => {});
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
@@ -797,6 +1368,30 @@ function App() {
           : "No result",
     [page, scalar],
   );
+
+  const exportCsv = useCallback(() => {
+    if (!page) return;
+    const blob = new Blob([toCsv(page)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "ibex-result.csv";
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, [page]);
+  const copyCsv = useCallback(async () => {
+    if (!page) return;
+    try {
+      await navigator.clipboard.writeText(toCsv(page));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      // Clipboard unavailable (blocked / insecure context); ignore.
+    }
+  }, [page]);
+
   return (
     <main>
       <aside>
@@ -976,6 +1571,34 @@ function App() {
               {page && page.rows.length < page.total_rows && (
                 <button onClick={() => void loadMore()}>Load more</button>
               )}
+              {page && (
+                <div className="result-view-toggle">
+                  <button
+                    className={resultView === "table" ? "active" : ""}
+                    onClick={() => setResultView("table")}
+                  >
+                    Table
+                  </button>
+                  <button
+                    className={resultView === "chart" ? "active" : ""}
+                    onClick={() => setResultView("chart")}
+                  >
+                    Chart
+                  </button>
+                </div>
+              )}
+              {page && (
+                <div className="results-export">
+                  <button onClick={exportCsv}>
+                    {page.rows.length < page.total_rows
+                      ? `Export CSV (first ${page.rows.length.toLocaleString()})`
+                      : "Export CSV"}
+                  </button>
+                  <button onClick={() => void copyCsv()}>
+                    {copied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              )}
             </header>
             {tableResults.length > 1 && (
               <nav className="result-tabs">
@@ -992,7 +1615,12 @@ function App() {
                 ))}
               </nav>
             )}
-            {page && <Grid page={page} />}
+            {page &&
+              (resultView === "chart" ? (
+                <Chart key={activeResultId} page={page} />
+              ) : (
+                <Grid page={page} />
+              ))}
             {scalar !== undefined && <output>{String(scalar)}</output>}
           </section>
         </section>

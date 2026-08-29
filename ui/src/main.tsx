@@ -663,13 +663,72 @@ function App() {
     }
   };
 
+  // Drop a starter query onto the current line if it is blank, otherwise onto
+  // the next blank line, otherwise appended on a fresh line at the end. Never
+  // overwrites what the user has already typed.
   const setStarterQuery = useCallback((table: EnvironmentTable) => {
     const columns = table.columns
       .slice(0, 4)
       .map((column) => column.name)
       .join(", ");
-    setSource(`${table.name}[select { ${columns} }];`);
-    editorRef.current?.focus();
+    const snippet = `${table.name}[select { ${columns} }];`;
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) {
+      setSource((current) =>
+        current.trim()
+          ? `${current.replace(/\n*$/, "")}\n${snippet}\n`
+          : snippet,
+      );
+      return;
+    }
+    const lineCount = model.getLineCount();
+    const cursorLine = editor.getPosition()?.lineNumber ?? lineCount;
+    const isBlank = (line: number) => model.getLineContent(line).trim() === "";
+
+    let target = isBlank(cursorLine) ? cursorLine : 0;
+    for (
+      let line = cursorLine + 1;
+      target === 0 && line <= lineCount;
+      line += 1
+    ) {
+      if (isBlank(line)) target = line;
+    }
+
+    if (target !== 0) {
+      editor.executeEdits("environment", [
+        {
+          range: {
+            startLineNumber: target,
+            startColumn: 1,
+            endLineNumber: target,
+            endColumn: model.getLineMaxColumn(target),
+          },
+          text: snippet,
+          forceMoveMarkers: true,
+        },
+      ]);
+      editor.setPosition({ lineNumber: target, column: snippet.length + 1 });
+    } else {
+      const endColumn = model.getLineMaxColumn(lineCount);
+      editor.executeEdits("environment", [
+        {
+          range: {
+            startLineNumber: lineCount,
+            startColumn: endColumn,
+            endLineNumber: lineCount,
+            endColumn,
+          },
+          text: `\n${snippet}`,
+          forceMoveMarkers: true,
+        },
+      ]);
+      editor.setPosition({
+        lineNumber: lineCount + 1,
+        column: snippet.length + 1,
+      });
+    }
+    editor.focus();
   }, []);
 
   const insertSnippet = useCallback((text: string) => {

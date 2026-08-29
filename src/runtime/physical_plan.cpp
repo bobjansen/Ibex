@@ -761,6 +761,13 @@ auto explain_physical(const Plan& plan) -> std::string {
     std::string out;
     if (!plan.migrated) {
         out += "MaterializedCall(";
+        // Name the logical subtree the fallback retains (physical_plan.hpp): a
+        // join it fully understands and a node it knows nothing about must not
+        // print the same opaque line. `plan.root` is always set by `plan_physical`.
+        if (plan.root != nullptr) {
+            out += node_kind_name_impl(plan.root->kind());
+            out += ": ";
+        }
         out += fallback_reason_name(plan.reason);
         out += ")\n";
         // A described-but-not-executed node still explains itself. Without

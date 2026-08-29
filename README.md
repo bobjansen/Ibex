@@ -3,8 +3,7 @@
 A statically typed DSL for columnar DataFrame and time-series manipulation,
 with a fast parallel interpreter and transpilation to C++23.
 
-See the [website](https://bobjansen.github.io/Ibex/#get-started) for more
-information.
+See the [website](https://ibexlang.org/docs.html) for more information.
 
 Ibex is licensed under the GNU Affero General Public License, version 3 only
 (`AGPL-3.0-only`). See [LICENSE](LICENSE) and [LICENSING.md](LICENSING.md),
@@ -622,9 +621,9 @@ separate plotting system or a full standalone kernel.
 **Reproducible and auditable by design.** The interactive results (Ibex vs
 Polars, DuckDB, ClickHouse, DataFusion, pandas, data.table and dplyr, 1M–50M
 rows, with peak-memory) live on the
-[benchmarks page](https://bobjansen.github.io/Ibex/benchmarks.html), and the
+[benchmarks page](https://ibexlang.org/benchmarks.html), and the
 exact code every engine runs for every query is on the
-[methodology page](https://bobjansen.github.io/Ibex/methodology.html) —
+[methodology page](https://ibexlang.org/methodology.html) —
 extracted from the harness source, so what's shown matches what ran.
 
 Every competing engine is a stock install (PyPI / CRAN) and the whole suite is

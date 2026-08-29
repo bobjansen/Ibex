@@ -854,14 +854,14 @@ function App() {
             <small>Typed columnar DataFrame &amp; TimeFrame DSL</small>
             <nav className="brand-links">
               <a
-                href="https://bobjansen.github.io/Ibex/"
+                href="https://ibexlang.org/docs.html"
                 target="_blank"
                 rel="noreferrer"
               >
                 Docs
               </a>
               <a
-                href="https://bobjansen.github.io/Ibex/cheatsheet.html"
+                href="https://ibexlang.org/cheatsheet.html"
                 target="_blank"
                 rel="noreferrer"
               >
@@ -1003,7 +1003,7 @@ function App() {
             <p className="cheatsheet-more">
               Full reference:{" "}
               <a
-                href="https://bobjansen.github.io/Ibex/cheatsheet.html"
+                href="https://ibexlang.org/cheatsheet.html"
                 target="_blank"
                 rel="noreferrer"
               >
@@ -1011,11 +1011,11 @@ function App() {
               </a>{" "}
               ·{" "}
               <a
-                href="https://bobjansen.github.io/Ibex/language.html"
+                href="https://ibexlang.org/docs.html"
                 target="_blank"
                 rel="noreferrer"
               >
-                language guide
+                docs
               </a>
             </p>
           </div>

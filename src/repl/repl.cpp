@@ -5881,8 +5881,9 @@ auto execution_capture_mutex() -> std::mutex& {
 // leaves it alone. Other platforms keep `tmpfile()`.
 auto open_capture_file() -> FILE* {
 #ifdef __linux__
-    // Linux memfd_create(2): anonymous in-memory file, closed on exec.
-    const int fd = static_cast<int>(memfd_create("ibex-stdout-capture", MFD_CLOEXEC));
+    // Linux memfd_create(2): anonymous in-memory file, closed on exec. Returns
+    // int on every libc that provides it (it is Linux-only).
+    const int fd = memfd_create("ibex-stdout-capture", MFD_CLOEXEC);
     if (fd >= 0) {
         if (FILE* file = fdopen(fd, "w+")) {
             return file;

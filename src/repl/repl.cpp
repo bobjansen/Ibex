@@ -59,6 +59,9 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -5870,10 +5873,30 @@ auto execution_capture_mutex() -> std::mutex& {
     return mutex;
 }
 
+// Backing store for the stdout redirect. `std::tmpfile()` opens under /tmp,
+// which the local UI server's Landlock sandbox forbids — there, a NULL file
+// silently disables capture and the interpreter's diagnostics leak to the
+// server's own stdout. On Linux, back the capture with an anonymous
+// `memfd_create` fd instead: it needs no filesystem path, so the sandbox
+// leaves it alone. Other platforms keep `tmpfile()`.
+auto open_capture_file() -> FILE* {
+#ifdef __linux__
+    // Linux memfd_create(2): anonymous in-memory file, closed on exec.
+    const int fd = static_cast<int>(memfd_create("ibex-stdout-capture", MFD_CLOEXEC));
+    if (fd >= 0) {
+        if (FILE* file = fdopen(fd, "w+")) {
+            return file;
+        }
+        close(fd);
+    }
+#endif
+    return std::tmpfile();
+}
+
 class StdoutCapture {
    public:
-    // C FILE ownership is acquired from tmpfile() and released with fclose().
-    StdoutCapture() : file_(std::tmpfile()) {
+    // C FILE ownership is acquired from open_capture_file() and released with fclose().
+    StdoutCapture() : file_(open_capture_file()) {
         static_cast<void>(std::fflush(stdout));
         std::cout.flush();
         if (file_ == nullptr) {

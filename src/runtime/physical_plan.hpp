@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -332,6 +333,46 @@ struct JoinParallelism {
     BreakerParallelism probe;
 };
 
+/// The typed edge between a streaming join's two physical nodes. The build
+/// resolves which candidate input is indexed and returns that orientation with
+/// the immutable hash index; the probe consumes both as one value.
+enum class JoinDataKind : std::uint8_t {
+    None,
+    RuntimeOrientedBuildOutput,
+};
+
+/// Explicit physical hash-build node. Both logical inputs are candidates: the
+/// smaller side is selected only after their actual row counts are known.
+struct HashBuildNode {
+    const ir::Node* left_input = nullptr;
+    const ir::Node* right_input = nullptr;
+    JoinDataKind output = JoinDataKind::None;
+    BreakerParallelism parallelism;
+};
+
+/// Explicit physical hash-probe node. `build_input` names the build node's
+/// output rather than smuggling the dependency through one monolithic join
+/// operator. The runtime orientation selects which candidate input is probed.
+struct HashProbeNode {
+    JoinDataKind build_input = JoinDataKind::None;
+    const ir::Node* left_input = nullptr;
+    const ir::Node* right_input = nullptr;
+    BreakerParallelism parallelism;
+};
+
+/// The two nodes and their barrier edge. Kept together so a plan cannot carry
+/// a build without its consumer (or reverse their policies by accident).
+struct StreamingJoinNodes {
+    HashBuildNode build;
+    HashProbeNode probe;
+};
+
+/// Validate the typed HashBuild -> HashProbe edge. The executor calls the same
+/// predicate mutation tests use, so a malformed plan cannot silently fall back
+/// to the coordinator's implicit handoff.
+[[nodiscard]] auto validate_streaming_join_edge(const StreamingJoinNodes& nodes)
+    -> std::optional<std::string>;
+
 /// A hash aggregate's fan-out points. The operator has two today:
 ///
 /// - `partition` — the histogram → prefix-sum → scatter → per-partition
@@ -410,6 +451,11 @@ struct Plan {
     /// than it runs, which is what makes the backlog shrinkable one kind at a
     /// time instead of in one jump.
     JoinPlan join;
+    /// Present exactly for a streaming inner join. These are physical nodes,
+    /// not generic labels in `breaker_phases`: their typed edge makes the
+    /// build → probe dependency and its runtime-resolved orientation
+    /// inspectable. Semi/anti retains its separate streaming operator.
+    std::optional<StreamingJoinNodes> streaming_join;
     /// Set when `root` is an `Aggregate`.
     AggregatePlan aggregate;
     /// Set when `root` is a breaker whose parallelism the plan describes.

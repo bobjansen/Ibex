@@ -1155,52 +1155,74 @@ TEST_CASE("Migrated Tail / TopK / FilterHead / FilterTail execute through the pl
 }
 
 TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical][breaker]") {
-    SECTION("hash-build then probe, each with its own floor and strategy") {
+    SECTION("explicit HashBuild feeds HashProbe with runtime orientation") {
         const auto [tree, plan] = serial_plan("(a join b on k);");
         REQUIRE(plan.migrated);
         REQUIRE(plan.join.strategy == runtime::physical::JoinStrategy::StreamingProbe);
-        REQUIRE(plan.breaker_phases.size() == 2);
+        REQUIRE(plan.streaming_join.has_value());
+        REQUIRE(plan.breaker_phases.empty());
 
-        const auto& build = plan.breaker_phases[0];
-        REQUIRE(build.name == "hash-build");
-        REQUIRE(build.parallelism.strategy == runtime::physical::PartitionStrategy::HeadTable);
-        REQUIRE(build.parallelism.row_floor == (1U << 17U));  // chunked.cpp build_partitions
-        REQUIRE(build.parallelism.breaker_max_workers == 64);
+        const auto& nodes = *plan.streaming_join;
+        REQUIRE(nodes.build.left_input == plan.join.left_input);
+        REQUIRE(nodes.build.right_input == plan.join.right_input);
+        REQUIRE(nodes.probe.left_input == plan.join.left_input);
+        REQUIRE(nodes.probe.right_input == plan.join.right_input);
+        REQUIRE(nodes.build.output == runtime::physical::JoinDataKind::RuntimeOrientedBuildOutput);
+        REQUIRE(nodes.probe.build_input == nodes.build.output);
 
-        const auto& probe = plan.breaker_phases[1];
-        REQUIRE(probe.name == "probe");
-        REQUIRE(probe.parallelism.strategy == runtime::physical::PartitionStrategy::Range);
-        REQUIRE(probe.parallelism.row_floor == (1U << 14U));  // probe_parallel_workers
-        REQUIRE(probe.parallelism.breaker_max_workers == 64);
+        const auto& build = nodes.build.parallelism;
+        REQUIRE(build.strategy == runtime::physical::PartitionStrategy::HeadTable);
+        REQUIRE(build.row_floor == (1U << 17U));  // chunked.cpp build_partitions
+        REQUIRE(build.breaker_max_workers == 64);
+
+        const auto& probe = nodes.probe.parallelism;
+        REQUIRE(probe.strategy == runtime::physical::PartitionStrategy::Range);
+        REQUIRE(probe.row_floor == (1U << 14U));  // probe_parallel_workers
+        REQUIRE(probe.breaker_max_workers == 64);
     }
 
-    SECTION("explain physical renders the strategy line and both phases") {
+    SECTION("explain physical renders the two nodes and their typed edge") {
         const auto [tree, plan] = serial_plan("(a join b on k);");
         const std::string text = runtime::physical::explain_physical(plan);
         REQUIRE(text.find("Breaker(Join)") != std::string::npos);
         REQUIRE(text.find("StreamingProbe") != std::string::npos);
-        REQUIRE(text.find("hash-build:") != std::string::npos);
-        REQUIRE(text.find("probe:") != std::string::npos);
+        REQUIRE(text.find("HashBuild.RuntimeOrientedBuildOutput -> HashProbe.build_input") !=
+                std::string::npos);
+        REQUIRE(text.find("HashBuild:") != std::string::npos);
+        REQUIRE(text.find("HashProbe:") != std::string::npos);
         REQUIRE(text.find("head-table") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
     }
 
-    SECTION("a registered scan gives both phases its exact input-row bound") {
-        const auto [tree, plan] =
-            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
-        REQUIRE(plan.breaker_phases.size() == 2);
-        for (const auto& phase : plan.breaker_phases) {
-            REQUIRE(phase.parallelism.estimate.source ==
-                    runtime::physical::RowEstimate::Source::TableExact);
-            REQUIRE(phase.parallelism.estimate.rows == 3);
-        }
-        const std::string text = runtime::physical::explain_physical(plan);
-        REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
+    SECTION("mutating either end of the build output edge is rejected") {
+        const auto [tree, plan] = serial_plan("(a join b on k);");
+        REQUIRE(plan.streaming_join.has_value());
+        auto nodes = *plan.streaming_join;
+        REQUIRE_FALSE(runtime::physical::validate_streaming_join_edge(nodes).has_value());
+
+        nodes.probe.build_input = runtime::physical::JoinDataKind::None;
+        auto error = runtime::physical::validate_streaming_join_edge(nodes);
+        REQUIRE(error.has_value());
+        REQUIRE(error->find("does not consume HashBuild") != std::string::npos);
+
+        nodes = *plan.streaming_join;
+        nodes.probe.right_input = nodes.probe.left_input;
+        error = runtime::physical::validate_streaming_join_edge(nodes);
+        REQUIRE(error.has_value());
+        REQUIRE(error->find("candidate inputs disagree") != std::string::npos);
     }
 
     SECTION("a materializing join carries no fan-out phases") {
         const auto [tree, plan] = serial_plan("(a left join b on k);");
+        REQUIRE_FALSE(plan.streaming_join.has_value());
         REQUIRE(plan.breaker_phases.empty());
+    }
+
+    SECTION("semi join retains its separate streaming operator") {
+        const auto [tree, plan] = serial_plan("(a semi join b on k);");
+        REQUIRE(plan.migrated);
+        REQUIRE(plan.join.branch == runtime::physical::JoinBranch::SemiAnti);
+        REQUIRE_FALSE(plan.streaming_join.has_value());
     }
 }
 
@@ -1234,6 +1256,19 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE(text.find("finalize:") != std::string::npos);
         REQUIRE(text.find("radix-hash") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
+
+    SECTION("a registered scan gives both phases its exact input-row bound") {
+        const auto [tree, plan] =
+            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+        REQUIRE(plan.breaker_phases.size() == 2);
+        for (const auto& phase : plan.breaker_phases) {
+            REQUIRE(phase.parallelism.estimate.source ==
+                    runtime::physical::RowEstimate::Source::TableExact);
+            REQUIRE(phase.parallelism.estimate.rows == 3);
+        }
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
     }
 
     SECTION("a fused left-join count carries no fan-out phases") {

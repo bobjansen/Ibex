@@ -36,6 +36,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -14933,6 +14934,112 @@ TEST_CASE("Pipeline scheduler stages a streamable join before its consumer",
     CHECK((*w)[1] == 400);
     CHECK((*w)[2] == 500);
     CHECK((*w)[3] == 600);
+}
+
+TEST_CASE("Deferred probe resolving below the stream threshold preserves its drained probe side",
+          "[runtime][parallel][join][deferred_probe]") {
+    // Regression for the q18 crash described in kernel-pipeline Phase 4. The
+    // lazy right starts above kStreamRightThreshold, so the join drains the
+    // left and publishes a membership filter. That filter leaves one right
+    // row, putting initialize() back below the threshold. The BuildRight path
+    // must replay the already-drained left rather than dereference its moved
+    // operator.
+    constexpr std::size_t kLeftRows = 20'000;  // also clears the probe fan-out floor
+    constexpr std::size_t kLazyRows = 70'000;  // above kStreamRightThreshold (65536)
+
+    runtime::Table left;
+    left.add_column("k", Column<std::int64_t>{std::vector<std::int64_t>(kLeftRows, 7)});
+    {
+        std::vector<std::int64_t> tags;
+        tags.reserve(kLeftRows);
+        for (std::size_t row = 0; row < kLeftRows; ++row) {
+            tags.push_back(static_cast<std::int64_t>(row));
+        }
+        left.add_column("tag", Column<std::int64_t>{std::move(tags)});
+    }
+    runtime::TableRegistry registry;
+    registry.emplace("build_t", std::move(left));
+    auto ir = require_ir("build_t join probe_t on k;");
+
+    struct RunResult {
+        runtime::Table table;
+        std::uint64_t parallel_probes = 0;
+        bool filter_ready = false;
+        bool membership_published = false;
+    };
+    const auto run = [&](bool parallel) -> RunResult {
+        runtime::Table schema;
+        schema.add_column("k", Column<std::int64_t>{});
+        schema.add_column("payload", Column<std::int64_t>{});
+        auto decode =
+            [](const std::vector<std::string>& names,
+               const runtime::Selection* selection) -> std::expected<runtime::Table, std::string> {
+            std::vector<std::size_t> rows;
+            if (selection == nullptr) {
+                rows.resize(kLazyRows);
+                std::iota(rows.begin(), rows.end(), std::size_t{0});
+            } else {
+                rows.assign(selection->begin(), selection->end());
+            }
+            runtime::Table out;
+            for (const auto& name : names) {
+                std::vector<std::int64_t> values;
+                values.reserve(rows.size());
+                if (name == "k") {
+                    for (const std::size_t row : rows) {
+                        // Exactly one row can match the left side.
+                        values.push_back(row == 0 ? 7 : static_cast<std::int64_t>(row + 1000));
+                    }
+                } else if (name == "payload") {
+                    for (const std::size_t row : rows) {
+                        values.push_back(static_cast<std::int64_t>(row * 3));
+                    }
+                } else {
+                    return std::unexpected("deferred-probe fixture: unknown column " + name);
+                }
+                out.add_column(name, Column<std::int64_t>{std::move(values)});
+            }
+            out.logical_rows = rows.size();
+            return out;
+        };
+
+        auto slot = std::make_shared<runtime::DynamicScanFilter>();
+        runtime::DeferredScanRegistry deferred;
+        deferred.emplace("probe_t", runtime::DeferredScan{
+                                        .lazy = std::make_shared<runtime::LazyTable>(
+                                            std::move(schema), kLazyRows, decode),
+                                        .conjuncts = {},
+                                        .demand = {"k", "payload"},
+                                        .demand_all = false,
+                                        .key_column = "k",
+                                        .filter = slot,
+                                    });
+
+        runtime::ParallelPipelineStats stats;
+        runtime::ExecutionContext exec{.deferred_scans = &deferred, .execution_profile = nullptr};
+        exec.parallel_threads = parallel ? 4 : 1;
+        exec.parallel_stats = &stats;
+        auto out = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(out.has_value());
+        return RunResult{
+            .table = std::move(*out),
+            .parallel_probes = stats.parallel_probes.load(),
+            .filter_ready = slot->ready,
+            .membership_published = slot->has_membership(),
+        };
+    };
+
+    auto serial = run(false);
+    auto parallel = run(true);
+    CHECK(serial.parallel_probes == 0);
+    CHECK(parallel.parallel_probes >= 1);
+    CHECK(serial.filter_ready);
+    CHECK(parallel.filter_ready);
+    CHECK(serial.membership_published);
+    CHECK(parallel.membership_published);
+    REQUIRE(serial.table.rows() == kLeftRows);
+    auto mismatch = runtime::compare_tables(serial.table, parallel.table);
+    CHECK_FALSE(mismatch.has_value());
 }
 
 TEST_CASE("Inner join probe fans out across workers and matches the serial probe",

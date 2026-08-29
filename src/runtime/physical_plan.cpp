@@ -501,14 +501,23 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (plan.join.strategy == JoinStrategy::StreamingProbe) {
             plan.migrated = true;
             plan.source_node = &root;
-            // Describe the two fan-out points the join operator already has.
-            // Descriptive only (slice 3): `build_physical_join` does not read
-            // these; the constants still live in `chunked.cpp`. A follow-up
-            // slice moves the authority, the way distinct's dedup phase did.
-            plan.breaker_phases.push_back(
-                {.name = "hash-build", .parallelism = join_hash_build_parallelism()});
-            plan.breaker_phases.push_back(
-                {.name = "probe", .parallelism = join_probe_parallelism()});
+            // An inner join is two explicit physical nodes joined by a typed
+            // build-output edge. Both retain the textual inputs because
+            // orientation is resolved only after the build has measured them.
+            // Semi/anti still uses its separate operator and is not described
+            // by the inner join's runtime-oriented output type.
+            if (plan.join.branch != JoinBranch::SemiAnti) {
+                plan.streaming_join = StreamingJoinNodes{
+                    .build = {.left_input = plan.join.left_input,
+                              .right_input = plan.join.right_input,
+                              .output = JoinDataKind::RuntimeOrientedBuildOutput,
+                              .parallelism = join_hash_build_parallelism()},
+                    .probe = {.build_input = JoinDataKind::RuntimeOrientedBuildOutput,
+                              .left_input = plan.join.left_input,
+                              .right_input = plan.join.right_input,
+                              .parallelism = join_probe_parallelism()},
+                };
+            }
             return plan;
         }
     }
@@ -673,10 +682,18 @@ auto explain_physical(const Plan& plan) -> std::string {
     if (plan.steps.empty() && plan.root != nullptr) {
         const std::string_view kind = node_kind_name_impl(plan.root->kind());
         if (plan.join.describes) {
-            // The strategy line, then one line per fan-out phase (a streaming
-            // join carries hash-build + probe; see `plan_physical`).
+            // The strategy line, explicit build → probe edge, then each node's
+            // fan-out policy. `breaker_phases` remains for untyped breakers;
+            // a streaming join no longer hides its dataflow in two labels.
             out += "Breaker(Join)\n  " + explain_join(plan.join);
-            append_phase_lines(out, plan.breaker_phases);
+            if (plan.streaming_join.has_value()) {
+                out += "\n  edge: HashBuild.RuntimeOrientedBuildOutput -> HashProbe.build_input";
+                const std::vector<BreakerPhase> nodes{
+                    {.name = "HashBuild", .parallelism = plan.streaming_join->build.parallelism},
+                    {.name = "HashProbe", .parallelism = plan.streaming_join->probe.parallelism},
+                };
+                append_phase_lines(out, nodes);
+            }
             out += '\n';
             return out;
         }
@@ -955,6 +972,22 @@ auto explain_breaker(std::string_view kind, const std::vector<BreakerPhase>& pha
     out += ')';
     append_phase_lines(out, phases);
     return out;
+}
+
+auto validate_streaming_join_edge(const StreamingJoinNodes& nodes) -> std::optional<std::string> {
+    if (nodes.build.left_input == nullptr || nodes.build.right_input == nullptr ||
+        nodes.probe.left_input == nullptr || nodes.probe.right_input == nullptr) {
+        return "physical join: HashBuild/HashProbe edge has a missing candidate input";
+    }
+    if (nodes.build.left_input != nodes.probe.left_input ||
+        nodes.build.right_input != nodes.probe.right_input) {
+        return "physical join: HashBuild and HashProbe candidate inputs disagree";
+    }
+    if (nodes.build.output != JoinDataKind::RuntimeOrientedBuildOutput ||
+        nodes.probe.build_input != nodes.build.output) {
+        return "physical join: HashProbe does not consume HashBuild's runtime-oriented output";
+    }
+    return std::nullopt;
 }
 
 auto plan_join(const ir::JoinNode& join) -> JoinPlan {

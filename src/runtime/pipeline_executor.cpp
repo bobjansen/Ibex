@@ -2073,7 +2073,7 @@ class PipelinedScanOperator final : public Operator {
         for (auto& worker : workers_) {
             auto trailing = worker.chain->next();
             if (!trailing.has_value()) {
-                throw std::runtime_error(std::move(trailing.error()));
+                throw std::runtime_error(trailing.error());
             }
             if (trailing->has_value()) {
                 throw std::runtime_error("scan pipeline: unexpected trailing output");

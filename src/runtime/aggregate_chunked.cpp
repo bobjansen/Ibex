@@ -518,8 +518,11 @@ class HashAggregateState final {
                                               chunk)) {
             return err;
         }
-        // `bind_aggregate_columns` returns nullopt only once `columns_` is bound.
-        const physical::AggregateColumnMapping& cols = columns_.value();
+        // `bind_aggregate_columns` only returns nullopt once `columns_` is bound.
+        if (!columns_.has_value()) {
+            return "HashAggregateState: column mapping not bound";
+        }
+        const physical::AggregateColumnMapping& cols = *columns_;
         std::vector<const ColumnEntry*> group_entries;
         group_entries.reserve(group_by_->size());
         for (const std::size_t index : cols.group_by) {
@@ -529,11 +532,11 @@ class HashAggregateState final {
         std::vector<const ColumnEntry*> agg_entries(aggregations_->size(), nullptr);
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             const auto& agg = (*aggregations_)[i];
-            if (agg.func == ir::AggFunc::Count) {
+            const std::optional<std::size_t>& input_idx = cols.aggregate_inputs[i];
+            if (agg.func == ir::AggFunc::Count || !input_idx.has_value()) {
                 continue;
             }
-            // Non-Count aggregations always carry an input column index.
-            const ColumnEntry* entry = &chunk.columns[cols.aggregate_inputs[i].value()];
+            const ColumnEntry* entry = &chunk.columns[*input_idx];
             const ExprType kind = expr_type_for_column(*entry->column);
             const bool first_or_last =
                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
@@ -4819,8 +4822,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
     // order don't matter for contiguity). Nullable group keys fall back, since
     // the streaming key compare ignores validity.
     [[nodiscard]] auto sorted_on_group_by(const Chunk& chunk) const -> bool {
-        if (group_by_->empty()) {
-            return false;  // global aggregate: let the hash path handle it
+        if (!columns_.has_value() || group_by_->empty()) {
+            return false;  // unbound, or a global aggregate: let the hash path handle it
         }
         if (!chunk.ordering().has_value() || chunk.ordering()->size() < group_by_->size()) {
             return false;
@@ -4838,7 +4841,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 return false;
             }
         }
-        return std::ranges::all_of(columns_.value().group_by, [&chunk](const std::size_t index) {
+        return std::ranges::all_of(columns_->group_by, [&chunk](const std::size_t index) {
             return !chunk.columns[index].validity.has_value();
         });
     }
@@ -4847,12 +4850,17 @@ class ChunkedSortedAggregateOperator final : public Operator {
     // implementation here — route it to the hash operator, which handles any
     // type. Numeric First/Last streams natively (see accumulate_typed).
     [[nodiscard]] auto needs_hash_fallback(const Chunk& first) const -> bool {
+        if (!columns_.has_value()) {
+            return true;  // unbound: route to the hash operator, which rebinds
+        }
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             const ir::AggSpec& agg = (*aggregations_)[i];
-            if (agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) {
+            const std::optional<std::size_t>& input_idx = columns_->aggregate_inputs[i];
+            if ((agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) ||
+                !input_idx.has_value()) {
                 continue;
             }
-            const ColumnEntry* entry = &first.columns[columns_.value().aggregate_inputs[i].value()];
+            const ColumnEntry* entry = &first.columns[*input_idx];
             const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return true;
@@ -4862,6 +4870,9 @@ class ChunkedSortedAggregateOperator final : public Operator {
     }
 
     auto init_plan(const Chunk& first) -> std::optional<std::string> {
+        if (!columns_.has_value()) {
+            return "ChunkedSortedAggregateOperator: column mapping not bound";
+        }
         n_aggs_ = aggregations_->size();
         plan_.resize(n_aggs_);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
@@ -4871,7 +4882,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 plan_[i].kind = ExprType::Int;
                 continue;
             }
-            const ColumnEntry* entry = &first.columns[columns_.value().aggregate_inputs[i].value()];
+            const std::optional<std::size_t>& input_idx = columns_->aggregate_inputs[i];
+            if (!input_idx.has_value()) {
+                continue;
+            }
+            const ColumnEntry* entry = &first.columns[*input_idx];
             const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return "ChunkedSortedAggregateOperator: non-numeric aggregation not supported";
@@ -4880,7 +4895,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         key_templates_.clear();
         key_templates_.reserve(group_by_->size());
-        for (const std::size_t index : columns_.value().group_by) {
+        for (const std::size_t index : columns_->group_by) {
             key_templates_.push_back(make_empty_like(*first.columns[index].column));
         }
         track_validity_.assign(n_aggs_, 0U);
@@ -4983,17 +4998,21 @@ class ChunkedSortedAggregateOperator final : public Operator {
     // equal group keys; each run is accumulated columnwise into the open
     // group's slots, and a group-key change closes the open group.
     auto consume(const Chunk& chunk) -> std::optional<std::string> {
+        if (!columns_.has_value()) {
+            return "ChunkedSortedAggregateOperator: column mapping not bound";
+        }
         std::vector<const ColumnValue*> key_cols;
         key_cols.reserve(group_by_->size());
-        for (const std::size_t index : columns_.value().group_by) {
+        for (const std::size_t index : columns_->group_by) {
             key_cols.push_back(chunk.columns[index].column.get());
         }
         std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
-            if (plan_[i].func == ir::AggFunc::Count) {
+            const std::optional<std::size_t>& input_idx = columns_->aggregate_inputs[i];
+            if (plan_[i].func == ir::AggFunc::Count || !input_idx.has_value()) {
                 continue;
             }
-            const ColumnEntry* entry = &chunk.columns[columns_.value().aggregate_inputs[i].value()];
+            const ColumnEntry* entry = &chunk.columns[*input_idx];
             if (expr_type_for_column(*entry->column) != plan_[i].kind) {
                 return "ChunkedSortedAggregateOperator: aggregate column type changed across "
                        "chunks";

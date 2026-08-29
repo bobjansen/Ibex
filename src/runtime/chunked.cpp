@@ -2379,7 +2379,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
 
 /// Encodes a fixed-width multi-column key into one flat integer.
 ///
-/// Shared by `ChunkedDistinctOperator` and `ChunkedAggregateOperator`: both
+/// Shared by `ChunkedDistinctOperator` and the hash aggregate state: both
 /// want the same thing from a multi-column key — a POD that hashes and compares
 /// in one shot, with no per-row allocation and no per-row string hashing — and
 /// both then hand it to a partitioned parallel discovery pass.
@@ -7052,7 +7052,7 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
     return std::nullopt;
 }
 
-class ChunkedAggregateOperator final : public Operator {
+class HashAggregateState final {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
     /// an integer for the same reason `process_rows_cat` may index an array
@@ -7060,35 +7060,104 @@ class ChunkedAggregateOperator final : public Operator {
     /// reorders, so a code identifies the same value in every chunk.
     enum class IntKeyKind : std::uint8_t { Int64, Date, Ts, Cat };
 
-    ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-                             const std::vector<ir::AggSpec>* aggregations,
-                             const ExecutionContext& exec, physical::AggregateParallelism par = {},
-                             std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
+    HashAggregateState(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                       const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
+                       physical::AggregateParallelism par = {},
+                       std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
           columns_(std::move(columns)),
-          par_(par) {}
+          par_(par),
+          discovery_profile_(exec.execution_profile == nullptr
+                                 ? nullptr
+                                 : exec.execution_profile->stage("Aggregate.Discovery")),
+          accumulation_profile_(exec.execution_profile == nullptr
+                                    ? nullptr
+                                    : exec.execution_profile->stage("Aggregate.Accumulation")),
+          final_ordering_profile_(
+              exec.execution_profile == nullptr
+                  ? nullptr
+                  : exec.execution_profile->stage("Aggregate.FinalOrdering")),
+          emission_profile_(exec.execution_profile == nullptr
+                                ? nullptr
+                                : exec.execution_profile->stage("Aggregate.Emission")) {}
 
-    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+    /// Pull and run the structural Discovery node for one chunk. The chunk is
+    /// retained until `accumulate_discovery` consumes its transfer, so the
+    /// ColumnEntry pointers in that value remain valid without copying data.
+    auto next_discovery() -> std::expected<bool, std::string> {
+        if (input_consumed_) {
+            return false;
+        }
+        if (active_chunk_.has_value()) {
+            return std::unexpected(
+                "physical aggregate: Discovery advanced before Accumulation consumed its input");
+        }
+        auto chunk_res = child_->next();
+        if (!chunk_res.has_value()) {
+            return std::unexpected(std::move(chunk_res.error()));
+        }
+        if (!chunk_res.value().has_value()) {
+            input_consumed_ = true;
+            return false;
+        }
+        active_chunk_ = std::move(*chunk_res.value());
+        const ExecutionProfileScope scope(discovery_profile_, ProfilePhase::Next);
+        if (auto err = discover_chunk(*active_chunk_)) {
+            return std::unexpected(*err);
+        }
+        return true;
+    }
+
+    /// Consume the current Discovery output at the structural Accumulation
+    /// node, then release the input chunk before the source advances.
+    auto accumulate_discovery() -> std::expected<void, std::string> {
+        if (!active_chunk_.has_value()) {
+            return std::unexpected("physical aggregate: Accumulation has no discovered chunk");
+        }
+        const ExecutionProfileScope scope(accumulation_profile_, ProfilePhase::Next);
+        if (auto err = accumulate_discovered_chunk()) {
+            return std::unexpected(*err);
+        }
+        active_chunk_.reset();
+        return {};
+    }
+
+    /// Structural FinalOrdering entry. Owned-partition strategies transfer
+    /// their local group state into deterministic first-occurrence order here;
+    /// already-global strategies have no deferred work at this boundary.
+    auto finalize_ordering() -> std::optional<std::string> {
+        const ExecutionProfileScope scope(final_ordering_profile_, ProfilePhase::Next);
+        if (ordering_finalized_) {
+            return std::nullopt;
+        }
+        if (owned_mode_) {
+            finalize_owned_active();
+            if (owned_async_error_.has_value()) {
+                return owned_async_error_;
+            }
+        }
+        ordering_finalized_ = true;
+        return std::nullopt;
+    }
+
+    /// Structural Emission entry. It consumes only finalized, globally ordered
+    /// group state and constructs the result columns.
+    auto emit_output() -> std::expected<std::optional<Chunk>, std::string> {
+        const ExecutionProfileScope scope(emission_profile_, ProfilePhase::Next);
+        if (!input_consumed_) {
+            return std::unexpected("physical aggregate: Emission ran before input consumption");
+        }
+        if (active_chunk_.has_value()) {
+            return std::unexpected("physical aggregate: Emission ran with unconsumed discovery");
+        }
+        if (!ordering_finalized_) {
+            return std::unexpected("physical aggregate: Emission ran before FinalOrdering");
+        }
         if (emitted_) {
             return std::optional<Chunk>{};
-        }
-        while (true) {
-            auto chunk_res = child_->next();
-            if (!chunk_res.has_value()) {
-                return std::unexpected(std::move(chunk_res.error()));
-            }
-            if (!chunk_res.value().has_value()) {
-                break;
-            }
-            const Chunk chunk = std::move(*chunk_res.value());
-            if (auto err = process_chunk(chunk)) {
-                return std::unexpected(*err);
-            }
-            // `chunk` goes out of scope here, releasing its memory
-            // before we pull the next one from the child.
         }
         emitted_ = true;
         return build_output_chunk();
@@ -7114,7 +7183,60 @@ class ChunkedAggregateOperator final : public Operator {
         }
     }
 
-    auto process_chunk(const Chunk& chunk) -> std::optional<std::string> {
+    enum class DiscoveryTransferKind : std::uint8_t {
+        None,
+        NeedsAccumulation,
+        FusedAccumulation,
+    };
+
+    /// Per-chunk ownership transfer from Discovery to Accumulation. Column
+    /// pointers remain valid because `consume_input` keeps the owning Chunk
+    /// alive until `accumulate_discovered_chunk` consumes this value. The gid
+    /// buffer is operator-owned and cannot be reused until the transfer resets.
+    struct AggregateDiscoveryTransfer {
+        DiscoveryTransferKind kind = DiscoveryTransferKind::None;
+        std::vector<const ColumnEntry*> aggregate_entries;
+        std::vector<std::uint8_t> skip_fields;
+        std::size_t rows = 0;
+    };
+
+    void publish_discovered(const std::vector<const ColumnEntry*>& aggregate_entries,
+                            std::size_t rows,
+                            const std::vector<std::uint8_t>* skip_fields = nullptr) {
+        discovery_transfer_.kind = DiscoveryTransferKind::NeedsAccumulation;
+        discovery_transfer_.aggregate_entries = aggregate_entries;
+        discovery_transfer_.rows = rows;
+        discovery_transfer_.skip_fields =
+            skip_fields == nullptr ? std::vector<std::uint8_t>{} : *skip_fields;
+    }
+
+    void publish_fused_accumulation() {
+        discovery_transfer_ = {};
+        discovery_transfer_.kind = DiscoveryTransferKind::FusedAccumulation;
+    }
+
+    auto accumulate_discovered_chunk() -> std::optional<std::string> {
+        if (discovery_transfer_.kind == DiscoveryTransferKind::None) {
+            return "physical aggregate: Discovery produced no accumulation transfer";
+        }
+        if (discovery_transfer_.kind == DiscoveryTransferKind::FusedAccumulation) {
+            discovery_transfer_ = {};
+            return std::nullopt;
+        }
+        if (gids_buf_.size() < discovery_transfer_.rows) {
+            return "physical aggregate: Discovery produced a short group-id buffer";
+        }
+        const auto* skip = discovery_transfer_.skip_fields.empty()
+                               ? nullptr
+                               : &discovery_transfer_.skip_fields;
+        accumulate_gids(gids_buf_.data(), discovery_transfer_.aggregate_entries,
+                        discovery_transfer_.rows, skip);
+        discovery_transfer_ = {};
+        return std::nullopt;
+    }
+
+    auto discover_chunk(const Chunk& chunk) -> std::optional<std::string> {
+        discovery_transfer_ = {};
         if (std::getenv("IBEX_AGG_PARTITION_DEBUG") != nullptr) {
             ibex::formatting::print(stderr, "[agg_process_chunk] rows={} group_by_size={}\n",
                                     chunk.rows(), group_by_->size());
@@ -7149,7 +7271,7 @@ class ChunkedAggregateOperator final : public Operator {
             const bool supported = kind == ExprType::Int || kind == ExprType::Double ||
                                    (first_or_last && kind == ExprType::String);
             if (!supported) {
-                return "ChunkedAggregateOperator: non-numeric aggregation not supported";
+                return "HashAggregateState: non-numeric aggregation not supported";
             }
             agg_entries[i] = entry;
         }
@@ -7272,12 +7394,12 @@ class ChunkedAggregateOperator final : public Operator {
                 }
                 const ExprType kind = expr_type_for_column(*agg_entries[i]->column);
                 if (kind != plan_[i].kind) {
-                    return "ChunkedAggregateOperator: aggregate column type changed across chunks";
+                    return "HashAggregateState: aggregate column type changed across chunks";
                 }
             }
             for (std::size_t i = 0; i < group_entries.size(); ++i) {
                 if (group_entries[i]->column->index() != group_templates_[i].index()) {
-                    return "ChunkedAggregateOperator: group-by column type changed across chunks";
+                    return "HashAggregateState: group-by column type changed across chunks";
                 }
             }
         }
@@ -7290,7 +7412,11 @@ class ChunkedAggregateOperator final : public Operator {
         // into the single group, and — since the groups are independent of row
         // order — fan the row range out across workers.
         if (group_entries.empty()) {
-            return process_rows_ungrouped(agg_entries, rows);
+            auto error = process_rows_ungrouped(agg_entries, rows);
+            if (!error.has_value()) {
+                publish_fused_accumulation();
+            }
+            return error;
         }
         // A fast-path index records only raw values/codes. It therefore cannot
         // distinguish a later null from that value's zero/code representation.
@@ -7341,7 +7467,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (!plan.has_value()) {
                 // The shape was packable when the first chunk fixed the path,
                 // so this is an unsupported mid-stream key-layout transition.
-                return "ChunkedAggregateOperator: group-by key column gained nulls across chunks";
+                return "HashAggregateState: group-by key column gained nulls across chunks";
             }
             if (plan->width <= sizeof(std::uint64_t)) {
                 return process_rows_packed(group_entries, agg_entries, plan->cols, rows, packed64_);
@@ -7379,7 +7505,7 @@ class ChunkedAggregateOperator final : public Operator {
                 },
                 kDefaultPartitionMinRows,
                 [&](std::uint32_t gid) -> std::string_view { return str_order_[gid]; })) {
-            accumulate_gids(gids, agg_entries, rows);
+            publish_discovered(agg_entries, rows);
             return std::nullopt;
         }
 
@@ -7413,7 +7539,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
 
@@ -7441,7 +7567,7 @@ class ChunkedAggregateOperator final : public Operator {
                 // A lone Categorical key never selects this path: it is
                 // all-Categorical by definition, so `cat_fast_path_` claims it
                 // and dispatches first. Only the pair path admits `Cat`.
-                return "ChunkedAggregateOperator: categorical key on the single-int path";
+                return "HashAggregateState: categorical key on the single-int path";
         }
         const auto key_at = [&](std::size_t row) -> std::int64_t {
             switch (int_key_kind_) {
@@ -7465,6 +7591,7 @@ class ChunkedAggregateOperator final : public Operator {
         // a 4096-slot cache-resident reduction and sends only cold/pre-aggregated
         // records to the persistent partition maps.
         if (try_async_hot_int_sum(group_entries[0]->column, agg_entries, rows)) {
+            publish_fused_accumulation();
             return std::nullopt;
         }
 
@@ -7513,6 +7640,7 @@ class ChunkedAggregateOperator final : public Operator {
         // does for the ordinary int path, so this needs no kind-specific arm.
         if (try_owned<std::int64_t, robin_hood::hash<std::int64_t>>(
                 key_at, rows, gids, agg_entries, owned_int_partitions_, kIntOwnedMinRows)) {
+            publish_fused_accumulation();
             return std::nullopt;
         }
 
@@ -7534,8 +7662,8 @@ class ChunkedAggregateOperator final : public Operator {
             if (has_discovery_first) {
                 seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
             }
-            accumulate_gids(gids, agg_entries, rows,
-                            has_discovery_first ? &discovery_first : nullptr);
+            publish_discovered(agg_entries, rows,
+                               has_discovery_first ? &discovery_first : nullptr);
             return std::nullopt;
         }
 
@@ -7573,7 +7701,8 @@ class ChunkedAggregateOperator final : public Operator {
         if (has_discovery_first) {
             seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
         }
-        accumulate_gids(gids, agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
+        publish_discovered(agg_entries, rows,
+                           has_discovery_first ? &discovery_first : nullptr);
         return std::nullopt;
     }
 
@@ -8638,7 +8767,7 @@ class ChunkedAggregateOperator final : public Operator {
                         // key is recoverable even though the pack is lossy.
                         return pack_u64(pair_order_[gid].first, pair_order_[gid].second);
                     })) {
-                accumulate_gids(gids, agg_entries, rows);
+                publish_discovered(agg_entries, rows);
                 return std::nullopt;
             }
 
@@ -8683,13 +8812,14 @@ class ChunkedAggregateOperator final : public Operator {
                 }
                 gids[row] = gid;
             }
-            accumulate_gids(gids, agg_entries, rows);
+            publish_discovered(agg_entries, rows);
             return std::nullopt;
         }
 
         if (try_owned<PairIntKey, PairIntKeyHash>(
                 [&](std::size_t row) { return pack(key_a_at(row), key_b_at(row)); }, rows, gids,
                 agg_entries, owned_pair_partitions_, kPairOwnedMinRows)) {
+            publish_fused_accumulation();
             return std::nullopt;
         }
 
@@ -8704,7 +8834,7 @@ class ChunkedAggregateOperator final : public Operator {
                 [&](std::uint32_t gid) {
                     return pack(pair_order_[gid].first, pair_order_[gid].second);
                 })) {
-            accumulate_gids(gids, agg_entries, rows);
+            publish_discovered(agg_entries, rows);
             return std::nullopt;
         }
 
@@ -8736,7 +8866,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
 
@@ -8847,7 +8977,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return true;
     }
 
@@ -9502,6 +9632,7 @@ class ChunkedAggregateOperator final : public Operator {
 
         if (single_key && rows > 0 &&
             try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
+            publish_fused_accumulation();
             return std::nullopt;
         }
 
@@ -9652,7 +9783,7 @@ class ChunkedAggregateOperator final : public Operator {
             }
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
 
@@ -9708,7 +9839,7 @@ class ChunkedAggregateOperator final : public Operator {
                     group_order_[gid] = build_key_at(row);
                 },
                 kPackedPartitionMinRows)) {
-            accumulate_gids(gids, agg_entries, rows);
+            publish_discovered(agg_entries, rows);
             return std::nullopt;
         }
 
@@ -9739,7 +9870,7 @@ class ChunkedAggregateOperator final : public Operator {
             gids[row] = gid;
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
 
@@ -9771,7 +9902,7 @@ class ChunkedAggregateOperator final : public Operator {
             });
         }
 
-        accumulate_gids(gids, agg_entries, rows);
+        publish_discovered(agg_entries, rows);
         return std::nullopt;
     }
 
@@ -10698,17 +10829,6 @@ class ChunkedAggregateOperator final : public Operator {
     }
 
     auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
-        // Owned-partition mode: the deferred first-occurrence merge runs
-        // exactly once, here, right before the ordinary emission logic below
-        // -- which then runs completely unmodified, reading the same
-        // pair_order_/flat_slots_/n_groups_ it always has.
-        if (owned_mode_) {
-            finalize_owned_active();
-            if (owned_async_error_.has_value()) {
-                return std::unexpected(*owned_async_error_);
-            }
-        }
-
         Chunk out;
         out.columns.reserve(group_by_->size() + aggregations_->size());
 
@@ -10758,8 +10878,7 @@ class ChunkedAggregateOperator final : public Operator {
                     }
                     break;
                 default:
-                    return std::unexpected(
-                        "ChunkedAggregateOperator: unsupported agg in build_output");
+                    return std::unexpected("HashAggregateState: unsupported agg in build_output");
             }
             out.add_column(agg.alias, std::move(column));
         }
@@ -11039,7 +11158,10 @@ class ChunkedAggregateOperator final : public Operator {
     const ExecutionContext* exec_;
     std::optional<physical::AggregateColumnMapping> columns_;
     bool columns_bound_ = false;
+    bool input_consumed_ = false;
+    bool ordering_finalized_ = false;
     bool emitted_ = false;
+    std::optional<Chunk> active_chunk_;
 
     bool initialized_ = false;
     bool cat_fast_path_ = false;
@@ -11071,6 +11193,7 @@ class ChunkedAggregateOperator final : public Operator {
 
     // Reusable per-chunk gids buffer to avoid repeated heap allocations.
     std::vector<std::uint32_t> gids_buf_;
+    AggregateDiscoveryTransfer discovery_transfer_;
 
     // Generic path (non-Categorical group keys).
     KeyRowIndex key_index_;
@@ -11206,6 +11329,10 @@ class ChunkedAggregateOperator final : public Operator {
     /// cap, and the strategy-specific admission floors (`kPairOwnedMinRows`, the
     /// ordered-run `1U << 16U`, `parallel_min_rows`).
     physical::AggregateParallelism par_{};
+    ExecutionProfileEntry* discovery_profile_ = nullptr;
+    ExecutionProfileEntry* accumulation_profile_ = nullptr;
+    ExecutionProfileEntry* final_ordering_profile_ = nullptr;
+    ExecutionProfileEntry* emission_profile_ = nullptr;
     /// Both keys are 32 bits wide (Categorical code / Date), so the composite
     /// packs into 64 bits and probes `int_index_` instead of `pair_index_`.
     /// The two paths are mutually exclusive, so sharing that map is safe.
@@ -11221,6 +11348,54 @@ class ChunkedAggregateOperator final : public Operator {
     std::uint64_t pair_dense_b_span_ = 0;
     bool pair_dense_active_ = false;
 };
+
+/// Serial executor for the hash fallback's typed structural chain. Discovery
+/// and Accumulation exchange a bounded per-chunk transfer (or an explicit fused
+/// marker); FinalOrdering and Emission are separate calls with enforceable
+/// preconditions. Keeping this coordinator outside the state object prevents
+/// output construction from silently triggering the ordering merge again.
+class HashAggregatePhaseOperator final : public Operator {
+   public:
+    explicit HashAggregatePhaseOperator(std::unique_ptr<HashAggregateState> state)
+        : state_(std::move(state)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (emitted_) {
+            return std::optional<Chunk>{};
+        }
+        while (true) {
+            auto discovered = state_->next_discovery();
+            if (!discovered.has_value()) {
+                return std::unexpected(std::move(discovered.error()));
+            }
+            if (!*discovered) {
+                break;
+            }
+            if (auto accumulated = state_->accumulate_discovery(); !accumulated.has_value()) {
+                return std::unexpected(std::move(accumulated.error()));
+            }
+        }
+        if (auto error = state_->finalize_ordering()) {
+            return std::unexpected(std::move(*error));
+        }
+        emitted_ = true;
+        return state_->emit_output();
+    }
+
+   private:
+    std::unique_ptr<HashAggregateState> state_;
+    bool emitted_ = false;
+};
+
+auto make_hash_aggregate_operator(
+    OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+    const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
+    physical::AggregateParallelism par,
+    std::optional<physical::AggregateColumnMapping> columns) -> OperatorPtr {
+    auto state = std::make_unique<HashAggregateState>(
+        std::move(child), group_by, aggregations, exec, par, std::move(columns));
+    return std::make_unique<HashAggregatePhaseOperator>(std::move(state));
+}
 
 /// Replays one buffered chunk ahead of the rest of a child stream. Used by
 /// ChunkedSortedAggregateOperator to hand the already-pulled first chunk back
@@ -11256,9 +11431,9 @@ class PrependChunkOperator final : public Operator {
 /// Eligibility is decided from the first non-empty chunk. If the input is not
 /// sorted on the group_by keys (no `ordering`, or it doesn't cover them, or a
 /// group key is nullable), the operator transparently falls back to the
-/// hash-based ChunkedAggregateOperator by replaying the already-pulled chunk
+/// hash aggregate phase operator by replaying the already-pulled chunk
 /// ahead of the remaining child. The supported agg subset matches
-/// ChunkedAggregateOperator (Count/Sum/Min/Max/Mean on numeric columns);
+/// HashAggregateState (Count/Sum/Min/Max/Mean on numeric columns);
 /// build_operator only routes that subset here.
 class ChunkedSortedAggregateOperator final : public Operator {
    public:
@@ -11331,7 +11506,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             // columns from the input's types, so hand it the empty chunk and let
             // it produce a properly-shaped empty result.
             if (schema_only.has_value()) {
-                fallback_ = std::make_unique<ChunkedAggregateOperator>(
+                fallback_ = make_hash_aggregate_operator(
                     std::make_unique<PrependChunkOperator>(std::move(*schema_only),
                                                            std::move(child_)),
                     group_by_, aggregations_, *exec_, par_, columns_);
@@ -11346,7 +11521,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             return std::unexpected(std::move(*err));
         }
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
-            fallback_ = std::make_unique<ChunkedAggregateOperator>(
+            fallback_ = make_hash_aggregate_operator(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
                 group_by_, aggregations_, *exec_, par_, columns_);
             return {};
@@ -11823,7 +11998,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
     const ExecutionContext* exec_;
-    /// Forwarded verbatim to the hash `ChunkedAggregateOperator` fallback --
+    /// Forwarded verbatim to the hash aggregate fallback --
     /// the sorted stream itself has no fan-out point (it emits group-at-a-time).
     physical::AggregateParallelism par_{};
     std::optional<physical::AggregateColumnMapping> columns_;
@@ -15094,6 +15269,18 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         return make_table_source(std::move(*result));
     }
     if (ap.strategy == physical::AggregateStrategy::StreamingSorted) {
+        if (!plan.hash_aggregate.has_value()) {
+            return std::unexpected(
+                "physical aggregate: adaptive strategy has no hash-fallback phase chain");
+        }
+        if (auto edge_error = physical::validate_hash_aggregate_edges(*plan.hash_aggregate)) {
+            return std::unexpected(std::move(*edge_error));
+        }
+        if (agg.children().empty() ||
+            plan.hash_aggregate->discovery.source != agg.children().front().get()) {
+            return std::unexpected(
+                "physical aggregate: Discovery input does not match the aggregate child");
+        }
         auto parallelism = resolved_aggregate_parallelism(plan, exec);
         if (!parallelism.has_value()) {
             return std::unexpected(std::move(parallelism.error()));
@@ -15105,7 +15292,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         }
         // The sorted operator streams group-at-a-time when the child's
         // chunks arrive sorted on the group keys, and otherwise replays the
-        // first chunk into a hash ChunkedAggregateOperator — so it is safe
+        // first chunk into the hash aggregate phase operator — so it is safe
         // to route the whole streamable subset here.
         // Aggregates are often the terminal breaker and hash aggregation
         // emits only after consuming all input. Scheduling one in its own

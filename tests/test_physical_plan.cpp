@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "interpreter_internal.hpp"
+#include "execution_profile_internal.hpp"
 #include "physical_plan.hpp"
 
 namespace {
@@ -1273,6 +1274,25 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
 }
 
 TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical][breaker]") {
+    SECTION("the hash fallback has four typed structural phases") {
+        const auto [tree, plan] =
+            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+        REQUIRE(plan.hash_aggregate.has_value());
+        const auto& nodes = *plan.hash_aggregate;
+        REQUIRE(nodes.discovery.source == tree->children().front().get());
+        REQUIRE(nodes.discovery.input == runtime::physical::AggregateDataKind::InputChunks);
+        REQUIRE(nodes.discovery.output ==
+                runtime::physical::AggregateDataKind::DiscoveredGroups);
+        REQUIRE(nodes.accumulation.input == nodes.discovery.output);
+        REQUIRE(nodes.accumulation.output ==
+                runtime::physical::AggregateDataKind::AccumulatedGroups);
+        REQUIRE(nodes.final_ordering.input == nodes.accumulation.output);
+        REQUIRE(nodes.final_ordering.output == runtime::physical::AggregateDataKind::OrderedGroups);
+        REQUIRE(nodes.emission.input == nodes.final_ordering.output);
+        REQUIRE(nodes.emission.output == runtime::physical::AggregateDataKind::OutputChunks);
+        REQUIRE_FALSE(runtime::physical::validate_hash_aggregate_edges(nodes).has_value());
+    }
+
     SECTION("partition then finalize, each with its own floor and strategy") {
         const auto [tree, plan] =
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
@@ -1300,6 +1320,10 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE(text.find("Breaker(Aggregate)") != std::string::npos);
         REQUIRE(text.find("partition:") != std::string::npos);
         REQUIRE(text.find("finalize:") != std::string::npos);
+        REQUIRE(text.find("Discovery -> Accumulation -> FinalOrdering -> Emission") !=
+                std::string::npos);
+        REQUIRE(text.find("InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> "
+                          "OutputChunks") != std::string::npos);
         REQUIRE(text.find("radix-hash") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
     }
@@ -1347,6 +1371,7 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
             "[select { n = count() }, by { o_orderkey }];");
         if (plan.aggregate.strategy == runtime::physical::AggregateStrategy::FusedLeftJoinCount) {
             REQUIRE(plan.breaker_phases.empty());
+            REQUIRE_FALSE(plan.hash_aggregate.has_value());
         }
     }
 }
@@ -1435,11 +1460,53 @@ TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations"
         CHECK(result_s[1] == expected_s[1]);
     }
 
+    SECTION("the serial executor accounts each structural phase independently") {
+        auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/1,
+                                                                        /*report=*/false);
+        auto exec = serial_exec();
+        exec.execution_profile = profile;
+        const auto result = execute_physical_plan(plan, *tree, registry, exec);
+        REQUIRE(result.has_value());
+
+        const auto rows = profile->snapshot();
+        for (const std::string_view label : {"Aggregate.Discovery", "Aggregate.Accumulation",
+                                             "Aggregate.FinalOrdering", "Aggregate.Emission"}) {
+            const auto phase = std::ranges::find_if(
+                rows, [&](const auto& row) { return row.label == label; });
+            REQUIRE(phase != rows.end());
+            CHECK(phase->next_self_ns > 0);
+        }
+    }
+
     SECTION("mutating the planned phase order is rejected") {
         std::swap(plan.breaker_phases[0], plan.breaker_phases[1]);
         const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error().find("expected partition and finalize") != std::string::npos);
+    }
+
+    SECTION("mutating a structural phase edge is rejected") {
+        REQUIRE(plan.hash_aggregate.has_value());
+        plan.hash_aggregate->final_ordering.input =
+            runtime::physical::AggregateDataKind::DiscoveredGroups;
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("Accumulation -> FinalOrdering") != std::string::npos);
+    }
+
+    SECTION("removing the structural phase chain is rejected") {
+        plan.hash_aggregate.reset();
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("no hash-fallback phase chain") != std::string::npos);
+    }
+
+    SECTION("mutating the discovery input is rejected") {
+        REQUIRE(plan.hash_aggregate.has_value());
+        plan.hash_aggregate->discovery.source = tree.get();
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("Discovery input") != std::string::npos);
     }
 }
 

@@ -568,6 +568,17 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             // left-join count is whole-table and has no fan-out to describe.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
                 plan.aggregate.columns = known_aggregate_column_mapping(aggregate, schemas);
+                plan.hash_aggregate = HashAggregateNodes{
+                    .discovery = {.source = aggregate.children().front().get(),
+                                  .input = AggregateDataKind::InputChunks,
+                                  .output = AggregateDataKind::DiscoveredGroups},
+                    .accumulation = {.input = AggregateDataKind::DiscoveredGroups,
+                                     .output = AggregateDataKind::AccumulatedGroups},
+                    .final_ordering = {.input = AggregateDataKind::AccumulatedGroups,
+                                       .output = AggregateDataKind::OrderedGroups},
+                    .emission = {.input = AggregateDataKind::OrderedGroups,
+                                 .output = AggregateDataKind::OutputChunks},
+                };
                 const RowEstimate input_estimate = table_input_row_estimate(root, registry);
                 plan.breaker_phases.push_back(
                     {.name = "partition",
@@ -798,10 +809,15 @@ auto explain_physical(const Plan& plan) -> std::string {
             return out;
         }
         if (plan.aggregate.describes) {
-            // The strategy line, then one line per fan-out phase (the streamed
-            // hash path carries partition + finalize; see `plan_physical`). A
-            // fused left-join count has no phases and prints just the strategy.
+            // The adaptive path shows both its structural hash-fallback chain
+            // and its current fan-out policies. A fused left-join count has
+            // neither and prints just the strategy.
             out += "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate);
+            if (plan.hash_aggregate.has_value()) {
+                out += "\n  hash-fallback: Discovery -> Accumulation -> FinalOrdering -> Emission";
+                out += "\n    edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> "
+                       "OrderedGroups -> OutputChunks";
+            }
             append_phase_lines(out, plan.breaker_phases);
             out += '\n';
             return out;
@@ -1117,6 +1133,30 @@ auto validate_streaming_join_edge(const StreamingJoinNodes& nodes) -> std::optio
     if (nodes.build.output != JoinDataKind::RuntimeOrientedBuildOutput ||
         nodes.probe.build_input != nodes.build.output) {
         return "physical join: HashProbe does not consume HashBuild's runtime-oriented output";
+    }
+    return std::nullopt;
+}
+
+auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
+    -> std::optional<std::string> {
+    if (nodes.discovery.source == nullptr) {
+        return "physical aggregate: Discovery has no input";
+    }
+    if (nodes.discovery.input != AggregateDataKind::InputChunks ||
+        nodes.discovery.output != AggregateDataKind::DiscoveredGroups ||
+        nodes.accumulation.input != nodes.discovery.output) {
+        return "physical aggregate: Discovery -> Accumulation edge is invalid";
+    }
+    if (nodes.accumulation.output != AggregateDataKind::AccumulatedGroups ||
+        nodes.final_ordering.input != nodes.accumulation.output) {
+        return "physical aggregate: Accumulation -> FinalOrdering edge is invalid";
+    }
+    if (nodes.final_ordering.output != AggregateDataKind::OrderedGroups ||
+        nodes.emission.input != nodes.final_ordering.output) {
+        return "physical aggregate: FinalOrdering -> Emission edge is invalid";
+    }
+    if (nodes.emission.output != AggregateDataKind::OutputChunks) {
+        return "physical aggregate: Emission output is invalid";
     }
     return std::nullopt;
 }

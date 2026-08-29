@@ -116,11 +116,14 @@ from the plan — backlog 116→6 breakers, plan describes 97% of real-work node
 Distinct, streaming Join, and streaming Aggregate read resolved fan-out policy
 from the plan).
 
-**The 97% still flatters it:** the streaming inner join is now shaped as
-explicit `HashBuild` and `HashProbe` nodes across a typed runtime-oriented
-barrier, but the aggregate is still one operator, not four phases. Semi/anti
-retains its separate streaming operator, and aggregate phases cannot yet be
-scheduled or measured separately.
+**The 97% still flatters it:** the streaming inner join is shaped as explicit
+`HashBuild` and `HashProbe` nodes across a typed runtime-oriented barrier. The
+hash-aggregate fallback now has typed discovery, accumulation, final-ordering,
+and emission plan nodes. A serial coordinator invokes all four: discovery
+publishes a bounded per-chunk transfer that accumulation consumes before the
+source advances, while owned/async one-pass kernels publish an explicit fused
+result. Each node has its own execution-profile row. Semi/anti retains its
+separate streaming operator.
 
 ### Next, in order
 
@@ -172,8 +175,23 @@ scheduled or measured separately.
    read the resolved plan policy; `AggregateColumnMapping` binds known schemas
    during planning and lazy/open schemas once at execution; and physical-plan
    mutation tests prove mapped positions, phase order, and worker ceilings are
-   consumed or rejected. What remains is the actual split into independently
-   scheduled/buildable phases.
+   consumed or rejected. **Structural plan slice DONE 2026-08-29:** the hash
+   fallback carries typed Discovery → Accumulation → FinalOrdering → Emission
+   nodes and ownership edges; `explain physical` renders the chain and the
+   executor rejects missing, redirected, or mistyped edges. **Serial lifecycle
+   slice DONE 2026-08-29:** final ordering is no longer triggered implicitly by
+   emission; a coordinator drains the input, invokes the deterministic ordering
+   merge, then permits output construction. Discovery and accumulation remain
+   deliberately fused only where owned/async or specialized categorical kernels
+   produce final aggregate state in one pass.
+   **Discovery-transfer/accounting slice DONE 2026-08-29:** ordinary paths pass
+   group IDs, positional aggregate entries, row count, and any seeded-First mask
+   through one chunk-bounded `AggregateDiscoveryTransfer`; fused kernels return
+   an explicit fused marker. The coordinator invokes Discovery and Accumulation
+   separately before advancing the source, and all four structural nodes have
+   independent profile rows. Release A/B over `groupagg,multi,events` (7
+   interleaved repeats, 3 timed iterations, pinned core) found all nine query
+   deltas noise; final total +0.22%, geometric speedup 0.992×.
 4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
    single-operator shape as Order/Head: `plan_physical` marks each migrated,
    `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
@@ -429,10 +447,14 @@ at all (a one-valued strategy enum would be ceremony).
    and probe kernels no longer look columns up by textual key per chunk. NOT
    blocked on a cost model.
 2. **Hash aggregate** — construction, positional column binding, fan-out
-   authority, and physical-plan mutation coverage DONE; phase decomposition has
-   not started. The former determinism blocker is resolved. `StreamingSorted`
-   is the historical name for an adaptive strategy: sorted group-at-a-time when
-   possible, hash fallback otherwise (including ordinary generated tables).
+   authority, physical-plan mutation coverage, and the four-node structural
+   hash-fallback chain DONE. Serial orchestration, the bounded
+   discovery→accumulation transfer, fused-result marker, final-ordering/emission
+   split, and per-node accounting are also DONE. The former determinism blocker
+   is resolved. `StreamingSorted` is the historical name for an adaptive
+   strategy: sorted group-at-a-time when possible, hash fallback otherwise
+   (including ordinary generated tables). Next replace the coarser
+   partition/finalize policy pair with policy attached to each structural node.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
    `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
    family and Distinct/Order now leave the per-kind switch.
@@ -471,8 +493,11 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
 3. Split aggregate execution at its existing ownership boundaries — discovery /
    partition accumulation / final ordering / emission — first with serial
    orchestration and plan-shape/accounting tests, then admit fan-out one phase
-   at a time with byte-identity checks. Preconditions are complete: positional
-   inputs, authoritative fan-out policy, and an executor mutation seam.
+   at a time with byte-identity checks. The typed plan shape and edge-mutation
+   tests, serial orchestration, bounded discovery transfer, fused marker, and
+   independent profile accounting are complete. Next attach fan-out policy to
+   each structural node and admit it one phase at a time. Positional inputs,
+   authoritative current policy, and the executor mutation seam are in place.
 4. Add per-phase scheduling accounting only after steps 2–3 provide stable
    pipeline identities. Keep DOP/memory budgeting blocked unless those changes
    produce measured queue contention or a multi-producer consumer.

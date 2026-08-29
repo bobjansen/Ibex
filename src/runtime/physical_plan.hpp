@@ -223,6 +223,57 @@ struct AggregateColumnMapping {
     auto operator==(const AggregateColumnMapping&) const -> bool = default;
 };
 
+/// Values crossing the structural phases of the hash-aggregate fallback.
+/// These are ownership types, not table schemas: each value is internal state
+/// that only the following phase may consume.
+enum class AggregateDataKind : std::uint8_t {
+    None,
+    InputChunks,
+    DiscoveredGroups,
+    AccumulatedGroups,
+    OrderedGroups,
+    OutputChunks,
+};
+
+struct AggregateDiscoveryNode {
+    const ir::Node* source = nullptr;
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+};
+
+struct AggregateAccumulationNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+};
+
+struct AggregateFinalOrderingNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+};
+
+struct AggregateEmissionNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+};
+
+/// The hash fallback's structural chain. The current optimized kernels may
+/// fuse work within an edge, but the plan and executor agree on these four
+/// ownership boundaries. Discovery hands Accumulation a bounded per-chunk
+/// transfer (or an explicit fused marker); final ordering and emission have
+/// separate executor entries. The serial coordinator invokes all four nodes;
+/// their current fan-out policies remain the coarser partition/finalize pair.
+struct HashAggregateNodes {
+    AggregateDiscoveryNode discovery;
+    AggregateAccumulationNode accumulation;
+    AggregateFinalOrderingNode final_ordering;
+    AggregateEmissionNode emission;
+};
+
+/// Validate the typed Discovery -> Accumulation -> FinalOrdering -> Emission
+/// chain. Execution calls the same predicate used by mutation tests.
+[[nodiscard]] auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
+    -> std::optional<std::string>;
+
 /// What the plan knows about an `Aggregate` node.
 ///
 /// Every field is RELAYED from the predicates the builder itself calls --
@@ -320,8 +371,8 @@ struct BreakerParallelism {
 
 /// A breaker is one or more named phases, each with a fan-out point. Distinct /
 /// Order / TopK have one; Join has two (hash-build, probe); Aggregate currently
-/// has two policy phases (partition, finalize). Its eventual structural split
-/// will name discovery, accumulation, final ordering, and emission separately.
+/// has two policy phases (partition, finalize), alongside four structural nodes
+/// for discovery, accumulation, final ordering, and emission.
 struct BreakerPhase {
     std::string_view name;
     BreakerParallelism parallelism;
@@ -491,6 +542,11 @@ struct Plan {
     std::optional<StreamingJoinNodes> streaming_join;
     /// Set when `root` is an `Aggregate`.
     AggregatePlan aggregate;
+    /// Present for the adaptive streamable aggregate's hash fallback. These
+    /// are structural phase nodes; `breaker_phases` below continues to carry
+    /// the two current fan-out policies until discovery and accumulation have
+    /// independent scheduling policies.
+    std::optional<HashAggregateNodes> hash_aggregate;
     /// Set when `root` is a breaker whose parallelism the plan describes.
     /// Empty otherwise. One entry per fan-out phase (see `BreakerPhase`).
     std::vector<BreakerPhase> breaker_phases;

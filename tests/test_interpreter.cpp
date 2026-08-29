@@ -13269,7 +13269,7 @@ TEST_CASE("Streaming first/last match the materializing path (parity)") {
 // ── Multi-key group-by (the generic grouping path) ────────────────────────────
 //
 // A group-by whose keys are neither all-categorical nor a single string column
-// lands in ChunkedAggregateOperator::process_rows_generic, which hashes each
+// lands in HashAggregateState::process_rows_generic, which hashes each
 // row's key columns in place and compares a candidate group's stored key
 // against the row. Nothing exercised it before: making key comparison always
 // answer "equal" — which merges unrelated groups — left the whole suite green.

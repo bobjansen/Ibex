@@ -1425,6 +1425,41 @@ TEST_CASE("Physical HashBuild and HashProbe consume the resolved join column map
     CHECK(parallel_left_ids[1] == left_ids[1]);
     CHECK(parallel_right_ids[0] == right_ids[0]);
     CHECK(parallel_right_ids[1] == right_ids[1]);
+
+    auto plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+    REQUIRE(plan.streaming_join.has_value());
+    REQUIRE(plan.streaming_join->columns.has_value());
+
+    SECTION("a mutated output position is rejected at the concrete boundary") {
+        plan.streaming_join->columns->output.back().source_index = 0;
+        const auto result = execute_physical_plan(plan, *tree, registry, serial);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("join column mapping") != std::string::npos);
+    }
+
+    SECTION("a narrower physical input layout rebinds the complete mapping once") {
+        auto& columns = *plan.streaming_join->columns;
+        columns.left_input_names.insert(columns.left_input_names.begin(), "predicate_only");
+        for (auto& key : columns.keys) {
+            ++key.left_index;
+        }
+        for (auto& output : columns.output) {
+            if (output.side == ir::JoinOutputSide::Left) {
+                ++output.source_index;
+            }
+        }
+        const auto result = execute_physical_plan(plan, *tree, registry, serial);
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == s->rows());
+        const auto& rebound_left_ids =
+            std::get<Column<std::int64_t>>(*result->find("left_id"));
+        const auto& rebound_right_ids =
+            std::get<Column<std::int64_t>>(*result->find("right_id"));
+        CHECK(rebound_left_ids[0] == left_ids[0]);
+        CHECK(rebound_left_ids[1] == left_ids[1]);
+        CHECK(rebound_right_ids[0] == right_ids[0]);
+        CHECK(rebound_right_ids[1] == right_ids[1]);
+    }
 }
 
 TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations",

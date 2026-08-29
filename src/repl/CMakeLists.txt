@@ -21,6 +21,8 @@ target_include_directories(ibex_repl
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
 )
 
 target_link_libraries(ibex_repl

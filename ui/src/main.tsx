@@ -4,7 +4,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import Editor, { type OnMount } from "@monaco-editor/react";
-import type { editor as MonacoEditor } from "monaco-editor";
+import type {
+  editor as MonacoEditor,
+  Position as MonacoPosition,
+} from "monaco-editor";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import "./styles.css";
 
@@ -79,6 +82,209 @@ const examples: Example[] = [
       "samples[select { n = count(), mean = mean(value), min = min(value), max = max(value) }];",
   },
 ];
+
+// Surface vocabulary the interpreter understands so the editor can complete it.
+const KEYWORDS = [
+  "let",
+  "fn",
+  "extern",
+  "from",
+  "import",
+  "filter",
+  "select",
+  "update",
+  "distinct",
+  "order",
+  "head",
+  "tail",
+  "by",
+  "window",
+  "resample",
+  "rename",
+  "join",
+  "left",
+  "right",
+  "outer",
+  "semi",
+  "anti",
+  "cross",
+  "asof",
+  "on",
+  "suffix",
+  "asc",
+  "desc",
+  "as",
+  "case",
+  "else",
+  "map",
+  "in",
+];
+
+type Builtin = { name: string; signature: string; summary: string };
+const BUILTINS: Builtin[] = [
+  {
+    name: "mean",
+    signature: "mean(col) -> Float64",
+    summary: "Aggregate mean.",
+  },
+  { name: "sum", signature: "sum(col)", summary: "Aggregate sum." },
+  {
+    name: "count",
+    signature: "count() | count(col) -> Int64",
+    summary: "Rows in the group, or non-null values of col.",
+  },
+  { name: "min", signature: "min(col)", summary: "Aggregate minimum." },
+  { name: "max", signature: "max(col)", summary: "Aggregate maximum." },
+  {
+    name: "first",
+    signature: "first(col)",
+    summary: "First value in group order.",
+  },
+  {
+    name: "last",
+    signature: "last(col)",
+    summary: "Last value in group order.",
+  },
+  {
+    name: "median",
+    signature: "median(col) -> Float64",
+    summary: "Aggregate median.",
+  },
+  {
+    name: "std",
+    signature: "std(col) -> Float64",
+    summary: "Sample standard deviation.",
+  },
+  {
+    name: "quantile",
+    signature: "quantile(col, p) -> Float64",
+    summary: "Interpolated aggregate quantile.",
+  },
+  {
+    name: "as_timeframe",
+    signature: 'as_timeframe(table, "ts_col") -> TimeFrame',
+    summary: "Mark a table as time-indexed and sorted.",
+  },
+  {
+    name: "lag",
+    signature: "lag(col, n)",
+    summary: "Value n rows before the current row.",
+  },
+  {
+    name: "lead",
+    signature: "lead(col, n)",
+    summary: "Value n rows after the current row.",
+  },
+  {
+    name: "rank",
+    signature: "rank(expr, method = dense, ascending = true)",
+    summary: "Row rank, optionally partitioned by a by clause.",
+  },
+  {
+    name: "round",
+    signature: "round(value, mode)",
+    summary: "nearest / bankers / floor / ceil / trunc.",
+  },
+  {
+    name: "like",
+    signature: "like(value, pattern) -> Bool",
+    summary: "SQL-LIKE match: % any run, _ one char.",
+  },
+  {
+    name: "columns",
+    signature: "columns(table) -> DataFrame",
+    summary: "Metadata table of column names.",
+  },
+  {
+    name: "scalar",
+    signature: "scalar(table, column)",
+    summary: "Extract a scalar from a one-row table.",
+  },
+  { name: "print", signature: "print(value)", summary: "Print a value." },
+  {
+    name: "rolling_mean",
+    signature: "rolling_mean(col)",
+    summary: "Mean over the surrounding window clause.",
+  },
+  {
+    name: "rolling_sum",
+    signature: "rolling_sum(col)",
+    summary: "Sum over the surrounding window clause.",
+  },
+  {
+    name: "rolling_count",
+    signature: "rolling_count()",
+    summary: "Row count over the surrounding window clause.",
+  },
+  {
+    name: "rolling_min",
+    signature: "rolling_min(col)",
+    summary: "Minimum over the surrounding window clause.",
+  },
+  {
+    name: "rolling_max",
+    signature: "rolling_max(col)",
+    summary: "Maximum over the surrounding window clause.",
+  },
+  {
+    name: "rolling_std",
+    signature: "rolling_std(col)",
+    summary: "Std deviation over the surrounding window clause.",
+  },
+];
+
+type CheatEntry = { title: string; code: string; note: string };
+const cheatsheet: CheatEntry[] = [
+  {
+    title: "Select columns",
+    code: "trades[select { symbol, price }]",
+    note: "Pick or compute columns. Bare `trades[{ symbol, price }]` is shorthand.",
+  },
+  {
+    title: "Filter rows",
+    code: "trades[filter price > 100]",
+    note: "Keep rows where the predicate holds. Combine with `&&`, `||`, `!`.",
+  },
+  {
+    title: "Computed columns",
+    code: "trades[select { notional = price * volume }]",
+    note: "`select` replaces the schema; `update` adds to it.",
+  },
+  {
+    title: "Group and aggregate",
+    code: "trades[select { avg = mean(price), n = count() }, by symbol]",
+    note: "`by` needs a `select` or `update`. Group keys come through automatically.",
+  },
+  {
+    title: "Order and limit",
+    code: "trades[order { price desc }, head 10]",
+    note: "`order { col asc/desc, ... }`, then `head n` / `tail n`.",
+  },
+  {
+    title: "Distinct",
+    code: "trades[distinct { symbol }]",
+    note: "One row per distinct combination of the listed columns.",
+  },
+  {
+    title: "Join",
+    code: "trades join reference on symbol",
+    note: '`left/right/outer/semi/anti/cross join`. Add `suffix { "", "_r" }` when non-key names collide.',
+  },
+  {
+    title: "Time series",
+    code: 'let tf = as_timeframe(trades, "timestamp");\ntf[window 5m, update { avg = rolling_mean(price) }]',
+    note: "`window` for trailing windows, `resample 1m` for fixed bars. Needs a TimeFrame.",
+  },
+  {
+    title: "Lag / lead",
+    code: "trades[update { prev = lag(price, 1) }, by symbol]",
+    note: "Row-relative access within each group.",
+  },
+];
+
+// Monaco language providers are global; register the completion provider once
+// even if the editor component remounts.
+let completionRegistered = false;
 
 const WELCOME_KEY = "ibex-ui-welcome";
 function welcomeDismissed(): boolean {
@@ -210,6 +416,7 @@ function App() {
   const [activeResultId, setActiveResultId] = useState<string>();
   const [environment, setEnvironment] = useState<EnvironmentTable[]>([]);
   const [error, setError] = useState<string>();
+  const [errorAt, setErrorAt] = useState<{ line: number; column?: number }>();
   const [scalar, setScalar] = useState<unknown>();
   const [running, setRunning] = useState(false);
   const [elapsedMs, setElapsedMs] = useState<number>();
@@ -217,8 +424,11 @@ function App() {
   const [filesError, setFilesError] = useState<string>();
   const [demo, setDemo] = useState(false);
   const [showWelcome, setShowWelcome] = useState(() => !welcomeDismissed());
+  const [showCheatsheet, setShowCheatsheet] = useState(false);
   const runRef = useRef<() => void>(() => {});
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
+  const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const environmentRef = useRef<EnvironmentTable[]>([]);
 
   const refreshEnvironment = useCallback(async () => {
     const response = await api<Environment>("/api/v1/environment");
@@ -258,9 +468,34 @@ function App() {
     void refreshFiles();
   }, [refreshFiles]);
 
+  const setEditorMarkers = useCallback(
+    (err?: { message: string; line?: number; column?: number }) => {
+      const monaco = monacoRef.current;
+      const model = editorRef.current?.getModel();
+      if (!monaco || !model) return;
+      const markers =
+        err && err.line
+          ? [
+              {
+                message: err.message,
+                severity: monaco.MarkerSeverity.Error,
+                startLineNumber: err.line,
+                startColumn: err.column ?? 1,
+                endLineNumber: err.line,
+                endColumn: (err.column ?? 1) + 1,
+              },
+            ]
+          : [];
+      monaco.editor.setModelMarkers(model, "ibex", markers);
+    },
+    [],
+  );
+
   const run = useCallback(async () => {
     setRunning(true);
     setError(undefined);
+    setErrorAt(undefined);
+    setEditorMarkers(undefined);
     setScalar(undefined);
     setElapsedMs(undefined);
     setTableResults([]);
@@ -274,6 +509,13 @@ function App() {
       setElapsedMs(response.elapsed_ms);
       if (!response.ok) {
         setError(response.error?.message ?? "Query failed");
+        if (response.error?.line !== undefined) {
+          setErrorAt({
+            line: response.error.line,
+            column: response.error.column,
+          });
+        }
+        setEditorMarkers(response.error);
         return;
       }
       const tables =
@@ -289,10 +531,11 @@ function App() {
     } finally {
       setRunning(false);
     }
-  }, [source]);
+  }, [source, setEditorMarkers]);
   runRef.current = () => {
     void run();
   };
+  environmentRef.current = environment;
 
   const remove = useCallback(async (name: string) => {
     const response = await api<Environment>(
@@ -335,18 +578,23 @@ function App() {
 
   const onMount: OnMount = (editor, monaco) => {
     editorRef.current = editor;
+    monacoRef.current = monaco;
     monaco.languages.register({ id: "ibex" });
     monaco.languages.setMonarchTokensProvider("ibex", {
+      keywords: KEYWORDS,
       tokenizer: {
         root: [
-          [
-            /\b(let|fn|filter|select|update|by|window|import|extern|from)\b/,
-            "keyword",
-          ],
-          [/\b(Int|Int64|Float64|String|Bool|DataFrame|TimeFrame)\b/, "type"],
           [/\/\/.*$/, "comment"],
           [/"([^"\\]|\\.)*"/, "string"],
-          [/\d+(\.\d+)?/, "number"],
+          [
+            /\b(Int|Int32|Int64|Float32|Float64|String|Bool|Date|Timestamp|Series|DataFrame|TimeFrame|Stream)\b/,
+            "type",
+          ],
+          [/\d+(\.\d+)?[smhd]?/, "number"],
+          [
+            /[a-zA-Z_]\w*/,
+            { cases: { "@keywords": "keyword", "@default": "identifier" } },
+          ],
         ],
       },
     });
@@ -357,22 +605,101 @@ function App() {
       keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
       run: () => runRef.current(),
     });
+
+    if (!completionRegistered) {
+      completionRegistered = true;
+      monaco.languages.registerCompletionItemProvider("ibex", {
+        provideCompletionItems: (
+          model: MonacoEditor.ITextModel,
+          position: MonacoPosition,
+        ) => {
+          const word = model.getWordUntilPosition(position);
+          const range = {
+            startLineNumber: position.lineNumber,
+            endLineNumber: position.lineNumber,
+            startColumn: word.startColumn,
+            endColumn: word.endColumn,
+          };
+          const K = monaco.languages.CompletionItemKind;
+          const suggestions = [
+            ...KEYWORDS.map((label) => ({
+              label,
+              kind: K.Keyword,
+              insertText: label,
+              range,
+            })),
+            ...BUILTINS.map((fn) => ({
+              label: fn.name,
+              kind: K.Function,
+              detail: fn.signature,
+              documentation: fn.summary,
+              insertText: fn.name,
+              range,
+            })),
+            ...environmentRef.current.map((table) => ({
+              label: table.name,
+              kind: K.Struct,
+              detail: `${table.lazy ? "lazy source" : `${table.rows} rows`}`,
+              insertText: table.name,
+              range,
+            })),
+            ...[
+              ...new Map(
+                environmentRef.current
+                  .flatMap((table) => table.columns)
+                  .map((column) => [column.name, column]),
+              ).values(),
+            ].map((column) => ({
+              label: column.name,
+              kind: K.Field,
+              detail: column.type,
+              insertText: column.name,
+              range,
+            })),
+          ];
+          return { suggestions };
+        },
+      });
+    }
   };
 
-  const insertFilePath = useCallback((path: string) => {
+  const setStarterQuery = useCallback((table: EnvironmentTable) => {
+    const columns = table.columns
+      .slice(0, 4)
+      .map((column) => column.name)
+      .join(", ");
+    setSource(`${table.name}[select { ${columns} }];`);
+    editorRef.current?.focus();
+  }, []);
+
+  const insertSnippet = useCallback((text: string) => {
     const editor = editorRef.current;
-    const text = JSON.stringify(path);
     if (!editor) {
-      setSource((current) => current + text);
+      setSource((current) => (current ? `${current}\n${text}` : text));
       return;
     }
     const selection = editor.getSelection();
     if (selection)
-      editor.executeEdits("file-explorer", [
+      editor.executeEdits("environment", [
         { range: selection, text, forceMoveMarkers: true },
       ]);
     editor.focus();
   }, []);
+  const insertFilePath = useCallback(
+    (path: string) => insertSnippet(JSON.stringify(path)),
+    [insertSnippet],
+  );
+
+  const jumpToError = useCallback(() => {
+    const editor = editorRef.current;
+    if (!editor || !errorAt) return;
+    editor.revealLineInCenter(errorAt.line);
+    editor.setPosition({
+      lineNumber: errorAt.line,
+      column: errorAt.column ?? 1,
+    });
+    editor.focus();
+  }, [errorAt]);
 
   const page = tableResults.find(
     (result) => result.result_id === activeResultId,
@@ -396,7 +723,13 @@ function App() {
         {environment.map((table) => (
           <section className="binding" key={table.name}>
             <div>
-              <strong>{table.name}</strong>
+              <button
+                className="binding-name"
+                title={`Load a starter query for ${table.name}`}
+                onClick={() => setStarterQuery(table)}
+              >
+                {table.name}
+              </button>
               <button
                 title={`Remove ${table.name}`}
                 onClick={() => void remove(table.name)}
@@ -410,9 +743,14 @@ function App() {
                 : `${table.rows.toLocaleString()} rows`}
             </small>
             {table.columns.map((column) => (
-              <span key={column.name}>
+              <button
+                className="binding-column"
+                key={column.name}
+                title={`Insert ${column.name}`}
+                onClick={() => insertSnippet(column.name)}
+              >
                 {column.name} <i>{column.type}</i>
-              </span>
+              </button>
             ))}
           </section>
         ))}
@@ -492,6 +830,7 @@ function App() {
                 </option>
               ))}
             </select>
+            <button onClick={() => setShowCheatsheet(true)}>Cheatsheet</button>
             <button
               className="run"
               disabled={running}
@@ -520,7 +859,15 @@ function App() {
         <section className="output-pane">
           {error && (
             <div className="error">
-              <strong>Query error</strong>
+              <div className="error-head">
+                <strong>Query error</strong>
+                {errorAt && (
+                  <button onClick={jumpToError}>
+                    Line {errorAt.line}
+                    {errorAt.column ? `, col ${errorAt.column}` : ""}
+                  </button>
+                )}
+              </div>
               <pre>{error}</pre>
             </div>
           )}
@@ -557,6 +904,64 @@ function App() {
           </section>
         </section>
       </section>
+      {showCheatsheet && (
+        <div
+          className="welcome-backdrop"
+          onClick={() => setShowCheatsheet(false)}
+        >
+          <div
+            className="cheatsheet-card"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header>
+              <strong>Ibex bracket syntax</strong>
+              <button onClick={() => setShowCheatsheet(false)}>Close</button>
+            </header>
+            <p className="cheatsheet-intro">
+              A table expression is <code>name[clause, clause, …]</code>.
+              Clauses run left to right. Click an entry to load it into the
+              editor.
+            </p>
+            <dl>
+              {cheatsheet.map((entry) => (
+                <div
+                  className="cheatsheet-entry"
+                  key={entry.title}
+                  onClick={() => {
+                    setSource(entry.code);
+                    setShowCheatsheet(false);
+                    editorRef.current?.focus();
+                  }}
+                >
+                  <dt>{entry.title}</dt>
+                  <dd>
+                    <pre>{entry.code}</pre>
+                    <span>{entry.note}</span>
+                  </dd>
+                </div>
+              ))}
+            </dl>
+            <p className="cheatsheet-more">
+              Full reference:{" "}
+              <a
+                href="https://bobjansen.github.io/Ibex/cheatsheet.html"
+                target="_blank"
+                rel="noreferrer"
+              >
+                cheatsheet
+              </a>{" "}
+              ·{" "}
+              <a
+                href="https://bobjansen.github.io/Ibex/language.html"
+                target="_blank"
+                rel="noreferrer"
+              >
+                language guide
+              </a>
+            </p>
+          </div>
+        </div>
+      )}
       {showWelcome && (
         <div className="welcome-backdrop">
           <div className="welcome-card">

@@ -4,8 +4,9 @@
 2026-08-22; Phase 2 complete except `KernelContext` (deliberately unbuilt);
 Phase 3's handoff/island/raw-thread work is complete, with accounting and
 DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
-authority are done, while true operator decomposition remains open; Phase 5 has
-not started apart from retiring the fused logical node kinds. **Compacted
+authority are done, while true operator decomposition remains open; Phase 5 is
+in progress: fused logical node kinds are retired and the aggregate execution
+family is now outside the monolith. **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -25,9 +26,11 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 ## Why
 
-`src/runtime/chunked.cpp` (~13k lines) is the physical planner, most streaming
-operator implementations, parallel islands, pipelined stages, and a large set of
-operator-specific eligibility rules — all grown together because
+`src/runtime/chunked.cpp` remains the physical planner, most streaming operator
+implementations, parallel pipelines, pipelined stages, and a large set of
+operator-specific eligibility rules. The aggregate family has moved to
+`aggregate_chunked.cpp`, but the remaining responsibilities are still grown
+together because
 `build_operator(const ir::Node&)` lowers logical nodes directly into mutable
 `Operator::next()` objects. Three costs: (1) a physical choice has no
 representation ("stream this join", "materialize this aggregate" are builder
@@ -208,8 +211,13 @@ separate streaming operator.
    physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
-5. **Phase 5 item 1 — split `chunked.cpp` by ownership** — easier now that the
-   fan-out policy is outside the operators.
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** The
+   aggregate family is extracted behind one private factory; its hot templates,
+   state, and kernels remain together in `aggregate_chunked.cpp`. The shared
+   packed-key encoder now has one private header for Aggregate and Distinct.
+   Next slice: extract the streaming inner-join family behind its existing
+   build/probe seam, leaving semi/anti and materializing fallbacks in place until
+   their own boundaries are explicit.
 6. **Sweep process-global plan counters in tests** — one test passed while its
    premise was false (`physical_materialized_calls` is process-wide, other tests
    in the binary bump it). Others may lean the same way.
@@ -391,9 +399,10 @@ breaker operators (Phase 4).
 4. **Eliminate raw-thread construction from join/builder branches — CLOSED, by
    deletion.** Both sites (build overlapped with materialize on a raw thread)
    measured worse (q09 +57%, then +47.5% under a since-removed helper-thread
-   budget; q10 ~−3% didn't survive widening) and were reverted. `chunked.cpp:10002`
-   / `:13066` carry the measurements. Branch concurrency needs a **cost-aware**
-   gate, not a thread-count one. The only remaining non-pool thread is
+   budget; q10 ~−3% didn't survive widening) and were reverted. The named join
+   builder branches retain the rationale; git carries their former locations.
+   Branch concurrency needs a **cost-aware** gate, not a thread-count one. The
+   only remaining non-pool thread is
    `PipelinedStageOperator`'s (item 1's subject).
 5. **Per-pipeline scheduling accounting** — not started, worth more after the
    join/aggregate splits give it phases to attribute to.
@@ -401,11 +410,11 @@ breaker operators (Phase 4).
 **Concurrency-ownership inventory:** raw threads — `WorkerPool` (sanctioned) +
 `PipelinedStageOperator` (long-lived, blocks on ring backpressure,
 `StageThreadScope` for the profiler). Bounded handoffs — the two sequence rings
-(now `OrderedChunkRing`) + the stage FIFO + the pool's own. 41 `pool.submit`
-sites (`chunked.cpp` 25) — DOP is seized there; `WorkerPool::submit` calls
-`invariant_violation` from a pool thread and 29 sites check
-`on_worker_pool_thread()` first (what makes nested parallelism a crash not a
-deadlock).
+(now `OrderedChunkRing`) + the stage FIFO + the pool's own. Pool submissions
+remain concentrated in the pipeline executor and breaker families — DOP is
+seized there; `WorkerPool::submit` calls `invariant_violation` from a pool thread
+and callers guard nested submission with `on_worker_pool_thread()` (what makes
+nested parallelism a crash rather than a deadlock).
 
 ### Phase 4 — migrate the high-value breakers
 
@@ -467,19 +476,27 @@ at all (a one-valued strategy enum would be ceremony).
    is resolved. `StreamingSorted` is the historical name for an adaptive
    strategy: sorted group-at-a-time when possible, hash fallback otherwise
    (including ordinary generated tables). Each structural node now owns its
-   fan-out policy. The next step is extracting this completed aggregate family
-   from `chunked.cpp` behind the existing physical planner/executor seam.
+   fan-out policy. **Extraction DONE 2026-08-29:** the whole adaptive
+   sorted/hash family now lives in `aggregate_chunked.cpp` behind one private
+   factory. No hot loop or state boundary was split across translation units.
+   `AggregateColumnMapping` also records the layout it was resolved against: a
+   lazy child that consumes a predicate-only column may rebind once at its
+   concrete boundary, then every phase remains positional. This fixes the q01
+   regression introduced when a logical closed schema was mistaken for a fixed
+   physical layout.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
    `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
    family and Distinct/Order now leave the per-kind switch.
 4. Delete the `chunked.cpp` classes only after the physical path handles every
-   supported shape and the fallback is mutation-tested. Join and aggregate no
-   longer block extraction; begin with the aggregate family as the next slice.
+   supported shape and the fallback is mutation-tested. The aggregate classes
+   are now deleted from `chunked.cpp`; the streaming inner-join family is the
+   next extraction slice.
 
 ### Phase 5 — retire the monolith, simplify IR
 
 1. Split by ownership: `physical_planner`, `pipeline_executor`, `kernels/`, one
-   file/family per breaker.
+   file/family per breaker. **IN PROGRESS:** aggregate family complete; streaming
+   inner join next.
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
@@ -512,14 +529,22 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    tests, serial orchestration, bounded discovery transfer, fused marker, and
    independent profile accounting are complete. Each structural node now owns
    and supplies its fan-out policy, with byte-identity and profile-backed
-   worker-ceiling mutations. This step is complete; extraction in item 5 is
-   next.
+   worker-ceiling mutations. This step, including extraction of the resulting
+   aggregate family, is complete.
 4. Add per-phase scheduling accounting only after steps 2–3 provide stable
    pipeline identities. Keep DOP/memory budgeting blocked unless those changes
    produce measured queue contention or a multi-producer consumer.
 5. Move the resulting planner, executor, kernels, join, and aggregate families
    out of `chunked.cpp`; replace residual recursion with the explicit physical
    fallback adapter, preserving mutation-tested `MaterializedCall` coverage.
+   **Aggregate DONE 2026-08-29.** Correctness: focused physical tests plus all
+   1,815 non-slow tests pass; SF4 q01 is byte-identical at one and eight cores.
+   Performance: the generated `groupagg,multi,events` A/B classified all nine
+   deltas as noise (total −2.33%); a fixed-but-unextracted SF4 baseline versus
+   the extracted target classified q01/q13/q22 all the same (geomean +0.3%,
+   byte-identical). Widened q01 alone was also a wash (+1.4%, p=0.478). Next:
+   the streaming inner-join family, with the same fixed-baseline A/B gate before
+   planner/executor separation.
 
 ## Acceptance gates (every phase, before the next starts)
 

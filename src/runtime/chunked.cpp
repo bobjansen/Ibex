@@ -75,6 +75,7 @@
 #include "kernel_update.hpp"
 #include "model_internal.hpp"
 #include "packed_key_encoder_internal.hpp"
+#include "physical_executor_internal.hpp"
 #include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
 
@@ -3822,19 +3823,11 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
-namespace {
-
 /// Defined next to `build_physical_join`; the join construction sites above it
 /// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
+namespace physical_executor_detail {
 auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism;
-
-/// The hash aggregate's four structural-node policies, resolved together.
-/// Defined next to `build_physical_aggregate`.
-auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
-                                    const ExecutionContext& exec)
-    -> std::expected<physical::AggregateParallelism, std::string>;
-
-}  // namespace
+}  // namespace physical_executor_detail
 
 auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
@@ -3950,7 +3943,7 @@ auto inner_join_table(const Table& left, const Table& right, const std::vector<i
     auto source = make_table_source(left);
     return materialize_operator(make_chunked_inner_join_operator(
         std::move(source), right, &keys, exec, suffix, &pending_order,
-        resolved_join_parallelism(exec)));
+        physical_executor_detail::resolved_join_parallelism(exec)));
 }
 
 namespace {
@@ -5537,7 +5530,7 @@ auto try_take_join_probe(const ir::Node& node, const TableRegistry& registry,
     }
     return take_fusible_join_probe(std::move(left_op.value()), std::move(right.value()),
                                    &join.keys(), exec, join.suffix(), &join.pending_order(),
-                                   resolved_join_parallelism(exec));
+                                   physical_executor_detail::resolved_join_parallelism(exec));
 }
 
 auto probe_morsel_workers(const Table& input, const ExecutionContext& exec) -> std::size_t {
@@ -6710,6 +6703,10 @@ class PipelinedStageOperator final : public Operator {
     });
 }
 
+}  // namespace
+
+namespace physical_executor_detail {
+
 /// Compose one step of a migrated physical map pipeline (Phase 1 of
 /// plans/kernel-pipeline-execution-plan.md). Walks the plan top-down so the
 /// per-step profile scopes nest exactly the way the per-kind switch's
@@ -7243,57 +7240,9 @@ auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
     return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), dedup_plan);
 }
 
-auto build_migrated_physical_operator(const physical::Plan& plan, const ir::Node& node,
-                                      const TableRegistry& registry, const ScalarRegistry* scalars,
-                                      const ExternRegistry* externs, const ExecutionContext& exec,
-                                      ModelResult* model_out)
-    -> std::expected<OperatorPtr, std::string> {
-    if (!plan.migrated) {
-        return std::unexpected("physical executor: plan does not migrate its root");
-    }
-    if (plan.root != &node) {
-        return std::unexpected("physical executor: plan root does not match execution root");
-    }
-    if (node.kind() == ir::NodeKind::Head) {
-        physical::note_map_pipeline_executed();
-        return build_physical_head(node, registry, scalars, externs, exec, model_out);
-    }
-    if (node.kind() == ir::NodeKind::Tail) {
-        physical::note_map_pipeline_executed();
-        return build_physical_tail(node, registry, scalars, externs, exec, model_out);
-    }
-    if (node.kind() == ir::NodeKind::TopK) {
-        physical::note_map_pipeline_executed();
-        return build_physical_topk(node, registry, scalars, externs, exec, model_out);
-    }
-    if (node.kind() == ir::NodeKind::FilterHead || node.kind() == ir::NodeKind::FilterTail) {
-        physical::note_map_pipeline_executed();
-        return build_physical_filter_head_tail(node, registry, scalars, externs, exec, model_out);
-    }
-    if (node.kind() == ir::NodeKind::Distinct) {
-        physical::note_map_pipeline_executed();
-        return build_physical_distinct(plan, node, registry, scalars, externs, exec, model_out);
-    }
-    if (node.kind() == ir::NodeKind::Order) {
-        physical::note_map_pipeline_executed();
-        return build_physical_order(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.aggregate.describes) {
-        physical::note_map_pipeline_executed();
-        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.join.describes) {
-        physical::note_map_pipeline_executed();
-        return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
-    }
-    // Every migrated map plan, both modes: the composer walks the chain and
-    // hands the morsel run off at its boundary, and that run picks its own
-    // source strategy.
-    if (plan.mode != physical::PipelineMode::MorselParallel || !exec.can_fan_out()) {
-        physical::note_map_pipeline_executed();
-    }
-    return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
-}
+}  // namespace physical_executor_detail
+
+namespace {
 
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
@@ -7779,15 +7728,6 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 }
 
 }  // namespace
-
-auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Node& node,
-                                       const TableRegistry& registry, const ScalarRegistry* scalars,
-                                       const ExternRegistry* externs, const ExecutionContext& exec,
-                                       ModelResult* model_out)
-    -> std::expected<OperatorPtr, std::string> {
-    return build_migrated_physical_operator(plan, node, registry, scalars, externs, exec,
-                                            model_out);
-}
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,

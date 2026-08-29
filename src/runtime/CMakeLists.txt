@@ -19,6 +19,7 @@ add_library(ibex_runtime STATIC
     lazy_table.cpp
     model.cpp
     ops.cpp
+    physical_executor.cpp
     physical_plan.cpp
     pipeline.cpp
     reshape.cpp

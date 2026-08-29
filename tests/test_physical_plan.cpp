@@ -559,7 +559,8 @@ TEST_CASE("explain_physical renders pipelines and fallback reasons", "[physical]
 
     const auto [fallback_tree, fallback] = serial_plan("trades[melt symbol];");
     const std::string declined = runtime::physical::explain_physical(fallback);
-    REQUIRE(declined.find("MaterializedCall(root is not a row-local map)") != std::string::npos);
+    REQUIRE(declined.find("MaterializedCall(Melt: root is not a row-local map)") !=
+            std::string::npos);
 
     // A migrated single-operator breaker renders as a Breaker line, not a
     // pipeline and not a MaterializedCall.

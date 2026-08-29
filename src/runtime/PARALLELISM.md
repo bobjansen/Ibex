@@ -172,7 +172,7 @@ several remaining breaker internals do not.
 |---|---|---|---|
 | **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
 | **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases. |
-| **Aggregate** | The plan owns the adaptive aggregate strategy, positional `AggregateColumnMapping`, and both current fan-out policies (`partition`, `finalize`). The executor consumes them; discovery, accumulation, final ordering, and emission are still structurally inside one operator. | **Yes for current policy; not yet for structural decomposition.** | Strategy + both policy phases. |
+| **Aggregate** | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, four typed hash-fallback nodes (discovery → accumulation → final ordering → emission), and both current fan-out policies (`partition`, `finalize`). A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass owned kernel explicitly fused; final ordering and emission are separate. Each node has an independent execution-profile row. | **Yes for shape and current policy; policy is not yet one-per-structural-node.** | Strategy + structural chain + both policy phases. |
 | **Distinct** | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions. | **Yes, authoritative.** | Yes. |
 | **Order** | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative. | **Yes, descriptive.** | Yes. |
 | **TopK / Head / Tail / FilterHead / FilterTail** | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort. | **Yes; no parallel policy.** | Serial-by-design reason. |
@@ -181,8 +181,9 @@ several remaining breaker internals do not.
 **There is not yet one owner for every breaker's parallelism.** The physical
 plan owns map chains and the promoted Distinct, Join, and Aggregate policies;
 other breaker internals remain unrepresented and tunable only at their use
-sites. Closing the remaining gap — and turning aggregate's two policy records
-into separately scheduled structural phases — is
+sites. Closing the remaining gap — replacing aggregate's coarser
+partition/finalize policy pair with policy attached to each structural node,
+then scheduling those nodes independently — is
 `kernel-pipeline-execution-plan.md` Phase 4.
 
 ### The split enforced by migrated parallel paths
@@ -347,8 +348,8 @@ struct BreakerParallelism {
 
 // One breaker = one or more named phases, each with its own fan-out point.
 // Distinct/Order/TopK have one; Join has two (hash-build / probe); Aggregate
-// currently has partition + finalize policies and will gain structural
-// discovery / accumulation / final-ordering / emission phases when decomposed.
+// has structural discovery / accumulation / final-ordering / emission nodes
+// plus the partition + finalize policies used by today's fused kernels.
 struct BreakerPhase {
     std::string_view    name;
     BreakerParallelism  parallelism;

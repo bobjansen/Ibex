@@ -102,20 +102,26 @@ auto gen_ticks(const runtime::RngBridge& rng, std::int64_t n, const std::string&
     }
 
     Column<Timestamp> ts_col;
-    Column<std::string> symbol_col;
     Column<double> price_col;
     Column<std::int64_t> volume_col;
     ts_col.reserve(rows);
-    symbol_col.reserve(rows);
     price_col.reserve(rows);
     volume_col.reserve(rows);
+
+    // `symbol` is a handful of distinct values over up to millions of rows: the
+    // textbook case for a dictionary-encoded column. Emitting it as Categorical
+    // (the row->dictionary codes are exactly `symbol_idx`) lets a group-by or a
+    // join on `symbol` resolve each code once instead of hashing a string per
+    // row — several times faster on the large tables this generator produces.
+    using Code = Column<Categorical>::code_type;
+    std::vector<Code> symbol_codes(symbol_idx.begin(), symbol_idx.end());
+    Column<Categorical> symbol_col(names, std::move(symbol_codes));
 
     double price = start_price;
     auto ts_ms = static_cast<double>(base_ts_ms);
     for (std::size_t i = 0; i < rows; ++i) {
         ts_ms += gaps_ms[i];
         ts_col.push_back(Timestamp{static_cast<std::int64_t>(ts_ms * 1'000'000.0)});
-        symbol_col.push_back(names[static_cast<std::size_t>(symbol_idx[i])]);
         price += price_steps[i];
         price = std::max(price, 0.01);
         price_col.push_back(price);
@@ -213,10 +219,13 @@ auto gen_reference(const std::string& symbols) -> runtime::Table {
         }
     }
 
-    Column<std::string> symbol_col;
-    Column<std::string> name_col;
-    Column<std::string> sector_col;
-    Column<std::string> currency_col;
+    // Dimension-table string columns are Categorical: `symbol` so its type
+    // matches `gen_ticks`'s join key, and the rest so that gathering them across
+    // a join to a large fact table copies dictionary codes rather than strings.
+    Column<Categorical> symbol_col;
+    Column<Categorical> name_col;
+    Column<Categorical> sector_col;
+    Column<Categorical> currency_col;
     Column<std::int64_t> lot_size_col;
     Column<double> tick_size_col;
     for (const auto& symbol : distinct) {

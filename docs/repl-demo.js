@@ -4,13 +4,13 @@
   const transcript = [
     {
       command: "import data_gen;",
-      output: "time: 798 us",
+      output: "time: 1.126 ms",
       elapsed: 1,
     },
     {
       command: 'let ticks = gen_ticks(10000000, "AAPL,MSFT,NVDA");',
-      output: "time: 580.712 ms",
-      elapsed: 581,
+      output: "time: 261.4 ms",
+      elapsed: 261,
     },
     {
       command: "ticks[select { avg_price = mean(price), traded = sum(volume) }, by symbol, order { avg_price desc }];",
@@ -18,12 +18,12 @@
 +--------+-----------+-------------+
 | symbol | avg_price | traded      |
 +--------+-----------+-------------+
-| "AAPL" | 279.846   | 16671488213 |
-| "NVDA" | 279.7652  | 16669109752 |
-| "MSFT" | 279.743   | 16662431719 |
+| "NVDA" | 212.0345  | 16660628626 |
+| "MSFT" | 174.9267  | 16685780924 |
+| "AAPL" | 80.42202  | 16657536712 |
 +--------+-----------+-------------+
-time: 100.744 ms`,
-      elapsed: 101,
+time: 9.3 ms`,
+      elapsed: 9,
     },
   ];
 

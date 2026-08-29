@@ -50,6 +50,20 @@ jobs:
           cp build-wasm/wasm/ibex.mjs build-wasm/wasm/ibex.wasm docs/playground/
           ls -l docs/playground
 
+      - name: Cache-bust static assets
+        run: |
+          # Stamp every deploy's commit onto local css/js URLs so returning
+          # visitors don't get served a stale stylesheet or script.
+          VER="$(git rev-parse --short HEAD)"
+          find docs -name '*.html' -print0 | xargs -0 sed -i -E \
+            "s#(href|src)=\"(\./[^\"?]+\.(css|js|mjs))\"#\1=\"\2?v=${VER}\"#g"
+          # ... the wasm module the playground script imports ...
+          sed -i -E "s#(\./playground/ibex\.mjs)#\1?v=${VER}#g" docs/playground.js
+          # ... and the .wasm the module fetches (Emscripten's URL() drops the
+          # query from import.meta.url, so stamp the filename itself).
+          sed -i -E "s#([\"'])ibex\.wasm([\"'])#\1ibex.wasm?v=${VER}\2#g" docs/playground/ibex.mjs
+          grep -o 'styles\.css?v=[0-9a-f]*' docs/index.html | head -1
+
       - name: Configure Pages
         uses: actions/configure-pages@v6
 

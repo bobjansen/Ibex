@@ -47,6 +47,7 @@
 #include "kernel_filter.hpp"
 #include "kernel_types.hpp"
 #include "physical_executor_internal.hpp"
+#include "pipeline_executor_internal.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime::pipeline_executor_detail {
@@ -601,7 +602,7 @@ class MorselPipelineOperator final : public Operator {
         std::optional<Chunk> chunk = ring_.take(next_sequence_);
         if (chunk.has_value()) {
             ++next_sequence_;
-            return std::optional<Chunk>{std::move(*chunk)};
+            return chunk;
         }
 
         // No chunk: the pipeline stopped early. Report why, deterministically.
@@ -1168,19 +1169,10 @@ class TwoPhaseFilterOperator final : public Operator {
 // directly into workers would mean handing them something other than a
 // finished table — at which point the LazyTable synchronization contract
 // applies in full and eligibility has to be re-established.
-/// Defined below; both are consulted by the run builder, which decides its own
-/// source strategy.
-[[nodiscard]] auto scan_pipeline_worker_count(std::size_t unit_count) -> std::size_t;
-
-/// Defined below; the run builder chooses between this streaming source and
-/// materialize-then-morselize, so the choice lives with the run rather than at
-/// the construction seam.
-[[nodiscard]] auto build_pipelined_scan(const std::vector<MapStep>& operators,
-                                        bool count_as_pipeline, const DeferredScan& scan,
-                                        std::vector<SourceUnit> units,
-                                        const ScalarRegistry* scalars,
-                                        const ExternRegistry* externs, const ExecutionContext& exec)
-    -> std::expected<OperatorPtr, std::string>;
+//
+// `scan_pipeline_worker_count` and `build_pipelined_scan` are defined below and
+// declared in `pipeline_executor_internal.hpp`; both are consulted by the run
+// builder, which decides its own source strategy.
 
 }  // namespace pipeline_executor_detail
 
@@ -1570,7 +1562,7 @@ class DeferredScanSourceOperator final : public Operator {
                 if (!chunk.has_value()) {
                     continue;  // the unit's rows were all filtered out
                 }
-                return std::optional<Chunk>{std::move(*chunk)};
+                return chunk;
             }
             // Out of decoded units: put the next window in flight and wait for
             // it.

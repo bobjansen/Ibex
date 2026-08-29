@@ -2143,7 +2143,7 @@ class ChunkedOrderedLimitOperator final : public Operator {
                 push_key_value(key, *entry, row);
             }
             group_keys_.push_back(std::move(key));
-            group_states_.push_back(GroupState{});
+            group_states_.emplace_back();
             return static_cast<std::uint32_t>(group_states_.size() - 1);
         });
     }
@@ -3821,12 +3821,6 @@ auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     return sink.run();
 }
 
-/// Defined next to `build_physical_join`; the join construction sites above it
-/// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
-namespace physical_executor_detail {
-auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism;
-}  // namespace physical_executor_detail
-
 auto distinct_table(const Table& input, const ExecutionContext& exec)
     -> std::expected<Table, std::string> {
     // I4 convergence: one implementation, reached through both shapes. The
@@ -4222,22 +4216,27 @@ auto process_pipeline_stats() -> ParallelPipelineStats* {
             if (!enabled) {
                 return;
             }
-            ibex::formatting::print(
-                stderr,
-                "pipeline stats: parallel={} serial={} morsels={} "
-                "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
-                "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
-                "parallel_hash_builds={} parallel_aggregate_partitions={} "
-                "parallel_aggregate_finalizes={} "
-                "grouped_lifted_group_state={} chunk_direct_updates={}\n",
-                stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
-                stats.morsels.load(), stats.pipelined_scans.load(), stats.pipelined_stages.load(),
-                stats.range_heads.load(), stats.two_phase_filters.load(),
-                stats.parallel_fields.load(), stats.parallel_direct_numeric_fields.load(),
-                stats.parallel_probes.load(), stats.parallel_hash_builds.load(),
-                stats.parallel_aggregate_partitions.load(),
-                stats.parallel_aggregate_finalizes.load(), stats.grouped_lifted_group_state.load(),
-                stats.chunk_direct_updates.load());
+            // Exit-time diagnostic: a failed stderr write must not turn into a
+            // `std::terminate` from a throwing destructor.
+            try {
+                ibex::formatting::print(
+                    stderr,
+                    "pipeline stats: parallel={} serial={} morsels={} "
+                    "pipelined_scans={} pipelined_stages={} range_heads={} two_phase={} "
+                    "parallel_fields={} parallel_direct_numeric_fields={} parallel_probes={} "
+                    "parallel_hash_builds={} parallel_aggregate_partitions={} "
+                    "parallel_aggregate_finalizes={} "
+                    "grouped_lifted_group_state={} chunk_direct_updates={}\n",
+                    stats.parallel_pipelines.load(), stats.serial_pipelines.load(),
+                    stats.morsels.load(), stats.pipelined_scans.load(),
+                    stats.pipelined_stages.load(), stats.range_heads.load(),
+                    stats.two_phase_filters.load(), stats.parallel_fields.load(),
+                    stats.parallel_direct_numeric_fields.load(), stats.parallel_probes.load(),
+                    stats.parallel_hash_builds.load(), stats.parallel_aggregate_partitions.load(),
+                    stats.parallel_aggregate_finalizes.load(),
+                    stats.grouped_lifted_group_state.load(), stats.chunk_direct_updates.load());
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
         }
     };
     static const Reporter reporter;
@@ -4519,6 +4518,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 /// a typed runtime-orientation edge; an eligible probe can also become a step
 /// inside a map pipeline.
 
+namespace {
+
 /// Both of a streaming join's fan-out phases, resolved for this query. The
 /// capability halves are `physical::join_hash_build_parallelism` /
 /// `join_probe_parallelism` (floor + worker ceiling); the resolved half needs
@@ -4533,14 +4534,6 @@ auto resolve_join_parallelism(physical::JoinParallelism par, const ExecutionCont
     physical::resolve_breaker_parallelism(par.build, exec, pool_size);
     physical::resolve_breaker_parallelism(par.probe, exec, pool_size);
     return par;
-}
-
-/// Compatibility construction sites that do not own a physical Plan still use
-/// the same policy factories. Migrated joins take the overload below instead.
-auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism {
-    return resolve_join_parallelism({.build = physical::join_hash_build_parallelism(),
-                                     .probe = physical::join_probe_parallelism()},
-                                    exec);
 }
 
 /// Resolve the policies carried by the explicit HashBuild and HashProbe nodes.
@@ -4572,6 +4565,18 @@ auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
     physical::resolve_breaker_parallelism(par.final_ordering, exec, pool_size);
     physical::resolve_breaker_parallelism(par.emission, exec, pool_size);
     return par;
+}
+
+}  // namespace
+
+/// Compatibility construction sites that do not own a physical Plan still use
+/// the same policy factories. Migrated joins take the `StreamingJoinNodes`
+/// overload above instead. Exported via `physical_executor_internal.hpp` for
+/// the pipeline unit's probe-fusion path.
+auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism {
+    return resolve_join_parallelism({.build = physical::join_hash_build_parallelism(),
+                                     .probe = physical::join_probe_parallelism()},
+                                    exec);
 }
 
 auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
@@ -4809,8 +4814,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // retains only data-dependent gates such as actual row counts and
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
-                                               &agg.aggregations(), exec, std::move(*parallelism),
-                                               ap.columns);
+                                               &agg.aggregations(), exec, *parallelism, ap.columns);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

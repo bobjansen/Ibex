@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include "interpreter_internal.hpp"
 #include "physical_executor_internal.hpp"
 
 namespace ibex::runtime {

@@ -518,9 +518,11 @@ class HashAggregateState final {
                                               chunk)) {
             return err;
         }
+        // `bind_aggregate_columns` returns nullopt only once `columns_` is bound.
+        const physical::AggregateColumnMapping& cols = columns_.value();
         std::vector<const ColumnEntry*> group_entries;
         group_entries.reserve(group_by_->size());
-        for (const std::size_t index : columns_->group_by) {
+        for (const std::size_t index : cols.group_by) {
             group_entries.push_back(&chunk.columns[index]);
         }
 
@@ -530,7 +532,8 @@ class HashAggregateState final {
             if (agg.func == ir::AggFunc::Count) {
                 continue;
             }
-            const ColumnEntry* entry = &chunk.columns[*columns_->aggregate_inputs[i]];
+            // Non-Count aggregations always carry an input column index.
+            const ColumnEntry* entry = &chunk.columns[cols.aggregate_inputs[i].value()];
             const ExprType kind = expr_type_for_column(*entry->column);
             const bool first_or_last =
                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
@@ -2543,7 +2546,7 @@ class HashAggregateState final {
             for (std::size_t p = 0; p < part_count; ++p) {
                 cursors[p] = partitions[p].stored;
             }
-            std::uint32_t next = static_cast<std::uint32_t>(base);
+            auto next = static_cast<std::uint32_t>(base);
             while (true) {
                 std::size_t best = part_count;
                 std::uint64_t best_row = std::numeric_limits<std::uint64_t>::max();
@@ -2724,7 +2727,7 @@ class HashAggregateState final {
     void migrate_str_fast_path_to_generic() {
         seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
             Key key;
-            key.values.push_back(str_order_[i]);
+            key.values.emplace_back(str_order_[i]);
             return key;
         });
         str_fast_path_ = false;
@@ -2746,7 +2749,7 @@ class HashAggregateState final {
         if (n_keys == 1) {
             seed_generic_index_from_keys(n_groups_, [&](std::size_t i) {
                 Key key;
-                key.values.push_back(std::string(decode(0, cat_order_[i])));
+                key.values.emplace_back(std::string(decode(0, cat_order_[i])));
                 return key;
             });
         } else {
@@ -2754,7 +2757,7 @@ class HashAggregateState final {
                 Key key;
                 key.values.reserve(n_keys);
                 for (std::size_t c = 0; c < n_keys; ++c) {
-                    key.values.push_back(
+                    key.values.emplace_back(
                         std::string(decode(c, multi_cat_codes_flat_[(i * n_keys) + c])));
                 }
                 return key;
@@ -2867,12 +2870,12 @@ class HashAggregateState final {
     auto multi_cat_find_or_insert(const Column<Categorical>::code_type* codes, std::size_t n_keys,
                                   NewGroup&& new_group) -> std::uint32_t {
         const std::uint64_t hash = hash_codes(codes, n_keys);
-        std::size_t mask = multi_cat_slots_.size() - 1;
+        const std::size_t mask = multi_cat_slots_.size() - 1;
         std::size_t probe = static_cast<std::size_t>(hash) & mask;
         while (true) {
             const std::uint32_t slot = multi_cat_slots_[probe];
             if (slot == 0) {
-                const std::uint32_t gid = new_group();
+                const std::uint32_t gid = std::forward<NewGroup>(new_group)();
                 multi_cat_slots_[probe] = gid + 1;
                 if ((n_groups_ * 10) > (multi_cat_slots_.size() * 7)) {
                     multi_cat_rehash_slots(multi_cat_slots_.size() * 2, n_keys);
@@ -3550,7 +3553,7 @@ class HashAggregateState final {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            std::int64_t v = data[row];
+                            const std::int64_t v = data[row];
                             slot.int_value = slot.present() ? std::min(slot.int_value, v) : v;
                             slot.mark_present();
                         }
@@ -3560,7 +3563,7 @@ class HashAggregateState final {
                             if (has_nulls && !(*validity)[row])
                                 continue;
                             auto& slot = slot_for(gids[row]);
-                            std::int64_t v = data[row];
+                            const std::int64_t v = data[row];
                             slot.int_value = slot.present() ? std::max(slot.int_value, v) : v;
                             slot.mark_present();
                         }
@@ -4835,7 +4838,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 return false;
             }
         }
-        return std::ranges::all_of(columns_->group_by, [&chunk](const std::size_t index) {
+        return std::ranges::all_of(columns_.value().group_by, [&chunk](const std::size_t index) {
             return !chunk.columns[index].validity.has_value();
         });
     }
@@ -4849,7 +4852,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             if (agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) {
                 continue;
             }
-            const ColumnEntry* entry = &first.columns[*columns_->aggregate_inputs[i]];
+            const ColumnEntry* entry = &first.columns[columns_.value().aggregate_inputs[i].value()];
             const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return true;
@@ -4868,7 +4871,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 plan_[i].kind = ExprType::Int;
                 continue;
             }
-            const ColumnEntry* entry = &first.columns[*columns_->aggregate_inputs[i]];
+            const ColumnEntry* entry = &first.columns[columns_.value().aggregate_inputs[i].value()];
             const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return "ChunkedSortedAggregateOperator: non-numeric aggregation not supported";
@@ -4877,7 +4880,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         key_templates_.clear();
         key_templates_.reserve(group_by_->size());
-        for (const std::size_t index : columns_->group_by) {
+        for (const std::size_t index : columns_.value().group_by) {
             key_templates_.push_back(make_empty_like(*first.columns[index].column));
         }
         track_validity_.assign(n_aggs_, 0U);
@@ -4982,7 +4985,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
     auto consume(const Chunk& chunk) -> std::optional<std::string> {
         std::vector<const ColumnValue*> key_cols;
         key_cols.reserve(group_by_->size());
-        for (const std::size_t index : columns_->group_by) {
+        for (const std::size_t index : columns_.value().group_by) {
             key_cols.push_back(chunk.columns[index].column.get());
         }
         std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
@@ -4990,7 +4993,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
             if (plan_[i].func == ir::AggFunc::Count) {
                 continue;
             }
-            const ColumnEntry* entry = &chunk.columns[*columns_->aggregate_inputs[i]];
+            const ColumnEntry* entry = &chunk.columns[columns_.value().aggregate_inputs[i].value()];
             if (expr_type_for_column(*entry->column) != plan_[i].kind) {
                 return "ChunkedSortedAggregateOperator: aggregate column type changed across "
                        "chunks";
@@ -5321,7 +5324,7 @@ auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::Co
                                      std::optional<physical::AggregateColumnMapping> columns)
     -> OperatorPtr {
     return std::make_unique<ChunkedSortedAggregateOperator>(
-        std::move(child), group_by, aggregations, exec, std::move(parallelism), std::move(columns));
+        std::move(child), group_by, aggregations, exec, parallelism, std::move(columns));
 }
 
 }  // namespace ibex::runtime

@@ -107,7 +107,7 @@ project / rename / row-local update / their fused forms) run as **one
 independent task per morsel**, with an **order-preserving merge** that makes the
 output byte-identical to the serial chain regardless of completion order.
 
-`MorselPipelineOperator` (`chunked.cpp`) is the executor. Key rules:
+`MorselPipelineOperator` (`pipeline_executor.cpp`) is the executor. Key rules:
 
 1. **Materialize the input subtree first, on the calling thread.** A
    deferred/lazy source decodes exactly once, serially, before any worker
@@ -264,10 +264,11 @@ disagree.
 **The structural owner now exists for migrated breakers.** Distinct, streaming
 Join, and streaming Aggregate take their fan-out policies from explicit
 physical nodes and expose those decisions through `explain physical`.
-Aggregate's four phases, streaming inner join, and migrated-plan dispatch now
-live outside `chunked.cpp`. Remaining operator-private decisions belong to
-breaker families that have not completed that migration; do not generalize
-their local thresholds into a second policy system.
+Aggregate's four phases, streaming inner join, migrated-plan dispatch, and the
+generic map/morsel executor now live outside `chunked.cpp`. Remaining
+operator-private decisions belong to breaker families that have not completed
+that migration; do not generalize their local thresholds into a second policy
+system.
 
 **The symptoms** (`plans/parallelism-overview.md` Part 2 is the live
 catalogue): type-exclusion rules with no shared "is this type parallel-capable

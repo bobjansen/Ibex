@@ -5,7 +5,8 @@ development diary and the completed-phase detail moved to git history at the
 pre-compaction commit's parent. `parallelism-overview.md` is the current map of
 what actually shipped; this file is the phase roadmap and the two design
 sections that are still load-bearing (the LazyTable Synchronization Contract,
-Phase 2 RNG).
+Phase 2 RNG). The separate pipelined-execution plan was removed as superseded;
+its remaining scheduler work is owned by `kernel-pipeline-execution-plan.md`.
 
 > **Nomenclature drift:** this plan predates the config rename. `IBEX_THREADS` →
 > **`IBEX_CORES`** (compute budget); `IBEX_PARALLEL` was **removed** — serial is
@@ -16,10 +17,10 @@ Phase 2 RNG).
 
 Multithreading as a query-execution capability, not ad-hoc loops inside kernels.
 The `Chunk` operators are the data unit for a morsel-driven executor. A query is
-a sequence of **parallel islands** (maximal runs of row-local, chunk-preserving
-operators) separated by **barriers** (order / join / group-by / distinct /
-window / rank / model). Start with one ordered parallel island for row-local
-work, keep serial implementations behind barriers, expand only after each
+a sequence of **morsel-parallel map pipelines** (maximal runs of row-local,
+chunk-preserving operators) separated by **barriers** (order / join / group-by /
+distinct / window / rank / model). Start with one ordered parallel map pipeline
+for row-local work, keep serial implementations behind barriers, expand only after each
 operator family has an explicit correctness contract. DuckDB's model
 (partitionable sources, pipeline breakers, worker-local + sparing query-global
 state) without a general DAG scheduler.
@@ -87,14 +88,14 @@ documented ownership contract — **not** blanket "make it thread-safe". The
 hazard surface is narrower than the object.
 
 **Interim gate (Phase 0) — LIFTED 2026-08-02, worth ~nothing.** The gate made
-any query reading a lazy source island-ineligible. Removed once established that
-no worker can reach a `LazyTable`: `build_parallel_island` materializes its
-input subtree to an owned `Table` on the building thread, and every morsel
-source takes that finished table by `const Table&`. Measured: 2 of 22 PDS-H
-queries changed eligibility, q19 gained an island (no time change), **only 5 of
-22 form an island at all** (q18/q19/q21×2/q22). The gate was never what kept
+any query reading a lazy source map-pipeline-ineligible. Removed once
+established that no worker can reach a `LazyTable`: the morsel pipeline
+materializes its input subtree to an owned `Table` on the building thread, and
+every morsel source takes that finished table by `const Table&`. Measured: 2 of
+22 PDS-H queries changed eligibility, q19 gained a map pipeline (no time
+change), **only 5 of 22 form one at all** (q18/q19/q21×2/q22). The gate was never what kept
 PDS-H serial — whole-script mode eagerly projects non-probe scans, and scan
-conjuncts get pushed into the decoder (removing the `Filter` an island builds
+conjuncts get pushed into the decoder (removing the `Filter` a map pipeline builds
 from). What's left above the scans is joins/group-by/sort — barriers. **The
 PDS-H multithreading gap is Phase 4, not Phase 3b.** A slice that streams a
 source's morsels straight into workers reintroduces the hazards and must
@@ -181,13 +182,12 @@ actively detects re-entry** — a fake `ColumnDecodeFn` that sets an atomic
 in-flight flag on entry and fails if already set. ThreadSanitizer build for the
 concurrent-lazy-scan tests.
 
-## Phase 1 — First parallel island — LANDED, ON by default
+## Phase 1 — First morsel-parallel map pipeline — LANDED, ON by default
 
 `ExecutionContext::parallel` defaults true. What shipped, in order:
-- **Serial island + worker pool + ordered merger** — `ParallelIslandOperator`
+- **Morsel pipeline + worker pool + ordered merger** — `MorselPipelineOperator`
   dispenses morsels off one atomic cursor, per-worker map chain, bounded ring
-  merge by `sequence`. `SerialIslandOrderValidator` asserts the two executors
-  are byte-identical.
+  merge by `sequence`. Tests assert serial and parallel byte-identity.
 - **Row-local `Update` eligibility** — an unguarded, ungrouped, tuple-free
   update whose every field is `is_subset_evaluable_expr` (stricter than
   `is_row_local_update_expr` — the looser one admits aggregates, which per
@@ -284,8 +284,9 @@ ordered units; units decode concurrently with independent reader products; a
 direct source or maximal row-local chain publishes completed units downstream
 without waiting for a decode window. First bounded join-probe output handoff
 landed. Pushdown / cancellation / backpressure / dictionary unification
-preserved. See `pipelined-execution-plan.md` for SF-1/SF-4 measurements and the
-unresolved two-core admission problem.
+preserved. The historical SF-1/SF-4 measurements are in git; the unresolved
+two-core admission problem and general breaker work are now tracked by
+`kernel-pipeline-execution-plan.md`.
 
 **Still open:** CSV, TSAN coverage, generalized source partitioning (SF-1 has
 too few row groups — must partition columns and row ranges, not just row

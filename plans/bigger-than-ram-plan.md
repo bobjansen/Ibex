@@ -72,8 +72,8 @@ built on it.
   Flag this as the one open design question worth confirming before writing
   code: bespoke binary would be marginally faster to (de)serialize but is a
   new format to maintain and test independently.
-- A byte-budget tracker (`IBEX_MAX_MEMORY`, mirroring the `IBEX_THREADS` knob
-  design in `runtime-multithreading-plan.md`): unset/0 means unbounded — the
+- A byte-budget tracker (`IBEX_MAX_MEMORY`, following the current compute/pool
+  configuration split in `runtime-multithreading-plan.md`): unset/0 means unbounded — the
   default, so existing benchmarks and RSS baselines in
   `plans/benchmark-perf-priorities.md` are completely unaffected until a user
   opts in. When set, operators accumulate in memory and spill only once the

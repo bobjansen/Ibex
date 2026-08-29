@@ -2,10 +2,13 @@
 
 **Status: in migration.** Phase 0 resolved by disposition; Phase 1 landed
 2026-08-22; Phase 2 complete except `KernelContext` (deliberately unbuilt);
-Phase 3 started; Phase 4 construction-ownership done, decomposition not started;
-Phase 5 not started. **Compacted 2026-08-27** — the ~40-entry Phase 2 per-commit
-diary is in git history at the pre-compaction commit's parent; the "Where Phase
-2 stands" table below is the current state.
+Phase 3's handoff/island/raw-thread work is complete, with accounting and
+DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
+authority are done, while true operator decomposition remains open; Phase 5 has
+not started apart from retiring the fused logical node kinds. **Compacted
+2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
+pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
+current state.
 
 The goal is **feature parity on this architecture**: every shape the old
 execution seams supported reaches either a kernel or an explicit, inspectable
@@ -102,22 +105,25 @@ parser AST  →  typed logical IR  →  physical plan  →  pipeline executable 
    and profiled — preserves median/quantile/EWMA/predicates/reshape until a
    physical implementation exists.
 
-## Where this stands (2026-08-24 / -25)
+## Where this stands (re-verified 2026-08-29)
 
 **Done:** Phase 1 (physical plan exists, inspectable); Phase 2 (map kernels
 ported, fusion is physical, fused node kinds retired as an execution concern);
 Phase 3 items 1/3/4 (one executor-owned ordered handoff, islands dissolved into
 a pipeline mode, no raw-thread branch concurrency); Phase 4 **construction
-ownership** (every breaker PDS-H reaches is built from the plan — backlog
-116→6 breakers, plan describes 97% of real-work nodes).
+ownership and parallelism authority** (every breaker PDS-H reaches is built
+from the plan — backlog 116→6 breakers, plan describes 97% of real-work nodes;
+Distinct, streaming Join, and streaming Aggregate read resolved fan-out policy
+from the plan).
 
 **The 97% flatters it:** that measures who *constructs* operators, not how they
 are shaped. The operators are unchanged — a join is still one
-`ChunkedInnerJoinOperator`, not `HashBuild` feeding a separate `HashProbe`
-across a barrier; the aggregate is still one operator, not four phases. So a
-probe can't be a pipeline step (can't fuse with filters/projections above it),
-one build can't feed several probes, and the aggregate's phases can't be
-scheduled or measured separately.
+`ChunkedInnerJoinOperator`, not explicit physical `HashBuild` and `HashProbe`
+nodes across a barrier; the aggregate is still one operator, not four phases.
+An eligible join probe can now be fused at the head of a morsel map chain, but
+the plan cannot yet schedule or inspect it as a separate physical node, one
+build cannot yet feed several independently represented probes, and aggregate
+phases cannot yet be scheduled or measured separately.
 
 ### Next, in order
 
@@ -132,14 +138,17 @@ scheduled or measured separately.
    plan-execution time. Measured: q21 −8.5% from the parallel fill; scheduled
    invocation geomean −1.9% over 22 queries (q21 +5.1%, q19 +5.5% reported not
    averaged). Kill switches `IBEX_JOIN_BUILD_SERIAL` / `IBEX_JOIN_BUILD_LAZY`.
-2. **Make the probe a step inside a map pipeline — BUILT 2026-08-25, off by
-   default** (`f8e84446`, `7cc940b1`). Correct at 1/2/8 cores. **Fires on 1 of
-   22 queries** (q17), so it can't be measured — no performance claim.
+2. **Make the probe a step inside a map pipeline — DONE structurally.** The
+   eligible probe is now admitted into `build_morsel_worker_chain` and installed
+   before the row-local map steps; `build_pipeline_from_input` extracts the
+   probe side rather than materializing join output first. This preserves the
+   intended source → probe → map worker shape, including swapped-mode coverage.
+   It is not yet an explicit `HashProbe` physical-plan node and carries no
+   end-to-end performance claim.
    Preconditions met: build is a scheduled phase (`8cb4e936`), build side is
    jointly owned so N probes share one (`6df9a966`), probe is its own operator
-   (`177b7a93`, `JoinProbeOperator`). What remains: admit it into
-   `build_morsel_worker_chain`, which today takes only row-local `MapStep`s — a
-   probe is 1:N and the chain builder has no word for that.
+   (`177b7a93`, `JoinProbeOperator`). The remaining work is to promote this
+   construction-time fusion into an inspectable plan/executor phase.
    - **Coverage is the finding.** PDS-H join modes: 28 `Stream`, 12
      `Precomputed`, 11 `Swapped`. `Precomputed`/`Swapped` materialize both sides
      and emit one table — no probe pipeline to give. `Swapped` (a third of
@@ -153,17 +162,16 @@ scheduled or measured separately.
      NOT dominate (14% of join self-time, ≤10.5% of any query's wall) —
      retiring the standing "assemble_output dominates" note. So the fusion
      argument is **structural, not performance**.
-   - **Test gap:** the extraction shipped a deterministic q18 segfault that all
-     1756 ctests passed through — the suite has no deferred-probe join whose
-     resolved right falls under `kStreamRightThreshold`. `check_answers.py`
-     caught it 21/22. Close before the morsel-chain work.
+   - **Remaining test gap:** retain a focused deferred-probe regression where
+     the resolved right falls under `kStreamRightThreshold`; swapped-mode probe
+     coverage is not the same shape.
 3. **Phase 4 aggregate decomposition** — discovery / per-partition slots / final
    ordering / emission as phases. **Determinism blocker cleared 2026-08-27**
-   (see below — the divergence no longer reproduces; guard test landed). Slice 1
-   (observability: `partition` + `finalize` phases on the plan, `explain
-   physical` prints them, `check_agg_plan` aborts on disagreement) LANDED.
-   Slices 2–3 move the authority (delete the operator's open-coded floors +
-   `min(budget, pool, 64)` caps).
+   (guard test landed). The observability slice and both authority slices are
+   LANDED: partition and finalize phases appear in `explain physical`,
+   `check_agg_plan` detects disagreement, and all current aggregate fan-out
+   gates read the resolved plan policy. What remains is an actual split into
+   independently scheduled/buildable phases.
 4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
    single-operator shape as Order/Head: `plan_physical` marks each migrated,
    `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
@@ -171,13 +179,13 @@ scheduled or measured separately.
    physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
-5. **Phase 5 item 1 — split `chunked.cpp` by ownership** — easier the more of
-   Phase 4 has landed.
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership** — easier now that the
+   fan-out policy is outside the operators.
 6. **Sweep process-global plan counters in tests** — one test passed while its
    premise was false (`physical_materialized_calls` is process-wide, other tests
    in the binary bump it). Others may lean the same way.
 7. **Phase 3 item 5 — per-pipeline scheduling accounting** — small, worth more
-   after 1–3.
+   once the join and aggregate phases have independent identities to attribute.
 8. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked**
    (`phase3-dop-budget-analysis.md`): the pool is 65% idle with nothing queued,
    so a budget rations a non-scarce resource. Reopen when a multi-producer
@@ -342,8 +350,9 @@ breaker operators (Phase 4).
    The **stronger** failure model is now shared (sequence-ordered, allocation-
    free `record_fault`, worker liveness through an exit guard — the scan
    pipeline's first-writer-wins exception path is gone). Naming followed:
-   `ParallelIslandOperator` → `MorselPipelineOperator`, stats keys unchanged
-   (tooling reads them). **Zero "island" occurrences in `src/`/`include/`/`tests/`.**
+   The prior island executor was replaced by `MorselPipelineOperator`; stats
+   keys stayed unchanged because tooling reads them. **Zero "island" occurrences
+   in `src/`/`include/`/`tests/`.**
    `PipelinedStageOperator` keeps its raw thread + plain `std::deque` FIFO (cap
    2, single producer) — deliberately not merged (no sequence ordering to
    maintain).
@@ -378,21 +387,22 @@ remaining are materializing joins (`nulls equal` / `expect` / non-equi
 predicates — porting them ports the semantics, not the construction).
 
 **Construction ownership DONE** (Join streaming `f5610646`, Aggregate `902d6941`,
-Order `ececc75f`, Head/Distinct `49ca33c1`). **Decomposition NOT started** — the
-operators are unchanged; the branches moved into `build_physical_join` /
+Order `ececc75f`, Head/Distinct `49ca33c1`). **Parallelism authority is also
+DONE**: Distinct, streaming Join, and streaming Aggregate receive resolved
+`BreakerParallelism` from the plan rather than deriving their worker caps and
+fan-out permission privately. **Decomposition remains open** — the operators
+are still largely unchanged; the branches moved into `build_physical_join` /
 `build_physical_aggregate` rather than dissolving into pipeline stages, so the
 exit criterion ("fast paths no longer depend on special builder branches") is
-**not met**. A breaker's parallelism (fan-out decision, worker cap, row floor,
-partition strategy) is still private to `chunked.cpp`, invisible to `explain
-physical`.
+**not met**.
 
 **The decomposition target is specified in
 [`src/runtime/PARALLELISM.md`](../src/runtime/PARALLELISM.md), "Target:
 parallelism as a plan decision"** — the `BreakerParallelism` descriptor, the
 planner-vs-operator split (same one `JoinPlan` already made), the `explain
 physical` format, the observability-before-authority slicing, and the sequence
-(Distinct → Order/TopK → Join → Aggregate, the last blocked on the determinism
-reconciliation).
+(Distinct → Order/TopK → Join → Aggregate; the determinism reconciliation is
+complete, so the remaining blocker is structural decomposition).
 
 *Method note (decided the outcome twice):* each port = name the builder's own
 predicates + de-duplicate, have the planner **relay** them, have the seam
@@ -405,10 +415,10 @@ at all (a one-valued strategy enum would be ceremony).
 1. **Hash join** — construction DONE; **data side DONE** (`5918b5cc`, `8a644381`,
    `f6a1a632` — build returns an immutable `JoinHashIndex`; `JoinProbe` consumes
    one via `shared_ptr<const>` so writing build state during a probe is a
-   compile error); **operator side NEXT** (two scheduled operators — see "Next"
-   item 2). NOT blocked on a cost model (corrected 2026-08-25).
-2. **Hash aggregate** — construction DONE; phase decomposition NOT started,
-   blocked-first on the determinism divergence above.
+   compile error); **map-pipeline probe fusion DONE**. Explicit physical
+   `HashBuild`/`HashProbe` nodes remain next. NOT blocked on a cost model.
+2. **Hash aggregate** — construction and fan-out authority DONE; phase
+   decomposition has not started. The former determinism blocker is resolved.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
    `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
    family and Distinct/Order now leave the per-kind switch.
@@ -427,6 +437,26 @@ at all (a one-valued strategy enum would be ceremony).
 4. Make planner / executor / kernel tests independently runnable.
 
 Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
+
+### Follow-up sequence
+
+1. Add the focused deferred-probe regression: force a deferred right side to
+   resolve below `kStreamRightThreshold`, then assert serial and parallel
+   byte-identity and that the fused-probe path is reached.
+2. Introduce explicit physical `HashBuild` and `HashProbe` nodes without
+   changing the current algorithm: make build output and probe input explicit,
+   preserve runtime orientation, and mutation-test the streaming and fallback
+   join shapes.
+3. Split aggregate execution at its existing ownership boundaries — discovery /
+   partition accumulation / final ordering / emission — first with serial
+   orchestration and plan-shape/accounting tests, then admit fan-out one phase
+   at a time with byte-identity checks.
+4. Add per-phase scheduling accounting only after steps 2–3 provide stable
+   pipeline identities. Keep DOP/memory budgeting blocked unless those changes
+   produce measured queue contention or a multi-producer consumer.
+5. Move the resulting planner, executor, kernels, join, and aggregate families
+   out of `chunked.cpp`; replace residual recursion with the explicit physical
+   fallback adapter, preserving mutation-tested `MaterializedCall` coverage.
 
 ## Acceptance gates (every phase, before the next starts)
 

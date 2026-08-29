@@ -1,3 +1,9 @@
+# misc-use-internal-linkage is disabled below: the runtime's foo.cpp +
+# foo_internal.hpp split shares helpers across a few TUs through named *_detail
+# namespaces. Analyzing one TU the check can't see the cross-TU use and tells us
+# to make those `static` (which breaks the link); the genuinely TU-local helpers
+# interleaved in the same blocks would each need call-site requalification to
+# move to an anonymous namespace. Style only (inlining / symbol-table size).
 Checks: >
   -*,
   bugprone-*,
@@ -26,7 +32,8 @@ Checks: >
   -cppcoreguidelines-owning-memory,
   -bugprone-easily-swappable-parameters,
   -cppcoreguidelines-pro-type-union-access,
-  -cppcoreguidelines-pro-type-vararg
+  -cppcoreguidelines-pro-type-vararg,
+  -misc-use-internal-linkage
 CheckOptions:
   # libstdc++ implementation headers are not portable include providers.
   # Prefer the public standard-library header for every standard declaration.

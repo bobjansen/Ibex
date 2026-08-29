@@ -1122,7 +1122,7 @@ struct JoinProbe {
         if (pair_mode_) {
             return probe_chunk_pair(std::move(left_chunk));
         }
-        const ir::JoinKeyColumns& key_columns = columns_->keys.front();
+        const ir::JoinKeyColumns& key_columns = columns_.value().keys.front();
         const ColumnEntry& probe_entry = left_chunk.columns[key_columns.left_index];
         const ColumnValue* key = probe_entry.column.get();
         probe_validity_ = probe_entry.validity.has_value() ? &*probe_entry.validity : nullptr;
@@ -1211,8 +1211,8 @@ struct JoinProbe {
     }
 
     auto probe_chunk_pair(Table left_chunk) -> std::expected<Table, std::string> {
-        const ir::JoinKeyColumns& k0 = columns_->keys[0];
-        const ir::JoinKeyColumns& k1 = columns_->keys[1];
+        const ir::JoinKeyColumns& k0 = columns_.value().keys[0];
+        const ir::JoinKeyColumns& k1 = columns_.value().keys[1];
         const ColumnEntry& e0 = left_chunk.columns[k0.left_index];
         const ColumnEntry& e1 = left_chunk.columns[k1.left_index];
         const ColumnValue* key0 = e0.column.get();
@@ -1332,7 +1332,7 @@ struct JoinProbe {
         if (pair_mode_) {
             return emit_swapped_pair(left_table);
         }
-        const ir::JoinKeyColumns& key_columns = columns_->keys.front();
+        const ir::JoinKeyColumns& key_columns = columns_.value().keys.front();
         const ColumnEntry& right_entry = right_->columns[key_columns.right_index];
         const ColumnValue* rkey = right_entry.column.get();
         const std::size_t n_right = right_->rows();
@@ -1432,8 +1432,8 @@ struct JoinProbe {
     // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
     // member, since a row here is null when EITHER key is.
     auto emit_swapped_pair(const Table& left_table) -> std::expected<Table, std::string> {
-        const ir::JoinKeyColumns& k0 = columns_->keys[0];
-        const ir::JoinKeyColumns& k1 = columns_->keys[1];
+        const ir::JoinKeyColumns& k0 = columns_.value().keys[0];
+        const ir::JoinKeyColumns& k1 = columns_.value().keys[1];
         const ColumnEntry& e0 = right_->columns[k0.right_index];
         const ColumnEntry& e1 = right_->columns[k1.right_index];
         const ColumnValue* rkey0 = e0.column.get();

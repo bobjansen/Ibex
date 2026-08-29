@@ -942,14 +942,14 @@ auto resolve_aggregate_columns(std::span<const ir::ColumnRef> group_by,
     mapping.aggregate_inputs.reserve(aggregations.size());
     for (const ir::AggSpec& aggregation : aggregations) {
         if (aggregation.func == ir::AggFunc::Count) {
-            mapping.aggregate_inputs.push_back(std::nullopt);
+            mapping.aggregate_inputs.emplace_back(std::nullopt);
             continue;
         }
         const auto found = std::ranges::find(input_names, aggregation.column.name);
         if (found == input_names.end()) {
             return std::unexpected("aggregate column not found: " + aggregation.column.name);
         }
-        mapping.aggregate_inputs.push_back(
+        mapping.aggregate_inputs.emplace_back(
             static_cast<std::size_t>(std::distance(input_names.begin(), found)));
     }
     return mapping;

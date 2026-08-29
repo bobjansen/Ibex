@@ -94,6 +94,17 @@ struct Session {
     std::uint64_t next_result_id = 1;
 };
 
+// Seeded into each new browser session when the server runs with `--demo`.
+// Draws through the RNG bridge so `seed_rng` makes the tables reproducible.
+// `trades` columns are timestamp/symbol/price/volume; `prices` and `samples`
+// each expose a single `value` column.
+constexpr std::string_view kDemoBootstrap = R"(import data_gen;
+seed_rng(20240115);
+let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
+let prices = gen_walk(2000, 100.0, 1.0);
+let samples = gen_normal(10000, 0.0, 1.0);
+)";
+
 struct StaticAsset {
     std::filesystem::path path;
     std::string contents;
@@ -686,10 +697,24 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
             id = new_session_id();
             sessions.insert_or_assign(*id, std::make_unique<Session>(config.repl, registry));
             created_cookie = "ibex_session=" + *id;
+            if (config.demo) {
+                const auto seeded = sessions.at(*id)->repl.execute(kDemoBootstrap);
+                if (!seeded.ok) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        std::cerr << "warning: --demo seeding failed: " << seeded.error
+                                  << " (is the data_gen plugin on the library path?)\n";
+                    }
+                }
+            }
         }
         auto& session = *sessions.at(*id);
         try {
-            if (request->method == "GET" && request->target == "/api/v1/environment") {
+            if (request->method == "GET" && request->target == "/api/v1/config") {
+                send_response(client, 200, "OK", json({{"demo", config.demo}}).dump(),
+                              "application/json; charset=utf-8", created_cookie);
+            } else if (request->method == "GET" && request->target == "/api/v1/environment") {
                 send_response(client, 200, "OK", environment_json(session).dump(),
                               "application/json; charset=utf-8", created_cookie);
             } else if (request->method == "GET" && request->target.starts_with("/api/v1/files")) {

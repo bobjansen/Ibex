@@ -44,6 +44,53 @@ type ExecuteResponse = {
 
 const initialQuery = "trades[select { price, symbol }];";
 
+type Example = { label: string; source: string };
+const examples: Example[] = [
+  {
+    label: "Select columns",
+    source: "trades[select { symbol, price, volume }];",
+  },
+  {
+    label: "Filter rows",
+    source: "trades[filter price > 100, select { timestamp, symbol, price }];",
+  },
+  {
+    label: "Aggregate by group",
+    source:
+      "trades[select { ticks = count(), avg_price = mean(price), total_volume = sum(volume) }, by symbol];",
+  },
+  {
+    label: "Top 10 by price",
+    source: "trades[order { price desc }, head 10];",
+  },
+  {
+    label: "Rolling 1-minute mean",
+    source:
+      'let tf = as_timeframe(trades, "timestamp");\ntf[window 1m, update { avg_1m = rolling_mean(price) }];',
+  },
+  {
+    label: "Summary stats",
+    source:
+      "samples[select { n = count(), mean = mean(value), min = min(value), max = max(value) }];",
+  },
+];
+
+const WELCOME_KEY = "ibex-ui-welcome";
+function welcomeDismissed(): boolean {
+  try {
+    return localStorage.getItem(WELCOME_KEY) === "dismissed";
+  } catch {
+    return false;
+  }
+}
+function dismissWelcome(): void {
+  try {
+    localStorage.setItem(WELCOME_KEY, "dismissed");
+  } catch {
+    // Ignore storage failures (private mode, blocked site data).
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -163,6 +210,8 @@ function App() {
   const [elapsedMs, setElapsedMs] = useState<number>();
   const [files, setFiles] = useState<FileListing>();
   const [filesError, setFilesError] = useState<string>();
+  const [demo, setDemo] = useState(false);
+  const [showWelcome, setShowWelcome] = useState(() => !welcomeDismissed());
   const runRef = useRef<() => void>(() => {});
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
 
@@ -173,6 +222,19 @@ function App() {
   useEffect(() => {
     void refreshEnvironment();
   }, [refreshEnvironment]);
+
+  useEffect(() => {
+    api<{ demo: boolean }>("/api/v1/config")
+      .then((config) => setDemo(config.demo))
+      .catch(() => setDemo(false));
+  }, []);
+
+  const loadExample = useCallback((label: string) => {
+    const example = examples.find((entry) => entry.label === label);
+    if (!example) return;
+    setSource(example.source);
+    editorRef.current?.focus();
+  }, []);
 
   const refreshFiles = useCallback(async (path = "") => {
     try {
@@ -385,11 +447,55 @@ function App() {
       </aside>
       <section className="workspace">
         <header className="toolbar">
-          <strong>Ibex</strong>
-          <button className="run" disabled={running} onClick={() => void run()}>
-            {running ? "Running…" : "Run"}
-            <kbd>⌘↵</kbd>
-          </button>
+          <div className="brand">
+            <strong>Ibex</strong>
+            <small>Typed columnar DataFrame &amp; TimeFrame DSL</small>
+            <nav className="brand-links">
+              <a
+                href="https://bobjansen.github.io/Ibex/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Docs
+              </a>
+              <a
+                href="https://bobjansen.github.io/Ibex/cheatsheet.html"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Cheatsheet
+              </a>
+              <a
+                href="https://github.com/bobjansen/Ibex"
+                target="_blank"
+                rel="noreferrer"
+              >
+                GitHub
+              </a>
+            </nav>
+          </div>
+          <div className="toolbar-actions">
+            <select
+              className="examples"
+              value=""
+              onChange={(event) => loadExample(event.target.value)}
+            >
+              <option value="">Examples…</option>
+              {examples.map((example) => (
+                <option key={example.label} value={example.label}>
+                  {example.label}
+                </option>
+              ))}
+            </select>
+            <button
+              className="run"
+              disabled={running}
+              onClick={() => void run()}
+            >
+              {running ? "Running…" : "Run"}
+              <kbd>⌘↵</kbd>
+            </button>
+          </div>
         </header>
         <div className="editor">
           <Editor
@@ -446,6 +552,45 @@ function App() {
           </section>
         </section>
       </section>
+      {showWelcome && (
+        <div className="welcome-backdrop">
+          <div className="welcome-card">
+            <strong>Welcome to Ibex</strong>
+            <p>
+              Ibex is a statically typed DSL for columnar DataFrame and
+              time-series work, with a fast parallel interpreter. Write a query
+              on the left, press <kbd>Run</kbd>, and inspect the result grid
+              below.
+            </p>
+            <p>
+              {demo ? (
+                <>
+                  Three tables are preloaded: <code>trades</code>,{" "}
+                  <code>prices</code>, and <code>samples</code>. Press Run to
+                  execute the sample query, or pick one from the{" "}
+                  <em>Examples</em> menu.
+                </>
+              ) : (
+                <>
+                  A tiny built-in <code>trades</code> table is available. Open a
+                  data file from the Files panel, or restart with{" "}
+                  <code>ibex ui --demo</code> for larger sample tables that the{" "}
+                  <em>Examples</em> menu is written against.
+                </>
+              )}
+            </p>
+            <button
+              className="run"
+              onClick={() => {
+                dismissWelcome();
+                setShowWelcome(false);
+              }}
+            >
+              Get started
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

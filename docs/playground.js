@@ -14,13 +14,27 @@
   const output = root.querySelector("[data-pg-output]");
   const envBar = root.querySelector("[data-pg-env]");
   const exampleBar = root.querySelector("[data-pg-examples]");
+  const sizeBar = root.querySelector("[data-pg-size]");
 
   const SYMBOLS = "AAPL,MSFT,GOOG,AMZN,NVDA";
-  const SEED = `import data_gen;
-seed_rng(42);
-let trades = gen_ticks(50000, "${SYMBOLS}");
-let reference = gen_reference("${SYMBOLS}");
-let prices = gen_walk(2000, 100.0, 1.0);`;
+
+  // Selectable trades-table size, so the timing means something: at 50k a query
+  // is mostly call overhead; at a few million the interpreter's actual work
+  // shows.
+  const SIZES = [
+    [50_000, "50K"],
+    [500_000, "500K"],
+    [2_000_000, "2M"],
+    [10_000_000, "10M"],
+  ];
+  const DEFAULT_ROWS = 50_000;
+  let currentRows = DEFAULT_ROWS;
+
+  const tradesScript = (rows, seed) =>
+    `import data_gen;\nseed_rng(${seed});\nlet trades = gen_ticks(${rows}, "${SYMBOLS}");`;
+
+  const seedScript = (rows) =>
+    `${tradesScript(rows, 42)}\nlet reference = gen_reference("${SYMBOLS}");\nlet prices = gen_walk(2000, 100.0, 1.0);`;
 
   const EXAMPLES = [
     ["Aggregate by group", 'trades[select { avg_price = mean(price), total_volume = sum(volume) }, by symbol];'],
@@ -177,22 +191,55 @@ let prices = gen_walk(2000, 100.0, 1.0);`;
   const resetSession = () => {
     envBar.replaceChildren();
     editor.value = FIRST_QUERY;
+    setSizeButtons(DEFAULT_ROWS);
+    currentRows = DEFAULT_ROWS;
     showEmpty();
     boot(true);
   };
 
-  // Session action: rebuild `trades` from a fresh random seed. Categorically
-  // different from the query buttons — it mutates the environment.
-  const regenerate = () => {
+  const setSizeButtons = (rows) => {
+    for (const button of sizeBar.querySelectorAll(".pg-size-option")) {
+      button.classList.toggle("active", Number(button.dataset.rows) === rows);
+    }
+  };
+
+  // Rebuild `trades` and report how long generating it took. `describe` names
+  // the action in the status line. Generation is synchronous and can take most
+  // of a second at 10M rows, so paint a pending state first (double rAF) before
+  // the blocking call.
+  const rebuildTrades = (rows, seed, describe) => {
     if (!ibex) return;
-    const seed = Math.floor(Math.random() * 1e9);
-    const source = `import data_gen;\nseed_rng(${seed});\nlet trades = gen_ticks(50000, "${SYMBOLS}");`;
-    const result = JSON.parse(ibex.execute(source));
-    renderEnv(result.environment);
-    setStatus(
-      result.error ? "Regenerate failed: " + result.error : `New random trades (seed ${seed.toLocaleString()})`,
-      result.error ? "error" : "",
+    const busy = (on) => {
+      runButton.disabled = on;
+      for (const b of sizeBar.querySelectorAll(".pg-size-option")) b.disabled = on;
+      regenButton.disabled = on;
+    };
+    busy(true);
+    setStatus(`Generating ${rows.toLocaleString()} rows…`);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const start = performance.now();
+        const result = JSON.parse(ibex.execute(tradesScript(rows, seed)));
+        const ms = performance.now() - start;
+        renderEnv(result.environment);
+        if (result.error) {
+          setStatus("Could not build trades: " + result.error, "error");
+        } else {
+          setStatus(`${describe}: ${rows.toLocaleString()} rows in ${ms.toFixed(0)} ms`);
+        }
+        busy(false);
+      }),
     );
+  };
+
+  // Session action: same size, fresh random data.
+  const regenerate = () => rebuildTrades(currentRows, Math.floor(Math.random() * 1e9), "Regenerated trades");
+
+  const setSize = (rows) => {
+    if (rows === currentRows && ibex) return;
+    currentRows = rows;
+    setSizeButtons(rows);
+    rebuildTrades(rows, 42, "Resized trades");
   };
 
   const boot = async (reset) => {
@@ -205,7 +252,7 @@ let prices = gen_walk(2000, 100.0, 1.0);`;
       }
       ibex = await window.__createIbex();
       // Seed the sample tables so the first query has something to hit.
-      const seeded = JSON.parse(ibex.execute(SEED));
+      const seeded = JSON.parse(ibex.execute(seedScript(currentRows)));
       renderEnv(seeded.environment);
       if (seeded.error) {
         setStatus("Sample data failed to load: " + seeded.error, "error");
@@ -245,6 +292,16 @@ let prices = gen_walk(2000, 100.0, 1.0);`;
       run();
     });
     exampleBar.append(button);
+  }
+
+  for (const [rows, label] of SIZES) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pg-size-option" + (rows === currentRows ? " active" : "");
+    button.dataset.rows = String(rows);
+    button.textContent = label;
+    button.addEventListener("click", () => setSize(rows));
+    sizeBar.append(button);
   }
 
   runButton.addEventListener("click", run);

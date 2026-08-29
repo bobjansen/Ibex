@@ -687,18 +687,16 @@ auto check_one_join(const JoinNode& join, const SchemaInfo& left, const SchemaIn
     for (const auto& key : join.keys()) {
         const auto* left_field = left.find(key.left);
         const auto* right_field = right.find(key.right);
-        // Only a closed schema proves absence: an open one lists the columns it
-        // knows about and admits others.
-        if (left_field == nullptr && !left.is_open()) {
+        // Open schemas admit extra physical columns, but those columns are not
+        // addressable until an ascription names them. Every referenced join
+        // key therefore has to appear in the declared portion on both sides.
+        if (left_field == nullptr) {
             return "join key '" + key.left +
                    "' not found on the left side (available: " + format_field_names(left) + ")";
         }
-        if (right_field == nullptr && !right.is_open()) {
+        if (right_field == nullptr) {
             return "join key '" + key.right +
                    "' not found on the right side (available: " + format_field_names(right) + ")";
-        }
-        if (left_field == nullptr || right_field == nullptr) {
-            continue;
         }
         if (!left_field->type.has_value() || !right_field->type.has_value()) {
             continue;  // an untyped column is still known to exist

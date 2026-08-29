@@ -5,13 +5,16 @@
 
 #include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
+#include <ibex/ir/schema.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/pipeline.hpp>
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -207,6 +210,18 @@ enum class AggregateStrategy : std::uint8_t {
     MaterializeAll,
 };
 
+/// One aggregate input resolved against the ordered physical columns of its
+/// child. Logical names stop at this boundary; execution phases share these
+/// positions.
+struct AggregateColumnMapping {
+    std::vector<std::size_t> group_by;
+    /// Count consumes rows rather than an input column, so its entry is
+    /// nullopt. Every other aggregate carries its input column position.
+    std::vector<std::optional<std::size_t>> aggregate_inputs;
+
+    auto operator==(const AggregateColumnMapping&) const -> bool = default;
+};
+
 /// What the plan knows about an `Aggregate` node.
 ///
 /// Every field is RELAYED from the predicates the builder itself calls --
@@ -224,7 +239,19 @@ struct AggregatePlan {
     /// The column the fused count/sum reads, resolved back through any updates
     /// between the aggregate and the join. Empty unless fused.
     std::string counted_column;
+    /// Positional bindings for the streamed/hash aggregate input. Closed known
+    /// schemas fill this during planning; lazy/unknown inputs bind it once at
+    /// the first concrete chunk.
+    std::optional<AggregateColumnMapping> columns;
 };
+
+/// Resolve an aggregate's logical column references against one ordered input
+/// schema. The same function serves physical planning and the one-time runtime
+/// bind for inputs whose schema is not statically known.
+[[nodiscard]] auto resolve_aggregate_columns(std::span<const ir::ColumnRef> group_by,
+                                             std::span<const ir::AggSpec> aggregations,
+                                             std::span<const std::string_view> input_names)
+    -> std::expected<AggregateColumnMapping, std::string>;
 
 /// Classify an aggregate. Pure, and decided entirely by relayed predicates.
 [[nodiscard]] auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan;
@@ -473,7 +500,8 @@ struct Plan {
 /// it as a map too (`is_map_step` mirrors that routing exactly), so the plan
 /// can never claim a shape the executor would construct differently.
 [[nodiscard]] auto plan_physical(const ir::Node& root, const TableRegistry& registry,
-                                 const ExternRegistry* externs) -> Plan;
+                                 const ExternRegistry* externs,
+                                 const ir::SourceSchemas& source_schemas = {}) -> Plan;
 
 /// Deterministic multi-line rendering for tests and debugging. A plan that
 /// cannot explain why it materialized is not an acceptable plan, so every

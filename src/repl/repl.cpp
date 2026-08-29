@@ -5373,7 +5373,8 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
     const ir::OptimizationContext optimization_context;
     lowered.value() = ir::optimize_plan(std::move(lowered.value()), optimization_context);
 
-    const auto plan = runtime::physical::plan_physical(*lowered.value(), tables, &externs);
+    const auto plan = runtime::physical::plan_physical(*lowered.value(), tables, &externs,
+                                                       context.source_schemas);
     ibex::formatting::print("Physical plan (capability; runtime fan-out may differ):\n{}",
                            runtime::physical::explain_physical(plan));
 }

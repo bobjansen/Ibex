@@ -7006,6 +7006,52 @@ class SlotArray {
 };
 // NOLINTEND(cppcoreguidelines-no-malloc)
 
+auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& columns, bool& bound,
+                            const std::vector<ir::ColumnRef>& group_by,
+                            const std::vector<ir::AggSpec>& aggregations, const Chunk& chunk)
+    -> std::optional<std::string> {
+    if (bound) {
+        return std::nullopt;
+    }
+    if (!columns.has_value()) {
+        std::vector<std::string_view> names;
+        names.reserve(chunk.columns.size());
+        for (const ColumnEntry& column : chunk.columns) {
+            names.push_back(column.name);
+        }
+        auto resolved = physical::resolve_aggregate_columns(group_by, aggregations, names);
+        if (!resolved.has_value()) {
+            return std::move(resolved.error());
+        }
+        columns = std::move(*resolved);
+    }
+    if (columns->group_by.size() != group_by.size() ||
+        columns->aggregate_inputs.size() != aggregations.size()) {
+        return "aggregate column mapping does not match aggregate shape";
+    }
+    for (std::size_t i = 0; i < columns->group_by.size(); ++i) {
+        const std::size_t index = columns->group_by[i];
+        if (index >= chunk.columns.size() || chunk.columns[index].name != group_by[i].name) {
+            return "aggregate group-by column mapping does not match concrete input";
+        }
+    }
+    for (std::size_t i = 0; i < columns->aggregate_inputs.size(); ++i) {
+        const auto index = columns->aggregate_inputs[i];
+        if (aggregations[i].func == ir::AggFunc::Count) {
+            if (index.has_value()) {
+                return "count aggregate unexpectedly has an input column mapping";
+            }
+            continue;
+        }
+        if (!index.has_value() || *index >= chunk.columns.size() ||
+            chunk.columns[*index].name != aggregations[i].column.name) {
+            return "aggregate input column mapping does not match concrete input";
+        }
+    }
+    bound = true;
+    return std::nullopt;
+}
+
 class ChunkedAggregateOperator final : public Operator {
    public:
     /// `Cat` carries a Categorical's *code*, which the pair path may treat as
@@ -7016,11 +7062,13 @@ class ChunkedAggregateOperator final : public Operator {
 
     ChunkedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                              const std::vector<ir::AggSpec>* aggregations,
-                             const ExecutionContext& exec, physical::AggregateParallelism par = {})
+                             const ExecutionContext& exec, physical::AggregateParallelism par = {},
+                             std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
+          columns_(std::move(columns)),
           par_(par) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -7075,20 +7123,14 @@ class ChunkedAggregateOperator final : public Operator {
         // how much input this OPERATOR has — a question the per-call row count
         // stopped answering the moment sources began arriving in pieces.
         rows_offered_ += chunk.rows();
+        if (auto err = bind_aggregate_columns(columns_, columns_bound_, *group_by_, *aggregations_,
+                                              chunk)) {
+            return err;
+        }
         std::vector<const ColumnEntry*> group_entries;
         group_entries.reserve(group_by_->size());
-        for (const auto& key : *group_by_) {
-            const ColumnEntry* entry = nullptr;
-            for (const auto& e : chunk.columns) {
-                if (e.name == key.name) {
-                    entry = &e;
-                    break;
-                }
-            }
-            if (entry == nullptr) {
-                return "group-by column not found: " + key.name;
-            }
-            group_entries.push_back(entry);
+        for (const std::size_t index : columns_->group_by) {
+            group_entries.push_back(&chunk.columns[index]);
         }
 
         std::vector<const ColumnEntry*> agg_entries(aggregations_->size(), nullptr);
@@ -7097,16 +7139,7 @@ class ChunkedAggregateOperator final : public Operator {
             if (agg.func == ir::AggFunc::Count) {
                 continue;
             }
-            const ColumnEntry* entry = nullptr;
-            for (const auto& e : chunk.columns) {
-                if (e.name == agg.column.name) {
-                    entry = &e;
-                    break;
-                }
-            }
-            if (entry == nullptr) {
-                return "aggregate column not found: " + agg.column.name;
-            }
+            const ColumnEntry* entry = &chunk.columns[*columns_->aggregate_inputs[i]];
             const ExprType kind = expr_type_for_column(*entry->column);
             const bool first_or_last =
                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
@@ -11004,6 +11037,8 @@ class ChunkedAggregateOperator final : public Operator {
     const std::vector<ir::ColumnRef>* group_by_;
     const std::vector<ir::AggSpec>* aggregations_;
     const ExecutionContext* exec_;
+    std::optional<physical::AggregateColumnMapping> columns_;
+    bool columns_bound_ = false;
     bool emitted_ = false;
 
     bool initialized_ = false;
@@ -11227,15 +11262,17 @@ class PrependChunkOperator final : public Operator {
 /// build_operator only routes that subset here.
 class ChunkedSortedAggregateOperator final : public Operator {
    public:
-    ChunkedSortedAggregateOperator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-                                   const std::vector<ir::AggSpec>* aggregations,
-                                   const ExecutionContext& exec,
-                                   physical::AggregateParallelism par = {})
+    ChunkedSortedAggregateOperator(
+        OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+        const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
+        physical::AggregateParallelism par = {},
+        std::optional<physical::AggregateColumnMapping> columns = std::nullopt)
         : child_(std::move(child)),
           group_by_(group_by),
           aggregations_(aggregations),
           exec_(&exec),
-          par_(par) {}
+          par_(par),
+          columns_(std::move(columns)) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (fallback_) {
@@ -11297,17 +11334,21 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 fallback_ = std::make_unique<ChunkedAggregateOperator>(
                     std::make_unique<PrependChunkOperator>(std::move(*schema_only),
                                                            std::move(child_)),
-                    group_by_, aggregations_, *exec_, par_);
+                    group_by_, aggregations_, *exec_, par_, columns_);
                 return {};
             }
             done_ = true;
             input_eof_ = true;
             return {};
         }
+        if (auto err = bind_aggregate_columns(columns_, columns_bound_, *group_by_, *aggregations_,
+                                              first)) {
+            return std::unexpected(std::move(*err));
+        }
         if (!sorted_on_group_by(first) || needs_hash_fallback(first)) {
             fallback_ = std::make_unique<ChunkedAggregateOperator>(
                 std::make_unique<PrependChunkOperator>(std::move(first), std::move(child_)),
-                group_by_, aggregations_, *exec_, par_);
+                group_by_, aggregations_, *exec_, par_, columns_);
             return {};
         }
         if (auto err = init_plan(first)) {
@@ -11343,36 +11384,27 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 return false;
             }
         }
-        return std::ranges::all_of(*group_by_, [&chunk](const auto& g) {
-            const ColumnEntry* entry = find_entry(chunk, g.name);
-            return entry != nullptr && !entry->validity.has_value();
+        return std::ranges::all_of(columns_->group_by, [&chunk](const std::size_t index) {
+            return !chunk.columns[index].validity.has_value();
         });
-    }
-
-    static auto find_entry(const Chunk& chunk, const std::string& name) -> const ColumnEntry* {
-        for (const auto& e : chunk.columns) {
-            if (e.name == name) {
-                return &e;
-            }
-        }
-        return nullptr;
     }
 
     // Non-numeric First/Last (string/categorical) has no group-at-a-time
     // implementation here — route it to the hash operator, which handles any
     // type. Numeric First/Last streams natively (see accumulate_typed).
     [[nodiscard]] auto needs_hash_fallback(const Chunk& first) const -> bool {
-        return std::ranges::any_of(*aggregations_, [&](const ir::AggSpec& agg) {
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            const ir::AggSpec& agg = (*aggregations_)[i];
             if (agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) {
-                return false;
+                continue;
             }
-            const ColumnEntry* entry = find_entry(first, agg.column.name);
-            if (entry == nullptr) {
-                return false;  // reported as a proper error by init_plan
-            }
+            const ColumnEntry* entry = &first.columns[*columns_->aggregate_inputs[i]];
             const ExprType kind = expr_type_for_column(*entry->column);
-            return kind != ExprType::Int && kind != ExprType::Double;
-        });
+            if (kind != ExprType::Int && kind != ExprType::Double) {
+                return true;
+            }
+        }
+        return false;
     }
 
     auto init_plan(const Chunk& first) -> std::optional<std::string> {
@@ -11385,10 +11417,7 @@ class ChunkedSortedAggregateOperator final : public Operator {
                 plan_[i].kind = ExprType::Int;
                 continue;
             }
-            const ColumnEntry* entry = find_entry(first, agg.column.name);
-            if (entry == nullptr) {
-                return "aggregate column not found: " + agg.column.name;
-            }
+            const ColumnEntry* entry = &first.columns[*columns_->aggregate_inputs[i]];
             const ExprType kind = expr_type_for_column(*entry->column);
             if (kind != ExprType::Int && kind != ExprType::Double) {
                 return "ChunkedSortedAggregateOperator: non-numeric aggregation not supported";
@@ -11397,8 +11426,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
         }
         key_templates_.clear();
         key_templates_.reserve(group_by_->size());
-        for (const auto& g : *group_by_) {
-            key_templates_.push_back(make_empty_like(*find_entry(first, g.name)->column));
+        for (const std::size_t index : columns_->group_by) {
+            key_templates_.push_back(make_empty_like(*first.columns[index].column));
         }
         track_validity_.assign(n_aggs_, 0U);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
@@ -11502,22 +11531,15 @@ class ChunkedSortedAggregateOperator final : public Operator {
     auto consume(const Chunk& chunk) -> std::optional<std::string> {
         std::vector<const ColumnValue*> key_cols;
         key_cols.reserve(group_by_->size());
-        for (const auto& g : *group_by_) {
-            const ColumnEntry* entry = find_entry(chunk, g.name);
-            if (entry == nullptr) {
-                return "group-by column not found: " + g.name;
-            }
-            key_cols.push_back(entry->column.get());
+        for (const std::size_t index : columns_->group_by) {
+            key_cols.push_back(chunk.columns[index].column.get());
         }
         std::vector<const ColumnEntry*> agg_entries(n_aggs_, nullptr);
         for (std::size_t i = 0; i < n_aggs_; ++i) {
             if (plan_[i].func == ir::AggFunc::Count) {
                 continue;
             }
-            const ColumnEntry* entry = find_entry(chunk, (*aggregations_)[i].column.name);
-            if (entry == nullptr) {
-                return "aggregate column not found: " + (*aggregations_)[i].column.name;
-            }
+            const ColumnEntry* entry = &chunk.columns[*columns_->aggregate_inputs[i]];
             if (expr_type_for_column(*entry->column) != plan_[i].kind) {
                 return "ChunkedSortedAggregateOperator: aggregate column type changed across "
                        "chunks";
@@ -11804,6 +11826,8 @@ class ChunkedSortedAggregateOperator final : public Operator {
     /// Forwarded verbatim to the hash `ChunkedAggregateOperator` fallback --
     /// the sorted stream itself has no fan-out point (it emits group-at-a-time).
     physical::AggregateParallelism par_{};
+    std::optional<physical::AggregateColumnMapping> columns_;
+    bool columns_bound_ = false;
 
     bool decided_ = false;
     bool done_ = false;
@@ -11852,7 +11876,8 @@ auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinPa
 
 /// The hash aggregate's `partition` and `finalize` fan-out policies, resolved
 /// together. Defined next to `build_physical_aggregate`.
-auto resolved_aggregate_parallelism(const ExecutionContext& exec) -> physical::AggregateParallelism;
+auto resolved_aggregate_parallelism(const physical::Plan& plan, const ExecutionContext& exec)
+    -> std::expected<physical::AggregateParallelism, std::string>;
 
 }  // namespace
 
@@ -14837,10 +14862,15 @@ auto resolved_join_parallelism(const physical::StreamingJoinNodes& nodes,
 /// `aggregate_{partition,finalize}_parallelism`; the resolved half needs the
 /// `ExecutionContext` and pool size, both in hand here at build time. One
 /// definition, shared by every aggregate construction site.
-auto resolved_aggregate_parallelism(const ExecutionContext& exec)
-    -> physical::AggregateParallelism {
-    physical::AggregateParallelism par{.partition = physical::aggregate_partition_parallelism(),
-                                       .finalize = physical::aggregate_finalize_parallelism()};
+auto resolved_aggregate_parallelism(const physical::Plan& plan, const ExecutionContext& exec)
+    -> std::expected<physical::AggregateParallelism, std::string> {
+    if (plan.breaker_phases.size() != 2 || plan.breaker_phases[0].name != "partition" ||
+        plan.breaker_phases[1].name != "finalize") {
+        return std::unexpected(
+            "physical aggregate: expected partition and finalize parallelism phases");
+    }
+    physical::AggregateParallelism par{.partition = plan.breaker_phases[0].parallelism,
+                                       .finalize = plan.breaker_phases[1].parallelism};
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(par.partition, exec, pool_size);
     physical::resolve_breaker_parallelism(par.finalize, exec, pool_size);
@@ -15064,6 +15094,10 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         return make_table_source(std::move(*result));
     }
     if (ap.strategy == physical::AggregateStrategy::StreamingSorted) {
+        auto parallelism = resolved_aggregate_parallelism(plan, exec);
+        if (!parallelism.has_value()) {
+            return std::unexpected(std::move(parallelism.error()));
+        }
         auto child_op =
             build_operator(*agg.children().front(), registry, scalars, externs, exec, model_out);
         if (!child_op.has_value()) {
@@ -15084,7 +15118,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // and `check_agg_plan` aborts on disagreement.
         return std::make_unique<ChunkedSortedAggregateOperator>(
             std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec,
-            resolved_aggregate_parallelism(exec));
+            std::move(*parallelism), ap.columns);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

@@ -131,26 +131,26 @@ auto runtime_column_type(const ColumnValue& column) -> ir::ColumnType {
         column);
 }
 
-auto registered_source_schemas(const TableRegistry& registry) -> ir::SourceSchemas {
-    ir::SourceSchemas schemas;
-    schemas.reserve(registry.size());
+auto planning_source_schemas(const TableRegistry& registry, const ir::SourceSchemas& declared)
+    -> ir::SourceSchemas {
+    ir::SourceSchemas schemas = declared;
+    schemas.reserve(schemas.size() + registry.size());
     for (const auto& [name, table] : registry) {
         std::vector<ir::SchemaField> fields;
         fields.reserve(table.columns.size());
         for (const ColumnEntry& column : table.columns) {
             fields.push_back({.name = column.name, .type = runtime_column_type(*column.column)});
         }
-        schemas.emplace(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
+        schemas.insert_or_assign(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
     }
     return schemas;
 }
 
-auto known_join_column_mapping(const ir::JoinNode& join, const TableRegistry& registry)
+auto known_join_column_mapping(const ir::JoinNode& join, const ir::SourceSchemas& schemas)
     -> std::optional<ir::JoinColumnMapping> {
     if (join.children().size() != 2) {
         return std::nullopt;
     }
-    const ir::SourceSchemas schemas = registered_source_schemas(registry);
     const ir::SchemaInfo left = ir::infer_schema(*join.children()[0], schemas);
     const ir::SchemaInfo right = ir::infer_schema(*join.children()[1], schemas);
     if (!left.is_known() || left.is_open() || !right.is_known() || right.is_open()) {
@@ -168,6 +168,29 @@ auto known_join_column_mapping(const ir::JoinNode& join, const TableRegistry& re
     }
     auto mapping =
         ir::resolve_join_columns(join.kind(), join.keys(), left_names, right_names, join.suffix());
+    if (!mapping.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(*mapping);
+}
+
+auto known_aggregate_column_mapping(const ir::AggregateNode& aggregate,
+                                    const ir::SourceSchemas& schemas)
+    -> std::optional<AggregateColumnMapping> {
+    if (aggregate.children().size() != 1) {
+        return std::nullopt;
+    }
+    const ir::SchemaInfo input = ir::infer_schema(*aggregate.children().front(), schemas);
+    if (!input.is_known() || input.is_open()) {
+        return std::nullopt;
+    }
+    std::vector<std::string_view> input_names;
+    input_names.reserve(input.fields().size());
+    for (const ir::SchemaField& field : input.fields()) {
+        input_names.push_back(field.name);
+    }
+    auto mapping =
+        resolve_aggregate_columns(aggregate.group_by(), aggregate.aggregations(), input_names);
     if (!mapping.has_value()) {
         return std::nullopt;
     }
@@ -481,9 +504,10 @@ void resolve_pipeline_mode(Plan& plan) {
 }  // namespace
 
 auto plan_physical(const ir::Node& root, const TableRegistry& registry,
-                   const ExternRegistry* externs) -> Plan {
+                   const ExternRegistry* externs, const ir::SourceSchemas& source_schemas) -> Plan {
     Plan plan;
     plan.root = &root;
+    const ir::SourceSchemas schemas = planning_source_schemas(registry, source_schemas);
     plan_stats().plans_built.fetch_add(1, std::memory_order_relaxed);
 
     // Describe a join even though the plan does not execute one yet. The plan
@@ -533,7 +557,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         // Described, not executed: `migrated` stays false and the per-kind
         // switch still builds every aggregate. The description is proven equal
         // to the builder's branches first, exactly as the join's was.
-        plan.aggregate = plan_aggregate(ir::node_cast<ir::AggregateNode>(root));
+        const auto& aggregate = ir::node_cast<ir::AggregateNode>(root);
+        plan.aggregate = plan_aggregate(aggregate);
         // Streaming and fused aggregates are executed by the plan now.
         // `MaterializeAll` is not: it still falls back and still counts, which
         // is what keeps the backlog measuring the port rather than the label.
@@ -550,6 +575,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             // disagrees. The authority slices move the decision the way
             // distinct's and the join's did.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
+                plan.aggregate.columns = known_aggregate_column_mapping(aggregate, schemas);
                 const RowEstimate input_estimate = table_input_row_estimate(root, registry);
                 plan.breaker_phases.push_back(
                     {.name = "partition",
@@ -586,7 +612,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                               .left_input = plan.join.left_input,
                               .right_input = plan.join.right_input,
                               .parallelism = join_probe_parallelism()},
-                    .columns = known_join_column_mapping(join, registry),
+                    .columns = known_join_column_mapping(join, schemas),
                 };
             }
             return plan;
@@ -868,6 +894,37 @@ auto explain_physical(const Plan& plan) -> std::string {
         out += '\n';
     }
     return out;
+}
+
+auto resolve_aggregate_columns(std::span<const ir::ColumnRef> group_by,
+                               std::span<const ir::AggSpec> aggregations,
+                               std::span<const std::string_view> input_names)
+    -> std::expected<AggregateColumnMapping, std::string> {
+    AggregateColumnMapping mapping;
+    mapping.group_by.reserve(group_by.size());
+    for (const ir::ColumnRef& key : group_by) {
+        const auto found = std::ranges::find(input_names, key.name);
+        if (found == input_names.end()) {
+            return std::unexpected("group-by column not found: " + key.name);
+        }
+        mapping.group_by.push_back(
+            static_cast<std::size_t>(std::distance(input_names.begin(), found)));
+    }
+
+    mapping.aggregate_inputs.reserve(aggregations.size());
+    for (const ir::AggSpec& aggregation : aggregations) {
+        if (aggregation.func == ir::AggFunc::Count) {
+            mapping.aggregate_inputs.push_back(std::nullopt);
+            continue;
+        }
+        const auto found = std::ranges::find(input_names, aggregation.column.name);
+        if (found == input_names.end()) {
+            return std::unexpected("aggregate column not found: " + aggregation.column.name);
+        }
+        mapping.aggregate_inputs.push_back(
+            static_cast<std::size_t>(std::distance(input_names.begin(), found)));
+    }
+    return mapping;
 }
 
 auto plan_aggregate(const ir::AggregateNode& agg) -> AggregatePlan {

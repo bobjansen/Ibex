@@ -569,18 +569,28 @@ TEST_CASE("check_joins: widths that share a runtime kind are compatible", "[ir][
     REQUIRE_FALSE(ibex::ir::check_joins(join, sources).has_value());
 }
 
-TEST_CASE("check_joins: an untyped or open side defers to the runtime", "[ir][schema]") {
+TEST_CASE("check_joins: only unknown types or schemas defer to the runtime", "[ir][schema]") {
     auto join = join_of({{"id", "id"}});
     // No type on the right: the column is known to exist, nothing more.
     auto untyped = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
                                SchemaInfo::known({{.name = "id", .type = std::nullopt}}));
     REQUIRE_FALSE(ibex::ir::check_joins(join, untyped).has_value());
 
-    // An open schema may carry the key among the columns it does not list.
+    // Extra physical columns in an open schema are anonymous until named by an
+    // ascription, so they cannot be used as join keys.
     auto open =
         two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
                     SchemaInfo::known({{.name = "v", .type = std::nullopt}}, /*open=*/true));
-    REQUIRE_FALSE(ibex::ir::check_joins(join, open).has_value());
+    auto open_error = ibex::ir::check_joins(join, open);
+    REQUIRE(open_error.has_value());
+    REQUIRE(open_error->find("join key 'id' not found on the right side") != std::string::npos);
+
+    // Naming the key makes it usable while the rest of the physical schema may
+    // remain open.
+    auto named_open = two_sources(SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}}),
+                                  SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}},
+                                                    /*open=*/true));
+    REQUIRE_FALSE(ibex::ir::check_joins(join, named_open).has_value());
 
     // An unknown source proves nothing either way.
     SourceSchemas one{{"left", SchemaInfo::known({{.name = "id", .type = ColumnType::Int64}})}};

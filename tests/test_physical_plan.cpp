@@ -1304,6 +1304,26 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
     }
 
+    SECTION("declared source schemas bind aggregate columns without executing the source") {
+        auto tree = require_ir("ticks[select { total = sum(volume) }, by { symbol }];");
+        const ir::SourceSchemas schemas{{
+            "ticks",
+            ir::SchemaInfo::known({{.name = "timestamp", .type = ir::ColumnType::Timestamp},
+                                   {.name = "symbol", .type = ir::ColumnType::String},
+                                   {.name = "price", .type = ir::ColumnType::Float64},
+                                   {.name = "volume", .type = ir::ColumnType::Int64}}),
+        }};
+        const runtime::TableRegistry empty;
+        const auto plan = runtime::physical::plan_physical(*tree, empty, nullptr, schemas);
+        REQUIRE(plan.aggregate.columns.has_value());
+        // Required-column projection narrows the physical child to
+        // [symbol, volume], so the mapping describes that input rather than
+        // the generator's wider source layout.
+        REQUIRE(plan.aggregate.columns->group_by == std::vector<std::size_t>{0});
+        REQUIRE(plan.aggregate.columns->aggregate_inputs ==
+                std::vector<std::optional<std::size_t>>{1});
+    }
+
     SECTION("a fused left-join count carries no fan-out phases") {
         // COUNT(*) grouped by the left key over a left join fuses to one step
         // that runs whole-table -- no ChunkedAggregateOperator, nothing to fan.

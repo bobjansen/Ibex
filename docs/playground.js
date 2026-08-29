@@ -9,15 +9,17 @@
   const editor = root.querySelector("[data-pg-editor]");
   const runButton = root.querySelector("[data-pg-run]");
   const resetButton = root.querySelector("[data-pg-reset]");
+  const regenButton = root.querySelector("[data-pg-regen]");
   const status = root.querySelector("[data-pg-status]");
   const output = root.querySelector("[data-pg-output]");
   const envBar = root.querySelector("[data-pg-env]");
   const exampleBar = root.querySelector("[data-pg-examples]");
 
+  const SYMBOLS = "AAPL,MSFT,GOOG,AMZN,NVDA";
   const SEED = `import data_gen;
 seed_rng(42);
-let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
-let reference = gen_reference("AAPL,MSFT,GOOG,AMZN,NVDA");
+let trades = gen_ticks(50000, "${SYMBOLS}");
+let reference = gen_reference("${SYMBOLS}");
 let prices = gen_walk(2000, 100.0, 1.0);`;
 
   const EXAMPLES = [
@@ -26,10 +28,6 @@ let prices = gen_walk(2000, 100.0, 1.0);`;
     ["Join reference data", "trades[select { trades = count() }, by symbol]\n  join reference on symbol;"],
     ["High / low by symbol", "trades[by symbol, select { hi = max(price), lo = min(price), spread = max(price) - min(price) }];"],
     ["Distinct symbols", "trades[distinct symbol];"],
-    ["Create random trades", `import data_gen;
-
-let trades = gen_ticks(100000, "AAPL,MSFT,GOOG,AMZN,NVDA");
-trades[select { avg_price = mean(price) }, by symbol]`]
   ];
 
   const FIRST_QUERY = EXAMPLES[0][1];
@@ -50,7 +48,7 @@ trades[select { avg_price = mean(price) }, by symbol]`]
     if (!tables.length) return;
     const label = document.createElement("span");
     label.className = "pg-env-label";
-    label.textContent = "session:";
+    label.textContent = "Available tables";
     envBar.append(label);
     for (const t of tables) {
       const chip = document.createElement("button");
@@ -168,11 +166,33 @@ trades[select { avg_price = mean(price) }, by symbol]`]
     }
   };
 
-  const resetSession = () => {
+  const showEmpty = () => {
     output.replaceChildren();
+    const p = document.createElement("p");
+    p.className = "pg-note pg-empty";
+    p.textContent = "Run a query to see results.";
+    output.append(p);
+  };
+
+  const resetSession = () => {
     envBar.replaceChildren();
     editor.value = FIRST_QUERY;
+    showEmpty();
     boot(true);
+  };
+
+  // Session action: rebuild `trades` from a fresh random seed. Categorically
+  // different from the query buttons — it mutates the environment.
+  const regenerate = () => {
+    if (!ibex) return;
+    const seed = Math.floor(Math.random() * 1e9);
+    const source = `import data_gen;\nseed_rng(${seed});\nlet trades = gen_ticks(50000, "${SYMBOLS}");`;
+    const result = JSON.parse(ibex.execute(source));
+    renderEnv(result.environment);
+    setStatus(
+      result.error ? "Regenerate failed: " + result.error : `New random trades (seed ${seed.toLocaleString()})`,
+      result.error ? "error" : "",
+    );
   };
 
   const boot = async (reset) => {
@@ -190,7 +210,8 @@ trades[select { avg_price = mean(price) }, by symbol]`]
       if (seeded.error) {
         setStatus("Sample data failed to load: " + seeded.error, "error");
       } else {
-        setStatus("Ready — sample tables loaded. Run a query with ⌘/Ctrl + Enter.");
+        setStatus("Ready. Run a query with ⌘/Ctrl + Enter.");
+        if (!output.childElementCount) showEmpty();
       }
       runButton.disabled = false;
     } catch (err) {
@@ -228,6 +249,7 @@ trades[select { avg_price = mean(price) }, by symbol]`]
 
   runButton.addEventListener("click", run);
   resetButton.addEventListener("click", resetSession);
+  regenButton.addEventListener("click", regenerate);
   editor.addEventListener("keydown", (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
       event.preventDefault();

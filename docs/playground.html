@@ -29,13 +29,14 @@
     <p class="eyebrow">Playground</p>
     <h1>Run Ibex in your browser.</h1>
     <p class="lead">
-      The real interpreter, compiled to WebAssembly — no install, no server, nothing
-      leaves your machine. Three sample tables are generated on load; edit a query and
-      press <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd>.
+      The real Ibex interpreter, compiled to WebAssembly. No install, no server,
+      nothing leaves your machine. Edit a query and press
+      <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd>.
     </p>
   </header>
 
   <section class="playground" data-playground>
+    <div class="pg-env" data-pg-env></div>
     <div class="pg-examples" data-pg-examples></div>
 
     <div class="pg-grid">
@@ -50,22 +51,21 @@
         ></textarea>
         <div class="pg-actions">
           <button type="button" class="button primary" data-pg-run>Run ▶</button>
-          <button type="button" class="button" data-pg-reset>Reset session</button>
           <span class="pg-status" data-pg-status>Loading…</span>
+          <span class="pg-actions-spacer"></span>
+          <button type="button" class="pg-session-action" data-pg-regen>Regenerate trades</button>
+          <button type="button" class="pg-session-action" data-pg-reset>Reset session</button>
         </div>
       </div>
 
-      <div class="pg-result-pane">
-        <div class="pg-env" data-pg-env></div>
-        <div class="pg-output" data-pg-output></div>
-      </div>
+      <div class="pg-output" data-pg-output></div>
     </div>
 
     <p class="repl-caption">
-      Runs single-threaded. For the full performance story — 10M rows in
-      ~600&nbsp;ms across cores — see the
-      <a href="./benchmarks.html">benchmarks</a>. Source lives in
-      <a href="https://github.com/bobjansen/Ibex/tree/main/wasm" target="_blank" rel="noopener">wasm/</a>.
+      Playground runs single-threaded. For multicore performance, see the
+      <a href="./benchmarks.html">benchmarks</a>.
+      <span class="pg-source">Source in
+      <a href="https://github.com/bobjansen/Ibex/tree/main/wasm" target="_blank" rel="noopener">wasm/</a>.</span>
     </p>
   </section>
 </main>

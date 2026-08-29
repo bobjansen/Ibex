@@ -865,7 +865,7 @@ table.bench {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
-  margin-bottom: 0.9rem;
+  margin-bottom: 1rem;
 }
 
 .pg-example {
@@ -892,7 +892,7 @@ table.bench {
 
 .pg-editor {
   width: 100%;
-  min-height: 10rem;
+  min-height: 7rem;
   box-sizing: border-box;
   resize: vertical;
   border: 1px solid #334044;
@@ -917,25 +917,51 @@ table.bench {
   margin-top: 0.7rem;
 }
 
-.pg-status {
-  color: var(--muted);
-  font-size: 0.78rem;
+.pg-actions-spacer {
+  flex: 1 1 1.5rem;
 }
 
-.pg-status-ok { color: var(--accent); }
+.pg-session-action {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.32rem 0.7rem;
+  background: transparent;
+  color: var(--muted);
+  font: 500 0.76rem/1 "Space Grotesk", system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.pg-session-action:hover,
+.pg-session-action:focus-visible {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.pg-status {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.pg-status-ok {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+
 .pg-status-error { color: #b3261e; }
 
 .pg-env {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
+  gap: 0.4rem;
   align-items: center;
-  margin-bottom: 0.7rem;
+  margin-bottom: 1rem;
 }
 
 .pg-env-label {
-  color: var(--muted);
-  font-size: 0.74rem;
+  color: var(--ink);
+  font: 600 0.78rem/1 "Space Grotesk", system-ui, sans-serif;
+  margin-right: 0.15rem;
 }
 
 .pg-chip {
@@ -1014,5 +1040,20 @@ table.bench {
   margin: 0.5rem 0.2rem 0;
   color: var(--muted);
   font-size: 0.74rem;
+}
+
+.pg-empty {
+  margin: 2.1rem 0.2rem;
+  text-align: center;
+  font-size: 0.8rem;
+}
+
+.pg-source {
+  color: var(--muted);
+  opacity: 0.75;
+}
+
+.pg-source a {
+  color: inherit;
 }
 

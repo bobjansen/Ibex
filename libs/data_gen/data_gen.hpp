@@ -26,8 +26,11 @@
 
 namespace ibex::data_gen {
 
-/// Synthetic tick data: timestamp, symbol, price (random walk per symbol),
-/// volume. `symbols` is a comma-separated list, e.g. "AAPL,MSFT,GOOG".
+/// Synthetic tick data: timestamp, symbol, price, volume. `symbols` is a
+/// comma-separated list, e.g. "AAPL,MSFT,GOOG". Each symbol has its own base
+/// price (spread around `start_price`) and its own mean-reverting random walk,
+/// so the series stay distinct even over millions of rows. `symbol` is a
+/// Categorical column.
 /// Inter-arrival times are drawn from an Exponential distribution with mean
 /// `interval_ms` (a Poisson process), not evenly spaced. `start_ts_ms` is the
 /// first timestamp in Unix milliseconds (0 means "use current wall-clock time").

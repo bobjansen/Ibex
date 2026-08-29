@@ -136,9 +136,9 @@ jobs:
           Quick start:
           - The browser workbench is bundled beside the executable at ./bin/ui.
           - Linux/macOS REPL: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex
-          - Linux/macOS UI: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex ui --data-dir .
+          - Linux/macOS UI: IBEX_LIBRARY_PATH="\$(pwd)/plugins" ./bin/ibex ui --data-dir . --demo
           - Windows PowerShell REPL: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe
-          - Windows PowerShell UI: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe ui --data-dir .
+          - Windows PowerShell UI: \$env:IBEX_LIBRARY_PATH = "$PWD/plugins"; .\bin\ibex.exe ui --data-dir . --demo
           - Open the printed http://127.0.0.1:8765 address in a browser.
 
           Notes:

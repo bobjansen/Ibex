@@ -53,6 +53,7 @@ auto main(int argc, char** argv) -> int {
     std::uint16_t ui_port = 8765;
     std::string ui_web_root;
     std::string ui_data_dir;
+    bool ui_demo = false;
     auto* ui = app.add_subcommand("ui", "Start the local browser-based query workbench");
     ui->add_option("--port", ui_port, "Loopback port to listen on")->default_val(8765);
     ui->add_option("--web-root", ui_web_root,
@@ -61,6 +62,9 @@ auto main(int argc, char** argv) -> int {
           "--data-dir", ui_data_dir,
           "Directory the browser workbench may read and write (defaults to the current directory)")
         ->type_name("DIR");
+    ui->add_flag("--demo", ui_demo,
+                 "Seed synthetic demo tables (trades, prices, samples) into each UI session "
+                 "using the data_gen plugin, so queries can be run without supplying data");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -108,6 +112,7 @@ auto main(int argc, char** argv) -> int {
         return ibex::ui::run_server(ibex::ui::ServerConfig{.port = ui_port,
                                                            .web_root = std::move(web_root),
                                                            .data_directory = std::move(ui_data_dir),
+                                                           .demo = ui_demo,
                                                            .repl = config},
                                     registry);
     }

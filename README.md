@@ -33,6 +33,10 @@ $env:IBEX_LIBRARY_PATH = "$PWD/plugins"
 .\bin\ibex.exe ui --data-dir .
 ```
 
+Add `--demo` to either command to seed synthetic `trades`, `prices`, and
+`samples` tables into every session (via the bundled `data_gen` plugin), so you
+can run queries immediately without supplying any data.
+
 Open the printed `http://127.0.0.1:8765` address in a browser. The UI assets
 are bundled at `bin/ui`; Node.js is only needed when building Ibex from source.
 The `--data-dir` directory is the sandbox the UI can read and write. Press

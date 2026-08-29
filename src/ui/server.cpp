@@ -94,7 +94,8 @@ struct Session {
     std::uint64_t next_result_id = 1;
 };
 
-// Seeded into each new browser session when the server runs with `--demo`.
+// Seeded into a session either automatically for every new session when the
+// server runs with `--demo`, or on request via `POST /api/v1/demo`.
 // Draws through the RNG bridge so `seed_rng` makes the tables reproducible.
 // `trades` columns are timestamp/symbol/price/volume; `reference` has one row
 // per symbol (symbol/name/sector/currency/lot_size/tick_size) and joins to
@@ -716,6 +717,19 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
             if (request->method == "GET" && request->target == "/api/v1/config") {
                 send_response(client, 200, "OK", json({{"demo", config.demo}}).dump(),
                               "application/json; charset=utf-8", created_cookie);
+            } else if (request->method == "POST" && request->target == "/api/v1/demo") {
+                const auto seeded = session.repl.execute(kDemoBootstrap);
+                if (seeded.ok) {
+                    send_response(client, 200, "OK", environment_json(session).dump(),
+                                  "application/json; charset=utf-8", created_cookie);
+                } else {
+                    send_response(
+                        client, 500, "Internal Server Error",
+                        json({{"error", "Could not load sample data: " + seeded.error +
+                                            " (is the data_gen plugin on the library path?)"}})
+                            .dump(),
+                        "application/json; charset=utf-8", created_cookie);
+                }
             } else if (request->method == "GET" && request->target == "/api/v1/environment") {
                 send_response(client, 200, "OK", environment_json(session).dump(),
                               "application/json; charset=utf-8", created_cookie);

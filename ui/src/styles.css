@@ -58,6 +58,17 @@ header {
 aside header button {
   margin-left: auto;
 }
+.load-demo {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 8px;
+  padding: 6px 9px;
+  background: #1f3a4d;
+  border-color: #2f5a75;
+}
+.load-demo:hover {
+  background: #274a63;
+}
 .binding {
   padding: 10px 12px;
   border-bottom: 1px solid #303842;
@@ -196,6 +207,10 @@ aside header button {
 .welcome-card p {
   color: #c3ccd8;
   line-height: 1.5;
+}
+.welcome-actions {
+  display: flex;
+  gap: 8px;
 }
 .welcome-card code {
   padding: 1px 4px;

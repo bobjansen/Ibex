@@ -66,3 +66,6 @@ examples/nycflights13/plots*/
 # another on the same box. The TSVs are already ignored by *.tsv; this also
 # covers the manifests that make them comparable.
 benchmarking/tpch/results/runs/
+
+# WASM playground artifacts (built in the Pages workflow)
+docs/playground/

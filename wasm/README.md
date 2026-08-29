@@ -52,10 +52,19 @@ python3 -m http.server 8000        # then open
   suite): an ADL ambiguity between `ibex::formatting::print` and libc++'s
   `std::print`, and a `sizeof(BuiltinFn)` guard that assumed a 64-bit pointer.
 
+## Deployed
+
+The `Pages` workflow (`.github/workflows/pages.yml`) builds `ibex_wasm` with
+emsdk on every push to `main` and drops `ibex.mjs` / `ibex.wasm` into
+`docs/playground/`. The site's **Playground** page (`docs/playground.html` +
+`docs/playground.js`) loads them — the interactive REPL on ibexlang.org.
+
+`wasm/demo/` stays as the minimal, framework-free reference page.
+
 ## Not done (next steps if this graduates)
 
 - Wire into `ui/src/main.tsx` behind a build flag so the same UI runs against
   either the local server or the WASM module.
 - Size pass (`-Oz`, `-sSTRICT`, closure) — the spike uses `-O2`.
 - Bundle a few sample CSVs into MEMFS so `read_csv` works offline.
-- CI job: build, run `smoke.mjs`, deploy `demo/` to Pages.
+- Run `smoke.mjs` in CI as a build gate.

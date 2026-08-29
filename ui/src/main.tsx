@@ -309,6 +309,19 @@ function dismissWelcome(): void {
   }
 }
 
+const THEME_KEY = "ibex-ui-theme";
+function readTheme(): "dark" | "light" {
+  try {
+    const stored = localStorage.getItem(THEME_KEY);
+    if (stored === "light" || stored === "dark") return stored;
+  } catch {
+    // fall through to system preference
+  }
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches
+    ? "light"
+    : "dark";
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -997,6 +1010,7 @@ function App() {
   const [showCheatsheet, setShowCheatsheet] = useState(false);
   const [resultView, setResultView] = useState<"table" | "chart">("table");
   const [copied, setCopied] = useState(false);
+  const [theme, setTheme] = useState<"dark" | "light">(readTheme);
   const runRef = useRef<() => void>(() => {});
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
@@ -1015,6 +1029,15 @@ function App() {
       .then((config) => setDemo(config.demo))
       .catch(() => setDemo(false));
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [theme]);
 
   const loadExample = useCallback((label: string) => {
     const example = examples.find((entry) => entry.label === label);
@@ -1473,6 +1496,9 @@ function App() {
               {entry.name}
             </button>
           ))}
+          {!files && !filesError && (
+            <small className="files-loading">Loading…</small>
+          )}
           {filesError && <small className="files-error">{filesError}</small>}
         </section>
       </aside>
@@ -1520,6 +1546,15 @@ function App() {
             </select>
             <button onClick={() => setShowCheatsheet(true)}>Cheatsheet</button>
             <button
+              className="icon-button"
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+              onClick={() =>
+                setTheme((current) => (current === "dark" ? "light" : "dark"))
+              }
+            >
+              {theme === "dark" ? "☾" : "☀"}
+            </button>
+            <button
               className="run"
               disabled={running}
               onClick={() => void run()}
@@ -1532,7 +1567,7 @@ function App() {
         <div className="editor">
           <Editor
             height="100%"
-            theme="vs-dark"
+            theme={theme === "light" ? "light" : "vs-dark"}
             defaultLanguage="ibex"
             value={source}
             onChange={(value) => setSource(value ?? "")}
@@ -1562,7 +1597,8 @@ function App() {
           <section className="results">
             <header>
               <strong>Results</strong>
-              <span>{resultSummary}</span>
+              <span>{running ? "Running…" : resultSummary}</span>
+              {running && <span className="run-bar" />}
               {elapsedMs !== undefined && (
                 <span className="query-timing">
                   {elapsedMs.toFixed(elapsedMs < 10 ? 2 : 1)} ms
@@ -1615,13 +1651,28 @@ function App() {
                 ))}
               </nav>
             )}
-            {page &&
-              (resultView === "chart" ? (
+            {running ? (
+              <div className="results-skeleton">
+                {Array.from({ length: 9 }, (_, index) => (
+                  <div className="skeleton-row" key={index} />
+                ))}
+              </div>
+            ) : page ? (
+              resultView === "chart" ? (
                 <Chart key={activeResultId} page={page} />
               ) : (
                 <Grid page={page} />
-              ))}
-            {scalar !== undefined && <output>{String(scalar)}</output>}
+              )
+            ) : scalar !== undefined ? (
+              <output>{String(scalar)}</output>
+            ) : (
+              !error && (
+                <div className="results-empty">
+                  Run a query (⌘↵) to see results — or pick one from the
+                  Examples menu.
+                </div>
+              )
+            )}
           </section>
         </section>
       </section>

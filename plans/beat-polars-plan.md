@@ -4,11 +4,11 @@ Status: **proposed.** Written 2026-08-16 on branch `streaming-scan-units`, after
 the pipelined-execution Phase 2 slices (streamed scan units, concurrent decode,
 source→map pipeline, join-probe handoff) landed. This is the umbrella plan: it
 sets the target, decomposes the remaining gap into workstreams with expected
-payoffs, and sequences them. It supersedes nothing — it points into
-`pipelined-execution-plan.md`, `runtime-multithreading-plan.md`, and
-`join-perf-plan.md` for mechanism (the former fourth input,
-`chunked-execution-plan.md`, was removed from the tree 2026-08-22; its
-open items live in the kernel-pipeline plan and bigger-than-ram).
+payoffs, and sequences them. It points into
+`kernel-pipeline-execution-plan.md`, `runtime-multithreading-plan.md`, and
+`join-perf-plan.md` for mechanism. The former pipelined- and chunked-execution
+plans were removed as superseded; their remaining work lives in the kernel
+pipeline plan and bigger-than-ram plan.
 Absorbed `pds.md` (the 2026-08-11 status snapshot this grew out of) on
 2026-08-22: §5 and §6 took its still-unique traps and dead ends, §8 keeps
 its baseline record.
@@ -193,8 +193,8 @@ is, so every workstream is stated as "serial ms attacked".
 ## 2. Where the serial time is
 
 Calling-thread self-ms summed over the suite at 8 cores, with worker help drawn
-(`pool_work / self`), from `pipelined-execution-plan.md` ("Where the serial
-time actually is", post-semi-join numbers):
+(`pool_work / self`), from the archived pipelined-execution measurement study
+(git history; post-semi-join numbers):
 
 | operator | self ms | pool ms | worker help | verdict |
 |---|---:|---:|---:|---|
@@ -512,7 +512,7 @@ W3.1 progress-aware admission       ── next scheduler slice; fixes 2-core cl
 W3.2 q18/q22 rundown                ── decides W4's priority
 W4 chunked let bindings             ── design note first; largest structural risk
 W3.3+ aggregate-output stages,
-      general scheduler, island retirement
+      explicit breaker phases and general scheduler
 W2.3 parallel gid                   ── only if still dominant after the above
 ```
 

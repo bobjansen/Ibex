@@ -7,6 +7,7 @@
   font:
     14px/1.4 system-ui,
     sans-serif;
+  --chart-accent: #5aa9e6;
 }
 * {
   box-sizing: border-box;
@@ -324,7 +325,9 @@ kbd {
   flex-direction: column;
 }
 .results > header {
-  flex: 0 0 42px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px 10px;
 }
 .results header span {
   color: #a9b5c4;
@@ -365,7 +368,7 @@ kbd {
   background: #20262e;
   border-bottom: 1px solid #2d3540;
 }
-.grid-header strong,
+.grid-header button,
 .grid-row span {
   padding: 6px 10px;
   min-width: 0;
@@ -373,9 +376,59 @@ kbd {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.grid-header button {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-weight: bold;
+  text-align: left;
+  cursor: pointer;
+}
+.grid-header button:hover {
+  background: #2c333d;
+}
+.grid-header button.active {
+  background: #33404e;
+}
 .grid-header small {
   color: #8e9bab;
   font-weight: normal;
+}
+.grid-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.grid-wrap .result-grid {
+  flex: 1 1 auto;
+}
+.column-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  background: #1b2027;
+  border-bottom: 1px solid #303842;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.column-stats i {
+  color: #77879a;
+  font-style: normal;
+}
+.column-stats-scope {
+  color: #8e9bab;
+}
+.column-stats button {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
 }
 .grid-body {
   position: relative;
@@ -400,4 +453,111 @@ kbd {
 output {
   padding: 16px;
   white-space: pre-wrap;
+}
+.result-view-toggle {
+  display: flex;
+  margin-left: auto;
+  gap: 2px;
+}
+.result-view-toggle button,
+.results-export button {
+  padding: 3px 10px;
+}
+.result-view-toggle button.active {
+  background: #3a4553;
+  border-color: #6c7d90;
+}
+.results-export {
+  display: flex;
+  gap: 4px;
+}
+.chart {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.chart-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 14px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #303842;
+}
+.chart-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #a9b5c4;
+  font-size: 12px;
+}
+.chart-toolbar select {
+  color: inherit;
+  background: #2c333d;
+  border: 1px solid #46515f;
+  border-radius: 3px;
+  padding: 3px 6px;
+}
+.chart-canvas {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 8px 0;
+}
+.chart svg {
+  display: block;
+  max-width: 100%;
+}
+.chart-grid {
+  stroke: #2d3540;
+}
+.chart-axis {
+  fill: #8e9bab;
+  font-size: 10px;
+}
+.chart-line {
+  fill: none;
+  stroke: var(--chart-accent);
+  stroke-width: 1.5;
+}
+.chart-area {
+  fill: var(--chart-accent);
+  opacity: 0.18;
+}
+.chart-bar {
+  fill: var(--chart-accent);
+}
+.chart-dot {
+  fill: var(--chart-accent);
+}
+.chart-crosshair {
+  stroke: #6c7d90;
+  stroke-dasharray: 3 3;
+}
+.chart-tip {
+  position: absolute;
+  transform: translateY(-50%);
+  padding: 4px 7px;
+  background: #12151a;
+  border: 1px solid #46515f;
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.chart-tip strong {
+  font-variant-numeric: tabular-nums;
+}
+.chart-tip span {
+  margin-left: 6px;
+  color: #8e9bab;
+}
+.chart-empty,
+.chart-note {
+  padding: 16px;
+  color: #a9b5c4;
+}
+.chart-note {
+  font-size: 12px;
 }

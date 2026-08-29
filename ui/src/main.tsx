@@ -64,6 +64,11 @@ const examples: Example[] = [
     source: "trades[order { price desc }, head 10];",
   },
   {
+    label: "Join reference data",
+    source:
+      "trades[select { avg_price = mean(price), total_volume = sum(volume) }, by symbol]\n  join reference on symbol;",
+  },
+  {
     label: "Rolling 1-minute mean",
     source:
       'let tf = as_timeframe(trades, "timestamp");\ntf[window 1m, update { avg_1m = rolling_mean(price) }];',
@@ -565,7 +570,8 @@ function App() {
             <p>
               {demo ? (
                 <>
-                  Three tables are preloaded: <code>trades</code>,{" "}
+                  Four tables are preloaded: <code>trades</code>,{" "}
+                  <code>reference</code> (symbol master data),{" "}
                   <code>prices</code>, and <code>samples</code>. Press Run to
                   execute the sample query, or pick one from the{" "}
                   <em>Examples</em> menu.

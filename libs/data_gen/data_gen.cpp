@@ -6,10 +6,14 @@
 #include <ibex/runtime/extern_registry.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ibex::data_gen {
@@ -29,6 +33,34 @@ auto split_symbols(const std::string& csv) -> std::vector<std::string> {
         out.emplace_back("SYM");
     }
     return out;
+}
+
+struct SymbolInfo {
+    std::string name;
+    std::string sector;
+};
+
+// Known tickers get a real name and sector so demo joins read naturally;
+// anything else is derived deterministically from the symbol string.
+auto lookup_symbol(const std::string& symbol) -> SymbolInfo {
+    static const std::map<std::string, SymbolInfo> known = {
+        {"AAPL", {"Apple Inc.", "Technology"}},
+        {"MSFT", {"Microsoft Corp.", "Technology"}},
+        {"GOOG", {"Alphabet Inc.", "Communication Services"}},
+        {"AMZN", {"Amazon.com Inc.", "Consumer Discretionary"}},
+        {"NVDA", {"NVIDIA Corp.", "Technology"}},
+        {"META", {"Meta Platforms Inc.", "Communication Services"}},
+        {"TSLA", {"Tesla Inc.", "Consumer Discretionary"}},
+        {"JPM", {"JPMorgan Chase & Co.", "Financials"}},
+        {"XOM", {"Exxon Mobil Corp.", "Energy"}},
+    };
+    if (const auto it = known.find(symbol); it != known.end()) {
+        return it->second;
+    }
+    static constexpr std::array<std::string_view, 6> sectors = {
+        "Technology", "Financials", "Healthcare", "Energy", "Industrials", "Utilities"};
+    const auto hash = std::hash<std::string>{}(symbol);
+    return {symbol + " Corp.", std::string(sectors[hash % sectors.size()])};
 }
 
 auto now_ms() -> std::int64_t {
@@ -173,6 +205,40 @@ auto gen_ids(std::int64_t n, const std::string& prefix) -> runtime::Table {
     return out;
 }
 
+auto gen_reference(const std::string& symbols) -> runtime::Table {
+    std::vector<std::string> distinct;
+    for (auto& symbol : split_symbols(symbols)) {
+        if (std::ranges::find(distinct, symbol) == distinct.end()) {
+            distinct.push_back(std::move(symbol));
+        }
+    }
+
+    Column<std::string> symbol_col;
+    Column<std::string> name_col;
+    Column<std::string> sector_col;
+    Column<std::string> currency_col;
+    Column<std::int64_t> lot_size_col;
+    Column<double> tick_size_col;
+    for (const auto& symbol : distinct) {
+        const auto info = lookup_symbol(symbol);
+        symbol_col.push_back(symbol);
+        name_col.push_back(info.name);
+        sector_col.push_back(info.sector);
+        currency_col.push_back("USD");
+        lot_size_col.push_back(100);
+        tick_size_col.push_back(0.01);
+    }
+
+    runtime::Table out;
+    out.add_column("symbol", std::move(symbol_col));
+    out.add_column("name", std::move(name_col));
+    out.add_column("sector", std::move(sector_col));
+    out.add_column("currency", std::move(currency_col));
+    out.add_column("lot_size", std::move(lot_size_col));
+    out.add_column("tick_size", std::move(tick_size_col));
+    return out;
+}
+
 }  // namespace ibex::data_gen
 
 namespace {
@@ -244,5 +310,13 @@ extern "C" IBEX_PLUGIN_EXPORT void ibex_register(ibex::runtime::ExternRegistry* 
                 return std::unexpected("gen_ids() expects 2 arguments");
             }
             return ExternValue{ibex::data_gen::gen_ids(arg_int(args, 0), arg_string(args, 1))};
+        });
+
+    registry->register_table(
+        "gen_reference", [](const ExternArgs& args) -> std::expected<ExternValue, std::string> {
+            if (args.size() != 1) {
+                return std::unexpected("gen_reference() expects 1 argument");
+            }
+            return ExternValue{ibex::data_gen::gen_reference(arg_string(args, 0))};
         });
 }

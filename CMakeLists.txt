@@ -62,6 +62,21 @@ option(IBEX_BUILD_ADBC "Build the bundled ADBC plugin" OFF)
 option(IBEX_BUILD_KAFKA "Build the bundled Kafka plugin" OFF)
 option(IBEX_KAFKA_VENDOR_AVROCPP "Vendor Apache Avro C++ for Kafka schema-registry decoding" ON)
 option(IBEX_MINIMAL_RUNTIME "Build only the runtime libraries needed by language bindings" OFF)
+
+# WebAssembly (Emscripten) build: the interpreter compiled to WASM so the
+# browser UI can run queries with no local server. A spike — see wasm/README.md.
+# Detected automatically from the toolchain; forces off everything that assumes
+# a native host (tools, tests, sockets, threads-by-default, heavyweight plugins).
+if(EMSCRIPTEN)
+    set(IBEX_WASM ON)
+    set(IBEX_BUILD_TESTS OFF)
+    set(IBEX_BUILD_TOOLS OFF)
+    set(IBEX_BUILD_UI OFF)
+    set(IBEX_BUILD_EXAMPLES OFF)
+    set(IBEX_BUILD_PYTHON_BRIDGE OFF)
+    set(IBEX_BUILD_PARQUET OFF)
+    set(IBEX_BUILD_LIGHTGBM OFF)
+endif()
 set(IBEX_PLUGIN_OUTPUT_DIR "${PROJECT_BINARY_DIR}/tools" CACHE PATH
     "Directory for bundled Ibex plugins")
 
@@ -171,7 +186,7 @@ add_subdirectory(src/ir)
 add_subdirectory(src/parser)
 add_subdirectory(src/runtime)
 add_subdirectory(src/interop)
-if(NOT IBEX_MINIMAL_RUNTIME)
+if(NOT IBEX_MINIMAL_RUNTIME AND NOT IBEX_WASM)
     add_subdirectory(src/codegen)
 endif()
 
@@ -187,12 +202,15 @@ target_link_libraries(ibex_lib
         Ibex::runtime
         Ibex::interop
 )
-if(NOT IBEX_MINIMAL_RUNTIME)
+if(NOT IBEX_MINIMAL_RUNTIME AND NOT IBEX_WASM)
     target_link_libraries(ibex_lib INTERFACE Ibex::codegen)
 endif()
 
 # Plugin libraries
-if(NOT IBEX_MINIMAL_RUNTIME)
+if(IBEX_WASM)
+    # The WASM spike statically links only data_gen (see wasm/); it builds the
+    # plugin's translation unit directly rather than as a shared object.
+elseif(NOT IBEX_MINIMAL_RUNTIME)
     add_subdirectory(libs/csv)
     add_subdirectory(libs/json)
     add_subdirectory(libs/data_gen)
@@ -216,8 +234,15 @@ if(NOT IBEX_MINIMAL_RUNTIME)
     endif()
 endif()
 
+if(IBEX_WASM)
+    add_subdirectory(wasm)
+endif()
+
 # Tools
-if(IBEX_BUILD_TOOLS)
+if(IBEX_WASM)
+    # The WASM bridge links the REPL session facade but none of the CLI tooling.
+    add_subdirectory(src/repl)
+elseif(IBEX_BUILD_TOOLS)
     add_subdirectory(src/repl)
     if(IBEX_BUILD_UI)
         add_subdirectory(src/ui)

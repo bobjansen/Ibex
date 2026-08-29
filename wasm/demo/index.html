@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ibex in the browser (WASM spike)</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        font: 14px/1.5 system-ui, sans-serif;
+        background: #15181d;
+        color: #d8dee9;
+        padding: 24px;
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      h1 { font-size: 18px; }
+      textarea {
+        width: 100%;
+        min-height: 120px;
+        font: 13px/1.5 ui-monospace, monospace;
+        background: #12151a;
+        color: #d8dee9;
+        border: 1px solid #303842;
+        border-radius: 6px;
+        padding: 10px;
+        box-sizing: border-box;
+        resize: vertical;
+      }
+      button {
+        margin-top: 8px;
+        padding: 6px 14px;
+        background: #236d45;
+        color: #fff;
+        border: 1px solid #328456;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      .examples { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; }
+      .examples button {
+        margin: 0;
+        background: #2c333d;
+        border-color: #46515f;
+        font-size: 12px;
+      }
+      table { border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+      th, td { border: 1px solid #303842; padding: 3px 8px; text-align: left; }
+      th { background: #20262e; }
+      pre.err { color: #ffb4b9; white-space: pre-wrap; }
+      .status { color: #8e9bab; margin-top: 12px; }
+      #env { margin-top: 16px; font-size: 12px; color: #a9b5c4; }
+    </style>
+  </head>
+  <body>
+    <h1>Ibex in the browser — WASM spike</h1>
+    <p class="status" id="boot">Loading the interpreter…</p>
+
+    <div class="examples" id="examples"></div>
+    <textarea id="src" spellcheck="false"></textarea>
+    <br />
+    <button id="run" disabled>Run ▶</button>
+
+    <div id="out"></div>
+    <div id="env"></div>
+
+    <script type="module">
+      import createIbex from "../../build-wasm/wasm/ibex.mjs";
+
+      const boot = document.getElementById("boot");
+      const runBtn = document.getElementById("run");
+      const srcEl = document.getElementById("src");
+      const outEl = document.getElementById("out");
+      const envEl = document.getElementById("env");
+
+      const SEED = `import data_gen;
+seed_rng(20240115);
+let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
+let reference = gen_reference("AAPL,MSFT,GOOG,AMZN,NVDA");
+let prices = gen_walk(2000, 100.0, 1.0);`;
+
+      const EXAMPLES = {
+        "Sample data": SEED,
+        "Aggregate by group":
+          "trades[select { avg_price = mean(price), total_volume = sum(volume) }, by symbol];",
+        "Filter + sort":
+          "trades[filter price > 100, order price desc, head 20];",
+        "Join reference":
+          "trades[select { n = count() }, by symbol]\n  join reference on symbol;",
+      };
+
+      let mod;
+
+      function render(json) {
+        const res = JSON.parse(json);
+        outEl.innerHTML = "";
+        if (res.error) {
+          const pre = document.createElement("pre");
+          pre.className = "err";
+          pre.textContent =
+            res.error + (res.error_line ? ` (line ${res.error_line})` : "");
+          outEl.append(pre);
+        }
+        for (const t of res.results) {
+          const table = document.createElement("table");
+          const head = table.insertRow();
+          for (const c of t.columns) {
+            const th = document.createElement("th");
+            th.textContent = `${c.name}\n${c.type}`;
+            head.append(th);
+          }
+          for (const row of t.rows.slice(0, 50)) {
+            const tr = table.insertRow();
+            for (const v of row) tr.insertCell().textContent = v === null ? "·" : v;
+          }
+          outEl.append(table);
+          if (t.total_rows > Math.min(t.rows.length, 50)) {
+            const p = document.createElement("p");
+            p.className = "status";
+            p.textContent = `${t.total_rows} rows total (showing ${Math.min(
+              t.rows.length,
+              50,
+            )})`;
+            outEl.append(p);
+          }
+        }
+        if (res.scalar !== undefined) {
+          const p = document.createElement("p");
+          p.textContent = `= ${res.scalar}`;
+          outEl.append(p);
+        }
+        const names = (res.environment?.tables ?? [])
+          .map((t) => `${t.name} (${t.rows})`)
+          .join("  ·  ");
+        envEl.textContent = names ? `environment: ${names}` : "";
+      }
+
+      function run() {
+        const t0 = performance.now();
+        const json = mod.execute(srcEl.value);
+        const ms = (performance.now() - t0).toFixed(1);
+        render(json);
+        boot.textContent = `Ran in ${ms} ms — entirely in your browser, no server.`;
+      }
+
+      for (const [label, code] of Object.entries(EXAMPLES)) {
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.onclick = () => {
+          srcEl.value = code;
+        };
+        document.getElementById("examples").append(b);
+      }
+      srcEl.value = SEED;
+
+      createIbex().then((m) => {
+        mod = m;
+        runBtn.disabled = false;
+        runBtn.onclick = run;
+        boot.textContent = "Interpreter ready. Run the sample data first.";
+      });
+    </script>
+  </body>
+</html>

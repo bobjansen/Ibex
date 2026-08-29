@@ -30,7 +30,10 @@ void print(std::FILE* stream, format_string<Args...> pattern, Args&&... args) {
 
 template <typename... Args>
 void print(format_string<Args...> pattern, Args&&... args) {
-    print(stdout, pattern, std::forward<Args>(args)...);
+    // Qualified so argument-dependent lookup cannot pull in `std::print`: the
+    // pattern's type is a `std` alias, and libc++'s <print> (transitively
+    // included by other standard headers) otherwise makes this call ambiguous.
+    ibex::formatting::print(stdout, pattern, std::forward<Args>(args)...);
 }
 
 // Formatting into streams explicitly keeps this surface independent from the

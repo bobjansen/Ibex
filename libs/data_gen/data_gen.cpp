@@ -89,6 +89,12 @@ auto gen_ticks(const runtime::RngBridge& rng, std::int64_t n, const std::string&
     if (!price_steps.empty()) {
         rng.fill_normal(price_steps.data(), rows, 0.0, volatility);
     }
+    // Each symbol gets its own base price so a group-by by symbol shows
+    // distinct levels rather than five samples of one shared walk.
+    std::vector<double> symbol_base(names.size(), start_price);
+    if (!symbol_base.empty()) {
+        rng.fill_uniform(symbol_base.data(), names.size(), start_price * 0.6, start_price * 2.4);
+    }
     std::vector<std::int64_t> volume(rows);
     if (!volume.empty()) {
         rng.fill_int(volume.data(), rows, 1, 10'000);
@@ -117,13 +123,22 @@ auto gen_ticks(const runtime::RngBridge& rng, std::int64_t n, const std::string&
     std::vector<Code> symbol_codes(symbol_idx.begin(), symbol_idx.end());
     Column<Categorical> symbol_col(names, std::move(symbol_codes));
 
-    double price = start_price;
+    // Per-symbol mean-reverting walk. A pure additive walk's variance grows with
+    // the row count, so over the millions of rows this generator targets every
+    // symbol drifts arbitrarily far from its base and the levels reconverge into
+    // noise. The reversion term (pull toward `symbol_base`) keeps each series
+    // fluctuating around its own price.
+    constexpr double kReversion = 0.005;
+    std::vector<double> symbol_price = symbol_base;
     auto ts_ms = static_cast<double>(base_ts_ms);
     for (std::size_t i = 0; i < rows; ++i) {
         ts_ms += gaps_ms[i];
         ts_col.push_back(Timestamp{static_cast<std::int64_t>(ts_ms * 1'000'000.0)});
-        price += price_steps[i];
+        const auto sym = static_cast<std::size_t>(symbol_idx[i]);
+        double price = symbol_price[sym] + price_steps[i] +
+                       kReversion * (symbol_base[sym] - symbol_price[sym]);
         price = std::max(price, 0.01);
+        symbol_price[sym] = price;
         price_col.push_back(price);
         volume_col.push_back(volume[i]);
     }

@@ -15,7 +15,7 @@
   const exampleBar = root.querySelector("[data-pg-examples]");
 
   const SEED = `import data_gen;
-seed_rng(20240115);
+seed_rng(42);
 let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
 let reference = gen_reference("AAPL,MSFT,GOOG,AMZN,NVDA");
 let prices = gen_walk(2000, 100.0, 1.0);`;
@@ -26,6 +26,10 @@ let prices = gen_walk(2000, 100.0, 1.0);`;
     ["Join reference data", "trades[select { trades = count() }, by symbol]\n  join reference on symbol;"],
     ["High / low by symbol", "trades[by symbol, select { hi = max(price), lo = min(price), spread = max(price) - min(price) }];"],
     ["Distinct symbols", "trades[distinct symbol];"],
+    ["Create random trades", `import data_gen;
+
+let trades = gen_ticks(100000, "AAPL,MSFT,GOOG,AMZN,NVDA");
+trades[select { avg_price = mean(price) }, by symbol]`]
   ];
 
   const FIRST_QUERY = EXAMPLES[0][1];

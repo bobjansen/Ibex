@@ -7013,12 +7013,20 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
     if (bound) {
         return std::nullopt;
     }
-    if (!columns.has_value()) {
-        std::vector<std::string_view> names;
-        names.reserve(chunk.columns.size());
-        for (const ColumnEntry& column : chunk.columns) {
-            names.push_back(column.name);
-        }
+    std::vector<std::string_view> names;
+    names.reserve(chunk.columns.size());
+    for (const ColumnEntry& column : chunk.columns) {
+        names.push_back(column.name);
+    }
+    const bool concrete_layout_matches_plan =
+        columns.has_value() && columns->input_names.size() == names.size() &&
+        std::ranges::equal(columns->input_names, names);
+    if (!concrete_layout_matches_plan) {
+        // Logical schema inference may know every source column while the
+        // physical child emits a narrower layout. A pushed-down filter, for
+        // example, can consume its predicate-only column inside a lazy scan and
+        // omit it from the chunks delivered to this breaker. Bind that actual
+        // boundary once; all row loops remain positional.
         auto resolved = physical::resolve_aggregate_columns(group_by, aggregations, names);
         if (!resolved.has_value()) {
             return std::move(resolved.error());
@@ -7045,7 +7053,18 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
         }
         if (!index.has_value() || *index >= chunk.columns.size() ||
             chunk.columns[*index].name != aggregations[i].column.name) {
-            return "aggregate input column mapping does not match concrete input";
+            std::string detail = "aggregate input column mapping does not match concrete input: expected '" +
+                                 aggregations[i].column.name + "'";
+            if (index.has_value()) {
+                detail += " at position " + std::to_string(*index);
+                if (*index < chunk.columns.size()) {
+                    detail += ", found '" + chunk.columns[*index].name + "'";
+                } else {
+                    detail += ", but the input has only " + std::to_string(chunk.columns.size()) +
+                              " columns";
+                }
+            }
+            return detail;
         }
     }
     bound = true;

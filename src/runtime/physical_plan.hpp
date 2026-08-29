@@ -215,6 +215,11 @@ enum class AggregateStrategy : std::uint8_t {
 /// child. Logical names stop at this boundary; execution phases share these
 /// positions.
 struct AggregateColumnMapping {
+    /// Ordered child layout against which the positions below were resolved.
+    /// A lazy physical source may legitimately project predicate-only columns
+    /// away after logical schema inference; the executor detects that boundary
+    /// change once and re-resolves the positions against the concrete chunk.
+    std::vector<std::string> input_names;
     std::vector<std::size_t> group_by;
     /// Count consumes rows rather than an input column, so its entry is
     /// nullopt. Every other aggregate carries its input column position.

@@ -22,8 +22,8 @@
 #include <variant>
 #include <vector>
 
-#include "interpreter_internal.hpp"
 #include "execution_profile_internal.hpp"
+#include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
 
 namespace {
@@ -1283,8 +1283,7 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         const auto& nodes = *plan.hash_aggregate;
         REQUIRE(nodes.discovery.source == tree->children().front().get());
         REQUIRE(nodes.discovery.input == runtime::physical::AggregateDataKind::InputChunks);
-        REQUIRE(nodes.discovery.output ==
-                runtime::physical::AggregateDataKind::DiscoveredGroups);
+        REQUIRE(nodes.discovery.output == runtime::physical::AggregateDataKind::DiscoveredGroups);
         REQUIRE(nodes.accumulation.input == nodes.discovery.output);
         REQUIRE(nodes.accumulation.output ==
                 runtime::physical::AggregateDataKind::AccumulatedGroups);
@@ -1332,8 +1331,9 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         REQUIRE(text.find("Emission:") != std::string::npos);
         REQUIRE(text.find("Discovery -> Accumulation -> FinalOrdering -> Emission") !=
                 std::string::npos);
-        REQUIRE(text.find("InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> "
-                          "OutputChunks") != std::string::npos);
+        REQUIRE(
+            text.find("InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> "
+                      "OutputChunks") != std::string::npos);
         REQUIRE(text.find("radix-hash") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
     }
@@ -1346,8 +1346,7 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
                                    &plan.hash_aggregate->accumulation.parallelism,
                                    &plan.hash_aggregate->final_ordering.parallelism,
                                    &plan.hash_aggregate->emission.parallelism}) {
-            REQUIRE(policy->estimate.source ==
-                    runtime::physical::RowEstimate::Source::TableExact);
+            REQUIRE(policy->estimate.source == runtime::physical::RowEstimate::Source::TableExact);
             REQUIRE(policy->estimate.rows == 3);
         }
         const std::string text = runtime::physical::explain_physical(plan);
@@ -1452,10 +1451,8 @@ TEST_CASE("Physical HashBuild and HashProbe consume the resolved join column map
         const auto result = execute_physical_plan(plan, *tree, registry, serial);
         REQUIRE(result.has_value());
         REQUIRE(result->rows() == s->rows());
-        const auto& rebound_left_ids =
-            std::get<Column<std::int64_t>>(*result->find("left_id"));
-        const auto& rebound_right_ids =
-            std::get<Column<std::int64_t>>(*result->find("right_id"));
+        const auto& rebound_left_ids = std::get<Column<std::int64_t>>(*result->find("left_id"));
+        const auto& rebound_right_ids = std::get<Column<std::int64_t>>(*result->find("right_id"));
         CHECK(rebound_left_ids[0] == left_ids[0]);
         CHECK(rebound_left_ids[1] == left_ids[1]);
         CHECK(rebound_right_ids[0] == right_ids[0]);
@@ -1535,8 +1532,8 @@ TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations"
         const auto rows = profile->snapshot();
         for (const std::string_view label : {"Aggregate.Discovery", "Aggregate.Accumulation",
                                              "Aggregate.FinalOrdering", "Aggregate.Emission"}) {
-            const auto phase = std::ranges::find_if(
-                rows, [&](const auto& row) { return row.label == label; });
+            const auto phase =
+                std::ranges::find_if(rows, [&](const auto& row) { return row.label == label; });
             REQUIRE(phase != rows.end());
             CHECK(phase->next_self_ns > 0);
         }

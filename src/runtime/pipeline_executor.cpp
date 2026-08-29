@@ -49,7 +49,6 @@
 #include "physical_executor_internal.hpp"
 #include "runtime_internal.hpp"
 
-
 namespace ibex::runtime::pipeline_executor_detail {
 
 struct ChunkIdentity {
@@ -138,7 +137,6 @@ class SerialMorselOrderValidator final : public Operator {
 };
 
 }  // namespace pipeline_executor_detail
-
 
 namespace pipeline_executor_detail {
 

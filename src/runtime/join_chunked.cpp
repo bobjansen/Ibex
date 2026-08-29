@@ -66,8 +66,8 @@
 #include "chunk_conversion_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
-#include "join_internal.hpp"
 #include "join_chunked_internal.hpp"
+#include "join_internal.hpp"
 #include "kernel_filter.hpp"
 #include "kernel_types.hpp"
 #include "kernel_update.hpp"
@@ -720,8 +720,8 @@ struct JoinProbe {
         }
         const auto left_names = table_column_names(left_side);
         const auto right_names = table_column_names(*right_);
-        auto concrete = ir::resolve_join_columns(ir::JoinKind::Inner, *keys_, left_names,
-                                                 right_names, suffix_);
+        auto concrete =
+            ir::resolve_join_columns(ir::JoinKind::Inner, *keys_, left_names, right_names, suffix_);
         if (!concrete.has_value()) {
             return std::unexpected(std::move(concrete.error()));
         }
@@ -1711,15 +1711,15 @@ class JoinProbeOperator final : public Operator {
 auto make_probe_factory(JoinProbe probe) -> JoinProbeFactory {
     const ExecutionContext* exec = probe.exec_;
     auto state = std::make_shared<JoinProbe>(std::move(probe));
-    return JoinProbeFactory{
-        [state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
-            return std::make_unique<JoinProbeOperator>(std::move(child), *state, preserve_empty);
-        },
-        [state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
-            return std::make_unique<JoinProbeOperator>(std::move(child), std::move(*state),
-                                                       preserve_empty);
-        },
-        exec};
+    return JoinProbeFactory{[state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
+                                return std::make_unique<JoinProbeOperator>(std::move(child), *state,
+                                                                           preserve_empty);
+                            },
+                            [state](OperatorPtr child, bool preserve_empty) -> OperatorPtr {
+                                return std::make_unique<JoinProbeOperator>(
+                                    std::move(child), std::move(*state), preserve_empty);
+                            },
+                            exec};
 }
 
 /// The runtime value carried by the physical HashBuild -> HashProbe edge.
@@ -2783,7 +2783,6 @@ auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPt
         std::make_unique<PrecomputedHashProbeOperator>(std::move(precomputed.output))};
 }
 
-
 }  // namespace
 
 auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
@@ -2791,14 +2790,15 @@ auto deferred_probe_scan_of(const ir::Node& right, const ExecutionContext& exec)
     return deferred_probe_scan_impl(right, exec);
 }
 
-auto make_chunked_inner_join_operator(
-    OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-    const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
-    const std::vector<ir::OrderKey>* pending_order, physical::JoinParallelism parallelism,
-    std::optional<ir::JoinColumnMapping> columns) -> OperatorPtr {
-    return std::make_unique<ChunkedInnerJoinOperator>(
-        std::move(left), std::move(right), keys, exec, std::move(suffix), pending_order,
-        parallelism, std::move(columns));
+auto make_chunked_inner_join_operator(OperatorPtr left, Table right,
+                                      const std::vector<ir::JoinKey>* keys,
+                                      const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
+                                      const std::vector<ir::OrderKey>* pending_order,
+                                      physical::JoinParallelism parallelism,
+                                      std::optional<ir::JoinColumnMapping> columns) -> OperatorPtr {
+    return std::make_unique<ChunkedInnerJoinOperator>(std::move(left), std::move(right), keys, exec,
+                                                      std::move(suffix), pending_order, parallelism,
+                                                      std::move(columns));
 }
 
 namespace {
@@ -2840,19 +2840,17 @@ auto make_scheduled_deferred_inner_join_operator(
     -> std::expected<OperatorPtr, std::string> {
     return finish_scheduled_join(std::make_unique<ChunkedInnerJoinOperator>(
         std::move(left), right_node, registry, scalars, externs, exec, keys, probe,
-        std::move(probe_name), std::move(suffix), pending_order, parallelism,
-        std::move(columns)));
+        std::move(probe_name), std::move(suffix), pending_order, parallelism, std::move(columns)));
 }
 
-auto take_fusible_join_probe(OperatorPtr left, Table right,
-                             const std::vector<ir::JoinKey>* keys,
+auto take_fusible_join_probe(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix,
                              const std::vector<ir::OrderKey>* pending_order,
                              physical::JoinParallelism parallelism)
     -> std::expected<std::optional<FusibleJoinProbe>, std::string> {
-    auto op = std::make_unique<ChunkedInnerJoinOperator>(
-        std::move(left), std::move(right), keys, exec, std::move(suffix), pending_order,
-        parallelism);
+    auto op =
+        std::make_unique<ChunkedInnerJoinOperator>(std::move(left), std::move(right), keys, exec,
+                                                   std::move(suffix), pending_order, parallelism);
     if (auto err = op->run_build()) {
         return std::unexpected(std::move(*err));
     }

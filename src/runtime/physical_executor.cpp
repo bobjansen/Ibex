@@ -6,10 +6,9 @@
 namespace ibex::runtime {
 
 auto build_migrated_physical_operator(const physical::Plan& plan, const ir::Node& node,
-                                      const TableRegistry& registry,
-                                      const ScalarRegistry* scalars,
-                                      const ExternRegistry* externs,
-                                      const ExecutionContext& exec, ModelResult* model_out)
+                                      const TableRegistry& registry, const ScalarRegistry* scalars,
+                                      const ExternRegistry* externs, const ExecutionContext& exec,
+                                      ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
     if (!plan.migrated) {
         return std::unexpected("physical executor: plan does not migrate its root");

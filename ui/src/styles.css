@@ -64,17 +64,38 @@ aside header button {
 }
 .binding div {
   display: flex;
+  align-items: center;
 }
-.binding button {
-  margin-left: auto;
+.binding div button {
   padding: 0 5px;
   border: 0;
   background: transparent;
 }
-.binding small,
-.binding span {
+.binding div button:last-child {
+  margin-left: auto;
+}
+.binding-name {
+  font-weight: bold;
+}
+.binding-name:hover,
+.binding-column:hover {
+  color: #fff;
+  background: #2c333d;
+}
+.binding small {
   display: block;
   color: #a9b5c4;
+  font-size: 12px;
+}
+.binding-column {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-radius: 2px;
+  padding: 2px 4px;
+  text-align: left;
+  color: #a9b5c4;
+  background: transparent;
   font-size: 12px;
 }
 .binding i {
@@ -201,9 +222,81 @@ kbd {
   color: #ffb4b9;
   border-bottom: 1px solid #7d3740;
 }
+.error-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.error-head button {
+  background: #5b2a30;
+  border-color: #7d3740;
+  color: inherit;
+  font-variant-numeric: tabular-nums;
+}
 .error pre {
   margin: 4px 0 0;
   white-space: pre-wrap;
+}
+.cheatsheet-card {
+  display: flex;
+  flex-direction: column;
+  max-width: 640px;
+  max-height: 80vh;
+  margin: 16px;
+  background: #1b2027;
+  border: 1px solid #46515f;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cheatsheet-card header {
+  justify-content: space-between;
+}
+.cheatsheet-intro,
+.cheatsheet-more {
+  margin: 0;
+  padding: 10px 16px;
+  color: #a9b5c4;
+  font-size: 12px;
+}
+.cheatsheet-card dl {
+  margin: 0;
+  padding: 4px 8px 12px;
+  overflow: auto;
+}
+.cheatsheet-entry {
+  padding: 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cheatsheet-entry:hover {
+  background: #232a33;
+}
+.cheatsheet-entry dt {
+  color: #d8dee9;
+  font-weight: bold;
+}
+.cheatsheet-entry dd {
+  margin: 4px 0 0;
+}
+.cheatsheet-entry pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: #12151a;
+  border-radius: 3px;
+  color: #cbd4e1;
+  white-space: pre-wrap;
+}
+.cheatsheet-entry dd span {
+  display: block;
+  margin-top: 4px;
+  color: #8e9bab;
+  font-size: 12px;
+}
+.cheatsheet-more code,
+.cheatsheet-intro code {
+  padding: 1px 4px;
+  background: #2c333d;
+  border-radius: 3px;
 }
 .output-pane {
   min-height: 0;

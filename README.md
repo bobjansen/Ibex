@@ -32,10 +32,11 @@ $env:IBEX_LIBRARY_PATH = "$PWD/plugins"
 .\bin\ibex.exe ui --data-dir .
 ```
 
-Add `--demo` to either command to seed synthetic `trades`, `reference`
-(per-symbol master data), `prices`, and `samples` tables into every session
-(via the bundled `data_gen` plugin), so you can run queries immediately
-without supplying any data.
+To try queries without supplying data, load synthetic `trades`, `reference`
+(per-symbol master data), `prices`, and `samples` tables — either with the
+**Load sample data** button in the UI, or by adding `--demo` to the command
+above to seed them into every session automatically. Both use the bundled
+`data_gen` plugin.
 
 Open the printed `http://127.0.0.1:8765` address in a browser. The UI assets
 are bundled at `bin/ui`; Node.js is only needed when building Ibex from source.

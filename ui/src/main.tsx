@@ -423,6 +423,7 @@ function App() {
   const [files, setFiles] = useState<FileListing>();
   const [filesError, setFilesError] = useState<string>();
   const [demo, setDemo] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
   const [showWelcome, setShowWelcome] = useState(() => !welcomeDismissed());
   const [showCheatsheet, setShowCheatsheet] = useState(false);
   const runRef = useRef<() => void>(() => {});
@@ -449,6 +450,30 @@ function App() {
     if (!example) return;
     setSource(example.source);
     editorRef.current?.focus();
+  }, []);
+
+  const loadDemo = useCallback(async () => {
+    setDemoLoading(true);
+    setError(undefined);
+    try {
+      const response = await api<Environment>("/api/v1/demo", {
+        method: "POST",
+      });
+      setEnvironment(response.tables);
+      setDemo(true);
+    } catch (cause) {
+      const raw =
+        cause instanceof Error ? cause.message : "Could not load sample data";
+      let message = raw;
+      try {
+        message = (JSON.parse(raw) as { error?: string }).error ?? raw;
+      } catch {
+        // Not JSON; use the raw text.
+      }
+      setError(message);
+    } finally {
+      setDemoLoading(false);
+    }
   }, []);
 
   const refreshFiles = useCallback(async (path = "") => {
@@ -779,6 +804,15 @@ function App() {
           <strong>Environment</strong>
           <button onClick={() => void refreshEnvironment()}>↻</button>
         </header>
+        {!demo && (
+          <button
+            className="load-demo"
+            disabled={demoLoading}
+            onClick={() => void loadDemo()}
+          >
+            {demoLoading ? "Loading…" : "＋ Load sample data"}
+          </button>
+        )}
         {environment.map((table) => (
           <section className="binding" key={table.name}>
             <div>
@@ -1042,22 +1076,36 @@ function App() {
                 </>
               ) : (
                 <>
-                  A tiny built-in <code>trades</code> table is available. Open a
-                  data file from the Files panel, or restart with{" "}
-                  <code>ibex ui --demo</code> for larger sample tables that the{" "}
-                  <em>Examples</em> menu is written against.
+                  Load the sample tables (<code>trades</code>,{" "}
+                  <code>reference</code>, <code>prices</code>,{" "}
+                  <code>samples</code>) that the <em>Examples</em> menu is
+                  written against, or open a data file from the Files panel.
                 </>
               )}
             </p>
-            <button
-              className="run"
-              onClick={() => {
-                dismissWelcome();
-                setShowWelcome(false);
-              }}
-            >
-              Get started
-            </button>
+            <div className="welcome-actions">
+              {!demo && (
+                <button
+                  disabled={demoLoading}
+                  onClick={() => {
+                    void loadDemo();
+                    dismissWelcome();
+                    setShowWelcome(false);
+                  }}
+                >
+                  {demoLoading ? "Loading…" : "Load sample data"}
+                </button>
+              )}
+              <button
+                className="run"
+                onClick={() => {
+                  dismissWelcome();
+                  setShowWelcome(false);
+                }}
+              >
+                Get started
+              </button>
+            </div>
           </div>
         </div>
       )}

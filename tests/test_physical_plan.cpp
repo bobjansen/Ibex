@@ -947,11 +947,11 @@ TEST_CASE("The plan describes the distinct dedup fan-out phase", "[physical][bre
         REQUIRE(phase.parallelism.worker_cap == 0);
     }
 
-    SECTION("a bare registered scan gets a footer row estimate") {
+    SECTION("a bare registered scan gets an exact table row estimate") {
         const auto [tree, plan] = serial_plan("trades[distinct { price }];");
         REQUIRE(plan.breaker_phases.size() == 1);
         const auto& est = plan.breaker_phases.front().parallelism.estimate;
-        REQUIRE(est.source == runtime::physical::RowEstimate::Source::Footer);
+        REQUIRE(est.source == runtime::physical::RowEstimate::Source::TableExact);
         REQUIRE(est.rows == 3);
     }
 
@@ -1183,6 +1183,19 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
         REQUIRE(text.find("probe:") != std::string::npos);
         REQUIRE(text.find("head-table") != std::string::npos);
         REQUIRE(text.find("MapPipeline") == std::string::npos);
+    }
+
+    SECTION("a registered scan gives both phases its exact input-row bound") {
+        const auto [tree, plan] =
+            serial_plan("trades[select { total = sum(price) }, by { symbol }];");
+        REQUIRE(plan.breaker_phases.size() == 2);
+        for (const auto& phase : plan.breaker_phases) {
+            REQUIRE(phase.parallelism.estimate.source ==
+                    runtime::physical::RowEstimate::Source::TableExact);
+            REQUIRE(phase.parallelism.estimate.rows == 3);
+        }
+        const std::string text = runtime::physical::explain_physical(plan);
+        REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
     }
 
     SECTION("a materializing join carries no fan-out phases") {

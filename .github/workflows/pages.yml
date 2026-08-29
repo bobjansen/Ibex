@@ -21,6 +21,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # ── Build the interactive playground (Ibex interpreter -> WebAssembly) ──
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.69
+          actions-cache-folder: emsdk-cache
+
+      - name: Cache ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: pages-wasm
+
+      - name: Build ibex_wasm
+        run: |
+          emcmake cmake -S . -B build-wasm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build-wasm --target ibex_wasm
+
+      - name: Stage playground artifacts
+        run: |
+          mkdir -p docs/playground
+          cp build-wasm/wasm/ibex.mjs build-wasm/wasm/ibex.wasm docs/playground/
+          ls -l docs/playground
+
       - name: Configure Pages
         uses: actions/configure-pages@v6
 

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ibex | Playground</title>
+  <meta name="description" content="Run Ibex in your browser — the real interpreter compiled to WebAssembly, no install, no server." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<main class="page">
+  <nav class="nav">
+    <a class="nav-logo" href="./index.html">Ibex</a>
+    <div class="nav-links">
+      <a class="nav-link" href="./index.html">Home</a>
+      <a class="nav-link" href="./docs.html">Docs</a>
+      <a class="nav-link" href="./examples.html">Examples</a>
+      <a class="nav-link active" href="./playground.html">Playground</a>
+      <a class="nav-link" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </div>
+  </nav>
+
+  <header class="docs-header">
+    <p class="eyebrow">Playground</p>
+    <h1>Run Ibex in your browser.</h1>
+    <p class="lead">
+      The real interpreter, compiled to WebAssembly — no install, no server, nothing
+      leaves your machine. Five sample tables are generated on load; edit a query and
+      press <kbd>⌘</kbd>/<kbd>Ctrl</kbd> + <kbd>Enter</kbd>.
+    </p>
+  </header>
+
+  <section class="playground" data-playground>
+    <div class="pg-examples" data-pg-examples></div>
+
+    <div class="pg-grid">
+      <div class="pg-editor-pane">
+        <textarea
+          class="pg-editor"
+          data-pg-editor
+          spellcheck="false"
+          autocapitalize="off"
+          autocomplete="off"
+          aria-label="Ibex query"
+        ></textarea>
+        <div class="pg-actions">
+          <button type="button" class="button primary" data-pg-run>Run ▶</button>
+          <button type="button" class="button" data-pg-reset>Reset session</button>
+          <span class="pg-status" data-pg-status>Loading…</span>
+        </div>
+      </div>
+
+      <div class="pg-result-pane">
+        <div class="pg-env" data-pg-env></div>
+        <div class="pg-output" data-pg-output></div>
+      </div>
+    </div>
+
+    <p class="repl-caption">
+      Runs single-threaded on the loaded slice of each result. For the full performance
+      story — 10M rows in ~600&nbsp;ms across cores — see the
+      <a href="./benchmarks.html">benchmarks</a>. Source for this build lives in
+      <a href="https://github.com/bobjansen/Ibex/tree/main/wasm" target="_blank" rel="noopener">wasm/</a>.
+    </p>
+  </section>
+</main>
+<script src="./playground.js" defer></script>
+</body>
+</html>

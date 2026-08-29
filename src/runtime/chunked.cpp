@@ -15112,10 +15112,10 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // stage in that shape buys no overlap and only creates a thread.
         // A join below it is staged instead: its probe stream can fill the
         // aggregate while it keeps pulling the next probe chunk.
-        // The plan describes the hash fallback's two fan-out phases; resolve
-        // them here, where the ExecutionContext is in hand, and hand them down.
-        // Observability only (slice 1): the operator still decides for itself
-        // and `check_agg_plan` aborts on disagreement.
+        // Resolve the hash fallback's two planned fan-out policies here, where
+        // the ExecutionContext is in hand, and hand them down. The operator
+        // retains only data-dependent gates such as actual row counts and
+        // strategy-specific usefulness thresholds.
         return std::make_unique<ChunkedSortedAggregateOperator>(
             std::move(child_op.value()), &agg.group_by(), &agg.aggregations(), exec,
             std::move(*parallelism), ap.columns);

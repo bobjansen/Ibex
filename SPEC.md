@@ -3152,6 +3152,11 @@ than an exact-match type.
 - `DataFrame<{ departmentId: Int, salary: Int }>` requires both columns; other
   columns remain permitted.
 
+Only the declared fields are statically nameable inside the function. Permitted
+extra columns pass through unchanged, but the function cannot reference one by
+name unless it adds that column to its parameter schema. The open remainder is
+a validation allowance, not a source of dynamically discoverable column names.
+
 This contract is checked at **call time**. A missing required column, or a
 required column with the wrong type, is a call-time error that names the
 parameter and the offending column. The same contract applies to a function's

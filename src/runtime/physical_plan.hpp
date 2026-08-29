@@ -202,8 +202,9 @@ enum class AggregateStrategy : std::uint8_t {
     /// Checked first, because it consumes the join rather than reading its
     /// output.
     FusedLeftJoinCount,
-    /// Streamed group-at-a-time; falls back to hashing internally when the
-    /// child's chunks do not arrive sorted on the group keys.
+    /// Adaptive streamable aggregate: group-at-a-time when the child's chunks
+    /// arrive sorted on the group keys, hash aggregation otherwise. The enum
+    /// name predates the hash fallback becoming the common generated-data path.
     StreamingSorted,
     /// Median and Quantile need every value at once, Ewma is row-order
     /// coupled: the whole input is materialized.
@@ -318,8 +319,9 @@ struct BreakerParallelism {
 };
 
 /// A breaker is one or more named phases, each with a fan-out point. Distinct /
-/// Order / TopK have one; a decomposed Join has two (hash-build, probe); a
-/// decomposed Aggregate has three (discovery, accumulate, finalize).
+/// Order / TopK have one; Join has two (hash-build, probe); Aggregate currently
+/// has two policy phases (partition, finalize). Its eventual structural split
+/// will name discovery, accumulation, final ordering, and emission separately.
 struct BreakerPhase {
     std::string_view name;
     BreakerParallelism parallelism;
@@ -409,8 +411,8 @@ struct StreamingJoinNodes {
 /// - `partition` — the histogram → prefix-sum → scatter → per-partition
 ///   accumulate region shared by `try_discover_partitioned` (radix-hash) and
 ///   `try_owned` (partition-owned key maps). Discovery and accumulation are one
-///   `pool.submit` here, not two; the spec's separate "discovery" / "accumulate"
-///   phases appear only once that region is actually decomposed (Phase 5).
+///   `pool.submit` here, not two; the plan's separate "discovery" / "accumulate"
+///   phases appear only once that region is actually decomposed (Phase 4).
 ///   `row_floor` is the *lower* admission floor (65536, `try_owned`'s
 ///   `kPairOwnedMinRows`); the radix path's stricter 262144
 ///   (`kDefaultPartitionMinRows`) is a strategy-internal detail slice 2 folds in.

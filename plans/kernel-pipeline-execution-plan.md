@@ -167,11 +167,13 @@ scheduled or measured separately.
      serial/parallel structural equality.
 3. **Phase 4 aggregate decomposition** — discovery / per-partition slots / final
    ordering / emission as phases. **Determinism blocker cleared 2026-08-27**
-   (guard test landed). The observability slice and both authority slices are
-   LANDED: partition and finalize phases appear in `explain physical`,
-   `check_agg_plan` detects disagreement, and all current aggregate fan-out
-   gates read the resolved plan policy. What remains is an actual split into
-   independently scheduled/buildable phases.
+   (guard test landed). The preflight is complete: partition and finalize
+   policies appear in `explain physical`; all current aggregate fan-out gates
+   read the resolved plan policy; `AggregateColumnMapping` binds known schemas
+   during planning and lazy/open schemas once at execution; and physical-plan
+   mutation tests prove mapped positions, phase order, and worker ceilings are
+   consumed or rejected. What remains is the actual split into independently
+   scheduled/buildable phases.
 4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
    single-operator shape as Order/Head: `plan_physical` marks each migrated,
    `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
@@ -426,8 +428,11 @@ at all (a one-valued strategy enum would be ceremony).
    physical planner, lazy/unknown schemas bind once at the concrete barrier,
    and probe kernels no longer look columns up by textual key per chunk. NOT
    blocked on a cost model.
-2. **Hash aggregate** — construction and fan-out authority DONE; phase
-   decomposition has not started. The former determinism blocker is resolved.
+2. **Hash aggregate** — construction, positional column binding, fan-out
+   authority, and physical-plan mutation coverage DONE; phase decomposition has
+   not started. The former determinism blocker is resolved. `StreamingSorted`
+   is the historical name for an adaptive strategy: sorted group-at-a-time when
+   possible, hash fallback otherwise (including ordinary generated tables).
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
    `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
    family and Distinct/Order now leave the per-kind switch.
@@ -466,7 +471,8 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
 3. Split aggregate execution at its existing ownership boundaries — discovery /
    partition accumulation / final ordering / emission — first with serial
    orchestration and plan-shape/accounting tests, then admit fan-out one phase
-   at a time with byte-identity checks.
+   at a time with byte-identity checks. Preconditions are complete: positional
+   inputs, authoritative fan-out policy, and an executor mutation seam.
 4. Add per-phase scheduling accounting only after steps 2–3 provide stable
    pipeline identities. Keep DOP/memory budgeting blocked unless those changes
    produce measured queue contention or a multi-producer consumer.

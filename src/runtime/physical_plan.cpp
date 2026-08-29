@@ -554,9 +554,6 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         return plan;
     }
     if (root.kind() == ir::NodeKind::Aggregate) {
-        // Described, not executed: `migrated` stays false and the per-kind
-        // switch still builds every aggregate. The description is proven equal
-        // to the builder's branches first, exactly as the join's was.
         const auto& aggregate = ir::node_cast<ir::AggregateNode>(root);
         plan.aggregate = plan_aggregate(aggregate);
         // Streaming and fused aggregates are executed by the plan now.
@@ -565,15 +562,10 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (plan.aggregate.strategy != AggregateStrategy::MaterializeAll) {
             plan.migrated = true;
             plan.source_node = &root;
-            // Describe the hash aggregate's fan-out points. Only the streamed
-            // path reaches `ChunkedAggregateOperator` (via
-            // `ChunkedSortedAggregateOperator`'s hash fallback); the fused
-            // left-join count runs whole-table and has no fan-out to describe.
-            // Descriptive only (slice 1): `build_physical_aggregate` does not
-            // read these, the constants still live in `chunked.cpp`, and the
-            // operator aborts via `check_agg_plan` if its own decision ever
-            // disagrees. The authority slices move the decision the way
-            // distinct's and the join's did.
+            // Plan the adaptive streamable aggregate's two current fan-out
+            // policies. `build_physical_aggregate` resolves and consumes both;
+            // the hash fallback uses `partition` and `finalize`. The fused
+            // left-join count is whole-table and has no fan-out to describe.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
                 plan.aggregate.columns = known_aggregate_column_mapping(aggregate, schemas);
                 const RowEstimate input_estimate = table_input_row_estimate(root, registry);

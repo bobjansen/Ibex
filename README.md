@@ -266,7 +266,8 @@ trades[update { (delta, gamma) = compute_greeks(price) }]
 
 User-defined functions can already require a minimum input table schema with
 `DataFrame<{ ... }>` parameter types. Declared columns must exist with the
-right types; extra columns are allowed:
+right types; extra columns are allowed and pass through, but cannot be named in
+the function body unless the parameter schema declares them:
 
 ```
 fn top_two_salaries(df: DataFrame<{ salary: Int64 }>) -> DataFrame effects {} {

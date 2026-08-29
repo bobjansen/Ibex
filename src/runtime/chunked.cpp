@@ -5748,6 +5748,27 @@ class JoinProbeOperator final : public Operator {
     bool emitted_nonempty_ = false;
 };
 
+/// The runtime value carried by the physical HashBuild -> HashProbe edge.
+/// Orientation is represented by the variant alternative, so HashProbe never
+/// re-decides which side was indexed.
+struct StreamingHashProbeInput {
+    OperatorPtr source;
+    std::optional<Table> materialized_source;
+    JoinProbe probe;
+};
+
+struct SwappedHashProbeInput {
+    Table left;
+    JoinProbe probe;
+};
+
+struct PrecomputedHashProbeInput {
+    Table output;
+};
+
+using HashProbeInput =
+    std::variant<StreamingHashProbeInput, SwappedHashProbeInput, PrecomputedHashProbeInput>;
+
 /// How many workers a probe over an already-materialized probe side may fan
 /// out to, or 0 to decline. Defined with the morsel machinery below.
 [[nodiscard]] auto probe_morsel_workers(const Table& input, const ExecutionContext& exec)
@@ -5885,6 +5906,38 @@ class ChunkedInnerJoinOperator final : public Operator {
         }
         initialized_ = true;
         return std::nullopt;
+    }
+
+    /// Move the completed HashBuild result across the physical edge. This is
+    /// deliberately unavailable before `run_build`: HashProbe receives a
+    /// runtime-oriented value, not the mutable coordinator that produced it.
+    [[nodiscard]] auto take_hash_probe_input() -> std::expected<HashProbeInput, std::string> {
+        if (!initialized_) {
+            return std::unexpected("physical HashBuild output requested before the build ran");
+        }
+        if (mode_ == Mode::Precomputed) {
+            return HashProbeInput{
+                PrecomputedHashProbeInput{.output = std::move(precomputed_output_)}};
+        }
+        if (mode_ == Mode::Swapped) {
+            if (!left_table_.has_value()) {
+                return std::unexpected(
+                    "ChunkedInnerJoinOperator: swapped mode without a materialized left table");
+            }
+            SwappedHashProbeInput input{.left = std::move(*left_table_),
+                                        .probe = std::move(probe_)};
+            left_table_.reset();
+            return HashProbeInput{std::move(input)};
+        }
+
+        StreamingHashProbeInput input{.source = std::move(left_),
+                                      .materialized_source = std::move(probe_side_),
+                                      .probe = std::move(probe_)};
+        probe_side_.reset();
+        if (!input.materialized_source.has_value() && input.source == nullptr) {
+            return std::unexpected("physical HashProbe has no probe-side source");
+        }
+        return HashProbeInput{std::move(input)};
     }
 
    private:
@@ -6714,6 +6767,85 @@ class ChunkedInnerJoinOperator final : public Operator {
     // join output during initialization.
     Table precomputed_output_;
 };
+
+/// HashProbe for the runtime BuildLeft orientation. The build has already
+/// produced the immutable index and retained the materialized left side; this
+/// operator only scans the right side through that index and emits once.
+class SwappedHashProbeOperator final : public Operator {
+   public:
+    explicit SwappedHashProbeOperator(SwappedHashProbeInput input)
+        : left_(std::move(input.left)), probe_(std::move(input.probe)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (emitted_) {
+            return std::optional<Chunk>{};
+        }
+        emitted_ = true;
+        auto out = probe_.emit_swapped(left_);
+        if (!out.has_value()) {
+            return std::unexpected(std::move(out.error()));
+        }
+        if (out->rows() == 0) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(*out))};
+    }
+
+   private:
+    Table left_;
+    JoinProbe probe_;
+    bool emitted_ = false;
+};
+
+/// Deferred joins can finish during HashBuild after their dynamic filter has
+/// resolved the probe source. They still cross the same typed edge; HashProbe
+/// simply emits the already-computed result rather than re-running work.
+class PrecomputedHashProbeOperator final : public Operator {
+   public:
+    explicit PrecomputedHashProbeOperator(Table output) : output_(std::move(output)) {}
+
+    [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (emitted_) {
+            return std::optional<Chunk>{};
+        }
+        emitted_ = true;
+        if (output_.rows() == 0) {
+            return std::optional<Chunk>{};
+        }
+        return std::optional<Chunk>{table_to_chunk(std::move(output_))};
+    }
+
+   private:
+    Table output_;
+    bool emitted_ = false;
+};
+
+/// Construct the physical HashProbe from exactly one completed HashBuild
+/// output. There is no orientation branch after this point: the variant chosen
+/// by the build owns the only legal probe implementation for that orientation.
+auto build_hash_probe_operator(HashProbeInput input) -> std::expected<OperatorPtr, std::string> {
+    if (auto* stream = std::get_if<StreamingHashProbeInput>(&input)) {
+        if (stream->materialized_source.has_value() && stream->probe.exec_ != nullptr) {
+            if (const std::size_t workers =
+                    probe_morsel_workers(*stream->materialized_source, *stream->probe.exec_);
+                workers >= 2) {
+                return build_probe_morsel_pipeline(std::move(*stream->materialized_source),
+                                                   stream->probe, workers, *stream->probe.exec_);
+            }
+        }
+        OperatorPtr source = stream->materialized_source.has_value()
+                                 ? make_table_source(std::move(*stream->materialized_source))
+                                 : std::move(stream->source);
+        return OperatorPtr{
+            std::make_unique<JoinProbeOperator>(std::move(source), std::move(stream->probe))};
+    }
+    if (auto* swapped = std::get_if<SwappedHashProbeInput>(&input)) {
+        return OperatorPtr{std::make_unique<SwappedHashProbeOperator>(std::move(*swapped))};
+    }
+    auto& precomputed = std::get<PrecomputedHashProbeInput>(input);
+    return OperatorPtr{
+        std::make_unique<PrecomputedHashProbeOperator>(std::move(precomputed.output))};
+}
 
 /// Streaming hash aggregate. Maintains a `robin_hood` group index and
 /// per-group `AggState` across chunks: each incoming chunk updates the
@@ -14668,15 +14800,31 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 /// the `ExecutionContext` and the pool size, both in hand at build time. One
 /// definition, shared by every join construction site, the way `distinct_table`
 /// and `build_physical_distinct` share the dedup policy.
-auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism {
-    physical::JoinParallelism par{.build = physical::join_hash_build_parallelism(),
-                                  .probe = physical::join_probe_parallelism()};
+auto resolve_join_parallelism(physical::JoinParallelism par, const ExecutionContext& exec)
+    -> physical::JoinParallelism {
     // The pool is sized for decode and spawns its threads on first touch, so a
     // serial query must not construct it just to learn it is serial.
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
     physical::resolve_breaker_parallelism(par.build, exec, pool_size);
     physical::resolve_breaker_parallelism(par.probe, exec, pool_size);
     return par;
+}
+
+/// Compatibility construction sites that do not own a physical Plan still use
+/// the same policy factories. Migrated joins take the overload below instead.
+auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism {
+    return resolve_join_parallelism({.build = physical::join_hash_build_parallelism(),
+                                     .probe = physical::join_probe_parallelism()},
+                                    exec);
+}
+
+/// Resolve the policies carried by the explicit HashBuild and HashProbe nodes.
+/// Taking copies is intentional: resolution is execution-context state and the
+/// data-only physical plan remains reusable and inspectable.
+auto resolved_join_parallelism(const physical::StreamingJoinNodes& nodes,
+                               const ExecutionContext& exec) -> physical::JoinParallelism {
+    return resolve_join_parallelism(
+        {.build = nodes.build.parallelism, .probe = nodes.probe.parallelism}, exec);
 }
 
 /// As `resolved_join_parallelism`, for the hash aggregate. The capability half
@@ -14705,12 +14853,17 @@ auto resolved_aggregate_parallelism(const ExecutionContext& exec)
 auto scheduled_join_build(std::unique_ptr<ChunkedInnerJoinOperator> op)
     -> std::expected<OperatorPtr, std::string> {
     static const bool lazy = std::getenv("IBEX_JOIN_BUILD_LAZY") != nullptr;
-    if (!lazy) {
-        if (auto err = op->run_build()) {
-            return std::unexpected(std::move(*err));
-        }
+    if (lazy) {
+        return OperatorPtr{std::move(op)};
     }
-    return OperatorPtr{std::move(op)};
+    if (auto err = op->run_build()) {
+        return std::unexpected(std::move(*err));
+    }
+    auto probe_input = op->take_hash_probe_input();
+    if (!probe_input.has_value()) {
+        return std::unexpected(std::move(probe_input.error()));
+    }
+    return build_hash_probe_operator(std::move(*probe_input));
 }
 
 auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
@@ -14748,6 +14901,13 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
                                        stage_probe, exec,
                                        execution_profile_entry(exec.execution_profile, node));
     }
+    if (!plan.streaming_join.has_value()) {
+        return std::unexpected("physical join: streaming plan has no HashBuild/HashProbe nodes");
+    }
+    const physical::StreamingJoinNodes& nodes = *plan.streaming_join;
+    if (auto edge_error = physical::validate_streaming_join_edge(nodes)) {
+        return std::unexpected(std::move(*edge_error));
+    }
     // `nulls equal` goes to the materialized join, which implements the
     // policy. These streaming operators hash and probe on their own and
     // would each need the same null tagging; sending the opt-in case to the
@@ -14777,7 +14937,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
                 exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
-                resolved_join_parallelism(exec)));
+                resolved_join_parallelism(nodes, exec)));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14791,7 +14951,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order(), resolved_join_parallelism(exec)));
+            &join.pending_order(), resolved_join_parallelism(nodes, exec)));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }
@@ -14821,7 +14981,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
                 exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
-                resolved_join_parallelism(exec)));
+                resolved_join_parallelism(nodes, exec)));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14835,7 +14995,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order(), resolved_join_parallelism(exec)));
+            &join.pending_order(), resolved_join_parallelism(nodes, exec)));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }

@@ -116,14 +116,11 @@ from the plan — backlog 116→6 breakers, plan describes 97% of real-work node
 Distinct, streaming Join, and streaming Aggregate read resolved fan-out policy
 from the plan).
 
-**The 97% flatters it:** that measures who *constructs* operators, not how they
-are shaped. The operators are unchanged — a join is still one
-`ChunkedInnerJoinOperator`, not explicit physical `HashBuild` and `HashProbe`
-nodes across a barrier; the aggregate is still one operator, not four phases.
-An eligible join probe can now be fused at the head of a morsel map chain, but
-the plan cannot yet schedule or inspect it as a separate physical node, one
-build cannot yet feed several independently represented probes, and aggregate
-phases cannot yet be scheduled or measured separately.
+**The 97% still flatters it:** the streaming inner join is now shaped as
+explicit `HashBuild` and `HashProbe` nodes across a typed runtime-oriented
+barrier, but the aggregate is still one operator, not four phases. Semi/anti
+retains its separate streaming operator, and aggregate phases cannot yet be
+scheduled or measured separately.
 
 ### Next, in order
 
@@ -143,12 +140,12 @@ phases cannot yet be scheduled or measured separately.
    before the row-local map steps; `build_pipeline_from_input` extracts the
    probe side rather than materializing join output first. This preserves the
    intended source → probe → map worker shape, including swapped-mode coverage.
-   It is not yet an explicit `HashProbe` physical-plan node and carries no
-   end-to-end performance claim.
+   `HashProbe` is now also an explicit physical-plan and executor node; this
+   still carries no end-to-end performance claim.
    Preconditions met: build is a scheduled phase (`8cb4e936`), build side is
    jointly owned so N probes share one (`6df9a966`), probe is its own operator
-   (`177b7a93`, `JoinProbeOperator`). The remaining work is to promote this
-   construction-time fusion into an inspectable plan/executor phase.
+   (`177b7a93`, `JoinProbeOperator`). The physical promotion is complete; the
+   opt-in map-chain fusion remains the measured construction described here.
    - **Coverage is the finding.** PDS-H join modes: 28 `Stream`, 12
      `Precomputed`, 11 `Swapped`. `Precomputed`/`Swapped` materialize both sides
      and emit one table — no probe pipeline to give. `Swapped` (a third of
@@ -162,9 +159,12 @@ phases cannot yet be scheduled or measured separately.
      NOT dominate (14% of join self-time, ≤10.5% of any query's wall) —
      retiring the standing "assemble_output dominates" note. So the fusion
      argument is **structural, not performance**.
-   - **Remaining test gap:** retain a focused deferred-probe regression where
-     the resolved right falls under `kStreamRightThreshold`; swapped-mode probe
-     coverage is not the same shape.
+   - **Deferred-probe threshold regression — DONE 2026-08-29.** The focused
+     test starts with a 70k-row deferred right, publishes a build-side
+     membership filter that resolves it to one row, then exercises the
+     below-`kStreamRightThreshold` BuildRight path after the 20k-row left was
+     drained. It asserts filter publication, parallel probe activation, and
+     serial/parallel structural equality.
 3. **Phase 4 aggregate decomposition** — discovery / per-partition slots / final
    ordering / emission as phases. **Determinism blocker cleared 2026-08-27**
    (guard test landed). The observability slice and both authority slices are
@@ -415,8 +415,12 @@ at all (a one-valued strategy enum would be ceremony).
 1. **Hash join** — construction DONE; **data side DONE** (`5918b5cc`, `8a644381`,
    `f6a1a632` — build returns an immutable `JoinHashIndex`; `JoinProbe` consumes
    one via `shared_ptr<const>` so writing build state during a probe is a
-   compile error); **map-pipeline probe fusion DONE**. Explicit physical
-   `HashBuild`/`HashProbe` nodes remain next. NOT blocked on a cost model.
+   compile error); **map-pipeline probe fusion DONE**; **explicit physical
+   `HashBuild`/`HashProbe` DONE 2026-08-29**. The build produces a move-only
+   `HashProbeInput` whose variant fixes Stream / Swapped / Precomputed
+   orientation; the physical probe consumes it, and the temporary coordinator
+   is discarded at the barrier. Semi/anti deliberately retains its separate
+   streaming operator. NOT blocked on a cost model.
 2. **Hash aggregate** — construction and fan-out authority DONE; phase
    decomposition has not started. The former determinism blocker is resolved.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
@@ -440,13 +444,17 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
 
 ### Follow-up sequence
 
-1. Add the focused deferred-probe regression: force a deferred right side to
-   resolve below `kStreamRightThreshold`, then assert serial and parallel
-   byte-identity and that the fused-probe path is reached.
-2. Introduce explicit physical `HashBuild` and `HashProbe` nodes without
-   changing the current algorithm: make build output and probe input explicit,
-   preserve runtime orientation, and mutation-test the streaming and fallback
-   join shapes.
+1. **Deferred-probe threshold regression — DONE 2026-08-29.** Force a deferred
+   right side to resolve below `kStreamRightThreshold`, then assert serial and
+   parallel byte-identity and that the deferred build/probe path is reached.
+2. **Explicit physical `HashBuild` and `HashProbe` nodes — DONE 2026-08-29.**
+   The data-only plan has distinct typed nodes connected by a
+   `RuntimeOrientedBuildOutput` edge; both retain the candidate inputs, and
+   `build_physical_join` consumes their policies. At execution the build moves
+   a Stream / Swapped / Precomputed `HashProbeInput` across that edge and the
+   probe owns all downstream work; the enclosing coordinator is discarded.
+   Edge mutations are rejected by the same validator execution calls, and
+   materializing plus semi/anti shapes carry no inner-join edge.
 3. Split aggregate execution at its existing ownership boundaries — discovery /
    partition accumulation / final ordering / emission — first with serial
    orchestration and plan-shape/accounting tests, then admit fan-out one phase

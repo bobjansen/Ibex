@@ -5,8 +5,8 @@
 Phase 3's handoff/island/raw-thread work is complete, with accounting and
 DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
 authority are done, while true operator decomposition remains open; Phase 5 is
-in progress: fused logical node kinds are retired and the aggregate execution
-family is now outside the monolith. **Compacted
+in progress: fused logical node kinds are retired and the aggregate and
+streaming inner-join execution families are now outside the monolith. **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -28,9 +28,9 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 `src/runtime/chunked.cpp` remains the physical planner, most streaming operator
 implementations, parallel pipelines, pipelined stages, and a large set of
-operator-specific eligibility rules. The aggregate family has moved to
-`aggregate_chunked.cpp`, but the remaining responsibilities are still grown
-together because
+operator-specific eligibility rules. Aggregate and streaming inner join have
+moved to family-owned translation units, but the remaining responsibilities
+are still grown together because
 `build_operator(const ir::Node&)` lowers logical nodes directly into mutable
 `Operator::next()` objects. Three costs: (1) a physical choice has no
 representation ("stream this join", "materialize this aggregate" are builder
@@ -211,13 +211,13 @@ separate streaming operator.
    physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
-5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** The
-   aggregate family is extracted behind one private factory; its hot templates,
-   state, and kernels remain together in `aggregate_chunked.cpp`. The shared
-   packed-key encoder now has one private header for Aggregate and Distinct.
-   Next slice: extract the streaming inner-join family behind its existing
-   build/probe seam, leaving semi/anti and materializing fallbacks in place until
-   their own boundaries are explicit.
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** Aggregate
+   and streaming inner join are extracted behind private factories. Their hot
+   templates, state, and kernels remain together in family-owned translation
+   units; the generic morsel executor sees only a copyable join-probe factory.
+   Semi/anti and materializing joins remain in their existing owners. Next:
+   separate the physical planner and pipeline executor from the residual
+   operator families.
 6. **Sweep process-global plan counters in tests** — one test passed while its
    premise was false (`physical_materialized_calls` is process-wide, other tests
    in the binary bump it). Others may lean the same way.
@@ -467,7 +467,11 @@ at all (a one-valued strategy enum would be ceremony).
    key/output mapping when predicate pushdown or projection pruning narrows a
    concrete child. Matching-layout mutations are rejected rather than hidden by
    rebinding. This fixes the q14/q19 crash where valid key positions masked a
-   stale `JoinOutputColumn::source_index`. NOT blocked on a cost model.
+   stale `JoinOutputColumn::source_index`. **Extraction DONE 2026-08-29:** hash
+   build state, orientation, probe kernels/operators, gather assembly, and
+   deferred-probe resolution live in `join_chunked.cpp`. `chunked.cpp` retains
+   the generic morsel adapter through `JoinProbeFactory`; semi/anti and
+   materializing fallbacks did not move. NOT blocked on a cost model.
 2. **Hash aggregate** — construction, positional column binding, fan-out
    authority, physical-plan mutation coverage, and the four-node structural
    hash-fallback chain DONE. Serial orchestration, the bounded
@@ -489,14 +493,13 @@ at all (a one-valued strategy enum would be ceremony).
    family and Distinct/Order now leave the per-kind switch.
 4. Delete the `chunked.cpp` classes only after the physical path handles every
    supported shape and the fallback is mutation-tested. The aggregate classes
-   are now deleted from `chunked.cpp`; the streaming inner-join family is the
-   next extraction slice.
+   and streaming inner-join classes are now deleted from `chunked.cpp`.
 
 ### Phase 5 — retire the monolith, simplify IR
 
 1. Split by ownership: `physical_planner`, `pipeline_executor`, `kernels/`, one
-   file/family per breaker. **IN PROGRESS:** aggregate family complete; streaming
-   inner join next.
+   file/family per breaker. **IN PROGRESS:** aggregate and streaming inner join
+   complete; physical planner / pipeline executor separation next.
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
@@ -542,9 +545,16 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    Performance: the generated `groupagg,multi,events` A/B classified all nine
    deltas as noise (total −2.33%); a fixed-but-unextracted SF4 baseline versus
    the extracted target classified q01/q13/q22 all the same (geomean +0.3%,
-   byte-identical). Widened q01 alone was also a wash (+1.4%, p=0.478). Next:
-   the streaming inner-join family, with the same fixed-baseline A/B gate before
-   planner/executor separation.
+   byte-identical). Widened q01 alone was also a wash (+1.4%, p=0.478).
+   **Streaming inner join DONE 2026-08-29.** Correctness: all 1,815 non-slow
+   tests, focused physical/join/deferred-probe tests, and SF4 q05/q09/q14/q19/q21
+   pass. The strict GCC runtime build passes. Performance: all four generated
+   join cases classified as noise (total −0.34%); ten join-heavy SF4 queries
+   were byte-identical and a wash (geomean −0.3%, every query under the 2%
+   practical floor). The opt-in `IBEX_PROBE_MORSELS=1` POC retains a
+   pre-existing SF4 q09 stall in both baseline and extracted trees; it remains
+   disabled and is a separate correctness follow-up. Next: physical planner /
+   pipeline executor separation.
 
 ## Acceptance gates (every phase, before the next starts)
 

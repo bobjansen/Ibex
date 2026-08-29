@@ -436,8 +436,8 @@ Every slice:
 - **Not removing the runtime checks.** `on_worker_pool_thread()` and the
   first-chunk floor check are the operator's, permanently.
 - **Not ownership of the remaining `chunked.cpp` split.** This contract enabled
-  Phase 5; Aggregate has now moved, while join/planner/executor extraction is
-  tracked by the kernel-pipeline plan.
+  Phase 5; Aggregate and streaming inner join have now moved, while
+  planner/executor extraction is tracked by the kernel-pipeline plan.
 - **Not a row-count estimator project.** The estimate is opportunistic (footer
   stats, exact child counts). `partition_count = 0 / derive` is the honest
   default and preserves today's behavior exactly.

@@ -120,7 +120,10 @@ auto gen_ticks(const runtime::RngBridge& rng, std::int64_t n, const std::string&
     // join on `symbol` resolve each code once instead of hashing a string per
     // row — several times faster on the large tables this generator produces.
     using Code = Column<Categorical>::code_type;
-    std::vector<Code> symbol_codes(symbol_idx.begin(), symbol_idx.end());
+    std::vector<Code> symbol_codes(rows);
+    for (std::size_t i = 0; i < rows; ++i) {
+        symbol_codes[i] = static_cast<Code>(symbol_idx[i]);  // 0..names.size()-1
+    }
     Column<Categorical> symbol_col(names, std::move(symbol_codes));
 
     // Per-symbol mean-reverting walk. A pure additive walk's variance grows with

@@ -43,6 +43,10 @@
 
 namespace ibex::runtime {
 
+namespace physical {
+struct Plan;
+}
+
 // `invariant_violation` and the gather kernel (`make_gather_column`,
 // `gather_range_into`, `gather_validity_range`) moved down to
 // runtime_internal.hpp, which this includes: `gather_column` lives in that
@@ -1751,6 +1755,14 @@ enum class FloatCleanMode : std::uint8_t {
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string>;
+/// Execute an already-built migrated physical plan. Production's normal
+/// `build_operator` path calls the same implementation after planning; keeping
+/// this seam explicit lets mutation tests prove that executor behavior follows
+/// the plan rather than a reconstructed policy.
+[[nodiscard]] auto build_operator_from_physical_plan(
+    const physical::Plan& plan, const ir::Node& node, const TableRegistry& registry,
+    const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,
+    ModelResult* model_out) -> std::expected<OperatorPtr, std::string>;
 [[nodiscard]] auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string>;
 [[nodiscard]] auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
                                         const std::vector<ir::ColumnRef>& group_by,

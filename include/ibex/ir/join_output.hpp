@@ -63,6 +63,12 @@ struct JoinKeyColumns {
 /// of `ColumnNameMap`: consumers resolve names once, then share this value
 /// instead of independently looking them up or reconstructing output names.
 struct JoinColumnMapping {
+    /// Ordered physical layouts against which every position below was
+    /// resolved. A lazy child can consume predicate-only columns before the
+    /// join boundary; execution detects that change once and re-resolves the
+    /// complete mapping against the concrete tables.
+    std::vector<std::string> left_input_names;
+    std::vector<std::string> right_input_names;
     std::vector<JoinKeyColumns> keys;
     std::vector<JoinOutputColumn> output;
 

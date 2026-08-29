@@ -172,6 +172,14 @@ auto resolve_join_columns(JoinKind kind, const std::vector<JoinKey>& keys,
     }
 
     JoinColumnMapping mapping;
+    mapping.left_input_names.reserve(left_names.size());
+    for (const std::string_view name : left_names) {
+        mapping.left_input_names.emplace_back(name);
+    }
+    mapping.right_input_names.reserve(right_names.size());
+    for (const std::string_view name : right_names) {
+        mapping.right_input_names.emplace_back(name);
+    }
     mapping.output = std::move(*output);
     mapping.keys.reserve(keys.size());
     for (const JoinKey& key : keys) {

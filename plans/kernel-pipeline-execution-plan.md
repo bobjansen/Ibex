@@ -452,9 +452,13 @@ at all (a one-valued strategy enum would be ceremony).
    streaming operator. **Column binding follow-up DONE 2026-08-29:**
    `JoinColumnMapping` resolves mapped left/right keys to positions together
    with the authoritative output plan; known closed schemas bind in the
-   physical planner, lazy/unknown schemas bind once at the concrete barrier,
-   and probe kernels no longer look columns up by textual key per chunk. NOT
-   blocked on a cost model.
+   physical planner, while lazy or layout-dynamic inputs bind once at the
+   concrete barrier; probe kernels no longer look columns up by textual key per
+   chunk. The mapping records both input layouts and re-resolves the complete
+   key/output mapping when predicate pushdown or projection pruning narrows a
+   concrete child. Matching-layout mutations are rejected rather than hidden by
+   rebinding. This fixes the q14/q19 crash where valid key positions masked a
+   stale `JoinOutputColumn::source_index`. NOT blocked on a cost model.
 2. **Hash aggregate** — construction, positional column binding, fan-out
    authority, physical-plan mutation coverage, and the four-node structural
    hash-fallback chain DONE. Serial orchestration, the bounded

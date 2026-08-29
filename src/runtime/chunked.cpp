@@ -4773,14 +4773,27 @@ struct JoinProbe {
         if (right_emit_ready_) {
             return {};
         }
-        if (!columns_.has_value()) {
-            auto mapped =
-                ir::resolve_join_columns(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
-                                         table_column_names(*right_), suffix_);
-            if (!mapped.has_value()) {
-                return std::unexpected(std::move(mapped.error()));
-            }
-            columns_ = std::move(*mapped);
+        const auto left_names = table_column_names(left_side);
+        const auto right_names = table_column_names(*right_);
+        auto concrete = ir::resolve_join_columns(ir::JoinKind::Inner, *keys_, left_names,
+                                                 right_names, suffix_);
+        if (!concrete.has_value()) {
+            return std::unexpected(std::move(concrete.error()));
+        }
+        const bool concrete_layout_matches_plan =
+            columns_.has_value() && columns_->left_input_names.size() == left_names.size() &&
+            columns_->right_input_names.size() == right_names.size() &&
+            std::ranges::equal(columns_->left_input_names, left_names) &&
+            std::ranges::equal(columns_->right_input_names, right_names);
+        if (!concrete_layout_matches_plan) {
+            // A pushed-down predicate may consume a column inside a lazy child
+            // and omit it from the join input. Rebind the complete key/output
+            // mapping at that concrete boundary once; probe and gather loops
+            // remain positional.
+            columns_ = std::move(*concrete);
+        } else if (*columns_ != *concrete) {
+            return std::unexpected(
+                "physical join column mapping does not match its concrete inputs");
         }
         if (columns_->keys.size() != keys_->size()) {
             return std::unexpected("physical join column mapping has the wrong key count");

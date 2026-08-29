@@ -172,7 +172,7 @@ several remaining breaker internals do not.
 |---|---|---|---|
 | **Map chains** (Filter/Project/Rename/row-local Update, fused) | **The physical planner owns it end to end.** `plan.mode` (`Serial`/`MorselParallel`), `parallel_begin`/`parallel_end` (which steps run over morsels), and per-step `MapStep` (capability + kernel factory + column signature). | **Yes, fully.** | Yes. |
 | **Join** | The plan owns the **structure** — `JoinPlan` carries build side + runtime-resolved orientation (`49188c71`) — and **both** fan-out phases: `build_partitions` reads `par_.build`, `probe_parallel_workers` reads `par_.probe` (slices 4–5). What stays in the operator is the kill switch / nesting / per-chunk floor. Output assembly is inside `ChunkedInnerJoinOperator`. | **Yes** (structure + both phases, both authoritative). | Structure + both phases. |
-| **Aggregate** | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, four typed hash-fallback nodes (discovery → accumulation → final ordering → emission), and both current fan-out policies (`partition`, `finalize`). A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass owned kernel explicitly fused; final ordering and emission are separate. Each node has an independent execution-profile row. | **Yes for shape and current policy; policy is not yet one-per-structural-node.** | Strategy + structural chain + both policy phases. |
+| **Aggregate** | The plan owns the adaptive strategy, positional `AggregateColumnMapping`, and four typed hash-fallback nodes (discovery → accumulation → final ordering → emission). Each node carries and authoritatively supplies its own fan-out policy. A serial coordinator invokes every node: discovery transfers one bounded chunk of group IDs/column bindings to accumulation, or marks a one-pass kernel explicitly fused; final ordering and emission are separate. | **Yes, structural and authoritative.** | Strategy + typed chain + all four node policies. |
 | **Distinct** | The plan owns the `dedup` policy (floor, ceiling, packed-key strategy, optional estimate); the builder resolves it and the operator reads it. Nesting, the first concrete chunk's row count, and the derived partition count remain runtime decisions. | **Yes, authoritative.** | Yes. |
 | **Order** | The plan describes one `sort` phase. The actual radix-sort/gather fan-out reads shared `ExecutionContext` knobs in `sort.cpp`, so this phase is descriptive rather than authoritative. | **Yes, descriptive.** | Yes. |
 | **TopK / Head / Tail / FilterHead / FilterTail** | Plan-built serial breaker operators. They have no current fan-out point; TopK deliberately uses a bounded streaming heap rather than a full sort. | **Yes; no parallel policy.** | Serial-by-design reason. |
@@ -181,10 +181,9 @@ several remaining breaker internals do not.
 **There is not yet one owner for every breaker's parallelism.** The physical
 plan owns map chains and the promoted Distinct, Join, and Aggregate policies;
 other breaker internals remain unrepresented and tunable only at their use
-sites. Closing the remaining gap — replacing aggregate's coarser
-partition/finalize policy pair with policy attached to each structural node,
-then scheduling those nodes independently — is
-`kernel-pipeline-execution-plan.md` Phase 4.
+sites. Aggregate's former coarse `partition` / `finalize` records are gone;
+its remaining coordinator is deliberately serial while the work inside each
+typed node may fan out under that node's policy.
 
 ### The split enforced by migrated parallel paths
 
@@ -346,10 +345,9 @@ struct BreakerParallelism {
     RowEstimate   estimate{};
 };
 
-// One breaker = one or more named phases, each with its own fan-out point.
-// Distinct/Order/TopK have one; Join has two (hash-build / probe); Aggregate
-// has structural discovery / accumulation / final-ordering / emission nodes
-// plus the partition + finalize policies used by today's fused kernels.
+// Untyped breakers retain named phases. Join and Aggregate instead carry the
+// same descriptor directly on their typed HashBuild/HashProbe and
+// Discovery/Accumulation/FinalOrdering/Emission nodes.
 struct BreakerPhase {
     std::string_view    name;
     BreakerParallelism  parallelism;
@@ -493,10 +491,8 @@ Every slice:
    onto the plan, byte-identical throughout. The `probe_parallel_workers`
    `on_worker_pool_thread()` veto was measured to fire 0/52 on PDS-H, so folding
    it changed nothing.
-4. **Aggregate** — `AggregatePlan` gains `partition` + `finalize` phases (the
-   two fan-out points `ChunkedAggregateOperator` has today; discovery and
-   accumulate are one `pool.submit`, so they are one phase until that region is
-   actually decomposed in Phase 5). **Determinism blocker cleared (2026-08-27):**
+4. **Aggregate** — four typed structural nodes now own the hash fallback's
+   scheduling policy. **Determinism blocker cleared (2026-08-27):**
    the `try_owned` vs serial re-association divergence recorded below does not
    reproduce on the current tree — the serial probe path, the owned path, and a
    strict-row-order reference all agree bit-for-bit at every thread count
@@ -506,31 +502,22 @@ Every slice:
    `d5928ee2`) reconciled it. Removing `try_owned`'s schedule gate outright was
    also tried and reverted — correctness stayed byte-identical but 1-core q20/q18
    regressed +25%/+40%. The guard test now exists: `tests/test_interpreter.cpp`
-   "two-key grouped aggregate is deterministic across thread counts". Slice 1
-   (observability) LANDED: `aggregate_{partition,finalize}_parallelism`,
-   `plan_physical` fills the phases, and `explain physical` prints them —
-   byte-identical, full suite + q01/q10/q13/q18/q20/q21 at 1c/8c.
-   Slice 2 (partition authority) LANDED: `try_owned` and `try_discover_
-   partitioned` read `par_.partition.{decline,worker_cap}` for fan-out
-   permission and the worker cap; the open-coded `!can_fan_out()` +
-   `min(budget, pool, 64)` are gone from both. The floors stay in the operator
-   — the radix `kDefaultPartitionMinRows` beside its constant, `try_owned`'s
-   lower `kPairOwnedMinRows` as the operator-resolved "owned specialization
-   worth it" gate (like the join's build orientation). Byte-identical vs base
-   on q01/q10/q13/q18/q20/q21, full suite.
+   "two-key grouped aggregate is deterministic across thread counts". The
+   observability and authority migration removed the open-coded
+   `!can_fan_out()` / `min(budget, pool, 64)` decisions while retaining
+   data-derived caps (`part_count`, `total/4096`, `run_count/8192`) and
+   strategy-specific admission floors next to their kernels. Existing
+   `ParallelPipelineStats` partition/finalize counters remain compatibility
+   telemetry; structural execution-profile rows are the per-node proof. The
+   executor mutation seam verifies mapped positions, typed edges, and worker
+   ceilings are consumed rather than reconstructed locally.
 
-   Slice 3 (finalize authority + the async-hot partition gate slice 2 missed)
-   LANDED: `finalize_owned`'s co-ranking merge, the ordered-run merge, the
-   first-occurrence seed pass, and the async-hot cold build read
-   `par_.finalize.{decline,worker_cap}` for their ceiling and permission; the
-   data-derived cap terms (`part_count`, `total/4096`, `run_count/8192`) and the
-   three strategy floors (`1U<<17`, `1U<<16`, `parallel_min_rows`) stay in the
-   operator. `try_async_hot_int_sum` (the q18 path — a fourth `partition`
-   strategy slice 2 did not touch) reads `par_.partition` too now. New
-   `ParallelPipelineStats` counters `parallel_aggregate_partitions` /
-   `parallel_aggregate_finalizes` so a silently-stopped gate is a red test.
-   Byte-identical vs the slice-1 base on q01/q10/q13/q18/q20/q21, full suite
-   1814/1814. **The Aggregate step of "parallelism as a plan decision" is
-   complete.** The executor now has an explicit physical-plan seam; mutation
-   tests alter mapped positions, phase order, and worker ceilings and prove the
-   changed plan is consumed or rejected rather than reconstructed locally.
+   Slice 4 (structural-node authority) LANDED 2026-08-29: the coarse records
+   are removed. Discovery owns radix, owned, and async-hot group discovery;
+   Accumulation owns deterministic private-state morsels (including fused
+   categorical/global kernels) and slot initialization; FinalOrdering owns
+   ordered merges and first-occurrence seeding; Emission owns independent
+   output-column tasks. `explain physical` renders
+   all four policies on their typed nodes. Execution-profile mutation tests
+   prove a one-worker node ceiling suppresses that node's pool work without
+   reconstructing defaults, while preserving byte-identical output.

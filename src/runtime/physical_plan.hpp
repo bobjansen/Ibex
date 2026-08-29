@@ -223,57 +223,6 @@ struct AggregateColumnMapping {
     auto operator==(const AggregateColumnMapping&) const -> bool = default;
 };
 
-/// Values crossing the structural phases of the hash-aggregate fallback.
-/// These are ownership types, not table schemas: each value is internal state
-/// that only the following phase may consume.
-enum class AggregateDataKind : std::uint8_t {
-    None,
-    InputChunks,
-    DiscoveredGroups,
-    AccumulatedGroups,
-    OrderedGroups,
-    OutputChunks,
-};
-
-struct AggregateDiscoveryNode {
-    const ir::Node* source = nullptr;
-    AggregateDataKind input = AggregateDataKind::None;
-    AggregateDataKind output = AggregateDataKind::None;
-};
-
-struct AggregateAccumulationNode {
-    AggregateDataKind input = AggregateDataKind::None;
-    AggregateDataKind output = AggregateDataKind::None;
-};
-
-struct AggregateFinalOrderingNode {
-    AggregateDataKind input = AggregateDataKind::None;
-    AggregateDataKind output = AggregateDataKind::None;
-};
-
-struct AggregateEmissionNode {
-    AggregateDataKind input = AggregateDataKind::None;
-    AggregateDataKind output = AggregateDataKind::None;
-};
-
-/// The hash fallback's structural chain. The current optimized kernels may
-/// fuse work within an edge, but the plan and executor agree on these four
-/// ownership boundaries. Discovery hands Accumulation a bounded per-chunk
-/// transfer (or an explicit fused marker); final ordering and emission have
-/// separate executor entries. The serial coordinator invokes all four nodes;
-/// their current fan-out policies remain the coarser partition/finalize pair.
-struct HashAggregateNodes {
-    AggregateDiscoveryNode discovery;
-    AggregateAccumulationNode accumulation;
-    AggregateFinalOrderingNode final_ordering;
-    AggregateEmissionNode emission;
-};
-
-/// Validate the typed Discovery -> Accumulation -> FinalOrdering -> Emission
-/// chain. Execution calls the same predicate used by mutation tests.
-[[nodiscard]] auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
-    -> std::optional<std::string>;
-
 /// What the plan knows about an `Aggregate` node.
 ///
 /// Every field is RELAYED from the predicates the builder itself calls --
@@ -334,6 +283,8 @@ enum class PartitionStrategy : std::uint8_t {
                 ///< (`PartitionedHeads`), one worker filling each — no merge afterwards
     Range,      ///< a worker per contiguous slice of probe rows, output concatenated in
                 ///< range order (`ChunkedInnerJoinOperator::probe_ranges_parallel`)
+    Morsel,     ///< deterministic row-derived morsels with private reduction state
+    Column,     ///< one independent output column per task
 };
 
 /// A row-count estimate available at plan time, and where it came from. The
@@ -369,10 +320,9 @@ struct BreakerParallelism {
     std::size_t worker_cap = 0;
 };
 
-/// A breaker is one or more named phases, each with a fan-out point. Distinct /
-/// Order / TopK have one; Join has two (hash-build, probe); Aggregate currently
-/// has two policy phases (partition, finalize), alongside four structural nodes
-/// for discovery, accumulation, final ordering, and emission.
+/// An untyped breaker is one or more named phases, each with a fan-out point.
+/// Distinct and Order have one. Join and Aggregate attach policy directly to
+/// their typed structural nodes instead.
 struct BreakerPhase {
     std::string_view name;
     BreakerParallelism parallelism;
@@ -457,29 +407,80 @@ struct StreamingJoinNodes {
 [[nodiscard]] auto validate_streaming_join_edge(const StreamingJoinNodes& nodes)
     -> std::optional<std::string>;
 
-/// A hash aggregate's fan-out points. The operator has two today:
-///
-/// - `partition` — the histogram → prefix-sum → scatter → per-partition
-///   accumulate region shared by `try_discover_partitioned` (radix-hash) and
-///   `try_owned` (partition-owned key maps). Discovery and accumulation are one
-///   `pool.submit` here, not two; the plan's separate "discovery" / "accumulate"
-///   phases appear only once that region is actually decomposed (Phase 4).
-///   `row_floor` is the *lower* admission floor (65536, `try_owned`'s
-///   `kPairOwnedMinRows`); the radix path's stricter 262144
-///   (`kDefaultPartitionMinRows`) is a strategy-internal detail slice 2 folds in.
-/// - `finalize` — the K-way first-occurrence merge (`finalize_owned`'s
-///   co-ranking merge, the ordered-run finalize, the non-owned first-row seed
-///   pass). `row_floor` 131072 (`1U << 17U`).
-[[nodiscard]] auto aggregate_partition_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
-[[nodiscard]] auto aggregate_finalize_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
+/// Capability policies for the four structural hash-aggregate nodes. Runtime
+/// data still selects specialized kernels and deterministic partition counts;
+/// these values own fan-out permission and worker ceilings.
+[[nodiscard]] auto aggregate_discovery_parallelism(RowEstimate estimate = {})
+    -> BreakerParallelism;
+[[nodiscard]] auto aggregate_accumulation_parallelism(RowEstimate estimate = {})
+    -> BreakerParallelism;
+[[nodiscard]] auto aggregate_final_ordering_parallelism(RowEstimate estimate = {})
+    -> BreakerParallelism;
+[[nodiscard]] auto aggregate_emission_parallelism(RowEstimate estimate = {})
+    -> BreakerParallelism;
 
 /// Both fan-out phases of a hash aggregate, resolved together — what
 /// `build_physical_aggregate` hands the operator. Bundled like `JoinParallelism`
 /// so the two cannot be passed in the wrong order.
 struct AggregateParallelism {
-    BreakerParallelism partition;
-    BreakerParallelism finalize;
+    BreakerParallelism discovery;
+    BreakerParallelism accumulation;
+    BreakerParallelism final_ordering;
+    BreakerParallelism emission;
 };
+
+/// Values crossing the structural phases of the hash-aggregate fallback.
+/// These are ownership types, not table schemas: each value is internal state
+/// that only the following phase may consume.
+enum class AggregateDataKind : std::uint8_t {
+    None,
+    InputChunks,
+    DiscoveredGroups,
+    AccumulatedGroups,
+    OrderedGroups,
+    OutputChunks,
+};
+
+struct AggregateDiscoveryNode {
+    const ir::Node* source = nullptr;
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+    BreakerParallelism parallelism;
+};
+
+struct AggregateAccumulationNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+    BreakerParallelism parallelism;
+};
+
+struct AggregateFinalOrderingNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+    BreakerParallelism parallelism;
+};
+
+struct AggregateEmissionNode {
+    AggregateDataKind input = AggregateDataKind::None;
+    AggregateDataKind output = AggregateDataKind::None;
+    BreakerParallelism parallelism;
+};
+
+/// The hash fallback's structural chain. The current optimized kernels may
+/// fuse work within an edge, but the plan and executor agree on these four
+/// ownership boundaries. Each node carries the policy for fan-out performed
+/// within that boundary.
+struct HashAggregateNodes {
+    AggregateDiscoveryNode discovery;
+    AggregateAccumulationNode accumulation;
+    AggregateFinalOrderingNode final_ordering;
+    AggregateEmissionNode emission;
+};
+
+/// Validate the typed Discovery -> Accumulation -> FinalOrdering -> Emission
+/// chain. Execution calls the same predicate used by mutation tests.
+[[nodiscard]] auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
+    -> std::optional<std::string>;
 
 /// Fill `bp`'s resolved half. `pool_size` is `process_worker_pool().size()`, or
 /// 0 when the caller declined to construct the pool for a serial query. The one
@@ -543,9 +544,7 @@ struct Plan {
     /// Set when `root` is an `Aggregate`.
     AggregatePlan aggregate;
     /// Present for the adaptive streamable aggregate's hash fallback. These
-    /// are structural phase nodes; `breaker_phases` below continues to carry
-    /// the two current fan-out policies until discovery and accumulation have
-    /// independent scheduling policies.
+    /// are structural phase nodes and each carries its own fan-out policy.
     std::optional<HashAggregateNodes> hash_aggregate;
     /// Set when `root` is a breaker whose parallelism the plan describes.
     /// Empty otherwise. One entry per fan-out phase (see `BreakerPhase`).

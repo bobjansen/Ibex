@@ -4750,6 +4750,7 @@ struct JoinProbe {
     std::vector<std::size_t> right_emit_idx_;
     std::vector<std::string> right_emit_names_;
     std::vector<std::string> left_emit_names_;
+    std::optional<ir::JoinColumnMapping> columns_;
     bool right_emit_ready_ = false;
 
     static constexpr std::size_t kNil = kJoinNil;
@@ -4769,13 +4770,32 @@ struct JoinProbe {
     // computed once from the first assembled chunk.
 
     auto setup_right_emit_schema(const Table& left_side) -> std::expected<void, std::string> {
-        auto planned =
-            ir::plan_join_output(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
-                                 table_column_names(*right_), suffix_);
-        if (!planned.has_value()) {
-            return std::unexpected(std::move(planned.error()));
+        if (right_emit_ready_) {
+            return {};
         }
-        const std::vector<ir::JoinOutputColumn>& plan = *planned;
+        if (!columns_.has_value()) {
+            auto mapped =
+                ir::resolve_join_columns(ir::JoinKind::Inner, *keys_, table_column_names(left_side),
+                                         table_column_names(*right_), suffix_);
+            if (!mapped.has_value()) {
+                return std::unexpected(std::move(mapped.error()));
+            }
+            columns_ = std::move(*mapped);
+        }
+        if (columns_->keys.size() != keys_->size()) {
+            return std::unexpected("physical join column mapping has the wrong key count");
+        }
+        for (std::size_t i = 0; i < keys_->size(); ++i) {
+            const ir::JoinKeyColumns& mapped = columns_->keys[i];
+            if (mapped.left_index >= left_side.columns.size() ||
+                mapped.right_index >= right_->columns.size() ||
+                left_side.columns[mapped.left_index].name != keys_->at(i).left ||
+                right_->columns[mapped.right_index].name != keys_->at(i).right) {
+                return std::unexpected(
+                    "physical join column mapping does not match its concrete inputs");
+            }
+        }
+        const std::vector<ir::JoinOutputColumn>& plan = columns_->output;
         // A suffix clause renames the *left* side of a collision too, so the
         // left names come from the plan as well; taking them from the chunk
         // would keep the pre-rename spelling.
@@ -5138,17 +5158,16 @@ struct JoinProbe {
     }
 
     auto probe_chunk_against_right(Table left_chunk) -> std::expected<Table, std::string> {
+        if (auto mapped = setup_right_emit_schema(left_chunk); !mapped.has_value()) {
+            return std::unexpected(std::move(mapped.error()));
+        }
         if (pair_mode_) {
             return probe_chunk_pair(std::move(left_chunk));
         }
-        const ColumnValue* key = left_chunk.find(keys_->front().left);
-        if (key == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + keys_->front().left);
-        }
-        const auto* probe_entry = left_chunk.find_entry(keys_->front().left);
-        probe_validity_ = probe_entry != nullptr && probe_entry->validity.has_value()
-                              ? &*probe_entry->validity
-                              : nullptr;
+        const ir::JoinKeyColumns& key_columns = columns_->keys.front();
+        const ColumnEntry& probe_entry = left_chunk.columns[key_columns.left_index];
+        const ColumnValue* key = probe_entry.column.get();
+        probe_validity_ = probe_entry.validity.has_value() ? &*probe_entry.validity : nullptr;
 
         std::vector<std::size_t> li;
         std::vector<std::size_t> ri;
@@ -5234,16 +5253,12 @@ struct JoinProbe {
     }
 
     auto probe_chunk_pair(Table left_chunk) -> std::expected<Table, std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* key0 = left_chunk.find(k0.left);
-        if (key0 == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + k0.left);
-        }
-        const ColumnValue* key1 = left_chunk.find(k1.left);
-        if (key1 == nullptr) {
-            return std::unexpected("join key not found in left chunk: " + k1.left);
-        }
+        const ir::JoinKeyColumns& k0 = columns_->keys[0];
+        const ir::JoinKeyColumns& k1 = columns_->keys[1];
+        const ColumnEntry& e0 = left_chunk.columns[k0.left_index];
+        const ColumnEntry& e1 = left_chunk.columns[k1.left_index];
+        const ColumnValue* key0 = e0.column.get();
+        const ColumnValue* key1 = e1.column.get();
         const auto* col0 = std::get_if<Column<std::int64_t>>(key0);
         const auto* col1 = std::get_if<Column<std::int64_t>>(key1);
         if (col0 == nullptr || col1 == nullptr) {
@@ -5251,12 +5266,8 @@ struct JoinProbe {
                 "inner join: left key type mismatch (two-key join expects "
                 "Int64)");
         }
-        const auto* e0 = left_chunk.find_entry(k0.left);
-        const auto* e1 = left_chunk.find_entry(k1.left);
-        const ValidityBitmap* v0 =
-            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
-        const ValidityBitmap* v1 =
-            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+        const ValidityBitmap* v0 = e0.validity.has_value() ? &*e0.validity : nullptr;
+        const ValidityBitmap* v1 = e1.validity.has_value() ? &*e1.validity : nullptr;
 
         std::vector<std::size_t> li;
         std::vector<std::size_t> ri;
@@ -5357,21 +5368,20 @@ struct JoinProbe {
     // cache-missing lookups. `hits` costs one entry per *matching* right row,
     // so it is bounded by the output row count.
     auto emit_swapped(const Table& left_table) -> std::expected<Table, std::string> {
+        if (auto mapped = setup_right_emit_schema(left_table); !mapped.has_value()) {
+            return std::unexpected(std::move(mapped.error()));
+        }
         if (pair_mode_) {
             return emit_swapped_pair(left_table);
         }
-        const ColumnValue* rkey = right_->find(keys_->front().right);
-        if (rkey == nullptr) {
-            return std::unexpected("join key not found in right table: " + keys_->front().right);
-        }
+        const ir::JoinKeyColumns& key_columns = columns_->keys.front();
+        const ColumnEntry& right_entry = right_->columns[key_columns.right_index];
+        const ColumnValue* rkey = right_entry.column.get();
         const std::size_t n_right = right_->rows();
 
         // In swapped mode the index is on the left, so the right table is the
         // probe side. Its null-keyed rows match nothing (see build_join_hash_index).
-        const auto* right_entry = right_->find_entry(keys_->front().right);
-        probe_validity_ = right_entry != nullptr && right_entry->validity.has_value()
-                              ? &*right_entry->validity
-                              : nullptr;
+        probe_validity_ = right_entry.validity.has_value() ? &*right_entry.validity : nullptr;
 
         std::vector<std::size_t> li;
         std::vector<std::size_t> ri;
@@ -5464,28 +5474,20 @@ struct JoinProbe {
     // itself (returning `kNil`) instead of the single-bitmap `probe_is_null`
     // member, since a row here is null when EITHER key is.
     auto emit_swapped_pair(const Table& left_table) -> std::expected<Table, std::string> {
-        const ir::JoinKey& k0 = keys_->at(0);
-        const ir::JoinKey& k1 = keys_->at(1);
-        const ColumnValue* rkey0 = right_->find(k0.right);
-        if (rkey0 == nullptr) {
-            return std::unexpected("join key not found in right table: " + k0.right);
-        }
-        const ColumnValue* rkey1 = right_->find(k1.right);
-        if (rkey1 == nullptr) {
-            return std::unexpected("join key not found in right table: " + k1.right);
-        }
+        const ir::JoinKeyColumns& k0 = columns_->keys[0];
+        const ir::JoinKeyColumns& k1 = columns_->keys[1];
+        const ColumnEntry& e0 = right_->columns[k0.right_index];
+        const ColumnEntry& e1 = right_->columns[k1.right_index];
+        const ColumnValue* rkey0 = e0.column.get();
+        const ColumnValue* rkey1 = e1.column.get();
         const auto* col0 = std::get_if<Column<std::int64_t>>(rkey0);
         const auto* col1 = std::get_if<Column<std::int64_t>>(rkey1);
         if (col0 == nullptr || col1 == nullptr) {
             return std::unexpected(
                 "inner join: right key type mismatch (two-key join expects Int64)");
         }
-        const auto* e0 = right_->find_entry(k0.right);
-        const auto* e1 = right_->find_entry(k1.right);
-        const ValidityBitmap* v0 =
-            e0 != nullptr && e0->validity.has_value() ? &*e0->validity : nullptr;
-        const ValidityBitmap* v1 =
-            e1 != nullptr && e1->validity.has_value() ? &*e1->validity : nullptr;
+        const ValidityBitmap* v0 = e0.validity.has_value() ? &*e0.validity : nullptr;
+        const ValidityBitmap* v1 = e1.validity.has_value() ? &*e1.validity : nullptr;
         const auto* d0 = col0->data();
         const auto* d1 = col1->data();
         const std::size_t n_right = right_->rows();
@@ -5803,13 +5805,14 @@ class ChunkedInnerJoinOperator final : public Operator {
     ChunkedInnerJoinOperator(OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
                              const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr,
-                             physical::JoinParallelism par = {})
+                             physical::JoinParallelism par = {},
+                             std::optional<ir::JoinColumnMapping> columns = std::nullopt)
         : left_(std::move(left)),
           right_(std::make_shared<Table>(std::move(right))),
           keys_(keys),
           par_(par),
           pending_order_(pending_order) {
-        bind_probe(keys, std::move(suffix), exec);
+        bind_probe(keys, std::move(suffix), exec, std::move(columns));
     }
 
     /// Deferred-probe variant: the right side is an undecoded lazy scan (plus
@@ -5823,7 +5826,8 @@ class ChunkedInnerJoinOperator final : public Operator {
                              const std::vector<ir::JoinKey>* keys, const DeferredScan* probe,
                              std::string probe_name, ir::JoinSuffixPolicy suffix = {},
                              const std::vector<ir::OrderKey>* pending_order = nullptr,
-                             physical::JoinParallelism par = {})
+                             physical::JoinParallelism par = {},
+                             std::optional<ir::JoinColumnMapping> columns = std::nullopt)
         : left_(std::move(left)),
           keys_(keys),
           deferred_probe_(probe),
@@ -5835,7 +5839,7 @@ class ChunkedInnerJoinOperator final : public Operator {
           deferred_exec_(&exec),
           par_(par),
           pending_order_(pending_order) {
-        bind_probe(keys, std::move(suffix), exec);
+        bind_probe(keys, std::move(suffix), exec, std::move(columns));
     }
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
@@ -5957,12 +5961,13 @@ class ChunkedInnerJoinOperator final : public Operator {
     /// deferred path fills it once the scan resolves), so this binds once and
     /// the build phase writes through it.
     void bind_probe(const std::vector<ir::JoinKey>* keys, ir::JoinSuffixPolicy suffix,
-                    const ExecutionContext& exec) {
+                    const ExecutionContext& exec, std::optional<ir::JoinColumnMapping> columns) {
         probe_.keys_ = keys;
         probe_.suffix_ = std::move(suffix);
         probe_.exec_ = &exec;
         probe_.right_ = right_;
         probe_.probe_plan_ = par_.probe;
+        probe_.columns_ = std::move(columns);
     }
 
     auto initialize() -> std::optional<std::string> {
@@ -14937,7 +14942,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
                 exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
-                resolved_join_parallelism(nodes, exec)));
+                resolved_join_parallelism(nodes, exec), nodes.columns));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14951,7 +14956,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order(), resolved_join_parallelism(nodes, exec)));
+            &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }
@@ -14981,7 +14986,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
                 std::move(left_op.value()), join.children()[1].get(), &registry, scalars, externs,
                 exec, &join.keys(), probe.scan, *probe.name, join.suffix(), &join.pending_order(),
-                resolved_join_parallelism(nodes, exec)));
+                resolved_join_parallelism(nodes, exec), nodes.columns));
             if (!built.has_value()) {
                 return std::unexpected(std::move(built.error()));
             }
@@ -14995,7 +15000,7 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         }
         auto built = scheduled_join_build(std::make_unique<ChunkedInnerJoinOperator>(
             std::move(left_op.value()), std::move(right.value()), &join.keys(), exec, join.suffix(),
-            &join.pending_order(), resolved_join_parallelism(nodes, exec)));
+            &join.pending_order(), resolved_join_parallelism(nodes, exec), nodes.columns));
         if (!built.has_value()) {
             return std::unexpected(std::move(built.error()));
         }

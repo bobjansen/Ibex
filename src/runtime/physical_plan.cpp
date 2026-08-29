@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -103,6 +105,73 @@ auto table_input_row_estimate(const ir::Node& root, const TableRegistry& registr
         return {};
     }
     return {.rows = it->second.rows(), .source = RowEstimate::Source::TableExact};
+}
+
+auto runtime_column_type(const ColumnValue& column) -> ir::ColumnType {
+    return std::visit(
+        []<typename ColumnT>(const ColumnT&) {
+            using ColumnType = std::remove_cvref_t<ColumnT>;
+            if constexpr (std::same_as<ColumnType, Column<std::int64_t>>) {
+                return ir::ColumnType::Int64;
+            } else if constexpr (std::same_as<ColumnType, Column<double>>) {
+                return ir::ColumnType::Float64;
+            } else if constexpr (std::same_as<ColumnType, Column<bool>>) {
+                return ir::ColumnType::Bool;
+            } else if constexpr (std::same_as<ColumnType, Column<std::string>>) {
+                return ir::ColumnType::String;
+            } else if constexpr (std::same_as<ColumnType, Column<Categorical>>) {
+                return ir::ColumnType::Categorical;
+            } else if constexpr (std::same_as<ColumnType, Column<Date>>) {
+                return ir::ColumnType::Date;
+            } else {
+                static_assert(std::same_as<ColumnType, Column<Timestamp>>);
+                return ir::ColumnType::Timestamp;
+            }
+        },
+        column);
+}
+
+auto registered_source_schemas(const TableRegistry& registry) -> ir::SourceSchemas {
+    ir::SourceSchemas schemas;
+    schemas.reserve(registry.size());
+    for (const auto& [name, table] : registry) {
+        std::vector<ir::SchemaField> fields;
+        fields.reserve(table.columns.size());
+        for (const ColumnEntry& column : table.columns) {
+            fields.push_back({.name = column.name, .type = runtime_column_type(*column.column)});
+        }
+        schemas.emplace(name, ir::SchemaInfo::known(std::move(fields), /*open=*/false));
+    }
+    return schemas;
+}
+
+auto known_join_column_mapping(const ir::JoinNode& join, const TableRegistry& registry)
+    -> std::optional<ir::JoinColumnMapping> {
+    if (join.children().size() != 2) {
+        return std::nullopt;
+    }
+    const ir::SourceSchemas schemas = registered_source_schemas(registry);
+    const ir::SchemaInfo left = ir::infer_schema(*join.children()[0], schemas);
+    const ir::SchemaInfo right = ir::infer_schema(*join.children()[1], schemas);
+    if (!left.is_known() || left.is_open() || !right.is_known() || right.is_open()) {
+        return std::nullopt;
+    }
+    std::vector<std::string_view> left_names;
+    left_names.reserve(left.fields().size());
+    for (const ir::SchemaField& field : left.fields()) {
+        left_names.push_back(field.name);
+    }
+    std::vector<std::string_view> right_names;
+    right_names.reserve(right.fields().size());
+    for (const ir::SchemaField& field : right.fields()) {
+        right_names.push_back(field.name);
+    }
+    auto mapping =
+        ir::resolve_join_columns(join.kind(), join.keys(), left_names, right_names, join.suffix());
+    if (!mapping.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(*mapping);
 }
 
 auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
@@ -493,7 +562,8 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         }
     }
     if (root.kind() == ir::NodeKind::Join) {
-        plan.join = plan_join(ir::node_cast<ir::JoinNode>(root));
+        const auto& join = ir::node_cast<ir::JoinNode>(root);
+        plan.join = plan_join(join);
         // A streaming join is executed by the plan now: `build_physical_join`
         // builds it, not the per-kind switch. A materializing one is still a
         // fallback and says so, which is why the backlog drops by the streaming
@@ -516,6 +586,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                               .left_input = plan.join.left_input,
                               .right_input = plan.join.right_input,
                               .parallelism = join_probe_parallelism()},
+                    .columns = known_join_column_mapping(join, registry),
                 };
             }
             return plan;
@@ -688,6 +759,17 @@ auto explain_physical(const Plan& plan) -> std::string {
             out += "Breaker(Join)\n  " + explain_join(plan.join);
             if (plan.streaming_join.has_value()) {
                 out += "\n  edge: HashBuild.RuntimeOrientedBuildOutput -> HashProbe.build_input";
+                if (plan.streaming_join->columns.has_value()) {
+                    out += "\n  columns: resolved";
+                    for (const ir::JoinKeyColumns& key : plan.streaming_join->columns->keys) {
+                        out += "  left[" + std::to_string(key.left_index) + "]=right[" +
+                               std::to_string(key.right_index) + "]";
+                    }
+                    out +=
+                        "  output=" + std::to_string(plan.streaming_join->columns->output.size());
+                } else {
+                    out += "\n  columns: deferred (bind once from concrete inputs)";
+                }
                 const std::vector<BreakerPhase> nodes{
                     {.name = "HashBuild", .parallelism = plan.streaming_join->build.parallelism},
                     {.name = "HashProbe", .parallelism = plan.streaming_join->probe.parallelism},

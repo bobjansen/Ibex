@@ -161,4 +161,33 @@ auto plan_join_output(JoinKind kind, const std::vector<JoinKey>& keys,
     return plan;
 }
 
+auto resolve_join_columns(JoinKind kind, const std::vector<JoinKey>& keys,
+                          std::span<const std::string_view> left_names,
+                          std::span<const std::string_view> right_names,
+                          const JoinSuffixPolicy& suffix)
+    -> std::expected<JoinColumnMapping, std::string> {
+    auto output = plan_join_output(kind, keys, left_names, right_names, suffix);
+    if (!output.has_value()) {
+        return std::unexpected(std::move(output.error()));
+    }
+
+    JoinColumnMapping mapping;
+    mapping.output = std::move(*output);
+    mapping.keys.reserve(keys.size());
+    for (const JoinKey& key : keys) {
+        const auto left = std::ranges::find(left_names, key.left);
+        if (left == left_names.end()) {
+            return std::unexpected("join key " + quote(key.left) + " not found in left input");
+        }
+        const auto right = std::ranges::find(right_names, key.right);
+        if (right == right_names.end()) {
+            return std::unexpected("join key " + quote(key.right) + " not found in right input");
+        }
+        mapping.keys.push_back(
+            {.left_index = static_cast<std::size_t>(std::distance(left_names.begin(), left)),
+             .right_index = static_cast<std::size_t>(std::distance(right_names.begin(), right))});
+    }
+    return mapping;
+}
+
 }  // namespace ibex::ir

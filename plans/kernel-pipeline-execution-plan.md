@@ -420,7 +420,12 @@ at all (a one-valued strategy enum would be ceremony).
    `HashProbeInput` whose variant fixes Stream / Swapped / Precomputed
    orientation; the physical probe consumes it, and the temporary coordinator
    is discarded at the barrier. Semi/anti deliberately retains its separate
-   streaming operator. NOT blocked on a cost model.
+   streaming operator. **Column binding follow-up DONE 2026-08-29:**
+   `JoinColumnMapping` resolves mapped left/right keys to positions together
+   with the authoritative output plan; known closed schemas bind in the
+   physical planner, lazy/unknown schemas bind once at the concrete barrier,
+   and probe kernels no longer look columns up by textual key per chunk. NOT
+   blocked on a cost model.
 2. **Hash aggregate** — construction and fan-out authority DONE; phase
    decomposition has not started. The former determinism blocker is resolved.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
@@ -454,7 +459,10 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    a Stream / Swapped / Precomputed `HashProbeInput` across that edge and the
    probe owns all downstream work; the enclosing coordinator is discarded.
    Edge mutations are rejected by the same validator execution calls, and
-   materializing plus semi/anti shapes carry no inner-join edge.
+   materializing plus semi/anti shapes carry no inner-join edge. The immediate
+   name-resolution audit is also complete: the edge carries one
+   `JoinColumnMapping` (positional keys + output provenance), resolved at plan
+   time when possible and once at execution otherwise.
 3. Split aggregate execution at its existing ownership boundaries — discovery /
    partition accumulation / final ordering / emission — first with serial
    orchestration and plan-shape/accounting tests, then admit fan-out one phase

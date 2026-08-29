@@ -48,6 +48,27 @@ struct JoinOutputColumn {
     auto operator==(const JoinOutputColumn&) const -> bool = default;
 };
 
+/// One equijoin key resolved against the ordered physical columns of both
+/// inputs. Names are a logical/schema concern; build and probe kernels consume
+/// these stable positions.
+struct JoinKeyColumns {
+    std::size_t left_index = 0;
+    std::size_t right_index = 0;
+
+    auto operator==(const JoinKeyColumns&) const -> bool = default;
+};
+
+/// The complete column-name resolution for one join: positional key bindings
+/// plus the authoritative output gather/rename plan. This is the join analogue
+/// of `ColumnNameMap`: consumers resolve names once, then share this value
+/// instead of independently looking them up or reconstructing output names.
+struct JoinColumnMapping {
+    std::vector<JoinKeyColumns> keys;
+    std::vector<JoinOutputColumn> output;
+
+    auto operator==(const JoinColumnMapping&) const -> bool = default;
+};
+
 /// The single authority on a join's output column list and naming.
 ///
 /// IR schema inference, the materialized interpreter, the chunked executor and
@@ -74,5 +95,15 @@ struct JoinOutputColumn {
                                     std::span<const std::string_view> right_names,
                                     const JoinSuffixPolicy& suffix = {})
     -> std::expected<std::vector<JoinOutputColumn>, std::string>;
+
+/// Resolve every textual join key to its input position and compute the output
+/// plan through `plan_join_output`. Known schemas call this during physical
+/// planning; lazy/unknown schemas call it once when their concrete columns
+/// first reach the build/probe barrier.
+[[nodiscard]] auto resolve_join_columns(JoinKind kind, const std::vector<JoinKey>& keys,
+                                        std::span<const std::string_view> left_names,
+                                        std::span<const std::string_view> right_names,
+                                        const JoinSuffixPolicy& suffix = {})
+    -> std::expected<JoinColumnMapping, std::string>;
 
 }  // namespace ibex::ir

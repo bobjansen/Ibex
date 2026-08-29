@@ -29,6 +29,18 @@
 
 namespace ibex::runtime {
 
+// A single-threaded WebAssembly build (Emscripten without `-pthread`, i.e. no
+// SharedArrayBuffer — the case for GitHub Pages hosting) cannot create a
+// `std::thread`: the constructor aborts at runtime. On that target the pool
+// spawns no workers and every `submit()` runs its bodies inline on the calling
+// thread. Nested fan-out therefore just recurses on the stack, sequentially.
+// Every other target keeps the real threaded pool.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+inline constexpr bool kInlinePool = true;
+#else
+inline constexpr bool kInlinePool = false;
+#endif
+
 struct WorkerPool::Batch::State {
     std::function<void(std::size_t)> body;
     // A batch remembers how to help its owning pool make progress. This is
@@ -365,7 +377,11 @@ auto stage_thread_peak() noexcept -> std::size_t {
 }
 
 WorkerPool::WorkerPool(std::size_t threads)
-    : impl_(std::make_unique<Impl>()), threads_(threads == 0 ? 1 : threads) {
+    : impl_(std::make_unique<Impl>()),
+      threads_(kInlinePool ? 1 : (threads == 0 ? 1 : threads)) {
+    if constexpr (kInlinePool) {
+        return;  // no worker threads; `submit()` runs bodies inline
+    }
     impl_->threads.reserve(threads_);
     for (std::size_t i = 0; i < threads_; ++i) {
         impl_->threads.emplace_back([this, &ledger = acquire_ledger<IntervalLedger>()] {
@@ -396,6 +412,9 @@ WorkerPool::WorkerPool(std::size_t threads)
 }
 
 WorkerPool::~WorkerPool() {
+    if constexpr (kInlinePool) {
+        return;  // no worker threads to stop or join
+    }
     {
         const std::lock_guard lock(impl_->mutex);
         impl_->stopping = true;
@@ -436,6 +455,12 @@ auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t
     // Counting here needs no matching hook in Batch::wait() (which is
     // idempotent, and which the destructor may call again).
     record_execution_profile_barrier(state->profile_entry);
+    if constexpr (kInlinePool) {
+        for (std::size_t i = 0; i < count; ++i) {
+            run_task(Task{.state = state, .worker_id = i});
+        }
+        return Batch{std::move(state)};
+    }
     {
         const std::lock_guard lock(impl_->mutex);
         for (std::size_t i = 0; i < count; ++i) {
@@ -614,6 +639,10 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
         run_task(task);
         return true;
     };
+    if constexpr (kInlinePool) {
+        run_task(Task{.state = state, .worker_id = 0});
+        return Batch{std::move(state)};
+    }
     {
         const std::lock_guard lock(impl_->mutex);
         impl_->queue.push_back(Task{.state = state, .worker_id = 0});

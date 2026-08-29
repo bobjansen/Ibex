@@ -15275,82 +15275,70 @@ auto build_physical_distinct(const physical::Plan& plan, const ir::Node& node,
     return std::make_unique<ChunkedDistinctOperator>(std::move(child_op.value()), dedup_plan);
 }
 
+auto build_migrated_physical_operator(const physical::Plan& plan, const ir::Node& node,
+                                      const TableRegistry& registry, const ScalarRegistry* scalars,
+                                      const ExternRegistry* externs, const ExecutionContext& exec,
+                                      ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    if (!plan.migrated) {
+        return std::unexpected("physical executor: plan does not migrate its root");
+    }
+    if (plan.root != &node) {
+        return std::unexpected("physical executor: plan root does not match execution root");
+    }
+    if (node.kind() == ir::NodeKind::Head) {
+        physical::note_map_pipeline_executed();
+        return build_physical_head(node, registry, scalars, externs, exec, model_out);
+    }
+    if (node.kind() == ir::NodeKind::Tail) {
+        physical::note_map_pipeline_executed();
+        return build_physical_tail(node, registry, scalars, externs, exec, model_out);
+    }
+    if (node.kind() == ir::NodeKind::TopK) {
+        physical::note_map_pipeline_executed();
+        return build_physical_topk(node, registry, scalars, externs, exec, model_out);
+    }
+    if (node.kind() == ir::NodeKind::FilterHead || node.kind() == ir::NodeKind::FilterTail) {
+        physical::note_map_pipeline_executed();
+        return build_physical_filter_head_tail(node, registry, scalars, externs, exec, model_out);
+    }
+    if (node.kind() == ir::NodeKind::Distinct) {
+        physical::note_map_pipeline_executed();
+        return build_physical_distinct(plan, node, registry, scalars, externs, exec, model_out);
+    }
+    if (node.kind() == ir::NodeKind::Order) {
+        physical::note_map_pipeline_executed();
+        return build_physical_order(node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.aggregate.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
+    }
+    if (plan.join.describes) {
+        physical::note_map_pipeline_executed();
+        return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
+    }
+    // Every migrated map plan, both modes: the composer walks the chain and
+    // hands the morsel run off at its boundary, and that run picks its own
+    // source strategy.
+    if (plan.mode != physical::PipelineMode::MorselParallel || !exec.can_fan_out()) {
+        physical::note_map_pipeline_executed();
+    }
+    return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
+}
+
 auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
                          const ScalarRegistry* scalars, const ExternRegistry* externs,
                          const ExecutionContext& exec, ModelResult* model_out)
     -> std::expected<OperatorPtr, std::string> {
-    // Runtime-multithreading Phase 1 seam. Only consult the pipeline analysis
-    // when a parallel executor is actually requested — build_operator() is a
-    // hot query-construction path, so the serial default must not pay for
-    // analysis it would discard. When eligible, the whole row-local chain is
-    // built as one pipeline here and its inner nodes are not recursed into
-    // separately (only the pipeline's input subtree is), so there is no
-    // re-analysis of the chain and no infinite recursion.
-    //
-    // A lazy/deferred source in the pipeline's input subtree used to disqualify
-    // it, per the LazyTable synchronization contract's interim gate. That gate
-    // is LIFTED (Phase 3b): `build_morsel_pipeline` materializes its input
-    // subtree into an owned Table *before* constructing any morsel source, so
-    // every deferred decode happens on the single build thread and no worker
-    // ever reaches a `LazyTable`. The contract's hazards — concurrent `cache_`
-    // writes and concurrent `decode_` calls — need a worker to touch the source
-    // to arise, and none does.
-    //
-    // That is a claim about `build_morsel_pipeline`'s structure, so it is
-    // asserted there rather than restated here. A future slice that streams a
-    // source's morsels straight into workers, instead of materializing first,
-    // reintroduces both hazards and must re-establish eligibility (per-worker
-    // readers + a frozen cache) before it removes that assertion.
     // Physical-plan seam (plans/kernel-pipeline-execution-plan.md). One plan
-    // per node, and it describes the whole map chain: which steps run over
-    // morsels, what feeds them, and what runs serially above them. The
-    // composer walks it in both modes, so there is no arrangement of map nodes
-    // that only one of the two paths can express.
+    // per node, and it describes the whole map chain or migrated breaker. The
+    // executor below is also callable with an already-built plan, which makes
+    // plan-edge mutation tests exercise the same consumer production uses.
     const physical::Plan plan = physical::plan_physical(node, registry, externs);
-    if (plan.migrated && node.kind() == ir::NodeKind::Head) {
-        physical::note_map_pipeline_executed();
-        return build_physical_head(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && node.kind() == ir::NodeKind::Tail) {
-        physical::note_map_pipeline_executed();
-        return build_physical_tail(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && node.kind() == ir::NodeKind::TopK) {
-        physical::note_map_pipeline_executed();
-        return build_physical_topk(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated &&
-        (node.kind() == ir::NodeKind::FilterHead || node.kind() == ir::NodeKind::FilterTail)) {
-        physical::note_map_pipeline_executed();
-        return build_physical_filter_head_tail(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && node.kind() == ir::NodeKind::Distinct) {
-        physical::note_map_pipeline_executed();
-        return build_physical_distinct(plan, node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && node.kind() == ir::NodeKind::Order) {
-        physical::note_map_pipeline_executed();
-        return build_physical_order(node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && plan.aggregate.describes) {
-        physical::note_map_pipeline_executed();
-        return build_physical_aggregate(plan, node, registry, scalars, externs, exec, model_out);
-    }
-    if (plan.migrated && plan.join.describes) {
-        physical::note_map_pipeline_executed();
-        return build_physical_join(plan, node, registry, scalars, externs, exec, model_out);
-    }
     if (plan.migrated) {
-        // Every migrated plan, both modes: the composer walks the chain and
-        // hands the morsel run off at its boundary, and that run picks its own
-        // source strategy. Same constructors, same per-node profile entries,
-        // same source construction (an input the run does not stream goes
-        // through the public build_operator, so every Scan/ExternCall decision
-        // below is unchanged).
-        if (plan.mode != physical::PipelineMode::MorselParallel || !exec.can_fan_out()) {
-            physical::note_map_pipeline_executed();
-        }
-        return build_physical_map_step(plan, 0, registry, scalars, externs, exec, model_out);
+        return build_migrated_physical_operator(plan, node, registry, scalars, externs, exec,
+                                                model_out);
     }
     // Counted in every mode. It used to fire only when the query could not fan
     // out, so at two cores or more the backlog read as empty -- a migration
@@ -15823,6 +15811,15 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
 }
 
 }  // namespace
+
+auto build_operator_from_physical_plan(const physical::Plan& plan, const ir::Node& node,
+                                       const TableRegistry& registry, const ScalarRegistry* scalars,
+                                       const ExternRegistry* externs, const ExecutionContext& exec,
+                                       ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    return build_migrated_physical_operator(plan, node, registry, scalars, externs, exec,
+                                            model_out);
+}
 
 auto build_operator(const ir::Node& node, const TableRegistry& registry,
                     const ScalarRegistry* scalars, const ExternRegistry* externs,

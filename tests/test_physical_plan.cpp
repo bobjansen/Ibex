@@ -22,6 +22,7 @@
 #include <variant>
 #include <vector>
 
+#include "interpreter_internal.hpp"
 #include "physical_plan.hpp"
 
 namespace {
@@ -62,6 +63,18 @@ auto serial_plan(const char* source) -> std::pair<ir::NodePtr, runtime::physical
     auto ir = require_ir(source);
     auto plan = runtime::physical::plan_physical(*ir, trades_registry(), nullptr);
     return {std::move(ir), std::move(plan)};
+}
+
+auto execute_physical_plan(const runtime::physical::Plan& plan, const ir::Node& root,
+                           const runtime::TableRegistry& registry,
+                           const runtime::ExecutionContext& exec)
+    -> std::expected<runtime::Table, std::string> {
+    auto op = runtime::build_operator_from_physical_plan(plan, root, registry, nullptr, nullptr,
+                                                         exec, nullptr);
+    if (!op.has_value()) {
+        return std::unexpected(std::move(op.error()));
+    }
+    return runtime::materialize_operator(std::move(*op));
 }
 
 }  // namespace
@@ -1377,6 +1390,92 @@ TEST_CASE("Physical HashBuild and HashProbe consume the resolved join column map
     CHECK(parallel_right_ids[1] == right_ids[1]);
 }
 
+TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations",
+          "[physical][breaker][execute][aggregate]") {
+    runtime::Table input;
+    input.add_column("unused", Column<std::int64_t>{90, 91, 92});
+    input.add_column("g", Column<std::int64_t>{1, 1, 2});
+    input.add_column("v", Column<std::int64_t>{10, 20, 7});
+    runtime::TableRegistry registry;
+    registry.emplace("input", std::move(input));
+    auto tree = require_ir("input[select { s = sum(v) }, by { g }];");
+    auto plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+    REQUIRE(plan.aggregate.columns.has_value());
+    REQUIRE(plan.aggregate.columns->group_by == std::vector<std::size_t>{0});
+    REQUIRE(plan.aggregate.columns->aggregate_inputs == std::vector<std::optional<std::size_t>>{1});
+
+    const auto expected = execute_physical_plan(plan, *tree, registry, serial_exec());
+    REQUIRE(expected.has_value());
+    REQUIRE(expected->rows() == 2);
+    const auto& expected_s = std::get<Column<std::int64_t>>(*expected->find("s"));
+    CHECK(expected_s[0] == 30);
+    CHECK(expected_s[1] == 7);
+
+    SECTION("a mutated group-key position is rejected at the concrete boundary") {
+        plan.aggregate.columns->group_by[0] = 1;
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("group-by column mapping") != std::string::npos);
+    }
+
+    SECTION("a mutated aggregate-input position is rejected at the concrete boundary") {
+        plan.aggregate.columns->aggregate_inputs[0] = 0;
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("aggregate input column mapping") != std::string::npos);
+    }
+
+    SECTION("a deliberately deferred mapping binds once and produces the same result") {
+        plan.aggregate.columns.reset();
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == expected->rows());
+        const auto& result_s = std::get<Column<std::int64_t>>(*result->find("s"));
+        CHECK(result_s[0] == expected_s[0]);
+        CHECK(result_s[1] == expected_s[1]);
+    }
+
+    SECTION("mutating the planned phase order is rejected") {
+        std::swap(plan.breaker_phases[0], plan.breaker_phases[1]);
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().find("expected partition and finalize") != std::string::npos);
+    }
+}
+
+TEST_CASE("Open aggregate schemas defer positions but authorize only declared names",
+          "[physical][breaker][execute][aggregate]") {
+    ir::Builder builder;
+    auto tree = builder.aggregate(
+        {ir::ColumnRef{.name = "g"}},
+        {ir::AggSpec{.func = ir::AggFunc::Sum, .column = {.name = "v"}, .alias = "s"}});
+    tree->add_child(builder.scan("open_input"));
+
+    const ir::SourceSchemas open{{
+        "open_input",
+        ir::SchemaInfo::known({{.name = "g", .type = ir::ColumnType::Int64},
+                               {.name = "v", .type = ir::ColumnType::Int64}},
+                              /*open=*/true),
+    }};
+    const runtime::TableRegistry none;
+    const auto plan = runtime::physical::plan_physical(*tree, none, nullptr, open);
+    REQUIRE(plan.migrated);
+    REQUIRE_FALSE(plan.aggregate.columns.has_value());
+
+    runtime::Table input;
+    input.add_column("extra", Column<std::int64_t>{4, 5, 6});
+    input.add_column("g", Column<std::int64_t>{1, 1, 2});
+    input.add_column("v", Column<std::int64_t>{10, 20, 7});
+    runtime::TableRegistry registry;
+    registry.emplace("open_input", std::move(input));
+    const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows() == 2);
+    const auto& sums = std::get<Column<std::int64_t>>(*result->find("s"));
+    CHECK(sums[0] == 30);
+    CHECK(sums[1] == 7);
+}
+
 TEST_CASE("The aggregate reads the plan: parallel output equals serial and the fan-out fires",
           "[physical][breaker][execute]") {
     // A high-cardinality single-Int64 group-by: past kPairOwnedMinRows so the
@@ -1426,6 +1525,30 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
     for (std::size_t i = 0; i < s->rows(); ++i) {
         REQUIRE(sg[i] == pg[i]);
         REQUIRE(sv[i] == pv[i]);
+    }
+
+    // Execute an explicitly mutated copy through the same physical executor.
+    // A worker ceiling of one on each phase must suppress both fan-out points;
+    // if the builder recreated factory defaults, these counters would fire.
+    auto capped_plan = runtime::physical::plan_physical(*ir, registry, nullptr);
+    REQUIRE(capped_plan.breaker_phases.size() == 2);
+    capped_plan.breaker_phases[0].parallelism.breaker_max_workers = 1;
+    capped_plan.breaker_phases[1].parallelism.breaker_max_workers = 1;
+    runtime::ParallelPipelineStats capped_stats;
+    runtime::ExecutionContext capped_exec;
+    capped_exec.parallel_threads = 8;
+    capped_exec.parallel_min_rows = 0;
+    capped_exec.parallel_stats = &capped_stats;
+    const auto capped = execute_physical_plan(capped_plan, *ir, registry, capped_exec);
+    REQUIRE(capped.has_value());
+    REQUIRE(capped_stats.parallel_aggregate_partitions.load() == 0);
+    REQUIRE(capped_stats.parallel_aggregate_finalizes.load() == 0);
+    REQUIRE(capped->rows() == s->rows());
+    const auto& capped_g = std::get<Column<std::int64_t>>(*capped->find_entry("g")->column);
+    const auto& capped_v = std::get<Column<double>>(*capped->find_entry("s")->column);
+    for (std::size_t i = 0; i < s->rows(); ++i) {
+        REQUIRE(capped_g[i] == sg[i]);
+        REQUIRE(capped_v[i] == sv[i]);
     }
 }
 

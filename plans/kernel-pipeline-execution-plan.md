@@ -221,8 +221,16 @@ separate streaming operator.
    strategy; concrete row-local factories remain callbacks owned by their
    operator families. No extra call was added to `Operator::next()`. Semi/anti,
    materializing joins, and residual breaker families remain in their existing
-   owners. Next: Phase 5 item 3, replace residual `build_operator` recursion with
-   the explicit physical fallback adapter.
+   owners. **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
+   `d1204b63`; `plans/physical-fallback-adapter-plan.md`): the 15-branch
+   materializing per-kind switch in `build_operator_impl` is gone. Every
+   non-migrated kind resolves through one `build_materialized_fallback` →
+   `interpret_node`; `build_materialized_fallback` still builds the breaker's
+   relational inputs through `build_operator` (handed back via
+   `ExecutionContext::pre_materialized_children`) so a filtered/projected input
+   keeps its fused parallel scan. `explain physical` names the retained subtree.
+   `chunked.cpp` −290 lines net. Next: physical-plan-migrate individual fallback
+   kinds as `physical_fallbacks_for(kind)` ranks them.
 6. **Sweep process-global plan counters in tests — DONE 2026-08-29.** The
    formerly false-premise test now checks the migrated pipeline counter. All
    three remaining counter assertions take a local before/after delta, and no
@@ -513,7 +521,12 @@ at all (a one-valued strategy enum would be ceremony).
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
 3. Remove obsolete `build_operator` recursion; migrate `interpret_node` to an
-   explicit physical fallback adapter.
+   explicit physical fallback adapter. **DONE 2026-08-29** (`5f7afc59`,
+   `94957719`, `d1204b63`; `plans/physical-fallback-adapter-plan.md`). The
+   materializing per-kind switch is one `build_materialized_fallback` seam;
+   `build_operator` no longer recurses through a fallback subtree (only through
+   the pre-built relational inputs). `interpret_node` keeps its own recursion as
+   the fallback interpreter.
 4. Make planner / executor / kernel tests independently runnable.
 
 Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.

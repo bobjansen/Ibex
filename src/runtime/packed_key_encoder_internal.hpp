@@ -10,12 +10,11 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <robin_hood.h>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <vector>
-
-#include <robin_hood.h>
 
 namespace ibex::runtime {
 

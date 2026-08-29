@@ -269,9 +269,9 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
     for (const ColumnEntry& column : chunk.columns) {
         names.push_back(column.name);
     }
-    const bool concrete_layout_matches_plan =
-        columns.has_value() && columns->input_names.size() == names.size() &&
-        std::ranges::equal(columns->input_names, names);
+    const bool concrete_layout_matches_plan = columns.has_value() &&
+                                              columns->input_names.size() == names.size() &&
+                                              std::ranges::equal(columns->input_names, names);
     if (!concrete_layout_matches_plan) {
         // Logical schema inference may know every source column while the
         // physical child emits a narrower layout. A pushed-down filter, for
@@ -304,8 +304,9 @@ auto bind_aggregate_columns(std::optional<physical::AggregateColumnMapping>& col
         }
         if (!index.has_value() || *index >= chunk.columns.size() ||
             chunk.columns[*index].name != aggregations[i].column.name) {
-            std::string detail = "aggregate input column mapping does not match concrete input: expected '" +
-                                 aggregations[i].column.name + "'";
+            std::string detail =
+                "aggregate input column mapping does not match concrete input: expected '" +
+                aggregations[i].column.name + "'";
             if (index.has_value()) {
                 detail += " at position " + std::to_string(*index);
                 if (*index < chunk.columns.size()) {
@@ -346,10 +347,9 @@ class HashAggregateState final {
           accumulation_profile_(exec.execution_profile == nullptr
                                     ? nullptr
                                     : exec.execution_profile->stage("Aggregate.Accumulation")),
-          final_ordering_profile_(
-              exec.execution_profile == nullptr
-                  ? nullptr
-                  : exec.execution_profile->stage("Aggregate.FinalOrdering")),
+          final_ordering_profile_(exec.execution_profile == nullptr
+                                      ? nullptr
+                                      : exec.execution_profile->stage("Aggregate.FinalOrdering")),
           emission_profile_(exec.execution_profile == nullptr
                                 ? nullptr
                                 : exec.execution_profile->stage("Aggregate.Emission")) {}
@@ -496,9 +496,8 @@ class HashAggregateState final {
         if (gids_buf_.size() < discovery_transfer_.rows) {
             return "physical aggregate: Discovery produced a short group-id buffer";
         }
-        const auto* skip = discovery_transfer_.skip_fields.empty()
-                               ? nullptr
-                               : &discovery_transfer_.skip_fields;
+        const auto* skip =
+            discovery_transfer_.skip_fields.empty() ? nullptr : &discovery_transfer_.skip_fields;
         accumulate_gids(gids_buf_.data(), discovery_transfer_.aggregate_entries,
                         discovery_transfer_.rows, skip);
         discovery_transfer_ = {};
@@ -932,8 +931,7 @@ class HashAggregateState final {
             if (has_discovery_first) {
                 seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
             }
-            publish_discovered(agg_entries, rows,
-                               has_discovery_first ? &discovery_first : nullptr);
+            publish_discovered(agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
             return std::nullopt;
         }
 
@@ -971,8 +969,7 @@ class HashAggregateState final {
         if (has_discovery_first) {
             seed_discovery_first(groups_before, first_rows, agg_entries, discovery_first);
         }
-        publish_discovered(agg_entries, rows,
-                           has_discovery_first ? &discovery_first : nullptr);
+        publish_discovered(agg_entries, rows, has_discovery_first ? &discovery_first : nullptr);
         return std::nullopt;
     }
 
@@ -4666,13 +4663,13 @@ class HashAggregatePhaseOperator final : public Operator {
     bool emitted_ = false;
 };
 
-auto make_hash_aggregate_operator(
-    OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-    const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
-    physical::AggregateParallelism par,
-    std::optional<physical::AggregateColumnMapping> columns) -> OperatorPtr {
-    auto state = std::make_unique<HashAggregateState>(
-        std::move(child), group_by, aggregations, exec, par, std::move(columns));
+auto make_hash_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                                  const std::vector<ir::AggSpec>* aggregations,
+                                  const ExecutionContext& exec, physical::AggregateParallelism par,
+                                  std::optional<physical::AggregateColumnMapping> columns)
+    -> OperatorPtr {
+    auto state = std::make_unique<HashAggregateState>(std::move(child), group_by, aggregations,
+                                                      exec, par, std::move(columns));
     return std::make_unique<HashAggregatePhaseOperator>(std::move(state));
 }
 
@@ -4785,10 +4782,10 @@ class ChunkedSortedAggregateOperator final : public Operator {
             // columns from the input's types, so hand it the empty chunk and let
             // it produce a properly-shaped empty result.
             if (schema_only.has_value()) {
-                fallback_ = make_hash_aggregate_operator(
-                    std::make_unique<PrependChunkOperator>(std::move(*schema_only),
-                                                           std::move(child_)),
-                    group_by_, aggregations_, *exec_, par_, columns_);
+                fallback_ =
+                    make_hash_aggregate_operator(std::make_unique<PrependChunkOperator>(
+                                                     std::move(*schema_only), std::move(child_)),
+                                                 group_by_, aggregations_, *exec_, par_, columns_);
                 return {};
             }
             done_ = true;
@@ -5317,14 +5314,14 @@ class ChunkedSortedAggregateOperator final : public Operator {
 
 }  // namespace
 
-auto make_chunked_aggregate_operator(
-    OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
-    const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
-    physical::AggregateParallelism parallelism,
-    std::optional<physical::AggregateColumnMapping> columns) -> OperatorPtr {
+auto make_chunked_aggregate_operator(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
+                                     const std::vector<ir::AggSpec>* aggregations,
+                                     const ExecutionContext& exec,
+                                     physical::AggregateParallelism parallelism,
+                                     std::optional<physical::AggregateColumnMapping> columns)
+    -> OperatorPtr {
     return std::make_unique<ChunkedSortedAggregateOperator>(
-        std::move(child), group_by, aggregations, exec, std::move(parallelism),
-        std::move(columns));
+        std::move(child), group_by, aggregations, exec, std::move(parallelism), std::move(columns));
 }
 
 }  // namespace ibex::runtime

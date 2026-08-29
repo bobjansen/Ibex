@@ -572,8 +572,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                     .discovery = {.source = aggregate.children().front().get(),
                                   .input = AggregateDataKind::InputChunks,
                                   .output = AggregateDataKind::DiscoveredGroups,
-                                  .parallelism =
-                                      aggregate_discovery_parallelism(input_estimate)},
+                                  .parallelism = aggregate_discovery_parallelism(input_estimate)},
                     .accumulation = {.input = AggregateDataKind::DiscoveredGroups,
                                      .output = AggregateDataKind::AccumulatedGroups,
                                      .parallelism =
@@ -822,8 +821,9 @@ auto explain_physical(const Plan& plan) -> std::string {
             out += "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate);
             if (plan.hash_aggregate.has_value()) {
                 out += "\n  hash-fallback: Discovery -> Accumulation -> FinalOrdering -> Emission";
-                out += "\n    edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> "
-                       "OrderedGroups -> OutputChunks";
+                out +=
+                    "\n    edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> "
+                    "OrderedGroups -> OutputChunks";
                 const std::vector<BreakerPhase> nodes{
                     {.name = "Discovery",
                      .parallelism = plan.hash_aggregate->discovery.parallelism},
@@ -1172,8 +1172,7 @@ auto validate_streaming_join_edge(const StreamingJoinNodes& nodes) -> std::optio
     return std::nullopt;
 }
 
-auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes)
-    -> std::optional<std::string> {
+auto validate_hash_aggregate_edges(const HashAggregateNodes& nodes) -> std::optional<std::string> {
     if (nodes.discovery.source == nullptr) {
         return "physical aggregate: Discovery has no input";
     }

@@ -87,17 +87,17 @@ struct DeferredProbeScan {
     OperatorPtr left, const ir::Node* right_node, const TableRegistry* registry,
     const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,
     const std::vector<ir::JoinKey>* keys, const DeferredScan* probe, std::string probe_name,
-    ir::JoinSuffixPolicy suffix = {},
-    const std::vector<ir::OrderKey>* pending_order = nullptr,
+    ir::JoinSuffixPolicy suffix = {}, const std::vector<ir::OrderKey>* pending_order = nullptr,
     physical::JoinParallelism parallelism = {},
     std::optional<ir::JoinColumnMapping> columns = std::nullopt)
     -> std::expected<OperatorPtr, std::string>;
 
-[[nodiscard]] auto take_fusible_join_probe(
-    OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
-    const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},
-    const std::vector<ir::OrderKey>* pending_order = nullptr,
-    physical::JoinParallelism parallelism = {})
+[[nodiscard]] auto take_fusible_join_probe(OperatorPtr left, Table right,
+                                           const std::vector<ir::JoinKey>* keys,
+                                           const ExecutionContext& exec,
+                                           ir::JoinSuffixPolicy suffix = {},
+                                           const std::vector<ir::OrderKey>* pending_order = nullptr,
+                                           physical::JoinParallelism parallelism = {})
     -> std::expected<std::optional<FusibleJoinProbe>, std::string>;
 
 }  // namespace ibex::runtime

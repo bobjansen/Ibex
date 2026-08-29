@@ -712,7 +712,8 @@ struct ExecutionContext {
     /// whole-table and serial. Only the fallback node's direct children appear;
     /// deeper descendants are interpreted normally. Not owned — the tables live
     /// in the fallback frame for the duration of the `interpret_node` call.
-    const std::vector<std::pair<const ir::Node*, const Table*>>* pre_materialized_children = nullptr;
+    const std::vector<std::pair<const ir::Node*, const Table*>>* pre_materialized_children =
+        nullptr;
 
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.

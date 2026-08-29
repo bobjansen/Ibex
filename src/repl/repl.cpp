@@ -29,8 +29,6 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
-#include "runtime/physical_plan.hpp"
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -53,6 +51,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "runtime/physical_plan.hpp"
 #ifdef _WIN32
 #define NOMINMAX
 #include <io.h>
@@ -5317,9 +5317,8 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
 /// physical planning capability without materializing a source or executing it.
 void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& tables,
                             const LazyTableRegistry& lazy_tables,
-                            const runtime::ScalarRegistry& scalars,
-                            const ColumnRegistry& columns, const ModelRegistry& models,
-                            const FunctionRegistry& functions,
+                            const runtime::ScalarRegistry& scalars, const ColumnRegistry& columns,
+                            const ModelRegistry& models, const FunctionRegistry& functions,
                             const CompileTimeListRegistry& compile_time_lists,
                             const ExternDeclRegistry& extern_decls,
                             const runtime::ExternRegistry& externs) {
@@ -5357,7 +5356,8 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
     }
     for (const auto& entry : lazy_tables) {
         context.lexical_names.insert(entry.first);
-        context.source_schemas.insert_or_assign(entry.first, table_schema_info(entry.second->schema()));
+        context.source_schemas.insert_or_assign(entry.first,
+                                                table_schema_info(entry.second->schema()));
     }
 
     auto lowered = parser::lower_expr(expr, context);
@@ -5376,7 +5376,7 @@ void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& ta
     const auto plan = runtime::physical::plan_physical(*lowered.value(), tables, &externs,
                                                        context.source_schemas);
     ibex::formatting::print("Physical plan (capability; runtime fan-out may differ):\n{}",
-                           runtime::physical::explain_physical(plan));
+                            runtime::physical::explain_physical(plan));
 }
 
 }  // namespace

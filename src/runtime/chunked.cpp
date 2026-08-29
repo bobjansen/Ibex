@@ -65,8 +65,8 @@
 #include <immintrin.h>
 #endif
 
-#include "chunk_conversion_internal.hpp"
 #include "aggregate_chunked_internal.hpp"
+#include "chunk_conversion_internal.hpp"
 #include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "join_chunked_internal.hpp"
@@ -136,7 +136,6 @@ struct ChunkIdentity {
     chunk.row_offset = identity.row_offset;
     return chunk;
 }
-
 
 }  // namespace
 
@@ -3815,8 +3814,6 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     std::vector<uint8_t> left_cat_matches_;
 };
 
-
-
 }  // namespace
 
 auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
@@ -4075,8 +4072,7 @@ auto build_unary_materializing_operator(const ir::Node& child_node, const TableR
 }  // namespace
 
 auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materialized_source,
-                              JoinProbeFactory probe)
-    -> std::expected<OperatorPtr, std::string> {
+                              JoinProbeFactory probe) -> std::expected<OperatorPtr, std::string> {
     const ExecutionContext* exec = probe.execution_context();
     if (materialized_source.has_value() && exec != nullptr) {
         if (const std::size_t workers =
@@ -4475,8 +4471,8 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
     if (exec.can_fan_out() && plan.mode == physical::PipelineMode::MorselParallel &&
         index == plan.parallel_begin) {
         physical::note_map_pipeline_executed();
-        return pipeline_executor_detail::build_map_pipeline_parallel(
-            plan, registry, scalars, externs, exec, model_out);
+        return pipeline_executor_detail::build_map_pipeline_parallel(plan, registry, scalars,
+                                                                     externs, exec, model_out);
     }
     const auto build_child = [&] -> std::expected<OperatorPtr, std::string> {
         if (index + 1 == plan.steps.size()) {
@@ -4609,9 +4605,9 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
             return std::unexpected(std::move(right.error()));
         }
         return pipeline_executor_detail::make_pipelined_stage_if(
-            std::make_unique<ChunkedSemiAntiJoinOperator>(
-                std::move(left_op.value()), std::move(right.value()), join.kind(), &join.keys(),
-                &exec),
+            std::make_unique<ChunkedSemiAntiJoinOperator>(std::move(left_op.value()),
+                                                          std::move(right.value()), join.kind(),
+                                                          &join.keys(), &exec),
             stage_probe, exec, execution_profile_entry(exec.execution_profile, node));
     }
     if (!plan.streaming_join.has_value()) {
@@ -4813,8 +4809,8 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
         // retains only data-dependent gates such as actual row counts and
         // strategy-specific usefulness thresholds.
         return make_chunked_aggregate_operator(std::move(child_op.value()), &agg.group_by(),
-                                               &agg.aggregations(), exec,
-                                               std::move(*parallelism), ap.columns);
+                                               &agg.aggregations(), exec, std::move(*parallelism),
+                                               ap.columns);
     }
 
     return std::unexpected("physical aggregate: plan named no executable strategy");

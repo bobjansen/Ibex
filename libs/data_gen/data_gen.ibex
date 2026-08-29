@@ -30,3 +30,8 @@ extern fn gen_uniform(n: Int, low: Float64 = 0.0, high: Float64 = 1.0) -> DataFr
 
 // n sequential string ids "<prefix>0" .. "<prefix>(n-1)".
 extern fn gen_ids(n: Int, prefix: String = "row") -> DataFrame from "data_gen.hpp";
+
+// Static reference data: one row per distinct symbol, with columns
+// symbol, name, sector, currency, lot_size, tick_size. Deterministic (no RNG),
+// so it joins against `gen_ticks` output on `symbol`.
+extern fn gen_reference(symbols: String = "AAPL,MSFT,GOOG") -> DataFrame from "data_gen.hpp";

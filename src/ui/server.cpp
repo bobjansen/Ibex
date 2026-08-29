@@ -96,11 +96,13 @@ struct Session {
 
 // Seeded into each new browser session when the server runs with `--demo`.
 // Draws through the RNG bridge so `seed_rng` makes the tables reproducible.
-// `trades` columns are timestamp/symbol/price/volume; `prices` and `samples`
-// each expose a single `value` column.
+// `trades` columns are timestamp/symbol/price/volume; `reference` has one row
+// per symbol (symbol/name/sector/currency/lot_size/tick_size) and joins to
+// `trades` on `symbol`; `prices` and `samples` each expose a `value` column.
 constexpr std::string_view kDemoBootstrap = R"(import data_gen;
 seed_rng(20240115);
 let trades = gen_ticks(50000, "AAPL,MSFT,GOOG,AMZN,NVDA");
+let reference = gen_reference("AAPL,MSFT,GOOG,AMZN,NVDA");
 let prices = gen_walk(2000, 100.0, 1.0);
 let samples = gen_normal(10000, 0.0, 1.0);
 )";

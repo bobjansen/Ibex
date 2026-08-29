@@ -52,4 +52,11 @@ auto gen_uniform(const runtime::RngBridge& rng, std::int64_t n, double low, doub
 /// n sequential string ids "<prefix>0" .. "<prefix>(n-1)".
 auto gen_ids(std::int64_t n, const std::string& prefix) -> runtime::Table;
 
+/// Static reference/master data, one row per distinct symbol in `symbols` (a
+/// comma-separated list, e.g. "AAPL,MSFT,GOOG"). Columns: symbol, name,
+/// sector, currency, lot_size, tick_size. Deterministic: a given symbol
+/// always maps to the same row, so it joins cleanly against `gen_ticks`
+/// output on `symbol` regardless of RNG seed.
+auto gen_reference(const std::string& symbols) -> runtime::Table;
+
 }  // namespace ibex::data_gen

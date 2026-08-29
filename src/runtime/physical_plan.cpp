@@ -83,15 +83,15 @@ constexpr std::size_t kAggPartitionRowFloor = 1U << 18U;
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
 
-/// A footer row estimate for `distinct`'s input, or `None` when the input is
-/// not a bare registered scan. Deliberately conservative: a Filter or Join
-/// under the Distinct makes the count unknowable at plan time, and the planner
-/// never guesses — `None` means the operator decides on its first chunk, which
-/// is exactly today's behaviour.
-auto distinct_row_estimate(const ir::Node& distinct, const TableRegistry& registry) -> RowEstimate {
-    const ir::Node* cur = distinct.children().empty() ? nullptr : distinct.children().front().get();
+/// The exact cardinality of a registered table scan, or `None` when its input
+/// cardinality is altered or otherwise unavailable. Project, Rename, and a
+/// row-local Update preserve row count; a Filter or Join deliberately makes it
+/// unknowable at plan time.
+auto table_input_row_estimate(const ir::Node& root, const TableRegistry& registry) -> RowEstimate {
+    const ir::Node* cur = root.children().empty() ? nullptr : root.children().front().get();
     while (cur != nullptr &&
-           (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename)) {
+           (cur->kind() == ir::NodeKind::Project || cur->kind() == ir::NodeKind::Rename ||
+            cur->kind() == ir::NodeKind::Update)) {
         cur = cur->children().empty() ? nullptr : cur->children().front().get();
     }
     if (cur == nullptr || cur->kind() != ir::NodeKind::Scan) {
@@ -102,7 +102,7 @@ auto distinct_row_estimate(const ir::Node& distinct, const TableRegistry& regist
     if (it == registry.end()) {
         return {};
     }
-    return {.rows = it->second.rows(), .source = RowEstimate::Source::Footer};
+    return {.rows = it->second.rows(), .source = RowEstimate::Source::TableExact};
 }
 
 auto join_strategy_name(JoinStrategy strategy) -> std::string_view {
@@ -446,7 +446,7 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         plan.source_node = &root;
         plan.breaker_phases.push_back(
             {.name = "dedup",
-             .parallelism = distinct_dedup_parallelism(distinct_row_estimate(root, registry))});
+             .parallelism = distinct_dedup_parallelism(table_input_row_estimate(root, registry))});
         return plan;
     }
     if (root.kind() == ir::NodeKind::Order) {
@@ -481,10 +481,13 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
             // disagrees. The authority slices move the decision the way
             // distinct's and the join's did.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
+                const RowEstimate input_estimate = table_input_row_estimate(root, registry);
                 plan.breaker_phases.push_back(
-                    {.name = "partition", .parallelism = aggregate_partition_parallelism()});
+                    {.name = "partition",
+                     .parallelism = aggregate_partition_parallelism(input_estimate)});
                 plan.breaker_phases.push_back(
-                    {.name = "finalize", .parallelism = aggregate_finalize_parallelism()});
+                    {.name = "finalize",
+                     .parallelism = aggregate_finalize_parallelism(input_estimate)});
             }
             return plan;
         }
@@ -845,20 +848,22 @@ auto join_probe_parallelism() -> BreakerParallelism {
             .strategy = PartitionStrategy::Range};
 }
 
-auto aggregate_partition_parallelism() -> BreakerParallelism {
+auto aggregate_partition_parallelism(RowEstimate estimate) -> BreakerParallelism {
     // RadixHash is the general strategy; `try_owned` is a specialization of it
     // (partition-owned key maps instead of whole scattered partitions). The
     // operator resolves which at run time from the key type and cardinality,
     // the way the join resolves its build orientation.
     return {.row_floor = kAggPartitionRowFloor,
             .breaker_max_workers = kAggMaxWorkers,
-            .strategy = PartitionStrategy::RadixHash};
+            .strategy = PartitionStrategy::RadixHash,
+            .estimate = estimate};
 }
 
-auto aggregate_finalize_parallelism() -> BreakerParallelism {
+auto aggregate_finalize_parallelism(RowEstimate estimate) -> BreakerParallelism {
     return {.row_floor = kAggFinalizeRowFloor,
             .breaker_max_workers = kAggMaxWorkers,
-            .strategy = PartitionStrategy::Owned};
+            .strategy = PartitionStrategy::Owned,
+            .estimate = estimate};
 }
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,
@@ -919,9 +924,26 @@ void append_phase_lines(std::string& out, const std::vector<BreakerPhase>& phase
         }
         out += "  partitions=derived  ";
         out += partition_strategy_name(bp.strategy);
-        out += bp.estimate.confident()
-                   ? "\n         estimate " + std::to_string(bp.estimate.rows) + " rows (footer)"
-                   : "\n         no row estimate -> decided on first chunk";
+        if (!bp.estimate.confident()) {
+            out += "\n         no row estimate -> decided on first chunk";
+            continue;
+        }
+        out += "\n         input estimate " + std::to_string(bp.estimate.rows) + " rows (";
+        switch (bp.estimate.source) {
+            case RowEstimate::Source::Footer:
+                out += "footer";
+                break;
+            case RowEstimate::Source::TableExact:
+                out += "table";
+                break;
+            case RowEstimate::Source::ChildExact:
+                out += "child";
+                break;
+            case RowEstimate::Source::None:
+                out += "?";
+                break;
+        }
+        out += ")";
     }
 }
 }  // namespace

@@ -260,7 +260,7 @@ enum class PartitionStrategy : std::uint8_t {
 /// means the operator will decide on its first chunk (today's behaviour).
 struct RowEstimate {
     std::size_t rows = 0;
-    enum class Source : std::uint8_t { None, Footer, ChildExact } source = Source::None;
+    enum class Source : std::uint8_t { None, Footer, TableExact, ChildExact } source = Source::None;
 
     [[nodiscard]] auto confident() const noexcept -> bool { return source != Source::None; }
 };
@@ -345,8 +345,8 @@ struct JoinParallelism {
 /// - `finalize` — the K-way first-occurrence merge (`finalize_owned`'s
 ///   co-ranking merge, the ordered-run finalize, the non-owned first-row seed
 ///   pass). `row_floor` 131072 (`1U << 17U`).
-[[nodiscard]] auto aggregate_partition_parallelism() -> BreakerParallelism;
-[[nodiscard]] auto aggregate_finalize_parallelism() -> BreakerParallelism;
+[[nodiscard]] auto aggregate_partition_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
+[[nodiscard]] auto aggregate_finalize_parallelism(RowEstimate estimate = {}) -> BreakerParallelism;
 
 /// Both fan-out phases of a hash aggregate, resolved together — what
 /// `build_physical_aggregate` hands the operator. Bundled like `JoinParallelism`

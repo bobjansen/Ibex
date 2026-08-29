@@ -18,6 +18,10 @@ struct ServerConfig {
     /// Directory the browser workbench may access for user data.  When empty,
     /// the server uses its launch directory.
     std::filesystem::path data_directory;
+    /// When true, each new browser session is seeded with synthetic demo
+    /// tables (trades, prices, samples) via the `data_gen` plugin so a
+    /// first-time visitor can run queries without supplying data.
+    bool demo = false;
     repl::ReplConfig repl;
 };
 

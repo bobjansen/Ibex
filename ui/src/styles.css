@@ -121,6 +121,66 @@ aside header button {
 .toolbar {
   justify-content: space-between;
 }
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.brand small {
+  color: #8e9bab;
+}
+.brand-links {
+  display: flex;
+  gap: 10px;
+}
+.brand-links a {
+  color: #8fb7de;
+  font-size: 12px;
+  text-decoration: none;
+}
+.brand-links a:hover {
+  text-decoration: underline;
+}
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.examples {
+  color: inherit;
+  background: #2c333d;
+  border: 1px solid #46515f;
+  border-radius: 3px;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.welcome-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.welcome-card {
+  max-width: 460px;
+  margin: 16px;
+  padding: 20px 22px;
+  background: #1b2027;
+  border: 1px solid #46515f;
+  border-radius: 6px;
+}
+.welcome-card p {
+  color: #c3ccd8;
+  line-height: 1.5;
+}
+.welcome-card code {
+  padding: 1px 4px;
+  background: #2c333d;
+  border-radius: 3px;
+}
 .run {
   background: #236d45;
   border-color: #328456;

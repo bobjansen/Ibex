@@ -918,6 +918,10 @@ auto resolve_aggregate_columns(std::span<const ir::ColumnRef> group_by,
                                std::span<const std::string_view> input_names)
     -> std::expected<AggregateColumnMapping, std::string> {
     AggregateColumnMapping mapping;
+    mapping.input_names.reserve(input_names.size());
+    for (const std::string_view name : input_names) {
+        mapping.input_names.emplace_back(name);
+    }
     mapping.group_by.reserve(group_by.size());
     for (const ir::ColumnRef& key : group_by) {
         const auto found = std::ranges::find(input_names, key.name);

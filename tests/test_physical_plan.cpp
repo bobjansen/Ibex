@@ -1472,6 +1472,22 @@ TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations"
         CHECK(result_s[1] == expected_s[1]);
     }
 
+    SECTION("a narrower physical child layout is rebound once at the aggregate boundary") {
+        // Model a lazy scan that consumed a predicate-only leading column and
+        // therefore emitted [g, v] although logical inference saw
+        // [predicate_only, g, v]. The positions are valid for that logical
+        // schema but stale for the concrete breaker input.
+        plan.aggregate.columns->input_names = {"predicate_only", "g", "v"};
+        plan.aggregate.columns->group_by = {1};
+        plan.aggregate.columns->aggregate_inputs = {2};
+        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
+        REQUIRE(result.has_value());
+        REQUIRE(result->rows() == expected->rows());
+        const auto& result_s = std::get<Column<std::int64_t>>(*result->find("s"));
+        CHECK(result_s[0] == expected_s[0]);
+        CHECK(result_s[1] == expected_s[1]);
+    }
+
     SECTION("the serial executor accounts each structural phase independently") {
         auto profile = std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/1,
                                                                         /*report=*/false);

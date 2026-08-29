@@ -43,7 +43,7 @@ naming the logical subtree retained by the fallback"*).
 
 ## Steps
 
-### Step 1 — Name the `MaterializedCall` node (observability first)
+### Step 1 — Name the `MaterializedCall` node (observability first) — DONE `5f7afc59`
 
 `explain_physical` (`physical_plan.cpp` ~760) emits the root `NodeKind` in the
 `MaterializedCall(...)` line, e.g. `MaterializedCall(Melt: root is not a
@@ -52,20 +52,52 @@ row-local map)`. `plan.root` is always set (`plan_physical` line 509). Reuse
 `tests/test_physical_plan.cpp` (lines ~562, ~760, and the join-materializing
 block ~1138). No execution change. Landed first, on its own commit.
 
-### Step 2 — Collapse bucket A into the tail adapter
+### Step 2 — Collapse bucket A into the tail adapter — DONE `94957719` (pending A/B)
 
-Delete the per-kind `if` blocks for every bucket-A kind so they fall through to
-the single `interpret_node` + `make_table_source` tail. Gate each deletion on
-proving the branch does nothing the tail does not:
+Deleted the 15 per-kind `if` blocks (`Columns, Melt, Dcast, Cov, Corr,
+Transpose`, materializing `Join`, `Matmul, Update, Resample, Window, AsTimeframe,
+Model, Construct/Stream, Program`) so they fall through to the single
+`interpret_node` + `make_table_source` tail. Each was a hand-synced copy of an
+`interpret_node` branch that produces the same table via the same table fn with
+the same args and error strings (verified, including the grouped-update
+rank/tuple dispatch and the `window` + `select_only` projection). `Model`
+threads `model_out`; `Program` runs the preamble — both handled by
+`interpret_node`. `build_binary_materializing_operator` had no other caller and
+was removed.
 
-- Pure `interpret_node`+wrap kinds (`Columns, Melt, Dcast, Cov, Corr, Transpose,
-  Matmul, Resample, Construct, Stream`): trivially equivalent.
-- **Risk kinds** — `Window`, non-row-local `Update`, `Model`, `Program`: the
-  branch builds a child operator then calls a table fn. Must confirm
-  `interpret_node`'s path matches, including per-call rolling `__window_n`
-  handling, grouped-update overwrite semantics (see known-issue memories), and
-  `Program` preamble execution. Verify with `check-object-equivalence.sh` on
-  each and focused tests before deleting.
+Initial wholesale collapse (route everything to `interpret_node`) confirmed a
+regression: `join_filter_rank` +14.7% (`regression` verdict, 15 repeats). Root
+cause — a `Filter` feeding a bucket-A breaker (here the grouped-rank `update`
+between a join and its output filter) lost the fused parallel scan `build_operator`
+gave it; `interpret_node` re-evaluated it whole-table and serial.
+
+### Step 3 — `build_materialized_fallback` keeps input construction on the physical path
+
+`build_operator_impl`'s tail now calls `build_materialized_fallback`, which:
+
+1. Resolves the node's **relational inputs** via `fallback_relational_inputs` — a
+   `switch` allowlist. Most kinds: the direct children. `Window`: the *grandchild*
+   (its direct child is an `update` clause `interpret_node` must own). `Stream`,
+   `Construct`, `Program`, and anything unlisted: none (their children are
+   template / expression nodes, not relational subtrees).
+2. Builds and drains each input via `materialize_row_local` (= `build_operator` +
+   `materialize_operator`) — the fused parallel path.
+3. Runs `interpret_node` over the node with those inputs handed back through a
+   new `ExecutionContext::pre_materialized_children` list (node ptr → table).
+   `interpret_node` checks it at entry and returns the pre-built table instead
+   of recursing; only direct inputs are listed, so the fallback node itself and
+   everything deeper are interpreted normally.
+
+`interpret_node` still owns every per-kind semantic; this only moves where the
+inputs are built. Recoverable end state is unchanged — a kind can still be
+lifted to a fully migrated breaker-over-pipeline, driven by
+`physical_fallbacks_for(kind)`.
+
+Validation: all 1,815 non-slow tests; strict GCC; Debug + Release builds. A
+first attempt without the `Window` grandchild / `Stream` exclusions failed 51
+tests (evaluating an `update` clause or a `__stream_input__` transform
+standalone) — the allowlist is load-bearing. Release A/B over
+`join,reshape,window,stats,transform,multi` vs pre-step-2 pending.
 
 ### Step 3 — Separate bucket B from the fallback bucket
 

@@ -29,6 +29,8 @@
 #include <ibex/runtime/safe_arith.hpp>
 #include <ibex/runtime/table_format.hpp>
 
+#include "runtime/physical_plan.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -140,7 +142,7 @@ enum class ReadLineStatus : std::uint8_t { Line, Eof, Interrupted };
 constexpr std::string_view kColonCommands[] = {
     ":q",       ":quit",     ":exit", ":help",   ":tables",   ":scalars", ":functions",
     ":imports", ":schema",   ":head", ":peek",   ":describe", ":load",    ":timing",
-    ":time",    ":comments", ":doc",  ":source", ":run",
+    ":time",    ":comments", ":doc",  ":source", ":run",      ":explain",
 };
 
 constexpr std::string_view kCompletionBuiltins[] = {
@@ -2090,6 +2092,8 @@ void print_help() {
         "  :peek <expr>          Evaluate and compactly display an expression, with any\n"
         "                        order-sensitive claims it carries (time index, ordering,\n"
         "                        grouping)\n");
+    ibex::formatting::print(
+        "  :explain <expr>       Show the read-only physical-plan capability for one expression\n");
     ibex::formatting::print("  :describe <table>     Schema + first rows\n");
     ibex::formatting::print(
         "  :doc <name>           Show docs/signature for a binding or built-in\n");
@@ -5309,6 +5313,71 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     return true;
 }
 
+/// Lower one REPL expression exactly as the evaluator would, then render the
+/// physical planning capability without materializing a source or executing it.
+void print_physical_explain(parser::Expr& expr, const runtime::TableRegistry& tables,
+                            const LazyTableRegistry& lazy_tables,
+                            const runtime::ScalarRegistry& scalars,
+                            const ColumnRegistry& columns, const ModelRegistry& models,
+                            const FunctionRegistry& functions,
+                            const CompileTimeListRegistry& compile_time_lists,
+                            const ExternDeclRegistry& extern_decls,
+                            const runtime::ExternRegistry& externs) {
+    parser::LowerContext context;
+    context.compile_time_lists = compile_time_lists;
+    for (const auto& [name, decl] : extern_decls) {
+        if (decl.return_type.kind == parser::Type::Kind::DataFrame ||
+            decl.return_type.kind == parser::Type::Kind::TimeFrame) {
+            context.table_externs.insert(name);
+            context.table_extern_decls.insert_or_assign(name, &decl);
+        }
+        if (!decl.params.empty() && decl.params[0].type.kind == parser::Type::Kind::DataFrame) {
+            context.sink_externs.insert(name);
+        }
+    }
+    for (const auto& entry : scalars) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : columns) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : models) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : functions) {
+        context.lexical_names.insert(entry.first);
+        context.functions.insert_or_assign(entry.first, &entry.second);
+    }
+    for (const auto& entry : compile_time_lists) {
+        context.lexical_names.insert(entry.first);
+    }
+    for (const auto& entry : tables) {
+        context.lexical_names.insert(entry.first);
+        context.source_schemas.insert_or_assign(entry.first, table_schema_info(entry.second));
+    }
+    for (const auto& entry : lazy_tables) {
+        context.lexical_names.insert(entry.first);
+        context.source_schemas.insert_or_assign(entry.first, table_schema_info(entry.second->schema()));
+    }
+
+    auto lowered = parser::lower_expr(expr, context);
+    if (!lowered.has_value()) {
+        ibex::formatting::print("error: {}\n", lowered.error().message);
+        return;
+    }
+    lowered.value() =
+        ir::push_filters_into_joins(std::move(lowered.value()), context.source_schemas);
+    lowered.value() = ir::push_semi_joins_down(std::move(lowered.value()), context.source_schemas);
+    lowered.value() =
+        ir::reduce_inner_joins_to_semi(std::move(lowered.value()), context.source_schemas);
+    const ir::OptimizationContext optimization_context;
+    lowered.value() = ir::optimize_plan(std::move(lowered.value()), optimization_context);
+
+    const auto plan = runtime::physical::plan_physical(*lowered.value(), tables, &externs);
+    ibex::formatting::print("Physical plan (capability; runtime fan-out may differ):\n{}",
+                           runtime::physical::explain_physical(plan));
+}
+
 }  // namespace
 
 auto normalize_input(std::string_view input) -> std::string {
@@ -5693,6 +5762,27 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             print_table(table.value(), count);
             continue;
         }
+        if (starts_with_command(line_view, ":explain")) {
+            auto source = trim(line_view.substr(std::string_view(":explain").size()));
+            if (source.empty()) {
+                ibex::formatting::print("usage: :explain <expr>\n");
+                continue;
+            }
+            auto parsed = parser::parse(normalize_input(source));
+            if (!parsed.has_value()) {
+                ibex::formatting::print("error: {}\n", parsed.error().format());
+                continue;
+            }
+            if (parsed->statements.size() != 1 ||
+                !std::holds_alternative<parser::ExprStmt>(parsed->statements.front())) {
+                ibex::formatting::print("error: :explain expects a single expression\n");
+                continue;
+            }
+            auto& expr = std::get<parser::ExprStmt>(parsed->statements.front()).expr;
+            print_physical_explain(*expr, tables, lazy_tables, scalars, columns, models, functions,
+                                   compile_time_lists, extern_decls, registry);
+            continue;
+        }
         // Accept the obvious typo `:peak` as an alias for `:peek`.
         const bool is_peek = line_view.starts_with(":peek") &&
                              (line_view.size() == 5 || line_view[5] == ' ' || line_view[5] == '\t');
@@ -5839,7 +5929,8 @@ void run(const ReplConfig& config, runtime::ExternRegistry& registry) {
             ibex::formatting::print("error: unknown REPL command '{}'\n", cmd);
             ibex::formatting::print(
                 "known: :help, :tables, :scalars, :functions, :imports, :schema, :head, "
-                ":peek, :describe, :doc, :source, :load, :timing, :time, :comments, :quit\n");
+                ":peek, :explain, :describe, :doc, :source, :load, :timing, :time, :comments, "
+                ":quit\n");
             continue;
         }
 

@@ -845,6 +845,7 @@ directory.
 :schema <table>          Show column names and types
 :head <table> [n]        Show first n rows (default 10)
 :peek <expr>             Evaluate and compactly display an expression
+:explain <expr>          Show the physical-plan capability without executing it
 :describe <table> [n]    Schema + first n rows
 :doc <name>              Show docs/signature for a binding or built-in
 ?name                    Shorthand for :doc <name>

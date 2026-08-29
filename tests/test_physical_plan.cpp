@@ -1181,6 +1181,39 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
         REQUIRE(probe.breaker_max_workers == 64);
     }
 
+    SECTION("known renamed inputs resolve mapped keys to physical positions") {
+        runtime::Table left;
+        left.add_column("value", Column<std::int64_t>{10, 20});
+        left.add_column("id", Column<std::int64_t>{1, 2});
+        runtime::Table right;
+        right.add_column("other", Column<std::int64_t>{30, 40});
+        right.add_column("id", Column<std::int64_t>{2, 3});
+        runtime::TableRegistry registry;
+        registry.emplace("left_t", std::move(left));
+        registry.emplace("right_t", std::move(right));
+        auto tree = require_ir(
+            "(left_t[rename { left_id = id }] join "
+            "right_t[rename { right_id = id }] on { left_id = right_id });");
+        const auto plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+        REQUIRE(plan.streaming_join.has_value());
+        REQUIRE(plan.streaming_join->columns.has_value());
+        REQUIRE(plan.streaming_join->columns->keys.size() == 1);
+        CHECK(plan.streaming_join->columns->keys[0].left_index == 1);
+        CHECK(plan.streaming_join->columns->keys[0].right_index == 1);
+        CHECK(plan.streaming_join->columns->output[1].name == "left_id");
+        CHECK(plan.streaming_join->columns->output[3].name == "right_id");
+        const std::string text = runtime::physical::explain_physical(plan);
+        CHECK(text.find("columns: resolved  left[1]=right[1]  output=4") != std::string::npos);
+    }
+
+    SECTION("unknown input schemas defer the same mapping to execution") {
+        const auto [tree, plan] = serial_plan("(a join b on k);");
+        REQUIRE(plan.streaming_join.has_value());
+        REQUIRE_FALSE(plan.streaming_join->columns.has_value());
+        CHECK(runtime::physical::explain_physical(plan).find("columns: deferred") !=
+              std::string::npos);
+    }
+
     SECTION("explain physical renders the two nodes and their typed edge") {
         const auto [tree, plan] = serial_plan("(a join b on k);");
         const std::string text = runtime::physical::explain_physical(plan);
@@ -1283,6 +1316,45 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
             REQUIRE(plan.breaker_phases.empty());
         }
     }
+}
+
+TEST_CASE("Physical HashBuild and HashProbe consume the resolved join column mapping",
+          "[physical][breaker][execute][join]") {
+    runtime::Table left;
+    left.add_column("value", Column<std::int64_t>{10, 20, 30});
+    left.add_column("id", Column<std::int64_t>{1, 2, 3});
+    runtime::Table right;
+    right.add_column("other", Column<std::int64_t>{200, 300, 400});
+    right.add_column("id", Column<std::int64_t>{2, 3, 4});
+    runtime::TableRegistry registry;
+    registry.emplace("left_t", std::move(left));
+    registry.emplace("right_t", std::move(right));
+    auto tree = require_ir(
+        "(left_t[rename { left_id = id }] join "
+        "right_t[rename { right_id = id }] on { left_id = right_id });");
+
+    runtime::ExecutionContext serial;
+    serial.parallel_threads = 1;
+    runtime::ExecutionContext parallel;
+    parallel.parallel_threads = 4;
+    const auto s = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, serial);
+    const auto p = runtime::interpret(*tree, registry, nullptr, nullptr, nullptr, parallel);
+    REQUIRE(s.has_value());
+    REQUIRE(p.has_value());
+    REQUIRE(s->rows() == 2);
+    REQUIRE(p->rows() == s->rows());
+    const auto& left_ids = std::get<Column<std::int64_t>>(*s->find("left_id"));
+    const auto& right_ids = std::get<Column<std::int64_t>>(*s->find("right_id"));
+    const auto& parallel_left_ids = std::get<Column<std::int64_t>>(*p->find("left_id"));
+    const auto& parallel_right_ids = std::get<Column<std::int64_t>>(*p->find("right_id"));
+    CHECK(left_ids[0] == 2);
+    CHECK(left_ids[1] == 3);
+    CHECK(right_ids[0] == 2);
+    CHECK(right_ids[1] == 3);
+    CHECK(parallel_left_ids[0] == left_ids[0]);
+    CHECK(parallel_left_ids[1] == left_ids[1]);
+    CHECK(parallel_right_ids[0] == right_ids[0]);
+    CHECK(parallel_right_ids[1] == right_ids[1]);
 }
 
 TEST_CASE("The aggregate reads the plan: parallel output equals serial and the fan-out fires",

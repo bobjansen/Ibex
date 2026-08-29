@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <ibex/ir/join_output.hpp>
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
@@ -365,6 +366,9 @@ struct HashProbeNode {
 struct StreamingJoinNodes {
     HashBuildNode build;
     HashProbeNode probe;
+    /// Resolved during planning when both child schemas are closed and known;
+    /// otherwise bound once from the first concrete inputs at execution.
+    std::optional<ir::JoinColumnMapping> columns;
 };
 
 /// Validate the typed HashBuild -> HashProbe edge. The executor calls the same

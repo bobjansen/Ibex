@@ -20,6 +20,7 @@ using ibex::ir::JoinKind;
 using ibex::ir::JoinOutputSide;
 using ibex::ir::JoinSuffixPolicy;
 using ibex::ir::plan_join_output;
+using ibex::ir::resolve_join_columns;
 
 namespace {
 
@@ -63,6 +64,41 @@ TEST_CASE("join output plan: a mapped key keeps both native columns", "[ir][join
     const auto out = planned_names(JoinKind::Inner, {{"left_id", "right_id"}}, {"left_id", "val"},
                                    {"right_id", "other"});
     REQUIRE(out == std::vector<std::string>{"left_id", "val", "right_id", "other"});
+}
+
+TEST_CASE("join column mapping resolves mapped keys once to physical positions",
+          "[ir][join][schema]") {
+    const std::vector<std::string> left{"value", "left_id"};
+    const std::vector<std::string> right{"other", "right_id"};
+    const auto left_views = views(left);
+    const auto right_views = views(right);
+    const auto mapping =
+        resolve_join_columns(JoinKind::Inner, {{"left_id", "right_id"}}, left_views, right_views);
+    REQUIRE(mapping.has_value());
+    REQUIRE(mapping->keys.size() == 1);
+    CHECK(mapping->keys[0].left_index == 1);
+    CHECK(mapping->keys[0].right_index == 1);
+    REQUIRE(mapping->output.size() == 4);
+    CHECK(mapping->output[0].source_index == 0);
+    CHECK(mapping->output[1].source_index == 1);
+}
+
+TEST_CASE("join column mapping rejects a key absent from either concrete input",
+          "[ir][join][schema]") {
+    const std::vector<std::string> left{"left_id"};
+    const std::vector<std::string> right{"right_id"};
+    const auto left_views = views(left);
+    const auto right_views = views(right);
+    auto mapping =
+        resolve_join_columns(JoinKind::Inner, {{"missing", "right_id"}}, left_views, right_views);
+    REQUIRE_FALSE(mapping.has_value());
+    CHECK_THAT(mapping.error(), ContainsSubstring("missing"));
+    CHECK_THAT(mapping.error(), ContainsSubstring("left input"));
+
+    mapping =
+        resolve_join_columns(JoinKind::Inner, {{"left_id", "missing"}}, left_views, right_views);
+    REQUIRE_FALSE(mapping.has_value());
+    CHECK_THAT(mapping.error(), ContainsSubstring("right input"));
 }
 
 TEST_CASE("join output plan: an explicitly folded mapped key keeps native inputs",

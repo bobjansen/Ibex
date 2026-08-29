@@ -21,20 +21,19 @@
 
 namespace ibex::runtime::physical {
 
-/// Phase 1 of plans/kernel-pipeline-execution-plan.md: an explicit, data-only
-/// physical plan computed *beside* `build_operator`, before any of its
-/// per-kind branches run. The plan is the decision record — which pipelines
-/// exist, and why anything else materialized — not a second executor. Phase 2
-/// replaces per-step execution with kernels; until then a migrated pipeline
-/// constructs exactly the operators the per-kind switch would have.
+/// An explicit, data-only physical plan computed before execution construction.
+/// The plan is the decision record — which pipelines and breaker phases exist,
+/// and why anything else materialized. The physical-plan execution adapter
+/// consumes migrated plans; residual shapes use an explicit materialized-call
+/// fallback.
 ///
-/// Scope (deliberately tiny, per the plan's "first vocabulary"):
-/// a `MapPipeline` is a non-empty top-down chain of row-local map nodes
+/// A `MapPipeline` is a non-empty top-down chain of row-local map nodes
 /// (Filter, Project, Rename, and row-local Update) over a source. A source is
 /// a Scan, a chunked extern call, or the materialized output of a subtree that
-/// keeps the existing executor — a pipeline breaker feeding this pipeline.
-/// Everything else is a `MaterializedCall` placeholder naming the logical
-/// subtree that keeps the existing executor.
+/// keeps the residual executor — a pipeline breaker feeding this pipeline.
+/// Migrated breakers add explicit join and aggregate phase nodes plus the
+/// single-operator breaker descriptions; everything else is a
+/// `MaterializedCall` naming the logical subtree retained by the fallback.
 enum class SourceKind : std::uint8_t {
     TableScan,     ///< Scan of a table in the registry
     LazyScan,      ///< Scan resolved lazily (deferred/reader-backed)
@@ -157,11 +156,9 @@ enum class JoinBranch : std::uint8_t {
 
 /// What the plan knows about a `Join` node.
 ///
-/// Describes only. Execution still goes through `build_operator`'s per-kind
-/// switch, exactly as before -- this is the same order the island removal took
-/// (describe, prove the description equals what the builder does, then move
-/// execution), because a description that is wrong is much cheaper to find than
-/// an executor that is wrong.
+/// Streaming execution consumes this description through the physical-plan
+/// adapter. Materializing and semi/anti shapes retain their explicit fallback
+/// construction paths.
 struct JoinPlan {
     /// False unless the planned node is a `Join`.
     bool describes = false;
@@ -536,10 +533,9 @@ struct Plan {
     }
     std::vector<ColumnKernelSignature> source_signature;
     const ir::Node* root = nullptr;
-    /// Set when `root` is a `Join`. The plan does not execute it yet, so this
-    /// coexists with `migrated == false`: the plan describes more of the query
-    /// than it runs, which is what makes the backlog shrinkable one kind at a
-    /// time instead of in one jump.
+    /// Set when `root` is a `Join`. Streaming joins are migrated and consumed
+    /// by the physical-plan adapter; unsupported materializing shapes remain
+    /// described but use the explicit fallback.
     JoinPlan join;
     /// Present exactly for a streaming inner join. These are physical nodes,
     /// not generic labels in `breaker_phases`: their typed edge makes the
@@ -556,11 +552,11 @@ struct Plan {
     std::vector<BreakerPhase> breaker_phases;
 };
 
-/// Lower `root` into a Phase 1 plan. Read-only over the IR, the registry, and
+/// Lower `root` into a physical plan. Read-only over the IR, the registry, and
 /// the context; safe to call from tests and `explain` tooling with no intent
-/// to execute. A step is admitted only when the per-kind switch would build
-/// it as a map too (`is_map_step` mirrors that routing exactly), so the plan
-/// can never claim a shape the executor would construct differently.
+/// to execute. A map step is admitted only when the residual construction path
+/// agrees (`is_map_step` mirrors that routing exactly), so the plan cannot
+/// claim a shape the executor would construct differently.
 [[nodiscard]] auto plan_physical(const ir::Node& root, const TableRegistry& registry,
                                  const ExternRegistry* externs,
                                  const ir::SourceSchemas& source_schemas = {}) -> Plan;
@@ -588,8 +584,8 @@ struct Plan {
 [[nodiscard]] auto physical_materialized_calls() -> std::uint64_t;
 
 /// Record that a pipeline is executing (called once per plan that migrates,
-/// whether the executor is the Phase 1 serial composer or the parallel
-/// pipeline, which is the same pipeline's parallel mode).
+/// whether the adapter selects the serial composer or the same pipeline's
+/// parallel mode).
 void note_map_pipeline_executed();
 
 /// Record a fallback: one logical node the physical plan does not describe, so

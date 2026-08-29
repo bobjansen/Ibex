@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
-// chunked.cpp — streaming (chunked) operator pipeline: per-chunk operators,
-// rank evaluation, extern-call execution, and build_operator plan construction.
-// Split out of interpreter.cpp; shared declarations live in interpreter_internal.hpp.
+// chunked.cpp — residual streaming operators, the generic pipeline executor,
+// rank evaluation, extern-call execution, and the physical-plan execution
+// adapter. Planning itself lives in physical_plan.cpp. Split out of
+// interpreter.cpp; shared declarations live in interpreter_internal.hpp.
 
 #include <ibex/core/column.hpp>
 #include <ibex/core/time.hpp>
@@ -6790,18 +6791,16 @@ auto build_physical_map_step(const physical::Plan& plan, std::size_t index,
 }
 
 /// Build a join the plan migrated: `HashBuild` on one side, `HashProbe` on the
-/// other, expressed for now as the streaming operators that already implement
-/// exactly that. The kernel-pipeline plan's Phase 4 item 1.
+/// other. The family-owned join executor implements both phases and exposes a
+/// narrow construction boundary here. The kernel-pipeline plan's Phase 4 item
+/// 1.
 ///
 /// The three branches are the ones that used to sit in `build_operator_impl`'s
-/// per-kind switch, moved rather than rewritten -- which is the whole point of
-/// this slice. Construction lives with the plan, the decisions are the same
-/// ones `plan_join` already relayed, and the operators are untouched. The
-/// backlog moves because a join is now executed *by* the physical plan, the
-/// same sense in which a migrated map chain is: through a plan-owned builder
-/// rather than the per-kind switch. What is still ahead is decomposing the
-/// build and the probe into separate pipeline stages with a barrier between
-/// them, so a probe can be a step inside a map pipeline.
+/// per-kind switch. Construction lives with the plan, the decisions are the
+/// same ones `plan_join` relayed, and execution is now owned by the join
+/// family. HashBuild and HashProbe are explicit structural nodes connected by
+/// a typed runtime-orientation edge; an eligible probe can also become a step
+/// inside a map pipeline.
 
 /// Both of a streaming join's fan-out phases, resolved for this query. The
 /// capability halves are `physical::join_hash_build_parallelism` /

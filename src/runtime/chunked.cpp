@@ -7897,14 +7897,14 @@ class HashAggregateState final {
                 return false;
             }
             // As `try_owned`: fan-out permission and the worker cap are the
-            // plan's `partition` phase (src/runtime/PARALLELISM.md);
+            // plan's Discovery node (src/runtime/PARALLELISM.md);
             // `kIntOwnedMinRows` stays as this specialization's admission gate.
-            if (par_.partition.decline != physical::FanOutDecline::None ||
-                par_.partition.worker_cap < 2) {
+            if (par_.discovery.decline != physical::FanOutDecline::None ||
+                par_.discovery.worker_cap < 2) {
                 return false;
             }
             auto& pool = process_worker_pool();
-            const std::size_t workers = par_.partition.worker_cap;
+            const std::size_t workers = par_.discovery.worker_cap;
             owned_async_part_count_ = 1;
             while (owned_async_part_count_ * 2 <= workers) {
                 owned_async_part_count_ *= 2;
@@ -8002,10 +8002,10 @@ class HashAggregateState final {
             // (src/runtime/PARALLELISM.md); `decline != None` folds in
             // `!exec_->can_fan_out()`. `min_rows` stays here: it is the owned
             // strategy's own "is the specialization worth it" gate, lower than
-            // the radix `partition` floor, and an operator-resolved choice like
+            // Discovery's radix floor, and an operator-resolved choice like
             // the join's build orientation.
-            if (par_.partition.decline != physical::FanOutDecline::None ||
-                par_.partition.worker_cap < 2) {
+            if (par_.discovery.decline != physical::FanOutDecline::None ||
+                par_.discovery.worker_cap < 2) {
                 return false;
             }
             if (std::max(rows_offered_, rows) < min_rows) {
@@ -8014,7 +8014,7 @@ class HashAggregateState final {
         }
 
         auto& pool = process_worker_pool();
-        const std::size_t workers = par_.partition.worker_cap;
+        const std::size_t workers = par_.discovery.worker_cap;
         std::size_t part_count = 1;
         while (part_count * 2 <= workers) {
             part_count *= 2;
@@ -8309,14 +8309,14 @@ class HashAggregateState final {
         // steps by exactly one at each value and so equals any target rank at
         // exactly one `v`. Each worker then merges the disjoint input slices
         // between two frontiers into its disjoint output slice.
-        // The `finalize` phase's worker ceiling and fan-out permission are the
+        // The FinalOrdering node's worker ceiling and fan-out permission are the
         // plan's (src/runtime/PARALLELISM.md); `part_count` and `total / 4096`
         // stay here -- they need the group count discovery just produced. The
         // `1U << 17U` group floor is this merge's own threshold, beside it.
         std::size_t workers = 1;
-        if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+        if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
             !on_worker_pool_thread() && part_count >= 2 && total >= std::size_t{1} << 17U) {
-            workers = std::min({par_.finalize.worker_cap, part_count, total / 4096});
+            workers = std::min({par_.final_ordering.worker_cap, part_count, total / 4096});
         }
 
         if (workers < 2) {
@@ -8520,10 +8520,10 @@ class HashAggregateState final {
             // path's own `1U << 16U` run floor stay here (the ordered-run merge
             // is a strategy specialization, floor beside its code).
             std::size_t workers = 1;
-            if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+            if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
                 !on_worker_pool_thread() && run_count >= (std::size_t{1} << 16U) &&
                 std::getenv("IBEX_DISABLE_PARALLEL_ORDERED_MERGE") == nullptr) {
-                workers = std::min({par_.finalize.worker_cap, run_count / 8192});
+                workers = std::min({par_.final_ordering.worker_cap, run_count / 8192});
             }
 
             std::size_t total = 0;
@@ -9095,7 +9095,7 @@ class HashAggregateState final {
         // lowering it is a measured dead end, because the break-even is set by
         // group CARDINALITY and a low-cardinality run of this size loses.
         constexpr bool can_seed = !std::is_same_v<KeyOfGroup, NoGroupKeys>;
-        // The `partition` phase's worker cap and fan-out permission come from
+        // The Discovery node's worker cap and fan-out permission come from
         // the plan (src/runtime/PARALLELISM.md); the operator keeps only the two
         // checks it alone can make -- is it nested, did this operator's input so
         // far clear the floor. `decline != None` folds in `!exec_->can_fan_out()`
@@ -9105,8 +9105,8 @@ class HashAggregateState final {
         if (exec_ == nullptr || on_worker_pool_thread()) {
             return false;
         }
-        if (par_.partition.decline != physical::FanOutDecline::None ||
-            par_.partition.worker_cap < 2) {
+        if (par_.discovery.decline != physical::FanOutDecline::None ||
+            par_.discovery.worker_cap < 2) {
             return false;
         }
         if (!partitioned_active_) {
@@ -9123,7 +9123,7 @@ class HashAggregateState final {
             }
         }
         auto& pool = process_worker_pool();
-        const std::size_t workers = par_.partition.worker_cap;
+        const std::size_t workers = par_.discovery.worker_cap;
         std::size_t part_count = 1;
         while (part_count * 2 <= workers) {
             part_count *= 2;  // a power of two, so the partition is a mask
@@ -9364,11 +9364,12 @@ class HashAggregateState final {
         if (tail.size() * sizeof(AggSlotCore) < kMinTailBytes) {
             return false;
         }
-        if (exec_ == nullptr || !exec_->can_fan_out() || on_worker_pool_thread()) {
+        if (exec_ == nullptr || par_.accumulation.decline != physical::FanOutDecline::None ||
+            on_worker_pool_thread()) {
             return false;
         }
         auto& pool = process_worker_pool();
-        const std::size_t threads = std::min(std::size_t{16}, exec_->compute_budget());
+        const std::size_t threads = std::min(std::size_t{16}, par_.accumulation.worker_cap);
         if (threads < 2) {
             return false;
         }
@@ -9944,9 +9945,9 @@ class HashAggregateState final {
         // the first-occurrence count stays here (the shared knob, not a phase
         // constant).
         std::size_t threads = 1;
-        if (exec_ != nullptr && par_.finalize.decline == physical::FanOutDecline::None &&
+        if (exec_ != nullptr && par_.final_ordering.decline == physical::FanOutDecline::None &&
             !on_worker_pool_thread() && first_rows.size() >= exec_->parallel_min_rows) {
-            threads = par_.finalize.worker_cap;
+            threads = par_.final_ordering.worker_cap;
         }
         if (threads >= 2) {
             note_finalize_fanout();
@@ -10071,7 +10072,9 @@ class HashAggregateState final {
             }
         };
         const std::size_t threads =
-            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+            exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
+                ? std::min(morsels, par_.accumulation.worker_cap)
+                : std::size_t{1};
         const bool fanned_out = threads >= 2 && !on_worker_pool_thread();
         if (fanned_out) {
             auto& pool = process_worker_pool();
@@ -10473,7 +10476,9 @@ class HashAggregateState final {
                                     cat_partial_scratch.data() + (m * dict_size * scratch_stride_));
         };
         const std::size_t threads =
-            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+            exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
+                ? std::min(morsels, par_.accumulation.worker_cap)
+                : std::size_t{1};
         const bool fanned_out = threads >= 2 && !on_worker_pool_thread();
         if (fanned_out) {
             auto& pool = process_worker_pool();
@@ -10755,7 +10760,9 @@ class HashAggregateState final {
             }
         };
         const std::size_t threads =
-            std::min(morsels, exec_ != nullptr ? exec_->compute_budget() : std::size_t{1});
+            exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
+                ? std::min(morsels, par_.accumulation.worker_cap)
+                : std::size_t{1};
         // Submitting from a pool thread would deadlock (`WorkerPool::submit`
         // aborts rather than allow it), and one worker gains nothing from a
         // round trip, so both run the morsels here. The arithmetic is unchanged
@@ -11049,9 +11056,11 @@ class HashAggregateState final {
         // thread is about to do anyway, so it stays serial.
         auto& pool = process_worker_pool();
         const std::size_t threads =
-            std::min(n_out_columns, exec_ != nullptr ? exec_->compute_budget() : pool.size());
-        if (exec_ != nullptr && exec_->can_fan_out() && !on_worker_pool_thread() && threads > 1 &&
-            n_groups_ >= exec_->parallel_min_rows) {
+            exec_ != nullptr && par_.emission.decline == physical::FanOutDecline::None
+                ? std::min(n_out_columns, par_.emission.worker_cap)
+                : std::size_t{1};
+        if (exec_ != nullptr && !on_worker_pool_thread() && threads > 1 &&
+            n_groups_ >= par_.emission.row_floor) {
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(threads, [&](std::size_t) {
                 while (true) {
@@ -11321,7 +11330,7 @@ class HashAggregateState final {
     /// counts only rows the partitioned path itself consumed and exists to give
     /// group first-rows a global base.
     std::size_t rows_offered_ = 0;
-    /// The `partition` and `finalize` fan-out policies, resolved by
+    /// The four structural nodes' fan-out policies, resolved by
     /// `build_physical_aggregate` (src/runtime/PARALLELISM.md). The operator
     /// reads `par_.<phase>.{decline, worker_cap}` for fan-out permission and the
     /// worker ceiling; it keeps only what the plan cannot know -- nesting
@@ -12049,9 +12058,10 @@ namespace {
 /// (`inner_join_table`, the `IBEX_PROBE_MORSELS` probe POC) need it too.
 auto resolved_join_parallelism(const ExecutionContext& exec) -> physical::JoinParallelism;
 
-/// The hash aggregate's `partition` and `finalize` fan-out policies, resolved
-/// together. Defined next to `build_physical_aggregate`.
-auto resolved_aggregate_parallelism(const physical::Plan& plan, const ExecutionContext& exec)
+/// The hash aggregate's four structural-node policies, resolved together.
+/// Defined next to `build_physical_aggregate`.
+auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
+                                    const ExecutionContext& exec)
     -> std::expected<physical::AggregateParallelism, std::string>;
 
 }  // namespace
@@ -15033,22 +15043,24 @@ auto resolved_join_parallelism(const physical::StreamingJoinNodes& nodes,
 }
 
 /// As `resolved_join_parallelism`, for the hash aggregate. The capability half
-/// (floors, `min(budget, pool, 64)` ceiling, strategy) comes from
-/// `aggregate_{partition,finalize}_parallelism`; the resolved half needs the
+/// (floors, worker ceiling, strategy) comes from the four aggregate node
+/// policy factories; the resolved half needs the
 /// `ExecutionContext` and pool size, both in hand here at build time. One
 /// definition, shared by every aggregate construction site.
-auto resolved_aggregate_parallelism(const physical::Plan& plan, const ExecutionContext& exec)
+auto resolved_aggregate_parallelism(const physical::HashAggregateNodes& nodes,
+                                    const ExecutionContext& exec)
     -> std::expected<physical::AggregateParallelism, std::string> {
-    if (plan.breaker_phases.size() != 2 || plan.breaker_phases[0].name != "partition" ||
-        plan.breaker_phases[1].name != "finalize") {
-        return std::unexpected(
-            "physical aggregate: expected partition and finalize parallelism phases");
-    }
-    physical::AggregateParallelism par{.partition = plan.breaker_phases[0].parallelism,
-                                       .finalize = plan.breaker_phases[1].parallelism};
+    physical::AggregateParallelism par{
+        .discovery = nodes.discovery.parallelism,
+        .accumulation = nodes.accumulation.parallelism,
+        .final_ordering = nodes.final_ordering.parallelism,
+        .emission = nodes.emission.parallelism,
+    };
     const std::size_t pool_size = exec.can_fan_out() ? process_worker_pool().size() : 0;
-    physical::resolve_breaker_parallelism(par.partition, exec, pool_size);
-    physical::resolve_breaker_parallelism(par.finalize, exec, pool_size);
+    physical::resolve_breaker_parallelism(par.discovery, exec, pool_size);
+    physical::resolve_breaker_parallelism(par.accumulation, exec, pool_size);
+    physical::resolve_breaker_parallelism(par.final_ordering, exec, pool_size);
+    physical::resolve_breaker_parallelism(par.emission, exec, pool_size);
     return par;
 }
 
@@ -15281,7 +15293,7 @@ auto build_physical_aggregate(const physical::Plan& plan, const ir::Node& node,
             return std::unexpected(
                 "physical aggregate: Discovery input does not match the aggregate child");
         }
-        auto parallelism = resolved_aggregate_parallelism(plan, exec);
+        auto parallelism = resolved_aggregate_parallelism(*plan.hash_aggregate, exec);
         if (!parallelism.has_value()) {
             return std::unexpected(std::move(parallelism.error()));
         }

@@ -170,11 +170,11 @@ separate streaming operator.
      serial/parallel structural equality.
 3. **Phase 4 aggregate decomposition** — discovery / per-partition slots / final
    ordering / emission as phases. **Determinism blocker cleared 2026-08-27**
-   (guard test landed). The preflight is complete: partition and finalize
-   policies appear in `explain physical`; all current aggregate fan-out gates
-   read the resolved plan policy; `AggregateColumnMapping` binds known schemas
+   (guard test landed). The preflight is complete: all four structural-node
+   policies appear in `explain physical`; aggregate fan-out gates read their
+   node's resolved policy; `AggregateColumnMapping` binds known schemas
    during planning and lazy/open schemas once at execution; and physical-plan
-   mutation tests prove mapped positions, phase order, and worker ceilings are
+   mutation tests prove mapped positions, typed edges, and worker ceilings are
    consumed or rejected. **Structural plan slice DONE 2026-08-29:** the hash
    fallback carries typed Discovery → Accumulation → FinalOrdering → Emission
    nodes and ownership edges; `explain physical` renders the chain and the
@@ -192,6 +192,15 @@ separate streaming operator.
    independent profile rows. Release A/B over `groupagg,multi,events` (7
    interleaved repeats, 3 timed iterations, pinned core) found all nine query
    deltas noise; final total +0.22%, geometric speedup 0.992×.
+   **Structural fan-out authority DONE 2026-08-29:** the coarse `partition` /
+   `finalize` records are removed. Discovery, Accumulation, FinalOrdering, and
+   Emission each carry and supply their own policy; explain renders all four,
+   and profile-backed mutations prove the executor consumes their individual
+   worker ceilings. Data-derived morsel/partition counts and specialization
+   thresholds remain next to the kernels that can observe them. Release A/B
+   against the preceding commit over `groupagg,multi,events` (7 interleaved
+   repeats, 3 timed iterations, pinned core) classified all nine deltas as
+   noise; total +0.53%, geometric speedup 0.998×.
 4. **Port `Tail` / `TopK` / `FilterHead` / `FilterTail` — DONE.** Same
    single-operator shape as Order/Head: `plan_physical` marks each migrated,
    `build_physical_{tail,topk,filter_head_tail}` construct them (moved verbatim
@@ -453,13 +462,15 @@ at all (a one-valued strategy enum would be ceremony).
    split, and per-node accounting are also DONE. The former determinism blocker
    is resolved. `StreamingSorted` is the historical name for an adaptive
    strategy: sorted group-at-a-time when possible, hash fallback otherwise
-   (including ordinary generated tables). Next replace the coarser
-   partition/finalize policy pair with policy attached to each structural node.
+   (including ordinary generated tables). Each structural node now owns its
+   fan-out policy. The next step is extracting this completed aggregate family
+   from `chunked.cpp` behind the existing physical planner/executor seam.
 3. **Distinct + ordered** — construction DONE; `Tail`/`TopK`/`FilterHead`/
    `FilterTail` ported too (see "Next" item 4). The whole Head/Tail/TopK/Filter*
    family and Distinct/Order now leave the per-kind switch.
 4. Delete the `chunked.cpp` classes only after the physical path handles every
-   supported shape and the fallback is mutation-tested. Blocked on 1–2.
+   supported shape and the fallback is mutation-tested. Join and aggregate no
+   longer block extraction; begin with the aggregate family as the next slice.
 
 ### Phase 5 — retire the monolith, simplify IR
 
@@ -495,9 +506,10 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    orchestration and plan-shape/accounting tests, then admit fan-out one phase
    at a time with byte-identity checks. The typed plan shape and edge-mutation
    tests, serial orchestration, bounded discovery transfer, fused marker, and
-   independent profile accounting are complete. Next attach fan-out policy to
-   each structural node and admit it one phase at a time. Positional inputs,
-   authoritative current policy, and the executor mutation seam are in place.
+   independent profile accounting are complete. Each structural node now owns
+   and supplies its fan-out policy, with byte-identity and profile-backed
+   worker-ceiling mutations. This step is complete; extraction in item 5 is
+   next.
 4. Add per-phase scheduling accounting only after steps 2–3 provide stable
    pipeline identities. Keep DOP/memory budgeting blocked unless those changes
    produce measured queue contention or a multi-producer consumer.

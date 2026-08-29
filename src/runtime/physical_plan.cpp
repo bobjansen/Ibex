@@ -70,17 +70,17 @@ constexpr std::size_t kJoinBuildRowFloor = 1U << 17U;
 constexpr std::size_t kJoinProbeRowFloor = 1U << 14U;
 constexpr std::size_t kJoinMaxWorkers = 64;
 
-/// A hash aggregate's two fan-out floors, matching the private constants in
-/// `chunked.cpp`. `kAggPartitionRowFloor` is the general radix path's
+/// Hash-aggregate fan-out floors, matching the private constants in
+/// `chunked.cpp`. `kAggPartitionRowFloor` is Discovery's general radix path's
 /// `kDefaultPartitionMinRows` -- the row count below which `try_discover_
 /// partitioned` stays serial. `try_owned`'s lower `kPairOwnedMinRows` (65536)
 /// is not the phase floor: it is the operator-resolved "is the owned
 /// specialization worth it" gate, the same kind of runtime strategy choice the
 /// join operator makes for its build orientation, and it stays in the operator.
 /// `kAggFinalizeRowFloor` matches the `1U << 17U` group-count gate on
-/// `finalize_owned`'s parallel co-ranking merge. Both phases share the
-/// `min(budget, pool, 64)` worker cap that is open-coded at ~7 sites in
-/// `ChunkedAggregateOperator` today.
+/// `finalize_owned`'s parallel co-ranking merge. Discovery, Accumulation, and
+/// FinalOrdering retain the existing 64-worker ceiling; Emission is bounded by
+/// its output-column count and the shared compute budget.
 constexpr std::size_t kAggPartitionRowFloor = 1U << 18U;
 constexpr std::size_t kAggFinalizeRowFloor = 1U << 17U;
 constexpr std::size_t kAggMaxWorkers = 64;
@@ -562,30 +562,30 @@ auto plan_physical(const ir::Node& root, const TableRegistry& registry,
         if (plan.aggregate.strategy != AggregateStrategy::MaterializeAll) {
             plan.migrated = true;
             plan.source_node = &root;
-            // Plan the adaptive streamable aggregate's two current fan-out
-            // policies. `build_physical_aggregate` resolves and consumes both;
-            // the hash fallback uses `partition` and `finalize`. The fused
-            // left-join count is whole-table and has no fan-out to describe.
+            // Plan the adaptive streamable aggregate's structural nodes and
+            // attach the fan-out policy each node owns. The fused left-join
+            // count is whole-table and has no hash fallback to describe.
             if (plan.aggregate.strategy == AggregateStrategy::StreamingSorted) {
                 plan.aggregate.columns = known_aggregate_column_mapping(aggregate, schemas);
+                const RowEstimate input_estimate = table_input_row_estimate(root, registry);
                 plan.hash_aggregate = HashAggregateNodes{
                     .discovery = {.source = aggregate.children().front().get(),
                                   .input = AggregateDataKind::InputChunks,
-                                  .output = AggregateDataKind::DiscoveredGroups},
+                                  .output = AggregateDataKind::DiscoveredGroups,
+                                  .parallelism =
+                                      aggregate_discovery_parallelism(input_estimate)},
                     .accumulation = {.input = AggregateDataKind::DiscoveredGroups,
-                                     .output = AggregateDataKind::AccumulatedGroups},
+                                     .output = AggregateDataKind::AccumulatedGroups,
+                                     .parallelism =
+                                         aggregate_accumulation_parallelism(input_estimate)},
                     .final_ordering = {.input = AggregateDataKind::AccumulatedGroups,
-                                       .output = AggregateDataKind::OrderedGroups},
+                                       .output = AggregateDataKind::OrderedGroups,
+                                       .parallelism =
+                                           aggregate_final_ordering_parallelism(input_estimate)},
                     .emission = {.input = AggregateDataKind::OrderedGroups,
-                                 .output = AggregateDataKind::OutputChunks},
+                                 .output = AggregateDataKind::OutputChunks,
+                                 .parallelism = aggregate_emission_parallelism(input_estimate)},
                 };
-                const RowEstimate input_estimate = table_input_row_estimate(root, registry);
-                plan.breaker_phases.push_back(
-                    {.name = "partition",
-                     .parallelism = aggregate_partition_parallelism(input_estimate)});
-                plan.breaker_phases.push_back(
-                    {.name = "finalize",
-                     .parallelism = aggregate_finalize_parallelism(input_estimate)});
             }
             return plan;
         }
@@ -809,16 +809,25 @@ auto explain_physical(const Plan& plan) -> std::string {
             return out;
         }
         if (plan.aggregate.describes) {
-            // The adaptive path shows both its structural hash-fallback chain
-            // and its current fan-out policies. A fused left-join count has
+            // The adaptive path shows its structural hash-fallback chain and
+            // each node's own fan-out policy. A fused left-join count has
             // neither and prints just the strategy.
             out += "Breaker(Aggregate)\n  " + explain_aggregate(plan.aggregate);
             if (plan.hash_aggregate.has_value()) {
                 out += "\n  hash-fallback: Discovery -> Accumulation -> FinalOrdering -> Emission";
                 out += "\n    edge: InputChunks -> DiscoveredGroups -> AccumulatedGroups -> "
                        "OrderedGroups -> OutputChunks";
+                const std::vector<BreakerPhase> nodes{
+                    {.name = "Discovery",
+                     .parallelism = plan.hash_aggregate->discovery.parallelism},
+                    {.name = "Accumulation",
+                     .parallelism = plan.hash_aggregate->accumulation.parallelism},
+                    {.name = "FinalOrdering",
+                     .parallelism = plan.hash_aggregate->final_ordering.parallelism},
+                    {.name = "Emission", .parallelism = plan.hash_aggregate->emission.parallelism},
+                };
+                append_phase_lines(out, nodes);
             }
-            append_phase_lines(out, plan.breaker_phases);
             out += '\n';
             return out;
         }
@@ -982,6 +991,10 @@ auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
             return "head-table (partition by key hash)";
         case PartitionStrategy::Range:
             return "range (contiguous probe-row slices)";
+        case PartitionStrategy::Morsel:
+            return "morsel (deterministic row ranges)";
+        case PartitionStrategy::Column:
+            return "column (independent output columns)";
     }
     return "?";
 }
@@ -1012,7 +1025,7 @@ auto join_probe_parallelism() -> BreakerParallelism {
             .strategy = PartitionStrategy::Range};
 }
 
-auto aggregate_partition_parallelism(RowEstimate estimate) -> BreakerParallelism {
+auto aggregate_discovery_parallelism(RowEstimate estimate) -> BreakerParallelism {
     // RadixHash is the general strategy; `try_owned` is a specialization of it
     // (partition-owned key maps instead of whole scattered partitions). The
     // operator resolves which at run time from the key type and cardinality,
@@ -1023,11 +1036,22 @@ auto aggregate_partition_parallelism(RowEstimate estimate) -> BreakerParallelism
             .estimate = estimate};
 }
 
-auto aggregate_finalize_parallelism(RowEstimate estimate) -> BreakerParallelism {
+auto aggregate_accumulation_parallelism(RowEstimate estimate) -> BreakerParallelism {
+    return {.row_floor = kAggFinalizeRowFloor,
+            .breaker_max_workers = kAggMaxWorkers,
+            .strategy = PartitionStrategy::Morsel,
+            .estimate = estimate};
+}
+
+auto aggregate_final_ordering_parallelism(RowEstimate estimate) -> BreakerParallelism {
     return {.row_floor = kAggFinalizeRowFloor,
             .breaker_max_workers = kAggMaxWorkers,
             .strategy = PartitionStrategy::Owned,
             .estimate = estimate};
+}
+
+auto aggregate_emission_parallelism(RowEstimate estimate) -> BreakerParallelism {
+    return {.strategy = PartitionStrategy::Column, .estimate = estimate};
 }
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,

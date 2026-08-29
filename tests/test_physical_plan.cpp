@@ -1273,7 +1273,8 @@ TEST_CASE("The plan describes a streaming join's two fan-out phases", "[physical
     }
 }
 
-TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical][breaker]") {
+TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
+          "[physical][breaker]") {
     SECTION("the hash fallback has four typed structural phases") {
         const auto [tree, plan] =
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
@@ -1293,24 +1294,30 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE_FALSE(runtime::physical::validate_hash_aggregate_edges(nodes).has_value());
     }
 
-    SECTION("partition then finalize, each with its own floor and strategy") {
+    SECTION("each structural node owns its fan-out policy") {
         const auto [tree, plan] =
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
         REQUIRE(plan.migrated);
         REQUIRE(plan.aggregate.strategy == runtime::physical::AggregateStrategy::StreamingSorted);
-        REQUIRE(plan.breaker_phases.size() == 2);
-
-        const auto& partition = plan.breaker_phases[0];
-        REQUIRE(partition.name == "partition");
-        REQUIRE(partition.parallelism.strategy == runtime::physical::PartitionStrategy::RadixHash);
-        REQUIRE(partition.parallelism.row_floor == (1U << 18U));  // radix kDefaultPartitionMinRows
-        REQUIRE(partition.parallelism.breaker_max_workers == 64);
-
-        const auto& finalize = plan.breaker_phases[1];
-        REQUIRE(finalize.name == "finalize");
-        REQUIRE(finalize.parallelism.strategy == runtime::physical::PartitionStrategy::Owned);
-        REQUIRE(finalize.parallelism.row_floor == (1U << 17U));  // finalize_owned's merge gate
-        REQUIRE(finalize.parallelism.breaker_max_workers == 64);
+        REQUIRE(plan.breaker_phases.empty());
+        REQUIRE(plan.hash_aggregate.has_value());
+        const auto& nodes = *plan.hash_aggregate;
+        REQUIRE(nodes.discovery.parallelism.strategy ==
+                runtime::physical::PartitionStrategy::RadixHash);
+        REQUIRE(nodes.discovery.parallelism.row_floor == (1U << 18U));
+        REQUIRE(nodes.discovery.parallelism.breaker_max_workers == 64);
+        REQUIRE(nodes.accumulation.parallelism.strategy ==
+                runtime::physical::PartitionStrategy::Morsel);
+        REQUIRE(nodes.accumulation.parallelism.row_floor == (1U << 17U));
+        REQUIRE(nodes.accumulation.parallelism.breaker_max_workers == 64);
+        REQUIRE(nodes.final_ordering.parallelism.strategy ==
+                runtime::physical::PartitionStrategy::Owned);
+        REQUIRE(nodes.final_ordering.parallelism.row_floor == (1U << 17U));
+        REQUIRE(nodes.final_ordering.parallelism.breaker_max_workers == 64);
+        REQUIRE(nodes.emission.parallelism.strategy ==
+                runtime::physical::PartitionStrategy::Column);
+        REQUIRE(nodes.emission.parallelism.row_floor == 0);
+        REQUIRE(nodes.emission.parallelism.breaker_max_workers == 0);
     }
 
     SECTION("explain physical renders the strategy line and both phases") {
@@ -1318,8 +1325,10 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
         const std::string text = runtime::physical::explain_physical(plan);
         REQUIRE(text.find("Breaker(Aggregate)") != std::string::npos);
-        REQUIRE(text.find("partition:") != std::string::npos);
-        REQUIRE(text.find("finalize:") != std::string::npos);
+        REQUIRE(text.find("Discovery:") != std::string::npos);
+        REQUIRE(text.find("Accumulation:") != std::string::npos);
+        REQUIRE(text.find("FinalOrdering:") != std::string::npos);
+        REQUIRE(text.find("Emission:") != std::string::npos);
         REQUIRE(text.find("Discovery -> Accumulation -> FinalOrdering -> Emission") !=
                 std::string::npos);
         REQUIRE(text.find("InputChunks -> DiscoveredGroups -> AccumulatedGroups -> OrderedGroups -> "
@@ -1328,14 +1337,17 @@ TEST_CASE("The plan describes a hash aggregate's two fan-out phases", "[physical
         REQUIRE(text.find("MapPipeline") == std::string::npos);
     }
 
-    SECTION("a registered scan gives both phases its exact input-row bound") {
+    SECTION("a registered scan gives all four nodes its exact input-row bound") {
         const auto [tree, plan] =
             serial_plan("trades[select { total = sum(price) }, by { symbol }];");
-        REQUIRE(plan.breaker_phases.size() == 2);
-        for (const auto& phase : plan.breaker_phases) {
-            REQUIRE(phase.parallelism.estimate.source ==
+        REQUIRE(plan.hash_aggregate.has_value());
+        for (const auto* policy : {&plan.hash_aggregate->discovery.parallelism,
+                                   &plan.hash_aggregate->accumulation.parallelism,
+                                   &plan.hash_aggregate->final_ordering.parallelism,
+                                   &plan.hash_aggregate->emission.parallelism}) {
+            REQUIRE(policy->estimate.source ==
                     runtime::physical::RowEstimate::Source::TableExact);
-            REQUIRE(phase.parallelism.estimate.rows == 3);
+            REQUIRE(policy->estimate.rows == 3);
         }
         const std::string text = runtime::physical::explain_physical(plan);
         REQUIRE(text.find("input estimate 3 rows (table)") != std::string::npos);
@@ -1478,13 +1490,6 @@ TEST_CASE("Physical aggregate consumes its column mapping and rejects mutations"
         }
     }
 
-    SECTION("mutating the planned phase order is rejected") {
-        std::swap(plan.breaker_phases[0], plan.breaker_phases[1]);
-        const auto result = execute_physical_plan(plan, *tree, registry, serial_exec());
-        REQUIRE_FALSE(result.has_value());
-        CHECK(result.error().find("expected partition and finalize") != std::string::npos);
-    }
-
     SECTION("mutating a structural phase edge is rejected") {
         REQUIRE(plan.hash_aggregate.has_value());
         plan.hash_aggregate->final_ordering.input =
@@ -1574,6 +1579,9 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
     parallel.parallel_threads = 8;
     parallel.parallel_min_rows = 0;
     parallel.parallel_stats = &stats;
+    auto parallel_profile =
+        std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8, /*report=*/false);
+    parallel.execution_profile = parallel_profile;
 
     const auto s = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, serial);
     const auto p = runtime::interpret(*ir, registry, nullptr, nullptr, nullptr, parallel);
@@ -1581,6 +1589,16 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
     REQUIRE(p.has_value());
     REQUIRE(stats.parallel_aggregate_partitions.load() > 0);  // the radix partition phase fired
     REQUIRE(stats.parallel_aggregate_finalizes.load() > 0);   // and its merge phase
+    const auto profile_tasks = [](const auto& rows, std::string_view label) {
+        const auto row = std::ranges::find_if(
+            rows, [&](const auto& candidate) { return candidate.label == label; });
+        REQUIRE(row != rows.end());
+        return row->pool_tasks;
+    };
+    const auto parallel_rows = parallel_profile->snapshot();
+    REQUIRE(profile_tasks(parallel_rows, "Aggregate.Discovery") > 0);
+    REQUIRE(profile_tasks(parallel_rows, "Aggregate.FinalOrdering") > 0);
+    REQUIRE(profile_tasks(parallel_rows, "Aggregate.Emission") > 0);
     REQUIRE(s->rows() == p->rows());
     REQUIRE(s->rows() == static_cast<std::size_t>(kKeys));
 
@@ -1595,27 +1613,98 @@ TEST_CASE("The aggregate reads the plan: parallel output equals serial and the f
     }
 
     // Execute an explicitly mutated copy through the same physical executor.
-    // A worker ceiling of one on each phase must suppress both fan-out points;
+    // A worker ceiling of one on each structural node must suppress fan-out;
     // if the builder recreated factory defaults, these counters would fire.
     auto capped_plan = runtime::physical::plan_physical(*ir, registry, nullptr);
-    REQUIRE(capped_plan.breaker_phases.size() == 2);
-    capped_plan.breaker_phases[0].parallelism.breaker_max_workers = 1;
-    capped_plan.breaker_phases[1].parallelism.breaker_max_workers = 1;
+    REQUIRE(capped_plan.hash_aggregate.has_value());
+    capped_plan.hash_aggregate->discovery.parallelism.breaker_max_workers = 1;
+    capped_plan.hash_aggregate->accumulation.parallelism.breaker_max_workers = 1;
+    capped_plan.hash_aggregate->final_ordering.parallelism.breaker_max_workers = 1;
+    capped_plan.hash_aggregate->emission.parallelism.breaker_max_workers = 1;
     runtime::ParallelPipelineStats capped_stats;
     runtime::ExecutionContext capped_exec;
     capped_exec.parallel_threads = 8;
     capped_exec.parallel_min_rows = 0;
     capped_exec.parallel_stats = &capped_stats;
+    auto capped_profile =
+        std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8, /*report=*/false);
+    capped_exec.execution_profile = capped_profile;
     const auto capped = execute_physical_plan(capped_plan, *ir, registry, capped_exec);
     REQUIRE(capped.has_value());
     REQUIRE(capped_stats.parallel_aggregate_partitions.load() == 0);
     REQUIRE(capped_stats.parallel_aggregate_finalizes.load() == 0);
+    const auto capped_rows = capped_profile->snapshot();
+    for (const std::string_view label : {"Aggregate.Discovery", "Aggregate.Accumulation",
+                                         "Aggregate.FinalOrdering", "Aggregate.Emission"}) {
+        REQUIRE(profile_tasks(capped_rows, label) == 0);
+    }
     REQUIRE(capped->rows() == s->rows());
     const auto& capped_g = std::get<Column<std::int64_t>>(*capped->find_entry("g")->column);
     const auto& capped_v = std::get<Column<double>>(*capped->find_entry("s")->column);
     for (std::size_t i = 0; i < s->rows(); ++i) {
         REQUIRE(capped_g[i] == sg[i]);
         REQUIRE(capped_v[i] == sv[i]);
+    }
+}
+
+TEST_CASE("Aggregate Accumulation consumes its structural-node worker ceiling",
+          "[physical][breaker][execute]") {
+    constexpr std::int64_t kRows = 300'000;
+    runtime::Table input;
+    Column<std::int64_t> groups;
+    Column<double> values;
+    groups.reserve(kRows);
+    values.reserve(kRows);
+    for (std::int64_t row = 0; row < kRows; ++row) {
+        groups.push_back(row % 8);
+        values.push_back(static_cast<double>(row % 97));
+    }
+    input.add_column("g", std::move(groups));
+    input.add_column("v", std::move(values));
+    runtime::TableRegistry registry;
+    registry.emplace("many", std::move(input));
+    auto tree = require_ir("many[select { s = sum(v), n = count() }, by { g }];");
+
+    const auto tasks_for = [](const auto& profile, std::string_view label) {
+        const auto rows = profile->snapshot();
+        const auto row = std::ranges::find_if(
+            rows, [&](const auto& candidate) { return candidate.label == label; });
+        REQUIRE(row != rows.end());
+        return row->pool_tasks;
+    };
+    const auto run = [&](runtime::physical::Plan plan) {
+        auto profile =
+            std::make_shared<runtime::ExecutionProfileState>(/*worker_budget=*/8, /*report=*/false);
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = 8;
+        exec.parallel_min_rows = 0;
+        exec.execution_profile = profile;
+        auto result = execute_physical_plan(plan, *tree, registry, exec);
+        REQUIRE(result.has_value());
+        return std::pair{std::move(*result), std::move(profile)};
+    };
+
+    auto baseline_plan = runtime::physical::plan_physical(*tree, registry, nullptr);
+    auto [baseline, baseline_profile] = run(baseline_plan);
+    REQUIRE(tasks_for(baseline_profile, "Aggregate.Discovery") > 0);
+    REQUIRE(tasks_for(baseline_profile, "Aggregate.Accumulation") > 0);
+
+    REQUIRE(baseline_plan.hash_aggregate.has_value());
+    baseline_plan.hash_aggregate->accumulation.parallelism.breaker_max_workers = 1;
+    auto [capped, capped_profile] = run(std::move(baseline_plan));
+    REQUIRE(tasks_for(capped_profile, "Aggregate.Discovery") > 0);
+    REQUIRE(tasks_for(capped_profile, "Aggregate.Accumulation") == 0);
+    REQUIRE(capped.rows() == baseline.rows());
+    const auto& capped_g = std::get<Column<std::int64_t>>(*capped.find("g"));
+    const auto& baseline_g = std::get<Column<std::int64_t>>(*baseline.find("g"));
+    const auto& capped_s = std::get<Column<double>>(*capped.find("s"));
+    const auto& baseline_s = std::get<Column<double>>(*baseline.find("s"));
+    const auto& capped_n = std::get<Column<std::int64_t>>(*capped.find("n"));
+    const auto& baseline_n = std::get<Column<std::int64_t>>(*baseline.find("n"));
+    for (std::size_t row = 0; row < baseline.rows(); ++row) {
+        CHECK(capped_g[row] == baseline_g[row]);
+        CHECK(capped_s[row] == baseline_s[row]);
+        CHECK(capped_n[row] == baseline_n[row]);
     }
 }
 

@@ -264,10 +264,10 @@ disagree.
 **The structural owner now exists for migrated breakers.** Distinct, streaming
 Join, and streaming Aggregate take their fan-out policies from explicit
 physical nodes and expose those decisions through `explain physical`.
-Aggregate's four phases additionally live outside `chunked.cpp`. Remaining
-operator-private decisions belong to breaker families that have not completed
-that migration; do not generalize their local thresholds into a second policy
-system.
+Aggregate's four phases, streaming inner join, and migrated-plan dispatch now
+live outside `chunked.cpp`. Remaining operator-private decisions belong to
+breaker families that have not completed that migration; do not generalize
+their local thresholds into a second policy system.
 
 **The symptoms** (`plans/parallelism-overview.md` Part 2 is the live
 catalogue): type-exclusion rules with no shared "is this type parallel-capable

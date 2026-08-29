@@ -26,10 +26,11 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 ## Why
 
-`src/runtime/chunked.cpp` remains the physical-plan execution adapter, most
-streaming operator implementations, parallel pipelines, pipelined stages, and
-a large set of operator-specific eligibility rules. Planning itself already
-lives in `physical_plan.cpp`. Aggregate and streaming inner join have moved to
+`src/runtime/chunked.cpp` remains most residual streaming operator
+implementations, the generic map/morsel composer, pipelined stages, and a large
+set of operator-specific eligibility rules. Planning lives in
+`physical_plan.cpp`, and migrated-plan validation and dispatch now live in
+`physical_executor.cpp`. Aggregate and streaming inner join have moved to
 family-owned translation units, but the remaining responsibilities are still
 grown together because
 `build_operator(const ir::Node&)` lowers logical nodes directly into mutable
@@ -214,12 +215,12 @@ separate streaming operator.
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
 5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** Aggregate
-   and streaming inner join are extracted behind private factories. Their hot
-   templates, state, and kernels remain together in family-owned translation
-   units; the generic morsel executor sees only a copyable join-probe factory.
-   Semi/anti and materializing joins remain in their existing owners. Next,
-   as two separately validated moves: extract the physical-plan execution
-   adapter, then extract the generic pipeline/morsel executor from the residual
+   and streaming inner join are extracted behind private factories; the
+   physical executor now independently owns plan validation, migrated-kind
+   dispatch, accounting, and the mutation-test entry point. Hot templates,
+   state, and kernels remain with their families, so the split adds no call to
+   `Operator::next()`. Semi/anti and materializing joins remain in their existing
+   owners. Next: extract the generic pipeline/morsel executor from the residual
    operator families.
 6. **Sweep process-global plan counters in tests — DONE 2026-08-29.** The
    formerly false-premise test now checks the migrated pipeline counter. All
@@ -504,9 +505,9 @@ at all (a one-valued strategy enum would be ceremony).
 
 1. Split by ownership: `physical_plan`, `physical_executor`,
    `pipeline_executor`, `kernels/`, one file/family per breaker. **IN
-   PROGRESS:** aggregate and streaming inner join complete; planning already
-   lives in `physical_plan.cpp`. Extract the physical-plan execution adapter
-   next, then the generic pipeline/morsel executor as a separate move.
+   PROGRESS:** aggregate, streaming inner join, and the physical-plan execution
+   adapter are complete; planning lives in `physical_plan.cpp`. Extract the
+   generic pipeline/morsel executor next as a separate move.
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
@@ -560,9 +561,17 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    were byte-identical and a wash (geomean −0.3%, every query under the 2%
    practical floor). The opt-in `IBEX_PROBE_MORSELS=1` POC retains a
    pre-existing SF4 q09 stall in both baseline and extracted trees; it remains
-   disabled and is a separate correctness follow-up. Next: physical-plan
-   execution-adapter extraction, followed separately by pipeline/morsel-executor
-   extraction.
+   disabled and is a separate correctness follow-up.
+   **Physical-plan executor DONE 2026-08-29.** `physical_executor.cpp` owns root
+   validation, migrated-kind dispatch, path accounting, and
+   `build_operator_from_physical_plan`; concrete operator factories stay with
+   their implementations. Correctness: focused physical tests (29 cases, 4.34M
+   assertions), all 1,815 non-slow tests, and the strict GCC runtime build pass.
+   Performance: the broad
+   generated A/B total was −2.00%; a replica-controlled 18-query
+   core/groupagg/join run classified every delta as noise (total +0.77%), and a
+   31-repeat join confirmation classified all four joins as noise (total
+   +0.15%). Next: pipeline/morsel-executor extraction.
 
 ## Acceptance gates (every phase, before the next starts)
 

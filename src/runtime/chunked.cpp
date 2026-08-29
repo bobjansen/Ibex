@@ -3968,6 +3968,91 @@ auto materialize_row_local(const ir::Node& node, const TableRegistry& registry,
     return materialize_operator(std::move(op.value()));
 }
 
+// The relational inputs of a materialized-call fallback node -- the subtrees
+// `build_materialized_fallback` may build ahead through the physical path. For
+// most kinds these are the direct children. Two shapes carry a child that is
+// *not* an independent relational input and must not be built standalone:
+//   - `Window`'s child is an `update` clause; only `interpret_node`'s Window
+//     case may evaluate it (it needs the window duration). The real input is
+//     the update's own child.
+//   - `Stream`'s child is a per-buffer transform template over `__stream_input__`
+//     and has no meaning outside the stream loop.
+// A kind not listed here (or one whose children are template/expression nodes)
+// gets no pre-build: `interpret_node` evaluates it whole, which is the prior
+// behaviour.
+auto fallback_relational_inputs(const ir::Node& node) -> std::vector<const ir::Node*> {
+    std::vector<const ir::Node*> inputs;
+    switch (node.kind()) {
+        case ir::NodeKind::Melt:
+        case ir::NodeKind::Dcast:
+        case ir::NodeKind::Columns:
+        case ir::NodeKind::Cov:
+        case ir::NodeKind::Corr:
+        case ir::NodeKind::Transpose:
+        case ir::NodeKind::Matmul:
+        case ir::NodeKind::Resample:
+        case ir::NodeKind::Model:
+        case ir::NodeKind::AsTimeframe:
+        case ir::NodeKind::Update:
+        case ir::NodeKind::Join:
+            inputs.reserve(node.children().size());
+            for (const auto& child : node.children()) {
+                inputs.push_back(child.get());
+            }
+            break;
+        case ir::NodeKind::Window:
+            if (!node.children().empty() && !node.children().front()->children().empty()) {
+                inputs.push_back(node.children().front()->children().front().get());
+            }
+            break;
+        default:
+            break;
+    }
+    return inputs;
+}
+
+// The materialized-call fallback for every node kind `plan_physical` does not
+// migrate (reshape, stats, window, non-row-local update, materializing join,
+// matmul, model, ...). `interpret_node` owns the per-kind semantics; this only
+// makes sure the breaker's *inputs* still go through the physical path: each
+// relational input is built and drained via `build_operator` (fused parallel
+// scan, projection pushdown, streaming join), then `interpret_node` runs over
+// the node with those inputs handed back pre-built through
+// `pre_materialized_children` -- so a `Filter`/`Project` feeding the breaker is
+// not re-evaluated whole-table and serial. `interpret_node` still recurses for
+// anything deeper, and for any kind `fallback_relational_inputs` leaves empty.
+auto build_materialized_fallback(const ir::Node& node, const TableRegistry& registry,
+                                 const ScalarRegistry* scalars, const ExternRegistry* externs,
+                                 const ExecutionContext& exec, ModelResult* model_out)
+    -> std::expected<OperatorPtr, std::string> {
+    const std::vector<const ir::Node*> inputs = fallback_relational_inputs(node);
+
+    std::vector<Table> built;
+    built.reserve(inputs.size());
+    for (const ir::Node* input : inputs) {
+        auto table = materialize_row_local(*input, registry, scalars, externs, exec, model_out);
+        if (!table.has_value()) {
+            return std::unexpected(std::move(table.error()));
+        }
+        built.push_back(std::move(table.value()));
+    }
+    // `built` is not resized past this point, so the addresses stay valid for
+    // the `interpret_node` call below.
+    std::vector<std::pair<const ir::Node*, const Table*>> handback;
+    handback.reserve(inputs.size());
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        handback.emplace_back(inputs[i], &built[i]);
+    }
+    ExecutionContext local = exec;
+    local.pre_materialized_children = &handback;
+
+    auto table = interpret_node(node, registry, scalars, externs, local, model_out);
+    if (!table.has_value()) {
+        return std::unexpected(std::move(table.error()));
+    }
+    return make_table_source(std::move(table.value()));
+}
+
 template <typename Fn>
 
 auto build_unary_materializing_operator(const ir::Node& child_node, const TableRegistry& registry,
@@ -5030,22 +5115,17 @@ auto build_operator_impl(const ir::Node& node, const TableRegistry& registry,
     // and calls `tail_table`; the plan just records that they are breakers.
 
     // Every other node kind is a materialized-call fallback: not migrated by
-    // `plan_physical`, counted just above, and executed by one whole-table
-    // `interpret_node` call rather than a per-kind branch that re-enters
-    // `build_operator` for each child. `interpret_node` recurses through
-    // itself, so a fallback subtree is planned once, here, not per node.
-    // Construct / Stream / Program (preamble), Model (`model_out`), and the
-    // reshape / stat / window / update / matmul / materializing-join kinds all
-    // resolve there. The input side of these breakers is no longer built
-    // through the fused physical path; `physical_fallbacks_for(kind)` buckets
-    // the backlog so a kind can later be lifted to a migrated breaker-over-
-    // pipeline the way Join / Aggregate / Order were. Scan is handled as a
-    // source by the caller.
-    auto table = interpret_node(node, registry, scalars, externs, exec, model_out);
-    if (!table.has_value()) {
-        return std::unexpected(std::move(table.error()));
-    }
-    return make_table_source(std::move(table.value()));
+    // `plan_physical`, counted just above, and executed by `interpret_node`
+    // rather than a per-kind branch. `build_materialized_fallback` still builds
+    // the breaker's direct children through the physical path (fused parallel
+    // scan, streaming join), so the switch's 15 hand-synced branches collapse
+    // to one without regressing a filtered/projected input. Construct / Stream /
+    // Program (preamble), Model (`model_out`), and the reshape / stat / window /
+    // update / matmul / materializing-join kinds all resolve there.
+    // `physical_fallbacks_for(kind)` buckets the backlog so a kind can later be
+    // lifted to a migrated breaker-over-pipeline the way Join / Aggregate /
+    // Order were. Scan is handled as a source by the caller.
+    return build_materialized_fallback(node, registry, scalars, externs, exec, model_out);
 }
 
 }  // namespace

@@ -703,6 +703,17 @@ struct ExecutionContext {
     /// chunked join, and the lazy-table keep-rows scan) and must agree.
     bool parallel_join_probe = true;
 
+    /// Child subtrees the materialized-call fallback already built through the
+    /// physical path (`build_materialized_fallback`), keyed by node pointer.
+    /// Null for every ordinary call. When set, `interpret_node` returns the
+    /// pre-built table for a node listed here instead of recursing into it, so a
+    /// filtered or projected input to a fallback breaker keeps the fused
+    /// parallel scan `build_operator` gave it rather than being re-evaluated
+    /// whole-table and serial. Only the fallback node's direct children appear;
+    /// deeper descendants are interpreted normally. Not owned — the tables live
+    /// in the fallback frame for the duration of the `interpret_node` call.
+    const std::vector<std::pair<const ir::Node*, const Table*>>* pre_materialized_children = nullptr;
+
     /// Look up a deferred scan by its plan (instance) name, or null if there is
     /// no registry or no matching entry.
     [[nodiscard]] auto deferred_scan(const std::string& name) const -> const DeferredScan* {

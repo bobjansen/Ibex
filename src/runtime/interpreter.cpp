@@ -374,6 +374,19 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
     if (interrupt_requested()) {
         return std::unexpected(interrupt_message());
     }
+    // The materialized-call fallback pre-builds a breaker's direct children
+    // through the physical path so a filtered/projected input keeps its fused
+    // parallel scan. Hand back the pre-built table rather than re-evaluating the
+    // subtree whole-table and serial. The list holds only direct children, so
+    // this never short-circuits the fallback node itself; a linear scan is
+    // right for a list that is at most binary.
+    if (exec.pre_materialized_children != nullptr) {
+        for (const auto& [child, table] : *exec.pre_materialized_children) {
+            if (child == &node) {
+                return *table;
+            }
+        }
+    }
     switch (node.kind()) {
         case ir::NodeKind::Scan: {
             const auto& scan = ir::node_cast<ir::ScanNode>(node);

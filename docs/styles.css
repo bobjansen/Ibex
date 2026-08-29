@@ -964,6 +964,42 @@ table.bench {
   margin-right: 0.15rem;
 }
 
+.pg-size {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
+.pg-size-label {
+  color: var(--muted);
+  font-size: 0.74rem;
+  margin-right: 0.1rem;
+}
+
+.pg-size-option {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.22rem 0.62rem;
+  background: var(--paper);
+  color: var(--muted);
+  font: 600 0.74rem/1 "JetBrains Mono", monospace;
+  cursor: pointer;
+}
+
+.pg-size-option:hover,
+.pg-size-option:focus-visible {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.pg-size-option.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 .pg-chip {
   border: 1px solid var(--line);
   border-radius: 999px;

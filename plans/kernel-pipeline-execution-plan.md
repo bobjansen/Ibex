@@ -26,11 +26,11 @@ canonicalize table is in `include/ibex/ir/canonicalize.hpp`.
 
 ## Why
 
-`src/runtime/chunked.cpp` remains most residual streaming operator
-implementations, the generic map/morsel composer, pipelined stages, and a large
-set of operator-specific eligibility rules. Planning lives in
-`physical_plan.cpp`, and migrated-plan validation and dispatch now live in
-`physical_executor.cpp`. Aggregate and streaming inner join have moved to
+`src/runtime/chunked.cpp` remains the residual streaming operator
+implementations and a large set of operator-specific construction rules.
+Planning lives in `physical_plan.cpp`, migrated-plan validation and dispatch in
+`physical_executor.cpp`, and generic map/morsel execution in
+`pipeline_executor.cpp`. Aggregate and streaming inner join have moved to
 family-owned translation units, but the remaining responsibilities are still
 grown together because
 `build_operator(const ir::Node&)` lowers logical nodes directly into mutable
@@ -214,14 +214,15 @@ separate streaming operator.
    physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
-5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** Aggregate
-   and streaming inner join are extracted behind private factories; the
-   physical executor now independently owns plan validation, migrated-kind
-   dispatch, accounting, and the mutation-test entry point. Hot templates,
-   state, and kernels remain with their families, so the split adds no call to
-   `Operator::next()`. Semi/anti and materializing joins remain in their existing
-   owners. Next: extract the generic pipeline/morsel executor from the residual
-   operator families.
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** Aggregate,
+   streaming inner join, physical-plan dispatch, and the generic pipeline/morsel
+   executor are extracted. The pipeline unit owns worker chains, ordered handoff,
+   two-phase filter, deferred-scan pipeline, asynchronous stage, and source
+   strategy; concrete row-local factories remain callbacks owned by their
+   operator families. No extra call was added to `Operator::next()`. Semi/anti,
+   materializing joins, and residual breaker families remain in their existing
+   owners. Next: Phase 5 item 3, replace residual `build_operator` recursion with
+   the explicit physical fallback adapter.
 6. **Sweep process-global plan counters in tests — DONE 2026-08-29.** The
    formerly false-premise test now checks the migrated pipeline counter. All
    three remaining counter assertions take a local before/after delta, and no
@@ -505,9 +506,9 @@ at all (a one-valued strategy enum would be ceremony).
 
 1. Split by ownership: `physical_plan`, `physical_executor`,
    `pipeline_executor`, `kernels/`, one file/family per breaker. **IN
-   PROGRESS:** aggregate, streaming inner join, and the physical-plan execution
-   adapter are complete; planning lives in `physical_plan.cpp`. Extract the
-   generic pipeline/morsel executor next as a separate move.
+   PROGRESS:** aggregate, streaming inner join, physical-plan execution, and the
+   generic pipeline/morsel executor are complete; planning lives in
+   `physical_plan.cpp`. Residual breaker-family extraction remains.
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.
@@ -571,7 +572,17 @@ Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
    generated A/B total was −2.00%; a replica-controlled 18-query
    core/groupagg/join run classified every delta as noise (total +0.77%), and a
    31-repeat join confirmation classified all four joins as noise (total
-   +0.15%). Next: pipeline/morsel-executor extraction.
+   +0.15%).
+   **Pipeline/morsel executor DONE 2026-08-29.** Worker-private map chains, the
+   bounded ordered ring, two-phase filter, deferred-scan pipeline, asynchronous
+   stage, and source-strategy orchestration now live in
+   `pipeline_executor.cpp`; `chunked.cpp` supplies concrete map factories and
+   residual breaker construction through a narrow internal interface.
+   Correctness: focused pipeline/physical tests (24 cases, 4.34M assertions),
+   all 1,815 non-slow tests, the strict GCC runtime build, and debug/Release
+   Parquet + LightGBM plugin builds pass. Performance: a replica-controlled
+   `pipeline,filter,join` A/B (15 interleaved repeats) classified all 13 deltas
+   as noise; total +0.24%.
 
 ## Acceptance gates (every phase, before the next starts)
 

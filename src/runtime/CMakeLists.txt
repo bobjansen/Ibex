@@ -22,6 +22,7 @@ add_library(ibex_runtime STATIC
     physical_executor.cpp
     physical_plan.cpp
     pipeline.cpp
+    pipeline_executor.cpp
     reshape.cpp
     rng.cpp
     runtime_internal.cpp

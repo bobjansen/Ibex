@@ -25,6 +25,9 @@ namespace ibex::runtime {
 /// types in the translation units that implement them.
 namespace physical_executor_detail {
 
+[[nodiscard]] auto resolved_join_parallelism(const ExecutionContext& exec)
+    -> physical::JoinParallelism;
+
 [[nodiscard]] auto build_physical_map_step(
     const physical::Plan& plan, std::size_t index, const TableRegistry& registry,
     const ScalarRegistry* scalars, const ExternRegistry* externs, const ExecutionContext& exec,

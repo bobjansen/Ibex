@@ -32,6 +32,23 @@ using ScanPredicateMap = std::map<std::string, std::vector<Expr>>;
 /// once, shared, rather than streamed per occurrence.
 [[nodiscard]] auto scan_source_counts(const Node& root) -> std::map<std::string, std::size_t>;
 
+struct ScanInstanceSplit {
+    NodePtr plan;
+    /// Renamed probe-scan instance name -> the source it reads.
+    std::map<std::string, std::string> instances;
+};
+
+/// Give a *deferrable probe* scan its own name (`source#k`) when its source is
+/// also scanned elsewhere. The probe side of an eligible inner join can then be
+/// deferred and bounded by its build side (`deferrable_probe_scans`) without the
+/// self-join's other occurrence — which needs a full decode — being confused
+/// for it. Every other repeated scan is left shared: it is decoded once, and
+/// occurrence identity for FD reduction comes from `ColumnOrigin::scan`, not a
+/// rename.
+[[nodiscard]] auto isolate_deferrable_probe_scans(NodePtr root,
+                                                  const std::set<std::string>& sources)
+    -> ScanInstanceSplit;
+
 /// A lazy scan eligible for deferred decode: it feeds — through nothing but
 /// column-only Project and Rename nodes — the RIGHT side of an inner
 /// single-key no-predicate join, and occurs nowhere else in the plan.

@@ -393,6 +393,58 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
     return !ratio.has_value() || *ratio < kMaxBuildDomainCoverage;
 }
 
+/// The inner-join / key-arity / no-predicate shape a deferrable probe needs.
+auto is_probe_shaped_join(const JoinNode& join) -> bool {
+    return join.kind() == JoinKind::Inner &&
+           (join.keys().size() == 1 || join.keys().size() == 2) && !join.predicate().has_value() &&
+           join.children().size() == 2 && join.children()[0] != nullptr &&
+           join.children()[1] != nullptr;
+}
+
+/// Replace the single `Scan` at the bottom of a verified probe chain (only
+/// row-local Project / Rename / Update above it) with one named `instance`.
+void rename_chain_scan(NodePtr& node, const std::string& instance) {
+    if (node->kind() == NodeKind::Scan) {
+        node = std::make_unique<ScanNode>(node->id(), instance);
+        return;
+    }
+    rename_chain_scan(node->mutable_children().front(), instance);
+}
+
+void isolate_probes(NodePtr& node, const std::set<std::string>& sources,
+                    const std::map<std::string, std::size_t>& counts,
+                    std::map<std::string, std::size_t>& next_instance,
+                    std::map<std::string, std::string>& instances) {
+    if (node->kind() == NodeKind::Join) {
+        auto& join = node_cast<JoinNode>(*node);
+        if (is_probe_shaped_join(join)) {
+            if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
+                match.has_value() && sources.contains(match->first)) {
+                if (const auto c = counts.find(match->first);
+                    c != counts.end() && c->second > 1) {
+                    auto instance = match->first + "#" + std::to_string(++next_instance[match->first]);
+                    instances.emplace(instance, match->first);
+                    rename_chain_scan(join.mutable_children()[1], instance);
+                }
+            }
+        }
+    }
+    if (node->kind() == NodeKind::Program) {
+        auto& program = node_cast<ProgramNode>(*node);
+        for (auto& preamble : program.mutable_preamble()) {
+            if (preamble != nullptr) {
+                isolate_probes(preamble, sources, counts, next_instance, instances);
+            }
+        }
+        isolate_probes(program.mutable_main_node(), sources, counts, next_instance, instances);
+    }
+    for (auto& child : node->mutable_children()) {
+        if (child != nullptr) {
+            isolate_probes(child, sources, counts, next_instance, instances);
+        }
+    }
+}
+
 void collect_deferrable(const Node& node, const std::set<std::string>& sources,
                         const std::map<std::string, std::size_t>& counts,
                         const SourceRowCounts& row_counts, const SourceSchemas& schemas,
@@ -443,6 +495,21 @@ auto scan_source_counts(const Node& root) -> std::map<std::string, std::size_t> 
     std::map<std::string, std::size_t> counts;
     count_scan_occurrences(root, counts);
     return counts;
+}
+
+auto isolate_deferrable_probe_scans(NodePtr root, const std::set<std::string>& sources)
+    -> ScanInstanceSplit {
+    ScanInstanceSplit split;
+    if (root == nullptr || sources.empty()) {
+        split.plan = std::move(root);
+        return split;
+    }
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(*root, counts);
+    std::map<std::string, std::size_t> next_instance;
+    isolate_probes(root, sources, counts, next_instance, split.instances);
+    split.plan = std::move(root);
+    return split;
 }
 
 auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)

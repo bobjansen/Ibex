@@ -146,6 +146,22 @@ struct AbsorbedScanFilters {
     return out;
 }
 
+/// Prove a plan's ascriptions and join keys against `schemas`, then fold every
+/// proven ascription into its Scan so no later pass has to special-case an
+/// `Ascribe` node. Both REPL execution paths run exactly this before their
+/// schema-aware rewrites and column-demand computation.
+[[nodiscard]] auto check_and_fuse_ascriptions(ir::NodePtr& plan, const ir::SourceSchemas& schemas)
+    -> std::expected<void, std::string> {
+    if (auto ok = ir::check_ascriptions(*plan, schemas); !ok.has_value()) {
+        return std::unexpected(ok.error());
+    }
+    plan = ir::fuse_checked_ascriptions(std::move(plan));
+    if (auto err = ir::check_joins(*plan, schemas)) {
+        return std::unexpected(*err);
+    }
+    return {};
+}
+
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
 std::atomic_bool verbose_logging{false};
 
@@ -3748,18 +3764,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             return it == lazy_tables.end() ? nullptr : it->second.get();
         };
 
-        // Same as the whole-script driver: prove the ascriptions against the
-        // source schemas before demand is computed, so they stop demanding the
-        // columns they only assert.
-        if (auto ok = ir::check_ascriptions(*lowered.value(), context.source_schemas);
+        // Same as the whole-script driver: prove the ascriptions and joins
+        // against the source schemas and fuse the proven ascriptions before
+        // demand is computed, so they stop demanding the columns they only
+        // assert.
+        if (auto ok = check_and_fuse_ascriptions(lowered.value(), context.source_schemas);
             !ok.has_value()) {
             return std::unexpected(ok.error());
-        }
-        // Fuse every ascription check_ascriptions just proved into its Scan,
-        // so no later pass has to special-case a checked Ascribe node at all.
-        lowered.value() = ir::fuse_checked_ascriptions(std::move(lowered.value()));
-        if (auto err = ir::check_joins(*lowered.value(), context.source_schemas)) {
-            return std::unexpected(*err);
         }
         const auto [predicates, applied_scan_filters] = absorb_lazy_scan_filters(
             lowered.value(), [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
@@ -5002,21 +5013,14 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
         }
 
-        // Prove what the ascriptions assert before anything is decoded: the
-        // assertion is about shape, and `schemas` already holds every source's
-        // names and types straight from its footer. Proving them here is also
-        // what stops them demanding the data they only assert.
-        if (auto ok = ir::check_ascriptions(*rewritten, schemas); !ok.has_value()) {
+        // Prove what the ascriptions and joins assert before anything is
+        // decoded: the assertion is about shape, and `schemas` already holds
+        // every source's names and types straight from its footer. Proving them
+        // here is also what stops the ascriptions demanding the data they only
+        // assert. This is the first point the join keys can be checked at all:
+        // at lowering a reader call site had no schema.
+        if (auto ok = check_and_fuse_ascriptions(rewritten, schemas); !ok.has_value()) {
             return std::unexpected(ok.error());
-        }
-        // Fuse every ascription check_ascriptions just proved into its Scan,
-        // so no later pass has to special-case a checked Ascribe node at all.
-        rewritten = ir::fuse_checked_ascriptions(std::move(rewritten));
-        // The same argument for the join keys, and this is the first point they
-        // can be checked at all: at lowering a reader call site had no schema,
-        // and `schemas` has just gained every source's names and types.
-        if (auto err = ir::check_joins(*rewritten, schemas)) {
-            return std::unexpected(*err);
         }
         rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);

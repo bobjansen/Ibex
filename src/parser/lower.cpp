@@ -4759,6 +4759,9 @@ class Lowerer {
         if (name == "count") {
             return ir::AggFunc::Count;
         }
+        if (name == "count_distinct") {
+            return ir::AggFunc::CountDistinct;
+        }
         if (name == "first") {
             return ir::AggFunc::First;
         }

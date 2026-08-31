@@ -233,6 +233,7 @@ auto expr_type(const Expr& expr, const SchemaInfo& input) -> std::optional<Colum
 auto agg_result_type(const AggSpec& agg, const SchemaInfo& input) -> std::optional<ColumnType> {
     switch (agg.func) {
         case AggFunc::Count:
+        case AggFunc::CountDistinct:
             return ColumnType::Int64;
         case AggFunc::Mean:
         case AggFunc::Median:

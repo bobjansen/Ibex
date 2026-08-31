@@ -1612,7 +1612,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
         // (aggregate.cpp) resolves the enum through parse_aggregate_func,
         // which reads the AggregateExec payload here.
         const auto agg_infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-            if (name == "count") {
+            if (name == "count" || name == "count_distinct") {
                 return ExprType::Int;
             }
             if (name == "sum" || name == "min" || name == "max" || name == "first" ||
@@ -1625,12 +1625,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             }
             return ExprType::Double;  // mean/median/std/ewma/quantile/skew/kurtosis
         };
-        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 13> agg_funcs{{
+        constexpr std::array<std::pair<std::string_view, ir::AggFunc>, 14> agg_funcs{{
             {"sum", ir::AggFunc::Sum},
             {"mean", ir::AggFunc::Mean},
             {"min", ir::AggFunc::Min},
             {"max", ir::AggFunc::Max},
             {"count", ir::AggFunc::Count},
+            {"count_distinct", ir::AggFunc::CountDistinct},
             {"first", ir::AggFunc::First},
             {"last", ir::AggFunc::Last},
             {"median", ir::AggFunc::Median},

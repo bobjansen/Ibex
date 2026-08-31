@@ -854,6 +854,56 @@ TEST_CASE("E2E: count without group-by", "[e2e]") {
     CHECK(col_i64(out, "n") == std::vector<std::int64_t>{5});
 }
 
+namespace {
+// g:  a a a b b c c   distinct v per g -> a{1,2}=2  b{5}=1  c{9}=1 (7 is null, excluded)
+auto make_distinct_fixture() -> runtime::TableRegistry {
+    runtime::Table t;
+    t.add_column("g", Column<std::string>{"a", "a", "a", "b", "b", "c", "c"});
+    t.add_column("v", Column<std::int64_t>{1, 1, 2, 5, 5, 9, 7},
+                 runtime::ValidityBitmap{true, true, true, true, true, true, false});
+    t.add_column("w", Column<double>{10, 20, 10, 1, 1, 7, 7});
+    t.add_column("s", Column<std::string>{"x", "x", "y", "z", "z", "z", "z"});
+    runtime::TableRegistry reg;
+    reg.emplace("t", std::move(t));
+    return reg;
+}
+}  // namespace
+
+TEST_CASE("E2E: count_distinct grouped, mixed with other aggregates, ignores nulls", "[e2e]") {
+    auto tables = make_distinct_fixture();
+    auto out = run("t[select { nd = count_distinct(v), ns = count_distinct(s), "
+                   "total = sum(w), n = count() }, by { g }];",
+                   tables);
+    REQUIRE(out.rows() == 3);
+    const auto g = col_str(out, "g");
+    const auto nd = col_i64(out, "nd");
+    const auto ns = col_i64(out, "ns");
+    const auto total = col_dbl(out, "total");
+    const auto n = col_i64(out, "n");
+    for (std::size_t i = 0; i < g.size(); ++i) {
+        if (g[i] == "a") {
+            CHECK(nd[i] == 2);  // {1, 2}
+            CHECK(ns[i] == 2);  // {"x", "y"}
+            CHECK(total[i] == 40.0);
+            CHECK(n[i] == 3);
+        } else if (g[i] == "b") {
+            CHECK(nd[i] == 1);  // {5}
+            CHECK(ns[i] == 1);
+        } else {  // c: value 9 plus one null -> null does not count
+            CHECK(nd[i] == 1);
+            CHECK(n[i] == 2);
+        }
+    }
+}
+
+TEST_CASE("E2E: count_distinct without group-by", "[e2e]") {
+    auto tables = make_distinct_fixture();
+    auto out = run("t[select { nd = count_distinct(v) }];", tables);
+    REQUIRE(out.rows() == 1);
+    CHECK(col_i64(out, "nd") == std::vector<std::int64_t>{4});  // {1, 2, 5, 9}, null skipped
+}
+
+
 // --- Rename ------------------------------------------------------------------
 
 TEST_CASE("E2E: rename column", "[e2e]") {

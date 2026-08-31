@@ -658,6 +658,7 @@ Aggregate functions skip null rows by default:
 sum(col)    // sums only non-null values; returns null for an all-null group
 count()     // counts all rows regardless of null
 count(col)  // counts only the non-null values of col; 0 (not null) if there are none
+count_distinct(col)  // counts the distinct non-null values of col; 0 (not null) if there are none
 mean(col)   // averages only non-null values
 median(col) // ignores null rows
 first(col)  // first non-null value; null for an all-null group
@@ -2503,6 +2504,7 @@ The following built-in functions are **aggregate functions**. They consume a
 | `max(col)`            | `Series<T>`        | `T`        | |
 | `count()`             | (none)             | `Int64`    | Counts rows in the group, nulls included. |
 | `count(col)`          | `Series<T>`        | `Int64`    | Counts the **non-null** values of `col`; `0` (not null) for a group with none. The argument must be a column name. |
+| `count_distinct(col)` | `Series<T>`        | `Int64`    | Counts the number of **distinct non-null** values of `col` in the group; `0` (not null) for a group with none. `T` may be any scalar type. |
 | `first(col)`          | `Series<T>`        | `T`        | |
 | `last(col)`           | `Series<T>`        | `T`        | |
 | `median(col)`         | `Series<Numeric>`  | `Float64`  | Middle value; null rows are ignored. Even-length groups return the average of the two middle values. |

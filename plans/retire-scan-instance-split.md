@@ -81,27 +81,23 @@ property, with the real (unsplit) source name available for every schema query.
   the instance-name additions to `deferrable_names`. FD reduction is then fed
   plain `schemas`.
 
-### 3. `scan_predicates`: push the intersection across occurrences
+### 3. `scan_predicates`: unchanged — no pushdown for a repeated scan
 
-`hoist_extern_sources` already coalesces repeated `read_parquet("x")` to one
-`Scan(__ibex_source_N)`. Today `scan_predicates` **erases** a source's
-candidates when `scan_counts[name] != 1` — a source scanned twice gets no
-pushdown at all, which is why the split exists. The principled behaviour is the
-**intersection**: a conjunct is safe to push into the shared decode iff *every*
-occurrence's pushable predicate contains it.
+`scan_predicates` already erases a source's candidates when
+`scan_counts[name] != 1` (`scan_predicates.cpp:276`). Without the split, a
+source scanned twice hits that guard → no per-occurrence pushdown, the
+use-site `Filter` nodes stay and run post-decode. This is exactly what q21
+wants: `lineitem_raw` is bare, filtered only at one use site
+(`[filter l_receiptdate > l_commitdate]`, which is `column <cmp> column` and
+prunes nothing), so a residual filter costs nothing.
 
-`visit` changes from appending all occurrences' conjuncts into one list to
-keeping a per-occurrence set; the final pass, for a source scanned `n > 1`
-times, keeps the conjuncts present in all `n` sets (and still drops the source
-if any occurrence is a bare `Scan` with no filter — intersection is then empty).
-
-- `let recent = orders[filter o_orderdate >= X]` used twice → both occurrences
-  carry `o_orderdate >= X` → it pushes into the one shared decode → row-group
-  pruning preserved, **one** filtered decode instead of two.
-- q21: `#2` (aggregate side) has no filter → intersection empty → whole decode,
-  which is correct: the aggregate needs every row. `#1`'s
-  `l_receiptdate > l_commitdate` becomes a residual `Filter` — and it is
-  `column <cmp> column`, prunes nothing, so nothing is lost.
+**An intersection push** (a conjunct every use of a source shares → push it to
+the one shared decode) is a real future enhancement but needs structural `Expr`
+equality, which does not exist yet. It is not built here: **no PDS-H query has
+the shape** — every query is `let X_raw = read_parquet(…)` (unfiltered) with
+distinct filters at each use site, so the intersection is always empty. Add it
+only if the A/B or a real query shows a common-filter repeated scan losing
+row-group pruning.
 
 ### 4. Execution: one decode
 
@@ -155,17 +151,15 @@ it.
 3. `group_key_reduction.cpp`: `SourceColumn` gains `scan`; thread it through
    `as_key` / `JoinEdge` / the closure. `facts_for` unchanged (uses `source`).
    Step 1's test goes green here.
-4. `scan_predicates`: per-occurrence conjunct sets → intersection for `n > 1`
-   (section 3). New tests in `test_ir_required_columns.cpp`: two same-filter
-   occurrences → conjunct pushed; two divergent → nothing pushed; one filtered
-   one bare → nothing pushed.
-5. Delete `split_scan_instances` + `ScanInstanceSplit` + `count_scans` /
+4. Delete `split_scan_instances` + `ScanInstanceSplit` + `count_scans` /
    `rename_scans`; delete the split plumbing in `repl.cpp` (both paths) and
    `schemas_with_instances`. Remove the now-dead `split_scan_instances` tests in
    `test_ir_required_columns.cpp`; keep the "scanned once keeps its name" and
-   demand-union coverage.
-6. Streaming gate: require occurrence-count 1 for per-unit streaming (one
-   `count_scan_occurrences` map, not per-iteration).
+   demand-union coverage. `scan_predicates` is unchanged — its `!= 1` guard
+   already declines pushdown for a repeated scan.
+5. Streaming gate: require occurrence-count 1 for per-unit streaming (one
+   `count_scan_occurrences` map, not per-iteration), so a repeated scan decodes
+   once eagerly instead of twice per-unit.
 7. `--report-planner`: a repeated scan now reports as one source; adjust the
    note if it changes.
 8. **Measure** — `benchmarking/tpch` interleaved A/B, HEAD vs this, SF-4

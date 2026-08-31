@@ -17,8 +17,17 @@
 namespace ibex::ir {
 namespace {
 
-/// A base column, as `ColumnOrigin` names it, ordered so it can key a set.
-using SourceColumn = std::pair<std::string, std::string>;
+/// A base column at a specific scan, as `ColumnOrigin` names it, ordered so it
+/// can key a set. `scan` distinguishes two occurrences of one source (a
+/// self-join); `source` is the key for `facts_for` (schema + proved uniqueness,
+/// which are source-level facts).
+struct SourceColumn {
+    NodeId scan{};
+    std::string source;
+    std::string column;
+
+    auto operator<=>(const SourceColumn&) const = default;
+};
 
 /// One equijoin edge, both sides resolved to the base columns they came from.
 struct JoinEdge {
@@ -31,7 +40,7 @@ struct JoinEdge {
 };
 
 auto as_key(const ColumnOrigin& origin) -> SourceColumn {
-    return {origin.source, origin.column};
+    return {.scan = origin.scan, .source = origin.source, .column = origin.column};
 }
 
 /// Collect every equijoin edge below `node`, with both sides resolved through
@@ -112,28 +121,34 @@ auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>&
     while (grew) {
         grew = false;
         const std::set<SourceColumn> current = closed;
-        const auto add_all_of = [&](const std::string& source) {
-            for (const auto& column : facts_for(source, sources).all_columns) {
-                if (closed.emplace(source, column).second) {
+        // A unique column determines every column OF THAT OCCURRENCE — the same
+        // `scan`, not just the same `source`, or a proof on one side of a
+        // self-join would collapse the other side's group keys.
+        const auto add_all_of = [&](const SourceColumn& rep) {
+            for (const auto& column : facts_for(rep.source, sources).all_columns) {
+                if (closed.emplace(SourceColumn{.scan = rep.scan,
+                                                .source = rep.source,
+                                                .column = column})
+                        .second) {
                     grew = true;
                 }
             }
         };
-        for (const auto& [source, column] : current) {
-            if (facts_for(source, sources).unique_columns.contains(column)) {
-                add_all_of(source);
+        for (const auto& sc : current) {
+            if (facts_for(sc.source, sources).unique_columns.contains(sc.column)) {
+                add_all_of(sc);
             }
         }
         for (const auto& edge : edges) {
             const bool right_unique =
-                facts_for(edge.right.first, sources).unique_columns.contains(edge.right.second);
+                facts_for(edge.right.source, sources).unique_columns.contains(edge.right.column);
             const bool left_unique =
-                facts_for(edge.left.first, sources).unique_columns.contains(edge.left.second);
+                facts_for(edge.left.source, sources).unique_columns.contains(edge.left.column);
             if (right_unique && closed.contains(edge.left)) {
-                add_all_of(edge.right.first);
+                add_all_of(edge.right);
             }
             if (edge.bidirectional && left_unique && closed.contains(edge.right)) {
-                add_all_of(edge.left.first);
+                add_all_of(edge.left);
             }
         }
     }

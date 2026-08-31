@@ -21,6 +21,25 @@ that is the right-child probe subtree of an eligible inner join, when its source
 is scanned elsewhere. q21's join is semi → not isolated → its `lineitem` stays
 shared, the win holds.
 
+**Attempted and reverted 2026-08-31: keying deferred probes by `Scan` node id
+instead of a name.** The idea was to delete `isolate_deferrable_probe_scans`
+entirely — `deferrable_probe_scans` returns `{NodeId scan, source, key_column}`,
+`ExecutionContext` gets a `DeferredProbeRegistry` keyed by node, and dropping
+the `count == 1` guard lets a self-join's probe occurrence defer directly.
+Compiled and passed the 1813 fast tests, but broke **6–10 TPC-H answers**
+(q2/q3/q5/q7/q8/q9/q10/q11/q16/q21 — wrong joins, raw ints where dates belong).
+Root cause not fully isolated but two contributors: (1) the demand loop still
+eagerly decodes the source, and `interpret_node`'s Scan handler resolves
+`registry.find(name)` before any node-keyed probe, so the probe occurrence read
+the full table; (2) `interpret_wrapped_right`'s `local[name] = probe_table`
+shadow, harmless with a `#1` name, collides with the source's other uses when
+the name is real; (3) dropping `count == 1` made `collect_deferrable` fire on
+inner-join right-side scans that were not previously eligible. The
+name-scoped decode registration is doing more coordination than it looks. A
+node-keyed rewrite would need `interpret_node` / `build_operator` / the demand
+loop all made node-aware together — out of proportion to removing one `#1`.
+`isolate_deferrable_probe_scans` stays.
+
 Original plan below.
 
 ## What `split_scan_instances` is, and why it should go

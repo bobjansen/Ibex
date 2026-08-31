@@ -1699,8 +1699,8 @@ auto count_distinct_in_column(const runtime::ColumnValue& column) -> std::size_t
 /// Parquet row group, or the whole source if it has no unit decomposition) --
 /// bounded, not a full-table decode, because this runs during PLANNING, not
 /// execution. `lazy_sources` is captured by reference and must outlive every
-/// call, which holds for the duration of one `evaluate()` invocation (the
-/// only caller).
+/// call, which holds for the duration of one `optimize_and_execute_plan()`
+/// invocation (the only caller).
 auto make_relation_sampler(LazyTableRegistry& lazy_sources) -> ir::RelationSamplerFn {
     return [&lazy_sources](
                const std::string& source, const ir::Expr* predicate,
@@ -4745,6 +4745,276 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
     }
 }
 
+/// Run the whole-script optimizer pipeline over one plan and execute it,
+/// returning the materialized result. Called once per shared binding, once per
+/// sink input, and once for the result plan by `try_execute_whole_script` --
+/// each over a distinct (already name-decomposed) plan. `base_tables` holds the
+/// builtins plus every shared binding materialized so far; `lazy_callees` names
+/// the extern readers to hoist into Scan nodes.
+[[nodiscard]] auto optimize_and_execute_plan(ir::NodePtr plan,
+                                             const runtime::TableRegistry& base_tables,
+                                             const std::set<std::string>& lazy_callees,
+                                             runtime::ExternRegistry& externs)
+    -> std::expected<runtime::Table, std::string> {
+        auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
+        runtime::TableRegistry tables = base_tables;
+        LazyTableRegistry lazy_sources;
+        ir::SourceStats source_stats;
+        ir::SourceSchemas& schemas = source_stats.schemas;
+        ir::SourceRowCounts& row_counts = source_stats.rows;
+        // Materialized shared bindings participate in schema-aware rewrites
+        // (and cardinality estimates) with their exact schemas and sizes. A
+        // materialized table carries no footer stats, so no distinct estimates.
+        for (const auto& [name, table] : base_tables) {
+            schemas.insert_or_assign(name, table_schema_info(table));
+            row_counts.insert_or_assign(name, table.rows());
+        }
+        for (const auto& source : sources) {
+            const auto* function = externs.find(source.callee);
+            auto args = literal_args(source.args);
+            if (function == nullptr || !function->lazy_table_func) {
+                return std::unexpected("lazy source unavailable: " + source.callee);
+            }
+            if (!args.has_value()) {
+                return std::unexpected(args.error());
+            }
+            auto lazy = function->lazy_table_func(*args);
+            if (!lazy.has_value()) {
+                return std::unexpected(lazy.error());
+            }
+            // Uniqueness is the one thing the planner cannot infer about a base
+            // table from its own construction, and without it the `|PK ⋈ FK| <=
+            // |FK|` bound in `estimate_cardinality` never applies to a scan —
+            // every base source reached the cost model with no unique key at
+            // all. Proving it here is what puts a real bound under join
+            // ordering rather than an estimate.
+            schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
+            row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
+            source_stats.distinct.insert_or_assign(source.source_name,
+                                                   derive_column_distinct(*lazy.value()));
+            lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
+        }
+        // `make_relation_sampler` (real, data-sampled filter selectivity and
+        // key-distinct counts) is built but gated OFF by default: measured
+        // against the full suite, a one-row-group sample regressed q10 5x
+        // (86ms -> 474ms) by giving `resolve_key_distincts` a WORSE
+        // o_orderkey/l_orderkey distinct estimate than the footer span it was
+        // meant to improve on -- q10's join keys are not uniformly
+        // distributed across row groups, so "the first row group" is not a
+        // representative sample of the whole file. The infrastructure
+        // (RelationSamplerFn, the sampled-selectivity path in
+        // join_order.cpp's collect_left_deep, and the sampled-distinct path
+        // in cardinality.cpp's distinct_below) is real and was
+        // correctness-verified where it WAS exercised (see
+        // join_reorder.cpp's connecting_keys fix, found via this work). What
+        // it needs before going live unconditionally is a sampling strategy
+        // that's actually representative -- multiple row groups, or a
+        // validated confidence bound on the single-unit estimate -- not a
+        // bigger reorder cap. IBEX_EXPERIMENTAL_JOIN_SAMPLING opts in for
+        // that follow-up work to A/B against without a rebuild.
+        if (std::getenv("IBEX_EXPERIMENTAL_JOIN_SAMPLING") != nullptr) {
+            source_stats.sample = make_relation_sampler(lazy_sources);
+        }
+
+        // Uniqueness is the one thing the planner cannot infer about a base
+        // table from its own construction, and without it the `|PK join FK| <=
+        // |FK|` bound in `estimate_cardinality` never applies to a scan. It runs
+        // as a second pass because resolving a join key back to the source
+        // column it came from needs every source's schema already in place.
+        {
+            const runtime::ExecutionContext proof_exec = command_exec();
+            std::set<std::string> lazy_names;
+            for (const auto& [name, lazy] : lazy_sources) {
+                lazy_names.insert(name);
+            }
+            // Only an actual deferred-probe key must stay uncached; all other
+            // proof reads are reusable execution work.  This analysis is
+            // conservative with respect to the current (pre-reorder) plan:
+            // a later plan that declines a probe simply keeps a useful cache.
+            const auto deferred_probes =
+                ir::deferrable_probe_scans(*rewritten, lazy_names, row_counts, schemas);
+            for (const auto& [source_name, columns] :
+                 ir::plan_join_key_origins(*rewritten, schemas)) {
+                const auto lazy = lazy_sources.find(source_name);
+                const auto schema = schemas.find(source_name);
+                if (lazy == lazy_sources.end() || schema == schemas.end()) {
+                    continue;
+                }
+                const auto probe = deferred_probes.find(source_name);
+                const std::string* probe_key =
+                    probe == deferred_probes.end() ? nullptr : &probe->second.key_column;
+                for (auto& column :
+                     prove_unique_columns(*lazy->second, columns, proof_exec, probe_key)) {
+                    schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
+                }
+            }
+        }
+
+        // Prove what the ascriptions and joins assert before anything is
+        // decoded: the assertion is about shape, and `schemas` already holds
+        // every source's names and types straight from its footer. Proving them
+        // here is also what stops the ascriptions demanding the data they only
+        // assert. This is the first point the join keys can be checked at all:
+        // at lowering a reader call site had no schema.
+        if (auto ok = check_and_fuse_ascriptions(rewritten, schemas); !ok.has_value()) {
+            return std::unexpected(ok.error());
+        }
+        rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
+        rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
+        rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
+        rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
+        std::set<std::string> lazy_names;
+        for (const auto& [name, lazy] : lazy_sources) {
+            lazy_names.insert(name);
+        }
+        // After the reorder, so it sees the join shape that will actually run,
+        // and after the uniqueness proofs above, which are its whole premise.
+        // Two occurrences of one source in a self-join are kept apart by the
+        // scan-node identity carried in `ColumnOrigin`, not by a rewrite.
+        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
+        // Needs no schema or uniqueness proof of its own -- it decides by
+        // walking the plan -- but it runs here so it sees the shape the joins
+        // and the FD reduction leave behind.
+        rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
+        // Give the probe side of a self-referenced source its own name so its
+        // decode can be deferred and bounded by the build side while the other
+        // occurrence still reads the whole table (TPC-H q18).
+        auto probe_split = ir::isolate_deferrable_probe_scans(std::move(rewritten), lazy_names);
+        rewritten = std::move(probe_split.plan);
+        const auto& instances = probe_split.instances;
+        const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto inst = instances.find(name); inst != instances.end()) {
+                    it = lazy_sources.find(inst->second);
+                }
+            }
+            return it == lazy_sources.end() ? nullptr : it->second.get();
+        };
+        // Absorb scan filters before computing demand, so a column referenced
+        // only by a pushed filter is decoded for the selection but never
+        // gathered into the scan's output. No ScalarRegistry is passed to
+        // project_where: batch-eligible scripts cannot bind scalars, so a
+        // pushed conjunct can never reference one.
+        const auto absorbed = absorb_lazy_scan_filters(
+            rewritten, [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
+        // What absorption just took out of the tree. The deferred-probe gate
+        // weighs a build side's filtered row estimate against its own table's
+        // size, and `remove_applied_scan_filters` deleted exactly the Filter
+        // nodes that estimate is made of -- without this every build side reads
+        // back its full table, and q03's filtered customer becomes
+        // indistinguishable from q12's unfiltered orders.
+        std::map<std::string, double> absorbed_scan_selectivity;
+        for (const auto& name : absorbed.applied) {
+            const auto conjuncts = absorbed.predicates.find(name);
+            if (conjuncts == absorbed.predicates.end()) {
+                continue;
+            }
+            double selectivity = 1.0;
+            for (const auto& conjunct : conjuncts->second) {
+                selectivity *= ir::compound_selectivity(conjunct);
+            }
+            absorbed_scan_selectivity.emplace(name, selectivity);
+        }
+        const auto demand = ir::required_columns(*rewritten);
+        // Deferred probe scans: an eligible scan (sole feed of an inner
+        // single-key join's right side, through projects/renames only) is not
+        // decoded here. The join decodes it during execution, after
+        // publishing build-side key bounds into its filter slot — see
+        // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
+        // makes this safe: project_where bypasses its whole-column cache.
+        const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto inst = instances.find(name); inst != instances.end()) {
+                    it = lazy_sources.find(inst->second);
+                }
+            }
+            return it == lazy_sources.end() ? nullptr : it->second;
+        };
+        std::set<std::string> deferrable_names = lazy_names;
+        for (const auto& [instance_name, source] : instances) {
+            deferrable_names.insert(instance_name);
+        }
+        runtime::DeferredScanRegistry deferred_scans;
+        // Declared here, before the lazy-source projection below, because that
+        // projection runs a scan's filter under it — not only `interpret` at
+        // the end of this function.
+        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans,
+                                       .execution_profile = nullptr};
+        runtime::configure_parallel_from_env(exec);
+        for (auto& [name, info] : ir::deferrable_probe_scans(
+                 *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
+            const auto needed = demand.find(name);
+            auto lazy = resolve_lazy_ptr(name);
+            if (needed == demand.end() || lazy == nullptr) {
+                continue;
+            }
+            deferred_scans.emplace(
+                name, runtime::DeferredScan{
+                          .lazy = std::move(lazy),
+                          .conjuncts = absorbed.applied.contains(name)
+                                           ? absorbed.predicates.at(name)
+                                           : std::vector<ir::Expr>{},
+                          .demand = needed->second.names,
+                          .demand_all = needed->second.all,
+                          .key_column = std::move(info.key_column),
+                          .filter = std::make_shared<runtime::DynamicScanFilter>(),
+                      });
+        }
+        // Streaming scan registration: hand a multi-unit source to the plan
+        // still undecoded (Phase 1 of plans/pipelined-execution-plan.md) so its
+        // scan operator can emit it a unit at a time instead of the whole file
+        // arriving as one chunk. The pushdowns are the same ones the eager
+        // decode applies -- they travel in the registration rather than being
+        // spent here. A null `filter` marks this as streaming rather than a
+        // deferred *probe* scan, whose decode is the join's to schedule; the
+        // probe loop above already populated `deferred_scans`, so the two never
+        // overlap.
+        //
+        // A source scanned more than once (a self-join) is excluded: streaming
+        // it would give each occurrence its own per-unit decode of the same
+        // file. `scan_predicates` already declined to push a per-occurrence
+        // filter for it, so the eager decode below reads the whole demanded
+        // union once into the registry.
+        const auto scan_counts = ir::scan_source_counts(*rewritten);
+        const auto repeated_scan = [&](const std::string& name) {
+            const auto it = scan_counts.find(name);
+            return it != scan_counts.end() && it->second > 1;
+        };
+        if (exec.stream_scans) {
+            for (const auto& [name, needed] : demand) {
+                if (deferred_scans.contains(name)) {
+                    continue;
+                }
+                auto* lazy = resolve_lazy(name);
+                if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name)) {
+                    continue;
+                }
+                deferred_scans.emplace(
+                    name, runtime::DeferredScan{
+                              .lazy = resolve_lazy_ptr(name),
+                              .conjuncts = absorbed.applied.contains(name)
+                                               ? absorbed.predicates.at(name)
+                                               : std::vector<ir::Expr>{},
+                              .demand = needed.names,
+                              .demand_all = needed.all,
+                              .key_column = {},
+                              .filter = nullptr,
+                          });
+            }
+        }
+        // Everything not deferred or streamed is decoded eagerly into the
+        // registry now, narrowed to its demand with its absorbed filter applied.
+        if (auto ok = decode_demanded_lazy_sources(
+                demand, absorbed, resolve_lazy, exec, nullptr, tables,
+                [&](const std::string& name) { return deferred_scans.contains(name); });
+            !ok.has_value()) {
+            return std::unexpected(ok.error());
+        }
+        return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
+}
+
 /// Executes relational batch scripts whose top-level effects are represented
 /// by ScriptPlan. Scalar, tuple, import, and function semantics remain on the
 /// mature statement-at-a-time path until they have equivalent plan nodes.
@@ -4934,266 +5204,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         return decline("script has statements that must run before the plan");
     }
 
-    const auto evaluate = [&](ir::NodePtr plan, const runtime::TableRegistry& base_tables)
-        -> std::expected<runtime::Table, std::string> {
-        auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
-        runtime::TableRegistry tables = base_tables;
-        LazyTableRegistry lazy_sources;
-        ir::SourceStats source_stats;
-        ir::SourceSchemas& schemas = source_stats.schemas;
-        ir::SourceRowCounts& row_counts = source_stats.rows;
-        // Materialized shared bindings participate in schema-aware rewrites
-        // (and cardinality estimates) with their exact schemas and sizes. A
-        // materialized table carries no footer stats, so no distinct estimates.
-        for (const auto& [name, table] : base_tables) {
-            schemas.insert_or_assign(name, table_schema_info(table));
-            row_counts.insert_or_assign(name, table.rows());
-        }
-        for (const auto& source : sources) {
-            const auto* function = externs.find(source.callee);
-            auto args = literal_args(source.args);
-            if (function == nullptr || !function->lazy_table_func) {
-                return std::unexpected("lazy source unavailable: " + source.callee);
-            }
-            if (!args.has_value()) {
-                return std::unexpected(args.error());
-            }
-            auto lazy = function->lazy_table_func(*args);
-            if (!lazy.has_value()) {
-                return std::unexpected(lazy.error());
-            }
-            // Uniqueness is the one thing the planner cannot infer about a base
-            // table from its own construction, and without it the `|PK ⋈ FK| <=
-            // |FK|` bound in `estimate_cardinality` never applies to a scan —
-            // every base source reached the cost model with no unique key at
-            // all. Proving it here is what puts a real bound under join
-            // ordering rather than an estimate.
-            schemas.insert_or_assign(source.source_name, table_schema_info(lazy.value()->schema()));
-            row_counts.insert_or_assign(source.source_name, lazy.value()->rows());
-            source_stats.distinct.insert_or_assign(source.source_name,
-                                                   derive_column_distinct(*lazy.value()));
-            lazy_sources.insert_or_assign(source.source_name, std::move(lazy.value()));
-        }
-        // `make_relation_sampler` (real, data-sampled filter selectivity and
-        // key-distinct counts) is built but gated OFF by default: measured
-        // against the full suite, a one-row-group sample regressed q10 5x
-        // (86ms -> 474ms) by giving `resolve_key_distincts` a WORSE
-        // o_orderkey/l_orderkey distinct estimate than the footer span it was
-        // meant to improve on -- q10's join keys are not uniformly
-        // distributed across row groups, so "the first row group" is not a
-        // representative sample of the whole file. The infrastructure
-        // (RelationSamplerFn, the sampled-selectivity path in
-        // join_order.cpp's collect_left_deep, and the sampled-distinct path
-        // in cardinality.cpp's distinct_below) is real and was
-        // correctness-verified where it WAS exercised (see
-        // join_reorder.cpp's connecting_keys fix, found via this work). What
-        // it needs before going live unconditionally is a sampling strategy
-        // that's actually representative -- multiple row groups, or a
-        // validated confidence bound on the single-unit estimate -- not a
-        // bigger reorder cap. IBEX_EXPERIMENTAL_JOIN_SAMPLING opts in for
-        // that follow-up work to A/B against without a rebuild.
-        if (std::getenv("IBEX_EXPERIMENTAL_JOIN_SAMPLING") != nullptr) {
-            source_stats.sample = make_relation_sampler(lazy_sources);
-        }
-
-        // Uniqueness is the one thing the planner cannot infer about a base
-        // table from its own construction, and without it the `|PK join FK| <=
-        // |FK|` bound in `estimate_cardinality` never applies to a scan. It runs
-        // as a second pass because resolving a join key back to the source
-        // column it came from needs every source's schema already in place.
-        {
-            const runtime::ExecutionContext proof_exec = command_exec();
-            std::set<std::string> lazy_names;
-            for (const auto& [name, lazy] : lazy_sources) {
-                lazy_names.insert(name);
-            }
-            // Only an actual deferred-probe key must stay uncached; all other
-            // proof reads are reusable execution work.  This analysis is
-            // conservative with respect to the current (pre-reorder) plan:
-            // a later plan that declines a probe simply keeps a useful cache.
-            const auto deferred_probes =
-                ir::deferrable_probe_scans(*rewritten, lazy_names, row_counts, schemas);
-            for (const auto& [source_name, columns] :
-                 ir::plan_join_key_origins(*rewritten, schemas)) {
-                const auto lazy = lazy_sources.find(source_name);
-                const auto schema = schemas.find(source_name);
-                if (lazy == lazy_sources.end() || schema == schemas.end()) {
-                    continue;
-                }
-                const auto probe = deferred_probes.find(source_name);
-                const std::string* probe_key =
-                    probe == deferred_probes.end() ? nullptr : &probe->second.key_column;
-                for (auto& column :
-                     prove_unique_columns(*lazy->second, columns, proof_exec, probe_key)) {
-                    schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
-                }
-            }
-        }
-
-        // Prove what the ascriptions and joins assert before anything is
-        // decoded: the assertion is about shape, and `schemas` already holds
-        // every source's names and types straight from its footer. Proving them
-        // here is also what stops the ascriptions demanding the data they only
-        // assert. This is the first point the join keys can be checked at all:
-        // at lowering a reader call site had no schema.
-        if (auto ok = check_and_fuse_ascriptions(rewritten, schemas); !ok.has_value()) {
-            return std::unexpected(ok.error());
-        }
-        rewritten = ir::push_filters_into_joins(std::move(rewritten), schemas);
-        rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
-        rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
-        rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
-        std::set<std::string> lazy_names;
-        for (const auto& [name, lazy] : lazy_sources) {
-            lazy_names.insert(name);
-        }
-        // After the reorder, so it sees the join shape that will actually run,
-        // and after the uniqueness proofs above, which are its whole premise.
-        // Two occurrences of one source in a self-join are kept apart by the
-        // scan-node identity carried in `ColumnOrigin`, not by a rewrite.
-        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
-        // Needs no schema or uniqueness proof of its own -- it decides by
-        // walking the plan -- but it runs here so it sees the shape the joins
-        // and the FD reduction leave behind.
-        rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
-        // Give the probe side of a self-referenced source its own name so its
-        // decode can be deferred and bounded by the build side while the other
-        // occurrence still reads the whole table (TPC-H q18).
-        auto probe_split = ir::isolate_deferrable_probe_scans(std::move(rewritten), lazy_names);
-        rewritten = std::move(probe_split.plan);
-        const auto& instances = probe_split.instances;
-        const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
-            auto it = lazy_sources.find(name);
-            if (it == lazy_sources.end()) {
-                if (const auto inst = instances.find(name); inst != instances.end()) {
-                    it = lazy_sources.find(inst->second);
-                }
-            }
-            return it == lazy_sources.end() ? nullptr : it->second.get();
-        };
-        // Absorb scan filters before computing demand, so a column referenced
-        // only by a pushed filter is decoded for the selection but never
-        // gathered into the scan's output. No ScalarRegistry is passed to
-        // project_where: batch-eligible scripts cannot bind scalars, so a
-        // pushed conjunct can never reference one.
-        const auto absorbed = absorb_lazy_scan_filters(
-            rewritten, [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
-        // What absorption just took out of the tree. The deferred-probe gate
-        // weighs a build side's filtered row estimate against its own table's
-        // size, and `remove_applied_scan_filters` deleted exactly the Filter
-        // nodes that estimate is made of -- without this every build side reads
-        // back its full table, and q03's filtered customer becomes
-        // indistinguishable from q12's unfiltered orders.
-        std::map<std::string, double> absorbed_scan_selectivity;
-        for (const auto& name : absorbed.applied) {
-            const auto conjuncts = absorbed.predicates.find(name);
-            if (conjuncts == absorbed.predicates.end()) {
-                continue;
-            }
-            double selectivity = 1.0;
-            for (const auto& conjunct : conjuncts->second) {
-                selectivity *= ir::compound_selectivity(conjunct);
-            }
-            absorbed_scan_selectivity.emplace(name, selectivity);
-        }
-        const auto demand = ir::required_columns(*rewritten);
-        // Deferred probe scans: an eligible scan (sole feed of an inner
-        // single-key join's right side, through projects/renames only) is not
-        // decoded here. The join decodes it during execution, after
-        // publishing build-side key bounds into its filter slot — see
-        // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
-        // makes this safe: project_where bypasses its whole-column cache.
-        const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
-            auto it = lazy_sources.find(name);
-            if (it == lazy_sources.end()) {
-                if (const auto inst = instances.find(name); inst != instances.end()) {
-                    it = lazy_sources.find(inst->second);
-                }
-            }
-            return it == lazy_sources.end() ? nullptr : it->second;
-        };
-        std::set<std::string> deferrable_names = lazy_names;
-        for (const auto& [instance_name, source] : instances) {
-            deferrable_names.insert(instance_name);
-        }
-        runtime::DeferredScanRegistry deferred_scans;
-        // Declared here, before the lazy-source projection below, because that
-        // projection runs a scan's filter under it — not only `interpret` at
-        // the end of this lambda.
-        runtime::ExecutionContext exec{.deferred_scans = &deferred_scans,
-                                       .execution_profile = nullptr};
-        runtime::configure_parallel_from_env(exec);
-        for (auto& [name, info] : ir::deferrable_probe_scans(
-                 *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
-            const auto needed = demand.find(name);
-            auto lazy = resolve_lazy_ptr(name);
-            if (needed == demand.end() || lazy == nullptr) {
-                continue;
-            }
-            deferred_scans.emplace(
-                name, runtime::DeferredScan{
-                          .lazy = std::move(lazy),
-                          .conjuncts = absorbed.applied.contains(name)
-                                           ? absorbed.predicates.at(name)
-                                           : std::vector<ir::Expr>{},
-                          .demand = needed->second.names,
-                          .demand_all = needed->second.all,
-                          .key_column = std::move(info.key_column),
-                          .filter = std::make_shared<runtime::DynamicScanFilter>(),
-                      });
-        }
-        // Streaming scan registration: hand a multi-unit source to the plan
-        // still undecoded (Phase 1 of plans/pipelined-execution-plan.md) so its
-        // scan operator can emit it a unit at a time instead of the whole file
-        // arriving as one chunk. The pushdowns are the same ones the eager
-        // decode applies -- they travel in the registration rather than being
-        // spent here. A null `filter` marks this as streaming rather than a
-        // deferred *probe* scan, whose decode is the join's to schedule; the
-        // probe loop above already populated `deferred_scans`, so the two never
-        // overlap.
-        //
-        // A source scanned more than once (a self-join) is excluded: streaming
-        // it would give each occurrence its own per-unit decode of the same
-        // file. `scan_predicates` already declined to push a per-occurrence
-        // filter for it, so the eager decode below reads the whole demanded
-        // union once into the registry.
-        const auto scan_counts = ir::scan_source_counts(*rewritten);
-        const auto repeated_scan = [&](const std::string& name) {
-            const auto it = scan_counts.find(name);
-            return it != scan_counts.end() && it->second > 1;
-        };
-        if (exec.stream_scans) {
-            for (const auto& [name, needed] : demand) {
-                if (deferred_scans.contains(name)) {
-                    continue;
-                }
-                auto* lazy = resolve_lazy(name);
-                if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name)) {
-                    continue;
-                }
-                deferred_scans.emplace(
-                    name, runtime::DeferredScan{
-                              .lazy = resolve_lazy_ptr(name),
-                              .conjuncts = absorbed.applied.contains(name)
-                                               ? absorbed.predicates.at(name)
-                                               : std::vector<ir::Expr>{},
-                              .demand = needed.names,
-                              .demand_all = needed.all,
-                              .key_column = {},
-                              .filter = nullptr,
-                          });
-            }
-        }
-        // Everything not deferred or streamed is decoded eagerly into the
-        // registry now, narrowed to its demand with its absorbed filter applied.
-        if (auto ok = decode_demanded_lazy_sources(
-                demand, absorbed, resolve_lazy, exec, nullptr, tables,
-                [&](const std::string& name) { return deferred_scans.contains(name); });
-            !ok.has_value()) {
-            return std::unexpected(ok.error());
-        }
-        return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
-    };
 
     // A shared binding's plan is evaluated on its own, inside `evaluate`,
     // where `ir::required_columns` has no consumer above the plan's root and
@@ -5280,7 +5290,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     // them ahead of the sinks does not reorder any observable effect.
     runtime::TableRegistry base_tables = build_builtin_tables();
     for (auto& shared : script->shared_bindings) {
-        auto table = evaluate(std::move(shared.plan), base_tables);
+        auto table = optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees, externs);
         if (!table.has_value()) {
             ibex::formatting::print("error: {}\n", table.error());
             return false;
@@ -5298,7 +5308,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             }
         }
         if (!input.has_value()) {
-            input = evaluate(std::move(sink.input), base_tables);
+            input = optimize_and_execute_plan(std::move(sink.input), base_tables, lazy_callees, externs);
             if (input.has_value() && sink.input_binding.has_value()) {
                 cached_bindings.insert_or_assign(*sink.input_binding, input.value());
             }
@@ -5326,7 +5336,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         }
     }
     if (!result.has_value()) {
-        result = evaluate(std::move(script->result), base_tables);
+        result = optimize_and_execute_plan(std::move(script->result), base_tables, lazy_callees, externs);
     }
     if (!result.has_value()) {
         ibex::formatting::print("error: {}\n", result.error());

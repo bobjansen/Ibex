@@ -6,6 +6,7 @@ add_library(ibex_runtime STATIC
     aggregate_chunked.cpp
     chunk_conversion.cpp
     chunked.cpp
+    distinct_chunked.cpp
     join_chunked.cpp
     env.cpp
     execution_profile.cpp

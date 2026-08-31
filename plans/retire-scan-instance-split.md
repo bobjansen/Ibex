@@ -6,10 +6,14 @@
 by removing the mechanism, keeping the one job it did that mattered
 (deferred-probe occurrence identity) in a narrow purpose-named pass.
 
-**Result (SF-4, 8-core, vs pre-change):** q21 −3.7% (noisy, ~5–10%), q03 −12.5%,
-small wins q05/q07/q11, q18 +3.7% (recovered from an intermediate +83% — see
-below), geomean 0.997, polars reference flat. `check_answers.py` 22/22,
-1813 tests, strict GCC, ASAN/UBSAN parity all pass.
+**Result (SF-4, 8-core, clean back-to-back A/B `18447fdb` vs `c3d12a37`):**
+q18 −17.3%, q21 −7.8%, wins on q15/q16/q19/q20/q22 (5–9%), **q01 −0.7% (not
+regressed — an earlier +5.4% came from a contaminated baseline run)**, q02
++8.3% and q14 +5.5% (small, 22ms / known-ceiling queries, likely noise),
+geomean 0.971. The polars reference in these runs is *cached, not re-run*
+(`--skip-pdsh`), so there is no box-drift guard — the two runs were ~4 min
+apart, direction is trustworthy, exact magnitude less so. `check_answers.py`
+22/22, 1813 tests, strict GCC, ASAN/UBSAN parity all pass.
 
 **The q18 lesson:** deleting the split outright regressed q18 83%. Its main
 `lineitem` join is a *deferrable probe* (semi-join pushdown filters `orders` to

@@ -8,6 +8,8 @@ add_library(ibex_runtime STATIC
     chunked.cpp
     distinct_chunked.cpp
     join_chunked.cpp
+    map_chunked.cpp
+    ordered_chunked.cpp
     env.cpp
     execution_profile.cpp
     expr.cpp

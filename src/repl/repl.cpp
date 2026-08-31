@@ -120,6 +120,32 @@ using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResul
     return needed.all ? lazy.materialize(exec) : lazy.project(needed.names, exec);
 }
 
+/// The pushable scan predicates of a plan, and which of them belong to a lazy
+/// source and so have been absorbed out of the tree.
+struct AbsorbedScanFilters {
+    ir::ScanPredicateMap predicates;  ///< every source's pushable conjuncts
+    std::set<std::string> applied;    ///< the subset that is a lazy source
+};
+
+/// Compute `plan`'s pushable scan predicates, mark the ones that name a lazy
+/// source as absorbed, and rewrite `plan` to drop exactly those Filter nodes so
+/// column demand is computed on the reduced tree. The shared front half of both
+/// REPL execution paths' projection pushdown.
+[[nodiscard]] auto absorb_lazy_scan_filters(ir::NodePtr& plan,
+                                            const std::function<bool(const std::string&)>& is_lazy)
+    -> AbsorbedScanFilters {
+    AbsorbedScanFilters out{.predicates = ir::scan_predicates(*plan), .applied = {}};
+    for (const auto& [name, conjuncts] : out.predicates) {
+        if (is_lazy(name)) {
+            out.applied.insert(name);
+        }
+    }
+    if (!out.applied.empty()) {
+        plan = ir::remove_applied_scan_filters(std::move(plan), out.applied);
+    }
+    return out;
+}
+
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
 std::atomic_bool verbose_logging{false};
 
@@ -3735,17 +3761,8 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
         if (auto err = ir::check_joins(*lowered.value(), context.source_schemas)) {
             return std::unexpected(*err);
         }
-        auto predicates = ir::scan_predicates(*lowered.value());
-        std::set<std::string> applied_scan_filters;
-        for (const auto& [name, conjuncts] : predicates) {
-            if (resolve_lazy(name) != nullptr) {
-                applied_scan_filters.insert(name);
-            }
-        }
-        if (!applied_scan_filters.empty()) {
-            lowered.value() =
-                ir::remove_applied_scan_filters(std::move(lowered.value()), applied_scan_filters);
-        }
+        const auto [predicates, applied_scan_filters] = absorb_lazy_scan_filters(
+            lowered.value(), [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
         auto demand = ir::required_columns(*lowered.value());
         projected = tables;
         for (const auto& [name, needed] : demand) {
@@ -5038,18 +5055,13 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // gathered into the scan's output. No ScalarRegistry is passed to
         // project_where: batch-eligible scripts cannot bind scalars, so a
         // pushed conjunct can never reference one.
-        const auto predicates = ir::scan_predicates(*rewritten);
-        std::set<std::string> applied_filters;
-        for (const auto& [name, conjuncts] : predicates) {
-            if (resolve_lazy(name) != nullptr) {
-                applied_filters.insert(name);
-            }
-        }
-        // What absorption is about to take out of the tree. The deferred-probe
-        // gate weighs a build side's filtered row estimate against its own
-        // table's size, and `remove_applied_scan_filters` deletes exactly the
-        // Filter nodes that estimate is made of -- without this every build
-        // side reads back its full table, and q03's filtered customer becomes
+        const auto [predicates, applied_filters] = absorb_lazy_scan_filters(
+            rewritten, [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
+        // What absorption just took out of the tree. The deferred-probe gate
+        // weighs a build side's filtered row estimate against its own table's
+        // size, and `remove_applied_scan_filters` deleted exactly the Filter
+        // nodes that estimate is made of -- without this every build side reads
+        // back its full table, and q03's filtered customer becomes
         // indistinguishable from q12's unfiltered orders.
         std::map<std::string, double> absorbed_scan_selectivity;
         for (const auto& name : applied_filters) {
@@ -5062,9 +5074,6 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                 selectivity *= ir::compound_selectivity(conjunct);
             }
             absorbed_scan_selectivity.emplace(name, selectivity);
-        }
-        if (!applied_filters.empty()) {
-            rewritten = ir::remove_applied_scan_filters(std::move(rewritten), applied_filters);
         }
         const auto demand = ir::required_columns(*rewritten);
         // Deferred probe scans: an eligible scan (sole feed of an inner
@@ -5153,18 +5162,10 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                           });
                 continue;
             }
-            std::expected<runtime::Table, std::string> table;
-            if (applied_filters.contains(name)) {
-                std::set<std::string> names = needed.names;
-                if (needed.all) {
-                    for (const auto& field : lazy->schema().columns) {
-                        names.insert(field.name);
-                    }
-                }
-                table = lazy->project_where(names, predicates.at(name), exec);
-            } else {
-                table = needed.all ? lazy->materialize(exec) : lazy->project(needed.names, exec);
-            }
+            const bool filtered = applied_filters.contains(name);
+            auto table = decode_demanded_lazy_source(
+                *lazy, needed, filtered,
+                filtered ? predicates.at(name) : std::vector<ir::Expr>{}, exec);
             if (!table.has_value()) {
                 return std::unexpected(table.error());
             }

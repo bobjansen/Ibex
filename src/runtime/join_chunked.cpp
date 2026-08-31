@@ -2857,6 +2857,75 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     // set, ~40% of the query). Past it, materialize the left and swap.
     static constexpr std::size_t kSemiSwapThreshold = 65536;
 
+    // ── Dense bit-packed integer membership (see `dense_i64_hits_`) ──────────
+    static constexpr auto dense_word(std::uint64_t slot) -> std::size_t {
+        return static_cast<std::size_t>(slot >> 6U);
+    }
+    static constexpr auto dense_bit(std::uint64_t slot) -> std::uint64_t {
+        return std::uint64_t{1} << (slot & 63U);
+    }
+    [[nodiscard]] auto dense_contains(std::int64_t value) const -> bool {
+        const std::uint64_t slot = static_cast<std::uint64_t>(value) -
+                                   static_cast<std::uint64_t>(*dense_i64_min_);
+        return slot < dense_i64_nbits_ &&
+               (dense_i64_hits_[dense_word(slot)] & dense_bit(slot)) != 0;
+    }
+
+    /// Build `dense_i64_hits_` directly from the right key column, for the
+    /// swapped build whose buffered left is NOT the smaller side (so
+    /// `try_dense_intersection` does not apply) but whose right key span is
+    /// still small and dense enough that a cache-resident bitmap beats a
+    /// multi-million-entry hash probe. q21: ~5M distinct order keys spanning
+    /// ~24M values -> a 3MB bitmap probed 15M times instead of an ~80MB
+    /// robin_hood set. Returns false to leave the hash build to the caller.
+    template <typename RNull>
+    auto try_build_dense_right(const Column<std::int64_t>& rcol, RNull rnull) -> bool {
+        const std::size_t rows = rcol.size();
+        if (rows == 0) {
+            return false;
+        }
+        std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
+        std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
+        std::size_t live = 0;
+        for (std::size_t i = 0; i < rows; ++i) {
+            if (rnull(i)) {
+                continue;
+            }
+            const std::int64_t value = rcol[i];
+            min_key = std::min(min_key, value);
+            max_key = std::max(max_key, value);
+            ++live;
+        }
+        if (live == 0) {
+            return false;
+        }
+        const std::uint64_t difference =
+            static_cast<std::uint64_t>(max_key) - static_cast<std::uint64_t>(min_key);
+        if (difference == std::numeric_limits<std::uint64_t>::max()) {
+            return false;
+        }
+        const std::uint64_t span = difference + 1;
+        // 8MB ceiling (64M slots) keeps the bitmap inside a large L3; at most
+        // 16 slots per live key keeps a sparse column on the hash path, where
+        // the bitmap would be mostly empty cache lines.
+        constexpr std::uint64_t kMaxDenseBits = 64ULL << 20U;
+        if (span > kMaxDenseBits || span > static_cast<std::uint64_t>(live) * 16U) {
+            return false;
+        }
+        dense_i64_min_ = min_key;
+        dense_i64_nbits_ = static_cast<std::size_t>(span);
+        dense_i64_hits_.assign((dense_i64_nbits_ + 63U) / 64U, std::uint64_t{0});
+        for (std::size_t i = 0; i < rows; ++i) {
+            if (rnull(i)) {
+                continue;
+            }
+            const std::uint64_t slot = static_cast<std::uint64_t>(rcol[i]) -
+                                       static_cast<std::uint64_t>(min_key);
+            dense_i64_hits_[dense_word(slot)] |= dense_bit(slot);
+        }
+        return true;
+    }
+
     /// Workers for the swapped build's intersection scan, or 0 to run it here.
     ///
     /// The scan is one hash lookup per right row against a map that stopped
@@ -2958,8 +3027,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     return false;  // the inclusive span is not representable
                 }
                 const std::uint64_t span64 = difference + 1;
-                constexpr std::size_t kMaxDenseSlots = 2UL << 20U;
-                constexpr std::size_t kMaxRangePerKey = 4;
+                // Bit-packed, so the ceiling and the per-key density gate are
+                // both 8x looser than the old byte-addressed table: 64M slots =
+                // 8MB, at most 16 slots per left key.
+                constexpr std::uint64_t kMaxDenseSlots = 64ULL << 20U;
+                constexpr std::size_t kMaxRangePerKey = 16;
                 const std::size_t density_limit =
                     left_rows > std::numeric_limits<std::size_t>::max() / kMaxRangePerKey
                         ? std::numeric_limits<std::size_t>::max()
@@ -2968,17 +3040,18 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     return false;
                 }
                 const auto slots = static_cast<std::size_t>(span64);
+                const std::size_t nwords = (slots + 63U) / 64U;
                 const auto slot_of = [min_key](std::int64_t value) {
-                    return static_cast<std::size_t>(static_cast<std::uint64_t>(value) -
-                                                    static_cast<std::uint64_t>(min_key));
+                    return static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
                 };
-                std::vector<char> candidates(slots, char{0});
+                std::vector<std::uint64_t> candidates(nwords, std::uint64_t{0});
                 for (const auto* lcol : lcols) {
                     for (const std::int64_t value : *lcol) {
-                        candidates[slot_of(value)] = char{1};
+                        const std::uint64_t slot = slot_of(value);
+                        candidates[dense_word(slot)] |= dense_bit(slot);
                     }
                 }
-                const auto scan_range = [&](std::size_t lo, std::size_t hi, char* hits) {
+                const auto scan_range = [&](std::size_t lo, std::size_t hi, std::uint64_t* hits) {
                     for (std::size_t row = lo; row < hi; ++row) {
                         if (rnull(row)) {
                             continue;
@@ -2987,20 +3060,21 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                         if (value < min_key || value > max_key) {
                             continue;
                         }
-                        const std::size_t slot = slot_of(value);
-                        if (candidates[slot] != char{0}) {
-                            hits[slot] = char{1};
+                        const std::uint64_t slot = slot_of(value);
+                        if ((candidates[dense_word(slot)] & dense_bit(slot)) != 0) {
+                            hits[dense_word(slot)] |= dense_bit(slot);
                         }
                     }
                 };
 
-                std::vector<char> hits(slots, char{0});
-                const std::size_t workers = intersect_worker_count(rcol.size(), slots);
+                std::vector<std::uint64_t> hits(nwords, std::uint64_t{0});
+                const std::size_t workers =
+                    intersect_worker_count(rcol.size(), nwords * sizeof(std::uint64_t));
                 if (workers < 2) {
                     scan_range(0, rcol.size(), hits.data());
                 } else {
-                    std::vector<std::vector<char>> parts(workers,
-                                                         std::vector<char>(slots, char{0}));
+                    std::vector<std::vector<std::uint64_t>> parts(
+                        workers, std::vector<std::uint64_t>(nwords, std::uint64_t{0}));
                     const std::size_t grain = (rcol.size() + workers - 1) / workers;
                     auto batch = process_worker_pool().submit(workers, [&](std::size_t worker) {
                         const std::size_t begin = worker * grain;
@@ -3011,8 +3085,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     });
                     batch.wait();
                     for (const auto& part : parts) {
-                        for (std::size_t slot = 0; slot < slots; ++slot) {
-                            hits[slot] = static_cast<char>(hits[slot] | part[slot]);
+                        for (std::size_t w = 0; w < nwords; ++w) {
+                            hits[w] |= part[w];
                         }
                     }
                 }
@@ -3021,6 +3095,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                 // away the representation win just before probing q22's 84k
                 // customer rows.
                 dense_i64_min_ = min_key;
+                dense_i64_nbits_ = slots;
                 dense_i64_hits_ = std::move(hits);
                 return true;
             };
@@ -3090,9 +3165,10 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     right_i64_.insert(k);
                 }
             }
-        } else {
-            // Left is not the smaller side (or its key vanished); the plain
-            // right set is as good, and the buffered left still emits.
+        } else if (!try_build_dense_right(rcol, rnull)) {
+            // Left is not the smaller side (or its key vanished) and the right
+            // key span is too wide/sparse for a bitmap; the plain right set is
+            // as good, and the buffered left still emits.
             right_i64_.reserve(rcol.size());
             for (std::size_t i = 0; i < rcol.size(); ++i) {
                 if (!rnull(i)) {
@@ -3373,14 +3449,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return filter_rows(std::move(t), [&](std::size_t row) {
                 bool match = false;
                 if (!probe_is_null(row)) {
-                    if (dense_i64_min_.has_value()) {
-                        const std::uint64_t slot = static_cast<std::uint64_t>((*col)[row]) -
-                                                   static_cast<std::uint64_t>(*dense_i64_min_);
-                        match = slot < dense_i64_hits_.size() &&
-                                dense_i64_hits_[static_cast<std::size_t>(slot)] != char{0};
-                    } else {
-                        match = right_i64_.contains((*col)[row]);
-                    }
+                    match = dense_i64_min_.has_value() ? dense_contains((*col)[row])
+                                                       : right_i64_.contains((*col)[row]);
                 }
                 return keep_matches ? match : !match;
             });
@@ -3475,8 +3545,15 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     const ExecutionContext* exec_ = nullptr;
 
     robin_hood::unordered_flat_set<std::int64_t> right_i64_;
+    /// Dense bit-packed membership over `[dense_i64_min_, dense_i64_min_ +
+    /// dense_i64_nbits_)`, used in place of `right_i64_` when the integer key
+    /// span is boundable and dense enough for the bitmap to stay
+    /// cache-resident. Populated by `try_build_dense_right` (probe the small
+    /// right against a bitmap of itself) or `try_dense_intersection` (probe the
+    /// large right against a bitmap of the smaller buffered left).
     std::optional<std::int64_t> dense_i64_min_;
-    std::vector<char> dense_i64_hits_;
+    std::size_t dense_i64_nbits_ = 0;
+    std::vector<std::uint64_t> dense_i64_hits_;
     robin_hood::unordered_flat_set<double> right_f64_;
     robin_hood::unordered_flat_set<bool> right_bool_;
     robin_hood::unordered_flat_set<Date> right_date_;

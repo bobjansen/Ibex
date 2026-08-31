@@ -219,9 +219,25 @@ separate streaming operator.
    executor are extracted. The pipeline unit owns worker chains, ordered handoff,
    two-phase filter, deferred-scan pipeline, asynchronous stage, and source
    strategy; concrete row-local factories remain callbacks owned by their
-   operator families. No extra call was added to `Operator::next()`. Semi/anti,
-   materializing joins, and residual breaker families remain in their existing
-   owners. **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
+   operator families. No extra call was added to `Operator::next()`.
+   **`distinct` extracted 2026-08-31** (`d82d9fa8`) into `distinct_chunked.cpp`
+   (`ChunkedDistinctOperator`, `distinct_table`, `build_physical_distinct`) —
+   fully private, every dependency already in a shared header, no new interface.
+   **Streaming semi/anti moved 2026-08-31** (`2e3f89dd`) into `join_chunked.cpp`
+   (`ChunkedSemiAntiJoinOperator`, `is_streamable_semi_anti_join`) behind a new
+   `make_chunked_semi_anti_join_operator` factory; it stays a separate operator
+   from the inner-join family by design, just co-located now. `chunked.cpp`
+   5152→3623 lines. **Still in `chunked.cpp`:** the Order/Head/Tail/TopK family
+   (`ChunkedOrderOperator`, `ChunkedAsTimeframeOperator`,
+   `ChunkedOrderedLimitOperator`, `ChunkedHeadOperator` +
+   `build_physical_{order,head,tail,topk}`) and the row-local map operators
+   (`Chunked{Filter,Project,Rename,Update,FilterProject,FilterHead,FilterTail,
+   FilterUpdateProject}` + map-step factories + `build_physical_filter_head_tail`).
+   These two are entangled through `append_validity`, `SchemaCarrier`,
+   `ChunkIdentity`, and `build_physical_filter_head_tail` straddling both — a
+   considered split, not the next mechanical one. Materializing joins remain
+   the intended `MaterializedCall`.
+   **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
    `d1204b63`; `plans/physical-fallback-adapter-plan.md`): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
    non-migrated kind resolves through one `build_materialized_fallback` →

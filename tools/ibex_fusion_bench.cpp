@@ -389,9 +389,9 @@ auto main(int argc, char** argv) -> int {
         // keys remapped. Exposes the sort to the source's pre-rename column
         // name, so the `sorted` passthrough path still fires after the push.
         {"sorted_rename_then_order", "sorted[rename key = k][order key asc]"},
-        // as_timeframe on a pre-sorted nanosecond column streams chunks
-        // through ChunkedAsTimeframeOperator without a sort; unsorted input
-        // falls back to concat + order_table (spec §9.1).
+        // as_timeframe promotes an Int nanosecond column to Timestamp; a
+        // pre-sorted column skips the sort, unsorted input pays concat +
+        // order_table (spec §9.1).
         {"tf_sorted_as_timeframe", "as_timeframe(tf_sorted, \"ts\")"},
         {"wide_as_timeframe_unsorted", "as_timeframe(wide, \"c0\")"},
         // TopK fusion (canonicalize R16): Head(Order(x)) → TopK(..., First),

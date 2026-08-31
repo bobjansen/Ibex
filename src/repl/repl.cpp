@@ -95,6 +95,31 @@ using ColumnRegistry = robin_hood::unordered_map<std::string, runtime::ColumnVal
 /// A binding lives in exactly one of the two registries.
 using LazyTableRegistry = robin_hood::unordered_map<std::string, runtime::LazyTablePtr>;
 using ModelRegistry = robin_hood::unordered_map<std::string, runtime::ModelResult>;
+
+/// Decode exactly the columns `needed` from one lazy source, applying its
+/// pushable scan predicate when `filter_applied`. The single place both
+/// execution paths (a REPL statement and the whole-script driver) turn a lazy
+/// binding into a Table, so a filtered decode cannot silently diverge between
+/// them. `scalars` is non-null only on the statement path, where a pushed
+/// conjunct may reference a bound scalar.
+[[nodiscard]] auto decode_demanded_lazy_source(runtime::LazyTable& lazy,
+                                               const ir::ColumnDemand& needed, bool filter_applied,
+                                               const std::vector<ir::Expr>& conjuncts,
+                                               const runtime::ExecutionContext& exec,
+                                               const runtime::ScalarRegistry* scalars = nullptr)
+    -> std::expected<runtime::Table, std::string> {
+    if (filter_applied) {
+        std::set<std::string> names = needed.names;
+        if (needed.all) {
+            for (const auto& field : lazy.schema().columns) {
+                names.insert(field.name);
+            }
+        }
+        return lazy.project_where(names, conjuncts, exec, scalars);
+    }
+    return needed.all ? lazy.materialize(exec) : lazy.project(needed.names, exec);
+}
+
 using CompileTimeListRegistry = robin_hood::unordered_map<std::string, std::vector<std::string>>;
 std::atomic_bool verbose_logging{false};
 
@@ -3728,18 +3753,10 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             if (lazy == nullptr) {
                 continue;  // an ordinary table, not a deferred one
             }
-            std::expected<runtime::Table, std::string> table;
-            if (applied_scan_filters.contains(name)) {
-                std::set<std::string> names = needed.names;
-                if (needed.all) {
-                    for (const auto& field : lazy->schema().columns) {
-                        names.insert(field.name);
-                    }
-                }
-                table = lazy->project_where(names, predicates.at(name), exec, &scalars);
-            } else {
-                table = needed.all ? lazy->materialize(exec) : lazy->project(needed.names, exec);
-            }
+            const bool filtered = applied_scan_filters.contains(name);
+            auto table = decode_demanded_lazy_source(
+                *lazy, needed, filtered,
+                filtered ? predicates.at(name) : std::vector<ir::Expr>{}, exec, &scalars);
             if (!table) {
                 return std::unexpected(table.error());
             }

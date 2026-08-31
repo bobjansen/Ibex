@@ -23,10 +23,15 @@
 # fixed names alone can never be: a rerun silently overwrites the numbers you
 # wanted to compare against. Use compare_runs.py to diff two archived runs.
 #
+# The upstream Polars/DuckDB reference ALWAYS runs, in the same sitting -- a
+# comparison against a stale reference number is worthless (a slower box then
+# reads as an ibex regression). Needs a pola-rs/polars-benchmark checkout,
+# auto-found at ~/polars-benchmark or given by --pdsh-root / $PDSH_ROOT. For a
+# quick ibex-only look use bench_ibex.py instead.
+#
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
-#                  [--skip-pdsh] [--polars-streaming] [--cores N] [--label TEXT]
-#                  [--no-archive]
+#                  [--polars-streaming] [--cores N] [--label TEXT] [--no-archive]
 
 set -euo pipefail
 
@@ -38,7 +43,6 @@ RESULTS="$SCRIPT_DIR/results"
 SCALE=1
 WARMUP=1
 ITERS=5
-SKIP_PDSH=0
 POLARS_STREAMING=0
 ARCHIVE=1
 LABEL=""
@@ -54,7 +58,6 @@ while [[ $# -gt 0 ]]; do
         --warmup) WARMUP="$2"; shift 2 ;;
         --iters)  ITERS="$2";  shift 2 ;;
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
-        --skip-pdsh) SKIP_PDSH=1; shift ;;
         --polars-streaming) POLARS_STREAMING=1; shift ;;
         --cores)  CORES="$2"; shift 2 ;;
         --label)  LABEL="$2"; shift 2 ;;
@@ -63,15 +66,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The reference engines always run in the same sitting as ibex -- a run that
+# reused an old polars number would let a box that got slower read as an ibex
+# regression, and compare_runs.py's "reference geomean" would show a fake 1.000
+# (feedback_rerun_reference_engine.md). There is no skip. `bench_ibex.py` is the
+# tool for a quick ibex-only look.
+if [[ -z "$PDSH_ROOT" ]]; then
+    for cand in "$HOME/polars-benchmark" "$IBEX_ROOT/../polars-benchmark" \
+                "$SCRIPT_DIR/polars-benchmark"; do
+        if [[ -d "$cand/queries/polars" ]]; then PDSH_ROOT="$cand"; break; fi
+    done
+fi
+
 PARQUET_DIR="$DATA_ROOT/parquet_sf${SCALE}"
 if [[ ! -d "$PARQUET_DIR" ]]; then
     echo "error: $PARQUET_DIR not found — run ./gen_data.sh $SCALE && ./gen_parquet.sh $SCALE first" >&2
     exit 1
 fi
 
-if [[ -z "$PDSH_ROOT" && "$SKIP_PDSH" -eq 0 ]]; then
-    echo "error: --pdsh-root is required (a checkout of pola-rs/polars-benchmark)" >&2
-    echo "       or pass --skip-pdsh to time only ibex and this tree's Polars." >&2
+if [[ -z "$PDSH_ROOT" || ! -d "$PDSH_ROOT/queries/polars" ]]; then
+    echo "error: no pola-rs/polars-benchmark checkout found." >&2
+    echo "       git clone https://github.com/pola-rs/polars-benchmark.git ~/polars-benchmark" >&2
+    echo "       (or pass --pdsh-root DIR / set PDSH_ROOT). For ibex-only timing use bench_ibex.py." >&2
     exit 1
 fi
 
@@ -94,10 +110,9 @@ fi
 # The manifest records the things that silently invalidate a comparison. The
 # commit and the dirty flag, because a number from an uncommitted tree cannot be
 # reproduced. The core count and scale, because the same query at 8 and 24 cores
-# is two different measurements. Which engine rows were MEASURED versus carried
-# forward from an earlier run, because `--skip-pdsh` leaves real-looking columns
-# in the table that this run did not produce. And the CPU, since these land in
-# the repo and get read on other machines.
+# is two different measurements. And the CPU, since these land in the repo and
+# get read on other machines. Every engine row is measured this run; the
+# carried_forward field is kept (empty) so old manifests still parse.
 archive_run() {
     [[ "$ARCHIVE" -eq 1 ]] || return 0
     local commit branch dirty stamp dir
@@ -118,14 +133,10 @@ archive_run() {
     dir="$RESULTS/runs/${stamp}_${commit:0:8}${dirty_suffix}_sf${SCALE}"
     mkdir -p "$dir"
 
-    local measured=("ibex" "ibex-st") carried=()
-    if [[ "$SKIP_PDSH" -eq 1 ]]; then
-        carried=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
-    else
-        measured+=("pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
-        if [[ "$POLARS_STREAMING" -eq 1 ]]; then
-            measured+=("pdsh-polars-stream" "pdsh-polars-stream-st")
-        fi
+    local measured=("ibex" "ibex-st" "pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
+    local carried=()
+    if [[ "$POLARS_STREAMING" -eq 1 ]]; then
+        measured+=("pdsh-polars-stream" "pdsh-polars-stream-st")
     fi
 
     local f
@@ -187,23 +198,6 @@ IBEX_CORES=1 "${PIN[@]}" python3 "$SCRIPT_DIR/bench_ibex.py" \
     --out "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 sed 's/^ibex\t/ibex-st\t/' "$RESULTS/ibex_st${SUFFIX}.tsv.tmp" > "$RESULTS/ibex_st${SUFFIX}.tsv"
 rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
-
-if [[ "$SKIP_PDSH" -eq 1 ]]; then
-    # The upstream engines are pinned baselines here: their numbers move only
-    # when polars-benchmark or DuckDB itself changes, so a run without that
-    # checkout reuses whatever is already in results/ rather than dropping the
-    # columns. Say so, because a carried-forward row is not a measured one.
-    echo
-    echo "=== upstream PDS-H engines SKIPPED (--skip-pdsh) ==="
-    for f in "$RESULTS"/pdsh_*"${SUFFIX}.tsv"; do
-        [[ -e "$f" ]] || continue
-        echo "    carrying forward $(basename "$f") ($(date -r "$f" +%Y-%m-%d))"
-    done
-    echo
-    python3 "$SCRIPT_DIR/print_table.py" "$RESULTS"/*"${SUFFIX}.tsv"
-    archive_run
-    exit 0
-fi
 
 # The upstream engines run under the same taskset core affinity as ibex. With
 # the in-tree Polars implementation removed these are the only reference left,

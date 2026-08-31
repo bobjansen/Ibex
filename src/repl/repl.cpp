@@ -146,6 +146,37 @@ struct AbsorbedScanFilters {
     return out;
 }
 
+/// Decode every lazy source named in `demand` into `registry`, each narrowed to
+/// its demanded columns with its absorbed scan filter applied. `skip` lets the
+/// whole-script driver exclude the scans it has already registered as
+/// deferred-probe or streaming; the statement path passes none. The shared back
+/// half of both REPL execution paths' projection pushdown.
+[[nodiscard]] auto decode_demanded_lazy_sources(
+    const std::map<std::string, ir::ColumnDemand>& demand, const AbsorbedScanFilters& absorbed,
+    const std::function<runtime::LazyTable*(const std::string&)>& resolve_lazy,
+    const runtime::ExecutionContext& exec, const runtime::ScalarRegistry* scalars,
+    runtime::TableRegistry& registry,
+    const std::function<bool(const std::string&)>& skip = {}) -> std::expected<void, std::string> {
+    for (const auto& [name, needed] : demand) {
+        if (skip && skip(name)) {
+            continue;
+        }
+        auto* lazy = resolve_lazy(name);
+        if (lazy == nullptr) {
+            continue;  // an ordinary table, not a deferred one
+        }
+        const bool filtered = absorbed.applied.contains(name);
+        auto table = decode_demanded_lazy_source(
+            *lazy, needed, filtered,
+            filtered ? absorbed.predicates.at(name) : std::vector<ir::Expr>{}, exec, scalars);
+        if (!table.has_value()) {
+            return std::unexpected(table.error());
+        }
+        registry.insert_or_assign(name, std::move(table.value()));
+    }
+    return {};
+}
+
 /// Prove a plan's ascriptions and join keys against `schemas`, then fold every
 /// proven ascription into its Scan so no later pass has to special-case an
 /// `Ascribe` node. Both REPL execution paths run exactly this before their
@@ -3755,10 +3786,6 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
     if (!lazy_tables.empty()) {
-        std::set<std::string> lazy_names;
-        for (const auto& [name, lazy] : lazy_tables) {
-            lazy_names.insert(name);
-        }
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
             const auto it = lazy_tables.find(name);
             return it == lazy_tables.end() ? nullptr : it->second.get();
@@ -3772,23 +3799,13 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             !ok.has_value()) {
             return std::unexpected(ok.error());
         }
-        const auto [predicates, applied_scan_filters] = absorb_lazy_scan_filters(
+        const auto absorbed = absorb_lazy_scan_filters(
             lowered.value(), [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
-        auto demand = ir::required_columns(*lowered.value());
         projected = tables;
-        for (const auto& [name, needed] : demand) {
-            auto* lazy = resolve_lazy(name);
-            if (lazy == nullptr) {
-                continue;  // an ordinary table, not a deferred one
-            }
-            const bool filtered = applied_scan_filters.contains(name);
-            auto table = decode_demanded_lazy_source(
-                *lazy, needed, filtered,
-                filtered ? predicates.at(name) : std::vector<ir::Expr>{}, exec, &scalars);
-            if (!table) {
-                return std::unexpected(table.error());
-            }
-            projected.insert_or_assign(name, std::move(table.value()));
+        if (auto ok = decode_demanded_lazy_sources(ir::required_columns(*lowered.value()), absorbed,
+                                                   resolve_lazy, exec, &scalars, projected);
+            !ok.has_value()) {
+            return std::unexpected(ok.error());
         }
         eval_tables = &projected;
     }
@@ -5059,7 +5076,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // gathered into the scan's output. No ScalarRegistry is passed to
         // project_where: batch-eligible scripts cannot bind scalars, so a
         // pushed conjunct can never reference one.
-        const auto [predicates, applied_filters] = absorb_lazy_scan_filters(
+        const auto absorbed = absorb_lazy_scan_filters(
             rewritten, [&](const std::string& name) { return resolve_lazy(name) != nullptr; });
         // What absorption just took out of the tree. The deferred-probe gate
         // weighs a build side's filtered row estimate against its own table's
@@ -5068,9 +5085,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // back its full table, and q03's filtered customer becomes
         // indistinguishable from q12's unfiltered orders.
         std::map<std::string, double> absorbed_scan_selectivity;
-        for (const auto& name : applied_filters) {
-            const auto conjuncts = predicates.find(name);
-            if (conjuncts == predicates.end()) {
+        for (const auto& name : absorbed.applied) {
+            const auto conjuncts = absorbed.predicates.find(name);
+            if (conjuncts == absorbed.predicates.end()) {
                 continue;
             }
             double selectivity = 1.0;
@@ -5116,64 +5133,64 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             deferred_scans.emplace(
                 name, runtime::DeferredScan{
                           .lazy = std::move(lazy),
-                          .conjuncts = applied_filters.contains(name) ? predicates.at(name)
-                                                                      : std::vector<ir::Expr>{},
+                          .conjuncts = absorbed.applied.contains(name)
+                                           ? absorbed.predicates.at(name)
+                                           : std::vector<ir::Expr>{},
                           .demand = needed->second.names,
                           .demand_all = needed->second.all,
                           .key_column = std::move(info.key_column),
                           .filter = std::make_shared<runtime::DynamicScanFilter>(),
                       });
         }
-        // A source scanned more than once (a self-join) is decoded once and
-        // shared: streaming it would give each occurrence its own per-unit
-        // decode of the same file. `scan_predicates` already declined to push a
-        // per-occurrence filter for it, so the eager `project` below reads the
-        // whole demanded union once into the registry.
+        // Streaming scan registration: hand a multi-unit source to the plan
+        // still undecoded (Phase 1 of plans/pipelined-execution-plan.md) so its
+        // scan operator can emit it a unit at a time instead of the whole file
+        // arriving as one chunk. The pushdowns are the same ones the eager
+        // decode applies -- they travel in the registration rather than being
+        // spent here. A null `filter` marks this as streaming rather than a
+        // deferred *probe* scan, whose decode is the join's to schedule; the
+        // probe loop above already populated `deferred_scans`, so the two never
+        // overlap.
+        //
+        // A source scanned more than once (a self-join) is excluded: streaming
+        // it would give each occurrence its own per-unit decode of the same
+        // file. `scan_predicates` already declined to push a per-occurrence
+        // filter for it, so the eager decode below reads the whole demanded
+        // union once into the registry.
         const auto scan_counts = ir::scan_source_counts(*rewritten);
         const auto repeated_scan = [&](const std::string& name) {
             const auto it = scan_counts.find(name);
             return it != scan_counts.end() && it->second > 1;
         };
-        for (const auto& [name, needed] : demand) {
-            if (deferred_scans.contains(name)) {
-                continue;
-            }
-            auto* lazy = resolve_lazy(name);
-            if (lazy == nullptr) {
-                continue;
-            }
-            // Phase 1 of plans/pipelined-execution-plan.md: hand the source to
-            // the plan still undecoded, so its scan operator can emit it a unit
-            // at a time instead of the whole file arriving as one chunk. The
-            // pushdowns are the same ones the eager call below applies — they
-            // travel in the registration rather than being spent here.
-            //
-            // A null `filter` marks this as a streaming registration rather
-            // than a deferred *probe* scan; the two must stay distinguishable
-            // because a probe's decode is the join's to schedule. Probes are
-            // registered above and skipped by the `contains` guard, so the two
-            // sets never overlap.
-            if (exec.stream_scans && lazy->scan_units().size() > 1 && !repeated_scan(name)) {
+        if (exec.stream_scans) {
+            for (const auto& [name, needed] : demand) {
+                if (deferred_scans.contains(name)) {
+                    continue;
+                }
+                auto* lazy = resolve_lazy(name);
+                if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name)) {
+                    continue;
+                }
                 deferred_scans.emplace(
                     name, runtime::DeferredScan{
                               .lazy = resolve_lazy_ptr(name),
-                              .conjuncts = applied_filters.contains(name) ? predicates.at(name)
-                                                                          : std::vector<ir::Expr>{},
+                              .conjuncts = absorbed.applied.contains(name)
+                                               ? absorbed.predicates.at(name)
+                                               : std::vector<ir::Expr>{},
                               .demand = needed.names,
                               .demand_all = needed.all,
                               .key_column = {},
                               .filter = nullptr,
                           });
-                continue;
             }
-            const bool filtered = applied_filters.contains(name);
-            auto table = decode_demanded_lazy_source(
-                *lazy, needed, filtered,
-                filtered ? predicates.at(name) : std::vector<ir::Expr>{}, exec);
-            if (!table.has_value()) {
-                return std::unexpected(table.error());
-            }
-            tables.insert_or_assign(name, std::move(table.value()));
+        }
+        // Everything not deferred or streamed is decoded eagerly into the
+        // registry now, narrowed to its demand with its absorbed filter applied.
+        if (auto ok = decode_demanded_lazy_sources(
+                demand, absorbed, resolve_lazy, exec, nullptr, tables,
+                [&](const std::string& name) { return deferred_scans.contains(name); });
+            !ok.has_value()) {
+            return std::unexpected(ok.error());
         }
         return runtime::interpret(*rewritten, tables, nullptr, &externs, nullptr, exec);
     };

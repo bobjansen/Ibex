@@ -414,6 +414,49 @@ TEST_CASE("deferrable_probe_scans: a filter absorbed into the build scan still c
               .contains("lineitem"));
 }
 
+TEST_CASE("deferrable_probe_scans: the no-absorbed and with-absorbed calls can disagree "
+          "on a small probe -- guards the prove_unique_columns caching window",
+          "[ir][scan_predicates][deferred_scan]") {
+    // repl.cpp's `optimize_and_execute_plan` calls deferrable_probe_scans TWICE:
+    //   1. before the join reorder, with absorbed={}, to decide which join-key
+    //      columns `prove_unique_columns` may leave in the LazyTable cache_
+    //      (a cached key column disables the fused dynamic-key scan, so a
+    //      column that WILL be a deferred probe must stay uncached).
+    //   2. after the reorder and filter absorption, with the real selectivity
+    //      map, to register the DeferredScan for real.
+    // These disagree exactly here: without the absorbed 0.05 the build side
+    // reads back its whole `dim` table and the size gate declines the probe, so
+    // call 1 lets `prove_unique_columns` cache `probe.k`; call 2 then wants a
+    // fused dynamic-key scan on that now-cached column and silently gets a
+    // whole-table decode instead.
+    //
+    // It stays a BOUNDED regression only because `prove_unique_columns` has a
+    // ~1M-row cap: `probe` here is small enough (500k) to be proven and cached,
+    // but the deferred probes that actually matter (PDS-H lineitem/orders) are
+    // far over the cap and never touched by the proof. Raising that cap, or
+    // caching probe keys, or sharing a LazyTable across plans, widens the
+    // window -- and should light this test up as the spec of the gap.
+    const ir::SourceRowCounts rows{{"dim", 400000}, {"probe", 500000}};
+    ir::SourceSchemas schemas;
+    schemas.emplace("dim", ir::SchemaInfo::known({ir::SchemaField{
+                               .name = "k",
+                               .type = ir::ColumnType::Int64,
+                               .nulls = ir::Nullability::Maybe}}));
+    schemas.emplace("probe", ir::SchemaInfo::known({ir::SchemaField{
+                                 .name = "k",
+                                 .type = ir::ColumnType::Int64,
+                                 .nulls = ir::Nullability::Maybe}}));
+
+    auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "dim"),
+                           std::make_unique<ir::ScanNode>(ir::NodeId{2}, "probe"), "k");
+
+    // Call 1 (what `prove_unique_columns` sees): declined -> `probe.k` is cached.
+    CHECK_FALSE(ir::deferrable_probe_scans(*plan, {"probe"}, rows, schemas).contains("probe"));
+    // Call 2 (the real registration): eligible -> wants a fused scan on `probe.k`.
+    const std::map<std::string, double> absorbed{{"dim", 0.10}};
+    CHECK(ir::deferrable_probe_scans(*plan, {"probe"}, rows, schemas, absorbed).contains("probe"));
+}
+
 TEST_CASE("deferrable_probe_scans: mapped join key defers under the right-side name",
           "[ir][scan_predicates][deferred_scan]") {
     // Q2's p_partkey = ps_partkey join must defer partsupp with its physical

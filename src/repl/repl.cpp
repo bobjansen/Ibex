@@ -4828,9 +4828,21 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                 lazy_names.insert(name);
             }
             // Only an actual deferred-probe key must stay uncached; all other
-            // proof reads are reusable execution work.  This analysis is
-            // conservative with respect to the current (pre-reorder) plan:
-            // a later plan that declines a probe simply keeps a useful cache.
+            // proof reads are reusable execution work.
+            //
+            // KNOWN GAP: this call runs on the PRE-reorder plan with
+            // absorbed={}, while the DeferredScan registration below runs
+            // post-reorder with the real absorbed-selectivity map. They can
+            // disagree in the unsafe direction -- a small source that only
+            // clears the deferred-probe gate once its build side's filter is
+            // absorbed is declined here, so `prove_unique_columns` caches its
+            // key, and the post-reorder probe then silently loses its fused
+            // dynamic-key scan (the cache disables it). Bounded to sources
+            // under `prove_unique_columns`'s ~1M-row cap -- PDS-H's real probes
+            // (lineitem/orders) are far over it and never proven. Widening that
+            // cap, caching probe keys, or sharing a LazyTable across plans
+            // widens the gap; `test_ir_required_columns.cpp`'s "the no-absorbed
+            // and with-absorbed calls can disagree on a small probe" pins it.
             const auto deferred_probes =
                 ir::deferrable_probe_scans(*rewritten, lazy_names, row_counts, schemas);
             for (const auto& [source_name, columns] :

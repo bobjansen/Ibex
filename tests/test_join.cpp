@@ -708,6 +708,53 @@ TEST_CASE("join: dense integer intersection preserves semi and anti membership",
     }
 }
 
+TEST_CASE("join: dense right bitmap preserves membership when the buffered left is the bigger side",
+          "[join]") {
+    // Swapped build (right over 65,536), and the buffered left is NOT smaller
+    // than the right -- so `try_dense_intersection` is skipped and the right
+    // key column itself is turned into a bit-packed membership bitmap
+    // (`try_build_dense_right`). Two spans: step 3 stays under the old 2M
+    // byte-table cap; step 12 (~2.4M span) is only reachable now that the map
+    // is one bit per slot.
+    for (const std::int64_t span_step : {std::int64_t{3}, std::int64_t{12}}) {
+        CAPTURE(span_step);
+        constexpr std::int64_t kRightRows = 200'000;
+        constexpr std::int64_t kLeftRows = 260'000;
+
+        Column<std::int64_t> right_ids;
+        right_ids.reserve(kRightRows);
+        for (std::int64_t row = 0; row < kRightRows; ++row) {
+            right_ids.push_back(row * span_step);  // distinct, evenly spaced
+        }
+        Column<std::int64_t> left_ids;
+        left_ids.reserve(kLeftRows);
+        for (std::int64_t row = 0; row < kLeftRows; ++row) {
+            // Half land on a real right key, half fall between two of them.
+            left_ids.push_back((row % 2 == 0) ? (row % kRightRows) * span_step
+                                              : (row % kRightRows) * span_step + 1);
+        }
+
+        runtime::Table lhs;
+        lhs.add_column("id", std::move(left_ids));
+        runtime::Table rhs;
+        rhs.add_column("id", std::move(right_ids));
+        runtime::TableRegistry tables;
+        tables.emplace("lhs", std::move(lhs));
+        tables.emplace("rhs", std::move(rhs));
+
+        auto semi = interpret_expr("lhs semi join rhs on id;", tables);
+        auto anti = interpret_expr("lhs anti join rhs on id;", tables);
+        CHECK(semi.rows() == static_cast<std::size_t>(kLeftRows / 2));
+        CHECK(anti.rows() == static_cast<std::size_t>(kLeftRows / 2));
+        for (const std::int64_t id : col_i64(semi, "id")) {
+            CHECK(id % span_step == 0);
+        }
+        for (const std::int64_t id : col_i64(anti, "id")) {
+            CHECK(id % span_step == 1);
+        }
+    }
+}
+
 TEST_CASE("join: anti join keeps non-matching left rows only", "[join]") {
     runtime::Table lhs;
     lhs.add_column("id", Column<std::int64_t>{1, 2, 3, 4});

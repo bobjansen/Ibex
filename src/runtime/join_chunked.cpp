@@ -3287,7 +3287,63 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         if (idx.size() == rows) {
             return t;
         }
+        // For a small output the serial per-column gather is cheapest. For a
+        // large one -- q21's semi join is one ~15M-row chunk, previously ~88%
+        // serial -- fan the columns out over the pool in one batch. The floor
+        // is the same `kMinParallelPredicateRows` (and the same reasoning) as
+        // `select_rows`: `filter_chunk` runs once per left chunk, so a lower
+        // floor forks a batch per ~150k-row chunk and the barriers cost more
+        // than they buy.
+        if (idx.size() >= kMinParallelPredicateRows) {
+            return gather_rows_batched(t, idx);
+        }
         return gather_rows(t, idx);
+    }
+
+    /// `gather_rows`, but the columns are gathered concurrently in ONE worker
+    /// batch (`gather_columns_batched`) instead of a serial per-column loop.
+    /// `idx` is an ascending subset with no `kNull` sentinel, so a subset keeps
+    /// every group boundary and imposes no order and the source properties ride
+    /// along unchanged -- the same rule `gather_rows` documents.
+    auto gather_rows_batched(const Table& input, const std::vector<std::size_t>& idx) -> Table {
+        const std::size_t total = idx.size();
+        const std::span<const std::size_t> idx_span{idx.data(), total};
+
+        std::vector<ColumnGatherJob> jobs;
+        jobs.reserve(input.columns.size());
+        for (const auto& entry : input.columns) {
+            jobs.push_back({
+                .column = entry.column.get(),
+                .validity = entry.validity.has_value() ? &*entry.validity : nullptr,
+                .idx = idx.data(),
+                .indivisible = false,
+            });
+        }
+
+        auto gathered = gather_columns_batched(
+            jobs, total, exec_, [&](std::size_t j) -> GatheredColumn {
+                const auto& entry = input.columns[j];
+                ColumnValue col = make_gather_column(*entry.column, total);
+                gather_range_into(col, *entry.column, idx_span, 0, total);
+                std::optional<ValidityBitmap> val;
+                if (entry.validity.has_value()) {
+                    ValidityBitmap dst(total, false);
+                    gather_validity_range(dst, *entry.validity, idx_span, 0, total);
+                    val = std::move(dst);
+                }
+                return {std::move(col), std::move(val)};
+            });
+
+        Table output;
+        output.columns.reserve(input.columns.size());
+        for (std::size_t j = 0; j < input.columns.size(); ++j) {
+            output.add_column(input.columns[j].name, std::move(gathered[j].first));
+            if (gathered[j].second.has_value()) {
+                output.columns.back().validity = std::move(gathered[j].second);
+            }
+        }
+        output.set_properties(input.properties());
+        return output;
     }
 
     auto filter_chunk(Table t) -> std::optional<Table> {

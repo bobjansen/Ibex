@@ -40,7 +40,7 @@ auto fresh_id() -> NodeId {
 }
 
 // Node kind is checked immediately before every downcast below; see the
-// same convention in interpreter.cpp / chunked.cpp / emitter.cpp.
+// same convention in interpreter.cpp / runtime_entry.cpp / emitter.cpp.
 
 // Takes Node& (not const Node&): every call site already has mutable access
 // (root is an owned NodePtr), and ProgramNode only exposes a nullable

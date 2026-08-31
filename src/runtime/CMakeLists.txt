@@ -5,7 +5,6 @@ add_library(ibex_runtime STATIC
     aggregate.cpp
     aggregate_chunked.cpp
     chunk_conversion.cpp
-    chunked.cpp
     distinct_chunked.cpp
     join_chunked.cpp
     map_chunked.cpp
@@ -13,9 +12,12 @@ add_library(ibex_runtime STATIC
     env.cpp
     execution_profile.cpp
     expr.cpp
+    extern_call.cpp
     extern_registry.cpp
     filter.cpp
     interpreter.cpp
+    rank_window.cpp
+    runtime_entry.cpp
     join.cpp
     kernel_filter.cpp
     kernel_update.cpp

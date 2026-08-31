@@ -7,7 +7,7 @@
 //
 // The interpreter was originally one translation unit; it is now split into
 // per-operator TUs (filter.cpp, sort.cpp, aggregate.cpp, window.cpp,
-// update.cpp, expr.cpp, chunked.cpp, interpreter.cpp). Everything declared
+// update.cpp, expr.cpp, runtime_entry.cpp, interpreter.cpp). Everything declared
 // here crosses a TU boundary. The split boundaries are per-operator / per-
 // column calls (one call per query node or per evaluated field), never
 // per-row, so the loss of cross-boundary inlining is not performance-
@@ -1750,7 +1750,9 @@ enum class FloatCleanMode : std::uint8_t {
 [[nodiscard]] auto expr_value_to_double(const ExprValue& v) -> std::optional<double>;
 [[nodiscard]] auto expr_value_to_string(const ExprValue& v) -> std::string;
 
-// chunked.cpp — streaming operator pipeline, rank, extern-call execution.
+// runtime_entry.cpp — operator-build dispatch and physical-plan construction.
+// Rank/window evaluation is in rank_window.cpp; extern-call execution in
+// extern_call.cpp.
 [[nodiscard]] auto build_operator(const ir::Node& node, const TableRegistry& registry,
                                   const ScalarRegistry* scalars, const ExternRegistry* externs,
                                   const ExecutionContext& exec, ModelResult* model_out)

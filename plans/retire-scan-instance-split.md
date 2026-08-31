@@ -1,8 +1,27 @@
 # Retire `split_scan_instances`; share a repeated scan by default
 
-Fixes the q21 duplicate decode [[project_scan_instance_split_no_cost_gate]] /
-[[project_q21_is_occupancy_bound]] point at, by removing the mechanism that
-causes it rather than gating it.
+**LANDED 2026-08-31** (`f9b0866e` FD identity, `40c6e497` delete,
+`<probe-fix>` probe isolation). Fixed the q21 duplicate decode
+[[project_scan_instance_split_no_cost_gate]] / [[project_q21_is_occupancy_bound]]
+by removing the mechanism, keeping the one job it did that mattered
+(deferred-probe occurrence identity) in a narrow purpose-named pass.
+
+**Result (SF-4, 8-core, vs pre-change):** q21 −3.7% (noisy, ~5–10%), q03 −12.5%,
+small wins q05/q07/q11, q18 +3.7% (recovered from an intermediate +83% — see
+below), geomean 0.997, polars reference flat. `check_answers.py` 22/22,
+1813 tests, strict GCC, ASAN/UBSAN parity all pass.
+
+**The q18 lesson:** deleting the split outright regressed q18 83%. Its main
+`lineitem` join is a *deferrable probe* (semi-join pushdown filters `orders` to
+~57 rows first, so the probe decodes a few hundred lines not 24M), and
+`collect_deferrable` requires the probe source's scan count to be 1 — which a
+self-referenced `lineitem` (also the aggregate side) fails.
+`isolate_deferrable_probe_scans` fixes it: rename **only** the scan occurrence
+that is the right-child probe subtree of an eligible inner join, when its source
+is scanned elsewhere. q21's join is semi → not isolated → its `lineitem` stays
+shared, the win holds.
+
+Original plan below.
 
 ## What `split_scan_instances` is, and why it should go
 

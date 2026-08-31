@@ -1,135 +1,185 @@
 # Scan-instance split cost gate
 
-Capture the q21 fruit that [[project_scan_instance_split_no_cost_gate]] and
-[[project_q21_is_occupancy_bound]] point at. Scoped small: one gate, one query
-to flip, no new estimator framework.
+Capture the q21 fruit [[project_scan_instance_split_no_cost_gate]] and
+[[project_q21_is_occupancy_bound]] point at.
 
-## The problem
+## Problem
 
-`split_scan_instances` (`src/ir/scan_predicates.cpp`) renames every scan of a
-multiply-referenced lazy source to a per-reference instance name
-(`lineitem#1`, `lineitem#2`, …) so `scan_predicates` can push a *different*
-pushed predicate + column demand into each. **No cost model — it splits
-whenever `count > 1`.**
+`hoist_extern_sources` coalesces repeated `read_parquet("x")` calls to one
+`Scan(__ibex_source_N)`. `split_scan_instances` then renames each occurrence to
+`__ibex_source_N#1`, `#2`, … so `scan_predicates` can push a *different*
+predicate + column demand into each instance's decode. **No cost model — it
+splits whenever a source is scanned more than once.**
 
-The rename has a load-bearing *correctness* job: `ColumnOrigin` / FD reduction
-identify a base column by scan-instance name, and a self-join whose two sides
-share one name would let a uniqueness proof on one side wrongly determine the
-other's columns (repl.cpp comment at the `split_scan_instances` call). **But
-that job is finished by the time the physical decode is chosen** — FD reduction
-(`reduce_functionally_dependent_group_keys`) and
-`reduce_duplicate_distinct_columns` both run *between* the split (~repl.cpp:5014)
-and `scan_predicates` (~repl.cpp:5049). After them, the instance identities can
-be merged back for the physical decode with no correctness cost.
+### q21, measured (SF-4, from [[project_scan_instance_split_no_cost_gate]])
 
-### q21, measured (SF-4, `project_scan_instance_split_no_cost_gate`)
+`lineitem` is scanned twice and **decoded twice** (~1163ms pool_work total;
+`l_orderkey` on both sides):
+- `#2` — 1 column (`l_orderkey`), 24M rows, no filter → `count() by l_orderkey`
+  (~365ms).
+- `#1` — 4 columns, `l_receiptdate > l_commitdate` pushed → semi-join probe
+  (~798ms + 107ms stage).
 
-`lineitem` is scanned twice:
-- `#2` — 1 column (`l_orderkey`), 24M rows whole, no filter → `count() by l_orderkey`, pool_work ~365ms.
-- `#1` — 4 columns, `l_receiptdate > l_commitdate` pushed → semi-join probe, pool_work ~798ms, +107ms stage.
+The probe is **100% ring_wait** — it cannot start until the aggregate *and*
+`#1`'s decode finish. A single shared decode of the 4-column union deletes `#2`
+(~365ms pool_work, ~30–45ms wall) and lets the aggregate and probe run off one
+in-memory table.
 
-So `lineitem` decodes **twice** (~1163ms total pool_work; `l_orderkey` on both
-sides), and the probe (node 18) is **100% ring_wait** — it cannot start until
-the aggregate (node 11) finishes *and* `#1` feeds it. A shared scan (union
-projection `{orderkey, suppkey, commitdate, receiptdate}`, whole, one residual
-`Filter` for the probe side) deletes `#2` entirely and lets the aggregate and
-the probe pipeline off one pass.
+## Approach — merge cost-losing instances back, after FD reduction
 
-Two costs the split pays that the naive col-count comparison misses:
-1. **A pushed predicate still decodes its predicate columns densely over every
-   row** (the [[project_scan_fusion_cost_gate_gap]] physics) — so `#1` decodes
-   `commitdate` + `receiptdate` over all 24M rows regardless, and only the
-   *remaining* demand (`orderkey`, `suppkey`) scales by survival.
-2. **The split serializes two consumers** a shared scan would let pipeline,
-   when they sit on opposite sides of a blocking breaker.
+`split_scan_instances` does two jobs: (1) give each occurrence a distinct
+**identity** for `reduce_functionally_dependent_group_keys`, whose
+`ColumnOrigin` keys on `(source_name, column)` and would otherwise conflate the
+two sides of a self-join (`repl.cpp` comment at the split call); (2) give each
+occurrence a distinct **name** so `scan_predicates` and `required_columns` can
+be per-instance.
 
-## Design
+Job (1) is done the moment FD reduction finishes (`repl.cpp:5028`). Job (2) is
+only worth its duplicate decode when the per-instance pushdown pays for it. So:
 
-A pass **`merge_redundant_scan_instances(plan, row_counts, schemas)`**, run
-right after `reduce_duplicate_distinct_columns` and before `scan_predicates`.
-For each base source with ≥2 live instances it costs *shared* vs *split* and,
-when shared wins, renames those instances back to the base name. `scan_predicates`
-then sees `scan_counts[base] > 1` and declines to push (its existing
-`scan_counts[name] != 1` guard) — the per-instance `Filter` nodes, which the
-rename-only split never removed, stay in the plan and run post-decode. Demand
-unions naturally through `required_columns`. One scan registration results.
+**after FD reduction, rename the instances of a cost-losing source back to the
+base name.** No round-trip in spirit — the split is a scoped identity for one
+pass, and the merge only touches sources where the split's *other* job (per-
+instance pushdown) was not worth having. FD reduction keeps its distinct
+identities; nothing downstream of it needs them.
 
-### Cost model
+Once merged, a source flows through the existing machinery:
+- `scan_predicates` sees `scan_counts[name] > 1` → pushes nothing (its existing
+  `!= 1` guard). The per-reference `Filter` nodes — which the rename-only split
+  never removed — stay and run post-decode.
+- `required_columns` yields one demand entry (the union).
+- the eager registration decodes it **once** into `tables[name]`; every
+  `Scan(name)` node slices that one shallow-handle `Table`, exactly as a
+  `let x = …` self-join already does.
 
-Per base source `S`, `rows` from `row_counts` (exact, Parquet footer), column
-type from `schemas`:
+One executor change: the streaming-registration gate
+(`repl.cpp:5142`, `if (exec.stream_scans && lazy->scan_units().size() > 1)`)
+gains `&& !merged.contains(name)`, so a merged source takes the eager
+`lazy->project(union)` path (one cache-backed decode) rather than two
+independent per-unit streaming decodes.
 
-```
-w(col)      = decode weight by ir::ColumnType — Int64/Date/Double/Bool ≈ 1,
-              String/Categorical ≈ 4 (rough constants, one tuning pass)
-W(cols)     = Σ w(col)
+### Why merge-after-FD and not skip-the-split
 
-shared_cost = W(union of every instance's demand) × rows
-
-split_cost  = Σ_instances [ ( W(predicate_cols_i)                      // dense, always
-                            + W(remaining_demand_i) × survival_i )     // gathered
-                            × rows ]
-            + serialization_penalty(S)
-
-merge S  ⇔  shared_cost ≤ split_cost × (1 − margin)      // margin ≈ 0.05
-```
-
-- `survival_i`: `estimate_cardinality` of the instance's filtered subtree ÷
-  `rows` (falls back to `compound_selectivity` when the walk is inconclusive).
-  An instance with no pushed predicate has `survival = 1` and
-  `predicate_cols = {}`, so it contributes `W(demand_i) × rows` — exactly its
-  share of the shared decode, i.e. splitting it off is never a decode win, only
-  a demand-narrowing one.
-- `serialization_penalty(S)`: walk from each instance's `Scan` to the nearest
-  common ancestor. If the paths meet at a `Join` and at least one path crosses
-  a blocking breaker (`Aggregate` / `Order` / `Distinct` / `Window`), the split
-  forces that breaker to finish before the other side can feed the join. Add a
-  penalty proportional to the blocked branch's estimated output — this is the
-  q21 term. Keep it a single, documented heuristic; do not build a scheduler
-  model.
-
-### Why this flips q21 and little else
-
-q21's `#2` is unfiltered (`survival = 1`, no predicate columns) → its split
-contribution is `W({orderkey}) × 24M`, pure duplication of a column the shared
-decode already pays for. `#1`'s predicate columns are decoded dense either way.
-Plus the serialization penalty (probe blocked behind the 3M-group aggregate).
-Every term points the same way.
-
-The other multi-scan PDS-H queries — `nation` in q07/q08 (tiny, 25 rows, cost
-negligible either way), self-joins where both sides carry a *selective* filter
-— either cost out as "keep split" or are too small to matter. The full-suite
-A/B is the check.
+Skipping the split for a keep-shared source is tempting (no round-trip), but it
+puts the un-split self-join back in front of FD reduction, and the exact shape
+that misreduces is **underspecified** — the `repl.cpp` comment asserts a
+"group key that is not actually redundant" gets dropped, but
+`schemas_with_instances` copies *identical* unique-key facts to every instance,
+so the protection is entirely in `ColumnOrigin` identity, and reconstructing the
+failing case from the FD code is not obvious. A 15-line inverse-rename after the
+pass that already works is less risk than getting that analysis wrong. If a
+concrete failing case turns up during implementation and it is narrow, revisit.
 
 ## Steps
 
-1. **`scan_decode_cost.{hpp,cpp}`** (`src/ir/`) — `w(ColumnType)` weights and
-   `W(columns, schema)`. Shared with the future `scan_fusion` gate; land it
-   with only this caller.
-2. **`merge_redundant_scan_instances`** in `scan_predicates.cpp` (it already
-   owns `count_scans` / `rename_scans` — the merge is `rename_scans` in
-   reverse, gated). Signature takes `row_counts` + `schemas` +
-   `split.instances`. Returns the rewritten plan + the set of merged base names
-   (for logging / `explain`).
-3. **Wire into repl.cpp batch path** after `reduce_duplicate_distinct_columns`,
-   before `scan_predicates`. The `--report-planner` line gains a
-   `merged_scans=[…]` note. (Statement path at repl.cpp:3698 unchanged for now —
-   the win is batch-only, like the measurement.)
-4. **`serialization_penalty`** — the common-ancestor / blocking-breaker walk.
-5. **Tests** (`tests/test_ir_*.cpp`): a q21-shaped fixture asserts one
-   `Scan(lineitem)` after the pass and the probe `Filter` retained; a
-   both-sides-selective self-join asserts the split is *kept*; a tiny-dimension
-   multi-scan asserts kept (cost below noise, no churn). Byte-identity is
-   covered by the existing interpreter/e2e suites — semantics do not change.
-6. **Measure** — `benchmarking/tpch` interleaved A/B, HEAD vs this, SF-4 8-core,
-   q21 + the full 22 (must not regress q02/q07/q08/q09/q19). Object-equivalence
-   on q21. Per `MEASURING.md`: byte-identity check + accounting closure before
-   any number is claimed.
+### 1. `scan_decode_cost.{hpp,cpp}` (`src/ir/`)
+
+`w(ir::ColumnType)` — Int64/Date/Double/Bool ≈ 1, String/Categorical ≈ 4 (rough
+constants, one tuning pass). `W(columns, SchemaInfo) = Σ w`. Small; shared with
+the future scan-fusion gate, landed with only this caller.
+
+### 2. `plan_scan_instance_merges(const Node& plan, const SourceStats&, const ScanInstanceSplit&) -> std::set<std::string>` (`src/ir/scan_predicates.cpp`)
+
+Runs on the post-FD-reduction plan (instance names present). For each base
+source with ≥2 live instances:
+
+1. **Per-instance facts, from passes that already compute them.**
+   `ir::required_columns(*plan)` is keyed by scan name → post-split it yields
+   `lineitem#1` / `lineitem#2` demand directly, no subtree walk.
+   `ir::scan_predicates(*plan)` returns the exact conjuncts that *would* push to
+   each instance.
+2. **Prunable guard.** If any instance's pushable conjuncts contain a
+   `column <cmp> literal` comparison (`< <= > >= ==`), the split may be
+   skipping row groups via footer min/max (`parquet.hpp:2443`) — a decode
+   saving the merge would forfeit. Do **not** merge that source. `column <cmp>
+   column` (q21's `l_receiptdate > l_commitdate`) is not prunable → merge
+   allowed. A plain AST check on the conjuncts, no stats.
+3. **Duplication cost** — `union` = every column any instance demands;
+   `duplicated` = Σ over columns `c` of `w(c) × (instances_demanding(c) − 1)`.
+   With the prunable guard already applied, no instance's pushed predicate
+   prunes the decode, so every instance decodes all `rows` of its demanded
+   columns either way — the only saving is the columns decoded more than once.
+4. **Merge iff** the prunable guard passed **and**
+   `duplicated ≥ 0.15 × W(union)` **and** `duplicated × rows ≥ 1e6` (absolute
+   floor — a 25-row dimension never qualifies).
+
+Returns the set of base names to merge.
+
+### 3. `merge_scan_instances(NodePtr, const std::set<std::string>& bases, const ScanInstanceSplit&) -> NodePtr`
+
+The inverse of `rename_scans`: walk the plan, rewrite `Scan(base#N)` → `Scan(base)`
+for every `base` in the set. ~15 lines next to `rename_scans`.
+
+### 4. Wire into `repl.cpp`
+
+```cpp
+rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas_with_instances);
+rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
+auto merged = ir::plan_scan_instance_merges(*rewritten, source_stats, split);
+if (!merged.empty()) rewritten = ir::merge_scan_instances(std::move(rewritten), merged, split);
+```
+
+`merged` threads to the streaming-registration gate. `--report-planner` gains a
+`merged_scans=[…]` note.
+
+### 5. Tests (`tests/test_ir_required_columns.cpp` — it already covers `split_scan_instances`)
+
+- q21 shape: self-semi-join, one unfiltered side. `plan_scan_instance_merges`
+  returns the base name; after `merge_scan_instances` the plan has one
+  `Scan(base)` and the probe `Filter` retained.
+- both-sides-narrow-demand double scan, little overlap → not merged (0.15).
+- 25-row dimension ×2 → not merged (1e6 floor).
+- an existing `split_scan_instances` test extended: split then merge is
+  identity when the whole source is merged.
+- byte-identity of q21's result: the existing e2e / `check_answers.py` suites —
+  semantics do not change.
+
+### 6. Measure
+
+`benchmarking/tpch` interleaved A/B, HEAD vs this, SF-4 8-core, q21 + full 22
+(must not regress q02/q07/q08/q09/q19). `check-object-equivalence.sh` on q21.
+Per `MEASURING.md`: byte-identity + accounting closure before any number.
+
+## Risks / open questions
+
+- **Parallel path shares the registry `Table` — verified.** In
+  `build_operator_impl` (chunked.cpp:1485) the streaming branch is gated on
+  `!registry.contains(scan.source_name())`; a merged source *is* in the registry
+  (the demand loop's `project` populated `tables[base]`), so it falls to
+  `build_materialized_fallback` → `interpret_node`, which does
+  `Table output = it->second` (shallow copy) → `make_table_source`. Two
+  `Scan(base)` nodes → two shallow copies of one decoded table — the same path a
+  `let x = …` self-join already takes under `IBEX_PARALLEL`. One physical decode.
+- **Which PDS-H queries even have a repeated scan?** Enumerate before the A/B
+  (`IBEX_PLAN_STATS` / grep the split's `instances` map per query). Known:
+  q07/q08 (`nation` ×2 — excluded by the 1e6 floor), q21 (`lineitem` ×2 — the
+  target). Any other that merges must be in the A/B set, not just the usual
+  suspects.
+- **Eager vs streaming trade.** A merged source is forced eager, giving up
+  decode↔first-operator overlap. For q21 (breaker-heavy) that overlap is
+  negligible and the win is measured. If a streaming-heavy query regresses in
+  the A/B, the `0.15` / `1e6` thresholds are the knobs — no query-specific
+  branch.
+- **One decode, downstream of the registration.** `for [name, needed] : demand`
+  iterates once per unique name; a merged source has one name → one
+  `lazy->project(union)` → `tables[name]`. Both `Scan(name)` nodes then read
+  that entry (subject to the parallel-path question above). Object-equivalence
+  on q21 is the check.
+- **Deferred-probe interaction.** A merged source is scanned ≥2× → never the
+  "sole feed of a join's right side" `deferrable_probe_scans` needs (and only
+  fires for `JoinKind::Inner`; q21 is semi) → no conflict. Confirm in step 2.
+- **`plan_scan_instance_merges` sees the pre-`scan_predicates` plan** — demand
+  and conjuncts are accurate (reorder + FD reduction done; predicate
+  *absorption* removes Filter nodes but does not relocate them between scans).
+- **Statement path** (`repl.cpp:3698`) unchanged — the win is batch-only, like
+  the measurement.
 
 ## Not in scope
 
 The `scan_predicates` / `project_where` fusion gate
 ([[project_scan_fusion_cost_gate_gap]]) and deferred-probe registration
-selectivity ([[project_deferred_probe_no_cost_model]]) — same family, same
-`scan_decode_cost` helper, separate schedules. Tuning the type weights against a
-broad corpus (one rough pass here; revisit only if the A/B misclassifies).
+selectivity ([[project_deferred_probe_no_cost_model]]) — same family, share the
+`scan_decode_cost` helper, separate schedules. Real sampled selectivity — only
+if the A/B shows the heuristic misclassifying. Deleting `split_scan_instances`
+in favour of scan-node-identity in `ColumnOrigin` — a larger cleanup that would
+subsume this, noted but not taken.

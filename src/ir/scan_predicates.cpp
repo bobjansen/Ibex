@@ -199,73 +199,7 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
     }
 }
 
-void count_scans(const Node& node, const std::set<std::string>& sources,
-                 std::map<std::string, std::size_t>& counts) {
-    if (node.kind() == NodeKind::Scan) {
-        const auto& name = node_cast<ScanNode>(node).source_name();
-        if (sources.contains(name)) {
-            ++counts[name];
-        }
-    }
-    if (node.kind() == NodeKind::Program) {
-        const auto& program = node_cast<ProgramNode>(node);
-        for (const auto& preamble : program.preamble()) {
-            if (preamble != nullptr) {
-                count_scans(*preamble, sources, counts);
-            }
-        }
-        count_scans(program.main_node(), sources, counts);
-    }
-    for (const auto& child : node.children()) {
-        if (child != nullptr) {
-            count_scans(*child, sources, counts);
-        }
-    }
-}
-
-void rename_scans(NodePtr& node, const std::map<std::string, std::size_t>& counts,
-                  std::map<std::string, std::size_t>& next_instance,
-                  std::map<std::string, std::string>& instances) {
-    if (node == nullptr) {
-        return;
-    }
-    if (node->kind() == NodeKind::Scan) {
-        const auto& name = node_cast<ScanNode>(*node).source_name();
-        if (const auto counted = counts.find(name);
-            counted != counts.end() && counted->second > 1) {
-            auto instance = name + "#" + std::to_string(++next_instance[name]);
-            instances.emplace(instance, name);
-            node = std::make_unique<ScanNode>(node->id(), std::move(instance));
-        }
-        return;
-    }
-    if (node->kind() == NodeKind::Program) {
-        auto& program = node_cast<ProgramNode>(*node);
-        for (auto& preamble : program.mutable_preamble()) {
-            rename_scans(preamble, counts, next_instance, instances);
-        }
-        rename_scans(program.mutable_main_node(), counts, next_instance, instances);
-    }
-    for (auto& child : node->mutable_children()) {
-        rename_scans(child, counts, next_instance, instances);
-    }
-}
-
 }  // namespace
-
-auto split_scan_instances(NodePtr root, const std::set<std::string>& sources) -> ScanInstanceSplit {
-    ScanInstanceSplit split;
-    if (root == nullptr || sources.empty()) {
-        split.plan = std::move(root);
-        return split;
-    }
-    std::map<std::string, std::size_t> counts;
-    count_scans(*root, sources, counts);
-    std::map<std::string, std::size_t> next_instance;
-    rename_scans(root, counts, next_instance, split.instances);
-    split.plan = std::move(root);
-    return split;
-}
 
 auto scan_predicates(const Node& root) -> ScanPredicateMap {
     std::map<std::string, std::size_t> scan_counts;
@@ -287,6 +221,15 @@ namespace {
 void count_scan_occurrences(const Node& node, std::map<std::string, std::size_t>& counts) {
     if (node.kind() == NodeKind::Scan) {
         ++counts[node_cast<ScanNode>(node).source_name()];
+    }
+    if (node.kind() == NodeKind::Program) {
+        const auto& program = node_cast<ProgramNode>(node);
+        for (const auto& preamble : program.preamble()) {
+            if (preamble != nullptr) {
+                count_scan_occurrences(*preamble, counts);
+            }
+        }
+        count_scan_occurrences(program.main_node(), counts);
     }
     for (const auto& child : node.children()) {
         if (child != nullptr) {
@@ -495,6 +438,12 @@ void collect_deferrable(const Node& node, const std::set<std::string>& sources,
 }
 
 }  // namespace
+
+auto scan_source_counts(const Node& root) -> std::map<std::string, std::size_t> {
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(root, counts);
+    return counts;
+}
 
 auto plan_join_key_origins(const Node& root, const SourceSchemas& sources)
     -> robin_hood::unordered_map<std::string, std::set<std::string>> {

@@ -1335,9 +1335,44 @@ auto node_kind_name(ir::NodeKind kind) -> std::string_view {
     return node_kind_name_impl(kind);
 }
 
+namespace {
+
+/// Whether a fallback kind is `accepted` (a permanent `MaterializedCall` — it is
+/// whole-table by nature or not breaker-shaped, so it will never become a
+/// streaming physical node) or `backlog` (a genuine candidate to migrate, but
+/// only once a profile shows it costing wall time — none currently does).
+///
+/// This is the disposition the kernel-pipeline plan's Phase 5 settled on: the
+/// adapter is the end state, not a way-station to zero fallbacks. `Scan` is the
+/// bare-source `EmptyChain` case, not a materialized call at all.
+auto fallback_disposition(ir::NodeKind kind) -> std::string_view {
+    switch (kind) {
+        case ir::NodeKind::Join:        // non-equi / nulls-equal / expect — materializing by design
+        case ir::NodeKind::Melt:
+        case ir::NodeKind::Dcast:
+        case ir::NodeKind::Transpose:
+        case ir::NodeKind::Matmul:
+        case ir::NodeKind::Cov:
+        case ir::NodeKind::Corr:
+        case ir::NodeKind::Columns:
+        case ir::NodeKind::Rbind:
+        case ir::NodeKind::Construct:
+        case ir::NodeKind::Stream:
+        case ir::NodeKind::Program:
+        case ir::NodeKind::Model:
+            return "accepted";
+        default:
+            // Window / Resample / grouped Update and anything else: a candidate
+            // to revisit if it ever measures as hot.
+            return "backlog";
+    }
+}
+
+}  // namespace
+
 auto physical_fallback_report() -> std::string {
-    // Descending by count: the top line is the next thing worth porting, which
-    // is the whole point of keeping this by kind.
+    // Descending by count, each line tagged `accepted` (permanent
+    // MaterializedCall) or `backlog` (migrate only when profiled hot).
     std::vector<std::pair<std::uint64_t, ir::NodeKind>> rows;
     for (std::size_t i = 0; i < kKindSlots; ++i) {
         const std::uint64_t n = plan_stats().fallback_by_kind[i].load(std::memory_order_relaxed);
@@ -1350,7 +1385,13 @@ auto physical_fallback_report() -> std::string {
     for (const auto& [count, kind] : rows) {
         out += "plan fallback: kind=";
         out += node_kind_name_impl(kind);
-        out += " count=" + std::to_string(count) + "\n";
+        out += " count=" + std::to_string(count);
+        if (kind != ir::NodeKind::Scan) {
+            out += " (";
+            out += fallback_disposition(kind);
+            out += ')';
+        }
+        out += '\n';
     }
     return out;
 }

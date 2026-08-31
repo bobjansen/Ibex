@@ -8,8 +8,8 @@ authority are done, and the targeted join and aggregate decomposition is
 complete; Phase 5 is in progress: fused logical node kinds are retired and every
 execution family — aggregate, streaming join, ordering, distinct, and the
 row-local map operators — is now outside the monolith (`chunked.cpp` 5152→1635
-lines), leaving the `physical_fallbacks_for(kind)`-ranked fallback migration as
-the remaining item. **Compacted
+lines). The `MaterializedCall` adapter is the accepted end state, not a
+way-station to zero fallbacks (Phase 5 §1). **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -243,10 +243,19 @@ separate streaming operator.
    `build_materialized_fallback` adapter, extern-call / program execution,
    parallel-env config, and the `build_physical_join` / `build_physical_aggregate`
    / `build_physical_tail` physical dispatch. A later cosmetic rename to
-   `runtime_entry.cpp` is possible but out of scope. Materializing joins remain
-   the intended `MaterializedCall`. **Next residual is no longer a split** —
-   it's the `physical_fallbacks_for(kind)`-ranked migration of individual
-   fallback kinds to real physical breakers (a design task, item 1's tail below).
+   `runtime_entry.cpp` is possible but out of scope.
+   **The fallback adapter is the end state — decided 2026-08-31.** An audit found
+   no fallback kind has a streaming operator waiting to be plan-wired: every
+   remaining kind (`Window`, `Resample`, `Melt`, `Dcast`, `Cov`, `Corr`,
+   `Matmul`, grouped `Update`, ...) is a whole-table `interpret_node`
+   implementation with no operator, and PDS-H's *only* non-`Scan` fallback is the
+   materializing `Join` (×4, non-equi / nulls-equal / expect). So there is no
+   cheap wiring pass — migrating any kind means writing a new breaker, which is
+   speculative until a profile shows that kind costing wall time, and none does.
+   `physical_fallback_report` now tags each line `accepted` (permanent
+   `MaterializedCall`) or `backlog` (revisit only when profiled hot);
+   `ChunkedAsTimeframeOperator` (dead since `as_timeframe` moved to a whole-table
+   path) was deleted. Reopen only on a measured hot fallback.
    **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
    `d1204b63`; `plans/physical-fallback-adapter-plan.md`): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
@@ -255,8 +264,9 @@ separate streaming operator.
    relational inputs through `build_operator` (handed back via
    `ExecutionContext::pre_materialized_children`) so a filtered/projected input
    keeps its fused parallel scan. `explain physical` names the retained subtree.
-   `chunked.cpp` −290 lines net. Next: physical-plan-migrate individual fallback
-   kinds as `physical_fallbacks_for(kind)` ranks them.
+   `chunked.cpp` −290 lines net. The residual-family extraction that followed is
+   done (item 5 above); the fallback adapter is now the accepted end state, not a
+   way-station — see item 5.
 6. **Sweep process-global plan counters in tests — DONE 2026-08-29.** The
    formerly false-premise test now checks the migrated pipeline counter. All
    three remaining counter assertions take a local before/after delta, and no
@@ -560,7 +570,15 @@ at all (a one-valued strategy enum would be ceremony).
    the fallback interpreter.
 4. Make planner / executor / kernel tests independently runnable.
 
-Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit.
+Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit —
+**met 2026-08-31.** It is now a ~1635-line entry point: `build_operator`, the
+`build_materialized_fallback` adapter, extern/program execution, parallel-env
+config, and the `build_physical_{join,aggregate,tail}` dispatch. Every operator
+family lives in its own translation unit. The exit criterion is *not* "zero
+fallbacks": the `MaterializedCall` adapter is honest, profiled, and names its
+retained subtree in `explain physical`, and `physical_fallback_report` tags each
+kind `accepted` or `backlog`. A fallback kind graduates to a physical breaker
+only when a profile shows it costing wall time.
 
 ### Follow-up sequence
 

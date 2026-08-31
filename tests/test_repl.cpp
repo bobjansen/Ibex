@@ -1057,10 +1057,12 @@ hi;
     REQUIRE(source_instances == 2);
 }
 
-TEST_CASE("REPL lazy scan: a source scanned twice pushes each scan's own filter", "[repl][lazy]") {
-    // The two subqueries filter the same lazy source differently. Per-scan
-    // instance identity keeps both filters pushable, and the shared decode
-    // cache means the predicate column is decoded once for both selections.
+TEST_CASE("REPL lazy scan: a source scanned twice is decoded once, filters stay",
+          "[repl][lazy]") {
+    // The two subqueries filter the same lazy source differently. Applying one
+    // occurrence's selection to the shared decode would be unsound, so the
+    // source is decoded whole exactly once for the union of what both need and
+    // each filter runs over the shared table.
     ibex::runtime::ExternRegistry registry;
     std::vector<std::vector<std::string>> decode_calls;
     std::vector<std::optional<ibex::runtime::Selection>> decode_selections;
@@ -1081,13 +1083,9 @@ result;
 )";
     REQUIRE(ibex::repl::execute_script(src, registry));
     REQUIRE(captured == std::vector<std::int64_t>{30});
-    REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a"}, {"b"}, {"b"}});
-    REQUIRE(decode_selections.size() == 3);
+    REQUIRE(decode_calls == std::vector<std::vector<std::string>>{{"a", "b"}});
+    REQUIRE(decode_selections.size() == 1);
     CHECK_FALSE(decode_selections[0].has_value());
-    REQUIRE(decode_selections[1].has_value());
-    CHECK(*decode_selections[1] == ibex::runtime::Selection{1, 2});
-    REQUIRE(decode_selections[2].has_value());
-    CHECK(*decode_selections[2] == ibex::runtime::Selection{2});
 }
 
 TEST_CASE("REPL supports named arguments and defaults for extern functions") {

@@ -3688,23 +3688,12 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
     const runtime::TableRegistry* eval_tables = &tables;
     runtime::TableRegistry projected;
     if (!lazy_tables.empty()) {
-        // A lazy source scanned twice (a self-join, or two differently
-        // filtered subqueries) gets one instance name per scan, so each scan
-        // keeps its own pushed selection and column demand.
         std::set<std::string> lazy_names;
         for (const auto& [name, lazy] : lazy_tables) {
             lazy_names.insert(name);
         }
-        auto split = ir::split_scan_instances(std::move(lowered.value()), lazy_names);
-        lowered.value() = std::move(split.plan);
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
-            auto it = lazy_tables.find(name);
-            if (it == lazy_tables.end()) {
-                if (const auto instance = split.instances.find(name);
-                    instance != split.instances.end()) {
-                    it = lazy_tables.find(instance->second);
-                }
-            }
+            const auto it = lazy_tables.find(name);
             return it == lazy_tables.end() ? nullptr : it->second.get();
         };
 
@@ -4999,46 +4988,21 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
         rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
-        // A source scanned twice in the plan (nation on both join sides, a
-        // self-joined fact table) gets one instance name per scan, so each
-        // scan keeps its own pushed selection and column demand. This must
-        // run before FD reduction: ColumnOrigin identifies a base column by
-        // scan-instance name, and until scans are split, both sides of a
-        // self-join share one name -- a unique key proved on one instance
-        // would otherwise be taken to determine the OTHER instance's columns
-        // too, dropping a group key that is not actually redundant.
         std::set<std::string> lazy_names;
         for (const auto& [name, lazy] : lazy_sources) {
             lazy_names.insert(name);
         }
-        auto split = ir::split_scan_instances(std::move(rewritten), lazy_names);
-        rewritten = std::move(split.plan);
-        // FD reduction needs each split instance's schema under its instance
-        // name too, or a self-join's second occurrence would look like an
-        // unknown source and just fail to prove anything about it.
-        ir::SourceSchemas schemas_with_instances = schemas;
-        for (const auto& [instance, source] : split.instances) {
-            if (const auto it = schemas.find(source); it != schemas.end()) {
-                schemas_with_instances.insert_or_assign(instance, it->second);
-            }
-        }
-        // After the reorder and split, so it sees the join shape and scan
-        // identities that will actually run, and after the uniqueness proofs
-        // above, which are its whole premise.
-        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten),
-                                                                 schemas_with_instances);
+        // After the reorder, so it sees the join shape that will actually run,
+        // and after the uniqueness proofs above, which are its whole premise.
+        // Two occurrences of one source in a self-join are kept apart by the
+        // scan-node identity carried in `ColumnOrigin`, not by a rewrite.
+        rewritten = ir::reduce_functionally_dependent_group_keys(std::move(rewritten), schemas);
         // Needs no schema or uniqueness proof of its own -- it decides by
         // walking the plan -- but it runs here so it sees the shape the joins
         // and the FD reduction leave behind.
         rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
-            auto it = lazy_sources.find(name);
-            if (it == lazy_sources.end()) {
-                if (const auto instance = split.instances.find(name);
-                    instance != split.instances.end()) {
-                    it = lazy_sources.find(instance->second);
-                }
-            }
+            const auto it = lazy_sources.find(name);
             return it == lazy_sources.end() ? nullptr : it->second.get();
         };
         // Absorb scan filters before computing demand, so a column referenced
@@ -5082,19 +5046,9 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
         // makes this safe: project_where bypasses its whole-column cache.
         const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
-            auto it = lazy_sources.find(name);
-            if (it == lazy_sources.end()) {
-                if (const auto instance = split.instances.find(name);
-                    instance != split.instances.end()) {
-                    it = lazy_sources.find(instance->second);
-                }
-            }
+            const auto it = lazy_sources.find(name);
             return it == lazy_sources.end() ? nullptr : it->second;
         };
-        std::set<std::string> deferrable_names = lazy_names;
-        for (const auto& [instance_name, source] : split.instances) {
-            deferrable_names.insert(instance_name);
-        }
         runtime::DeferredScanRegistry deferred_scans;
         // Declared here, before the lazy-source projection below, because that
         // projection runs a scan's filter under it — not only `interpret` at
@@ -5103,7 +5057,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                                        .execution_profile = nullptr};
         runtime::configure_parallel_from_env(exec);
         for (auto& [name, info] : ir::deferrable_probe_scans(
-                 *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
+                 *rewritten, lazy_names, row_counts, schemas, absorbed_scan_selectivity)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
             if (needed == demand.end() || lazy == nullptr) {
@@ -5120,6 +5074,16 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                           .filter = std::make_shared<runtime::DynamicScanFilter>(),
                       });
         }
+        // A source scanned more than once (a self-join) is decoded once and
+        // shared: streaming it would give each occurrence its own per-unit
+        // decode of the same file. `scan_predicates` already declined to push a
+        // per-occurrence filter for it, so the eager `project` below reads the
+        // whole demanded union once into the registry.
+        const auto scan_counts = ir::scan_source_counts(*rewritten);
+        const auto repeated_scan = [&](const std::string& name) {
+            const auto it = scan_counts.find(name);
+            return it != scan_counts.end() && it->second > 1;
+        };
         for (const auto& [name, needed] : demand) {
             if (deferred_scans.contains(name)) {
                 continue;
@@ -5139,7 +5103,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
             // because a probe's decode is the join's to schedule. Probes are
             // registered above and skipped by the `contains` guard, so the two
             // sets never overlap.
-            if (exec.stream_scans && lazy->scan_units().size() > 1) {
+            if (exec.stream_scans && lazy->scan_units().size() > 1 && !repeated_scan(name)) {
                 deferred_scans.emplace(
                     name, runtime::DeferredScan{
                               .lazy = resolve_lazy_ptr(name),

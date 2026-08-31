@@ -75,6 +75,14 @@ struct DeferredProbeScan {
     physical::JoinParallelism parallelism = {},
     std::optional<ir::JoinColumnMapping> columns = std::nullopt) -> OperatorPtr;
 
+/// Streaming semi/anti join (single equi-key, `nulls never`). A separate
+/// operator from the inner-join family by design — see the parent plan — but
+/// lives in the same translation unit.
+[[nodiscard]] auto make_chunked_semi_anti_join_operator(OperatorPtr left, Table right,
+                                                        ir::JoinKind kind,
+                                                        const std::vector<ir::JoinKey>* keys,
+                                                        const ExecutionContext* exec) -> OperatorPtr;
+
 [[nodiscard]] auto make_scheduled_chunked_inner_join_operator(
     OperatorPtr left, Table right, const std::vector<ir::JoinKey>* keys,
     const ExecutionContext& exec, ir::JoinSuffixPolicy suffix = {},

@@ -5001,8 +5001,19 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // walking the plan -- but it runs here so it sees the shape the joins
         // and the FD reduction leave behind.
         rewritten = ir::reduce_duplicate_distinct_columns(std::move(rewritten));
+        // Give the probe side of a self-referenced source its own name so its
+        // decode can be deferred and bounded by the build side while the other
+        // occurrence still reads the whole table (TPC-H q18).
+        auto probe_split = ir::isolate_deferrable_probe_scans(std::move(rewritten), lazy_names);
+        rewritten = std::move(probe_split.plan);
+        const auto& instances = probe_split.instances;
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
-            const auto it = lazy_sources.find(name);
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto inst = instances.find(name); inst != instances.end()) {
+                    it = lazy_sources.find(inst->second);
+                }
+            }
             return it == lazy_sources.end() ? nullptr : it->second.get();
         };
         // Absorb scan filters before computing demand, so a column referenced
@@ -5046,9 +5057,18 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
         // plans/dynamic-filter-pushdown-plan.md. The shared LazyTable is what
         // makes this safe: project_where bypasses its whole-column cache.
         const auto resolve_lazy_ptr = [&](const std::string& name) -> runtime::LazyTablePtr {
-            const auto it = lazy_sources.find(name);
+            auto it = lazy_sources.find(name);
+            if (it == lazy_sources.end()) {
+                if (const auto inst = instances.find(name); inst != instances.end()) {
+                    it = lazy_sources.find(inst->second);
+                }
+            }
             return it == lazy_sources.end() ? nullptr : it->second;
         };
+        std::set<std::string> deferrable_names = lazy_names;
+        for (const auto& [instance_name, source] : instances) {
+            deferrable_names.insert(instance_name);
+        }
         runtime::DeferredScanRegistry deferred_scans;
         // Declared here, before the lazy-source projection below, because that
         // projection runs a scan's filter under it — not only `interpret` at
@@ -5057,7 +5077,7 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
                                        .execution_profile = nullptr};
         runtime::configure_parallel_from_env(exec);
         for (auto& [name, info] : ir::deferrable_probe_scans(
-                 *rewritten, lazy_names, row_counts, schemas, absorbed_scan_selectivity)) {
+                 *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
             if (needed == demand.end() || lazy == nullptr) {

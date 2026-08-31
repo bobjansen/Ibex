@@ -1,15 +1,18 @@
 # Kernel-oriented pipeline execution
 
-**Status: in migration.** Phase 0 resolved by disposition; Phase 1 landed
-2026-08-22; Phase 2 complete except `KernelContext` (deliberately unbuilt);
-Phase 3's handoff/island/raw-thread work is complete, with accounting and
-DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
-authority are done, and the targeted join and aggregate decomposition is
-complete; Phase 5 is in progress: fused logical node kinds are retired and every
-execution family — aggregate, streaming join, ordering, distinct, and the
-row-local map operators — is now outside the monolith (`chunked.cpp` 5152→1635
-lines). The `MaterializedCall` adapter is the accepted end state, not a
-way-station to zero fallbacks (Phase 5 §1). **Compacted
+**Status: migration drained (2026-08-31).** Phase 0 resolved by disposition;
+Phase 1 landed 2026-08-22; Phase 2 complete except `KernelContext` (deliberately
+unbuilt); Phase 3's handoff/island/raw-thread work is complete, with accounting
+and DOP/memory budgets deferred (not blockers); Phase 4 construction ownership,
+parallelism authority, and the targeted join/aggregate decomposition are done;
+Phase 5's splits are done — every execution family (aggregate, streaming join,
+ordering, distinct, row-local map) is out of the monolith (`chunked.cpp`
+5152→1635 lines) and the `MaterializedCall` adapter is the accepted end state,
+not a way-station to zero fallbacks. The two remaining Phase 5 items (test-binary
+split; fallback-kind migration) are deferred with reopen conditions. **What's
+left is perf, not migration** — see "Next, in order" and `plans/beat-polars-plan.md`;
+the first target is the q21 serial hash build, now unblocked by Phase 4.
+**Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -285,10 +288,27 @@ separate streaming operator.
    and q21 (the one pipeline-identity-sensitive query) is already diagnosed
    three ways. Reopen if a multi-producer change lands or occupancy rises enough
    to build queues.
-8. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked**
+8. **Phase 5 item 4 — split the test binary by layer — DEFERRED, 2026-08-31.**
+   The split is clean (no shared test-helper lib) and `ibex_runtime` pulls no
+   arrow/codegen, so a `core+ir+parser+runtime` test binary is achievable. But
+   the relink cost it saves is not currently a felt pain, so it is not worth the
+   CMake churn and the CI reshaping. Reopen if the test link becomes a drag on
+   the inner loop.
+9. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked / deferred**
    (`phase3-dop-budget-analysis.md`): the pool is 65% idle with nothing queued,
    so a budget rations a non-scarce resource. Reopen when a multi-producer
    change needs it or `profile_suite.py` shows queues.
+
+**The architectural migration is drained.** Phases 1–4 are done; Phase 5's
+splits are done and its remaining items (test binary split; fallback-kind
+migration) are deferred with reopen conditions above. Phase 3's accounting and
+DOP items are deferred/blocked. What remains is **not migration work** — it is
+the measured perf fronts, tracked in the memory index and `plans/beat-polars-plan.md`.
+The standout, now unblocked by this plan's Phase 4: **the q21 serial hash build**
+(`build_join_hash_index`, 1.28M rows in ~40ms of a 75–79ms query, 70% of all
+join-build self-time). It could not be morsel-parallel while buried in
+`initialize()`; `HashBuild` is now its own scheduled phase and can be. See
+"Where join time actually goes" below and `project_q21_is_occupancy_bound`.
 
 **Deliberately not doing:** porting the 6 materializing joins (they're the
 intended `MaterializedCall`); a join build-side cost model *as a prerequisite
@@ -584,7 +604,12 @@ at all (a one-valued strategy enum would be ceremony).
    `build_operator` no longer recurses through a fallback subtree (only through
    the pre-built relational inputs). `interpret_node` keeps its own recursion as
    the fallback interpreter.
-4. Make planner / executor / kernel tests independently runnable.
+4. Make planner / executor / kernel tests independently runnable — **DEFERRED
+   2026-08-31.** `ibex_tests` is one binary linking every lib (codegen, interop,
+   kafka, ...); only 9 of ~55 files need the heavy deps, and `ibex_runtime` has
+   no arrow/codegen edge, so a `core+ir+parser+runtime` test binary is a clean
+   split. Deferred because the relink cost is not a felt pain at current sizes —
+   reopen if it becomes one.
 
 Exit: `chunked.cpp` no longer exists as a monolithic execution/planning unit —
 **met 2026-08-31.** It is now a ~1635-line entry point: `build_operator`, the

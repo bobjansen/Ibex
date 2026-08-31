@@ -14,7 +14,13 @@ namespace ibex::ir {
 
 /// The base-table column one output column's values are taken from, unchanged.
 struct ColumnOrigin {
-    std::string source;  ///< Source instance name, as a `ScanNode` names it.
+    /// Identity of the `ScanNode` the value came from. Two occurrences of one
+    /// source in a plan (a self-join, a repeated binding) share `source` but
+    /// not `scan` — a consumer that must tell them apart (functional-dependency
+    /// reduction) keys on `scan`, while `source` stays the key for schema and
+    /// proved-uniqueness lookups. Zero for an origin with no single scan.
+    NodeId scan{};
+    std::string source;  ///< The source's name, as a `ScanNode` names it.
     std::string column;  ///< That source's own name for the column.
 
     friend auto operator==(const ColumnOrigin&, const ColumnOrigin&) -> bool = default;

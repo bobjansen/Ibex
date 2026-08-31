@@ -21,6 +21,10 @@ auto scan(std::string name) -> ir::NodePtr {
     return std::make_unique<ir::ScanNode>(ir::NodeId{1}, std::move(name));
 }
 
+auto scan_id(std::string name, std::uint64_t id) -> ir::NodePtr {
+    return std::make_unique<ir::ScanNode>(ir::NodeId{id}, std::move(name));
+}
+
 /// A source schema, optionally with `unique` proved unique.
 auto source(std::vector<std::string> names, const std::string& unique = {}) -> ir::SchemaInfo {
     std::vector<ir::SchemaField> fields;
@@ -227,6 +231,39 @@ TEST_CASE("group key reduction declines when a key has no traceable origin") {
 
     REQUIRE(plan->kind() == ir::NodeKind::Aggregate);
     CHECK(static_cast<const ir::AggregateNode&>(*plan).group_by().size() == 2);
+}
+
+TEST_CASE("group key reduction distinguishes self-join occurrences by scan identity") {
+    // A self-join on a NON-unique column `k`. `t.pk` is unique in the source,
+    // but a non-unique-key self-join fans a single left row out over many right
+    // rows, so grouping by (left pk, right name) is a real grouping and the
+    // right name must be KEPT. Identifying a base column by source NAME alone
+    // conflates the two scans: "pk is unique -> it determines every column of
+    // t" then reaches the right occurrence's name and collapses it to first().
+    // Scan-node identity keeps the two occurrences apart.
+    ir::SourceSchemas sources;
+    sources.emplace("t", source({"k", "pk", "name", "v"}, "pk"));
+
+    std::vector<ir::RenameSpec> renames{
+        ir::RenameSpec{.new_name = "k2", .old_name = "k"},
+        ir::RenameSpec{.new_name = "pk2", .old_name = "pk"},
+        ir::RenameSpec{.new_name = "name2", .old_name = "name"},
+        ir::RenameSpec{.new_name = "v2", .old_name = "v"},
+    };
+    auto right = std::make_unique<ir::RenameNode>(ir::NodeId{2}, std::move(renames));
+    right->add_child(scan_id("t", 20));
+
+    std::vector<ir::JoinKey> keys{ir::JoinKey{std::string{"k"}, std::string{"k2"}}};
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{3}, ir::JoinKind::Inner, std::move(keys));
+    join->add_child(scan_id("t", 10));
+    join->add_child(std::move(right));
+
+    auto plan = aggregate({"pk", "name2"}, std::move(join));
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    CHECK(agg->group_by().size() == 2);
 }
 
 TEST_CASE("group key reduction never reduces to no key at all") {

@@ -144,8 +144,9 @@ auto column_origins(const Node& node, const SourceSchemas& sources) -> ColumnOri
             }
             ColumnOriginMap out;
             for (const auto& field : it->second.fields()) {
-                out.emplace(field.name,
-                            ColumnOrigin{.source = scan.source_name(), .column = field.name});
+                out.emplace(field.name, ColumnOrigin{.scan = scan.id(),
+                                                     .source = scan.source_name(),
+                                                     .column = field.name});
             }
             return out;
         }

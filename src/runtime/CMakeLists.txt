@@ -31,6 +31,7 @@ add_library(ibex_runtime STATIC
     reshape.cpp
     rng.cpp
     runtime_internal.cpp
+    semi_anti_join.cpp
     sort.cpp
     table_format.cpp
     table_compare.cpp

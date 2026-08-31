@@ -1422,6 +1422,8 @@ auto Emitter::emit_agg_func(ir::AggFunc func) -> std::string {
             return "Max";
         case ir::AggFunc::Count:
             return "Count";
+        case ir::AggFunc::CountDistinct:
+            return "CountDistinct";
         case ir::AggFunc::First:
             return "First";
         case ir::AggFunc::Last:

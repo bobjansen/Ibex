@@ -108,9 +108,9 @@ auto expr_nullability(const Expr& expr, const SchemaInfo& input) -> Nullability 
 }
 
 auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) -> Nullability {
-    if (agg.func == AggFunc::Count) {
-        // A row count. Nothing it reads can make it absent, and an empty group
-        // counts zero rather than null.
+    if (agg.func == AggFunc::Count || agg.func == AggFunc::CountDistinct) {
+        // A count. Nothing it reads can make it absent, and a group with no
+        // present values counts zero rather than null.
         return Nullability::Never;
     }
     if (!grouped) {
@@ -139,6 +139,7 @@ auto agg_nullability(const AggSpec& agg, const SchemaInfo& input, bool grouped) 
             // some size and this pass has no bound on group size.
             return Nullability::Maybe;
         case AggFunc::Count:
+        case AggFunc::CountDistinct:
             break;  // handled above
     }
     return Nullability::Maybe;

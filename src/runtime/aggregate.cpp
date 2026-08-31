@@ -24,6 +24,8 @@
 #include <expected>
 #include <limits>
 #include <optional>
+#include <bit>
+
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
@@ -203,7 +205,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             }
         }
 
-        if (item.kind == ExprType::Date || item.kind == ExprType::Timestamp) {
+        if ((item.kind == ExprType::Date || item.kind == ExprType::Timestamp) &&
+            agg.func != ir::AggFunc::CountDistinct) {
             return std::unexpected("date/time aggregation not supported");
         }
 
@@ -218,7 +221,11 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
 
         if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Stddev ||
             agg.func == ir::AggFunc::Ewma || agg.func == ir::AggFunc::Quantile ||
-            agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
+            agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis ||
+            agg.func == ir::AggFunc::CountDistinct) {
+            // CountDistinct keeps a per-group set of seen values -- like the
+            // moment aggregates it cannot be folded into a scalar accumulator,
+            // so it takes the row-wise grouping path below.
             has_complex_agg = true;
             numeric_only = false;
         } else if (agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last) {
@@ -299,11 +306,13 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 continue;
             }
             if (agg.func == ir::AggFunc::Median || agg.func == ir::AggFunc::Quantile ||
-                agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis) {
+                agg.func == ir::AggFunc::Skew || agg.func == ir::AggFunc::Kurtosis ||
+                agg.func == ir::AggFunc::CountDistinct) {
                 // Collected contiguously after grouping (reserve-then-fill from the
                 // value column directly), not per row here — see the collect pass
                 // below. Per-row push_back into one growing vector per group was the
-                // dominant cost of median/quantile by-group.
+                // dominant cost of median/quantile by-group. CountDistinct fills a
+                // per-group set in its own pass after grouping for the same reason.
                 continue;
             }
             if (agg.func == ir::AggFunc::Stddev) {
@@ -371,6 +380,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         break;
                     case ir::AggFunc::Count:
+                    case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                     case ir::AggFunc::Median:
@@ -409,6 +419,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         break;
                     case ir::AggFunc::Count:
+                    case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                     case ir::AggFunc::Median:
@@ -481,6 +492,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         break;
                     case ir::AggFunc::Count:
+                    case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                     case ir::AggFunc::Median:
@@ -518,6 +530,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                         }
                         break;
                     case ir::AggFunc::Count:
+                    case ir::AggFunc::CountDistinct:
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                     case ir::AggFunc::Median:
@@ -553,6 +566,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             ColumnValue column;
             switch (agg.func) {
                 case ir::AggFunc::Count:
+                case ir::AggFunc::CountDistinct:
                     column = Column<std::int64_t>{};
                     break;
                 case ir::AggFunc::Mean:
@@ -606,6 +620,10 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             AggSlot& slot = slots[i];
             switch (agg.func) {
                 case ir::AggFunc::Count:
+                case ir::AggFunc::CountDistinct:
+                    // CountDistinct's per-group distinct count is written to
+                    // `slot.count` by the collect pass below, the same slot
+                    // field a row count uses.
                     append_scalar(*column, slot.count);
                     break;
                 case ir::AggFunc::Mean:
@@ -682,6 +700,7 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
             case ir::AggFunc::Kurtosis:
                 return slot.count >= 4;
             case ir::AggFunc::Count:
+            case ir::AggFunc::CountDistinct:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
                 return true;
@@ -968,14 +987,17 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
         // contiguous reserve-then-scatter pass below, reading the value column
         // directly. Only allocate row_gid when a collect-aggregate is present.
         std::vector<std::size_t> collect_aggs;
+        std::vector<std::size_t> count_distinct_aggs;
         for (std::size_t i = 0; i < plan.size(); ++i) {
             if (plan[i].func == ir::AggFunc::Median || plan[i].func == ir::AggFunc::Quantile ||
                 plan[i].func == ir::AggFunc::Skew || plan[i].func == ir::AggFunc::Kurtosis) {
                 collect_aggs.push_back(i);
+            } else if (plan[i].func == ir::AggFunc::CountDistinct) {
+                count_distinct_aggs.push_back(i);
             }
         }
         std::vector<std::uint32_t> row_gid;
-        if (!collect_aggs.empty()) {
+        if (!collect_aggs.empty() || !count_distinct_aggs.empty()) {
             row_gid.resize(rows);
         }
 
@@ -1021,12 +1043,61 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                 gid = index.find_or_insert(group_order, key_cols, row,
                                            [&] { return new_group(row); });
             }
-            if (!collect_aggs.empty()) {
+            if (!row_gid.empty()) {
                 row_gid[row] = gid;
             }
 
             if (auto err = update_state(states[gid].slots.data(), row)) {
                 return std::unexpected(*err);
+            }
+        }
+
+        // Per-group distinct counts. One pass over the value column per
+        // CountDistinct aggregate, hashing (group, value) into a per-group set.
+        // Groups own disjoint `states[g].slots[ai]`, so the result is written
+        // straight in with nothing to merge -- the same shape as the collect
+        // pass below. Nulls are not values and do not count.
+        if (!count_distinct_aggs.empty() && rows > 0) {
+            const std::size_t n_groups = states.size();
+            for (const std::size_t ai : count_distinct_aggs) {
+                const ColumnValue& col = *agg_columns[ai];
+                const ValidityBitmap* vb = agg_validity[ai];
+                std::vector<std::int64_t> counts(n_groups, 0);
+                const auto count_with = [&](auto key_of) {
+                    std::vector<robin_hood::unordered_flat_set<
+                        std::decay_t<decltype(key_of(std::size_t{0}))>>>
+                        seen(n_groups);
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (vb != nullptr && !(*vb)[row]) {
+                            continue;
+                        }
+                        seen[row_gid[row]].insert(key_of(row));
+                    }
+                    for (std::size_t g = 0; g < n_groups; ++g) {
+                        counts[g] = static_cast<std::int64_t>(seen[g].size());
+                    }
+                };
+                if (const auto* ic = std::get_if<Column<std::int64_t>>(&col)) {
+                    count_with([&](std::size_t row) { return (*ic)[row]; });
+                } else if (const auto* dc = std::get_if<Column<double>>(&col)) {
+                    count_with(
+                        [&](std::size_t row) { return std::bit_cast<std::uint64_t>((*dc)[row]); });
+                } else if (const auto* bc = std::get_if<Column<bool>>(&col)) {
+                    count_with([&](std::size_t row) -> std::uint8_t { return (*bc)[row] ? 1U : 0U; });
+                } else if (const auto* dtc = std::get_if<Column<Date>>(&col)) {
+                    count_with([&](std::size_t row) { return (*dtc)[row].days; });
+                } else if (const auto* tsc = std::get_if<Column<Timestamp>>(&col)) {
+                    count_with([&](std::size_t row) { return (*tsc)[row].nanos; });
+                } else if (const auto* cc = std::get_if<Column<Categorical>>(&col)) {
+                    count_with([&](std::size_t row) { return cc->code_at(row); });
+                } else if (const auto* sc = std::get_if<Column<std::string>>(&col)) {
+                    count_with([&](std::size_t row) { return std::string_view((*sc)[row]); });
+                } else {
+                    return std::unexpected("count_distinct: unsupported column type");
+                }
+                for (std::size_t g = 0; g < n_groups; ++g) {
+                    states[g].slots[ai].count = counts[g];
+                }
             }
         }
 

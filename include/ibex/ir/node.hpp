@@ -266,6 +266,8 @@ enum class AggFunc : std::uint8_t {
     Min,
     Max,
     Count,
+    CountDistinct,  ///< Number of distinct non-null values in the group (`count_distinct(col)`);
+                    ///< always returns Int64.
     First,
     Last,
     Median,  ///< Middle value (ignores nulls; always returns double).

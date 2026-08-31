@@ -20,6 +20,7 @@ add_library(ibex_ir STATIC
     pending_order.cpp
     required_columns.cpp
     column_origins.cpp
+    count_distinct_reduction.cpp
     distinct_key_reduction.cpp
     group_key_reduction.cpp
     scan_predicates.cpp

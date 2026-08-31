@@ -245,8 +245,14 @@ separate streaming operator.
    `chunked.cpp` 5152→1635 lines: the runtime entry (`build_operator`), the
    `build_materialized_fallback` adapter, extern-call / program execution,
    parallel-env config, and the `build_physical_join` / `build_physical_aggregate`
-   / `build_physical_tail` physical dispatch. A later cosmetic rename to
-   `runtime_entry.cpp` is possible but out of scope.
+   / `build_physical_tail` physical dispatch.
+   - **Renamed `chunked.cpp` → `runtime_entry.cpp` 2026-08-31**, and lifted the
+     two concerns unrelated to operator dispatch into their own TUs:
+     `rank_window.cpp` (`compare_scalar_for_order`, `evaluate_rank_column`) and
+     `extern_call.cpp` (`invoke_extern_call`, `execute_program_preamble`).
+     Bodies-only move; all declared in `interpreter_internal.hpp`.
+     `runtime_entry.cpp` is now ~980 lines: `build_operator` dispatch + physical
+     construction + fallback adapter + parallel config.
    **The fallback adapter is the end state — decided 2026-08-31.** An audit found
    no fallback kind has a streaming operator waiting to be plan-wired: every
    remaining kind (`Window`, `Resample`, `Melt`, `Dcast`, `Cov`, `Corr`,

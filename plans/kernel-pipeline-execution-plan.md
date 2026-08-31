@@ -271,8 +271,20 @@ separate streaming operator.
    formerly false-premise test now checks the migrated pipeline counter. All
    three remaining counter assertions take a local before/after delta, and no
    test reads `physical_materialized_calls`; no counter redesign is required.
-7. **Phase 3 item 5 — per-pipeline scheduling accounting** — small, worth more
-   once the join and aggregate phases have independent identities to attribute.
+7. **Phase 3 item 5 — per-pipeline scheduling accounting — DEFERRED (not
+   blocked), 2026-08-31.** The accounting is already closed at the levels that
+   matter: `IBEX_PROFILE_OPERATORS` gives per-operator `pool_work_ms` /
+   `ring_wait_ms` / `barrier_wait_ms` / `pool_idle_ms` / `occupancy` / morsels
+   plus a plan summary (`serial_fraction`, `amdahl_ceiling`, closure check —
+   `parallelism-overview.md`: "closure is 99.6% on the pool"), and each join /
+   aggregate phase node already has its own profile row. A per-pipeline rollup
+   would only *group* those rows into source→breaker segments — no first-class
+   pipeline object exists to key it on. Every decision it would inform is dead
+   or blocked: the task scheduler was DROPPED on measurement, DOP/memory budgets
+   are blocked (item 8), branch concurrency needs a cost gate not accounting,
+   and q21 (the one pipeline-identity-sensitive query) is already diagnosed
+   three ways. Reopen if a multi-producer change lands or occupancy rises enough
+   to build queues.
 8. **Phase 3 item 2 — DOP/memory budgets** — analysed and **blocked**
    (`phase3-dop-budget-analysis.md`): the pool is 65% idle with nothing queued,
    so a budget rations a non-scarce resource. Reopen when a multi-producer
@@ -454,8 +466,12 @@ breaker operators (Phase 4).
    Branch concurrency needs a **cost-aware** gate, not a thread-count one. The
    only remaining non-pool thread is
    `PipelinedStageOperator`'s (item 1's subject).
-5. **Per-pipeline scheduling accounting** — not started, worth more after the
-   join/aggregate splits give it phases to attribute to.
+5. **Per-pipeline scheduling accounting — DEFERRED (not blocked), 2026-08-31.**
+   Plan+operator accounting is closed (`parallelism-overview.md`: 99.6% on the
+   pool); a per-pipeline rollup would only re-group existing per-operator rows
+   and unblocks no live decision (scheduler dropped, DOP budget blocked, branch
+   concurrency wants a cost gate). See "Next, in order" item 7 for the full
+   rationale. Reopen on a multi-producer change or rising occupancy.
 
 **Concurrency-ownership inventory:** raw threads — `WorkerPool` (sanctioned) +
 `PipelinedStageOperator` (long-lived, blocks on ring backpressure,
@@ -605,9 +621,12 @@ only when a profile shows it costing wall time.
    and supplies its fan-out policy, with byte-identity and profile-backed
    worker-ceiling mutations. This step, including extraction of the resulting
    aggregate family, is complete.
-4. Add per-phase scheduling accounting only after steps 2–3 provide stable
-   pipeline identities. Keep DOP/memory budgeting blocked unless those changes
-   produce measured queue contention or a multi-producer consumer.
+4. Per-phase / per-pipeline scheduling accounting — **DEFERRED (not blocked),
+   2026-08-31.** Steps 2–3 did give stable phase identities, but the accounting
+   they'd feed is already closed at plan+operator level and the decisions a
+   rollup informs are all dead or blocked (see "Next, in order" item 7). Keep
+   DOP/memory budgeting blocked unless a change produces measured queue
+   contention or a multi-producer consumer.
 5. Move the resulting planner, executor, kernels, join, and aggregate families
    out of `chunked.cpp`; replace residual recursion with the explicit physical
    fallback adapter, preserving mutation-tested `MaterializedCall` coverage.

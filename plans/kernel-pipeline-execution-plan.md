@@ -5,8 +5,11 @@
 Phase 3's handoff/island/raw-thread work is complete, with accounting and
 DOP/memory budgets deferred; Phase 4 construction ownership and parallelism
 authority are done, and the targeted join and aggregate decomposition is
-complete; Phase 5 is in progress: fused logical node kinds are retired and the
-aggregate and streaming inner-join execution families are now outside the monolith. **Compacted
+complete; Phase 5 is in progress: fused logical node kinds are retired and every
+execution family — aggregate, streaming join, ordering, distinct, and the
+row-local map operators — is now outside the monolith (`chunked.cpp` 5152→1635
+lines), leaving the `physical_fallbacks_for(kind)`-ranked fallback migration as
+the remaining item. **Compacted
 2026-08-27** — the ~40-entry Phase 2 per-commit diary is in git history at the
 pre-compaction commit's parent; the "Where Phase 2 stands" table below is the
 current state.
@@ -214,29 +217,36 @@ separate streaming operator.
    physical` renders `Breaker(<kind>)  serial (single-operator breaker, no
    fan-out point)`. TopK stays a serial bounded-heap select by design. No
    behaviour change.
-5. **Phase 5 item 1 — split `chunked.cpp` by ownership — IN PROGRESS.** Aggregate,
-   streaming inner join, physical-plan dispatch, and the generic pipeline/morsel
-   executor are extracted. The pipeline unit owns worker chains, ordered handoff,
+5. **Phase 5 item 1 — split `chunked.cpp` by ownership — DONE 2026-08-31.**
+   Aggregate, streaming inner join, physical-plan dispatch, and the generic
+   pipeline/morsel executor were already extracted; the residual breaker families
+   are now out too. The pipeline unit owns worker chains, ordered handoff,
    two-phase filter, deferred-scan pipeline, asynchronous stage, and source
    strategy; concrete row-local factories remain callbacks owned by their
    operator families. No extra call was added to `Operator::next()`.
-   **`distinct` extracted 2026-08-31** (`d82d9fa8`) into `distinct_chunked.cpp`
-   (`ChunkedDistinctOperator`, `distinct_table`, `build_physical_distinct`) —
-   fully private, every dependency already in a shared header, no new interface.
-   **Streaming semi/anti moved 2026-08-31** (`2e3f89dd`) into `join_chunked.cpp`
-   (`ChunkedSemiAntiJoinOperator`, `is_streamable_semi_anti_join`) behind a new
-   `make_chunked_semi_anti_join_operator` factory; it stays a separate operator
-   from the inner-join family by design, just co-located now. `chunked.cpp`
-   5152→3623 lines. **Still in `chunked.cpp`:** the Order/Head/Tail/TopK family
-   (`ChunkedOrderOperator`, `ChunkedAsTimeframeOperator`,
-   `ChunkedOrderedLimitOperator`, `ChunkedHeadOperator` +
-   `build_physical_{order,head,tail,topk}`) and the row-local map operators
-   (`Chunked{Filter,Project,Rename,Update,FilterProject,FilterHead,FilterTail,
-   FilterUpdateProject}` + map-step factories + `build_physical_filter_head_tail`).
-   These two are entangled through `append_validity`, `SchemaCarrier`,
-   `ChunkIdentity`, and `build_physical_filter_head_tail` straddling both — a
-   considered split, not the next mechanical one. Materializing joins remain
-   the intended `MaterializedCall`.
+   - `distinct_chunked.cpp` (`d82d9fa8`) — `ChunkedDistinctOperator`,
+     `distinct_table`, `build_physical_distinct`. Fully private, no new interface.
+   - `join_chunked.cpp` (`2e3f89dd`) — streaming semi/anti
+     (`ChunkedSemiAntiJoinOperator`, `is_streamable_semi_anti_join`) behind a new
+     `make_chunked_semi_anti_join_operator` factory; still a separate operator
+     from the inner-join family by design, just co-located.
+   - `ordered_chunked.cpp` (`35289955`) — `ChunkedOrderOperator`,
+     `ChunkedAsTimeframeOperator`, `ChunkedOrderedLimitOperator` (TopK) +
+     `build_physical_{order,topk}`.
+   - `map_chunked.cpp` (`35289955`) — the row-local map operators, `SchemaCarrier`,
+     the `ChunkIdentity` helpers, the six map-step kernel factories,
+     `map_kernel_factory`, `build_physical_map_step`, `build_physical_head`,
+     `build_physical_filter_head_tail`. `append_validity` moved to
+     `chunk_conversion_internal.hpp` as `inline`.
+
+   `chunked.cpp` 5152→1635 lines: the runtime entry (`build_operator`), the
+   `build_materialized_fallback` adapter, extern-call / program execution,
+   parallel-env config, and the `build_physical_join` / `build_physical_aggregate`
+   / `build_physical_tail` physical dispatch. A later cosmetic rename to
+   `runtime_entry.cpp` is possible but out of scope. Materializing joins remain
+   the intended `MaterializedCall`. **Next residual is no longer a split** —
+   it's the `physical_fallbacks_for(kind)`-ranked migration of individual
+   fallback kinds to real physical breakers (a design task, item 1's tail below).
    **Phase 5 item 3 DONE 2026-08-29** (`5f7afc59`, `94957719`,
    `d1204b63`; `plans/physical-fallback-adapter-plan.md`): the 15-branch
    materializing per-kind switch in `build_operator_impl` is gone. Every
@@ -529,10 +539,15 @@ at all (a one-valued strategy enum would be ceremony).
 ### Phase 5 — retire the monolith, simplify IR
 
 1. Split by ownership: `physical_plan`, `physical_executor`,
-   `pipeline_executor`, `kernels/`, one file/family per breaker. **IN
-   PROGRESS:** aggregate, streaming inner join, physical-plan execution, and the
-   generic pipeline/morsel executor are complete; planning lives in
-   `physical_plan.cpp`. Residual breaker-family extraction remains.
+   `pipeline_executor`, `kernels/`, one file/family per breaker. **DONE
+   2026-08-31:** aggregate, streaming inner join, physical-plan execution, the
+   generic pipeline/morsel executor, `distinct`, streaming semi/anti, the
+   ordering family (`ordered_chunked.cpp`), and the row-local map / head /
+   filter-head-tail operators (`map_chunked.cpp`) are all in their own
+   translation units; planning lives in `physical_plan.cpp`. `chunked.cpp` is
+   down to the runtime entry, the `build_materialized_fallback` adapter,
+   extern/program execution, and join/aggregate/tail physical dispatch (1635
+   lines, from 5152).
 2. Move logical fusion/selection out of `ir::NodeKind` — **DONE** for
    `FilterProject` / `FilterUpdateProject`: both legacy types and their
    compatibility lowering are deleted.

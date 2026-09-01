@@ -14,6 +14,14 @@
 
 namespace ibex::runtime {
 
+/// How long a cooperative waiter parks between re-checking the pool queue when
+/// it has nothing to assist with but its own wait condition is still unmet.
+/// Short enough that the "work was enqueued the instant after I last looked"
+/// window costs nothing on a path that is already a backpressure stall; long
+/// enough not to spin. Shared by `wait_for_batch` and the pipeline ring waits —
+/// see `plans/cooperative-pipeline-waits-plan.md`.
+inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
+
 /// Process-owned worker pool for the runtime's morsel pipelines
 /// (`plans/runtime-multithreading-plan.md`, Phase 1).
 ///
@@ -133,6 +141,9 @@ class WorkerPool {
 
    private:
     [[nodiscard]] auto submit_unbarriered(std::function<void()> body) -> Batch;
+    // Shared body of `try_run_one_pending` (nested_only) and the `wait_for_batch`
+    // assist (not). See its definition.
+    [[nodiscard]] auto run_one_queued(bool nested_only) noexcept -> bool;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::size_t threads_;
@@ -172,6 +183,12 @@ void shutdown_process_worker_pool();
 /// `WorkerPool` itself supports a necessary nested batch by cooperatively
 /// executing queued work while its parent waits.
 [[nodiscard]] auto on_worker_pool_thread() noexcept -> bool;
+
+/// True when a batch this thread submitted from inside its current task body has
+/// not yet completed. The one case where a cooperative ring wait on this thread
+/// has queued work to run; a pipeline worker that has fanned out nothing reads
+/// false and parks plainly, keeping the common path free of the cooperative loop.
+[[nodiscard]] auto this_thread_has_outstanding_nested_work() noexcept -> bool;
 
 /// True on a runtime-owned thread that is NOT a pool worker.
 ///

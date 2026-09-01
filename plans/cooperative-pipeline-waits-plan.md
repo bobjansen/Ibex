@@ -30,20 +30,21 @@ dead-end, unrelated). q18 post-C: `serial_fraction=0.14`, `occupancy=0.85` —
 already parallel. Revive step D only if a profile shows a *specific* nested
 serial decode/scan that `parallel_readers` doesn't reach.
 
-- **C** (this commit): `parallel_readers` (parquet.hpp) fans out a *nested* decode
-  (one already on a pool worker — a dimension table scanned inside a pipeline)
-  by column, capped at `kNestedDecodeFanout = 4` extra readers. An earlier cut
-  sized it exactly via a `pool.size() - g_pool_busy` counter, but the per-task
-  atomic RMW to maintain `g_pool_busy` cost measurably on task-heavy queries
-  (q01/q20/q21); the fixed cap needs no bookkeeping and the cooperative ring
-  waits absorb any oversubscription.
+- **C** (`9a6c0616` + fixup): `parallel_readers` (parquet.hpp) fans out a
+  *nested* decode (one already on a pool worker — a dimension table scanned
+  inside a pipeline) by column, capped at `kNestedDecodeFanout = 4` extra
+  readers, **and only when `num_row_groups() < pool.size()`**. The row-group
+  gate is load-bearing: without it every big-table decode (lineitem, 46 groups
+  at SF-8 — already fills the pool by row group) also fans out by column and
+  oversubscribes — measured **q01 +21%** (`perf stat`: fewer CPUs utilised,
+  longer wall). An even earlier cut sized the cap exactly via a
+  `pool.size() - g_pool_busy` counter, dropped for the per-task atomic cost.
 
-  Realises the dimension-table decode win — standalone interleaved min-wall
-  SF-8 8c, stable across runs: **q02 −13-18%, q18 −8-10%, q14 −4-9%,
-  q10 −4-8%**, q16/q19 −2-3%. Heavy queries (q01/q20/q21/q12) swung ±15%
-  between runs on a contended WSL2 box — inconclusive; needs a clean-box
-  `run_bench.sh` re-measure. q19 (deadlocked in the pre-cooperative prototype)
-  clean in every check.
+  Win, `perf stat` (quiet box, task-clock elapsed) vs pre-arc: **q18 −10%,
+  q02 −5%, q10 −3%**; q01/q13/q20/q21 parity. (A full standalone suite run on a
+  contended box read q13/q18/q20 as noisy ±10% — box artifact, not real; the
+  one real regression it surfaced was q01, now fixed.) q19 (deadlocked in the
+  pre-cooperative prototype) clean every check.
 
   Step C testing revealed step B's *ungated* `wait_for_batch` assist could pick
   up an unrelated **older**-generation `PipelinedScanOperator::run_worker` task,
@@ -52,8 +53,8 @@ serial decode/scan that `parallel_readers` doesn't reach.
   the q18 cost once blamed on gating it was the poll spin, fixed separately by
   the outstanding-nested gate.
 
-- **A** (`9919da0e`): `WorkerPool::try_run_one_pending()` + bounded `wait_for_batch` park.
-- **B** (`8e84cf88`): `cooperative_ring_wait()` at `OrderedChunkRing::acquire`/`take`
+- **A** (`94f34a88`): `WorkerPool::try_run_one_pending()` + bounded `wait_for_batch` park.
+- **B** (`9a5e06f6`): `cooperative_ring_wait()` at `OrderedChunkRing::acquire`/`take`
   and the `PipelinedStageOperator` consumer wait. Two gates, each added after a
   measured failure of the naive cut:
 

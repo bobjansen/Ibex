@@ -23,15 +23,21 @@
 # fixed names alone can never be: a rerun silently overwrites the numbers you
 # wanted to compare against. Use compare_runs.py to diff two archived runs.
 #
-# The upstream Polars/DuckDB reference ALWAYS runs, in the same sitting -- a
-# comparison against a stale reference number is worthless (a slower box then
-# reads as an ibex regression). Needs a pola-rs/polars-benchmark checkout,
+# A DuckDB reference ALWAYS runs, in the same sitting -- a comparison against a
+# stale reference number is worthless (a slower box then reads as an ibex
+# regression). The in-memory Polars reference also runs unless
+# --no-polars-in-memory is passed. Needs a pola-rs/polars-benchmark checkout,
 # auto-found at ~/polars-benchmark or given by --pdsh-root / $PDSH_ROOT. For a
 # quick ibex-only look use bench_ibex.py instead.
 #
+# The in-memory Polars executor materialises whole tables and can OOM a small
+# box at high scale factors; --no-polars-in-memory drops those two passes (pair
+# it with --polars-streaming so a Polars reference still runs).
+#
 # Usage:
 #   ./run_bench.sh [--sf N] [--warmup N] [--iters N] [--pdsh-root DIR]
-#                  [--polars-streaming] [--cores N] [--label TEXT] [--no-archive]
+#                  [--polars-streaming] [--no-polars-in-memory]
+#                  [--cores N] [--label TEXT] [--no-archive]
 
 set -euo pipefail
 
@@ -44,6 +50,7 @@ SCALE=1
 WARMUP=1
 ITERS=5
 POLARS_STREAMING=0
+POLARS_IN_MEMORY=1
 ARCHIVE=1
 LABEL=""
 # Cores the whole comparison is pinned to. Unset means "every core on the box",
@@ -59,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --iters)  ITERS="$2";  shift 2 ;;
         --pdsh-root) PDSH_ROOT="$2"; shift 2 ;;
         --polars-streaming) POLARS_STREAMING=1; shift ;;
+        --no-polars-in-memory) POLARS_IN_MEMORY=0; shift ;;
         --cores)  CORES="$2"; shift 2 ;;
         --label)  LABEL="$2"; shift 2 ;;
         --no-archive) ARCHIVE=0; shift ;;
@@ -133,8 +141,11 @@ archive_run() {
     dir="$RESULTS/runs/${stamp}_${commit:0:8}${dirty_suffix}_sf${SCALE}"
     mkdir -p "$dir"
 
-    local measured=("ibex" "ibex-st" "pdsh-polars" "pdsh-polars-st" "pdsh-duckdb" "pdsh-duckdb-st")
+    local measured=("ibex" "ibex-st" "pdsh-duckdb" "pdsh-duckdb-st")
     local carried=()
+    if [[ "$POLARS_IN_MEMORY" -eq 1 ]]; then
+        measured+=("pdsh-polars" "pdsh-polars-st")
+    fi
     if [[ "$POLARS_STREAMING" -eq 1 ]]; then
         measured+=("pdsh-polars-stream" "pdsh-polars-stream-st")
     fi
@@ -203,15 +214,24 @@ rm -f "$RESULTS/ibex_st${SUFFIX}.tsv.tmp"
 # the in-tree Polars implementation removed these are the only reference left,
 # and measuring ibex on 8 cores against a reference free to use 24 is not a
 # comparison. (Nothing is version-pinned here: --pdsh-root is a checkout.)
-echo "=== upstream PDS-H Polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
-"${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
-    --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
-    --out "$RESULTS/pdsh_polars${SUFFIX}.tsv"
+# The in-memory executor is the upstream default, but it materialises whole
+# tables; --no-polars-in-memory skips it for a memory-constrained box. Stale
+# TSVs from an earlier run are removed so print_table.py and the archive do not
+# pick up a number this sitting did not measure.
+if [[ "$POLARS_IN_MEMORY" -eq 1 ]]; then
+    echo "=== upstream PDS-H Polars (multi-threaded, ${CORES:-$(nproc)} cores) ==="
+    "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" --engine polars --pdsh-root "$PDSH_ROOT" \
+        --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" --framework pdsh-polars \
+        --out "$RESULTS/pdsh_polars${SUFFIX}.tsv"
 
-echo "=== upstream PDS-H Polars (single-threaded) ==="
-POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
-    --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
-    --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+    echo "=== upstream PDS-H Polars (single-threaded) ==="
+    POLARS_MAX_THREADS=1 "${PIN[@]}" uv run --project "$IBEX_ROOT" "$SCRIPT_DIR/bench_pdsh.py" \
+        --engine polars --pdsh-root "$PDSH_ROOT" --sf "$SCALE" --warmup "$WARMUP" --iters "$ITERS" \
+        --framework pdsh-polars-st --out "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+else
+    echo "=== upstream PDS-H Polars in-memory: SKIPPED (--no-polars-in-memory) ==="
+    rm -f "$RESULTS/pdsh_polars${SUFFIX}.tsv" "$RESULTS/pdsh_polars_st${SUFFIX}.tsv"
+fi
 
 # Polars' streaming executor, run only on request. Upstream selects the
 # in-memory one EXPLICITLY unless told otherwise, so which executor the

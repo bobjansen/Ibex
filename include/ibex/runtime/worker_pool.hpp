@@ -141,9 +141,6 @@ class WorkerPool {
 
    private:
     [[nodiscard]] auto submit_unbarriered(std::function<void()> body) -> Batch;
-    // Shared body of `try_run_one_pending` (nested_only) and the `wait_for_batch`
-    // assist (not). See its definition.
-    [[nodiscard]] auto run_one_queued(bool nested_only) noexcept -> bool;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::size_t threads_;

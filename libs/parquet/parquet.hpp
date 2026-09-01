@@ -3184,9 +3184,16 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     /// waste — the footer is already shared, so an extra reader is just page
     /// readers and cursors.
     ///
-    /// Serial when the query is not parallel, when there is only one unit, or
-    /// when this call is already running on a pool thread: `submit` from a
-    /// worker deadlocks against a saturated pool.
+    /// Serial when the query is not parallel or there is only one unit.
+    ///
+    /// A call already on a pool thread (a nested decode — a dimension table
+    /// scanned from inside a pipeline worker) used to bail to serial: `submit`
+    /// from a worker could strand its tasks against a saturated pool. The
+    /// cooperative ring waits (`plans/cooperative-pipeline-waits-plan.md`) fixed
+    /// that — a parked worker now runs queued tasks — so a nested decode fans
+    /// out too, bounded by the workers actually free (`pool.size() - busy`).
+    /// This is the lever for the small dimension tables (customer/part, 1-2 row
+    /// groups) whose 5-7 columns otherwise decode on one worker while six idle.
     ///
     /// The settings come from the query's `ExecutionContext`, never from the
     /// environment — a decoder that read `IBEX_PARALLEL` itself would be a
@@ -3196,10 +3203,17 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         -> std::vector<parquet::arrow::FileReader*> {
         auto& pool = ibex::runtime::process_worker_pool();
         std::size_t want = 1;
+        const bool nested = ibex::runtime::on_worker_pool_thread();
         if (factory_ != nullptr && units > 1 && exec.can_fan_out() &&
-            rows_ >= std::max(exec.parallel_min_rows, kParallelDecodeMinRows) &&
-            !ibex::runtime::on_worker_pool_thread()) {
-            const std::size_t budget = exec.compute_budget();
+            rows_ >= std::max(exec.parallel_min_rows, kParallelDecodeMinRows)) {
+            std::size_t budget = exec.compute_budget();
+            // A nested decode runs under a pipeline worker; cap its extra readers
+            // so a full-width fan-out from every concurrent unit cannot badly
+            // oversubscribe the pool. The cooperative ring waits make it safe;
+            // this keeps it cheap (no per-task bookkeeping to size it exactly).
+            if (nested) {
+                budget = std::min<std::size_t>(budget, kNestedDecodeFanout);
+            }
             want = std::min({units, budget, pool.size()});
         }
 
@@ -3219,6 +3233,9 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
     /// Below this the decode is short enough that spinning up the pool and
     /// building extra readers costs more than it saves.
     static constexpr std::size_t kParallelDecodeMinRows = 65536;
+
+    /// Extra readers a decode already on a pool worker may fan out to.
+    static constexpr std::size_t kNestedDecodeFanout = 4;
 
     std::unique_ptr<parquet::arrow::FileReader> reader_;
     std::vector<std::unique_ptr<parquet::arrow::FileReader>> extra_readers_;

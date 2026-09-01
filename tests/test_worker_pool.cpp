@@ -174,6 +174,71 @@ TEST_CASE("WorkerPool cooperatively completes nested batches from every worker",
     CHECK(children_ran.load() == 16);
 }
 
+TEST_CASE("try_run_one_pending drains nested work when every worker is otherwise blocked",
+          "[runtime][worker_pool]") {
+    // The pipeline-ring deadlock in miniature. N pool workers are each parked on
+    // a backpressure condition (here a flag) that a *raw* condvar wait would
+    // sleep through. `Batch::wait` already cooperates; `OrderedChunkRing`'s
+    // waits did not, so a nested `submit` under a scan worker stranded its
+    // tasks with no thread in the pool's dispatch loop to run them
+    // (`plans/cooperative-pipeline-waits-plan.md`). The fix: the ring wait calls
+    // `try_run_one_pending` while parked. This exercises that primitive under
+    // the exact topology — replace the `try_run_one_pending` call below with a
+    // bare `yield()` and this test hangs.
+    runtime::WorkerPool pool(4);
+    std::atomic<std::size_t> parked{0};
+    std::atomic<bool> release{false};
+    std::atomic<std::size_t> children_ran{0};
+
+    auto outer = pool.submit(4, [&](std::size_t) {
+        parked.fetch_add(1, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            if (!pool.try_run_one_pending()) {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    while (parked.load(std::memory_order_acquire) != 4) {
+        std::this_thread::yield();
+    }
+    // Every pool thread is now inside an outer body. Work submitted now must
+    // still complete, run by the parked workers as they cooperatively drain.
+    //
+    // The nested bodies also cooperate — and must NOT pick up each other. They
+    // share a generation, so `try_run_one_pending` refuses them to one another;
+    // without that gate a body would re-enter on a thread already inside one,
+    // which is the unbounded `run_worker` tower that hung the morsel-pipeline
+    // E2E tests. `depth` catches a regression of that gate.
+    static thread_local int depth = 0;
+    std::atomic<int> max_depth{0};
+    std::atomic<bool> nested_release{false};
+    auto nested = pool.submit(4, [&](std::size_t) {
+        ++depth;
+        for (int seen = max_depth.load(); depth > seen;) {
+            if (max_depth.compare_exchange_weak(seen, depth)) {
+                break;
+            }
+        }
+        children_ran.fetch_add(1);
+        while (!nested_release.load(std::memory_order_acquire)) {
+            (void)pool.try_run_one_pending();
+            std::this_thread::yield();
+        }
+        --depth;
+    });
+    while (children_ran.load() != 4) {
+        std::this_thread::yield();
+    }
+    CHECK(max_depth.load() == 1);
+    nested_release.store(true, std::memory_order_release);
+    nested.wait();
+    CHECK(children_ran.load() == 4);
+
+    release.store(true, std::memory_order_release);
+    outer.wait();
+}
+
 TEST_CASE("decode_thread_count separates the decode pool from the compute budget",
           "[runtime][worker_pool]") {
     // The two budgets are different numbers on purpose: decode is

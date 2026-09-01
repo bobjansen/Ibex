@@ -372,6 +372,46 @@ struct MorselWorkerChain {
     }
     return worker;
 }
+/// Wait on `cv` (holding `lock`) until `pred()`, cooperatively running queued
+/// pool tasks while parked when the caller is a pool worker.
+///
+/// Without this a pool worker blocked on a pipeline ring strands any nested
+/// `pool.submit` under it: its child tasks sit in the queue while every other
+/// worker is parked in its own ring wait, none in the pool's dispatch loop. See
+/// `plans/cooperative-pipeline-waits-plan.md`.
+///
+/// Assist only when this thread is a pool worker AND a fan-out it started is
+/// still running — the sole case with queued work to run. A non-pool caller (the
+/// merger thread, a stage producer) owns no pool task to strand; a pipeline
+/// worker that has nested nothing has an empty-for-it queue. Both take the plain
+/// `cv.wait`, so the common backpressure park costs exactly what it did before
+/// this existed, and the stage-ledger accounting in `RingWaitScope` is unchanged.
+template <typename Pred>
+void cooperative_ring_wait(std::condition_variable& cv, std::unique_lock<std::mutex>& lock,
+                           Pred pred) {
+    if (!on_worker_pool_thread() || !this_thread_has_outstanding_nested_work()) {
+        const RingWaitScope ring_wait;
+        cv.wait(lock, pred);
+        return;
+    }
+    auto& pool = process_worker_pool();
+    while (!pred()) {
+        lock.unlock();
+        const bool helped = pool.try_run_one_pending();
+        lock.lock();
+        if (pred()) {
+            break;
+        }
+        if (!helped) {
+            // Genuine park — the only interval that is "ring wait". Bounded so a
+            // task another worker runs while we sleep cannot leave fresh queue
+            // work unnoticed (that wakeup lands on the pool queue, not `cv`).
+            const RingWaitScope ring_wait;
+            cv.wait_for(lock, kCoopPollInterval, [&pred] { return pred(); });
+        }
+    }
+}
+
 /// A bounded, sequence-ordered handoff between several producers and one
 /// consumer — the one implementation of that shape in the runtime.
 ///
@@ -414,8 +454,7 @@ class OrderedChunkRing {
     /// Park until this sequence's slot is free. Called with no lock held.
     [[nodiscard]] auto acquire(std::uint64_t sequence) -> Acquire {
         std::unique_lock lock(mutex_);
-        const RingWaitScope ring_wait;
-        space_.wait(lock, [&] {
+        cooperative_ring_wait(space_, lock, [&] {
             return cancelled_ || sequence < released_ + window_ ||
                    (has_error_ && error_sequence_ < sequence);
         });
@@ -475,13 +514,10 @@ class OrderedChunkRing {
         {
             std::unique_lock lock(mutex_);
             const auto slot = static_cast<std::size_t>(sequence % window_);
-            {
-                const RingWaitScope ring_wait;
-                ready_.wait(lock, [&] {
-                    return ring_[slot].has_value() || cancelled_ || active_producers_ == 0 ||
-                           (has_error_ && error_sequence_ <= sequence);
-                });
-            }
+            cooperative_ring_wait(ready_, lock, [&] {
+                return ring_[slot].has_value() || cancelled_ || active_producers_ == 0 ||
+                       (has_error_ && error_sequence_ <= sequence);
+            });
             if (ring_[slot].has_value()) {
                 chunk = std::move(ring_[slot]);
                 ring_[slot].reset();
@@ -2151,13 +2187,12 @@ class PipelinedStageOperator final : public Operator {
         std::expected<std::optional<Chunk>, std::string> result = std::optional<Chunk>{};
         {
             std::unique_lock lock(mutex_);
-            {
-                // Idle, not serial work: waiting on the stage's producer thread.
-                const RingWaitScope ring_wait;
-                ready_.wait(lock, [this] {
-                    return !ready_chunks_.empty() || producer_done_ || failure_.has_value();
-                });
-            }
+            // Idle, not serial work: waiting on the stage's producer thread. When
+            // this stage is nested under another pipeline, `next()` runs on a
+            // pool worker, so the wait must keep the pool moving.
+            cooperative_ring_wait(ready_, lock, [this] {
+                return !ready_chunks_.empty() || producer_done_ || failure_.has_value();
+            });
             if (failure_.has_value()) {
                 result = std::unexpected(std::move(*failure_));
                 failure_.reset();

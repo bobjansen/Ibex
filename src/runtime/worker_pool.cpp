@@ -55,6 +55,11 @@ struct WorkerPool::Batch::State {
     std::size_t error_worker = 0;
     ExecutionProfileEntry* profile_entry = nullptr;
     bool account_wait = true;
+    // When this batch was submitted from inside a task body, points at the
+    // submitting thread's `t_outstanding_nested` counter; the last task to
+    // finish decrements it. Lets a cooperative waiter tell "I have nested work
+    // in flight" (assist) from "I have not fanned out" (park plainly).
+    std::atomic<std::int32_t>* nested_debit = nullptr;
 };
 
 struct WorkerPool::TaskGroup::State {
@@ -70,9 +75,29 @@ struct WorkerPool::TaskGroup::State {
 
 namespace {
 
+// Monotonic id stamped on every batch at submit. A cooperative waiter only runs
+// a queued task whose generation is *newer* than the one its own thread is
+// currently executing — i.e. strictly nested work, submitted by this task or a
+// descendant. Running an older or equal generation would let a thread parked in
+// a ring wait pick up a *sibling* from its own batch, which then parks on the
+// same ring and recurses without bound (a `MorselPipelineOperator` worker in
+// `OrderedChunkRing::acquire` grabbing another `run_worker` was exactly that).
+std::atomic<std::uint64_t> g_submit_gen{0};
+
+// The generation of the task this thread is running, or 0 on a thread that is
+// not inside `run_task`. Saved and restored across nested `run_task` calls.
+thread_local std::uint64_t t_running_gen = 0;
+
+// Batches this thread has submitted that have not yet completed. Non-zero only
+// while a fan-out this thread kicked off is still running, which is the one
+// situation in which a cooperative ring wait on this thread has work to do.
+// Atomic because the decrement runs on whichever thread finishes the batch.
+thread_local std::atomic<std::int32_t> t_outstanding_nested{0};
+
 struct Task {
     std::shared_ptr<WorkerPool::Batch::State> state;
     std::size_t worker_id = 0;
+    std::uint64_t gen = 0;
 };
 
 /// Runs one worker body and settles its slot in the batch. Exceptions are
@@ -90,11 +115,14 @@ void run_task(const Task& task) {
         (void)take_pool_park_ns();
     }
     std::exception_ptr caught;
+    const std::uint64_t outer_gen = t_running_gen;
+    t_running_gen = task.gen;
     try {
         state.body(task.worker_id);
     } catch (...) {
         caught = std::current_exception();
     }
+    t_running_gen = outer_gen;
     // Attribute the worker's time BEFORE settling the batch. `profile_entry`
     // points into the query's profile state, and nothing here keeps that alive:
     // the moment `remaining` reaches zero the waiter may return, finish the
@@ -113,6 +141,7 @@ void run_task(const Task& task) {
         record_execution_profile_worker(state.profile_entry, elapsed - parked);
         record_execution_profile_pool_idle(state.profile_entry, parked);
     }
+    std::atomic<std::int32_t>* debit_to_settle = nullptr;
     {
         const std::lock_guard lock(state.mutex);
         if (caught != nullptr && (state.error == nullptr || task.worker_id < state.error_worker)) {
@@ -120,16 +149,15 @@ void run_task(const Task& task) {
             state.error_worker = task.worker_id;
         }
         --state.remaining;
+        if (state.remaining == 0) {
+            debit_to_settle = std::exchange(state.nested_debit, nullptr);
+        }
+    }
+    if (debit_to_settle != nullptr) {
+        debit_to_settle->fetch_sub(1, std::memory_order_relaxed);
     }
     state.done.notify_all();
 }
-
-// How long a cooperative waiter parks between re-checking the pool queue when it
-// has nothing to assist with but its own wait condition is still unmet. Short
-// enough that the "work was enqueued the instant after I last looked" window
-// costs nothing on a path that is already a backpressure stall; long enough not
-// to spin. See `plans/cooperative-pipeline-waits-plan.md`.
-inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
 
 [[nodiscard]] auto env_value(const char* name) -> std::string_view {
     const char* raw = std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
@@ -341,6 +369,10 @@ auto on_worker_pool_thread() noexcept -> bool {
     return t_on_pool_thread;
 }
 
+auto this_thread_has_outstanding_nested_work() noexcept -> bool {
+    return t_outstanding_nested.load(std::memory_order_relaxed) > 0;
+}
+
 auto on_stage_thread() noexcept -> bool {
     return t_on_stage_thread;
 }
@@ -437,11 +469,20 @@ WorkerPool::~WorkerPool() {
 #endif
 }
 
-auto WorkerPool::try_run_one_pending() noexcept -> bool {
+// Run one queued task on the calling thread, or return false when there is none
+// eligible. `nested_only` restricts eligibility to tasks submitted *after* the
+// one this thread is running — used by the pipeline ring waits, where running a
+// same-generation sibling would recurse on the same ring without bound. The
+// `wait_for_batch` cooperative loop passes false: a task it runs there belongs
+// to a different batch and cannot recurse into the wait it is helping, so
+// restricting it there only makes a waiter idle when it could be working (a
+// measured ~10% loss on q18).
+auto WorkerPool::run_one_queued(bool nested_only) noexcept -> bool {
     Task task;
     {
         const std::lock_guard lock(impl_->mutex);
-        if (impl_->queue.empty()) {
+        if (impl_->queue.empty() ||
+            (nested_only && impl_->queue.front().gen <= t_running_gen)) {
             return false;
         }
         task = std::move(impl_->queue.front());
@@ -451,28 +492,37 @@ auto WorkerPool::try_run_one_pending() noexcept -> bool {
     return true;
 }
 
+auto WorkerPool::try_run_one_pending() noexcept -> bool {
+    return run_one_queued(/*nested_only=*/true);
+}
+
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
-    state->assist_one = [this] { return try_run_one_pending(); };
+    state->assist_one = [this] { return run_one_queued(false); };
     // A public submit is one fork-join round trip. TaskGroup uses the private
     // unbarriered submission below and accounts its single join at group wait.
     // Counting here needs no matching hook in Batch::wait() (which is
     // idempotent, and which the destructor may call again).
     record_execution_profile_barrier(state->profile_entry);
+    const std::uint64_t gen = g_submit_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (t_running_gen != 0) {
+        t_outstanding_nested.fetch_add(1, std::memory_order_relaxed);
+        state->nested_debit = &t_outstanding_nested;
+    }
     if constexpr (kInlinePool) {
         for (std::size_t i = 0; i < count; ++i) {
-            run_task(Task{.state = state, .worker_id = i});
+            run_task(Task{.state = state, .worker_id = i, .gen = gen});
         }
         return Batch{std::move(state)};
     }
     {
         const std::lock_guard lock(impl_->mutex);
         for (std::size_t i = 0; i < count; ++i) {
-            impl_->queue.push_back(Task{.state = state, .worker_id = i});
+            impl_->queue.push_back(Task{.state = state, .worker_id = i, .gen = gen});
         }
     }
     impl_->work.notify_all();
@@ -641,14 +691,19 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
     state->account_wait = false;
-    state->assist_one = [this] { return try_run_one_pending(); };
+    state->assist_one = [this] { return run_one_queued(false); };
+    const std::uint64_t gen = g_submit_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (t_running_gen != 0) {
+        t_outstanding_nested.fetch_add(1, std::memory_order_relaxed);
+        state->nested_debit = &t_outstanding_nested;
+    }
     if constexpr (kInlinePool) {
-        run_task(Task{.state = state, .worker_id = 0});
+        run_task(Task{.state = state, .worker_id = 0, .gen = gen});
         return Batch{std::move(state)};
     }
     {
         const std::lock_guard lock(impl_->mutex);
-        impl_->queue.push_back(Task{.state = state, .worker_id = 0});
+        impl_->queue.push_back(Task{.state = state, .worker_id = 0, .gen = gen});
     }
     impl_->work.notify_one();
     return Batch{std::move(state)};

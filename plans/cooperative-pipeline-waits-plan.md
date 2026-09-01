@@ -4,12 +4,46 @@ description: "Make the pipeline executor's backpressure waits (OrderedChunkRing:
 metadata:
   node_type: plan
   type: project
-  status: proposed
+  status: in-progress
 ---
 
 # Cooperative pipeline waits
 
-**Status: PROPOSED (2026-09-01, better-plans).** Written after a q19 SF-8 hang
+**Status: STEP A + B LANDED (2026-09-01, better-plans).** Steps C/D (lifting the
+`on_worker_pool_thread()` serial gates) still pending.
+
+- **A** (`9919da0e`): `WorkerPool::try_run_one_pending()` + bounded `wait_for_batch` park.
+- **B** (`8e84cf88`): `cooperative_ring_wait()` at `OrderedChunkRing::acquire`/`take`
+  and the `PipelinedStageOperator` consumer wait. Two gates, each added after a
+  measured failure of the naive cut:
+
+  * **Generation gate** on the *ring-wait* assist. A cooperative waiter must only
+    run strictly-nested work: every `submit` stamps a monotonic generation,
+    `run_task` tracks the running one thread-locally, and the ring-wait assist
+    (`try_run_one_pending`) skips a queued task whose generation is `<=` the
+    caller's. Without it a `MorselPipelineOperator` worker parked in `acquire`
+    picked up a **sibling** `run_worker`, which parked on the same ring and
+    recursed without bound (an 8-deep tower hung two morsel-pipeline E2E tests).
+    `wait_for_batch`'s assist stays **ungated** — its tasks belong to other
+    batches and can't recurse into the wait it helps; gating it there measured
+    ~3% off q18 (a waiter idling on work it could do).
+
+  * **Outstanding-nested gate** on entering the cooperative loop at all. It runs
+    only when `this_thread_has_outstanding_nested_work()` — a thread-local count
+    of batches this thread submitted from within a task that have not finished
+    (decremented by the last task of each). A pipeline worker that has fanned
+    out nothing takes a plain `cv.wait`. Without this, the 250µs poll loop spins
+    on the pool mutex and burns ~1 extra core on q18 (~3% wall standalone; more
+    under interleaved A/B, where the extra CPU biases the paired comparison —
+    the first A/Bs read q18 at +10%, standalone min-wall was +3%, and with the
+    gate q18 is at parity).
+
+  1831 tests + check_answers 22/22; guard test asserts `max_depth == 1` for
+  nested cooperative bodies.
+
+---
+
+Written after a q19 SF-8 hang
 diagnosed the deadlock precisely — see [[project_nested_decode_fanout_deadlock]].
 
 ## Problem

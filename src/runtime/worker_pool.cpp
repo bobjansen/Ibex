@@ -124,6 +124,13 @@ void run_task(const Task& task) {
     state.done.notify_all();
 }
 
+// How long a cooperative waiter parks between re-checking the pool queue when it
+// has nothing to assist with but its own wait condition is still unmet. Short
+// enough that the "work was enqueued the instant after I last looked" window
+// costs nothing on a path that is already a backpressure stall; long enough not
+// to spin. See `plans/cooperative-pipeline-waits-plan.md`.
+inline constexpr auto kCoopPollInterval = std::chrono::microseconds(250);
+
 [[nodiscard]] auto env_value(const char* name) -> std::string_view {
     const char* raw = std::getenv(name);  // NOLINT(concurrency-mt-unsafe)
     return raw == nullptr ? std::string_view{} : std::string_view{raw};
@@ -430,25 +437,27 @@ WorkerPool::~WorkerPool() {
 #endif
 }
 
+auto WorkerPool::try_run_one_pending() noexcept -> bool {
+    Task task;
+    {
+        const std::lock_guard lock(impl_->mutex);
+        if (impl_->queue.empty()) {
+            return false;
+        }
+        task = std::move(impl_->queue.front());
+        impl_->queue.pop_front();
+    }
+    run_task(task);
+    return true;
+}
+
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
-    state->assist_one = [this] {
-        Task task;
-        {
-            const std::lock_guard pool_lock(impl_->mutex);
-            if (impl_->queue.empty()) {
-                return false;
-            }
-            task = std::move(impl_->queue.front());
-            impl_->queue.pop_front();
-        }
-        run_task(task);
-        return true;
-    };
+    state->assist_one = [this] { return try_run_one_pending(); };
     // A public submit is one fork-join round trip. TaskGroup uses the private
     // unbarriered submission below and accounts its single join at group wait.
     // Counting here needs no matching hook in Batch::wait() (which is
@@ -505,11 +514,18 @@ void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex
         if (helped || state.remaining == 0) {
             continue;
         }
+        // Nothing to assist with right now, but this batch is not done — its
+        // tasks are running on other threads. Park, but only briefly: a task one
+        // of those threads runs may enqueue fresh work this thread could pick
+        // up, and a wakeup for that arrives on the pool queue, not `state.done`.
+        // The bounded re-check closes that window without spinning.
         if (state.profile_entry == nullptr || !state.account_wait) {
-            state.done.wait(lock, [&state] { return state.remaining == 0; });
+            state.done.wait_for(lock, kCoopPollInterval,
+                                [&state] { return state.remaining == 0; });
         } else {
             const auto start = std::chrono::steady_clock::now();
-            state.done.wait(lock, [&state] { return state.remaining == 0; });
+            state.done.wait_for(lock, kCoopPollInterval,
+                                [&state] { return state.remaining == 0; });
             parked += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start);
         }
@@ -625,19 +641,7 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
     state->account_wait = false;
-    state->assist_one = [this] {
-        Task task;
-        {
-            const std::lock_guard pool_lock(impl_->mutex);
-            if (impl_->queue.empty()) {
-                return false;
-            }
-            task = std::move(impl_->queue.front());
-            impl_->queue.pop_front();
-        }
-        run_task(task);
-        return true;
-    };
+    state->assist_one = [this] { return try_run_one_pending(); };
     if constexpr (kInlinePool) {
         run_task(Task{.state = state, .worker_id = 0});
         return Batch{std::move(state)};

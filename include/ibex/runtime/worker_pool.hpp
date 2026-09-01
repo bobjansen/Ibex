@@ -120,6 +120,17 @@ class WorkerPool {
     /// tasks must finish before the pool is destroyed.
     [[nodiscard]] auto task_group() -> TaskGroup;
 
+    /// Run one queued task on the calling thread, or return false when the queue
+    /// is empty. The caller need not be a pool worker.
+    ///
+    /// Every queued task belongs to the current query (the one-query-at-a-time
+    /// lease), so running an arbitrary one is always safe. This is the primitive
+    /// that lets a thread blocked in a pipeline backpressure wait keep the pool
+    /// moving instead of stranding nested work — `wait_for_batch` and the
+    /// pipeline ring waits share it. See
+    /// `plans/cooperative-pipeline-waits-plan.md`.
+    [[nodiscard]] auto try_run_one_pending() noexcept -> bool;
+
    private:
     [[nodiscard]] auto submit_unbarriered(std::function<void()> body) -> Batch;
     struct Impl;

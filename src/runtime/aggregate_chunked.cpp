@@ -3449,7 +3449,12 @@ class HashAggregateState final {
             accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(), scratch_.data(),
                                     skip);
         }
-        accumulate_distinct(gids, agg_entries, rows, skip);
+        // Guarded here, not just inside `accumulate_distinct`, so this function
+        // -- which every gid-assigning fast path ends with -- stays small enough
+        // to inline when there is no distinct aggregate, which is the norm.
+        if (has_count_distinct_) {
+            accumulate_distinct(gids, agg_entries, rows, skip);
+        }
     }
 
     /// Run `fn(lo, hi)` over `workers` contiguous shard ranges covering
@@ -4213,7 +4218,9 @@ class HashAggregateState final {
             group_order_.emplace_back();
             alloc_group();
         }
-        accumulate_distinct(nullptr, agg_entries, rows, nullptr);
+        if (has_count_distinct_) {
+            accumulate_distinct(nullptr, agg_entries, rows, nullptr);
+        }
         AggSlotCore* dst = flat_slots_.data();
 
         const std::size_t morsels = ungrouped_morsels(rows);

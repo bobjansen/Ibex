@@ -303,3 +303,36 @@ result;
     REQUIRE(rows_of(out, {"region", "total"}) ==
             std::set<std::vector<std::int64_t>>{{1, 25}, {2, 25}, {3, 30}});
 }
+
+TEST_CASE("e2e lazy: streaming count_distinct, grouped and global", "[e2e][lazy]") {
+    // Exercises the streaming hash-aggregate's count_distinct path (the batch
+    // planner routes an aggregate through it; `test_e2e.cpp` only reaches
+    // `aggregate_table`). g: 1 1 1 2 2 3 3 ; v per g -> 1{7,7,8}=2  2{9,9}=1
+    //  3{4,5}=2 ; global distinct v -> {7,8,9,4,5} = 5.
+    Table hits = make_table({{"g", {1, 1, 1, 2, 2, 3, 3}}, {"v", {7, 7, 8, 9, 9, 4, 5}}});
+
+    const char* src = R"(
+extern fn read_hits() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let hits = read_hits();
+let per_g = hits[select { nd = count_distinct(v) }, by { g }];
+capture(per_g);
+per_g;
+)";
+    Table grouped = run_lazy_script(src, {{"read_hits", hits}});
+    REQUIRE(rows_of(grouped, {"g", "nd"}) ==
+            std::set<std::vector<std::int64_t>>{{1, 2}, {2, 1}, {3, 2}});
+
+    const char* global_src = R"(
+extern fn read_hits() -> DataFrame from "x.hpp";
+extern fn capture(df: DataFrame) -> Int from "x.hpp";
+
+let hits = read_hits();
+let total = hits[select { nd = count_distinct(v) }];
+capture(total);
+total;
+)";
+    Table global = run_lazy_script(global_src, {{"read_hits", std::move(hits)}});
+    REQUIRE(i64(global, "nd") == std::vector<std::int64_t>{5});
+}

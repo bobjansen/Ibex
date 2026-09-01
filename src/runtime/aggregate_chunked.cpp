@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -331,6 +332,37 @@ class HashAggregateState final {
     /// reorders, so a code identifies the same value in every chunk.
     enum class IntKeyKind : std::uint8_t { Int64, Date, Ts, Cat };
 
+    /// Streaming `count_distinct` state for one aggregation.
+    ///
+    /// A `(gid, value)` pair maps to exactly one shard, so the shards never
+    /// need cross-merging: the exact per-group distinct count is the sum over
+    /// shards of the pairs each holds. That is also what lets the per-chunk
+    /// insert fan out -- each worker owns a disjoint slice of the shards and
+    /// scans the whole column, inserting only the pairs that land in its slice.
+    ///
+    /// Fixed-width values are bit-cast into `bits`; text is kept verbatim in
+    /// `str` (gid prefixed, 4 bytes little-endian) so equal strings across
+    /// chunks collide regardless of the hash.
+    static constexpr std::size_t kDistinctShards = 16;
+    struct DistinctKey {
+        std::uint32_t gid = 0;
+        std::uint64_t bits = 0;
+        auto operator==(const DistinctKey&) const -> bool = default;
+    };
+    struct DistinctKeyHash {
+        auto operator()(const DistinctKey& k) const -> std::size_t {
+            return robin_hood::hash_int((static_cast<std::uint64_t>(k.gid) *
+                                         0x9E3779B97F4A7C15ULL) ^
+                                        robin_hood::hash_int(k.bits));
+        }
+    };
+    struct DistinctAgg {
+        std::array<robin_hood::unordered_flat_set<DistinctKey, DistinctKeyHash>, kDistinctShards>
+            num;
+        std::array<robin_hood::unordered_flat_set<std::string>, kDistinctShards> str;
+        bool is_string = false;
+    };
+
     HashAggregateState(OperatorPtr child, const std::vector<ir::ColumnRef>* group_by,
                        const std::vector<ir::AggSpec>* aggregations, const ExecutionContext& exec,
                        physical::AggregateParallelism par = {},
@@ -542,8 +574,11 @@ class HashAggregateState final {
                 agg.func == ir::AggFunc::First || agg.func == ir::AggFunc::Last;
             // First/Last also accept String (which covers Column<std::string> and
             // Column<Categorical> — expr_type_for_column collapses both to
-            // String); every other function stays numeric-only.
+            // String); CountDistinct accepts every scalar kind (fixed-width
+            // values are bit-cast, text is kept verbatim); every other function
+            // stays numeric-only.
             const bool supported = kind == ExprType::Int || kind == ExprType::Double ||
+                                   agg.func == ir::AggFunc::CountDistinct ||
                                    (first_or_last && kind == ExprType::String);
             if (!supported) {
                 return "HashAggregateState: non-numeric aggregation not supported";
@@ -565,6 +600,18 @@ class HashAggregateState final {
                         std::holds_alternative<Column<Categorical>>(*agg_entries[i]->column);
                 }
                 plan_.push_back(p);
+            }
+            for (std::size_t i = 0; i < n_aggs_; ++i) {
+                if (plan_[i].func == ir::AggFunc::CountDistinct) {
+                    has_count_distinct_ = true;
+                }
+            }
+            if (has_count_distinct_) {
+                distinct_.resize(n_aggs_);
+                for (std::size_t i = 0; i < n_aggs_; ++i) {
+                    distinct_[i].is_string = plan_[i].func == ir::AggFunc::CountDistinct &&
+                                             plan_[i].kind == ExprType::String;
+                }
             }
             // Lay the scratch out once the plan is known. Skew/Kurtosis share
             // one online recurrence that updates both higher moments, so each
@@ -3402,6 +3449,160 @@ class HashAggregateState final {
             accumulate_columns_into(gids, agg_entries, 0, rows, flat_slots_.data(), scratch_.data(),
                                     skip);
         }
+        accumulate_distinct(gids, agg_entries, rows, skip);
+    }
+
+    /// Run `fn(lo, hi)` over `workers` contiguous shard ranges covering
+    /// [0, kDistinctShards), each on its own pool thread when `workers >= 2`.
+    /// A `(gid, value)` pair maps to one shard, so disjoint ranges never touch
+    /// the same set and no locking is needed.
+    template <typename Fn>
+    void run_shard_ranges(std::size_t workers, const Fn& fn) {
+        if (workers < 2) {
+            fn(std::size_t{0}, kDistinctShards);
+            return;
+        }
+        auto& pool = process_worker_pool();
+        const std::size_t grain = (kDistinctShards + workers - 1) / workers;
+        std::atomic<std::size_t> cursor{0};
+        auto batch = pool.submit(workers, [&](std::size_t) {
+            while (true) {
+                const std::size_t w = cursor.fetch_add(1, std::memory_order_relaxed);
+                const std::size_t lo = w * grain;
+                if (lo >= kDistinctShards) {
+                    return;
+                }
+                fn(lo, std::min(kDistinctShards, lo + grain));
+            }
+        });
+        batch.wait();
+        if (exec_ != nullptr && exec_->parallel_stats != nullptr) {
+            exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// Fold rows [0, rows) of every CountDistinct aggregation's input column
+    /// into its shards. `gids == nullptr` means the ungrouped single group 0.
+    void accumulate_distinct(const std::uint32_t* gids,
+                             const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
+                             const std::vector<std::uint8_t>* skip = nullptr) {
+        if (!has_count_distinct_ || rows == 0) {
+            return;
+        }
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (plan_[a].func != ir::AggFunc::CountDistinct) {
+                continue;
+            }
+            if (skip != nullptr && (*skip)[a] != 0U) {
+                continue;
+            }
+            const ColumnEntry& entry = *agg_entries[a];
+            const ValidityBitmap* validity =
+                entry.validity.has_value() ? &*entry.validity : nullptr;
+            DistinctAgg& da = distinct_[a];
+
+            const std::size_t shard_workers =
+                (exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None &&
+                 !on_worker_pool_thread() && rows >= (std::size_t{1} << 16U))
+                    ? std::min<std::size_t>(kDistinctShards, par_.accumulation.worker_cap)
+                    : std::size_t{1};
+
+            const auto gid_at = [&](std::size_t row) -> std::uint32_t {
+                return gids == nullptr ? 0U : gids[row];
+            };
+
+            if (da.is_string) {
+                const bool categorical = plan_[a].categorical;
+                const Column<std::string>* scol =
+                    categorical ? nullptr : &std::get<Column<std::string>>(*entry.column);
+                const Column<Categorical>* ccol =
+                    categorical ? &std::get<Column<Categorical>>(*entry.column) : nullptr;
+                const auto insert_range = [&](std::size_t lo, std::size_t hi) {
+                    std::string key;
+                    for (std::size_t row = 0; row < rows; ++row) {
+                        if (validity != nullptr && !(*validity)[row]) {
+                            continue;
+                        }
+                        const std::string_view sv =
+                            categorical ? std::string_view{(*ccol)[row]}
+                                        : std::string_view{(*scol)[row]};
+                        const std::uint32_t gid = gid_at(row);
+                        const std::size_t h = robin_hood::hash_bytes(sv.data(), sv.size()) ^
+                                              robin_hood::hash_int(gid);
+                        const std::size_t shard = h & (kDistinctShards - 1);
+                        if (shard < lo || shard >= hi) {
+                            continue;
+                        }
+                        key.resize(sizeof(gid));
+                        std::memcpy(key.data(), &gid, sizeof(gid));
+                        key.append(sv);
+                        da.str[shard].insert(key);
+                    }
+                };
+                run_shard_ranges(shard_workers, insert_range);
+                continue;
+            }
+
+            const ExprType kind = plan_[a].kind;
+            const auto bits_at = [&](std::size_t row) -> std::uint64_t {
+                switch (kind) {
+                    case ExprType::Double:
+                        return std::bit_cast<std::uint64_t>(
+                            std::get<Column<double>>(*entry.column).data()[row]);
+                    case ExprType::Date:
+                        return static_cast<std::uint32_t>(
+                            std::get<Column<Date>>(*entry.column)[row].days);
+                    case ExprType::Timestamp:
+                        return static_cast<std::uint64_t>(
+                            std::get<Column<Timestamp>>(*entry.column)[row].nanos);
+                    case ExprType::Bool:
+                        return std::get<Column<bool>>(*entry.column)[row] ? 1U : 0U;
+                    default:  // Int
+                        return static_cast<std::uint64_t>(
+                            std::get<Column<std::int64_t>>(*entry.column).data()[row]);
+                }
+            };
+            const auto insert_range = [&](std::size_t lo, std::size_t hi) {
+                for (std::size_t row = 0; row < rows; ++row) {
+                    if (validity != nullptr && !(*validity)[row]) {
+                        continue;
+                    }
+                    const DistinctKey k{gid_at(row), bits_at(row)};
+                    const std::size_t shard = DistinctKeyHash{}(k) & (kDistinctShards - 1);
+                    if (shard < lo || shard >= hi) {
+                        continue;
+                    }
+                    da.num[shard].insert(k);
+                }
+            };
+            run_shard_ranges(shard_workers, insert_range);
+        }
+    }
+
+    /// The distinct count per group for aggregation `a`, in gid order.
+    [[nodiscard]] auto distinct_counts_for(std::size_t a) const -> std::vector<std::int64_t> {
+        std::vector<std::int64_t> out(n_groups_, 0);
+        const DistinctAgg& da = distinct_[a];
+        if (da.is_string) {
+            for (const auto& shard : da.str) {
+                for (const std::string& key : shard) {
+                    std::uint32_t gid = 0;
+                    std::memcpy(&gid, key.data(), sizeof(gid));
+                    if (gid < out.size()) {
+                        ++out[gid];
+                    }
+                }
+            }
+        } else {
+            for (const auto& shard : da.num) {
+                for (const DistinctKey& k : shard) {
+                    if (k.gid < out.size()) {
+                        ++out[k.gid];
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     /// Scatter-accumulate rows [begin, end) into `base`, indexed by
@@ -3441,6 +3642,9 @@ class HashAggregateState final {
                     slot_for(gids[row]).count++;
                 }
                 continue;
+            }
+            if (plan_[agg_i].func == ir::AggFunc::CountDistinct) {
+                continue;  // streamed into `distinct_` shards, not the slot
             }
 
             const auto& entry = *agg_entries[agg_i];
@@ -3820,6 +4024,9 @@ class HashAggregateState final {
                 slot.count += static_cast<std::int64_t>(end - begin);
                 continue;
             }
+            if (func == ir::AggFunc::CountDistinct) {
+                continue;  // streamed into `distinct_` shards, not the slot
+            }
             const auto& entry = *agg_entries[agg_i];
             const ValidityBitmap* validity =
                 entry.validity.has_value() ? &*entry.validity : nullptr;
@@ -4006,6 +4213,7 @@ class HashAggregateState final {
             group_order_.emplace_back();
             alloc_group();
         }
+        accumulate_distinct(nullptr, agg_entries, rows, nullptr);
         AggSlotCore* dst = flat_slots_.data();
 
         const std::size_t morsels = ungrouped_morsels(rows);
@@ -4128,6 +4336,7 @@ class HashAggregateState final {
             ColumnValue column;
             switch (agg.func) {
                 case ir::AggFunc::Count:
+                case ir::AggFunc::CountDistinct:
                     column = Column<std::int64_t>{};
                     break;
                 case ir::AggFunc::Mean:
@@ -4265,6 +4474,9 @@ class HashAggregateState final {
         const auto emit_agg_column = [&](std::size_t i) {
             ColumnValue& column = out.mutable_column(group_by_->size() + i);
             const bool tracks_validity = track_validity[i] != 0U;
+            const std::vector<std::int64_t> distinct_counts =
+                plan_[i].func == ir::AggFunc::CountDistinct ? distinct_counts_for(i)
+                                                            : std::vector<std::int64_t>{};
             for (std::size_t g = 0; g < n_groups_; ++g) {
                 const AggSlotCore& slot = fs[(g * n_aggs_) + i];
                 if (tracks_validity) {
@@ -4273,6 +4485,9 @@ class HashAggregateState final {
                 switch (plan_[i].func) {
                     case ir::AggFunc::Count:
                         append_scalar(column, slot.count);
+                        break;
+                    case ir::AggFunc::CountDistinct:
+                        append_scalar(column, distinct_counts[g]);
                         break;
                     case ir::AggFunc::Mean:
                         append_scalar(column,
@@ -4629,6 +4844,11 @@ class HashAggregateState final {
     std::int64_t pair_dense_b_max_ = 0;
     std::uint64_t pair_dense_b_span_ = 0;
     bool pair_dense_active_ = false;
+
+    /// Per-aggregation streaming `count_distinct` state, populated in `plan_`
+    /// order only for the `CountDistinct` aggs. Empty when the node has none.
+    std::vector<DistinctAgg> distinct_;
+    bool has_count_distinct_ = false;
 };
 
 /// Serial executor for the hash fallback's typed structural chain. Discovery
@@ -4856,6 +5076,11 @@ class ChunkedSortedAggregateOperator final : public Operator {
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             const ir::AggSpec& agg = (*aggregations_)[i];
             const std::optional<std::size_t>& input_idx = columns_->aggregate_inputs[i];
+            // CountDistinct keeps per-group value sets; only the hash operator
+            // streams it. The sorted path has no incremental form for it.
+            if (agg.func == ir::AggFunc::CountDistinct) {
+                return true;
+            }
             if ((agg.func != ir::AggFunc::First && agg.func != ir::AggFunc::Last) ||
                 !input_idx.has_value()) {
                 continue;

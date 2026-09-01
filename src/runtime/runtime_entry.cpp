@@ -131,8 +131,12 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
             case ir::AggFunc::Stddev:
             case ir::AggFunc::Skew:
             case ir::AggFunc::Kurtosis:
+            case ir::AggFunc::CountDistinct:
             case ir::AggFunc::First:
             case ir::AggFunc::Last:
+                // CountDistinct streams as a per-group set of seen values,
+                // hash-partitioned across shards so the per-chunk insert fans
+                // out lock-free; any scalar column type.
                 // First/Last: the operators themselves gate by column type
                 // (numeric, string, categorical stream; Date/Timestamp fall to
                 // the hash operator's error path -- unreachable in practice

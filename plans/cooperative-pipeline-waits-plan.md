@@ -4,14 +4,31 @@ description: "Make the pipeline executor's backpressure waits (OrderedChunkRing:
 metadata:
   node_type: plan
   type: project
-  status: in-progress
+  status: done
 ---
 
 # Cooperative pipeline waits
 
-**Status: STEPS A + B + C LANDED (2026-09-01, better-plans).** Step D (the other
-`on_worker_pool_thread()` serial gates — `scan_shard_target`, `for_row_ranges`,
-`DeferredScanSourceOperator::unit_window`) still pending.
+**Status: STEPS A + B + C LANDED (2026-09-01, better-plans). STEP D SURVEYED —
+NOT WORTH IT.**
+
+Step D was the other `on_worker_pool_thread()` bails. Profiling q10/q18 with C:
+- `scan_shard_target` (parquet.hpp) is gated by `unit != nullptr` first, so it
+  only fires for a non-streamed whole-file *fused key* scan — never the
+  streaming path PDS-H uses.
+- `unit_window` is `DeferredScanSourceOperator`, the *old* scan path;
+  `PipelinedScanOperator` → `materialize_deferred_scan_unit` (what q10/q18/q19
+  actually run) is covered by C's `parallel_readers` change.
+- `for_row_ranges` / `evaluate_field_maybe_parallel` are per-row compute
+  fan-out — [[project_serial_fraction_is_the_ceiling]] says that improves the
+  half ibex already wins.
+
+q10 post-C: customer scan `ring_wait` 135ms → 74ms (C working); the residual is
+row-group-count bound (2 groups) not a gate, and q10's real serial is the 7-key
+generic `Aggregate.Discovery` (191ms — [[project_groupby_functional_dependency]]
+dead-end, unrelated). q18 post-C: `serial_fraction=0.14`, `occupancy=0.85` —
+already parallel. Revive step D only if a profile shows a *specific* nested
+serial decode/scan that `parallel_readers` doesn't reach.
 
 - **C** (this commit): `parallel_readers` (parquet.hpp) fans out a *nested* decode
   (one already on a pool worker — a dimension table scanned inside a pipeline)

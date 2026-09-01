@@ -9,8 +9,31 @@ metadata:
 
 # Cooperative pipeline waits
 
-**Status: STEP A + B LANDED (2026-09-01, better-plans).** Steps C/D (lifting the
-`on_worker_pool_thread()` serial gates) still pending.
+**Status: STEPS A + B + C LANDED (2026-09-01, better-plans).** Step D (the other
+`on_worker_pool_thread()` serial gates — `scan_shard_target`, `for_row_ranges`,
+`DeferredScanSourceOperator::unit_window`) still pending.
+
+- **C** (this commit): `parallel_readers` (parquet.hpp) fans out a *nested* decode
+  (one already on a pool worker — a dimension table scanned inside a pipeline)
+  by column, capped at `kNestedDecodeFanout = 4` extra readers. An earlier cut
+  sized it exactly via a `pool.size() - g_pool_busy` counter, but the per-task
+  atomic RMW to maintain `g_pool_busy` cost measurably on task-heavy queries
+  (q01/q20/q21); the fixed cap needs no bookkeeping and the cooperative ring
+  waits absorb any oversubscription.
+
+  Realises the dimension-table decode win — standalone interleaved min-wall
+  SF-8 8c, stable across runs: **q02 −13-18%, q18 −8-10%, q14 −4-9%,
+  q10 −4-8%**, q16/q19 −2-3%. Heavy queries (q01/q20/q21/q12) swung ±15%
+  between runs on a contended WSL2 box — inconclusive; needs a clean-box
+  `run_bench.sh` re-measure. q19 (deadlocked in the pre-cooperative prototype)
+  clean in every check.
+
+  Step C testing revealed step B's *ungated* `wait_for_batch` assist could pick
+  up an unrelated **older**-generation `PipelinedScanOperator::run_worker` task,
+  which parks on its ring and strands the nested decode the waiter is blocked
+  on (q19 hung ~1/3). `try_run_one_pending` is now uniformly generation-gated;
+  the q18 cost once blamed on gating it was the poll spin, fixed separately by
+  the outstanding-nested gate.
 
 - **A** (`9919da0e`): `WorkerPool::try_run_one_pending()` + bounded `wait_for_batch` park.
 - **B** (`8e84cf88`): `cooperative_ring_wait()` at `OrderedChunkRing::acquire`/`take`
@@ -24,9 +47,11 @@ metadata:
     caller's. Without it a `MorselPipelineOperator` worker parked in `acquire`
     picked up a **sibling** `run_worker`, which parked on the same ring and
     recursed without bound (an 8-deep tower hung two morsel-pipeline E2E tests).
-    `wait_for_batch`'s assist stays **ungated** — its tasks belong to other
-    batches and can't recurse into the wait it helps; gating it there measured
-    ~3% off q18 (a waiter idling on work it could do).
+    Applies to **all** cooperative assist, `wait_for_batch` included — step B
+    first left `wait_for_batch` ungated (a supposed ~3% q18 cost) and step C's
+    nested decode then showed an ungated waiter can pick up an unrelated
+    *older*-gen scan-worker task and strand itself. The q18 cost was the poll
+    spin, handled by the outstanding-nested gate below.
 
   * **Outstanding-nested gate** on entering the cooperative loop at all. It runs
     only when `this_thread_has_outstanding_nested_work()` — a thread-local count

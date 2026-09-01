@@ -469,20 +469,16 @@ WorkerPool::~WorkerPool() {
 #endif
 }
 
-// Run one queued task on the calling thread, or return false when there is none
-// eligible. `nested_only` restricts eligibility to tasks submitted *after* the
-// one this thread is running — used by the pipeline ring waits, where running a
-// same-generation sibling would recurse on the same ring without bound. The
-// `wait_for_batch` cooperative loop passes false: a task it runs there belongs
-// to a different batch and cannot recurse into the wait it is helping, so
-// restricting it there only makes a waiter idle when it could be working (a
-// measured ~10% loss on q18).
-auto WorkerPool::run_one_queued(bool nested_only) noexcept -> bool {
+auto WorkerPool::try_run_one_pending() noexcept -> bool {
     Task task;
     {
         const std::lock_guard lock(impl_->mutex);
-        if (impl_->queue.empty() ||
-            (nested_only && impl_->queue.front().gen <= t_running_gen)) {
+        // Only run *strictly nested* work — a task submitted after the one this
+        // thread is running. An older or same-generation task is a sibling or an
+        // unrelated pipeline worker; running one here can park on a resource
+        // this thread's own progress depends on (a scan worker on its ring),
+        // stranding the nested work the caller is actually waiting for.
+        if (impl_->queue.empty() || impl_->queue.front().gen <= t_running_gen) {
             return false;
         }
         task = std::move(impl_->queue.front());
@@ -492,17 +488,13 @@ auto WorkerPool::run_one_queued(bool nested_only) noexcept -> bool {
     return true;
 }
 
-auto WorkerPool::try_run_one_pending() noexcept -> bool {
-    return run_one_queued(/*nested_only=*/true);
-}
-
 auto WorkerPool::submit(std::size_t worker_count, std::function<void(std::size_t)> body) -> Batch {
     const std::size_t count = std::clamp<std::size_t>(worker_count, 1, threads_);
     auto state = std::make_shared<Batch::State>();
     state->body = std::move(body);
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
-    state->assist_one = [this] { return run_one_queued(false); };
+    state->assist_one = [this] { return try_run_one_pending(); };
     // A public submit is one fork-join round trip. TaskGroup uses the private
     // unbarriered submission below and accounts its single join at group wait.
     // Counting here needs no matching hook in Batch::wait() (which is
@@ -691,7 +683,7 @@ auto WorkerPool::submit_unbarriered(std::function<void()> body) -> Batch {
     state->remaining = count;
     state->profile_entry = current_execution_profile_entry();
     state->account_wait = false;
-    state->assist_one = [this] { return run_one_queued(false); };
+    state->assist_one = [this] { return try_run_one_pending(); };
     const std::uint64_t gen = g_submit_gen.fetch_add(1, std::memory_order_relaxed) + 1;
     if (t_running_gen != 0) {
         t_outstanding_nested.fetch_add(1, std::memory_order_relaxed);

@@ -8,6 +8,7 @@
 #include <ibex/ir/node.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
+#include <ibex/runtime/like.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <atomic>
@@ -40,7 +41,19 @@ struct NumericOutputSpan {
 };
 
 enum class FixedWidthNumericKind : std::uint8_t { Int, Double };
-enum class DirectFieldKind : std::uint8_t { NumericBinary, TemporalPart, StringLength };
+/// `PredicateInt` is `Int64(<predicate>)`: a native chunk predicate whose 0/1
+/// result is written as an integer rather than as packed bits. It is the shape
+/// TPC-H reaches for whenever SQL would say `case when <cond> then x else 0` --
+/// q14's `rev * Int64(like(p_type, "PROMO%"))` is one -- and without it such a
+/// field falls off the direct route entirely and updates serially, however
+/// parallel the predicate underneath it would have been.
+enum class DirectFieldKind : std::uint8_t {
+    NumericBinary,
+    TemporalPart,
+    StringLength,
+    PredicateInt,
+    LikeInt
+};
 enum class TemporalPart : std::uint8_t { Year, Month, Day, Hour, Minute, Second };
 
 /// Immutable direct-field plan for the first parallel-safe output shape.  The
@@ -57,6 +70,11 @@ struct DirectFieldPlan {
     const Column<std::string>* strings = nullptr;
     const Column<Categorical>* categoricals = nullptr;
     std::shared_ptr<const std::vector<std::int64_t>> categorical_lengths;
+    /// `LikeInt` only: the pattern, compiled once for every range that will use
+    /// it, and — for a categorical source — the match precomputed per
+    /// dictionary entry, so the row loop is one indexed lookup.
+    std::shared_ptr<const LikePattern> like_pattern;
+    std::shared_ptr<const std::vector<char>> categorical_matches;
 };
 
 /// A caller-owned output window for one direct-field range.  Validity is

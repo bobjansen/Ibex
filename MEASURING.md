@@ -181,6 +181,23 @@ Two things to know when reading it:
 
 ### Benchmark suites, cheapest first
 
+### Rebuild the complete Release tree before timing
+
+Run this immediately before **every** benchmark or profile:
+
+```bash
+cmake --build build-release
+```
+
+Do not build only the executable used by a focused experiment (`ibex_eval`,
+`ibex_tests`, etc.) and then time a different one. `run_bench.sh` drives the
+REPL binary (`build-release/tools/ibex`) while focused query A/B work often
+builds `ibex_eval`; an incremental target build can therefore leave the actual
+benchmark executable stale while Git records the current commit in its result
+archive. Rebuilding the complete Release tree is cheap relative to a suite
+run, refreshes every executable and plugin, and is the required guard against
+that false result.
+
 ```bash
 # 1. PDS-H, 22 queries, one warm process — the usual gate
 uv run --project . python benchmarking/tpch/bench_ibex.py --iters 5

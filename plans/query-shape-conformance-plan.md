@@ -94,7 +94,71 @@ folds `Ascribe(Scan)` into one `Scan` node (`2d4ac98`,
 pass special-cases. Do NOT retry the leaf-level classification patch —
 see `project_ascribe_pipeline_barrier` in memory.
 
-## The scan-fusion cost gate (designed, not built)
+## The scan-fusion cost gate — RE-MEASURED 2026-09-02, NO LONGER THE PRIORITY
+
+**The regressions this gate was designed to recover are gone.** Measured on the
+current tree by building a "never fuse" variant (`absorb_lazy_scan_filters`
+marking nothing applied) and A/B-ing all 22 at SF-8, 8 physical cores, min-of-5
+twice per side, answers byte-identical on every query:
+
+| | ratio (fused / unfused) | |
+|---|---|---|
+| **fusing wins big** | q03 0.39, q07 0.55, q15 0.68, q14 0.69, q06 0.73, q19 0.75, **q04 0.77**, q12 0.80, q08 0.81, q09 0.83, q02 0.84 | |
+| **fusing wins** | q10 0.90, q20 0.91 | |
+| **neutral (±3%)** | q01 0.98, q18 0.98, q16 0.99, q17 0.99, q22 0.99, q21 1.01, q11 1.02, q05 1.03 | |
+| **fusing loses** | **q13 1.10** | the only one |
+
+Against the three regressions that motivated the gate at `120a567`:
+
+| | then | now |
+|---|---|---|
+| q04 | **1.76** | **0.77** — a 23% win |
+| q01 | 1.24 | 0.98 — neutral |
+| q03 | 1.17 | **0.39** — a 2.6× win |
+
+Something between `120a567` and here absorbed them — `2ffbd59c`'s
+dictionary-coded predicate-only DATE32 scan is the obvious candidate, since
+q03/q04/q12/q14/q15 all filter on dates and all now fuse profitably — but the
+attribution was not chased, because the conclusion does not depend on it.
+
+**The MVP model below is also stale in sign, not just in magnitude.** Its worked
+example says q13 *fuses* (predicate column `o_comment` is String and expensive
+enough to swamp the Int64 remaining set). q13 is now the single query that
+loses. So a two-bucket model calibrated on the old table would get the one
+remaining case wrong, and rebuilding it needs a fresh calibration anyway.
+
+**Recommendation: close the cost gate as a work item.** Fusing is the right
+default on 21 of 22 queries; a gate can win at most q13's 10% on one query, at
+the cost of a model, a calibration table, and a decision every scan pays.
+
+### What replaces it: q13's predicate side, not its remaining side
+
+q13's loss is not the gather-vs-dense trade this section modelled. Its fused
+route runs `string_filter_scan` over all of `o_comment` and *that* is the cost
+(SF-8, 8 cores, operator profile):
+
+```
+fused    wall 398ms  pool_work 2614ms   string filter scan: pool_src 1136ms, pool_work 917ms
+                                        + selected decode:  pool_src  145ms
+unfused  wall 294ms  pool_work 1577ms   decode whole:       pool_src  706ms
+```
+
+Fusing q13 does **66% more CPU work**, partly hidden by better occupancy (0.82
+vs 0.67). The model's premise — that fusing *saves* predicate-column work — is
+what fails here: a non-anchored `not like '%special%requests%'` over 12M strings
+costs more in the decoder than a dense decode plus an in-memory filter. Mechanism
+4(b) has landed (q13 does take the fused string route), so the open question is
+narrower and different: **make the fused string scan competitive with dense
+decode + filter, or decline fusion for non-anchored LIKE over a large String
+column.** One query, one mechanism, no cost model.
+
+## Appendix — the original design (kept for the calibration method)
+
+*Superseded by the re-measurement above: the ratios, the two-bucket model, the
+named call sites and the validation set below all date from `120a567` and no
+longer describe the tree. Kept because the method — build a never-fuse variant,
+A/B the suite, read the ratio per query — is what produced the table above and
+is worth repeating whenever a decode change lands. Do not implement from it.*
 
 > **This gate now has a sibling with a measured price.** 2026-09-02 built
 > `push_computed_columns_into_joins` — hoisting an `Update`'s single-side
@@ -118,7 +182,7 @@ predicate columns densely+whole, and decodes the *remaining* demanded columns
 via a Selection-gathered decode instead of dense. It saves only the *gather* of
 the predicate columns into output.
 
-**Calibrated fusion ratios** (`fused_ms / unfused_ms`, synthetic 8M-row
+**Calibrated fusion ratios (STALE — see the re-measurement above)** (`fused_ms / unfused_ms`, synthetic 8M-row
 8-row-group **uncompressed** file — real TPC-H files are `UNCOMPRESSED`, the
 first calibration used Snappy and was wrong; single remaining column):
 

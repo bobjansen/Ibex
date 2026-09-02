@@ -264,3 +264,42 @@ slow. Consumers wait on producers, never the reverse.**
 
 **The lever is more and finer parallel work, not better scheduling of what
 exists** — see memory: `project_serial_fraction_is_the_ceiling`.
+
+## Before attributing serial time to an operator, check which node it is
+
+Two attribution mistakes made in one session (2026-09-02), both of which read as
+architectural limits and were neither:
+
+- **"The join build side is serial."** It is not, structurally: the build side's
+  input is a real operator chain (`MaterializeOperator(left_).run()`) and the
+  scan under it gets pool tasks. What was actually serial in a q14 experiment was
+  the `Update` sitting between them, because one field shape fell off
+  `plan_direct_field` — and that route is **all-or-nothing per update node**, so
+  a single unrecognised field serialises the whole node. `serial_fraction` moved
+  0.133 → 0.288 from one such field over 1.6M rows. Fixed in `4ac93b33`; see
+  `parallel-chunkview-output-plan.md`. The general rule: read `pool_tasks` per
+  node before naming the operator, because "this operator is serial" and "this
+  operator's *expression* fell off a fast path" look identical from the outside.
+
+- **`__memmove` percentages are not DRAM traffic.** A decode change sized off a
+  33%-of-profile `__memmove` measured 20% *slower*, because the buffer being
+  copied is a 64Ki-row scratch batch that lives in L2. Ask whether the buffer
+  fits in cache before treating a copy as bandwidth. `beat-polars-plan.md` §8.6.
+
+And one measurement that bounds the whole discussion: on the dev box the pure
+page-cache read ceiling is **44.5 GB/s at 8 threads** (14.3 at one). A query
+that reads 903 MB therefore has a ~20 ms floor — which is how we know q14, at
+~104 ms, is 4.5× off its own I/O floor rather than anywhere near a hardware
+limit. Cheap to re-measure; worth doing before calling anything bandwidth-bound.
+
+## When a fan-out moves work rather than adding it
+
+`push_computed_columns_into_joins` (built and reverted, `beat-polars-plan.md`
+§6) is the cautionary case for a whole class: moving an expression to a
+different operator changes the **row count it is evaluated over**, and that
+factor is invisible in the plan without cardinality estimates. Pushing
+`Int64(like(p_type, …))` onto q14's `part` side was 2.7× more evaluations and
+paid; pushing `Int64(o_orderpriority == …)` onto q12's `orders` side was 9× more
+and cost 40%. Same pass, same shape, opposite verdicts. Any fan-out or
+placement change that alters which operator evaluates an expression needs both
+row counts before it is safe to enable.

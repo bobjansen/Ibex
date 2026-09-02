@@ -644,6 +644,28 @@ pds.md baseline because they are recorded nowhere else:
   reverted because the discovery point does not cover q10 (customer is never
   the build side, so `c_custkey`'s uniqueness is never observed). Full
   narrative and the two bugs found while building it: §8.4.
+- **Selected-row gather straight out of the Parquet page buffer** (2026-09-02).
+  For a selection too dense for `Skip` and too sparse for the dense decode to
+  be honest — q14's 1.25% — copy only the selected values out of PLAIN pages and
+  look up only the selected codes in dictionary pages. Correct, byte-identical,
+  and it did cut decode bytes; **~20% slower at both 1 and 8 cores**, and
+  prefetching changed nothing. The reason generalises: the dense path's
+  intermediate is a 64Ki-row scratch batch — 512 KB, **L2-resident** — so the
+  copy it replaces never touched DRAM. **Do not size a decode change off
+  `__memmove` percentages without first asking whether the buffer fits in
+  cache.** See §8.6.
+- **Moving a computed column across a join without a cost model** (2026-09-02).
+  `push_computed_columns_into_joins`: hoist an `Update`'s maximal single-side
+  sub-expressions to their own side, then use `join_output_demand` to drop the
+  source columns nothing above still reads (that second phase is what makes it
+  narrow the join rather than widen it). Byte-identical on all 22, full suite
+  green, and worth **−9 to −15%** where post-join rows × payload width is large
+  — but **q12 +40%**, because the same push puts
+  `Int64(o_orderpriority == …)` on 12M `orders` rows to save gathering 1.3M.
+  The mechanism is real in both directions and the pass cannot tell them apart:
+  it needs join-output cardinality against each side's post-filter row count.
+  A cost gate is the prerequisite, not a refinement — same missing estimate as
+  the scan-fusion gate in `query-shape-conformance-plan.md`. See §8.6.
 
 ## 7. What winning looks like
 
@@ -783,3 +805,58 @@ which precedes every other join pass. Residual, documented at each gate:
 Right and Outer joins, and any join whose right key column really is read
 above it — those need an order-restoring Project or an equivalence-class key
 model in `join_reorder`/`join_order`.
+
+### 8.6 q14 and the ceiling that wasn't — measured 2026-09-02 (SF-8, 8 cores)
+
+Recorded because two plausible framings of q14 were both wrong, in opposite
+directions, and the corrections are reusable.
+
+q14 is at **parity single-threaded** (234 ms vs polars-stream 222 ms) and loses
+2.3× multi-threaded. Its CPU inflates with cores — 279 ms at 1c, 425 at 4c, 537
+at 8c on physical P-cores — and eight *independent* single-threaded copies each
+take 632 ms instead of 285 ms. So it contends for a shared resource and no
+scheduler, ring or fan-out change will move it.
+
+**But that resource is not streaming memory bandwidth.** Measured ceiling on the
+dev box (`taskset -c 0,2,…,14`):
+
+```
+                 1 thread    4 threads    8 threads
+DRAM read         15.8 GB/s   34.4 GB/s   38.6 GB/s
+pread page cache  14.3 GB/s   42.5 GB/s   44.5 GB/s
+```
+
+Eight copies move 8 × 903 MB in 632 ms = **11.4 GB/s, a quarter of peak**. The
+contention is L3 capacity plus a non-streaming access pattern (the 1.6M-entry
+join hash probe, the 600k-row gathers), not the DRAM ceiling.
+
+q14 reads **903 MB** (counted with `strace`: 194 large reads, so nothing is read
+twice), for a predicate no page statistic can prune — every SF-8 row group's
+`l_shipdate` min/max spans 1992-01-02…1998-12-01. Against the 8-thread ceiling
+that is a ~20.5 ms pure-I/O floor:
+
+| | wall | effective | vs floor |
+|---|---|---|---|
+| floor (just read the bytes) | 20.5 ms | 44 GB/s | 1.0× |
+| polars-stream | 41.3 ms | 21.9 GB/s | **2.0×** |
+| ibex | ~104 ms | 8.7 GB/s | **4.5×** |
+
+**So polars is at about half the achievable bandwidth, not at a limit**, and
+ibex has ~4.5× of headroom to the floor and ~2.4× to polars. Neither "q14 is
+bandwidth-bound" nor "the fix is to read fewer bytes" survives these numbers;
+the lever is the compute and access pattern over the 600k surviving rows.
+
+Two corrections to standing beliefs came out of the same session:
+
+- **A join's build side is not inherently serial.** The scan under it does get
+  pool tasks. What ran serially in the q14 experiment was the `Update` above it,
+  because one field shape fell off `plan_direct_field` and that route is
+  all-or-nothing per node (`4ac93b33`). Check which node is serial before
+  attributing it to the build.
+- **File-layout facts worth not re-deriving.** SF-8 `lineitem`, 46 row groups of
+  1Mi rows, uncompressed. Bytes/row gives the encoding: `l_partkey` 8.25 and
+  `l_extendedprice` 8.23 are **PLAIN** (their dictionaries outgrew the page
+  limit); `l_discount` 0.50 and `l_shipdate` 1.51 are dictionary. Chunks are
+  *mixed* — `l_partkey` has 1 dictionary page, 7 PLAIN data pages and 1
+  RLE_DICTIONARY data page — so "is this column dictionary-encoded" is a
+  per-page question, not a per-column one.

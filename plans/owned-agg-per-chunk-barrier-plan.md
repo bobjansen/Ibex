@@ -97,7 +97,15 @@ Verified against `~/polars` v1.42 (`polars-stream/src/nodes/group_by.rs`,
   orchestration and a duplicate lineitem decode
   ([[project_scan_instance_split_no_cost_gate]]), plus the serial hash-join
   build ([[kernel-pipeline-execution-plan]] "where join time goes" — q21 hashes
-  1.28M rows in 40ms serial).
+  1.28M rows in 40ms serial). **Treat that 40ms as unconfirmed**: it comes from
+  operator-profile self-times, which are wall-spans including the drain of the
+  input, and `perf record` has since put `fill_partitioned_heads` at 2.28% on
+  q10 with no `build_join_hash_index` in q21's top 20
+  ([[project_row_group_caps_parallel_width]] "CORRECTION 2"). A 2026-09-02
+  session found the same trap again from the other side: a build side that
+  profiled as serial was serial in its `Update`, not its build
+  (`parallelism-overview.md`, "Before attributing serial time to an operator").
+  Re-measure with `perf` and per-node `pool_tasks` before spending on it.
 - **Decode overlap (Stage 3)** — MEASURED NON-EXISTENT as a lever for the async
   path: `child_->next()` returns in 0.0ms from the aggregate's view, the
   pipelined scan already overlaps decode fully.

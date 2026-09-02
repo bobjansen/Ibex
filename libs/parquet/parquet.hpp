@@ -2572,6 +2572,94 @@ inline auto filtered_key_selection(std::span<parquet::arrow::FileReader* const> 
     return merge_key_scan_parts(parts);
 }
 
+/// DATE32 is dictionary-encoded in every SF-8 lineitem row group. Evaluate the
+/// range once per tiny dictionary, then scan only RLE dictionary codes rather
+/// than expanding a date value for each row.
+inline auto filtered_dictionary_int32_group_scan(parquet::arrow::FileReader& reader, int leaf_index,
+                                                 const KeyScanGroup& group,
+                                                 const ibex::runtime::DynamicScanFilter& filter,
+                                                 ibex::runtime::Selection& selected) -> bool {
+    auto row_group = reader.parquet_reader()->RowGroup(group.index);
+    auto column =
+        row_group->ColumnWithExposeEncoding(leaf_index, parquet::ExposedEncoding::DICTIONARY);
+    if (column->GetExposedEncoding() != parquet::ExposedEncoding::DICTIONARY)
+        return false;
+    const auto* descriptor = column->descr();
+    if (descriptor->max_repetition_level() != 0 || descriptor->max_definition_level() > 1 ||
+        group.skip != 0)
+        return false;
+    const bool optional = descriptor->max_definition_level() != 0;
+    auto typed = std::static_pointer_cast<parquet::TypedColumnReader<parquet::Int32Type>>(column);
+    std::unique_ptr<std::int32_t[]> codes(new std::int32_t[kDirectDecodeBatchRows]);
+    std::unique_ptr<std::int16_t[]> definitions(new std::int16_t[kDirectDecodeBatchRows]);
+    std::vector<char> keep;
+    std::size_t row = 0;
+    while (row < group.rows && typed->HasNext()) {
+        const auto request = static_cast<std::int64_t>(
+            std::min<std::size_t>(kDirectDecodeBatchRows, group.rows - row));
+        std::int64_t codes_read = 0;
+        const std::int32_t* dictionary = nullptr;
+        std::int32_t dictionary_size = 0;
+        const auto levels =
+            typed->ReadBatchWithDictionary(request, optional ? definitions.get() : nullptr, nullptr,
+                                           codes.get(), &codes_read, &dictionary, &dictionary_size);
+        if (levels <= 0)
+            throw std::runtime_error("read_parquet: dictionary date scan made no progress");
+        if (dictionary != nullptr) {
+            keep.resize(static_cast<std::size_t>(dictionary_size));
+            for (std::int32_t i = 0; i < dictionary_size; ++i)
+                keep[static_cast<std::size_t>(i)] = filter.passes(dictionary[i]);
+        }
+        if (keep.empty() && codes_read != 0)
+            throw std::runtime_error("read_parquet: dictionary date page was not exposed");
+        std::size_t code = 0;
+        for (std::int64_t offset = 0; offset < levels; ++offset) {
+            const bool valid = !optional || definitions[static_cast<std::size_t>(offset)] != 0;
+            if (!valid)
+                continue;
+            const auto value = codes[code++];
+            if (value < 0 || static_cast<std::size_t>(value) >= keep.size())
+                throw std::runtime_error("read_parquet: invalid dictionary date code");
+            if (keep[static_cast<std::size_t>(value)])
+                selected.push_back(group.base + row + static_cast<std::size_t>(offset));
+        }
+        if (code != static_cast<std::size_t>(codes_read))
+            throw std::runtime_error("read_parquet: inconsistent dictionary date levels");
+        row += static_cast<std::size_t>(levels);
+    }
+    if (row != group.rows)
+        throw std::runtime_error("read_parquet: dictionary date column ended early");
+    return true;
+}
+
+inline auto filtered_dictionary_int32_selection(
+    std::span<parquet::arrow::FileReader* const> readers, int leaf_index,
+    const ibex::runtime::DynamicScanFilter& filter, const std::vector<KeyScanGroup>& groups)
+    -> std::optional<ibex::runtime::Selection> {
+    std::vector<ibex::runtime::Selection> parts(groups.size());
+    std::atomic<std::size_t> cursor{0};
+    std::atomic<bool> unsupported{false};
+    const auto run = [&](std::size_t worker) {
+        for (;;) {
+            const auto i = cursor.fetch_add(1, std::memory_order_relaxed);
+            if (i >= groups.size())
+                return;
+            if (!filtered_dictionary_int32_group_scan(*readers[worker], leaf_index, groups[i],
+                                                      filter, parts[i])) {
+                unsupported.store(true, std::memory_order_relaxed);
+                return;
+            }
+        }
+    };
+    if (readers.size() <= 1)
+        run(0);
+    else
+        ibex::runtime::process_worker_pool().submit(readers.size(), run).wait();
+    if (unsupported.load(std::memory_order_relaxed))
+        return std::nullopt;
+    return merge_key_scan_parts(parts);
+}
+
 /// ── Fused string filter scan ────────────────────────────────────────────────
 ///
 /// The same trade as the key scan, for the column a query references only from
@@ -3007,7 +3095,7 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
         const auto id = schema_->field(it->second)->type()->id();
         const bool fusable = id == arrow::Type::INT8 || id == arrow::Type::INT16 ||
                              id == arrow::Type::INT32 || id == arrow::Type::INT64 ||
-                             id == arrow::Type::UINT64;
+                             id == arrow::Type::UINT64 || id == arrow::Type::DATE32;
         const auto& manifest = reader_->manifest();
         if (!fusable || it->second >= static_cast<int>(manifest.schema_fields.size()) ||
             !manifest.schema_fields[static_cast<std::size_t>(it->second)].is_leaf()) {
@@ -3040,6 +3128,10 @@ class ParquetLazySourceReader final : public ibex::runtime::LazySourceReader {
                         target),
                     unit);
                 auto readers = parallel_readers(groups.size(), exec);
+                if (id == arrow::Type::DATE32) {
+                    return filtered_dictionary_int32_selection(std::span{readers}, leaf_index,
+                                                               filter, groups);
+                }
                 return filtered_key_selection<parquet::Int32Type>(std::span{readers}, leaf_index,
                                                                   filter, groups);
             }

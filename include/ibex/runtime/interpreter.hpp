@@ -437,6 +437,14 @@ struct DynamicScanFilter {
 
     /// Only meaningful when `has_membership()`; false means "cannot match".
     [[nodiscard]] auto passes(std::int64_t key) const noexcept -> bool {
+        if ((min.has_value() && key < *min) || (max.has_value() && key > *max)) {
+            return false;
+        }
+        // Static literal ranges share the source-side scan machinery but do
+        // not publish a join Bloom filter.
+        if (!bloom.has_value()) {
+            return true;
+        }
         if (!bloom->contains(key)) {
             return false;
         }

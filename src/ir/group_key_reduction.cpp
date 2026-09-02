@@ -115,7 +115,8 @@ auto facts_for(const std::string& source, const SourceSchemas& sources) -> Sourc
 /// The second is what makes it transitive, and q10 needs that: `c_custkey`
 /// reaches `c_nationkey` by the first rule, then `n_name` by the second.
 auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>& edges,
-                const SourceSchemas& sources) -> std::set<SourceColumn> {
+                const SourceSchemas& sources,
+                const SourceColumn* assumed_unique = nullptr) -> std::set<SourceColumn> {
     std::set<SourceColumn> closed = seed;
     bool grew = true;
     while (grew) {
@@ -135,14 +136,17 @@ auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>&
             }
         };
         for (const auto& sc : current) {
-            if (facts_for(sc.source, sources).unique_columns.contains(sc.column)) {
+            if ((assumed_unique != nullptr && sc == *assumed_unique) ||
+                facts_for(sc.source, sources).unique_columns.contains(sc.column)) {
                 add_all_of(sc);
             }
         }
         for (const auto& edge : edges) {
             const bool right_unique =
+                (assumed_unique != nullptr && edge.right == *assumed_unique) ||
                 facts_for(edge.right.source, sources).unique_columns.contains(edge.right.column);
             const bool left_unique =
+                (assumed_unique != nullptr && edge.left == *assumed_unique) ||
                 facts_for(edge.left.source, sources).unique_columns.contains(edge.left.column);
             if (right_unique && closed.contains(edge.left)) {
                 add_all_of(edge.right);
@@ -249,11 +253,56 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
     return node;
 }
 
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_proof_candidates(const Node& node, const SourceSchemas& sources,
+                              std::map<std::string, std::set<std::string>>& out) {
+    if (node.kind() == NodeKind::Aggregate) {
+        const auto& aggregate = node_cast<AggregateNode>(node);
+        if (aggregate.group_by().size() >= 2 && !node.children().empty() &&
+            node.children().front() != nullptr) {
+            const ColumnOriginMap origins = column_origins(*node.children().front(), sources);
+            std::vector<SourceColumn> key_origins;
+            key_origins.reserve(aggregate.group_by().size());
+            for (const auto& key : aggregate.group_by()) {
+                const auto it = origins.find(key.name);
+                if (it == origins.end()) {
+                    key_origins.clear();
+                    break;
+                }
+                key_origins.push_back(as_key(it->second));
+            }
+            std::vector<JoinEdge> edges;
+            collect_join_edges(*node.children().front(), sources, edges);
+            for (const auto& candidate : key_origins) {
+                const std::set<SourceColumn> closure =
+                    fd_closure({candidate}, edges, sources, &candidate);
+                if (std::ranges::all_of(key_origins, [&](const SourceColumn& key) {
+                        return closure.contains(key);
+                    })) {
+                    out[candidate.source].insert(candidate.column);
+                }
+            }
+        }
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_proof_candidates(*child, sources, out);
+        }
+    }
+}
+
 }  // namespace
 
 auto reduce_functionally_dependent_group_keys(NodePtr root, const SourceSchemas& sources)
     -> NodePtr {
     return walk(std::move(root), sources);
+}
+
+auto group_key_proof_candidates(const Node& root, const SourceSchemas& sources)
+    -> std::map<std::string, std::set<std::string>> {
+    std::map<std::string, std::set<std::string>> out;
+    collect_proof_candidates(root, sources, out);
+    return out;
 }
 
 }  // namespace ibex::ir

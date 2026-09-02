@@ -1564,7 +1564,8 @@ auto table_schema_info(const runtime::Table& table) -> ir::SchemaInfo {
 
 auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>& wanted,
                           const runtime::ExecutionContext& exec,
-                          const std::string* deferred_probe_key = nullptr)
+                          const std::string* deferred_probe_key = nullptr,
+                          bool expanded_group_key_proof = false)
     -> std::vector<std::string> {
     /// Cap on the bitset, in values. A candidate wider than this is left
     /// unproven rather than allocating without bound for a plan-time fact.
@@ -1579,9 +1580,16 @@ auto prove_unique_columns(runtime::LazyTable& lazy, const std::set<std::string>&
     /// exploits. Dimensions are small by definition, so a row cap buys back
     /// nearly all of that cost without giving up a fact anything would read.
     constexpr std::size_t kMaxProofRows = 1U << 20U;  // 8 MiB of int64
+    /// A wider validation window is justified when the column is itself a key
+    /// of a multi-key aggregate: proving it unique can remove expensive group
+    /// keys. Keep the ordinary join-planning budget above unchanged, so merely
+    /// joining a larger source never buys an otherwise unused full decode.
+    constexpr std::size_t kMaxGroupKeyProofRows = 5U << 18U;  // 10 MiB of int64
     std::vector<std::string> proved;
     const auto rows = lazy.rows();
-    if (rows == 0 || rows > kMaxProofRows) {
+    const std::size_t max_rows =
+        expanded_group_key_proof ? kMaxGroupKeyProofRows : kMaxProofRows;
+    if (rows == 0 || rows > max_rows || (expanded_group_key_proof && rows <= kMaxProofRows)) {
         return proved;
     }
     for (const auto& [name, stats] : lazy.column_stats()) {
@@ -4754,7 +4762,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
 [[nodiscard]] auto optimize_and_execute_plan(ir::NodePtr plan,
                                              const runtime::TableRegistry& base_tables,
                                              const std::set<std::string>& lazy_callees,
-                                             runtime::ExternRegistry& externs)
+                                             runtime::ExternRegistry& externs,
+                                             bool root_order_insensitive = false)
     -> std::expected<runtime::Table, std::string> {
         auto [rewritten, sources] = ir::hoist_extern_sources(std::move(plan), lazy_callees);
         runtime::TableRegistry tables = base_tables;
@@ -4860,6 +4869,25 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                     schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
                 }
             }
+            // Re-evaluate after the bounded pass: small dimension-key proofs
+            // may be the transitive link that makes a larger determinant useful.
+            // Spend the wider budget only where assuming that determinant
+            // unique would collapse the complete multi-column group key.
+            for (const auto& [source_name, columns] :
+                 ir::group_key_proof_candidates(*rewritten, schemas)) {
+                const auto lazy = lazy_sources.find(source_name);
+                const auto schema = schemas.find(source_name);
+                if (lazy == lazy_sources.end() || schema == schemas.end()) {
+                    continue;
+                }
+                const auto probe = deferred_probes.find(source_name);
+                const std::string* probe_key =
+                    probe == deferred_probes.end() ? nullptr : &probe->second.key_column;
+                for (auto& column :
+                     prove_unique_columns(*lazy->second, columns, proof_exec, probe_key, true)) {
+                    schema->second.add_unique_key(ir::UniqueKey{std::move(column)});
+                }
+            }
         }
 
         // Prove what the ascriptions and joins assert before anything is
@@ -4875,6 +4903,10 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         rewritten = ir::push_semi_joins_down(std::move(rewritten), schemas);
         rewritten = ir::reduce_inner_joins_to_semi(std::move(rewritten), schemas);
         rewritten = ir::reorder_inner_joins_for_aggregates(std::move(rewritten), source_stats);
+        if (root_order_insensitive) {
+            rewritten =
+                ir::reorder_inner_joins_for_order_insensitive_root(std::move(rewritten), source_stats);
+        }
         std::set<std::string> lazy_names;
         for (const auto& [name, lazy] : lazy_sources) {
             lazy_names.insert(name);
@@ -5301,8 +5333,34 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     // or result plan. Their plans are pure relational expressions, so running
     // them ahead of the sinks does not reorder any observable effect.
     runtime::TableRegistry base_tables = build_builtin_tables();
+    std::map<std::string, bool> shared_order_insensitive;
+    for (const auto& shared : script->shared_bindings) {
+        ir::BindingOrderUses uses;
+        const auto absorb_uses = [&](const ir::NodePtr& plan) {
+            if (plan == nullptr) {
+                return;
+            }
+            const auto found = ir::binding_order_uses(*plan, shared.name);
+            uses.count += found.count;
+            uses.all_order_insensitive =
+                uses.all_order_insensitive && found.all_order_insensitive;
+        };
+        absorb_uses(script->result);
+        for (const auto& sink : script->sinks) {
+            absorb_uses(sink.input);
+        }
+        for (const auto& consumer : script->shared_bindings) {
+            if (consumer.name != shared.name) {
+                absorb_uses(consumer.plan);
+            }
+        }
+        shared_order_insensitive.emplace(shared.name,
+                                         uses.count > 0 && uses.all_order_insensitive);
+    }
     for (auto& shared : script->shared_bindings) {
-        auto table = optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees, externs);
+        const bool root_order_insensitive = shared_order_insensitive.at(shared.name);
+        auto table = optimize_and_execute_plan(std::move(shared.plan), base_tables, lazy_callees,
+                                               externs, root_order_insensitive);
         if (!table.has_value()) {
             ibex::formatting::print("error: {}\n", table.error());
             return false;

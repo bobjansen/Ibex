@@ -75,6 +75,55 @@ TEST_CASE("join reorder changes an aggregate's order-insensitive inner chain",
     CHECK(((a == "lineitem" && b == "orders") || (a == "orders" && b == "lineitem")));
 }
 
+TEST_CASE("join reorder changes an explicitly order-insensitive root chain",
+          "[ir][join_reorder]") {
+    ir::Builder builder;
+    auto first = builder.join(ir::JoinKind::Inner, {"c_custkey"});
+    first->add_child(builder.scan("customer"));
+    first->add_child(builder.scan("orders"));
+    auto chain = builder.join(ir::JoinKind::Inner, {"o_orderkey"});
+    chain->add_child(std::move(first));
+    chain->add_child(builder.scan("lineitem"));
+
+    auto out = ir::reorder_inner_joins_for_order_insensitive_root(std::move(chain),
+                                                                  misordered_stats());
+    REQUIRE(out->kind() == ir::NodeKind::Join);
+    CHECK(scan_name(*out->children()[1]) == "customer");
+}
+
+TEST_CASE("binding order proof requires every use to erase encounter order",
+          "[ir][join_reorder]") {
+    ir::Builder builder;
+    auto sum = builder.aggregate(
+        {}, {ir::AggSpec{.func = ir::AggFunc::Sum,
+                         .column = {.name = "value"},
+                         .alias = "total"}});
+    sum->add_child(builder.scan("shared"));
+    auto safe = ir::binding_order_uses(*sum, "shared");
+    CHECK(safe.count == 1);
+    CHECK(safe.all_order_insensitive);
+
+    auto first = builder.aggregate(
+        {}, {ir::AggSpec{.func = ir::AggFunc::First,
+                         .column = {.name = "value"},
+                         .alias = "first"}});
+    first->add_child(builder.scan("shared"));
+    auto unsafe = ir::binding_order_uses(*first, "shared");
+    CHECK(unsafe.count == 1);
+    CHECK_FALSE(unsafe.all_order_insensitive);
+
+    auto head = std::make_unique<ir::HeadNode>(ir::NodeId{99}, 1);
+    head->add_child(builder.scan("shared"));
+    auto aggregate_over_head = builder.aggregate(
+        {}, {ir::AggSpec{.func = ir::AggFunc::Sum,
+                         .column = {.name = "value"},
+                         .alias = "total"}});
+    aggregate_over_head->add_child(std::move(head));
+    auto selected = ir::binding_order_uses(*aggregate_over_head, "shared");
+    CHECK(selected.count == 1);
+    CHECK_FALSE(selected.all_order_insensitive);
+}
+
 TEST_CASE("join reorder hands back the plan intact when it rejects a rewrite",
           "[ir][join_reorder]") {
     // `dup` is a non-key column on two leaves, so key ownership is ambiguous and

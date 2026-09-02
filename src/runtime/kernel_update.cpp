@@ -1584,6 +1584,106 @@ auto try_plan_direct_string_length_field(const ir::Expr& expr, const PredicateIn
     return std::nullopt;
 }
 
+/// `Int64(<predicate>)` / `Int32(<predicate>)`: plan the predicate and write its
+/// 0/1 result into the integer output.
+///
+/// The inner predicate has to clear the same bar a standalone boolean field
+/// does -- `try_plan_direct_predicate_field` is the single authority on that --
+/// so this adds an output representation, not a new vocabulary. The cast itself
+/// is the identity on 0/1, and validity is not this plan's concern: the
+/// fixed-width path collects it from the whole field expression, cast included.
+auto try_plan_direct_predicate_int_field(const ir::Expr& expr) -> std::optional<DirectFieldPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty() ||
+        (call->callee != "Int64" && call->callee != "Int32") || call->args.front() == nullptr) {
+        return std::nullopt;
+    }
+    const ir::Expr& inner = *call->args.front();
+    // The inner predicate has to clear the same bar a standalone boolean field
+    // does -- `try_plan_direct_predicate_field` is the single authority -- so
+    // this adds an output representation, not a new vocabulary. That authority
+    // admits no CallExpr at all, which is why `like` needs the separate plan
+    // below rather than a widening here: `compute_mask` can only walk a row
+    // range for expressions `is_range_native_expr` admits, and a whole-column
+    // string kernel is not one.
+    if (!try_plan_direct_predicate_field(inner).has_value()) {
+        return std::nullopt;
+    }
+    return DirectFieldPlan{.kind = DirectFieldKind::PredicateInt,
+                           .expression = &inner,
+                           .numeric_kind = FixedWidthNumericKind::Int};
+}
+
+/// `Int64(like(<column>, "<pattern>"))` -> 0/1 integers, by range.
+///
+/// `like` is evaluated by a whole-column kernel, so the general evaluator
+/// refuses a partial row range and `compute_mask` cannot serve a morsel. The way
+/// out is the one `try_plan_direct_string_length_field` already takes for
+/// `length`: borrow the source column, keep the per-row rule in the plan, and
+/// let the range writer run its own loop. No evaluator contract moves.
+///
+/// This is the shape TPC-H q14 is built on -- `rev * Int64(like(p_type,
+/// "PROMO%"))` is how `case when p_type like 'PROMO%'` is spelled -- and without
+/// it that field leaves the direct route and the whole update runs serially,
+/// which on a join's build side is serial time the query cannot get back.
+auto try_plan_direct_like_int_field(const ir::Expr& expr, const PredicateInput& input)
+    -> std::optional<DirectFieldPlan> {
+    const auto* call = std::get_if<ir::CallExpr>(&expr.node);
+    if (call == nullptr || call->args.size() != 1 || !call->named_args.empty() ||
+        (call->callee != "Int64" && call->callee != "Int32") || call->args.front() == nullptr) {
+        return std::nullopt;
+    }
+    const auto* like = std::get_if<ir::CallExpr>(&call->args.front()->node);
+    if (like == nullptr || like->callee != "like" || like->args.size() != 2 ||
+        !like->named_args.empty() || like->args[0] == nullptr || like->args[1] == nullptr) {
+        return std::nullopt;
+    }
+    // Column and literal pattern only: a computed pattern would have to be
+    // compiled per row, which is the evaluator's job, not a plan's.
+    const auto* source = std::get_if<ir::ColumnRef>(&like->args[0]->node);
+    const auto* pattern_literal = std::get_if<ir::Literal>(&like->args[1]->node);
+    if (source == nullptr || source->lexical || pattern_literal == nullptr) {
+        return std::nullopt;
+    }
+    const auto* pattern_text = std::get_if<std::string>(&pattern_literal->value);
+    if (pattern_text == nullptr) {
+        return std::nullopt;
+    }
+    const auto* entry = input.find(source->name);
+    if (entry == nullptr) {
+        return std::nullopt;
+    }
+    auto compiled = compile_like_pattern(*pattern_text);
+    if (!compiled.has_value()) {
+        return std::nullopt;  // the evaluator owns this diagnostic
+    }
+    auto shared_pattern = std::make_shared<const LikePattern>(std::move(*compiled));
+
+    if (const auto* strings = std::get_if<Column<std::string>>(entry->column.get())) {
+        return DirectFieldPlan{.kind = DirectFieldKind::LikeInt,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .strings = strings,
+                               .like_pattern = std::move(shared_pattern)};
+    }
+    if (const auto* categorical = std::get_if<Column<Categorical>>(entry->column.get())) {
+        // One match per dictionary entry, not per row -- the same trade
+        // `try_plan_direct_string_length_field` makes for categorical lengths.
+        auto matches = std::make_shared<std::vector<char>>();
+        matches->reserve(categorical->dictionary_size());
+        for (const auto& label : categorical->dictionary()) {
+            matches->push_back(static_cast<char>(like_match(*shared_pattern, label)));
+        }
+        return DirectFieldPlan{.kind = DirectFieldKind::LikeInt,
+                               .expression = &expr,
+                               .numeric_kind = FixedWidthNumericKind::Int,
+                               .categoricals = categorical,
+                               .like_pattern = std::move(shared_pattern),
+                               .categorical_matches = std::move(matches)};
+    }
+    return std::nullopt;
+}
+
 auto try_plan_direct_fixed_width_field(const ir::Expr& expr, const PredicateInput& input,
                                        const ScalarRegistry* scalars)
     -> std::optional<DirectFieldPlan> {
@@ -1591,6 +1691,12 @@ auto try_plan_direct_fixed_width_field(const ir::Expr& expr, const PredicateInpu
         return plan;
     }
     if (auto plan = try_plan_direct_temporal_field(expr, input); plan.has_value()) {
+        return plan;
+    }
+    if (auto plan = try_plan_direct_predicate_int_field(expr); plan.has_value()) {
+        return plan;
+    }
+    if (auto plan = try_plan_direct_like_int_field(expr, input); plan.has_value()) {
         return plan;
     }
     return try_plan_direct_string_length_field(expr, input);
@@ -1603,6 +1709,37 @@ auto write_direct_field_range(const DirectFieldPlan& plan, const PredicateInput&
         return plan.expression != nullptr &&
                write_fixed_width_numeric_binary(*plan.expression, input, range, scalars,
                                                 plan.numeric_kind, output.numeric);
+    }
+    if (plan.kind == DirectFieldKind::PredicateInt) {
+        if (output.numeric.ints == nullptr || plan.expression == nullptr) {
+            return false;
+        }
+        auto mask = compute_mask(*plan.expression, input, scalars, range);
+        if (!mask.has_value()) {
+            return false;  // decline the range; the caller's fallback owns the diagnostic
+        }
+        for (std::size_t offset = 0; offset < range.count; ++offset) {
+            output.numeric.ints[offset] = mask->value[offset] != 0 ? 1 : 0;
+        }
+        return true;
+    }
+    if (plan.kind == DirectFieldKind::LikeInt) {
+        if (output.numeric.ints == nullptr || plan.like_pattern == nullptr) {
+            return false;
+        }
+        for (std::size_t offset = 0; offset < range.count; ++offset) {
+            const std::size_t row = range.begin + offset;
+            if (plan.strings != nullptr) {
+                output.numeric.ints[offset] =
+                    like_match(*plan.like_pattern, (*plan.strings)[row]) ? 1 : 0;
+            } else if (plan.categoricals != nullptr && plan.categorical_matches != nullptr) {
+                const auto code = static_cast<std::size_t>(plan.categoricals->code_at(row));
+                output.numeric.ints[offset] = (*plan.categorical_matches)[code] != 0 ? 1 : 0;
+            } else {
+                return false;
+            }
+        }
+        return true;
     }
     if (plan.kind == DirectFieldKind::StringLength) {
         if (output.numeric.ints == nullptr ||

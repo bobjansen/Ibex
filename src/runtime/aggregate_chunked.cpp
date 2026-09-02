@@ -440,6 +440,9 @@ class HashAggregateState final {
             if (owned_async_error_.has_value()) {
                 return owned_async_error_;
             }
+            if (owned_async_pair_error_.has_value()) {
+                return owned_async_pair_error_;
+            }
         }
         ordering_finalized_ = true;
         return std::nullopt;
@@ -1258,6 +1261,140 @@ class HashAggregateState final {
         return true;
     }
 
+    struct PairIntKey {
+        std::uint64_t first = 0;
+        std::uint64_t second = 0;
+
+        [[nodiscard]] friend auto operator==(const PairIntKey&, const PairIntKey&)
+            -> bool = default;
+    };
+    struct PairIntKeyHash {
+        auto operator()(const PairIntKey& key) const noexcept -> std::size_t {
+            std::uint64_t h = key.first * 0x9e3779b97f4a7c15ULL;
+            h ^= key.second + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return static_cast<std::size_t>(h);
+        }
+    };
+
+    // q20's composite key has essentially no short-range reuse, so the Int64
+    // hot table above only adds probes.  Keep its records directly instead:
+    // one task per input chunk routes compact (key, value, first-row) records
+    // to their final owner.  At end-of-stream every owner knows its complete
+    // input cardinality upper bound and can build its map once, rather than
+    // repeatedly growing it behind each chunk-local histogram/scatter barrier.
+    struct OwnedPairRecord {
+        PairIntKey key;
+        std::uint64_t first_row = 0;
+        AggSlotCore slot;
+    };
+
+    struct OwnedPairChunk {
+        std::shared_ptr<ColumnValue> first_column;
+        std::shared_ptr<ColumnValue> second_column;
+        std::shared_ptr<ColumnValue> sum_column;
+        std::optional<ValidityBitmap> sum_validity;
+        std::uint64_t row_base = 0;
+        std::size_t rows = 0;
+        std::size_t part_count = 0;
+        std::vector<std::vector<OwnedPairRecord>> records_by_partition;
+        std::optional<std::string> error;
+    };
+
+    static void process_owned_pair_chunk(OwnedPairChunk& job) noexcept {
+        try {
+            const auto* first = std::get<Column<std::int64_t>>(*job.first_column).data();
+            const auto* second = std::get<Column<std::int64_t>>(*job.second_column).data();
+            const auto* values = std::get<Column<double>>(*job.sum_column).data();
+            const ValidityBitmap* validity =
+                job.sum_validity.has_value() ? &*job.sum_validity : nullptr;
+            const PairIntKeyHash hasher;
+            const std::size_t mask = job.part_count - 1;
+
+            job.records_by_partition.resize(job.part_count);
+            // The first pass is deliberately only a count.  It lets each
+            // vector make one allocation, while the following source-order
+            // append preserves per-partition first-occurrence order.
+            std::vector<std::size_t> counts(job.part_count, 0);
+            for (std::size_t row = 0; row < job.rows; ++row) {
+                const PairIntKey key{static_cast<std::uint64_t>(first[row]),
+                                     static_cast<std::uint64_t>(second[row])};
+                ++counts[hasher(key) & mask];
+            }
+            for (std::size_t p = 0; p < job.part_count; ++p) {
+                job.records_by_partition[p].reserve(counts[p]);
+            }
+            for (std::size_t row = 0; row < job.rows; ++row) {
+                OwnedPairRecord record;
+                record.key = {static_cast<std::uint64_t>(first[row]),
+                              static_cast<std::uint64_t>(second[row])};
+                record.first_row = job.row_base + row;
+                if (validity == nullptr || (*validity)[row]) {
+                    record.slot.double_value = values[row];
+                    record.slot.mark_present();
+                }
+                job.records_by_partition[hasher(record.key) & mask].push_back(record);
+            }
+            job.first_column.reset();
+            job.second_column.reset();
+            job.sum_column.reset();
+            job.sum_validity.reset();
+        } catch (const std::exception& error) {
+            job.error = "async pair aggregate: " + std::string(error.what());
+        } catch (...) {
+            job.error = "async pair aggregate: non-standard worker exception";
+        }
+    }
+
+    auto try_async_pair_sum(const std::vector<const ColumnEntry*>& group_entries,
+                            const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
+        -> bool {
+        if (!owned_async_pair_mode_) {
+            if (std::getenv("IBEX_DISABLE_ASYNC_PAIR_AGG") != nullptr || n_groups_ > 0 ||
+                partitioned_active_ || owned_mode_ || n_aggs_ != 1 ||
+                plan_[0].func != ir::AggFunc::Sum || plan_[0].kind != ExprType::Double ||
+                pair_packs_u64_ || scratch_stride_ != 0 || exec_ == nullptr ||
+                on_worker_pool_thread() || std::max(rows_offered_, rows) < kPairOwnedMinRows ||
+                group_entries.size() != 2 ||
+                !std::holds_alternative<Column<std::int64_t>>(*group_entries[0]->column) ||
+                !std::holds_alternative<Column<std::int64_t>>(*group_entries[1]->column) ||
+                par_.discovery.decline != physical::FanOutDecline::None ||
+                par_.discovery.worker_cap < 2) {
+                return false;
+            }
+            auto& pool = process_worker_pool();
+            const std::size_t workers = par_.discovery.worker_cap;
+            owned_async_pair_part_count_ = 1;
+            while (owned_async_pair_part_count_ * 2 <= workers) {
+                owned_async_pair_part_count_ *= 2;
+            }
+            owned_pair_partitions_.resize(owned_async_pair_part_count_);
+            owned_async_pair_group_.emplace(pool.task_group());
+            owned_async_pair_mode_ = true;
+            owned_mode_ = true;
+            note_partition_fanout();
+        }
+
+        const ColumnEntry& agg0 = *agg_entries[0];
+        auto job = std::make_unique<OwnedPairChunk>();
+        job->first_column = group_entries[0]->column;
+        job->second_column = group_entries[1]->column;
+        job->sum_column = agg0.column;
+        if (agg0.validity.has_value()) {
+            job->sum_validity = *agg0.validity;
+        }
+        job->row_base = owned_rows_seen_;
+        job->rows = rows;
+        job->part_count = owned_async_pair_part_count_;
+        auto* const raw_job = job.get();
+        owned_async_pair_jobs_.push_back(std::move(job));
+        if (!owned_async_pair_group_.has_value()) {
+            invariant_violation("async pair aggregate: task group missing while accepting chunks");
+        }
+        owned_async_pair_group_->submit([raw_job] { process_owned_pair_chunk(*raw_job); });
+        owned_rows_seen_ += rows;
+        return true;
+    }
+
     /// Production ownership threshold for the narrow PairIntKey path below,
     /// backed by a synthetic row/cardinality sweep (32k/64k/128k/262144 rows
     /// x low/high cardinality, 8 cores, 6 interleaved rounds): 32k showed no
@@ -1695,6 +1832,8 @@ class HashAggregateState final {
     void finalize_owned_active() {
         if (owned_async_hot_mode_) {
             finalize_owned_async_hot();
+        } else if (owned_async_pair_mode_) {
+            finalize_owned_async_pair();
         } else if (owned_ordered_run_mode_) {
             finalize_owned_ordered_runs();
         } else if (!owned_pair_partitions_.empty()) {
@@ -1805,6 +1944,84 @@ class HashAggregateState final {
         finalize_owned(
             partitions, [&](std::size_t n) { int_order_.resize(n); },
             [&](std::size_t g, std::int64_t key) { int_order_[g] = key; });
+    }
+
+    /// Build q20's final PairInt maps after every streamed chunk has supplied
+    /// its compact records.  The exact record count is an upper bound on the
+    /// distinct keys in one partition, so this is the cardinality-sizing
+    /// experiment without an extra sketch pass or a calling-thread reserve.
+    void finalize_owned_async_pair() {
+        if (owned_finalized_) {
+            return;
+        }
+        owned_finalized_ = true;
+        if (!owned_async_pair_group_.has_value()) {
+            invariant_violation("async pair aggregate join: task group already released");
+        }
+        try {
+            owned_async_pair_group_->wait();
+        } catch (const std::exception& error) {
+            owned_async_pair_error_ = "async pair aggregate join: " + std::string(error.what());
+            return;
+        } catch (...) {
+            owned_async_pair_error_ = "async pair aggregate join: non-standard worker exception";
+            return;
+        }
+        for (const auto& job : owned_async_pair_jobs_) {
+            if (job->error.has_value()) {
+                owned_async_pair_error_ = *job->error;
+                return;
+            }
+        }
+
+        try {
+            auto batch =
+                process_worker_pool().submit(owned_async_pair_part_count_, [&](std::size_t p) {
+                    auto& partition = owned_pair_partitions_[p];
+                    std::size_t records = 0;
+                    for (const auto& job : owned_async_pair_jobs_) {
+                        records += job->records_by_partition[p].size();
+                    }
+                    partition.index.reserve(records);
+                    partition.keys.reserve(records);
+                    partition.first_rows.reserve(records);
+                    partition.slots.reserve(records);
+                    for (const auto& job : owned_async_pair_jobs_) {
+                        for (const auto& record : job->records_by_partition[p]) {
+                            auto it = partition.index.find(record.key);
+                            if (it == partition.index.end()) {
+                                const auto local =
+                                    static_cast<std::uint32_t>(partition.keys.size());
+                                partition.index.emplace(record.key, local);
+                                partition.keys.push_back(record.key);
+                                partition.first_rows.push_back(record.first_row);
+                                partition.slots.push_back(record.slot);
+                            } else if (record.slot.present()) {
+                                auto& slot = partition.slots[it->second];
+                                slot.double_value += record.slot.double_value;
+                                slot.mark_present();
+                            }
+                        }
+                    }
+                });
+            batch.wait();
+        } catch (const std::exception& error) {
+            owned_async_pair_error_ = "async pair cold aggregate: " + std::string(error.what());
+            return;
+        } catch (...) {
+            owned_async_pair_error_ = "async pair cold aggregate: non-standard worker exception";
+            return;
+        }
+
+        owned_async_pair_jobs_.clear();
+        owned_async_pair_group_.reset();
+        owned_finalized_ = false;
+        finalize_owned(
+            owned_pair_partitions_, [&](std::size_t n) { pair_order_.resize(n); },
+            [&](std::size_t g, const PairIntKey& key) {
+                pair_order_[g] = {static_cast<std::int64_t>(key.first),
+                                  static_cast<std::int64_t>(key.second)};
+            });
     }
 
     /// A clustered single-Int64 Count is summarized as contiguous runs while
@@ -2133,6 +2350,11 @@ class HashAggregateState final {
                 gids[row] = gid;
             }
             publish_discovered(agg_entries, rows);
+            return std::nullopt;
+        }
+
+        if (try_async_pair_sum(group_entries, agg_entries, rows)) {
+            publish_fused_accumulation();
             return std::nullopt;
         }
 
@@ -4752,20 +4974,6 @@ class HashAggregateState final {
     PackedGroups<PackedKeyEncoder::Packed128, PackedKeyEncoder::PackedWordsHash<2>> packed128_;
     PackedGroups<PackedKeyEncoder::Packed256, PackedKeyEncoder::PackedWordsHash<4>> packed256_;
     IntKeyKind int_key_kind_b_ = IntKeyKind::Int64;
-    struct PairIntKey {
-        std::uint64_t first = 0;
-        std::uint64_t second = 0;
-
-        [[nodiscard]] friend auto operator==(const PairIntKey&, const PairIntKey&)
-            -> bool = default;
-    };
-    struct PairIntKeyHash {
-        auto operator()(const PairIntKey& key) const noexcept -> std::size_t {
-            std::uint64_t h = key.first * 0x9e3779b97f4a7c15ULL;
-            h ^= key.second + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            return static_cast<std::size_t>(h);
-        }
-    };
     robin_hood::unordered_flat_map<PairIntKey, std::uint32_t, PairIntKeyHash> pair_index_;
     std::vector<std::pair<std::int64_t, std::int64_t>> pair_order_;
     /// Parallel group discovery (see `try_discover_partitioned`). `rows_seen_`
@@ -4806,6 +5014,11 @@ class HashAggregateState final {
     std::optional<std::string> owned_async_error_;
     std::size_t owned_async_part_count_ = 0;
     bool owned_async_hot_mode_ = false;
+    std::vector<std::unique_ptr<OwnedPairChunk>> owned_async_pair_jobs_;
+    std::optional<WorkerPool::TaskGroup> owned_async_pair_group_;
+    std::optional<std::string> owned_async_pair_error_;
+    std::size_t owned_async_pair_part_count_ = 0;
+    bool owned_async_pair_mode_ = false;
     std::vector<std::int64_t> owned_ordered_run_keys_;
     std::vector<std::size_t> owned_ordered_run_counts_;
     bool owned_ordered_run_mode_ = false;

@@ -170,6 +170,7 @@ auto not_like(std::string name, std::string pattern) -> ir::Expr {
 struct TextSourceState {
     std::vector<std::vector<std::string>> decode_calls;
     std::vector<std::string> scan_calls;
+    std::vector<std::string> key_scan_calls;
     /// When false the reader declines the fused scan, exercising the fallback.
     bool fused = true;
     /// When false the reader reports no decomposition, so `scan_units` is
@@ -255,6 +256,21 @@ class TextReader final : public runtime::LazySourceReader {
                 selected.push_back(row);
             }
         }
+        return std::optional{std::move(selected)};
+    }
+
+    auto key_filter_scan(const std::string& column, const runtime::DynamicScanFilter& filter,
+                         const runtime::SourceUnit* unit, const runtime::ExecutionContext& /*exec*/)
+        -> std::expected<std::optional<runtime::Selection>, std::string> override {
+        state_->key_scan_calls.push_back(column);
+        if (column != "n")
+            return std::optional<runtime::Selection>{};
+        const std::size_t begin = unit == nullptr ? 0 : unit->start;
+        const std::size_t end = unit == nullptr ? kText.size() : unit->start + unit->rows;
+        runtime::Selection selected;
+        for (std::size_t row = begin; row < end; ++row)
+            if (filter.passes(static_cast<std::int64_t>(row)))
+                selected.push_back(row);
         return std::optional{std::move(selected)};
     }
 
@@ -1067,6 +1083,18 @@ TEST_CASE("LazyTable: join_key_selection uses the fused scan when available",
     REQUIRE(keys != nullptr);
     REQUIRE(keys->size() == 1);
     CHECK((*keys)[0] == 3);
+}
+
+TEST_CASE("LazyTable: predicate-only literal range uses the source key scan",
+          "[runtime][lazy_table][range_filter]") {
+    auto state = std::make_shared<TextSourceState>();
+    auto lazy = make_text_lazy(state);
+
+    auto table = lazy.project_where({"s"}, {greater_than("n", 1)}, kExec);
+    REQUIRE(table);
+    CHECK(state->key_scan_calls == std::vector<std::string>{"n"});
+    for (const auto& call : state->decode_calls)
+        CHECK(std::ranges::find(call, "n") == call.end());
 }
 
 TEST_CASE("LazyTable: a filter-only string column is never materialized",

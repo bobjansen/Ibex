@@ -96,6 +96,19 @@ see `project_ascribe_pipeline_barrier` in memory.
 
 ## The scan-fusion cost gate (designed, not built)
 
+> **This gate now has a sibling with a measured price.** 2026-09-02 built
+> `push_computed_columns_into_joins` — hoisting an `Update`'s single-side
+> sub-expressions below the join and dropping the columns
+> `join_output_demand` shows nothing above still reads. Byte-identical on all
+> 22, full suite green, worth **−9 to −15%** where post-join rows × payload
+> width is large, and **+40% on q12** where the same push evaluates a predicate
+> over 12M `orders` rows to save gathering 1.3M. It was reverted for exactly the
+> reason this section exists: no cardinality estimate to decide with. The two
+> gates want the same input — per-node row counts, here compared against join
+> output — so whoever builds one should look at whether it generalises.
+> Patch and full narrative: `beat-polars-plan.md` §6, and
+> `project_q14_bandwidth_and_selected_gather` in session memory.
+
 Mechanism 2 routes more filters into `project_where`/`project_where_unit`'s
 split-decode, which has **no cost gate**. Fusing a filter always: decodes the
 predicate columns densely+whole, and decodes the *remaining* demanded columns

@@ -15,6 +15,7 @@
 #include <memory>
 #include <robin_hood.h>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -145,6 +146,40 @@ auto is_row_wise(const Node& node) -> bool {
         }
         default:
             return false;
+    }
+}
+
+auto preserves_multiset_without_observing_order(const Node& node) -> bool {
+    if (is_row_wise(node)) {
+        return true;
+    }
+    if (node.kind() == NodeKind::Join) {
+        return node_cast<JoinNode>(node).kind() != JoinKind::Asof;
+    }
+    return node.kind() == NodeKind::Ascribe || node.kind() == NodeKind::Distinct ||
+           node.kind() == NodeKind::Order;
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_binding_order_uses(const Node& node, std::string_view binding,
+                                bool order_is_erased, BindingOrderUses& out) {
+    if (node.kind() == NodeKind::Scan &&
+        node_cast<ScanNode>(node).source_name() == binding) {
+        ++out.count;
+        out.all_order_insensitive = out.all_order_insensitive && order_is_erased;
+        return;
+    }
+
+    bool child_order_is_erased = order_is_erased;
+    if (node.kind() == NodeKind::Aggregate) {
+        child_order_is_erased = aggregate_order_insensitive(node_cast<AggregateNode>(node));
+    } else if (order_is_erased && !preserves_multiset_without_observing_order(node)) {
+        child_order_is_erased = false;
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_binding_order_uses(*child, binding, child_order_is_erased, out);
+        }
     }
 }
 
@@ -354,6 +389,29 @@ auto reorder_inner_joins_for_aggregates(NodePtr root, const SourceStats& stats) 
         next_id() = highest + 1;
     }
     return walk(std::move(root), stats);
+}
+
+auto reorder_inner_joins_for_order_insensitive_root(NodePtr root, const SourceStats& stats)
+    -> NodePtr {
+    if (root == nullptr) {
+        return root;
+    }
+    std::uint64_t highest = 0;
+    max_id(*root, highest);
+    next_id() = highest + 1;
+    if (NodePtr* chain = find_join_chain(root)) {
+        NodePtr reordered = reorder_aggregate_child(std::move(*chain), stats);
+        if (reordered != nullptr) {
+            *chain = std::move(reordered);
+        }
+    }
+    return root;
+}
+
+auto binding_order_uses(const Node& root, std::string_view binding) -> BindingOrderUses {
+    BindingOrderUses out;
+    collect_binding_order_uses(root, binding, false, out);
+    return out;
 }
 
 }  // namespace ibex::ir

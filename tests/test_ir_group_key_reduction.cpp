@@ -283,3 +283,45 @@ TEST_CASE("group key reduction never reduces to no key at all") {
     REQUIRE(agg != nullptr);
     CHECK(agg->group_by().size() == 1);
 }
+
+TEST_CASE("group key proof candidates include only traceable multi-key aggregate columns") {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}));
+
+    auto plan = aggregate({"c_custkey", "c_name"}, scan("customer"));
+    const auto candidates = ir::group_key_proof_candidates(*plan, sources);
+
+    REQUIRE(candidates.contains("customer"));
+    CHECK(candidates.at("customer") == std::set<std::string>{"c_custkey", "c_name"});
+
+    auto single_key = aggregate({"c_custkey"}, scan("customer"));
+    CHECK(ir::group_key_proof_candidates(*single_key, sources).empty());
+}
+
+TEST_CASE("group key proof candidates must determine the complete group key") {
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "c_nationkey", "v"}));
+    sources.emplace("nation", source({"n_nationkey", "n_name"}, "n_nationkey"));
+
+    std::vector<ir::JoinKey> keys{
+        ir::JoinKey{std::string{"c_nationkey"}, std::string{"n_nationkey"}}};
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{3}, ir::JoinKind::Inner, std::move(keys));
+    join->add_child(scan("customer"));
+    join->add_child(scan("nation"));
+
+    auto reducible = aggregate({"c_custkey", "c_name", "n_name"}, std::move(join));
+    const auto candidates = ir::group_key_proof_candidates(*reducible, sources);
+    REQUIRE(candidates.contains("customer"));
+    CHECK(candidates.at("customer") == std::set<std::string>{"c_custkey", "c_name"});
+
+    sources.emplace("orders", source({"o_orderkey", "o_orderdate"}));
+    std::vector<ir::JoinKey> unrelated_keys{
+        ir::JoinKey{std::string{"c_custkey"}, std::string{"o_orderkey"}}};
+    auto unrelated =
+        std::make_unique<ir::JoinNode>(ir::NodeId{4}, ir::JoinKind::Inner,
+                                      std::move(unrelated_keys));
+    unrelated->add_child(scan("customer"));
+    unrelated->add_child(scan("orders"));
+    auto partial = aggregate({"c_custkey", "c_name", "o_orderdate"}, std::move(unrelated));
+    CHECK(ir::group_key_proof_candidates(*partial, sources).empty());
+}

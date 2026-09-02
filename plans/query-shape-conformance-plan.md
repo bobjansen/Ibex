@@ -102,10 +102,13 @@ see `project_ascribe_pipeline_barrier` in memory.
 > `join_output_demand` shows nothing above still reads. Byte-identical on all
 > 22, full suite green, worth **−9 to −15%** where post-join rows × payload
 > width is large, and **+40% on q12** where the same push evaluates a predicate
-> over 12M `orders` rows to save gathering 1.3M. It was reverted for exactly the
-> reason this section exists: no cardinality estimate to decide with. The two
-> gates want the same input — per-node row counts, here compared against join
-> output — so whoever builds one should look at whether it generalises.
+> over 12M `orders` rows to save gathering 1.3M. It was reverted for want of a
+> cost model — but **not the same one**. Correcting a claim first made here on
+> 2026-09-02: these two gates want *different* inputs. This section's own
+> calibration is explicit that the scan-fusion signal is the remaining column's
+> **type**, not selectivity, so its MVP needs no cardinality at all; the join
+> pushdown needs exactly what this gate does without — join-output rows against
+> each side's post-filter rows. Siblings in spirit, not a shared prerequisite.
 > Patch and full narrative: `beat-polars-plan.md` §6, and
 > `project_q14_bandwidth_and_selected_gather` in session memory.
 

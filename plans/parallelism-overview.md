@@ -276,8 +276,9 @@ architectural limits and were neither:
   the `Update` sitting between them, because one field shape fell off
   `plan_direct_field` — and that route is **all-or-nothing per update node**, so
   a single unrecognised field serialises the whole node. `serial_fraction` moved
-  0.133 → 0.288 from one such field over 1.6M rows. Fixed in `4ac93b33`; see
-  `parallel-chunkview-output-plan.md`. The general rule: read `pool_tasks` per
+  0.133 → 0.288 from one such field over 1.6M rows. Fixed in `4ac93b33`; the
+  rule now heads `update_row_local_chunk` in `src/runtime/kernel_update.cpp`.
+  The general rule: read `pool_tasks` per
   node before naming the operator, because "this operator is serial" and "this
   operator's *expression* fell off a fast path" look identical from the outside.
 

@@ -1626,6 +1626,13 @@ auto try_plan_direct_predicate_int_field(const ir::Expr& expr) -> std::optional<
 /// "PROMO%"))` is how `case when p_type like 'PROMO%'` is spelled -- and without
 /// it that field leaves the direct route and the whole update runs serially,
 /// which on a join's build side is serial time the query cannot get back.
+///
+/// **Rule for the next whole-column kernel that wants a range plan: do NOT
+/// widen `is_chunk_predicate_native` or `is_range_native_expr` to admit calls.**
+/// The first decides how every FILTER routes; the second is exactly what the
+/// "evaluators cannot evaluate by range" invariant guards. A whole-column kernel
+/// earns a range-native plan of its own, as this one does, or it stays on the
+/// evaluator.
 auto try_plan_direct_like_int_field(const ir::Expr& expr, const PredicateInput& input)
     -> std::optional<DirectFieldPlan> {
     const auto* call = std::get_if<ir::CallExpr>(&expr.node);
@@ -2812,6 +2819,20 @@ auto update_row_local_chunk(Chunk input, const std::vector<ir::FieldSpec>& field
     // let update_table evaluate the original complete update.
     // Counted where the chunk kernel keeps the work, so the bridge below is
     // observable by its absence -- see `chunk_direct_updates`.
+    //
+    // All-or-nothing is why a family `plan_direct_field` does not recognise is a
+    // CLIFF and not a slowdown: the bridge does not parallelise at all, so one
+    // unplannable field costs every OTHER field in the node its parallelism.
+    // Measured 2026-09-02 -- `Int64(p_partkey > 5)` planned nowhere and the node
+    // ran `tasks=0 pool_work=0.000` over 1.6M rows at eight cores, whatever the
+    // core count. Two consequences when adding the next family:
+    //
+    //   * rank candidates by what SHARES their update node and by whether that
+    //     node sits somewhere serial time is unrecoverable (a join's build side
+    //     most of all), not by how hot the expression itself looks; and
+    //   * the cliff is invisible in query timings until it lands somewhere
+    //     serial -- `PredicateInt`/`LikeInt` cost a q14 build-side experiment
+    //     10% while moving no query on their own.
     const auto direct = [&](Chunk output, std::size_t field_count) {
         if (exec.parallel_stats != nullptr) {
             exec.parallel_stats->chunk_direct_updates.fetch_add(field_count,

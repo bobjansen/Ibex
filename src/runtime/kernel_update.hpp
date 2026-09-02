@@ -118,6 +118,18 @@ struct CategoricalOutputSpan {
 
 /// Owns the deterministic output dictionary and read-only source-code remaps.
 /// Worker writes are restricted to `CategoricalOutputSpan::codes`.
+///
+/// A categorical result must not be assembled by parallel workers, so the
+/// dictionary is built ONCE here, before any range is scheduled, and its order
+/// is fixed: operands / CASE arms in lexical order, then the labels of each
+/// source dictionary in that dictionary's own code order, then literal labels in
+/// arm order -- first occurrence of a label wins. Every source code gets its
+/// output code from `remaps`, and literals theirs from `literal_codes`, at
+/// planning time. A worker therefore never inserts a label, never mutates a
+/// remap, and never sees shared validity; it writes codes into its own window
+/// and returns a dense range-local bitmap. Source dictionaries are read-only and
+/// never alias the output dictionary. That fixed order is what makes a parallel
+/// run reproduce the serial one exactly.
 struct DirectCategoricalPlan {
     DirectValidityKind kind = DirectValidityKind::Coalesce;
     std::vector<const ir::Expr*> conditions;

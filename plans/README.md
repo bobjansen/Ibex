@@ -20,7 +20,6 @@ history).
 | [benchmark-perf-priorities.md](benchmark-perf-priorities.md) | Living reference | P0–P2 resolved/landed; rolling min/max optimized. Open: suite trimming (pin sqlite + data.table frollapply cells, duckdb at 3 scales); P4 `tanh` deferred pending accuracy-vs-speed call; P3 ohlc scatter-bound (negative result recorded — don't re-attempt naive fusion); re-check rolling_mean on AWS after the July 2026 regression fix |
 | [benchmark-coverage-plan.md](benchmark-coverage-plan.md) | ~95% done | #9 ClickHouse EWMA (needs arrayFold workaround); #10 DataFusion `fill_forward/backward` + `tf_asof_join` |
 | [count-window-plan.md](count-window-plan.md) | Implemented (interpreter + codegen) | Per-call count/duration windows work (`__window_n`/`__window_ns` in lower.cpp + window.cpp), and the compiled path (`ibex_compile`) is at parity. Open: `window N rows` block syntax and tuple-field `update` inside `window` (interpreter doesn't support that combo either, so codegen correctly still rejects it). The old monotonic-deque follow-up for `rolling_min`/`rolling_max` is done. |
-| [parallel-chunkview-output-plan.md](parallel-chunkview-output-plan.md) | **Substantially implemented** (status corrected 2026-09-02 — it was listed as "proposed" while the whole protocol was already in the tree). Delivery items 1–4 done; item 5 has its writer. `PredicateInt`/`LikeInt` landed `4ac93b33`. | Widen the families `plan_direct_field` recognises. The direct route is **all-or-nothing per update node**, so an unrecognised family serialises every *other* field in that node — rank candidates by what shares their update and whether it sits somewhere serial (a join's build side), not by how hot the expression is. Do not widen `is_chunk_predicate_native`/`is_range_native_expr` to admit calls. |
 | [non-row-local-filter-plan.md](non-row-local-filter-plan.md) | Stage 1 shipped | `lag`/`lead`/`is_null` in filter work. Remaining: `rank(...)` in filter/select with `by`, explicit `order {}` context, rolling functions in filter (`price > rolling_mean(price)`) |
 | [bigger-than-ram-plan.md](bigger-than-ram-plan.md) | Phase 4 bullet 1 of 4 done | Out-of-core execution. Done: chunked/streaming `read_parquet` (branch `chunked-parquet-read`; ~6.5× lower peak RSS, ~1.7× faster, verified local + AWS). Next: column projection pushdown, row-group stats pushdown, directory/Hive datasets (rest of Phase 4), then Phase 1 spill infrastructure (prerequisite for Phases 2–3, 6–7: external sort, out-of-core join, adaptive spill selection) |
 | [runtime-multithreading-plan.md](runtime-multithreading-plan.md) | Row-local morsel-parallel pipelines are **ON by default**; Phase 3a is complete; Phase 3b's first source slice landed; Phase 4 items 1–2 landed, item 3 RETIRED (the join gap was Categorical probe keys hashed as *text*, not threading), item 4 part-done. **Nomenclature: `IBEX_THREADS` → `IBEX_CORES`; `IBEX_PARALLEL` removed (serial is `IBEX_CORES=1`).** | The PDS-H multithreading gap is **parallel barriers**, not sources. Next: group-by string/int/generic hash paths + `distinct`; the LazyTable Synchronization Contract (written, unimplemented — Phase 3b's foundation); Phase 2 deterministic RNG (designed, not started). Re-measure at a larger scale before ranking — the threading share of a gap grows with row count. |
@@ -62,6 +61,18 @@ focus; the last set lived under `plans/done/`). They are fully recoverable
 from git history — `git log --diff-filter=D --name-only -- plans/done/`
 lists them, and the removal commit's parent still has every file. Citations
 in active plans to `plans/done/...` paths refer to that history.
+
+- **parallel-chunkview-output-plan.md** — removed 2026-09-02, all five delivery
+  items landed (it had been mislabelled "proposed" while its whole protocol was
+  already in the tree). Its two durable rules moved into the code they govern:
+  the categorical dictionary/ownership and determinism contract now heads
+  `DirectCategoricalPlan` in `src/runtime/kernel_update.hpp`, and the
+  all-or-nothing consequence — one field `plan_direct_field` cannot name
+  serialises every *other* field in that update node, so rank new families by
+  what shares their node rather than by how hot the expression is — heads
+  `update_row_local_chunk` in `kernel_update.cpp`, next to the
+  "do not widen `is_chunk_predicate_native`/`is_range_native_expr`" rule on
+  `try_plan_direct_like_int_field`.
 
 ## Cross-plan dependency notes
 

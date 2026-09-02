@@ -347,11 +347,15 @@ without a shape where accumulate is actually dominant.
 
 The original three, kept for the parts still standing:
 
-1. **First-chunk serial discovery under streaming.** The cumulative-rows gate
-   fix seeds late-activated partitions, but chunk 0 is still discovered
-   serially then seeded (q20's residual). Defer the aggregate's first chunk
-   until the partition decision is made — buffer one chunk, decide, replay.
-   Named follow-up in the pipelined plan.
+1. **First-chunk serial discovery under streaming — measured dead end.** The
+   cumulative-rows gate fix seeds late-activated partitions, but chunk 0 is
+   still discovered serially then seeded (q20's residual). Buffering chunk zero,
+   pulling chunk one to decide admission, then replaying both in order did make
+   the first q20 aggregate take the partitioned path. It did not pay: SF-8,
+   8 cores, interleaved 16-pair A/B pinned to CPUs 0-7 measured 687.6 ms →
+   675.5 ms minimum, a −1.0% paired effect (p=0.098; byte-identical), below
+   the 2% practical floor. Removed. Do not retry this exact one-chunk lookahead
+   without evidence that it can avoid, rather than merely move, serial work.
 2. **High-cardinality group-by** ([[project_high_cardinality_groupby_gap]] —
    8× slower at 5M groups; q13's 150k-customer group-by declines parallelism
    *by design*). The lever is not lowering the gate (measured dead end: q13

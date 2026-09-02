@@ -18,7 +18,7 @@ stays `== workers` — over-partitioning is a measured dead end
 |---|---|---|
 | single-Int64 `Sum(Double)` | q18 | **async hot/cold rewrite LANDED, q18 −33%** (kill switch `IBEX_DISABLE_ASYNC_HOT_AGG=1`) |
 | all owned paths' finalize | q18 + q20 | **parallel merge LANDED, −7% each** |
-| `PairIntKey` (`{partkey,suppkey}`) | q20 | radix path unchanged — the hot table is near-useless here (a pair recurs ~250k rows apart, long evicted). Open. |
+| `PairIntKey` (`{partkey,suppkey}`) | q20 | **async partition collector LANDED, q20 −51.7%** — scattered pairs bypass the hot table, stream compact records to final owners, then build each pre-sized map once. |
 | ordered-run `Count` (sorted key) | q21 | **parallel first-occurrence merge + emit fusion LANDED** (fd9fecb1, 103f3904, this session) — q21 −11.2% SF-4. See [[project_q21_is_occupancy_bound]] |
 
 ### q18 async hot/cold rewrite (LANDED, UPDATE 5)
@@ -83,10 +83,15 @@ Verified against `~/polars` v1.42 (`polars-stream/src/nodes/group_by.rs`,
 
 ## Live fronts
 
-- **q20 / PairIntKey** — the hot table doesn't help (scattered composite key).
-  A per-partition `CardinalitySketch` sizing the final grouper (the correct
-  version of the reverted serial-`reserve`) is the candidate — reserve *inside*
-  each parallel task, not on the calling thread.
+- **q20 / PairIntKey — LANDED.** The hot table does not help scattered composite
+  keys. Instead, `OwnedPairChunk` streams compact `(key, value, first-row)`
+  records to a `TaskGroup`; one final parallel owner per partition reserves its
+  map from the exact record count and builds it once. SF-8, 8 cores, interleaved
+  16-pair A/B: **672.7 → 301.4 ms minimum, −51.7%, 16/16, p<0.001**,
+  byte-identical. This is stronger than a cardinality sketch for the current
+  in-memory collector: the exact record count is already available at final
+  build, without an additional sketch pass. q10/q13 were neutral and q18 was
+  −5.7% in the focused regression A/B; 22/22 answers and 1830 fast tests pass.
 - **q21 / ordered-run Count** — the parallel finalize + emit fusion landed this
   session (−11.2% SF-4). Remaining q21 wall is the per-chunk accumulate
   orchestration and a duplicate lineitem decode

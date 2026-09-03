@@ -125,7 +125,8 @@ install_r_benchmark_packages() {
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"
     R_LIBS_USER="$R_BENCH_LIB" Rscript --vanilla -e '
-        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow", "slider")
+        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow", "slider",
+                   "bit64", "TTR", "lubridate", "tibble")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org",

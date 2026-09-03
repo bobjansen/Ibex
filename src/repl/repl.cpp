@@ -157,6 +157,13 @@ struct AbsorbedScanFilters {
     const runtime::ExecutionContext& exec, const runtime::ScalarRegistry* scalars,
     runtime::TableRegistry& registry,
     const std::function<bool(const std::string&)>& skip = {}) -> std::expected<void, std::string> {
+    // Group by the binding each name resolves to, not by the name itself.
+    // `isolate_filtered_scan_instances` gives the occurrences of one repeatedly
+    // scanned source separate names so each can keep its own predicate; they all
+    // resolve to the same `LazyTable`, and decoding them independently would
+    // read the file once per occurrence -- worse than the pooled decode the
+    // split replaced.
+    std::map<runtime::LazyTable*, std::vector<const std::string*>> by_binding;
     for (const auto& [name, needed] : demand) {
         if (skip && skip(name)) {
             continue;
@@ -165,14 +172,63 @@ struct AbsorbedScanFilters {
         if (lazy == nullptr) {
             continue;  // an ordinary table, not a deferred one
         }
-        const bool filtered = absorbed.applied.contains(name);
-        auto table = decode_demanded_lazy_source(
-            *lazy, needed, filtered,
-            filtered ? absorbed.predicates.at(name) : std::vector<ir::Expr>{}, exec, scalars);
-        if (!table.has_value()) {
-            return std::unexpected(table.error());
+        by_binding[lazy].push_back(&name);
+    }
+
+    for (const auto& [lazy, names] : by_binding) {
+        const auto conjuncts_of = [&](const std::string& name) -> std::vector<ir::Expr> {
+            return absorbed.applied.contains(name) ? absorbed.predicates.at(name)
+                                                   : std::vector<ir::Expr>{};
+        };
+
+        if (names.size() == 1) {
+            const auto& name = *names.front();
+            const bool filtered = absorbed.applied.contains(name);
+            auto table = decode_demanded_lazy_source(*lazy, demand.at(name), filtered,
+                                                     conjuncts_of(name), exec, scalars);
+            if (!table.has_value()) {
+                return std::unexpected(table.error());
+            }
+            registry.insert_or_assign(name, std::move(table.value()));
+            continue;
         }
-        registry.insert_or_assign(name, std::move(table.value()));
+
+        // Several occurrences of one binding. Decode the union of what they
+        // OUTPUT exactly once -- `project` caches, so the per-occurrence
+        // `project_rows` below gathers those columns in memory rather than
+        // re-reading their pages. A column only a filter reads stays out of the
+        // union, so it is never materialized and `selection_for` can answer it
+        // inside the page decoder, which is the whole point.
+        std::set<std::string> union_names;
+        bool union_all = false;
+        for (const auto* name : names) {
+            const auto& needed = demand.at(*name);
+            union_all = union_all || needed.all;
+            union_names.insert(needed.names.begin(), needed.names.end());
+        }
+        if (union_all) {
+            for (const auto& field : lazy->schema().columns) {
+                union_names.insert(field.name);
+            }
+        }
+        if (auto shared = lazy->project(union_names, exec); !shared.has_value()) {
+            return std::unexpected(shared.error());
+        }
+
+        for (const auto* name : names) {
+            const auto& needed = demand.at(*name);
+            const std::set<std::string> wanted = needed.all ? union_names : needed.names;
+            auto selected = lazy->selection_for(wanted, conjuncts_of(*name), exec, scalars);
+            if (!selected.has_value()) {
+                return std::unexpected(selected.error());
+            }
+            auto table = selected->has_value() ? lazy->project_rows(wanted, **selected, exec)
+                                               : lazy->project(wanted, exec);
+            if (!table.has_value()) {
+                return std::unexpected(table.error());
+            }
+            registry.insert_or_assign(*name, std::move(table.value()));
+        }
     }
     return {};
 }
@@ -4925,7 +4981,26 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
         // occurrence still reads the whole table (TPC-H q18).
         auto probe_split = ir::isolate_deferrable_probe_scans(std::move(rewritten), lazy_names);
         rewritten = std::move(probe_split.plan);
-        const auto& instances = probe_split.instances;
+        // The same rename, for a different reason: a source bound once and
+        // filtered more than once loses ALL its pushdown, because
+        // `scan_predicates` keys on the source name and cannot give two
+        // occurrences different rows. Naming them apart lets each keep its own
+        // predicate; `decode_demanded_lazy_sources` then decodes the union of
+        // their output columns ONCE and gathers each occurrence from it, so the
+        // file is still read once.
+        //
+        // These instances stay EAGER. The split creates deferred-probe and
+        // streaming eligibility that the repeated source did not have -- it was
+        // ineligible precisely because it occurred twice -- and both of those
+        // paths own their own decode, which is how the shared one gets lost.
+        auto filter_split = ir::isolate_filtered_scan_instances(std::move(rewritten), lazy_names);
+        rewritten = std::move(filter_split.plan);
+        std::set<std::string> eager_only;
+        for (const auto& [instance, source] : filter_split.instances) {
+            eager_only.insert(instance);
+        }
+        auto instances = std::move(probe_split.instances);
+        instances.merge(std::move(filter_split.instances));
         const auto resolve_lazy = [&](const std::string& name) -> runtime::LazyTable* {
             auto it = lazy_sources.find(name);
             if (it == lazy_sources.end()) {
@@ -4991,7 +5066,7 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                  *rewritten, deferrable_names, row_counts, schemas, absorbed_scan_selectivity)) {
             const auto needed = demand.find(name);
             auto lazy = resolve_lazy_ptr(name);
-            if (needed == demand.end() || lazy == nullptr) {
+            if (needed == demand.end() || lazy == nullptr || eager_only.contains(name)) {
                 continue;
             }
             deferred_scans.emplace(
@@ -5032,7 +5107,8 @@ void collect_shared_plan_max_id(const ir::Node& node, std::uint64_t& out) {
                     continue;
                 }
                 auto* lazy = resolve_lazy(name);
-                if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name)) {
+                if (lazy == nullptr || lazy->scan_units().size() <= 1 || repeated_scan(name) ||
+                    eager_only.contains(name)) {
                     continue;
                 }
                 deferred_scans.emplace(

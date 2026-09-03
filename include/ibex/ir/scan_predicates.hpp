@@ -74,6 +74,28 @@ struct ScanInstanceSplit {
                                                   const std::set<std::string>& sources)
     -> ScanInstanceSplit;
 
+/// Give each occurrence of a repeatedly-scanned, FILTERED source its own name.
+///
+/// `scan_predicates` can only push a source's predicates when the source has
+/// ONE occurrence: the registry is keyed by name, so two occurrences of one name
+/// cannot be given different rows. Naming them apart lifts that, and each keeps
+/// its own predicate.
+///
+/// **Only sound with a caller that shares the decode AND keeps these instances
+/// eager.** They map back to one `LazyTable`, and
+/// `decode_demanded_lazy_sources` decodes the union of their output columns once
+/// and gathers each occurrence from it. Two things break that:
+///   * renaming without the shared decode gives every occurrence its own full
+///     decode, strictly worse than the pooled decode it replaced;
+///   * letting an instance be taken as a deferred-probe or streaming scan moves
+///     its decode to a path that does not share (`project_where_unit` never
+///     writes `cache_` at all). The split CREATES that eligibility -- before it,
+///     a repeated source was ineligible precisely because it occurred twice --
+///     so the caller must exclude these names from both registrations.
+[[nodiscard]] auto isolate_filtered_scan_instances(NodePtr root,
+                                                   const std::set<std::string>& sources)
+    -> ScanInstanceSplit;
+
 /// A lazy scan eligible for deferred decode: it feeds — through nothing but
 /// column-only Project and Rename nodes — the RIGHT side of an inner
 /// single-key no-predicate join, and occurs nowhere else in the plan.

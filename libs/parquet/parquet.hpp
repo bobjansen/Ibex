@@ -3532,11 +3532,88 @@ class ChunkedParquetSourceOperator final : public ibex::runtime::Operator {
 
 namespace {
 
-/// Build an Arrow array from an ibex ColumnEntry, preserving null values.
+/// Largest amount of character data to put in one Arrow string chunk.
+///
+/// arrow::StringBuilder uses int32 offsets, so a single StringArray cannot hold
+/// more than 2^31-1 bytes of characters. Building a whole column as one array
+/// therefore failed outright on any string column above 2 GB -- for TPC-H that
+/// is lineitem.l_comment at about SF-14. The column is split into chunks under
+/// this budget instead, which keeps the Parquet logical type plain UTF8 (a
+/// LargeStringBuilder would write large_string and change the documented type
+/// mapping). Well under the hard limit so a single long value cannot straddle
+/// it.
+inline auto string_chunk_budget() -> std::size_t {
+    // Overridable only so tests can force many chunk boundaries without
+    // building a multi-gigabyte column; read once, never in the append loop.
+    static const std::size_t budget = [] {
+        if (const char* env = std::getenv("IBEX_PARQUET_STRING_CHUNK_BYTES")) {
+            const auto v = std::strtoull(env, nullptr, 10);
+            if (v > 0)
+                return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(1024ULL * 1024 * 1024);
+    }();
+    return budget;
+}
+
+/// Wrap one finished array as a single-chunk ChunkedArray.
+inline auto single_chunk(std::shared_ptr<arrow::Array> arr)
+    -> std::shared_ptr<arrow::ChunkedArray> {
+    auto type = arr->type();
+    return std::make_shared<arrow::ChunkedArray>(
+        arrow::ArrayVector{std::move(arr)}, std::move(type));
+}
+
+/// Build a chunked UTF8 array from `n` values, splitting chunks so no single
+/// StringArray exceeds the int32 offset limit. `get` returns the i'th value;
+/// `is_null_at` says whether it is null.
+template <typename GetFn, typename IsNullFn>
+inline auto build_string_chunks(std::size_t n, GetFn get, IsNullFn is_null_at, const char* what)
+    -> std::shared_ptr<arrow::ChunkedArray> {
+    arrow::ArrayVector chunks;
+    arrow::StringBuilder builder;
+    std::size_t pending = 0;
+
+    auto flush = [&]() {
+        std::shared_ptr<arrow::Array> arr;
+        auto st = builder.Finish(&arr);
+        if (!st.ok())
+            throw std::runtime_error(std::string("write_parquet: finish ") + what + " failed");
+        chunks.push_back(std::move(arr));
+        pending = 0;
+    };
+
+    for (std::size_t i = 0; i < n; ++i) {
+        arrow::Status st;
+        if (is_null_at(i)) {
+            st = builder.AppendNull();
+        } else {
+            auto sv = get(i);
+            // Close the chunk BEFORE the append that would overflow it, so a
+            // value is never split across two chunks.
+            if (pending != 0 && pending + sv.size() > string_chunk_budget())
+                flush();
+            st = builder.Append(sv.data(), static_cast<int32_t>(sv.size()));
+            pending += sv.size();
+        }
+        if (!st.ok())
+            throw std::runtime_error(std::string("write_parquet: append ") + what + " failed");
+    }
+    // Always flush: an all-null or empty column still needs one chunk so the
+    // ChunkedArray has a length and the table's columns stay aligned.
+    flush();
+
+    return std::make_shared<arrow::ChunkedArray>(std::move(chunks), arrow::utf8());
+}
+
+/// Build an Arrow column from an ibex ColumnEntry, preserving null values.
+///
+/// Returns a ChunkedArray because string columns above the int32 offset limit
+/// must span several arrays; fixed-width types are returned as a single chunk.
 inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
-    -> std::shared_ptr<arrow::Array> {
+    -> std::shared_ptr<arrow::ChunkedArray> {
     return std::visit(
-        [&](const auto& col) -> std::shared_ptr<arrow::Array> {
+        [&](const auto& col) -> std::shared_ptr<arrow::ChunkedArray> {
             using ColT = std::decay_t<decltype(col)>;
             const std::size_t n = col.size();
 
@@ -3558,7 +3635,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 st = builder.Finish(&arr);
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish int64 failed");
-                return arr;
+                return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<double>>) {
                 arrow::DoubleBuilder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
@@ -3577,43 +3654,17 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 st = builder.Finish(&arr);
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish double failed");
-                return arr;
+                return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<std::string>>) {
-                arrow::StringBuilder builder;
-                for (std::size_t i = 0; i < n; ++i) {
-                    arrow::Status st;
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        auto sv = col[i];
-                        st = builder.Append(sv.data(), static_cast<int32_t>(sv.size()));
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("write_parquet: append string failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                auto st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish string failed");
-                return arr;
+                return build_string_chunks(
+                    n, [&](std::size_t i) { return col[i]; },
+                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); }, "string");
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Categorical>>) {
-                arrow::StringBuilder builder;
-                for (std::size_t i = 0; i < n; ++i) {
-                    arrow::Status st;
-                    if (ibex::runtime::is_null(entry, i)) {
-                        st = builder.AppendNull();
-                    } else {
-                        auto sv = col[i];  // string_view from dictionary
-                        st = builder.Append(sv.data(), static_cast<int32_t>(sv.size()));
-                    }
-                    if (!st.ok())
-                        throw std::runtime_error("write_parquet: append categorical failed");
-                }
-                std::shared_ptr<arrow::Array> arr;
-                auto st = builder.Finish(&arr);
-                if (!st.ok())
-                    throw std::runtime_error("write_parquet: finish categorical failed");
-                return arr;
+                // string_view from the dictionary
+                return build_string_chunks(
+                    n, [&](std::size_t i) { return col[i]; },
+                    [&](std::size_t i) { return ibex::runtime::is_null(entry, i); },
+                    "categorical");
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Date>>) {
                 arrow::Date32Builder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
@@ -3632,7 +3683,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 st = builder.Finish(&arr);
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish date failed");
-                return arr;
+                return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<ibex::Timestamp>>) {
                 arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::NANO),
                                                 arrow::default_memory_pool());
@@ -3652,7 +3703,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 st = builder.Finish(&arr);
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish timestamp failed");
-                return arr;
+                return single_chunk(std::move(arr));
             } else if constexpr (std::is_same_v<ColT, ibex::Column<bool>>) {
                 arrow::BooleanBuilder builder;
                 auto st = builder.Reserve(static_cast<int64_t>(n));
@@ -3671,7 +3722,7 @@ inline auto build_arrow_array(const ibex::runtime::ColumnEntry& entry)
                 st = builder.Finish(&arr);
                 if (!st.ok())
                     throw std::runtime_error("write_parquet: finish bool failed");
-                return arr;
+                return single_chunk(std::move(arr));
             } else {
                 static_assert(std::is_same_v<ColT, void>, "unhandled column type in write_parquet");
             }
@@ -3729,14 +3780,16 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     }
     auto schema = arrow::schema(std::move(fields));
 
-    // Build Arrow arrays
-    std::vector<std::shared_ptr<arrow::Array>> arrays;
+    // Build Arrow columns. Chunked, because a string column over 2 GB cannot be
+    // one array (int32 offsets); Table::Make takes ChunkedArrays directly.
+    std::vector<std::shared_ptr<arrow::ChunkedArray>> arrays;
     arrays.reserve(cols.size());
     for (const auto& entry : cols) {
         arrays.push_back(build_arrow_array(entry));
     }
 
-    auto arrow_table = arrow::Table::Make(schema, arrays);
+    auto arrow_table = arrow::Table::Make(schema, arrays,
+                                          static_cast<int64_t>(table.rows()));
 
     // Open output file
     auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));

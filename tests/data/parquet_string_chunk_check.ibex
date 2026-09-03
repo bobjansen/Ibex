@@ -1,0 +1,21 @@
+extern fn write_parquet(df: DataFrame, path: String) -> Int from "parquet.hpp";
+extern fn read_parquet(path: String) -> DataFrame from "parquet.hpp";
+
+// arrow::StringBuilder uses int32 offsets, so one StringArray caps at 2 GB of
+// characters and write_parquet used to throw "append string failed" on any
+// bigger string column (TPC-H lineitem.l_comment above about SF-14). The writer
+// now splits a string column into several chunks under that limit.
+//
+// Reproducing the real 2 GB case would need a multi-gigabyte column, so the
+// harness sets IBEX_PARQUET_STRING_CHUNK_BYTES small and crosses hundreds of
+// chunk boundaries on a tiny column instead: same code path, same boundary
+// arithmetic. `ok` re-derives each row's string from its index, so a value
+// mangled, dropped, or duplicated at a boundary drops `matching` below 50000.
+let base = Table(50000)[update { one = rep([1], length_out = 50000) }];
+let indexed = base[update { idx = rank(one, method = first) }];
+let withstr = indexed[update { s = `v-${idx}-tail` }];
+write_parquet(withstr, "tests/data/parquet_string_chunk_check_out.parquet");
+
+let back = read_parquet("tests/data/parquet_string_chunk_check_out.parquet");
+let checked = back[update { want = `v-${idx}-tail` }][update { ok = (s == want) }];
+checked[select { cnt = count(), total = sum(idx), matching = sum(Int64(ok)) }];

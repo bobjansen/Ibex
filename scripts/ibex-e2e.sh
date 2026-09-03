@@ -88,6 +88,21 @@ if [[ "$SKIP_REPL" == false ]]; then
     fi
     rm -f "$repl_out"
 
+    echo "▸ REPL smoke (parquet plugin, string chunk-boundary check)"
+    repl_out="$(mktemp)"
+    # A tiny chunk budget forces hundreds of write-side string chunks on a small
+    # column, standing in for the >2 GB column that used to fail outright.
+    printf ":load tests/data/parquet_string_chunk_check.ibex\n:quit\n" \
+        | IBEX_PARQUET_STRING_CHUNK_BYTES=1024 IBEX_LIBRARY_PATH="$BUILD_DIR/tools" \
+          "$BUILD_DIR/tools/ibex" >"$repl_out" 2>&1
+    rm -f "$IBEX_ROOT/tests/data/parquet_string_chunk_check_out.parquet"
+    if rg -n "error:" "$repl_out" >/dev/null || ! rg -n "1250025000" "$repl_out" >/dev/null; then
+        cat "$repl_out" >&2
+        rm -f "$repl_out"
+        exit 1
+    fi
+    rm -f "$repl_out"
+
     echo "▸ REPL smoke (parquet plugin, chunked read batch-boundary check)"
     repl_out="$(mktemp)"
     printf ":load tests/data/parquet_chunk_check.ibex\n:quit\n" \

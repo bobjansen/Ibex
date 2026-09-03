@@ -281,29 +281,67 @@ asserts a **hand-computed** answer rather than serial-vs-parallel agreement —
 the two now share one task grid, so an index wrong in both would agree with
 itself. Mutation-checked: an off-by-one within a range fails it.
 
-### 4.3 `Aggregate.Discovery` is serial at low cardinality — 1,835 core-ms (7.7%)
+### 4.3 `Aggregate.Discovery` — 1,835 core-ms (7.7%) — BUILT, and it did not pay
 
-q01 is the pure case and it is stark: **45.3ms of self time, `pool_work` exactly
-0.000, occupancy 0.00** — to discover **four groups**. q15 (249), q11 (102) and
-q21 (1150) are the same shape at other cardinalities.
+**Status: built (2026-09-03). q01 −2%, and the ranking behind it was wrong.**
 
-This is the case from the previous session, and the map confirms the diagnosis
-while re-ranking it third rather than first. q01's whole aggregate — Discovery
-363 + Accumulation 699 — is 1,062 core-ms, and the `update` beneath it
-contributes another 519 through the per-chunk barrier (46 chunks, 106ms of
-barrier wait, `barriers=92`). The shape to build is the one already sketched:
+**"Discovery" is a phase name, not a mechanism.** Probing which code each query
+actually runs under that profile row:
 
-```
-scan + filter + derived columns
-  → worker-local {returnflag, linestatus} aggregate state
-  → one deterministic merge of ~4 groups at the end
-  → order/output
-```
+| query | Discovery is really | serial? |
+|---|---|---|
+| q21 (1,127 core-ms) | `try_owned` — partition-owned key maps | no, already fans out |
+| q18 | `try_async_hot_int_sum` — the streaming hot table | no |
+| q15, q11 | `try_owned`, with `try_discover_partitioned` declining below its floor | no |
+| **q01 (283)** | **multi-key Categorical** | **yes, fully — `pool_work` 0.000** |
 
-i.e. the low-cardinality categorical analogue of the partition-owned path that
-already exists for high-cardinality integer keys. It removes 46 cycles of "scan
-workers occupy the pool → aggregate submits a batch → aggregate waits", which is
-what the 150ms of Accumulation barrier wait *is*.
+So of the 1,835 core-ms, only q01's 283 was the serial thing the map implied,
+and ranking the item by the phase label put three unrelated algorithms in one
+bucket. Idle core-ms tells you which operator idled the cores; it does not tell
+you they idled for one reason.
+
+*What was built anyway,* because q01's case is real: a multi-key Categorical
+group-by ran a **serial** discovery pass writing a gid per row, then a second
+parallel pass reading it back — two passes and two pool barriers per chunk over
+the same 47M rows, plus a 47M-entry gid array nothing else wanted. The
+single-key Categorical path already avoids all of that (a code is a dense index,
+so each morsel accumulates into a private `cells × aggs` slot array and the
+merge assigns gids on first occurrence); a tuple of codes has the same dense
+index in its bounded Cartesian **cell**. Both now run one shared
+`run_dense_fused`, and the morsel/budget constants that were copied in **three**
+places (`try_accumulate_parallel`, the single-key Categorical path, and
+`ungrouped_morsels`) have one definition — `morsel_cut_from_rows` for the shared
+row-derived cut, with the grouped paths adding the byte and merge-ratio gates.
+That matters in this file specifically: its own worst measured bug (`hash_combine`
+missing its finalizer, 12.9x) had to be fixed in three places for the same reason.
+
+**It is not a net simplification, and the line count says so:** +199/−114 code
+lines (comments excluded). Removing the copies is roughly line-neutral once the
+extracted functions pay for their signatures and doc; the growth is the new
+multi-key path. The claim is "one definition of a policy where there were
+three", not "less code".
+
+Measured, SF-8 / 8 cores: q01's `Aggregate.Accumulation` **268ms → 1.5ms** (it
+is fused away), and the aggregate's serial CPU **41.5ms → 5.7ms**. Wall clock:
+**q01 0.984 / 0.980 (min/median, 15 reps), 0.960 / 0.976 (9 reps)** — about −2%,
+consistent in direction, small.
+
+*Why it did not pay, measured rather than guessed.* q01's aggregate barrier wait
+(262ms before, 284ms after) is not its own serial work — it is **contention with
+the concurrent scan decode**. `IBEX_STREAM_SCAN=0` halves the aggregate's own
+time (338ms → 152ms, and its serial fraction goes 0.147 → 0.483) while making
+the query **34% slower** (635ms → 849ms). The scan and the aggregate are
+competing for the same eight cores, and overlapping them is still the right
+trade. q01's floor is its total pool work — scan 1,454 + update 281 + aggregate
+433 ≈ 2,170 core-ms, or 271ms perfectly packed, against 635ms of wall. The
+remaining gap is **scheduling**, not any operator's serial fraction, and the
+mechanism that would close it is pushing the aggregate into the scan pipeline's
+workers so there is no second fan-out to schedule at all.
+
+Verification: 22 outputs byte-identical at 8 cores, q01 also at 1 core; 1839
+tests; a new test drives 450k rows through the fused path (single- and
+multi-chunk) against an independent `std::map` reference, and catches both a
+wrong cell decode and a merge that loses first-occurrence order.
 
 ### 4.4 Inner-join probe and output assembly — ~3,100 core-ms
 
@@ -370,12 +408,20 @@ so before somebody spends a week on the scan.
 2. ~~**Semi/anti build partitioning** (§4.1)~~ — **done**, though not by
    partitioning anything: the breaker was a whole-Table materialization of the
    right side that nothing needed. q04 −28…−38%, q22 −51…−55%, suite −2.7%.
-3. **Worker-local low-cardinality aggregate** (§4.3) — q01 is the validation
-   case, and the one where the mechanism is already fully sketched.
+3. ~~**Worker-local low-cardinality aggregate** (§4.3)~~ — **built, −2%.** The
+   serial pass was real and is gone; q01 is limited by pool contention with its
+   own scan, not by the aggregate. Do not re-attack the aggregate here.
 4. **`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms) — untouched,
    and the harder half: it already runs at occupancy 0.63–0.70, so the headroom
    is real but thinner than Emission's was.
-5. Re-measure the map. Every item above moves capacity between rows; the
+5. **The q01 shape: aggregate inside the scan pipeline.** §4.3's negative result
+   points at it — a breaker that fans out *while its producer is fanned out*
+   spends its time queueing, and no amount of work removed from either side
+   fixes that. Accumulating into per-row-group private state on the scan
+   worker removes the second fan-out entirely. This is the largest unbuilt
+   idea the map has produced, and the first one that is a scheduling change
+   rather than an operator change.
+6. Re-measure the map. Every item above moves capacity between rows; the
    ranking after step 3 is not the ranking now.
 
 The map is regenerated, not maintained by hand:

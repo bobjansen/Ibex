@@ -789,8 +789,22 @@ if [[ "${IBEX_TPCH_MODE:-0}" == "1" ]]; then
     for scale in "${TPCH_SCALES[@]}"; do
         bash /ibex/benchmarking/tpch/gen_data.sh "$scale"
         bash /ibex/benchmarking/tpch/gen_parquet.sh "$scale"
-        bash /ibex/benchmarking/tpch/run_bench.sh --sf "$scale" \
-            --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}" --pdsh-root "$PDSH_ROOT"
+        # --cores is load-bearing on a big box: run_bench.sh pins every engine to
+        # the same set, and without it Polars sizes its pool from nproc, thrashes
+        # above ~8 threads, and inflates Ibex's lead. run-tpch.sh resolves the
+        # physical core count from the instance type; 0 means "deliberately
+        # unpinned".
+        TPCH_ARGS=(--sf "$scale" --warmup "${IBEX_WARMUP:-1}" --iters "${IBEX_ITERS:-5}"
+                   --pdsh-root "$PDSH_ROOT")
+        if [[ -n "${IBEX_TPCH_CORES:-}" && "${IBEX_TPCH_CORES}" != "0" ]]; then
+            TPCH_ARGS+=(--cores "${IBEX_TPCH_CORES}")
+        fi
+        # The in-memory Polars executor materialises whole tables and OOMs the
+        # box at high scale factors; the streaming pass still gives a reference.
+        if [[ "${IBEX_TPCH_POLARS_IN_MEMORY:-1}" == "0" ]]; then
+            TPCH_ARGS+=(--no-polars-in-memory --polars-streaming)
+        fi
+        bash /ibex/benchmarking/tpch/run_bench.sh "${TPCH_ARGS[@]}"
     done
     exit 0
 fi

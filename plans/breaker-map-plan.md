@@ -145,45 +145,80 @@ Full per-query detail: `python benchmarking/breaker_map.py 8`.
 
 ## 4. What the map says — five findings, in rank order
 
-### 4.1 The semi/anti join build is essentially serial — 4,418 core-ms (18.5% of all idle)
+### 4.1 The semi/anti join build is essentially serial — 4,418 core-ms (18.5% of all idle) — BUILT
+
+**Status: done (2026-09-03). q04 −28…−38%, q22 −51…−55%, suite −2.7%.**
 
 q04 `join semi keys=1` at **occ 0.08**, q22 `join anti keys=1` at **occ 0.06**,
-q21's two semi joins at 0.40 and 0.56. This is the single largest recoverable
-block in the suite and it is one operator: `semi_anti_join.cpp`.
+q21's two semi joins at 0.40 and 0.56. The largest recoverable block in the
+suite, and one operator.
 
-The probe half was parallelized (`a69d01d9` + `b07ebdd5` + `e7c7c2c6`, q21
-−34%). The **build** half was not, and at SF-8 it is what is left:
+**The first diagnosis here was wrong, and the way it was wrong is the lesson.**
+It read the code, found `intersect_worker_count`'s 8MB private-slot budget, and
+concluded the cap collapsed the intersection scan to one worker at SF-8. A probe
+of the actual queries says otherwise: q04 takes the hash-intersection path with
+**8 workers**, q22 the dense path with **8 workers**, and q21 neither (its right
+side is small enough for the plain set build). The cap never fired. The
+`barriers=1 pool_tasks=8` in the profile — read as "one fan-out, in `next()`,
+so the build has none" — *was* that intersection scan.
 
-* the left side is drained chunk-by-chunk into a chunk list on the calling
-  thread (`init_int_swapped`);
-* the dense path marks a `candidates` bitmap over **every left key**, serially,
-  before the parallel right-side scan starts — 12M orders rows for q04;
-* the hash path builds a `robin_hood` map of every left key serially
-  (`seen.try_emplace`, one insert per left row);
-* the hit merge and the final `right_i64_.insert` reconstruction are serial
-  loops over the slot space.
+What the build actually spent its time on, timed phase by phase:
 
-**Measured, not inferred.** q04's `join semi keys=1` row reports
-`build_self_ms=172.069` with `pool_work` attributable to the build of **zero**,
-and `barriers=1 pool_tasks=8` for the *entire* operator — one fan-out, of eight
-tasks, in a 261ms operator, and it happens during `next()`, not the build. The
-build phase is 172ms of one thread while seven sit idle. (The `next()` half is a
-different problem: `ring_wait_ms=89.153` against `next_self_ms=89.293` — the
-probe is parked on its producer for 100% of its window, the §4.5 signature.)
+| q04 phase | ms |
+|---|---:|
+| `materialize_row_local` of the right side | **244** |
+| — of which `MaterializeOperator`'s concat | **214** |
+| — of which waiting for the producer | 2 |
+| drain + buffer the left | 15 |
+| build the `seen` map over left keys | 12 |
+| intersection scan (8 workers, 30.3M rows) | 32 |
+| rebuild `right_i64_` from the hit slots | 23 |
 
-The reason is a live footgun: `intersect_worker_count` caps workers by
-`kSlotBudgetBytes / slots` (8 MB of private per-worker slot bytes). Its comment
-reasons about a 57k-key left — a scale where the cap never binds. q04's left is
-12M orders rows over a sparse orderkey span, so the dense bitmap alone is
-megabytes and the cap collapses the one parallel phase to a **single worker**
-(`workers < 2` → run it here) exactly when the left is largest, which is the
-opposite of what is wanted. That is a break-even measured at one scale and
-applied at another.
+The breaker was **`materialize_row_local`**: the construction site handed the
+operator a `Table`, so `MaterializeOperator` copied every chunk of the right
+side into one growing buffer, serially, on the calling thread, while the pool
+sat idle. 214ms of q04's 244ms build; 100 of q22's 111. The producer was never
+the problem — 2ms and 7ms of actual waiting.
 
-*Treatment:* hash-partition the left key space, so candidate marking, the right
-scan, the hit merge, and the set reconstruction are all per-partition and
-private — the same private-state-then-merge idiom the aggregate already uses,
-with the byte budget becoming per-partition rather than per-worker.
+And nothing wanted that Table. The operator reads **one column** (the join key)
+and every scan it runs wants a *range*, not a pointer. The file had already
+learned this for the other side — "Gluing them cost a full copy of the left the
+moment sources started arriving in more than one chunk: on q21 the semi join's
+own time went 113ms -> 211ms" — and the right side was still glued.
+
+*Treatment (built):* the site passes the right side as an **operator**. The join
+drains it and keeps the key column of each chunk, dropping the rest — which also
+disposes of q21's `n_supp_by_order` and q22's `o_custkey`, columns the operator
+never reads and was copying anyway. A `for_right_rows(lo, hi, fn)` walker serves
+the global row ranges the scans split on, so **splitting stays by row**: a right
+side arriving as one chunk still divides across the pool exactly as before. The
+`Categorical` case gained a check a single Table could not need — chunks may
+carry different dictionaries, and codes only mean anything against the one they
+were built with, so a mixed right side goes in as text.
+
+*Measured*, SF-8 / 8 cores, interleaved min-wall over two runs (9 and 13 reps):
+
+| query | min ratio | median ratio |
+|---|---:|---:|
+| q04 | 0.722 / **0.621** | 0.720 / 0.707 |
+| q22 | 0.449 / **0.480** | 0.487 / 0.489 |
+| q21 | 1.034 / 0.931 | 1.064 / 0.902 |
+| suite | **0.973** | — |
+
+q04 and q22 are far outside the ±13% noise floor and agree between min and
+median across both runs. q21 swung both directions and is inside it — expected,
+since its right side arrives as a single chunk and never paid the concat.
+
+Verification: all 22 outputs byte-identical at 8 cores, q04/q21/q22 also at 1
+core; 1838 tests pass; a new test drives a 35-chunk right side through both
+swapped builds (dense and hash intersection) and asserts a hand-computed answer.
+It took two attempts to make that test bite: a left side that does not densely
+cover the right's key space is blind to chunk boundaries, and the first version
+passed under mutation because no left row asked for the dropped keys. Both
+boundary mutations fail it now.
+
+*Still there, and not addressed:* the `seen` map build and the `right_i64_`
+rebuild are serial (12ms + 23ms on q04). Small next to what was removed.
 
 ### 4.2 Hash-aggregate `FinalOrdering` + `Emission` — 3,251 core-ms (13.6%) — Emission BUILT
 
@@ -305,6 +340,12 @@ so before somebody spends a week on the scan.
   `execution_profile.cpp`), and q13's overcorrection comes from its
   `string_filter_scan` donating 1,152 core-ms into other operators' windows.
   **Rank on the large queries; treat q11/q15/q02 as directional.**
+* **It says which operator idled the cores, not why.** Both items built so far
+  were diagnosed wrong from reading the code and right from a five-minute probe
+  of the running query — an emission that was already parallel but capped at
+  the output's width, and a "serial build" that was a `MaterializeOperator`
+  concat one call frame above the operator. Time the phases before writing the
+  fix.
 * **It measures idle, not waste.** An operator doing 4.6× the necessary work at
   perfect occupancy is invisible here — that is what
   `project_task_clock_finds_multiplied_work` is for. The two are complementary
@@ -326,10 +367,9 @@ so before somebody spends a week on the scan.
    −1.6…−2.3%, q18 −5…−12%, byte-identical. Smaller than the 3.7%-of-capacity
    the map priced it at, which is the expected shape: recovering idle capacity
    at one boundary hands it to the next one down.
-2. **Semi/anti build partitioning** (§4.1) — largest win outright, and fixes a
-   threshold that currently misfires at scale. Check `intersect_worker_count`
-   against SF-8 first: if it is collapsing to one worker on q04, that alone is
-   a measurable slice before any restructuring.
+2. ~~**Semi/anti build partitioning** (§4.1)~~ — **done**, though not by
+   partitioning anything: the breaker was a whole-Table materialization of the
+   right side that nothing needed. q04 −28…−38%, q22 −51…−55%, suite −2.7%.
 3. **Worker-local low-cardinality aggregate** (§4.3) — q01 is the validation
    case, and the one where the mechanism is already fully sketched.
 4. **`Aggregate.FinalOrdering`** (§4.2's other half, 1,461 core-ms) — untouched,

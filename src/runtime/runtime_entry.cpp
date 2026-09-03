@@ -566,8 +566,12 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         if (!left_op.has_value()) {
             return std::unexpected(std::move(left_op.error()));
         }
-        auto right =
-            materialize_row_local(*join.children()[1], registry, scalars, externs, exec, model_out);
+        // NOT materialized. The operator drains this itself and keeps only the
+        // key column, chunk by chunk -- `materialize_row_local` here copied the
+        // whole right side into one growing Table on this thread (214ms of
+        // q04's 244ms build) to hand the join a contiguity it never used.
+        auto right = build_operator(*join.children()[1], registry, scalars, externs, exec,
+                                    model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }

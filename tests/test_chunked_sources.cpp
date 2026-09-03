@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -112,6 +113,104 @@ auto run(const std::string& source, const runtime::TableRegistry& registry) -> r
 }
 
 }  // namespace
+
+TEST_CASE("chunked semi/anti join: a multi-chunk right side matches one chunk",
+          "[runtime][chunked][join]") {
+    // The semi/anti join no longer materializes its right side into one Table;
+    // it drains the producer and keeps the key column of each chunk. So every
+    // right-side scan it runs -- the swapped build's key-space bitmap, the
+    // intersection scan, the plain set build -- reads a CONCATENATION now, and
+    // a global row range it splits for the pool can begin in one chunk and end
+    // in another. At one chunk none of that is exercised.
+    //
+    // Getting this test to bite took two tries, and the reason is worth
+    // recording: a left side that does not densely cover the right's key space
+    // is blind to chunk boundaries. Dropping the last row of every right chunk
+    // (the mutation this is written against) changes nothing if no left row
+    // ever asks for those particular keys. Here the left covers every right
+    // row below 20000 and the grain is small, so ~10 boundaries fall inside
+    // the covered range.
+    constexpr std::int64_t kRightRows = 70'000;  // > kSemiSwapThreshold (65536)
+    constexpr std::int64_t kLeftRows = 40'000;
+    constexpr const char* kGrain = "2003";  // 35 right chunks, and divides neither side
+
+    Column<std::int64_t> right_id;
+    runtime::ValidityBitmap right_valid;
+    right_id.reserve(kRightRows);
+    for (std::int64_t r = 0; r < kRightRows; ++r) {
+        // Right row r holds key 2r, and every 1000th is null. A null build key
+        // matches nothing -- including a left row holding that very value,
+        // which is what `nulls never` means on the build side.
+        right_id.push_back(r * 2);
+        right_valid.push_back(r % 1000 != 0);
+    }
+    runtime::Table right;
+    right.add_column("id", std::move(right_id));
+    right.columns[0].validity = std::move(right_valid);
+
+    // One definition of the answer, hand-computed from the construction above.
+    const auto left_matches = [](std::int64_t id) {
+        return id % 2 == 0 && id / 2 < kRightRows && (id / 2) % 1000 != 0;
+    };
+
+    // Two lefts, to reach both swapped builds. Both are dense over 0..39998 so
+    // both see the chunk boundaries; the second adds one far-away key, which
+    // widens the left key SPAN past the bitmap's density gate and sends the
+    // build down the hash-map intersection instead of the dense one. That is
+    // q04's path and q22's path respectively, and they scan the right
+    // differently.
+    for (const bool sparse_outlier : {false, true}) {
+        Column<std::int64_t> left_id;
+        Column<std::int64_t> payload;
+        left_id.reserve(kLeftRows);
+        for (std::int64_t i = 0; i < kLeftRows; ++i) {
+            // Even ids can match; odd ids never can, since every right key is
+            // even.
+            left_id.push_back(sparse_outlier && i == kLeftRows - 1 ? 100'000'000 : i);
+            payload.push_back(i * 10);
+        }
+        runtime::Table left;
+        left.add_column("id", std::move(left_id));
+        left.add_column("payload", std::move(payload));
+
+        runtime::TableRegistry registry;
+        registry.emplace("lhs", std::move(left));
+        registry.emplace("rhs", right);
+
+        for (const char* query : {"lhs semi join rhs on id;", "lhs anti join rhs on id;"}) {
+            INFO(query << (sparse_outlier ? " (hash intersection)" : " (dense intersection)"));
+            const auto one_chunk = run(query, registry);
+            runtime::Table many_chunks;
+            {
+                const ChunkGrainGuard guard(kGrain);
+                many_chunks = run(query, registry);
+            }
+            auto mismatch = runtime::compare_tables(one_chunk, many_chunks);
+            if (mismatch.has_value()) {
+                FAIL(mismatch->message());
+            }
+
+            // And against the hand-computed answer, so a scan that is wrong the
+            // same way at one chunk and at thirty-five cannot agree with itself.
+            const auto* ids = std::get_if<Column<std::int64_t>>(many_chunks.find("id"));
+            REQUIRE(ids != nullptr);
+            const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
+            std::size_t expected = 0;
+            for (std::int64_t i = 0; i < kLeftRows; ++i) {
+                const std::int64_t id =
+                    sparse_outlier && i == kLeftRows - 1 ? 100'000'000 : i;
+                if (left_matches(id) == semi) {
+                    ++expected;
+                }
+            }
+            REQUIRE(ids->size() == expected);
+            for (std::size_t row = 0; row < ids->size(); ++row) {
+                INFO("row " << row << " id " << (*ids)[row]);
+                REQUIRE(left_matches((*ids)[row]) == semi);
+            }
+        }
+    }
+}
 
 TEST_CASE("chunked source groups two categorical keys identically to one chunk",
           "[runtime][chunked][categorical]") {

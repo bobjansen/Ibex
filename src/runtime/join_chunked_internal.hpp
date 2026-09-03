@@ -78,7 +78,10 @@ struct DeferredProbeScan {
 /// Streaming semi/anti join (single equi-key, `nulls never`). A separate
 /// operator from the inner-join family by design — see the parent plan — but
 /// lives in the same translation unit.
-[[nodiscard]] auto make_chunked_semi_anti_join_operator(OperatorPtr left, Table right,
+/// `right` is taken as an OPERATOR, not a materialized Table: the join reads
+/// one column of it and never needs its rows contiguous, so materializing it
+/// was a full serial copy of the right side for nothing.
+[[nodiscard]] auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right,
                                                         ir::JoinKind kind,
                                                         const std::vector<ir::JoinKey>* keys,
                                                         const ExecutionContext* exec) -> OperatorPtr;

@@ -7,9 +7,10 @@ metadata:
 
 # Per-occurrence scan selections over one shared decode
 
-**Status: proposed, nothing built.** The regression that motivates it is
-diagnosed and bisected; one candidate fix was built, measured, and rejected
-(§ Rejected). The design below is what is left.
+**Status: Phase 1 DONE (`78a09fad`), Phase 2a DONE (`bf783ef3`), Phase 2b
+attempted and reverted — it is a three-path problem, see below.** The regression
+that motivates it is diagnosed and bisected; two candidate fixes have now been
+built and rejected, both for the same reason in different places.
 
 ## The defect
 
@@ -141,6 +142,49 @@ columns once; each occurrence gathers. The `instances` map
 (`instance -> source`) already threads through `resolve_lazy` in `repl.cpp` and
 is the natural place to carry the extra indirection. Behaviour still identical
 when every selection is "all rows".
+
+- **2a — the seam. DONE** (`bf783ef3`): `LazyTable::selection_for` returns the
+  rows conjuncts select without materializing any output column, so a caller can
+  decode shared columns once and gather per occurrence. Additive; nothing calls
+  it yet.
+- **2b — the shared decode. ATTEMPTED, reverted. Bigger than this plan
+  assumed** — see below.
+
+#### 2b is a THREE-path problem, not one (found 2026-09-03)
+
+The attempt paired the occurrence rename with a shared decode in
+`decode_demanded_lazy_sources`: group demand by the `LazyTable*` each name
+resolves to, `project` the union of their output columns once (which caches
+them), then `selection_for` + `project_rows` per occurrence, which gathers the
+cached columns in memory. `project_rows` is already written for exactly this —
+its comment says *"columns already cached whole-file (predicate columns, or
+another scan instance's decode) are gathered in memory"*.
+
+**It fixed the e2e case** — the fused scan fired and the answer was right — **and
+still failed `test_repl.cpp:1060`**, with the same `{a}`, `{b}`, `{b}` as the
+naive fix. Instrumenting the grouping showed why: only ONE of the two instances
+was in the eager demand at all. The other had been picked up as a **deferred
+probe scan** and was decoded by the join, never passing through the grouping.
+
+A source's decode can be owned by any of three paths, and sharing has to cover
+all three:
+
+| path | entry point | owns |
+|------|-------------|------|
+| eager | `decode_demanded_lazy_sources` (`repl.cpp`) | `project` / `project_where` |
+| deferred probe | `materialize_deferred_scan` (`interpreter.cpp`) | `project_where`, scheduled by the join |
+| streaming | `DeferredScanSourceOperator` (`pipeline_executor.cpp`) | `project_where_unit`, per unit |
+
+The streaming path is the awkward one: `project_where_unit` **deliberately never
+writes `cache_`** (a unit holds a fragment of a column and must never masquerade
+as the whole), so it cannot participate in a cache-mediated share at all. Its
+own registration already excludes repeated scans by name for this reason.
+
+So Phase 2b needs a representation of "this occurrence's rows over that
+occurrence's decode" that all three paths honour — not just a grouping in the
+eager path. Sequence it after deciding whether the streaming path opts out
+(keeping the pooled decode when any occurrence streams) or gains a shared-buffer
+notion of its own.
 
 **Phase 3 — per-occurrence fused predicate evaluation.**
 With 1 and 2 in place, an occurrence whose predicate is over a filter-only

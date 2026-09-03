@@ -221,6 +221,31 @@ class LazyTable {
                                      const std::string* dynamic_key = nullptr)
         -> std::expected<Table, std::string>;
 
+    /// The rows `conjuncts` select, WITHOUT materializing any output column.
+    ///
+    /// `project_where` computes a selection and immediately spends it decoding
+    /// that occurrence's own output columns, which is right when one occurrence
+    /// owns the decode. It is exactly wrong when several occurrences of one
+    /// source share a decode: each would re-read the file. This returns the
+    /// selection alone, so a caller can decode the shared columns once and
+    /// gather per occurrence.
+    ///
+    /// `nullopt` means "every row" -- no conjunct rejected anything -- and is
+    /// distinct from an empty `Selection`, which means nothing survived.
+    ///
+    /// `output_names` is what the query will actually read from this source. It
+    /// gates the fused scan exactly as `project_where` does: a predicate column
+    /// that the projection also wants is decoded normally rather than answered
+    /// inside the page decoder, because it has to be materialized anyway.
+    ///
+    /// Phase 2 seam of plans/per-occurrence-scan-selections-plan.md. Nothing
+    /// calls it yet.
+    [[nodiscard]] auto selection_for(const std::set<std::string>& output_names,
+                                     const std::vector<ir::Expr>& conjuncts,
+                                     const ExecutionContext& exec,
+                                     const ScalarRegistry* scalars = nullptr)
+        -> std::expected<std::optional<Selection>, std::string>;
+
     /// The source's streaming decomposition, or empty when it has none.
     ///
     /// A source with units can be scanned a piece at a time through

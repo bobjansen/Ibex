@@ -589,6 +589,62 @@ auto LazyTable::scan_string_filters(const std::vector<FusedStringConjunct>& fuse
     return selected;
 }
 
+auto LazyTable::selection_for(const std::set<std::string>& output_names,
+                              const std::vector<ir::Expr>& conjuncts, const ExecutionContext& exec,
+                              const ScalarRegistry* scalars)
+    -> std::expected<std::optional<Selection>, std::string> {
+    if (conjuncts.empty()) {
+        return std::optional<Selection>{};  // every row
+    }
+
+    // Conjuncts over a column nothing else reads are answered inside the page
+    // decoder, so that column is never built. This is the mechanism a repeated
+    // source currently loses entirely.
+    std::vector<FusedStringConjunct> fused;
+    std::vector<ir::Expr> unfused;
+    std::optional<Selection> fused_selection;
+    if (fusable_string_conjuncts(conjuncts, output_names, fused, unfused)) {
+        auto scan = scan_string_filters(fused, nullptr, exec);
+        if (!scan) {
+            return std::unexpected(scan.error());
+        }
+        fused_selection = std::move(*scan);
+    }
+    // A source that declined the fused scan answered nothing, so every conjunct
+    // takes the ordinary path -- matching `project_where`.
+    const std::vector<ir::Expr>& applied = fused_selection.has_value() ? unfused : conjuncts;
+
+    std::optional<Selection> selected;
+    if (!applied.empty()) {
+        robin_hood::unordered_set<std::string> referenced;
+        for (const auto& conjunct : applied) {
+            ir::collect_expr_column_refs(conjunct, referenced);
+        }
+        auto predicates = decode_whole_columns(referenced, exec);
+        if (!predicates) {
+            return std::unexpected(predicates.error());
+        }
+        auto from_conjuncts = filter_selection(*predicates, applied, exec, scalars);
+        if (!from_conjuncts) {
+            return std::unexpected(from_conjuncts.error());
+        }
+        selected = std::move(*from_conjuncts);
+    }
+
+    if (fused_selection.has_value()) {
+        if (!selected.has_value()) {
+            selected = std::move(*fused_selection);
+        } else {
+            // Both are ascending source-row indices, so ANDing them is a merge.
+            Selection both;
+            both.reserve(std::min(selected->size(), fused_selection->size()));
+            std::ranges::set_intersection(*selected, *fused_selection, std::back_inserter(both));
+            selected = std::move(both);
+        }
+    }
+    return selected;
+}
+
 auto LazyTable::project_where(const std::set<std::string>& names,
                               const std::vector<ir::Expr>& conjuncts, const ExecutionContext& exec,
                               const ScalarRegistry* scalars, const DynamicScanFilter* dynamic,

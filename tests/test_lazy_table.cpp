@@ -442,6 +442,50 @@ TEST_CASE("LazyTable: project_where decodes predicates before selected payload c
     CHECK((*b)[1] == 3.5);
 }
 
+TEST_CASE("LazyTable: selection_for returns the rows project_where keeps",
+          "[runtime][lazy_table]") {
+    // The equivalence Phase 2 of plans/per-occurrence-scan-selections-plan.md
+    // rests on: the selection alone must pick out exactly the rows
+    // project_where would have produced, so several occurrences of one source
+    // can share a decode and gather from it instead of each re-reading.
+    FakeSource selection_source;
+    auto selection_lazy = make_lazy(selection_source);
+    auto selection = selection_lazy.selection_for({"a", "b"}, {greater_than("a", 1)}, kExec);
+    REQUIRE(selection);
+    REQUIRE(selection->has_value());
+    CHECK(**selection == runtime::Selection{1, 2});
+
+    FakeSource filtered_source;
+    auto filtered_lazy = make_lazy(filtered_source);
+    auto table = filtered_lazy.project_where({"a", "b"}, {greater_than("a", 1)}, kExec);
+    REQUIRE(table);
+    CHECK(table->rows() == (*selection)->size());
+
+    // No payload column was materialized to answer it: only the predicate
+    // column is read, and read whole.
+    REQUIRE(selection_source.decode_calls.size() == 1);
+    CHECK(selection_source.decode_calls[0] == std::vector<std::string>{"a"});
+    CHECK_FALSE(selection_source.selections[0].has_value());
+}
+
+TEST_CASE("LazyTable: selection_for reports every row as nullopt, not a full selection",
+          "[runtime][lazy_table]") {
+    // `nullopt` (nothing rejected) and an empty Selection (nothing survived)
+    // are opposite answers, so the caller must be able to tell them apart.
+    FakeSource source;
+    auto lazy = make_lazy(source);
+
+    auto none = lazy.selection_for({"a", "b"}, {}, kExec);
+    REQUIRE(none);
+    CHECK_FALSE(none->has_value());
+    CHECK(source.decode_calls.empty());
+
+    auto empty = lazy.selection_for({"a", "b"}, {greater_than("a", 99)}, kExec);
+    REQUIRE(empty);
+    REQUIRE(empty->has_value());
+    CHECK((*empty)->empty());
+}
+
 TEST_CASE("LazyTable: project_where evaluates staged predicates before selected payload",
           "[runtime][lazy_table]") {
     FakeSource source;

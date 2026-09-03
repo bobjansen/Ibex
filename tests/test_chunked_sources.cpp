@@ -249,6 +249,82 @@ TEST_CASE("multi-key categorical aggregate: the fused parallel path matches a re
     }
 }
 
+TEST_CASE("inner join: the left is drained only until the orientation is decided",
+          "[runtime][chunked][join]") {
+    // The join needs one fact about its left side -- whether it has more rows
+    // than the right -- and it used to learn that by CONCATENATING the whole
+    // side into a Table. It now stops pulling as soon as the comparison is
+    // settled and streams the rest, so a left that is bigger than the right is
+    // never copied. Both halves of that need covering:
+    //
+    //   * the left outruns the right, so the drain stops part-way and the
+    //     probe continues from the partially-consumed operator -- the buffered
+    //     chunks first, then the rest;
+    //   * the left runs out first, so everything it had is buffered and the
+    //     swap indexes it, which is the path that still concatenates.
+    //
+    // The right must exceed `kStreamRightThreshold` (65536) or the join takes
+    // the small-right fast path and never measures the left at all.
+    constexpr std::int64_t kRightRows = 70'000;
+
+    Column<std::int64_t> right_id;
+    Column<std::int64_t> right_val;
+    right_id.reserve(kRightRows);
+    for (std::int64_t i = 0; i < kRightRows; ++i) {
+        right_id.push_back(i);
+        right_val.push_back(i * 3);
+    }
+    runtime::Table right;
+    right.add_column("id", std::move(right_id));
+    right.add_column("rv", std::move(right_val));
+
+    for (const std::int64_t left_rows : {200'000, 50'000}) {
+        INFO("left_rows " << left_rows);
+        Column<std::int64_t> left_id;
+        Column<std::int64_t> left_val;
+        left_id.reserve(static_cast<std::size_t>(left_rows));
+        for (std::int64_t i = 0; i < left_rows; ++i) {
+            left_id.push_back(i % kRightRows);
+            left_val.push_back(i);
+        }
+        runtime::Table left;
+        left.add_column("id", std::move(left_id));
+        left.add_column("lv", std::move(left_val));
+
+        runtime::TableRegistry registry;
+        registry.emplace("lhs", std::move(left));
+        registry.emplace("rhs", right);
+
+        const std::string query = "lhs join rhs on id;";
+        const auto one_chunk = run(query, registry);
+        runtime::Table many_chunks;
+        {
+            // A grain that divides neither side, so the drain stops mid-chunk
+            // relative to the right's row count rather than on a boundary.
+            const ChunkGrainGuard guard("30001");
+            many_chunks = run(query, registry);
+        }
+        auto mismatch = runtime::compare_tables(one_chunk, many_chunks);
+        if (mismatch.has_value()) {
+            FAIL(mismatch->message());
+        }
+
+        // Every right key is unique and every left key exists in it, so the
+        // join is one output row per left row -- and `rv` is a function of the
+        // key, which is what catches a probe that carried the wrong right row
+        // across the buffered/streamed boundary.
+        REQUIRE(many_chunks.rows() == static_cast<std::size_t>(left_rows));
+        const auto* out_lv = std::get_if<Column<std::int64_t>>(many_chunks.find("lv"));
+        const auto* out_rv = std::get_if<Column<std::int64_t>>(many_chunks.find("rv"));
+        REQUIRE(out_lv != nullptr);
+        REQUIRE(out_rv != nullptr);
+        for (std::size_t row = 0; row < many_chunks.rows(); ++row) {
+            INFO("row " << row);
+            REQUIRE((*out_rv)[row] == ((*out_lv)[row] % kRightRows) * 3);
+        }
+    }
+}
+
 TEST_CASE("chunked semi/anti join: a multi-chunk right side matches one chunk",
           "[runtime][chunked][join]") {
     // The semi/anti join no longer materializes its right side into one Table;

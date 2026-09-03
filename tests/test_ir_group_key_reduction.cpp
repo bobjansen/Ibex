@@ -61,6 +61,33 @@ auto aggregate(std::vector<std::string> keys, ir::NodePtr input) -> ir::NodePtr 
     return node;
 }
 
+/// Wrap `input` in `order { by desc } head n` -- the top-k the payload lift
+/// requires above the aggregate.
+auto topk(ir::NodePtr input, const std::string& by, std::size_t n) -> ir::NodePtr {
+    auto order = std::make_unique<ir::OrderNode>(
+        ir::NodeId{20}, std::vector<ir::OrderKey>{ir::OrderKey{.name = by, .ascending = false}});
+    order->add_child(std::move(input));
+    auto head = std::make_unique<ir::HeadNode>(ir::NodeId{21}, n);
+    head->add_child(std::move(order));
+    return head;
+}
+
+/// The JoinNode in `plan`, or nullptr -- the lift's re-fetch.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto find_join(const ir::Node& plan) -> const ir::JoinNode* {
+    if (plan.kind() == ir::NodeKind::Join) {
+        return static_cast<const ir::JoinNode*>(&plan);
+    }
+    for (const auto& child : plan.children()) {
+        if (child != nullptr) {
+            if (const auto* found = find_join(*child)) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
 /// The AggregateNode in `plan`, wherever the pass left it.
 auto find_aggregate(const ir::Node& plan) -> const ir::AggregateNode* {
     if (plan.kind() == ir::NodeKind::Aggregate) {
@@ -324,4 +351,87 @@ TEST_CASE("group key proof candidates must determine the complete group key") {
     unrelated->add_child(scan("orders"));
     auto partial = aggregate({"c_custkey", "c_name", "o_orderdate"}, std::move(unrelated));
     CHECK(ir::group_key_proof_candidates(*partial, sources).empty());
+}
+
+TEST_CASE("payload lift moves determined columns above a top-k") {
+    // q10's shape: the reduction turns c_name/c_phone into first() aggregates,
+    // and the lift then moves them out of the aggregate entirely so the scan
+    // stops decoding them -- they are needed only for the surviving rows.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "c_phone", "v"}, "c_custkey"));
+
+    auto plan = topk(aggregate({"c_custkey", "c_name", "c_phone"}, scan("customer")), "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    REQUIRE(agg->group_by().size() == 1);
+    CHECK(agg->group_by().front().name == "c_custkey");
+    // Only the real aggregate survives; both first()s were lifted.
+    REQUIRE(agg->aggregations().size() == 1);
+    CHECK(agg->aggregations().front().alias == "total");
+
+    const auto* join = find_join(*plan);
+    REQUIRE(join != nullptr);
+    REQUIRE(join->keys().size() == 1);
+    CHECK(join->keys().front().left == "c_custkey");
+    CHECK(join->keys().front().right == "c_custkey");
+    // Folded, or the key would collide with the re-fetch side's own copy.
+    CHECK(join->keys().front().fold_output);
+
+    // The caller-visible column order must survive the new shape.
+    REQUIRE(plan->kind() == ir::NodeKind::Project);
+    const auto& columns = static_cast<const ir::ProjectNode&>(*plan).columns();
+    REQUIRE(columns.size() == 4);
+    CHECK(columns[0].name == "c_custkey");
+    CHECK(columns[1].name == "c_name");
+    CHECK(columns[2].name == "c_phone");
+    CHECK(columns[3].name == "total");
+}
+
+TEST_CASE("payload lift re-sorts after the re-fetch join") {
+    // A join's row order is outside the contract (SPEC 5.6), so the ordering the
+    // top-k established has to be re-established above the join.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    auto plan = topk(aggregate({"c_custkey", "c_name"}, scan("customer")), "total", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    REQUIRE(plan->kind() == ir::NodeKind::Project);
+    const auto& under_project = *plan->children().front();
+    REQUIRE(under_project.kind() == ir::NodeKind::Order);
+    const auto& keys = static_cast<const ir::OrderNode&>(under_project).keys();
+    REQUIRE(keys.size() == 1);
+    CHECK(keys.front().name == "total");
+    CHECK_FALSE(keys.front().ascending);
+    CHECK(under_project.children().front()->kind() == ir::NodeKind::Join);
+}
+
+TEST_CASE("payload lift declines without a top-k") {
+    // The structural gate: with no head, every group survives and the re-fetch
+    // would join as many rows as the aggregate produced.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    auto plan = aggregate({"c_custkey", "c_name"}, scan("customer"));
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    CHECK(find_join(*plan) == nullptr);
+    const auto* agg = find_aggregate(*plan);
+    REQUIRE(agg != nullptr);
+    // c_name stays a first() aggregate, the pre-existing behaviour.
+    REQUIRE(agg->aggregations().size() == 2);
+}
+
+TEST_CASE("payload lift declines when the top-k sorts on a lifted column") {
+    // Sorting on c_name picks a different k, and no re-sort above the join can
+    // recover rows the head already discarded.
+    ir::SourceSchemas sources;
+    sources.emplace("customer", source({"c_custkey", "c_name", "v"}, "c_custkey"));
+
+    auto plan = topk(aggregate({"c_custkey", "c_name"}, scan("customer")), "c_name", 20);
+    plan = ir::reduce_functionally_dependent_group_keys(std::move(plan), sources);
+
+    CHECK(find_join(*plan) == nullptr);
 }

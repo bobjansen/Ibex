@@ -113,6 +113,11 @@ install_current_r() {
 }
 
 install_r_benchmark_packages() {
+    # Keep this list in sync with install-deps.sh's. They drifted once: `slider`
+    # was added there and not here, and because a baked AMI never re-runs
+    # provision(), the R box ran all seven sizes with `library(slider)` failing
+    # and uploaded a header-only CSV that read as a clean finish.
+    #
     # Do not load Noble's /usr/lib/R/site-library: it contains native packages
     # compiled for R 4.3 (for example rlang), which fail to load in CRAN's newer
     # R. This dedicated library persists in the AMI and precedes the temporary
@@ -120,7 +125,7 @@ install_r_benchmark_packages() {
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"
     R_LIBS_USER="$R_BENCH_LIB" Rscript --vanilla -e '
-        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow")
+        needed <- c("data.table", "dplyr", "tidyr", "optparse", "nanoarrow", "slider")
         missing <- needed[!sapply(needed, requireNamespace, quietly = TRUE)]
         if (length(missing) > 0) {
             install.packages(missing, repos = "https://cloud.r-project.org",

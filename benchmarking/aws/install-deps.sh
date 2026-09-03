@@ -161,6 +161,7 @@ if [[ $INSTALL_R -eq 1 ]]; then
 
     # Install every benchmark package against the CRAN R runtime, rather than
     # loading Ubuntu packages compiled for the older distro R.
+    # Keep this list in sync with bootstrap.sh's install_r_benchmark_packages().
     R_BENCH_LIB=/usr/local/lib/R/site-library
     mkdir -p "$R_BENCH_LIB"
     export R_LIBS_SITE="$R_BENCH_LIB"

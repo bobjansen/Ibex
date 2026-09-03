@@ -312,12 +312,17 @@ ensure_compiler_compare_toolchain() {
 # rebuilds only the ibex objects that changed between the baked commit and this
 # run's commit; Arrow and the other FetchContent deps are version-pinned and
 # stay built). IBEX_PARQUET_S3=OFF drops the bundled AWS SDK (~64% of targets).
+# IBEX_BUILD_UI=OFF is load-bearing, not a build-time saving: src/ui does an
+# unconditional find_program(npm REQUIRED), so on a box without Node the whole
+# CONFIGURE aborts and every target dies -- including ibex_bench, which never
+# touches the UI. The bench AMI has no npm.
 build_ibex() {
     cmake -B /ibex/build-release -G Ninja \
         -DCMAKE_C_COMPILER="clang-${CLANG_VERSION}" \
         -DCMAKE_CXX_COMPILER="clang++-${CLANG_VERSION}" \
         -DIBEX_PARQUET_S3=OFF \
         -DIBEX_BUILD_LIGHTGBM=OFF \
+        -DIBEX_BUILD_UI=OFF \
         -DIBEX_ENABLE_MARCH_NATIVE=ON \
         -DIBEX_ENABLE_LTO=OFF \
         -DCMAKE_BUILD_TYPE=Release \
@@ -340,6 +345,7 @@ build_ibex_with_compiler() {
         -DIBEX_BUILD_TESTS=OFF \
         -DIBEX_BUILD_EXAMPLES=OFF \
         -DIBEX_BUILD_PYTHON_BRIDGE=OFF \
+        -DIBEX_BUILD_UI=OFF \
         -DIBEX_BUILD_PARQUET=OFF \
         -DIBEX_BUILD_ADBC=OFF \
         -DIBEX_BUILD_KAFKA=OFF \

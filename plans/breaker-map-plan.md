@@ -369,6 +369,129 @@ so before somebody spends a week on the scan.
 
 ---
 
+### 4.6 Re-measure, 2026-09-03 (after §4.1–4.3 landed)
+
+Suite wall **6138 → 5527ms (−10%)**, idle **23,907 → 18,897 core-ms (−21%)**.
+The families re-rank: **join 48.1%** (was 44.5), aggregate 36.9%, map 7.9%,
+scan 6.0% — scan idle fell by two thirds, and `partial` boundaries are now
+73.7% of the total.
+
+Two measured prizes came out of the re-measure, both unbuilt:
+
+**(a) q01 materializes its derived columns — 126ms, 22% of the query.**
+Replacing q01's two expression aggregates with bare-column sums, interleaved
+and pinned on a quiet box: 572.2 / 500.6 / 442.4ms min for two / one / zero
+derived columns — **linear at ~65ms per column**. Only ~25ms of that is the
+arithmetic (`eval_numeric_double_node_block` is 395ms of CPU across both
+columns, ÷8). The other ~40ms per column is the intermediate: each derived
+column is 8MB per chunk, and with 24MB of source columns in flight the working
+set passes this box's 30MB L3, so the aggregate re-reads it from DRAM.
+*Treatment:* evaluate the expression per morsel inside the aggregate so the
+intermediate never leaves cache — expression pushdown into the aggregate, not
+a faster evaluator. (The evaluator itself is already compiled, block-vectorized
+and parallel; making it *more* parallel is a recorded dead end.)
+
+**(b) The inner join's right side is materialized, and the concat is serial.**
+`build_physical_join`'s `SingleKeyInner` branch calls `materialize_row_local`,
+so `MaterializeOperator` copies the whole right side into one growing Table on
+the calling thread — the same shape §4.1 removed from semi/anti, except the
+inner join genuinely needs the right side's rows, so it cannot simply keep the
+key column. Timed: **q10 57ms, q12 65ms, q19 40ms**, against `next` times of
+0ms, 6ms and 34ms — almost none of it is waiting for the producer. That
+accounts exactly for the 30–80ms of otherwise-unexplained serial CPU each inner
+join shows (self minus barrier minus ring wait). q12 is the clearest: it
+materializes **10.95M rows of `orders` to produce a 248k-row join output**.
+**The diagnosis above is right about the cost and wrong about the side.**
+Measuring which side each join actually indexes: the RIGHT is the build side
+almost everywhere, and it is small — q12's right is 248,608 rows, q07's is
+80,000. So q12's 11M-row materialization is not its right side at all. It is
+the **left**, materialized inside `initialize_single_key`:
+
+```cpp
+if (n_right <= kStreamRightThreshold) {            // 65536
+    return adopt_build(build_join_side(*right_, ... BuildRight ...));  // streams the left
+}
+auto left_res = MaterializeOperator(std::move(left_)).run();           // 65ms on q12
+... choose_and_build_single_key(left_table, *right_, ...);             // picks BuildRight
+```
+
+q12 copied a **12M-row left side to discover that 12M > 248k**, then made
+exactly the choice the fast path above would have made for free.
+
+| query | left rows | right rows | build side |
+|---|---:|---:|:--|
+| q12 | 12,000,000 | 248,608 | RIGHT |
+| q10 | 1,200,000 | 458,401 | RIGHT |
+| q03 | 1,169,870 | 401,994 | RIGHT |
+| q07 | 1,169,481 | 80,000 | RIGHT |
+| q09 | 348,500 / 2,610,723 | 80,000 / 2,406,447 | RIGHT |
+
+*Treatment (built, 2026-09-03):* the orientation needs one fact about the left —
+whether it has more rows than the right — and that is settled as soon as enough
+rows have been **seen**, not when the side is exhausted. The join now pulls
+chunks while counting, stops at `n_right`, and hands the partially-consumed
+side to the probe as `BufferedThenStreamSource` (the buffered chunks, then the
+original operator). The buffer holds at most the right's row count: 248k rows
+of q12's 12M instead of a 12M-row copy. The smaller-left case still
+concatenates — it is the side the swap indexes, and `order_preserving_pays`
+needs its ordering and column names — but it is bounded by `n_right` by
+construction.
+
+No estimate, no cost model, no composite row ids: the comparison is exact, and
+the path it selects (`BuildRight` + streaming left) is the one the operator
+already had.
+
+*Measured*, SF-8 / 8 cores, interleaved min-wall over three runs:
+**q12 0.719 / 0.723 / 0.704** (min) and 0.763 / 0.731 / 0.728 (median) — a
+consistent **−27 to −30%**, 223.5 → 157.4ms. q10 −4.5%, q13 −5%, q19 and q03
+and q07 neutral. **Suite −2.7%.**
+
+An intermediate version that drained the left *fully* before deciding cost q19
++2.4% — it buffered every chunk and then concatenated, strictly worse than
+streaming into the concat. Stopping at `n_right` removed that (q19 1.024 →
+0.997).
+
+**One output changed.** q14 moves by 4.5e-15 relative (16.624545325936882 →
+...808). The left now reaches the probe as several chunks instead of one table,
+and a downstream aggregate derives its morsel cut from the rows in each chunk,
+so the float reduction order changed. Thread-count determinism is intact — q14
+is identical at 1, 2 and 8 cores — and `check_answers.py` passes all 22. This is
+the determinism contract working as written (the cut is data-derived, not
+schedule-derived); it is chunk *boundaries* that moved, and they are part of the
+plan, not the answer.
+
+**Dead end — parallelizing the copy instead of removing it (2026-09-03).**
+The cheaper thing to try first, and it does not work. `MaterializeOperator`
+gained an optional `ExecutionContext`, pre-sized each destination column for
+the incoming chunk, and copied it as `(column × row range)` tasks — the shape
+`gather_columns_batched` uses. Suite **1.018, a 1.8% regression**, and the
+per-chunk concat got *worse* on the queries it targeted (q12 65 → 88ms, q19
+40 → 60ms; only q10 improved, 57 → 46ms).
+
+Two things went wrong, and the second is the real lesson:
+
+* `Column::resize` **value-initializes**, so a split column was memset and then
+  memcpy'd over. Restricting the split to `Column<int64_t>`/`Column<double>`
+  (the only element types `NoInitAllocator` leaves uninitialized — `Date` and
+  `Timestamp` carry a default member initializer, `Categorical`'s codes use a
+  plain allocator) recovered part of it: q12 92 → 88ms. Still worse than serial.
+* **The concat is not CPU-bound.** It is a bulk memcpy competing with the
+  concurrent scan decode for the same memory system, so splitting it across
+  eight threads buys nothing and costs a submit/wait per chunk — 46 of them on
+  q19. This is the same finding as §4.3's: at this point in the engine, work
+  that looks parallelizable is usually bandwidth, and the fix is to *remove the
+  traffic*, not to spread it.
+
+So the concat has to be **eliminated**, not parallelized.
+
+**Measured and reverted:** `append_column_values` copied `Column<std::string>`
+one `push_back` per row, which the column header itself documents as costing
+2× a cursor write. Replacing it with one memcpy of the source's contiguous
+character range plus a rebased offsets copy took q10's append 57 → 45ms and the
+suite **0.999** — flat. The concat's cost is bulk memcpy of fixed-width columns
+(q12: 11M rows at ~6ns/row), not the string encoding, so this was the wrong
+half of the problem. Reverted; the finding is (b).
+
 ## 5. What the map does not say
 
 * **Small-query attribution is soft.** Per-query closure runs 95–104% on the

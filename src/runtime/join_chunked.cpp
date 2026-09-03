@@ -1748,6 +1748,35 @@ struct SwappedHashProbeInput {
     JoinProbe probe;
 };
 
+/// Replays chunks already pulled out of `rest`, then hands `rest` back over.
+///
+/// The join needs one number about its left side -- whether it has more rows
+/// than the right -- and that question is answered as soon as it has SEEN
+/// enough rows, not when the side is exhausted. So the drain stops there and
+/// the partially-consumed side continues from here: the buffer holds at most
+/// the right's row count, and the rest of the left is never buffered at all.
+/// On q12 that is 248k rows held out of 12M rather than a 12M-row copy.
+class BufferedThenStreamSource final : public Operator {
+   public:
+    BufferedThenStreamSource(std::vector<Chunk> buffered, OperatorPtr rest)
+        : buffered_(std::move(buffered)), rest_(std::move(rest)) {}
+
+    auto next() -> std::expected<std::optional<Chunk>, std::string> override {
+        if (position_ < buffered_.size()) {
+            return std::optional<Chunk>{std::move(buffered_[position_++])};
+        }
+        if (rest_ == nullptr) {
+            return std::optional<Chunk>{};
+        }
+        return rest_->next();
+    }
+
+   private:
+    std::vector<Chunk> buffered_;
+    OperatorPtr rest_;
+    std::size_t position_ = 0;
+};
+
 struct PrecomputedHashProbeInput {
     Table output;
 };
@@ -1978,27 +2007,88 @@ class ChunkedInnerJoinOperator final : public Operator {
                                                build_partitions(n_right)));
         }
 
-        Table left_table;
+        // The orientation needs exactly one fact about the left: how many rows
+        // it has. Draining it yields that; CONCATENATING it -- what this used
+        // to do unconditionally -- copies the whole side, and the copy is
+        // wasted whenever the right wins the comparison. On PDS-H the right
+        // wins every time: q12 spent 65ms copying 12M rows of `orders` to
+        // discover that 12M > 248k, then indexed the 248k side exactly as the
+        // small-right fast path above would have.
+        std::vector<Chunk> left_chunks;
+        std::size_t n_left = 0;
+        bool left_exhausted = false;
+        std::optional<Table> drained_left;
         if (use_materialized_left_ && left_materialized_.has_value()) {
-            // The deferred-probe path already drained the left child.
-            left_table = std::move(*left_materialized_);
+            // The deferred-probe path already drained the left child, and it
+            // drained it into a Table -- there is nothing left to avoid.
+            drained_left = std::move(*left_materialized_);
             left_materialized_.reset();
             use_materialized_left_ = false;
+            n_left = drained_left->rows();
+            left_exhausted = true;
         } else {
-            auto left_res = MaterializeOperator(std::move(left_)).run();
+            // Stop as soon as the comparison is decided. Past `n_right` rows
+            // the answer cannot change, so every further chunk would be
+            // buffered for nothing.
+            while (n_left < n_right) {
+                if (interrupt_requested()) {
+                    return interrupt_message();
+                }
+                auto chunk = left_->next();
+                if (!chunk.has_value()) {
+                    return std::move(chunk.error());
+                }
+                if (!chunk->has_value()) {
+                    left_exhausted = true;
+                    break;
+                }
+                n_left += (*chunk)->rows();
+                left_chunks.push_back(std::move(**chunk));
+            }
+        }
+
+        if (n_left >= n_right) {
+            // Build on the right and stream the left back through the index --
+            // the same orientation `choose_and_build_single_key` reaches for
+            // these counts, without the Table it would have needed to say so.
+            if (!drained_left.has_value()) {
+                left_ = std::make_unique<BufferedThenStreamSource>(std::move(left_chunks),
+                                                                   std::move(left_));
+            }
+            auto outcome = build_join_side(*right_, right_key_name, key_kind,
+                                           JoinOrientation::BuildRight, build_partitions(n_right));
+            return adopt_build(std::move(outcome), std::move(drained_left));
+        }
+
+        // A left smaller than the right is the only case that can want the
+        // swap, and the only one that needs the left as a Table: the swap
+        // indexes it, and `order_preserving_pays` reads its ordering and
+        // column names. Concatenating it here keeps one definition of what a
+        // concatenation means (schema checks, validity backfill, properties).
+        // Reaching here means the left ran out before it matched the right's
+        // row count, so everything it had is in `left_chunks` and it is at most
+        // `n_right` rows -- the side the swap was going to index anyway.
+        if (!left_exhausted) {
+            invariant_violation("join build: undrained left on the swap path");
+        }
+        Table left_table;
+        if (drained_left.has_value()) {
+            left_table = std::move(*drained_left);
+        } else {
+            auto left_res = MaterializeOperator(std::make_unique<BufferedThenStreamSource>(
+                                                    std::move(left_chunks), nullptr))
+                                .run();
             if (!left_res.has_value()) {
                 return std::move(left_res.error());
             }
             left_table = std::move(*left_res);
         }
-        const std::size_t n_left = left_table.rows();
 
         // Evaluated only when swapping was otherwise preferred: it is not a
         // pure predicate (it can set up the probe's right-emit schema), so
         // asking it unconditionally would move work the short-circuit used to
         // skip.
-        const bool order_pays =
-            n_left < n_right && order_preserving_pays(left_table, n_left, n_right);
+        const bool order_pays = order_preserving_pays(left_table, n_left, n_right);
         auto outcome = choose_and_build_single_key(left_table, *right_, left_key_name,
                                                    right_key_name, key_kind, order_pays,
                                                    build_partitions(std::min(n_left, n_right)));

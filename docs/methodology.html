@@ -54,11 +54,13 @@
     <span class="nav-logo">Ibex</span>
     <div class="nav-links">
       <a class="nav-link" href="./index.html">Home</a>
-      <a class="nav-link" href="./docs.html">Docs</a>
-      <a class="nav-link" href="./examples.html">Examples</a>
-      <a class="nav-link" href="./playground.html">Playground</a>
+      <a class="nav-link" href="./getting-started.html">Getting started</a>
       <a class="nav-link active" href="./benchmarks.html">Benchmarks</a>
+      <a class="nav-link" href="./comparison.html">Comparison</a>
       <a class="nav-link" href="./reference.html">Reference</a>
+      <a class="nav-link" href="./io.html">I/O</a>
+      <a class="nav-link" href="./functions.html">Function reference</a>
+      <a class="nav-link" href="./cheatsheet.html">Cheat sheet</a>
       <a class="nav-link" href="https://github.com/bobjansen/Ibex" target="_blank" rel="noopener">GitHub &#8599;</a>
     </div>
   </nav>
@@ -90,11 +92,13 @@ benchmarking/run_scale_suite.sh --warmup 1 --iters 3
 # render these pages from that CSV:
 python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
     <p class="section-sub">
-      The published numbers come from a clean cloud box for isolation &mdash; an
-      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids, 64&nbsp;GB),
-      one command end-to-end:
+      The published numbers come from clean cloud boxes for isolation &mdash;
+      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids = 4 physical
+      cores, 64&nbsp;GB), <strong>one instance per engine</strong> so no engine
+      competes with another for memory bandwidth or threads. One command
+      end-to-end:
     </p>
-    <pre>./benchmarking/aws/run.sh --on-demand   # provisions, runs 1M&ndash;50M, uploads, shuts down</pre>
+    <pre>./benchmarking/aws/run-per-engine.sh --on-demand   # one box per engine, 1M&ndash;50M, uploads, shuts down</pre>
     <div class="callout">
       <strong>Know a faster way to write one of these queries?</strong> Open a PR
       against
@@ -114,7 +118,7 @@ python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
       time-window comparison is auditable. <code>polars-st</code> runs identical
       code to Polars with <code>POLARS_MAX_THREADS=1</code>, and
       <code>ibex-st</code> identical code to Ibex with
-      <code>IBEX_PARALLEL=0</code>; <code>ibex+parse</code>
+      <code>IBEX_CORES=1</code>; <code>ibex+parse</code>
       is the same Ibex query timed with parsing included.
     </p>
     <div class="codewrap">

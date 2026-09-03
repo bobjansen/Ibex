@@ -444,6 +444,103 @@ void rename_chain_scan(NodePtr& node, const std::string& instance) {
     rename_chain_scan(node->mutable_children().front(), instance);
 }
 
+/// Is `expr` a `like(col, "literal")`, possibly negated? The column name if so.
+///
+/// Deliberately narrow. Splitting a source's occurrences is only worth its cost
+/// when pushdown buys something a downstream filter cannot: a `like` over a
+/// column the query reads from nowhere else is answered inside the page decoder
+/// and the string column is never built at all. Every other predicate is merely
+/// evaluated EARLIER by pushing, which is not worth a per-occurrence gather --
+/// measured: splitting on q21's `l_receiptdate > l_commitdate` costs +10% there,
+/// because each occurrence then materializes its own 48M-row gather instead of
+/// sharing one table that downstream filters stream over.
+// NOLINTNEXTLINE(misc-no-recursion)
+auto like_predicate_column(const Expr& expr) -> const std::string* {
+    if (const auto* logical = std::get_if<LogicalExpr>(&expr.node)) {
+        if (logical->op == LogicalOp::Not && logical->left != nullptr) {
+            return like_predicate_column(*logical->left);
+        }
+        return nullptr;
+    }
+    const auto* call = std::get_if<CallExpr>(&expr.node);
+    if (call == nullptr || call->callee != "like" || call->args.size() != 2 ||
+        !call->named_args.empty() || call->args[0] == nullptr || call->args[1] == nullptr) {
+        return nullptr;
+    }
+    if (std::get_if<Literal>(&call->args[1]->node) == nullptr) {
+        return nullptr;
+    }
+    const auto* column = as_column_ref(*call->args[0]);
+    return column == nullptr ? nullptr : &column->name;
+}
+
+/// Sources with an occurrence whose filter is a fusable `like`.
+// NOLINTNEXTLINE(misc-no-recursion)
+void collect_filtered_sources(const Node& node, std::set<std::string>& out) {
+    if (const auto* predicate = filter_predicate(node)) {
+        std::vector<const RenameNode*> renames;
+        if (const auto* scan = projected_scan(node, &renames); scan != nullptr) {
+            Expr scan_predicate = *predicate;
+            for (const auto* rename : renames) {
+                ColumnNameMap(rename->renames()).remap_expr_to_input(scan_predicate);
+            }
+            std::vector<Expr> conjuncts;
+            if (append_conjuncts(scan_predicate, conjuncts)) {
+                for (const auto& conjunct : conjuncts) {
+                    if (like_predicate_column(conjunct) != nullptr) {
+                        out.insert(scan->source_name());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (node.kind() == NodeKind::Program) {
+        const auto& program = node_cast<ProgramNode>(node);
+        for (const auto& preamble : program.preamble()) {
+            if (preamble != nullptr) {
+                collect_filtered_sources(*preamble, out);
+            }
+        }
+        collect_filtered_sources(program.main_node(), out);
+    }
+    for (const auto& child : node.children()) {
+        if (child != nullptr) {
+            collect_filtered_sources(*child, out);
+        }
+    }
+}
+
+/// Rename every occurrence of a source in `split_these` to its own instance.
+// NOLINTNEXTLINE(misc-no-recursion)
+void isolate_filtered(NodePtr& node, const std::set<std::string>& split_these,
+                      std::map<std::string, std::size_t>& next_instance,
+                      std::map<std::string, std::string>& instances) {
+    if (node->kind() == NodeKind::Scan) {
+        const auto& source = node_cast<ScanNode>(*node).source_name();
+        if (split_these.contains(source)) {
+            auto instance = source + "#f" + std::to_string(++next_instance[source]);
+            instances.emplace(instance, source);
+            node = std::make_unique<ScanNode>(node->id(), instance);
+        }
+        return;
+    }
+    if (node->kind() == NodeKind::Program) {
+        auto& program = node_cast<ProgramNode>(*node);
+        for (auto& preamble : program.mutable_preamble()) {
+            if (preamble != nullptr) {
+                isolate_filtered(preamble, split_these, next_instance, instances);
+            }
+        }
+        isolate_filtered(program.mutable_main_node(), split_these, next_instance, instances);
+    }
+    for (auto& child : node->mutable_children()) {
+        if (child != nullptr) {
+            isolate_filtered(child, split_these, next_instance, instances);
+        }
+    }
+}
+
 void isolate_probes(NodePtr& node, const std::set<std::string>& sources,
                     const std::map<std::string, std::size_t>& counts,
                     std::map<std::string, std::size_t>& next_instance,
@@ -541,6 +638,34 @@ auto isolate_deferrable_probe_scans(NodePtr root, const std::set<std::string>& s
     count_scan_occurrences(*root, counts);
     std::map<std::string, std::size_t> next_instance;
     isolate_probes(root, sources, counts, next_instance, split.instances);
+    split.plan = std::move(root);
+    return split;
+}
+
+auto isolate_filtered_scan_instances(NodePtr root, const std::set<std::string>& sources)
+    -> ScanInstanceSplit {
+    ScanInstanceSplit split;
+    if (root == nullptr || sources.empty()) {
+        split.plan = std::move(root);
+        return split;
+    }
+    std::map<std::string, std::size_t> counts;
+    count_scan_occurrences(*root, counts);
+
+    std::set<std::string> filtered;
+    collect_filtered_sources(*root, filtered);
+
+    std::set<std::string> split_these;
+    for (const auto& source : filtered) {
+        const auto count = counts.find(source);
+        if (count != counts.end() && count->second > 1 && sources.contains(source)) {
+            split_these.insert(source);
+        }
+    }
+    if (!split_these.empty()) {
+        std::map<std::string, std::size_t> next_instance;
+        isolate_filtered(root, split_these, next_instance, split.instances);
+    }
     split.plan = std::move(root);
     return split;
 }

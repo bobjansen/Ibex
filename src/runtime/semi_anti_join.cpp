@@ -46,9 +46,13 @@ namespace {
 
 class ChunkedSemiAntiJoinOperator final : public Operator {
    public:
-    ChunkedSemiAntiJoinOperator(OperatorPtr left, Table right, ir::JoinKind kind,
+    ChunkedSemiAntiJoinOperator(OperatorPtr left, OperatorPtr right, ir::JoinKind kind,
                                 const std::vector<ir::JoinKey>* keys, const ExecutionContext* exec)
-        : left_(std::move(left)), right_(std::move(right)), kind_(kind), keys_(keys), exec_(exec) {}
+        : left_(std::move(left)),
+          right_op_(std::move(right)),
+          kind_(kind),
+          keys_(keys),
+          exec_(exec) {}
 
     [[nodiscard]] auto next() -> std::expected<std::optional<Chunk>, std::string> override {
         if (!initialized_) {
@@ -127,24 +131,19 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// multi-million-entry hash probe. q21: ~5M distinct order keys spanning
     /// ~24M values -> a 3MB bitmap probed 15M times instead of an ~80MB
     /// robin_hood set. Returns false to leave the hash build to the caller.
-    template <typename RNull>
-    auto try_build_dense_right(const Column<std::int64_t>& rcol, RNull rnull) -> bool {
-        const std::size_t rows = rcol.size();
+    auto try_build_dense_right() -> bool {
+        const std::size_t rows = right_rows_;
         if (rows == 0) {
             return false;
         }
         std::int64_t min_key = std::numeric_limits<std::int64_t>::max();
         std::int64_t max_key = std::numeric_limits<std::int64_t>::min();
         std::size_t live = 0;
-        for (std::size_t i = 0; i < rows; ++i) {
-            if (rnull(i)) {
-                continue;
-            }
-            const std::int64_t value = rcol[i];
+        for_right_rows<std::int64_t>(0, rows, [&](std::int64_t value) {
             min_key = std::min(min_key, value);
             max_key = std::max(max_key, value);
             ++live;
-        }
+        });
         if (live == 0) {
             return false;
         }
@@ -164,14 +163,11 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         dense_i64_min_ = min_key;
         dense_i64_nbits_ = static_cast<std::size_t>(span);
         dense_i64_hits_.assign((dense_i64_nbits_ + 63U) / 64U, std::uint64_t{0});
-        for (std::size_t i = 0; i < rows; ++i) {
-            if (rnull(i)) {
-                continue;
-            }
+        for_right_rows<std::int64_t>(0, rows, [&](std::int64_t value) {
             const std::uint64_t slot =
-                static_cast<std::uint64_t>(rcol[i]) - static_cast<std::uint64_t>(min_key);
+                static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(min_key);
             dense_i64_hits_[dense_word(slot)] |= dense_bit(slot);
-        }
+        });
         return true;
     }
 
@@ -202,13 +198,103 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         return workers < 2 ? 0 : workers;
     }
 
+    /// Drain the right side, keeping only the join key column of each chunk.
+    ///
+    /// This is what replaces `materialize_row_local` at the construction site.
+    /// The old shape asked for a whole Table, so `MaterializeOperator` copied
+    /// every chunk of every column into one growing buffer -- serially, on the
+    /// calling thread. Nothing here wanted that: the operator reads one column
+    /// and only ever scans it.
+    auto drain_right_keys() -> std::optional<std::string> {
+        const std::string& key_name = keys_->front().right;
+        const std::size_t* type_index = nullptr;
+        std::size_t first_index = 0;
+        while (true) {
+            if (interrupt_requested()) {
+                return interrupt_message();
+            }
+            auto chunk_res = right_op_->next();
+            if (!chunk_res.has_value()) {
+                return std::move(chunk_res.error());
+            }
+            if (!chunk_res.value().has_value()) {
+                break;
+            }
+            Chunk chunk = std::move(*chunk_res.value());
+            ColumnEntry* entry = nullptr;
+            for (auto& column : chunk.columns) {
+                if (column.name == key_name) {
+                    entry = &column;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                if (chunk.columns.empty()) {
+                    continue;  // a column-less chunk carries no keys
+                }
+                return "join key not found in right table: " + key_name;
+            }
+            // One definition of the type across chunks, the check
+            // `MaterializeOperator` used to make on the way to a Table.
+            if (type_index == nullptr) {
+                first_index = entry->column->index();
+                type_index = &first_index;
+            } else if (entry->column->index() != first_index) {
+                return "ChunkedSemiAntiJoinOperator: right key column type differs across chunks";
+            }
+            right_rows_ += column_size(*entry->column);
+            right_key_chunks_.push_back(std::move(*entry));
+        }
+        right_op_.reset();
+        return std::nullopt;
+    }
+
+    /// Is row `row` of right chunk `chunk` null?
+    static auto chunk_is_null(const ColumnEntry& chunk, std::size_t row) -> bool {
+        return chunk.validity.has_value() && !(*chunk.validity)[row];
+    }
+
+    /// Visit the non-null right keys in the global row range `[lo, hi)`.
+    ///
+    /// The right key sequence is a concatenation of per-chunk columns, so a
+    /// global range covers a contiguous run of rows in one or more chunks.
+    /// This is the contiguity the operator used to buy with a full copy --
+    /// every scan below wants a *range*, not a pointer, and a range is
+    /// something a chunk list can serve directly. Splitting stays by ROW so a
+    /// right side that arrives as a single chunk still divides across the
+    /// pool.
+    template <typename Column_T, typename Fn>
+    void for_right_rows(std::size_t lo, std::size_t hi, Fn&& fn) const {
+        std::size_t base = 0;
+        for (const auto& chunk : right_key_chunks_) {
+            const auto* col = std::get_if<Column<Column_T>>(chunk.column.get());
+            if (col == nullptr) {
+                return;
+            }
+            const std::size_t rows = col->size();
+            const std::size_t begin = std::max(lo, base);
+            const std::size_t end = std::min(hi, base + rows);
+            for (std::size_t row = begin; row < end; ++row) {
+                const std::size_t local = row - base;
+                if (chunk_is_null(chunk, local)) {
+                    continue;  // a null right key puts nothing in the set
+                }
+                fn((*col)[local]);
+            }
+            base += rows;
+            if (base >= hi) {
+                return;
+            }
+        }
+    }
+
     // Build the right-key set as the INTERSECTION of the two key columns, by
     // probing the large right against a map of the small left keys rather than
     // inserting every right key. `filter_chunk` then works unchanged: a left row
     // is in the intersection iff it has a right match (semi keeps those; anti
     // keeps the rest). Restricted to integer keys, which every TPC-H join uses
     // and where the win is; other key types keep the streaming build-on-right.
-    auto init_int_swapped(const Column<std::int64_t>& rcol) -> std::optional<std::string> {
+    auto init_int_swapped() -> std::optional<std::string> {
         // Drain the left into a list of chunks. Deliberately NOT
         // `MaterializeOperator`: see the note in `next()` — concatenating them
         // is a full copy of the left that nothing here needs.
@@ -224,12 +310,6 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         }
         swapped_ = true;
 
-        const auto* rentry = right_.find_entry(keys_->front().right);
-        const ValidityBitmap* rvalidity =
-            rentry != nullptr && rentry->validity.has_value() ? &*rentry->validity : nullptr;
-        const auto rnull = [rvalidity](std::size_t row) {
-            return rvalidity != nullptr && !(*rvalidity)[row];
-        };
         // The left key column, chunk by chunk. Every chunk must carry it as an
         // int64 for the intersection build to be worth taking; one that does not
         // falls back to the plain right set below, exactly as a missing key
@@ -247,7 +327,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             lcols.push_back(lcol);
             left_rows += lcol->size();
         }
-        if (!lcols.empty() && left_rows < rcol.size()) {
+        if (!lcols.empty() && left_rows < right_rows_) {
             // A moderately dense integer key range does not need a hash lookup
             // for every row on the large side. q22's 84k in-scope customer
             // keys span only ~300k values: a byte-addressed candidate table is
@@ -301,34 +381,30 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     }
                 }
                 const auto scan_range = [&](std::size_t lo, std::size_t hi, std::uint64_t* hits) {
-                    for (std::size_t row = lo; row < hi; ++row) {
-                        if (rnull(row)) {
-                            continue;
-                        }
-                        const std::int64_t value = rcol[row];
+                    for_right_rows<std::int64_t>(lo, hi, [&](std::int64_t value) {
                         if (value < min_key || value > max_key) {
-                            continue;
+                            return;
                         }
                         const std::uint64_t slot = slot_of(value);
                         if ((candidates[dense_word(slot)] & dense_bit(slot)) != 0) {
                             hits[dense_word(slot)] |= dense_bit(slot);
                         }
-                    }
+                    });
                 };
 
                 std::vector<std::uint64_t> hits(nwords, std::uint64_t{0});
                 const std::size_t workers =
-                    intersect_worker_count(rcol.size(), nwords * sizeof(std::uint64_t));
+                    intersect_worker_count(right_rows_, nwords * sizeof(std::uint64_t));
                 if (workers < 2) {
-                    scan_range(0, rcol.size(), hits.data());
+                    scan_range(0, right_rows_, hits.data());
                 } else {
                     std::vector<std::vector<std::uint64_t>> parts(
                         workers, std::vector<std::uint64_t>(nwords, std::uint64_t{0}));
-                    const std::size_t grain = (rcol.size() + workers - 1) / workers;
+                    const std::size_t grain = (right_rows_ + workers - 1) / workers;
                     auto batch = process_worker_pool().submit(workers, [&](std::size_t worker) {
                         const std::size_t begin = worker * grain;
-                        if (begin < rcol.size()) {
-                            scan_range(begin, std::min(rcol.size(), begin + grain),
+                        if (begin < right_rows_) {
+                            scan_range(begin, std::min(right_rows_, begin + grain),
                                        parts[worker].data());
                         }
                     });
@@ -375,30 +451,27 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             const std::size_t n_slots = next_slot;
 
             const auto scan_range = [&](std::size_t lo, std::size_t hi, char* hits) {
-                for (std::size_t i = lo; i < hi; ++i) {
-                    if (rnull(i)) {
-                        continue;  // a null right key puts nothing in the set
-                    }
-                    if (auto it = seen.find(rcol[i]); it != seen.end()) {
+                for_right_rows<std::int64_t>(lo, hi, [&](std::int64_t value) {
+                    if (auto it = seen.find(value); it != seen.end()) {
                         hits[it->second] = char{1};
                     }
-                }
+                });
             };
 
             std::vector<char> hits(n_slots, char{0});
-            const std::size_t workers = intersect_worker_count(rcol.size(), n_slots);
+            const std::size_t workers = intersect_worker_count(right_rows_, n_slots);
             if (workers < 2) {
-                scan_range(0, rcol.size(), hits.data());
+                scan_range(0, right_rows_, hits.data());
             } else {
                 // One private vector per worker, ORed below. `n_slots` bytes
                 // each, which is why the worker count is capped by a byte
                 // budget rather than by the pool size alone.
                 std::vector<std::vector<char>> parts(workers, std::vector<char>(n_slots, char{0}));
-                const std::size_t grain = (rcol.size() + workers - 1) / workers;
+                const std::size_t grain = (right_rows_ + workers - 1) / workers;
                 auto batch = process_worker_pool().submit(workers, [&](std::size_t w) {
                     const std::size_t lo = w * grain;
-                    if (lo < rcol.size()) {
-                        scan_range(lo, std::min(rcol.size(), lo + grain), parts[w].data());
+                    if (lo < right_rows_) {
+                        scan_range(lo, std::min(right_rows_, lo + grain), parts[w].data());
                     }
                 });
                 batch.wait();
@@ -414,16 +487,13 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
                     right_i64_.insert(k);
                 }
             }
-        } else if (!try_build_dense_right(rcol, rnull)) {
+        } else if (!try_build_dense_right()) {
             // Left is not the smaller side (or its key vanished) and the right
             // key span is too wide/sparse for a bitmap; the plain right set is
             // as good, and the buffered left still emits.
-            right_i64_.reserve(rcol.size());
-            for (std::size_t i = 0; i < rcol.size(); ++i) {
-                if (!rnull(i)) {
-                    right_i64_.insert(rcol[i]);
-                }
-            }
+            right_i64_.reserve(right_rows_);
+            for_right_rows<std::int64_t>(0, right_rows_,
+                                         [&](std::int64_t value) { right_i64_.insert(value); });
         }
         return std::nullopt;
     }
@@ -432,91 +502,115 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         if (keys_->size() != 1) {
             return "ChunkedSemiAntiJoinOperator only supports single-key joins";
         }
-        if (right_.columns.empty()) {
+        if (auto err = drain_right_keys()) {
+            return err;
+        }
+        if (right_key_chunks_.empty()) {
             return std::nullopt;
         }
-        const ColumnValue* key = right_.find(keys_->front().right);
-        if (key == nullptr) {
-            return "join key not found in right table: " + keys_->front().right;
-        }
+        // The key type is one column's type, checked to be the same in every
+        // chunk by the drain, so the first chunk answers for all of them.
+        const ColumnValue& key = *right_key_chunks_.front().column;
+
         // The other half of "a null matches nothing": a null-keyed right row is
         // never put in the set, so nothing can find it. Skipping it on the probe
         // side alone would still let a null here be found by a genuine zero.
-        const auto* right_entry = right_.find_entry(keys_->front().right);
-        const ValidityBitmap* build_validity =
-            right_entry != nullptr && right_entry->validity.has_value() ? &*right_entry->validity
-                                                                        : nullptr;
-        const auto build_is_null = [build_validity](std::size_t row) {
-            return build_validity != nullptr && !(*build_validity)[row];
-        };
-
-        if (const auto* col = std::get_if<Column<std::int64_t>>(key)) {
-            right_kind_ = ExprType::Int;
-            if (col->size() > kSemiSwapThreshold) {
-                return init_int_swapped(*col);
-            }
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (!build_is_null(i)) {
-                    right_i64_.insert((*col)[i]);
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<double>>(key)) {
-            right_kind_ = ExprType::Double;
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (!build_is_null(i)) {
-                    right_f64_.insert((*col)[i]);
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<bool>>(key)) {
-            right_kind_ = ExprType::Bool;
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (!build_is_null(i)) {
-                    right_bool_.insert((*col)[i]);
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<Date>>(key)) {
-            right_kind_ = ExprType::Date;
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (!build_is_null(i)) {
-                    right_date_.insert((*col)[i]);
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<Timestamp>>(key)) {
-            right_kind_ = ExprType::Timestamp;
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (!build_is_null(i)) {
-                    right_timestamp_.insert((*col)[i]);
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<Categorical>>(key)) {
-            right_kind_ = ExprType::String;
-            right_cat_dictionary_id_ = static_cast<const void*>(col->dictionary_ptr().get());
-            for (std::size_t row = 0; row < col->size(); ++row) {
-                if (!build_is_null(row)) {
-                    right_cat_codes_.insert(col->code_at(row));
-                }
-            }
-            return std::nullopt;
-        }
-        if (const auto* col = std::get_if<Column<std::string>>(key)) {
-            right_kind_ = ExprType::String;
-            for (std::size_t i = 0; i < col->size(); ++i) {
-                if (build_is_null(i)) {
+        // `for_right_rows` applies it for the Int64 paths; the set builds below
+        // apply it per chunk.
+        const auto insert_all = [&]<typename T, typename Fn>(Fn&& insert) {
+            for (const auto& chunk : right_key_chunks_) {
+                const auto* col = std::get_if<Column<T>>(chunk.column.get());
+                if (col == nullptr) {
                     continue;
                 }
-                owned_strings_.emplace_back((*col)[i]);
-                right_strings_.insert(std::string_view{owned_strings_.back()});
+                for (std::size_t row = 0; row < col->size(); ++row) {
+                    if (!chunk_is_null(chunk, row)) {
+                        insert(*col, row);
+                    }
+                }
             }
+        };
+
+        if (std::holds_alternative<Column<std::int64_t>>(key)) {
+            right_kind_ = ExprType::Int;
+            if (right_rows_ > kSemiSwapThreshold) {
+                return init_int_swapped();
+            }
+            for_right_rows<std::int64_t>(0, right_rows_,
+                                         [&](std::int64_t v) { right_i64_.insert(v); });
+            return std::nullopt;
+        }
+        if (std::holds_alternative<Column<double>>(key)) {
+            right_kind_ = ExprType::Double;
+            insert_all.template operator()<double>(
+                [&](const Column<double>& col, std::size_t row) { right_f64_.insert(col[row]); });
+            return std::nullopt;
+        }
+        if (std::holds_alternative<Column<bool>>(key)) {
+            right_kind_ = ExprType::Bool;
+            insert_all.template operator()<bool>(
+                [&](const Column<bool>& col, std::size_t row) { right_bool_.insert(col[row]); });
+            return std::nullopt;
+        }
+        if (std::holds_alternative<Column<Date>>(key)) {
+            right_kind_ = ExprType::Date;
+            insert_all.template operator()<Date>(
+                [&](const Column<Date>& col, std::size_t row) { right_date_.insert(col[row]); });
+            return std::nullopt;
+        }
+        if (std::holds_alternative<Column<Timestamp>>(key)) {
+            right_kind_ = ExprType::Timestamp;
+            insert_all.template operator()<Timestamp>(
+                [&](const Column<Timestamp>& col, std::size_t row) {
+                    right_timestamp_.insert(col[row]);
+                });
+            return std::nullopt;
+        }
+        if (const auto* first_cat = std::get_if<Column<Categorical>>(&key)) {
+            right_kind_ = ExprType::String;
+            // A code only means anything against the dictionary it was built
+            // with. A materialized right side was one column and so one
+            // dictionary; a chunked one need not be, so decide FIRST whether
+            // every chunk shares the first one. If they do, this is the
+            // code set the probe's fast path expects. If they do not, there
+            // is no single dictionary for `right_cat_dictionary_id_` to name:
+            // the whole set goes in as text and the probe's dictionary-mapped
+            // path handles it, which is what it already does for a probe
+            // chunk whose dictionary is foreign.
+            const void* dictionary = static_cast<const void*>(first_cat->dictionary_ptr().get());
+            const bool one_dictionary =
+                std::ranges::all_of(right_key_chunks_, [&](const ColumnEntry& chunk) {
+                    const auto* col = std::get_if<Column<Categorical>>(chunk.column.get());
+                    return col != nullptr &&
+                           static_cast<const void*>(col->dictionary_ptr().get()) == dictionary;
+                });
+            right_cat_dictionary_id_ = one_dictionary ? dictionary : nullptr;
+            for (const auto& chunk : right_key_chunks_) {
+                const auto* col = std::get_if<Column<Categorical>>(chunk.column.get());
+                if (col == nullptr) {
+                    continue;
+                }
+                for (std::size_t row = 0; row < col->size(); ++row) {
+                    if (chunk_is_null(chunk, row)) {
+                        continue;
+                    }
+                    if (one_dictionary) {
+                        right_cat_codes_.insert(col->code_at(row));
+                    } else {
+                        owned_strings_.emplace_back((*col)[row]);
+                        right_strings_.insert(std::string_view{owned_strings_.back()});
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+        if (std::holds_alternative<Column<std::string>>(key)) {
+            right_kind_ = ExprType::String;
+            insert_all.template operator()<std::string>(
+                [&](const Column<std::string>& col, std::size_t row) {
+                    owned_strings_.emplace_back(col[row]);
+                    right_strings_.insert(std::string_view{owned_strings_.back()});
+                });
             return std::nullopt;
         }
         return "ChunkedSemiAntiJoinOperator: unsupported key type";
@@ -782,7 +876,20 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     }
 
     OperatorPtr left_;
-    Table right_;
+    /// The right side, undrained. The operator needs exactly ONE column of it
+    /// (the join key) and never needs its rows contiguous, so it keeps the
+    /// producer rather than a materialized Table -- the same reasoning, and
+    /// the same measurement, as the buffered left in `next()`. Gluing the
+    /// right into one Table cost a full serial copy of it on the calling
+    /// thread while the pool sat idle: 214ms of q04's 244ms build (30.3M rows,
+    /// 46 chunks) and 100ms of q22's 111ms, against 2ms and 7ms actually spent
+    /// waiting for the producer.
+    OperatorPtr right_op_;
+    /// One entry per right chunk: the key column and its validity, nothing
+    /// else. Dropping the other columns here is why q21's `n_supp_by_order`
+    /// and q22's `o_custkey` are never copied at all.
+    std::vector<ColumnEntry> right_key_chunks_;
+    std::size_t right_rows_ = 0;
     ir::JoinKind kind_;
     const std::vector<ir::JoinKey>* keys_;
     bool initialized_ = false;
@@ -817,7 +924,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
 
 }  // namespace
 
-auto make_chunked_semi_anti_join_operator(OperatorPtr left, Table right, ir::JoinKind kind,
+auto make_chunked_semi_anti_join_operator(OperatorPtr left, OperatorPtr right, ir::JoinKind kind,
                                           const std::vector<ir::JoinKey>* keys,
                                           const ExecutionContext* exec) -> OperatorPtr {
     return std::make_unique<ChunkedSemiAntiJoinOperator>(std::move(left), std::move(right), kind,

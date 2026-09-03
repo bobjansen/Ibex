@@ -27,6 +27,31 @@ using ScanPredicateMap = std::map<std::string, std::vector<Expr>>;
 ///
 [[nodiscard]] auto scan_predicates(const Node& root) -> ScanPredicateMap;
 
+/// One `Scan` node's own pushable conjuncts.
+///
+/// Phase 1 of `plans/per-occurrence-scan-selections-plan.md`. `ScanPredicateMap`
+/// above is keyed by SOURCE NAME, which cannot tell two occurrences of one
+/// source apart, so it must drop every predicate of a repeated source: pushing
+/// one occurrence's filter would wrongly filter the other. This keys on the
+/// scan node instead, the same identity `ColumnOrigin::scan` uses to tell a
+/// self-join's two sides apart for FD reduction.
+///
+/// Nothing consumes the extra resolution yet -- `scan_predicates` is still
+/// derived from this and still declines a repeated source, byte for byte. It
+/// exists so the later phases have somewhere to put "same decode, different
+/// rows".
+struct ScanOccurrence {
+    NodeId scan;                 ///< identity of the `ScanNode` itself
+    std::string source;          ///< the source it reads
+    std::vector<Expr> conjuncts; ///< pushable conjuncts of THIS occurrence
+};
+
+/// Every scan occurrence in `root`, including unfiltered ones (empty
+/// `conjuncts`) -- an occurrence that wants the whole table is exactly the one
+/// a pushed filter would corrupt, so it has to be visible. Ordered by scan id
+/// for determinism.
+[[nodiscard]] auto scan_predicates_by_occurrence(const Node& root) -> std::vector<ScanOccurrence>;
+
 /// How many `Scan` nodes name each source. A count above one means a self-join
 /// or repeated binding: the source keeps its use-site filters and is decoded
 /// once, shared, rather than streamed per occurrence.

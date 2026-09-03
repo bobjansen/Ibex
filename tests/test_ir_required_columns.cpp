@@ -272,6 +272,72 @@ TEST_CASE("scan_predicates: repeated source scans are not selected globally",
     CHECK_FALSE(ir::scan_predicates(*join).contains("t"));
 }
 
+TEST_CASE("scan_predicates_by_occurrence: keeps two occurrences of one source apart",
+          "[ir][scan_predicates]") {
+    // The same shape the name-keyed map has to reject wholesale: one source,
+    // two scans, each wanting different rows. Per occurrence the two predicates
+    // are separable -- which is what the later phases of
+    // plans/per-occurrence-scan-selections-plan.md need.
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
+                                               std::vector<ir::JoinKey>{"id"});
+    join->add_child(
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
+    join->add_child(with_child(std::make_unique<ir::FilterNode>(ir::NodeId{4}, gt_zero("b")),
+                               std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t")));
+
+    const auto occurrences = ir::scan_predicates_by_occurrence(*join);
+    REQUIRE(occurrences.size() == 2);
+    CHECK(occurrences[0].source == "t");
+    CHECK(occurrences[1].source == "t");
+    // Distinct scan identities, and one conjunct each rather than both pooled.
+    CHECK(occurrences[0].scan != occurrences[1].scan);
+    CHECK(occurrences[0].conjuncts.size() == 1);
+    CHECK(occurrences[1].conjuncts.size() == 1);
+
+    // The name-keyed view still declines, byte for byte as before: the table
+    // registry cannot give two occurrences of one name different rows.
+    CHECK_FALSE(ir::scan_predicates(*join).contains("t"));
+}
+
+TEST_CASE("scan_predicates_by_occurrence: records an unfiltered occurrence",
+          "[ir][scan_predicates]") {
+    // An occurrence that wants the whole table is exactly the one a pushed
+    // filter would corrupt, so it must be visible even with no conjuncts.
+    auto join = std::make_unique<ir::JoinNode>(ir::NodeId{5}, ir::JoinKind::Inner,
+                                               std::vector<ir::JoinKey>{"id"});
+    join->add_child(
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")), make_scan("t")));
+    join->add_child(std::make_unique<ir::ScanNode>(ir::NodeId{3}, "t"));
+
+    const auto occurrences = ir::scan_predicates_by_occurrence(*join);
+    REQUIRE(occurrences.size() == 2);
+    const auto filtered = std::ranges::count_if(
+        occurrences, [](const ir::ScanOccurrence& o) { return !o.conjuncts.empty(); });
+    CHECK(filtered == 1);
+    CHECK_FALSE(ir::scan_predicates(*join).contains("t"));
+}
+
+TEST_CASE("scan_predicates_by_occurrence: agrees with the name-keyed map on one occurrence",
+          "[ir][scan_predicates]") {
+    // A stacked filter does NOT push: `projected_scan` reaches a scan through
+    // column-only Project/Rename nodes, never through another Filter, so only
+    // the filter directly above the scan is a candidate. Pinned here because
+    // the per-occurrence view must agree with the name-keyed one wherever the
+    // name-keyed one still answers -- that is the whole claim of Phase 1.
+    auto plan = with_child(
+        std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")),
+        with_child(std::make_unique<ir::FilterNode>(ir::NodeId{3}, gt_zero("b")), make_scan("t")));
+
+    const auto occurrences = ir::scan_predicates_by_occurrence(*plan);
+    REQUIRE(occurrences.size() == 1);
+    CHECK(occurrences.front().source == "t");
+    CHECK(occurrences.front().conjuncts.size() == 1);
+
+    const auto predicates = ir::scan_predicates(*plan);
+    REQUIRE(predicates.contains("t"));
+    CHECK(predicates.at("t").size() == occurrences.front().conjuncts.size());
+}
+
 TEST_CASE("scan_predicates: reaches a scan through a column-only projection",
           "[ir][scan_predicates]") {
     auto plan = with_child(

@@ -304,7 +304,9 @@ __BENCHMARK_NAV__
     <div class="tablewrap"><table class="bench" id="tbl"></table></div>
 
     <p class="bench-note" style="margin-top:1rem">
-      <strong>Threads.</strong> Every engine gets the same 8 vCPU. Ibex
+      <strong>Threads.</strong> Every engine gets the same box: 8 vCPU, which
+      is <strong>4 physical cores</strong> with 2 hardware threads each &mdash;
+      EC2 counts hyperthreads as vCPUs, so these are 4-core numbers, not 8. Ibex
       parallelises some operators by default, so <code>ibex</code> is not a
       single-core number; <code>ibex-st</code> is the same build run with
       <code>IBEX_CORES=1</code>, which makes <code>ibex</code> vs
@@ -577,11 +579,13 @@ benchmarking/run_scale_suite.sh --warmup 1 --iters 3
 # render these pages from that CSV:
 python3 benchmarking/gen_website.py benchmarking/results/scales.csv</pre>
     <p class="section-sub">
-      The published numbers come from a clean cloud box for isolation &mdash; an
-      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids, 64&nbsp;GB),
-      one command end-to-end:
+      The published numbers come from clean cloud boxes for isolation &mdash;
+      AWS <strong>r7i.2xlarge</strong> (8 vCPU Sapphire Rapids = 4 physical
+      cores, 64&nbsp;GB), <strong>one instance per engine</strong> so no engine
+      competes with another for memory bandwidth or threads. One command
+      end-to-end:
     </p>
-    <pre>./benchmarking/aws/run.sh --on-demand   # provisions, runs 1M&ndash;50M, uploads, shuts down</pre>
+    <pre>./benchmarking/aws/run-per-engine.sh --on-demand   # one box per engine, 1M&ndash;50M, uploads, shuts down</pre>
     <div class="callout">
       <strong>Know a faster way to write one of these queries?</strong> Open a PR
       against

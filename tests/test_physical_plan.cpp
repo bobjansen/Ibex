@@ -1315,7 +1315,7 @@ TEST_CASE("The plan describes a hash aggregate's structural fan-out policies",
         REQUIRE(nodes.final_ordering.parallelism.row_floor == (1U << 17U));
         REQUIRE(nodes.final_ordering.parallelism.breaker_max_workers == 64);
         REQUIRE(nodes.emission.parallelism.strategy ==
-                runtime::physical::PartitionStrategy::Column);
+                runtime::physical::PartitionStrategy::ColumnRange);
         REQUIRE(nodes.emission.parallelism.row_floor == 0);
         REQUIRE(nodes.emission.parallelism.breaker_max_workers == 0);
     }

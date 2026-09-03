@@ -4545,6 +4545,134 @@ class HashAggregateState final {
         return std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
     }
 
+    /// How one output column of the emitted chunk is written.
+    ///
+    /// `Whole` is the append path: variable-width output, the generic `Key`
+    /// path, `CountDistinct`. Everything else is a fixed-width buffer that can
+    /// be pre-sized once and then written by group index, which is what lets a
+    /// narrow output still use the whole pool.
+    enum class EmitSlot : std::uint8_t { Whole, I64, F64, DateKey, TsKey, Cat };
+
+    /// One emission task: a column, and the half-open group range of it to
+    /// write. `Whole` columns get exactly one task covering every group.
+    struct EmitTask {
+        std::size_t column = 0;
+        std::size_t lo = 0;
+        std::size_t hi = 0;
+    };
+
+    /// Group-range granularity. A `ValidityBitmap` word is 64 bits, so ranges
+    /// aligned to 64 groups guarantee no two tasks write the same word --
+    /// the same device `gather_columns_batched` uses for bit-packed columns.
+    static constexpr std::size_t kEmitAlign = 64;
+
+    static auto emit_slot_for_int_key(IntKeyKind kind) -> EmitSlot {
+        switch (kind) {
+            case IntKeyKind::Int64:
+                return EmitSlot::I64;
+            case IntKeyKind::Date:
+                return EmitSlot::DateKey;
+            case IntKeyKind::Ts:
+                return EmitSlot::TsKey;
+            case IntKeyKind::Cat:
+                return EmitSlot::Cat;
+        }
+        return EmitSlot::Whole;
+    }
+
+    /// Mirrors the output-column construction above: an aggregate is
+    /// range-writable exactly when that switch gives it a fixed-width column.
+    /// Written next to it deliberately -- the two disagreeing would size a
+    /// column as one type and index it as another.
+    static auto emit_slot_for_agg(ir::AggFunc func, ExprType kind) -> EmitSlot {
+        switch (func) {
+            case ir::AggFunc::Count:
+                return EmitSlot::I64;
+            case ir::AggFunc::Mean:
+            case ir::AggFunc::Stddev:
+            case ir::AggFunc::Skew:
+            case ir::AggFunc::Kurtosis:
+                return EmitSlot::F64;
+            case ir::AggFunc::Sum:
+            case ir::AggFunc::Min:
+            case ir::AggFunc::Max:
+                return kind == ExprType::Double ? EmitSlot::F64 : EmitSlot::I64;
+            case ir::AggFunc::First:
+            case ir::AggFunc::Last:
+                if (kind == ExprType::Double) {
+                    return EmitSlot::F64;
+                }
+                return kind == ExprType::Int ? EmitSlot::I64 : EmitSlot::Whole;
+            default:
+                // CountDistinct builds one per-group vector for the column, so
+                // splitting it would rebuild that vector per range.
+                return EmitSlot::Whole;
+        }
+    }
+
+    /// Size a range-writable column and return its buffer. Called on the
+    /// building thread only: `data()` and `codes_data()` detach a shared
+    /// buffer, so resolving the address once here is what makes the indexed
+    /// writes below safe from workers.
+    static auto size_and_address(ColumnValue& col, EmitSlot kind, std::size_t n) -> void* {
+        switch (kind) {
+            case EmitSlot::I64: {
+                auto& c = std::get<Column<std::int64_t>>(col);
+                c.resize(n);
+                return c.data();
+            }
+            case EmitSlot::F64: {
+                auto& c = std::get<Column<double>>(col);
+                c.resize(n);
+                return c.data();
+            }
+            case EmitSlot::DateKey: {
+                auto& c = std::get<Column<Date>>(col);
+                c.resize(n);
+                return c.data();
+            }
+            case EmitSlot::TsKey: {
+                auto& c = std::get<Column<Timestamp>>(col);
+                c.resize(n);
+                return c.data();
+            }
+            case EmitSlot::Cat: {
+                auto& c = std::get<Column<Categorical>>(col);
+                c.resize(n);
+                return c.codes_data();
+            }
+            case EmitSlot::Whole:
+                break;
+        }
+        return nullptr;
+    }
+
+    static void store_int_key(EmitSlot kind, void* base, std::size_t g, std::int64_t raw) {
+        switch (kind) {
+            case EmitSlot::I64:
+                static_cast<std::int64_t*>(base)[g] = raw;
+                return;
+            case EmitSlot::DateKey:
+                static_cast<Date*>(base)[g] = Date{static_cast<std::int32_t>(raw)};
+                return;
+            case EmitSlot::TsKey:
+                static_cast<Timestamp*>(base)[g] = Timestamp{raw};
+                return;
+            case EmitSlot::Cat:
+                // The output column is `make_empty_like` of the input, so it
+                // shares the input's dictionary and the stored code resolves
+                // against it.
+                static_cast<Column<Categorical>::code_type*>(base)[g] =
+                    static_cast<Column<Categorical>::code_type>(raw);
+                return;
+            case EmitSlot::F64:
+            case EmitSlot::Whole:
+                // No key kind produces either: `emit_slot_for_int_key` never
+                // returns them, and only it feeds this.
+                return;
+        }
+    }
+
     auto build_output_chunk() -> std::expected<std::optional<Chunk>, std::string> {
         Chunk out;
         out.columns.reserve(group_by_->size() + aggregations_->size());
@@ -4601,16 +4729,52 @@ class HashAggregateState final {
             out.add_column(agg.alias, std::move(column));
         }
 
-        for (std::size_t i = 0; i < out.columns.size(); ++i) {
-            std::visit([&](auto& c) { c.reserve(n_groups_); }, out.mutable_column(i));
+        // Which output columns can be written by GROUP RANGE rather than only
+        // as a whole. One task per column caps the fan-out at the output's
+        // width, and the shapes this phase is slowest on are the narrowest:
+        // an Int64 key plus one aggregate is two columns, so two workers, on
+        // millions of groups (q18, q21). A range-writable column is pre-sized
+        // here, on the calling thread, and its destination pointer resolved
+        // once -- `Column::data()` and `codes_data()` detach a shared buffer,
+        // which is not a thing to do from a worker.
+        //
+        // Everything else keeps the append path and stays one whole-column
+        // task: variable-width output (strings), the generic `Key` path, and
+        // `CountDistinct` (whose per-group counts are one vector built per
+        // column). Same split, and for the same reason, as
+        // `gather_columns_batched`.
+        std::vector<EmitSlot> slot_kind(out.columns.size(), EmitSlot::Whole);
+        std::vector<void*> slot_data(out.columns.size(), nullptr);
+        for (std::size_t ci = 0; ci < group_by_->size(); ++ci) {
+            if (cat_fast_path_) {
+                slot_kind[ci] = EmitSlot::Cat;
+            } else if (int_fast_path_) {
+                slot_kind[ci] = emit_slot_for_int_key(int_key_kind_);
+            } else if (pair_int_fast_path_) {
+                slot_kind[ci] = emit_slot_for_int_key(ci == 0 ? int_key_kind_ : int_key_kind_b_);
+            }
+        }
+        for (std::size_t i = 0; i < aggregations_->size(); ++i) {
+            slot_kind[group_by_->size() + i] = emit_slot_for_agg(plan_[i].func, plan_[i].kind);
+        }
+        for (std::size_t c = 0; c < out.columns.size(); ++c) {
+            ColumnValue& col = out.mutable_column(c);
+            if (slot_kind[c] == EmitSlot::Whole) {
+                std::visit([&](auto& x) { x.reserve(n_groups_); }, col);
+                continue;
+            }
+            slot_data[c] = size_and_address(col, slot_kind[c], n_groups_);
         }
 
+        // Pre-assigned rather than pushed, so a range task can clear the bit
+        // for its own group without knowing what came before it. Ranges are
+        // whole 64-group words (`kEmitAlign`), so no two tasks share a word.
         std::vector<ValidityBitmap> agg_validity(aggregations_->size());
         std::vector<std::uint8_t> track_validity(aggregations_->size(), 0U);
         for (std::size_t i = 0; i < aggregations_->size(); ++i) {
             if (chunked_agg_tracks_validity(plan_[i].func)) {
                 track_validity[i] = 1U;
-                agg_validity[i].reserve(n_groups_);
+                agg_validity[i].assign(n_groups_, true);
             }
         }
 
@@ -4630,25 +4794,12 @@ class HashAggregateState final {
             }
         }
 
-        const auto push_int_key = [](ColumnValue& col, IntKeyKind kind, std::int64_t raw) {
-            switch (kind) {
-                case IntKeyKind::Int64:
-                    std::get<Column<std::int64_t>>(col).push_back(raw);
-                    return;
-                case IntKeyKind::Date:
-                    std::get<Column<Date>>(col).push_back(Date{static_cast<std::int32_t>(raw)});
-                    return;
-                case IntKeyKind::Ts:
-                    std::get<Column<Timestamp>>(col).push_back(Timestamp{raw});
-                    return;
-                case IntKeyKind::Cat:
-                    // The output column is `make_empty_like` of the input, so it
-                    // shares the input's dictionary and the stored code resolves
-                    // against it.
-                    std::get<Column<Categorical>>(col).push_code(
-                        static_cast<Column<Categorical>::code_type>(raw));
-                    return;
-            }
+        // One definition of "store this raw integer key at group g". The
+        // destination was pre-sized above, so this is an indexed write; the
+        // Cat case stores a code, which resolves against the shared dictionary
+        // the output column inherited from `make_empty_like`.
+        const auto put_int_key = [&](std::size_t ci, std::size_t g, std::int64_t raw) {
+            store_int_key(slot_kind[ci], slot_data[ci], g, raw);
         };
 
         const AggSlotCore* fs = flat_slots_.data();
@@ -4657,36 +4808,35 @@ class HashAggregateState final {
         // a separate buffer written by exactly one worker, so no two tasks touch
         // the same bytes and the emitted order is the group order regardless of
         // which worker got which column.
-        const auto emit_key_column = [&](std::size_t ci) {
+        const auto emit_key_range = [&](std::size_t ci, std::size_t lo, std::size_t hi) {
             ColumnValue& col = out.mutable_column(ci);
             if (cat_fast_path_) {
-                auto& cat_col = std::get<Column<Categorical>>(col);
+                auto* codes = static_cast<Column<Categorical>::code_type*>(slot_data[ci]);
                 const std::size_t n_keys = group_by_->size();
                 if (n_keys == 1) {
-                    for (std::size_t g = 0; g < n_groups_; ++g) {
-                        cat_col.push_code(cat_order_[g]);
+                    for (std::size_t g = lo; g < hi; ++g) {
+                        codes[g] = cat_order_[g];
                     }
                 } else {
-                    for (std::size_t g = 0; g < n_groups_; ++g) {
-                        cat_col.push_code(multi_cat_codes_flat_[(g * n_keys) + ci]);
+                    for (std::size_t g = lo; g < hi; ++g) {
+                        codes[g] = multi_cat_codes_flat_[(g * n_keys) + ci];
                     }
                 }
             } else if (str_fast_path_) {
                 auto& str_col = std::get<Column<std::string>>(col);
-                for (std::size_t g = 0; g < n_groups_; ++g) {
+                for (std::size_t g = lo; g < hi; ++g) {
                     str_col.push_back(str_order_[g]);
                 }
             } else if (int_fast_path_) {
-                for (std::size_t g = 0; g < n_groups_; ++g) {
-                    push_int_key(col, int_key_kind_, int_order_[g]);
+                for (std::size_t g = lo; g < hi; ++g) {
+                    put_int_key(ci, g, int_order_[g]);
                 }
             } else if (pair_int_fast_path_) {
-                const IntKeyKind kind = ci == 0 ? int_key_kind_ : int_key_kind_b_;
-                for (std::size_t g = 0; g < n_groups_; ++g) {
-                    push_int_key(col, kind, ci == 0 ? pair_order_[g].first : pair_order_[g].second);
+                for (std::size_t g = lo; g < hi; ++g) {
+                    put_int_key(ci, g, ci == 0 ? pair_order_[g].first : pair_order_[g].second);
                 }
             } else {
-                for (std::size_t g = 0; g < n_groups_; ++g) {
+                for (std::size_t g = lo; g < hi; ++g) {
                     const Key& key = group_order_[g];
                     if (ci >= key.values.size()) {
                         continue;
@@ -4700,56 +4850,78 @@ class HashAggregateState final {
             }
         };
 
-        const auto emit_agg_column = [&](std::size_t i) {
-            ColumnValue& column = out.mutable_column(group_by_->size() + i);
+        const auto emit_agg_range = [&](std::size_t i, std::size_t lo, std::size_t hi) {
+            const std::size_t ci = group_by_->size() + i;
+            ColumnValue& column = out.mutable_column(ci);
             const bool tracks_validity = track_validity[i] != 0U;
             const std::vector<std::int64_t> distinct_counts =
                 plan_[i].func == ir::AggFunc::CountDistinct ? distinct_counts_for(i)
                                                             : std::vector<std::int64_t>{};
-            for (std::size_t g = 0; g < n_groups_; ++g) {
+            // Resolved once per task, not per row: a range-writable column
+            // indexes its pre-sized buffer, a whole-column one appends. One
+            // body either way, so no finalize formula is written twice.
+            auto* ints = slot_kind[ci] == EmitSlot::I64
+                             ? static_cast<std::int64_t*>(slot_data[ci])
+                             : nullptr;
+            auto* doubles =
+                slot_kind[ci] == EmitSlot::F64 ? static_cast<double*>(slot_data[ci]) : nullptr;
+            const auto put_i = [&](std::size_t g, std::int64_t v) {
+                if (ints != nullptr) {
+                    ints[g] = v;
+                } else {
+                    append_scalar(column, v);
+                }
+            };
+            const auto put_d = [&](std::size_t g, double v) {
+                if (doubles != nullptr) {
+                    doubles[g] = v;
+                } else {
+                    append_scalar(column, v);
+                }
+            };
+            for (std::size_t g = lo; g < hi; ++g) {
                 const AggSlotCore& slot = fs[(g * n_aggs_) + i];
-                if (tracks_validity) {
-                    agg_validity[i].push_back(chunked_agg_valid(plan_[i].func, slot));
+                if (tracks_validity && !chunked_agg_valid(plan_[i].func, slot)) {
+                    agg_validity[i].set(g, false);
                 }
                 switch (plan_[i].func) {
                     case ir::AggFunc::Count:
-                        append_scalar(column, slot.count);
+                        put_i(g, slot.count);
                         break;
                     case ir::AggFunc::CountDistinct:
-                        append_scalar(column, distinct_counts[g]);
+                        put_i(g, distinct_counts[g]);
                         break;
                     case ir::AggFunc::Mean:
-                        append_scalar(column,
-                                      slot.count == 0
-                                          ? 0.0
-                                          : slot.double_value / static_cast<double>(slot.count));
+                        put_d(g, slot.count == 0
+                                     ? 0.0
+                                     : slot.double_value / static_cast<double>(slot.count));
                         break;
                     case ir::AggFunc::Sum:
                     case ir::AggFunc::Min:
                     case ir::AggFunc::Max:
                         if (plan_[i].kind == ExprType::Double) {
-                            append_scalar(column, slot.double_value);
+                            put_d(g, slot.double_value);
                         } else {
-                            append_scalar(column, slot.int_value);
+                            put_i(g, slot.int_value);
                         }
                         break;
                     case ir::AggFunc::Stddev:
-                        append_scalar(column, agg_finalize_stddev(slot, scratch_for(g, i)[0]));
+                        put_d(g, agg_finalize_stddev(slot, scratch_for(g, i)[0]));
                         break;
                     case ir::AggFunc::Skew:
-                        append_scalar(column, agg_finalize_skew(slot, scratch_for(g, i)[0],
-                                                                scratch_for(g, i)[1]));
+                        put_d(g, agg_finalize_skew(slot, scratch_for(g, i)[0],
+                                                   scratch_for(g, i)[1]));
                         break;
                     case ir::AggFunc::Kurtosis:
-                        append_scalar(column, agg_finalize_kurtosis(slot, scratch_for(g, i)[0],
-                                                                    scratch_for(g, i)[2]));
+                        put_d(g, agg_finalize_kurtosis(slot, scratch_for(g, i)[0],
+                                                       scratch_for(g, i)[2]));
                         break;
                     case ir::AggFunc::First:
                     case ir::AggFunc::Last:
                         if (plan_[i].kind == ExprType::Double) {
-                            append_scalar(column, slot.double_value);
+                            put_d(g, slot.double_value);
                         } else if (plan_[i].kind == ExprType::Int) {
-                            append_scalar(column, slot.int_value);
+                            put_i(g, slot.int_value);
                         } else {
                             append_scalar(column, text_store_[(g * n_aggs_) + i]);
                         }
@@ -4761,31 +4933,56 @@ class HashAggregateState final {
         };
 
         const std::size_t n_out_columns = out.columns.size();
-        const auto emit_column = [&](std::size_t c) {
+        const auto emit_range = [&](std::size_t c, std::size_t lo, std::size_t hi) {
             if (c < group_by_->size()) {
-                emit_key_column(c);
+                emit_key_range(c, lo, hi);
             } else {
-                emit_agg_column(c - group_by_->size());
+                emit_agg_range(c - group_by_->size(), lo, hi);
             }
         };
 
         // A one-task budget would pay the pool round trip for work the calling
         // thread is about to do anyway, so it stays serial.
         auto& pool = process_worker_pool();
-        const std::size_t threads =
+        const std::size_t budget =
             exec_ != nullptr && par_.emission.decline == physical::FanOutDecline::None
-                ? std::min(n_out_columns, par_.emission.worker_cap)
+                ? par_.emission.worker_cap
                 : std::size_t{1};
+
+        // The task grid. A range-writable column splits into whole-word spans
+        // so one wide column cannot strand the rest -- and, more to the point,
+        // so a two-column output is not a two-worker output. Enough spans for
+        // ~4 per thread, the same derivation the morsel grain uses.
+        std::vector<EmitTask> tasks;
+        std::size_t span = n_groups_;
+        if (budget > 1) {
+            span = (n_groups_ + (budget * 4) - 1) / (budget * 4);
+            span = ((span + kEmitAlign - 1) / kEmitAlign) * kEmitAlign;
+            span = std::max(span, kEmitAlign);
+        }
+        tasks.reserve(n_out_columns + (span == 0 ? 0 : (n_groups_ / span) + 1));
+        for (std::size_t c = 0; c < n_out_columns; ++c) {
+            if (slot_kind[c] == EmitSlot::Whole || span >= n_groups_) {
+                tasks.push_back({.column = c, .lo = 0, .hi = n_groups_});
+                continue;
+            }
+            for (std::size_t lo = 0; lo < n_groups_; lo += span) {
+                tasks.push_back(
+                    {.column = c, .lo = lo, .hi = std::min(lo + span, n_groups_)});
+            }
+        }
+
+        const std::size_t threads = std::min(tasks.size(), budget);
         if (exec_ != nullptr && !on_worker_pool_thread() && threads > 1 &&
             n_groups_ >= par_.emission.row_floor) {
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(threads, [&](std::size_t) {
                 while (true) {
-                    const std::size_t c = cursor.fetch_add(1, std::memory_order_relaxed);
-                    if (c >= n_out_columns) {
+                    const std::size_t task = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (task >= tasks.size()) {
                         return;
                     }
-                    emit_column(c);
+                    emit_range(tasks[task].column, tasks[task].lo, tasks[task].hi);
                 }
             });
             batch.wait();
@@ -4793,8 +4990,8 @@ class HashAggregateState final {
                 exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
-            for (std::size_t c = 0; c < n_out_columns; ++c) {
-                emit_column(c);
+            for (const auto& task : tasks) {
+                emit_range(task.column, task.lo, task.hi);
             }
         }
 
@@ -4802,12 +4999,23 @@ class HashAggregateState final {
             if (track_validity[i] == 0U || agg_validity[i].empty()) {
                 continue;
             }
+            // Word-wise: this runs once per aggregate over every group, and
+            // bit-at-a-time it was a serial O(groups) tail on a phase whose
+            // parallel part is now the cheap half. The final partial word is
+            // read bit-wise because `assign` clears its unused tail bits, so
+            // it does not compare equal to an all-ones word.
             bool has_null = false;
-            for (std::size_t r = 0; r < agg_validity[i].size(); ++r) {
-                if (!agg_validity[i][r]) {
+            const ValidityBitmap& bits = agg_validity[i];
+            const std::size_t whole_words = bits.size() / 64;
+            const auto* words = bits.words_data();
+            for (std::size_t w = 0; w < whole_words; ++w) {
+                if (words[w] != ~std::uint64_t{0}) {
                     has_null = true;
                     break;
                 }
+            }
+            for (std::size_t r = whole_words * 64; !has_null && r < bits.size(); ++r) {
+                has_null = !bits[r];
             }
             if (has_null) {
                 out.columns[group_by_->size() + i].validity = std::move(agg_validity[i]);

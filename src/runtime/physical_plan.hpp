@@ -287,6 +287,13 @@ enum class PartitionStrategy : std::uint8_t {
                 ///< range order (`ChunkedInnerJoinOperator::probe_ranges_parallel`)
     Morsel,     ///< deterministic row-derived morsels with private reduction state
     Column,     ///< one independent output column per task
+    /// `(output column × group range)` tasks over a pre-sized destination.
+    /// Column alone caps the fan-out at the output's WIDTH, which for the
+    /// shapes that matter -- an Int64 key plus one aggregate -- is two. Ranges
+    /// are 64 groups wide so no two tasks share a validity word, and each task
+    /// writes its groups by index, so the emitted order is the group order
+    /// regardless of which worker ran which range.
+    ColumnRange,
 };
 
 /// A row-count estimate available at plan time, and where it came from. The

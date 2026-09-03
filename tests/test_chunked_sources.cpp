@@ -483,13 +483,15 @@ TEST_CASE("chunked aggregate: moment aggregates agree serially and in parallel",
 
 TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",
           "[runtime][chunked][aggregate]") {
-    // `build_output_chunk` emits COLUMN-MAJOR, one output column per pool task.
-    // Every column is a separate buffer, so the tasks cannot race -- but a
-    // column that reads the wrong index (its own `ci` against another column's
-    // source array) produces a plausible-looking chunk with the values of a
-    // neighbour. Only a run with enough groups to cross the gate can see it:
-    // the emit stays serial below `parallel_min_rows` groups, and every other
-    // aggregate test has a handful of groups.
+    // `build_output_chunk` emits as `(output column x group range)` tasks.
+    // Each task owns a disjoint slice of one column's buffer, so tasks cannot
+    // race -- but a task that reads the wrong index (its own `ci` against
+    // another column's source array, or its `g` against another range)
+    // produces a plausible-looking chunk with the values of a neighbour. Only
+    // a run with enough groups to cross the gate can see it: the emit stays
+    // serial below `parallel_min_rows` groups, and every other aggregate test
+    // has a handful of groups. `kGroups` is deliberately not a multiple of 64,
+    // so the final partial validity word is covered too.
     constexpr std::size_t kRows = 300000;
     constexpr std::int64_t kGroups = 100000;
     Column<std::int64_t> k1;
@@ -543,6 +545,104 @@ TEST_CASE("chunked aggregate: output emission agrees serially and in parallel",
             REQUIRE((*a)[i] == (*b)[i]);
         }
     }
+}
+
+TEST_CASE("chunked aggregate: a narrow output still emits over the whole pool",
+          "[runtime][chunked][aggregate]") {
+    // The shape the range split exists for. One key plus one aggregate is two
+    // output columns, so a column-per-task emit could use at most two workers
+    // however many groups there are -- and this is the common wide-output
+    // shape in PDS-H (q18's `sum(l_quantity) by l_orderkey`, q21's
+    // `count() by l_orderkey`), at millions of groups.
+    //
+    // Correctness here is the same claim as the sibling test above, but the
+    // arrangement is the interesting one: with two columns and ~70k groups
+    // there are far MORE tasks than columns, so a task's `lo`/`hi` is what
+    // separates it from its neighbours rather than its column index.
+    constexpr std::size_t kGroups = 70'003;  // > parallel_min_rows, and prime
+    constexpr std::size_t kRows = 3 * kGroups;
+    Column<std::int64_t> key;
+    Column<double> value;
+    runtime::ValidityBitmap valid;
+    key.reserve(kRows);
+    value.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        key.push_back(static_cast<std::int64_t>(i % kGroups));
+        value.push_back(static_cast<double>(i) * 0.5);
+        // Every value of one whole group in every 97 is null, so `min` reports
+        // an invalid group -- the branch the emit's word-wise "did any range
+        // clear a bit" scan exists for, and one that a all-valid input leaves
+        // untested.
+        valid.push_back((i % kGroups) % 97 != 5);
+    }
+    runtime::Table table;
+    table.add_column("k", std::move(key));
+    table.add_column("v", std::move(value));
+    table.columns[1].validity = std::move(valid);
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    const std::string query = "t[select { lo = min(v) }, by { k }];";
+
+    const auto run_with = [&](bool parallel) {
+        auto program = parser::parse(query);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        runtime::ExecutionContext exec;
+        exec.parallel_threads = (parallel) ? 0 : 1;
+        auto result = runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+        REQUIRE(result.has_value());
+        return std::move(*result);
+    };
+
+    const auto serial = run_with(false);
+    const auto parallel = run_with(true);
+    REQUIRE(serial.rows() == kGroups);
+    REQUIRE(parallel.rows() == kGroups);
+
+    const auto* keys_s = std::get_if<Column<std::int64_t>>(serial.find("k"));
+    const auto* keys_p = std::get_if<Column<std::int64_t>>(parallel.find("k"));
+    const auto* lo_s = std::get_if<Column<double>>(serial.find("lo"));
+    const auto* lo_p = std::get_if<Column<double>>(parallel.find("lo"));
+    REQUIRE(keys_s != nullptr);
+    REQUIRE(keys_p != nullptr);
+    REQUIRE(lo_s != nullptr);
+    REQUIRE(lo_p != nullptr);
+
+    // The null groups must survive as nulls, in both runs, at the same rows --
+    // a validity word written by the wrong range would move them.
+    // A null group means the emit attached a validity bitmap; both runs must
+    // agree that it did.
+    REQUIRE(serial.columns[1].validity.has_value());
+    REQUIRE(parallel.columns[1].validity.has_value());
+    const auto& valid_s = *serial.columns[1].validity;
+    const auto& valid_p = *parallel.columns[1].validity;
+    REQUIRE(valid_s.size() == kGroups);
+    REQUIRE(valid_p.size() == kGroups);
+    // Asserted against a HAND-COMPUTED answer, not just against each other:
+    // serial and parallel now share one task grid, so an index that is wrong
+    // in the same way in both would agree with itself. Group g is first seen
+    // at row g, so the group order is ascending; its rows are g, g + kGroups,
+    // g + 2*kGroups, whose values are (row * 0.5) -- so the minimum is g/2.
+    std::size_t nulls = 0;
+    for (std::size_t i = 0; i < kGroups; ++i) {
+        INFO("row " << i);
+        REQUIRE((*keys_s)[i] == static_cast<std::int64_t>(i));
+        REQUIRE((*keys_p)[i] == static_cast<std::int64_t>(i));
+        REQUIRE(valid_s[i] == valid_p[i]);
+        REQUIRE(valid_s[i] == (i % 97 != 5));
+        if (!valid_s[i]) {
+            ++nulls;
+            continue;
+        }
+        REQUIRE((*lo_s)[i] == static_cast<double>(i) * 0.5);
+        REQUIRE((*lo_p)[i] == static_cast<double>(i) * 0.5);
+    }
+    // The null groups are the point of the validity assertions above, so fail
+    // loudly rather than silently if the input stopped producing any.
+    REQUIRE(nulls > 0);
+    REQUIRE(nulls == (kGroups + 91) / 97);
 }
 
 TEST_CASE("chunked aggregate: clustered integer counts merge runs across chunks",

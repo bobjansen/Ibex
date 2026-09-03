@@ -1004,6 +1004,8 @@ auto partition_strategy_name(PartitionStrategy strategy) -> std::string_view {
             return "range (contiguous probe-row slices)";
         case PartitionStrategy::Morsel:
             return "morsel (deterministic row ranges)";
+        case PartitionStrategy::ColumnRange:
+            return "column-range (output column x group range)";
         case PartitionStrategy::Column:
             return "column (independent output columns)";
     }
@@ -1062,7 +1064,7 @@ auto aggregate_final_ordering_parallelism(RowEstimate estimate) -> BreakerParall
 }
 
 auto aggregate_emission_parallelism(RowEstimate estimate) -> BreakerParallelism {
-    return {.strategy = PartitionStrategy::Column, .estimate = estimate};
+    return {.strategy = PartitionStrategy::ColumnRange, .estimate = estimate};
 }
 
 void resolve_breaker_parallelism(BreakerParallelism& bp, const ExecutionContext& exec,

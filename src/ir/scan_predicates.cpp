@@ -171,10 +171,16 @@ auto remove_applied_filters(NodePtr node, const std::set<std::string>& applied_s
     return node;
 }
 
-void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
-           ScanPredicateMap& candidates) {
+/// Collect each scan OCCURRENCE and the conjuncts sitting over it.
+///
+/// Keyed by the scan's own `NodeId` rather than its source name, so two
+/// occurrences of one source stay apart. Unfiltered occurrences are recorded
+/// too: an occurrence that wants the whole table is exactly the one a pushed
+/// filter would corrupt, so the count has to see it.
+void visit(const Node& node, std::map<NodeId, std::string>& occurrences,
+           std::map<NodeId, std::vector<Expr>>& by_scan) {
     if (node.kind() == NodeKind::Scan) {
-        ++scan_counts[node_cast<ScanNode>(node).source_name()];
+        occurrences.emplace(node.id(), node_cast<ScanNode>(node).source_name());
     }
 
     if (const auto* predicate = filter_predicate(node)) {
@@ -186,7 +192,7 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
             }
             std::vector<Expr> conjuncts;
             if (append_conjuncts(scan_predicate, conjuncts)) {
-                auto& destination = candidates[scan->source_name()];
+                auto& destination = by_scan[scan->id()];
                 destination.insert(destination.end(), conjuncts.begin(), conjuncts.end());
             }
         }
@@ -194,24 +200,51 @@ void visit(const Node& node, std::map<std::string, std::size_t>& scan_counts,
 
     for (const auto& child : node.children()) {
         if (child != nullptr) {
-            visit(*child, scan_counts, candidates);
+            visit(*child, occurrences, by_scan);
         }
     }
 }
 
 }  // namespace
 
-auto scan_predicates(const Node& root) -> ScanPredicateMap {
-    std::map<std::string, std::size_t> scan_counts;
-    ScanPredicateMap candidates;
-    visit(root, scan_counts, candidates);
+auto scan_predicates_by_occurrence(const Node& root) -> std::vector<ScanOccurrence> {
+    std::map<NodeId, std::string> occurrences;
+    std::map<NodeId, std::vector<Expr>> by_scan;
+    visit(root, occurrences, by_scan);
 
-    for (auto it = candidates.begin(); it != candidates.end();) {
-        if (it->second.empty() || scan_counts[it->first] != 1) {
-            it = candidates.erase(it);
-        } else {
-            ++it;
+    std::vector<ScanOccurrence> out;
+    out.reserve(occurrences.size());
+    for (auto& [scan, source] : occurrences) {
+        auto conjuncts = by_scan.find(scan);
+        out.push_back(ScanOccurrence{
+            .scan = scan,
+            .source = source,
+            .conjuncts = conjuncts == by_scan.end() ? std::vector<Expr>{} : conjuncts->second});
+    }
+    return out;  // `occurrences` is ordered by scan id, so `out` is too
+}
+
+auto scan_predicates(const Node& root) -> ScanPredicateMap {
+    // Derived from the per-occurrence answer, and deliberately no more
+    // permissive than before: a source is pushed only when it has exactly ONE
+    // occurrence, because the table registry is keyed by source name and cannot
+    // give two occurrences different rows. Widening this is Phase 3 of
+    // plans/per-occurrence-scan-selections-plan.md, and needs the registry
+    // change first -- lifting it alone is UNSOUND, not merely risky: on a
+    // `like` / `!like` pair both conjuncts land in one decode, intersect to
+    // nothing, and the query returns zero rows.
+    auto occurrences = scan_predicates_by_occurrence(root);
+    std::map<std::string, std::size_t> counts;
+    for (const auto& occurrence : occurrences) {
+        ++counts[occurrence.source];
+    }
+
+    ScanPredicateMap candidates;
+    for (auto& occurrence : occurrences) {
+        if (occurrence.conjuncts.empty() || counts[occurrence.source] != 1) {
+            continue;
         }
+        candidates.emplace(occurrence.source, std::move(occurrence.conjuncts));
     }
     return candidates;
 }

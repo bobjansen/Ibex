@@ -147,6 +147,13 @@ With 1 and 2 in place, an occurrence whose predicate is over a filter-only
 column asks the source for a `Selection` instead of a column. This is the phase
 that actually fixes the e2e check and recovers the mechanism.
 
+**Acceptance:** the e2e check
+(*"fused string filter over a nullable column"*) goes green at Phase 3, with
+`source string filter scan` back in the profile and the answer still
+400/300000/800/600000. `test_repl.cpp:1060` must stay green throughout —
+one decode of `{a, b}`, not three — since that is the property the rejected fix
+broke.
+
 **Phase 4 — re-examine the `!= 1` gate.** It can then be narrowed from "any
 repeated source" to "a predicate that cannot be answered per occurrence",
 which should be nearly nothing.
@@ -191,8 +198,14 @@ difference:
 
 ## Until this is built
 
-`scripts/ibex-e2e.sh` fails at that check. It is a genuine failure asserting a
-genuine capability, so it should not be deleted or weakened to green the script.
+`scripts/ibex-e2e.sh` fails at that check, and **Phase 3 is what turns it green
+again** — restoring the fused scan for a repeatedly-scanned source is the whole
+point of this plan, and that check is its acceptance test. Phases 1 and 2 change
+no behaviour, so it stays red through them; that is expected, not a surprise.
+
+In the meantime the check should not be deleted, skipped, or weakened to green
+the script. It is a true failure reporting a real lost capability, and it is the
+only thing that noticed — every answer stayed correct.
 
 A **strictly safe interim** that needs none of the above: push the INTERSECTION
 of the conjuncts common to every occurrence. Each occurrence's own filter still

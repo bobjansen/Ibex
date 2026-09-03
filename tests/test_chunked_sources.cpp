@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <map>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -113,6 +115,139 @@ auto run(const std::string& source, const runtime::TableRegistry& registry) -> r
 }
 
 }  // namespace
+
+TEST_CASE("multi-key categorical aggregate: the fused parallel path matches a reference",
+          "[runtime][chunked][aggregate][categorical]") {
+    // A multi-key Categorical group-by no longer runs a serial discovery pass
+    // that writes a gid per row for a second pass to read back: the Cartesian
+    // cell of the key codes IS a dense index, so each morsel accumulates into
+    // its own `cells x aggs` slot array and the merge assigns gids on first
+    // occurrence. Only a run past the morsel gate (>= 131072 rows in a chunk)
+    // takes it, and every other multi-key Categorical test is a few thousand
+    // rows -- so without this size the path never executes.
+    constexpr std::size_t kRows = 450'000;
+    Column<Categorical> a;
+    Column<Categorical> b;
+    Column<Categorical> c;
+    Column<double> value;
+    value.reserve(kRows);
+    for (std::size_t i = 0; i < kRows; ++i) {
+        // Three keys whose combinations do NOT fill their Cartesian product
+        // (i % 2 is implied by i % 4), so the cell space is 24 but only 12
+        // groups exist -- an empty cell that got a group would show up.
+        a.push_back(std::string("a") + static_cast<char>('0' + (i % 4)));
+        b.push_back(std::string("b") + static_cast<char>('0' + (i % 3)));
+        c.push_back(std::string("c") + static_cast<char>('0' + (i % 2)));
+        value.push_back(static_cast<double>(i % 1000) * 0.5);
+    }
+    runtime::Table table;
+    table.add_column("a", std::move(a));
+    table.add_column("b", std::move(b));
+    table.add_column("c", std::move(c));
+    table.add_column("v", std::move(value));
+    runtime::TableRegistry registry;
+    registry.emplace("t", std::move(table));
+
+    const std::string query =
+        "t[select { n = count(), s = sum(v), lo = min(v), hi = max(v) }, by { a, b, c }];";
+
+    // An independent reference: a plain map keyed by the key TEXT, walked in
+    // row order. It shares no machinery with the engine's cells, morsels or
+    // slot arrays, which is the point -- the engine agreeing with itself at one
+    // core and at eight would not catch a cell computed wrongly in both.
+    struct Ref {
+        std::size_t first_row = 0;
+        std::int64_t n = 0;
+        double s = 0.0;
+        double lo = 0.0;
+        double hi = 0.0;
+    };
+    std::map<std::string, Ref> reference;
+    std::vector<std::string> order;
+    for (std::size_t i = 0; i < kRows; ++i) {
+        std::string key = std::string("a") + static_cast<char>('0' + (i % 4)) + "|b" +
+                          static_cast<char>('0' + (i % 3)) + "|c" +
+                          static_cast<char>('0' + (i % 2));
+        const double v = static_cast<double>(i % 1000) * 0.5;
+        auto [it, inserted] = reference.try_emplace(key);
+        if (inserted) {
+            it->second.first_row = i;
+            it->second.lo = v;
+            it->second.hi = v;
+            order.push_back(key);
+        }
+        it->second.n += 1;
+        it->second.s += v;
+        it->second.lo = std::min(it->second.lo, v);
+        it->second.hi = std::max(it->second.hi, v);
+    }
+    REQUIRE(reference.size() == 12);  // not 24: the cell space is not filled
+
+    const auto check = [&](const runtime::Table& out) {
+        REQUIRE(out.rows() == reference.size());
+        const auto* ca = std::get_if<Column<Categorical>>(out.find("a"));
+        const auto* cb = std::get_if<Column<Categorical>>(out.find("b"));
+        const auto* cc = std::get_if<Column<Categorical>>(out.find("c"));
+        const auto* cn = std::get_if<Column<std::int64_t>>(out.find("n"));
+        const auto* cs = std::get_if<Column<double>>(out.find("s"));
+        const auto* clo = std::get_if<Column<double>>(out.find("lo"));
+        const auto* chi = std::get_if<Column<double>>(out.find("hi"));
+        REQUIRE(ca != nullptr);
+        REQUIRE(cb != nullptr);
+        REQUIRE(cc != nullptr);
+        REQUIRE(cn != nullptr);
+        REQUIRE(cs != nullptr);
+        REQUIRE(clo != nullptr);
+        REQUIRE(chi != nullptr);
+        for (std::size_t row = 0; row < out.rows(); ++row) {
+            const std::string key =
+                std::string((*ca)[row]) + "|" + std::string((*cb)[row]) + "|" +
+                std::string((*cc)[row]);
+            INFO("row " << row << " key " << key);
+            // Group order is first-occurrence order, whichever morsel found it.
+            REQUIRE(key == order[row]);
+            const Ref& want = reference.at(key);
+            REQUIRE((*cn)[row] == want.n);
+            REQUIRE((*cs)[row] == want.s);
+            REQUIRE((*clo)[row] == want.lo);
+            REQUIRE((*chi)[row] == want.hi);
+        }
+    };
+
+    runtime::Table parallel;
+    runtime::Table serial;
+    {
+        auto program = parser::parse(query);
+        REQUIRE(program.has_value());
+        auto ir = parser::lower(program.value());
+        REQUIRE(ir.has_value());
+        for (const bool fan_out : {true, false}) {
+            runtime::ExecutionContext exec;
+            exec.parallel_threads = fan_out ? 0 : 1;
+            auto result =
+                runtime::interpret(*ir.value(), registry, nullptr, nullptr, nullptr, exec);
+            REQUIRE(result.has_value());
+            (fan_out ? parallel : serial) = std::move(*result);
+        }
+    }
+    check(parallel);
+    check(serial);
+    // The morsel cut is derived from the row count, not the thread count, so
+    // the float reduction order -- and therefore every bit of the output -- is
+    // the same however many workers ran it.
+    auto mismatch = runtime::compare_tables(serial, parallel);
+    if (mismatch.has_value()) {
+        FAIL(mismatch->message());
+    }
+
+    // Across chunks the cell -> gid array has to carry groups forward, and each
+    // chunk is still large enough to take the fused path on its own.
+    {
+        const ChunkGrainGuard guard("150001");
+        const auto chunked = run(query, registry);
+        check(chunked);
+    }
+}
 
 TEST_CASE("chunked semi/anti join: a multi-chunk right side matches one chunk",
           "[runtime][chunked][join]") {

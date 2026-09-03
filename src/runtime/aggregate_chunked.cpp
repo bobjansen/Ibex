@@ -3162,6 +3162,152 @@ class HashAggregateState final {
         }
     }
 
+    /// The Cartesian-cell layout for a multi-key Categorical group-by.
+    ///
+    /// cell = c0*s0 + c1*s1 + ... with s_{n-1} = 1, so a tuple of codes is one
+    /// dense number. It only identifies a tuple while the stride product fits
+    /// in 64 bits: past that the multiply wraps, distinct tuples collide, and
+    /// `total_cells` itself wraps -- a product of exactly 2^64 (16 keys of 16
+    /// values, say) lands on 0, which would pass a dense-array bound and index
+    /// a zero-length array. `dense_possible` is false when that happens, and
+    /// the hash path, which identifies a group by its codes rather than by a
+    /// cell, takes over.
+    ///
+    /// Computed once per chunk and shared by the fused parallel path and the
+    /// serial loops, so the two cannot disagree about what a cell is.
+    struct CatCellPlan {
+        std::vector<std::uint64_t> dict_sizes;
+        std::vector<std::uint64_t> strides;
+        std::uint64_t total_cells = 1;
+        bool dense_possible = false;
+    };
+
+    [[nodiscard]] auto cat_cell_plan(const std::vector<const Column<Categorical>*>& cols) const
+        -> CatCellPlan {
+        CatCellPlan plan;
+        const std::size_t n_keys = cols.size();
+        plan.dict_sizes.resize(n_keys);
+        plan.strides.resize(n_keys);
+        for (std::size_t c = 0; c < n_keys; ++c) {
+            plan.dict_sizes[c] = static_cast<std::uint64_t>(cols[c]->dictionary().size());
+            if (plan.dict_sizes[c] == 0) {
+                plan.dict_sizes[c] = 1;  // avoid stride collapse
+            }
+        }
+        std::uint64_t stride = 1;
+        bool overflow = false;
+        for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
+            plan.strides[static_cast<std::size_t>(ci)] = stride;
+            const std::uint64_t size = plan.dict_sizes[static_cast<std::size_t>(ci)];
+            if (stride > std::numeric_limits<std::uint64_t>::max() / size) {
+                overflow = true;
+                break;
+            }
+            stride *= size;
+        }
+        plan.total_cells = stride;
+        plan.dense_possible = !overflow && plan.total_cells <= kDenseCellLimit;
+        return plan;
+    }
+
+    /// The cell of group `g`, from the codes it was created with.
+    [[nodiscard]] auto cat_cell_of_group(const CatCellPlan& plan, std::size_t g) const
+        -> std::uint64_t {
+        const std::size_t n_keys = plan.strides.size();
+        std::uint64_t cell = 0;
+        for (std::size_t c = 0; c < n_keys; ++c) {
+            cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
+                    plan.strides[c];
+        }
+        return cell;
+    }
+
+    /// Rebuild the cell -> gid array when the strides changed, which happens
+    /// when a chunk introduces new dictionary entries. Rare: Categorical dicts
+    /// are usually stable.
+    void ensure_multi_cat_dense(const CatCellPlan& plan) {
+        if (multi_cat_strides_ == plan.strides) {
+            return;
+        }
+        multi_cat_cell_dense_.assign(static_cast<std::size_t>(plan.total_cells), kNoGid);
+        for (std::size_t g = 0; g < n_groups_; ++g) {
+            multi_cat_cell_dense_[cat_cell_of_group(plan, g)] = static_cast<std::uint32_t>(g);
+        }
+        multi_cat_strides_ = plan.strides;
+    }
+
+    /// Multi-key Categorical, fused and parallel -- the same private-slot pass
+    /// the single-key path uses, over the Cartesian cell instead of the code.
+    ///
+    /// Without it a multi-key Categorical group-by ran a SERIAL discovery pass
+    /// that wrote a gid per row, and then a second parallel pass that read it
+    /// back: two passes and two pool barriers per chunk over the same rows, on
+    /// top of materializing a gid array nothing else wanted. PDS-H q01 is 47M
+    /// rows by `{l_returnflag, l_linestatus}` -- 6 cells -- and spent every one
+    /// of its 46 chunks that way.
+    auto try_process_rows_cat_multi_parallel(
+        const std::vector<const Column<Categorical>*>& cat_cols,
+        const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows) -> bool {
+        // Once the groups have moved into the hash index there is no cell to
+        // index by; the serial path owns that case.
+        if (!multi_dense_ || rows == 0 || !aggs_are_slot_combinable()) {
+            return false;
+        }
+        const CatCellPlan plan = cat_cell_plan(cat_cols);
+        if (!plan.dense_possible) {
+            return false;  // the serial path migrates to the hash index
+        }
+        const std::size_t n_cells = static_cast<std::size_t>(plan.total_cells);
+        const std::size_t morsels = dense_morsel_count(n_cells, rows);
+        if (morsels == 0) {
+            return false;
+        }
+        ensure_multi_cat_dense(plan);
+
+        const std::size_t n_keys = cat_cols.size();
+        std::vector<const Column<Categorical>::code_type*> raws(n_keys);
+        for (std::size_t c = 0; c < n_keys; ++c) {
+            raws[c] = cat_cols[c]->codes_data();
+        }
+        multi_cat_cells_.resize(rows);
+        auto* cells = multi_cat_cells_.data();
+        run_dense_fused(
+            cells, n_cells, agg_entries, rows, multi_cat_cell_dense_, morsels,
+            [&](std::size_t begin, std::size_t end) {
+                // Computed on the morsel's own worker, into its own slice.
+                if (n_keys == 2) {
+                    const auto* k0 = raws[0];
+                    const auto* k1 = raws[1];
+                    const std::uint64_t s0 = plan.strides[0];
+                    const std::uint64_t s1 = plan.strides[1];
+                    for (std::size_t row = begin; row < end; ++row) {
+                        cells[row] = static_cast<std::uint32_t>(
+                            (static_cast<std::uint64_t>(k0[row]) * s0) +
+                            (static_cast<std::uint64_t>(k1[row]) * s1));
+                    }
+                    return;
+                }
+                for (std::size_t row = begin; row < end; ++row) {
+                    std::uint64_t cell = 0;
+                    for (std::size_t c = 0; c < n_keys; ++c) {
+                        cell += static_cast<std::uint64_t>(raws[c][row]) * plan.strides[c];
+                    }
+                    cells[row] = static_cast<std::uint32_t>(cell);
+                }
+            },
+            [&](std::size_t cell) {
+                // The cell is invertible: c_i = (cell / s_i) % dict_size_i.
+                for (std::size_t c = 0; c < n_keys; ++c) {
+                    const std::uint64_t code =
+                        (static_cast<std::uint64_t>(cell) / plan.strides[c]) % plan.dict_sizes[c];
+                    multi_cat_codes_flat_.push_back(
+                        static_cast<Column<Categorical>::code_type>(code));
+                }
+                return alloc_group();
+            });
+        return true;
+    }
+
     auto process_rows_cat(const std::vector<const ColumnEntry*>& group_entries,
                           const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows)
         -> std::optional<std::string> {
@@ -3175,6 +3321,10 @@ class HashAggregateState final {
 
         if (single_key && rows > 0 &&
             try_process_rows_cat_parallel(*cat_cols[0], agg_entries, rows)) {
+            publish_fused_accumulation();
+            return std::nullopt;
+        }
+        if (!single_key && try_process_rows_cat_multi_parallel(cat_cols, agg_entries, rows)) {
             publish_fused_accumulation();
             return std::nullopt;
         }
@@ -3203,56 +3353,21 @@ class HashAggregateState final {
                 gids[row] = gid;
             }
         } else {
-            // Multi-key: encode each row as a uint64_t Cartesian cell.
-            // Strides may grow across chunks if a chunk introduces new dict
-            // entries; we recompute per chunk and rebuild the index when that
-            // happens (rare — Categorical dicts are usually stable).
-            std::vector<std::uint64_t> dict_sizes(n_keys);
-            for (std::size_t c = 0; c < n_keys; ++c) {
-                dict_sizes[c] = static_cast<std::uint64_t>(cat_cols[c]->dictionary().size());
-                if (dict_sizes[c] == 0)
-                    dict_sizes[c] = 1;  // avoid stride collapse
-            }
-            // Strides: cell = c0*s0 + c1*s1 + … with s_{n-1} = 1.
-            //
-            // The cell only identifies a key tuple while the stride product
-            // fits in 64 bits. Past that the multiply wraps, distinct tuples
-            // collide, and `total_cells` itself wraps — a product of exactly
-            // 2^64 (16 keys of 16 values, say) lands on 0, which would pass the
-            // dense-array bound and index a zero-length array. Detect the
-            // overflow and let the hash path, which identifies groups by their
-            // codes rather than by a cell, take over.
-            std::vector<std::uint64_t> strides(n_keys);
-            std::uint64_t total_cells = 1;
-            bool cells_overflow = false;
-            {
-                std::uint64_t s = 1;
-                for (int ci = static_cast<int>(n_keys) - 1; ci >= 0; --ci) {
-                    strides[static_cast<std::size_t>(ci)] = s;
-                    const std::uint64_t size = dict_sizes[static_cast<std::size_t>(ci)];
-                    if (s > std::numeric_limits<std::uint64_t>::max() / size) {
-                        cells_overflow = true;
-                        break;
-                    }
-                    s *= size;
-                }
-                total_cells = s;
-            }
-            const bool dense_possible = !cells_overflow && total_cells <= kDenseCellLimit;
+            // Multi-key: encode each row as a uint64_t Cartesian cell. Strides
+            // may grow across chunks if a chunk introduces new dict entries; we
+            // recompute per chunk and rebuild the index when that happens
+            // (rare — Categorical dicts are usually stable). The layout and its
+            // overflow rule are `cat_cell_plan`'s, shared with the fused
+            // parallel path so the two cannot disagree about what a cell is.
+            const CatCellPlan cell_plan = cat_cell_plan(cat_cols);
+            const std::vector<std::uint64_t>& strides = cell_plan.strides;
+            const bool dense_possible = cell_plan.dense_possible;
 
             // Hoist raw code pointers out of the row loop.
             std::vector<const Column<Categorical>::code_type*> raws(n_keys);
             for (std::size_t c = 0; c < n_keys; ++c)
                 raws[c] = cat_cols[c]->codes_data();
 
-            const auto cell_of_group = [&](std::size_t g) -> std::uint64_t {
-                std::uint64_t cell = 0;
-                for (std::size_t c = 0; c < n_keys; ++c) {
-                    cell += static_cast<std::uint64_t>(multi_cat_codes_flat_[(g * n_keys) + c]) *
-                            strides[c];
-                }
-                return cell;
-            };
             const auto new_group = [&](std::size_t row) -> std::uint32_t {
                 for (std::size_t c = 0; c < n_keys; ++c)
                     multi_cat_codes_flat_.push_back(raws[c][row]);
@@ -3271,13 +3386,7 @@ class HashAggregateState final {
             }
 
             if (multi_dense_) {
-                // Rebuild the dense array when strides change (new dict entries).
-                if (multi_cat_strides_ != strides) {
-                    multi_cat_cell_dense_.assign(static_cast<std::size_t>(total_cells), kNoGid);
-                    for (std::size_t g = 0; g < n_groups_; ++g)
-                        multi_cat_cell_dense_[cell_of_group(g)] = static_cast<std::uint32_t>(g);
-                    multi_cat_strides_ = strides;
-                }
+                ensure_multi_cat_dense(cell_plan);
                 std::uint32_t* dense = multi_cat_cell_dense_.data();
                 if (n_keys == 2) {
                     const auto* k0 = raws[0];
@@ -3551,6 +3660,86 @@ class HashAggregateState final {
     ///
     /// This mirrors `try_process_rows_cat_parallel`, which can skip the gid
     /// pass entirely because a Categorical code is already a dense index.
+    /// Can every aggregate be accumulated into a private slot array and merged?
+    ///
+    /// One definition for all three fused/partial paths. A boxed First/Last
+    /// value lives outside the slot array, so a private copy would not capture
+    /// it; everything else `agg_is_combinable` admits merges by slot.
+    [[nodiscard]] auto aggs_are_slot_combinable(
+        const std::vector<std::uint8_t>* skip = nullptr) const -> bool {
+        for (std::size_t a = 0; a < n_aggs_; ++a) {
+            if (skip != nullptr && (*skip)[a] != 0U) {
+                continue;
+            }
+            if (!agg_is_combinable(plan_[a].func)) {
+                return false;
+            }
+            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// How many morsels to cut `rows` into for a private-slot aggregation over
+    /// `n_cells` dense group indices, or 0 to decline.
+    ///
+    /// Partition on the DATA alone -- not `exec_->can_fan_out()`, the thread
+    /// budget, or whether this runs on a pool thread. Those choose who executes
+    /// the morsels; the cut decides the arithmetic, and a cut that varied with
+    /// the schedule would let the same query answer differently on two
+    /// machines.
+    ///
+    /// Partial state is bounded by CELL COUNT, and the merge costs one
+    /// agg_combine per (morsel, cell) while the scan it replaces costs one
+    /// update per row. Fanning out only pays when the merge stays small against
+    /// the scan: `by symbol` (252 groups) merges ~4k slots against 1M rows, but
+    /// `by user_id` (100k groups) would merge ~1M -- more work than it saves,
+    /// and measured as a 17% REGRESSION when a smaller slot let it through the
+    /// memory gate.
+    ///
+    /// One definition, because three callers share it: the accumulation of
+    /// already-discovered gids, the single-key Categorical fused path (cell =
+    /// dictionary code), and the multi-key one (cell = Cartesian product).
+    /// The row-derived morsel cut, shared by every private-slot aggregation.
+    ///
+    /// A function of the ROW COUNT ALONE -- deliberately not of the thread
+    /// count. A float reduction's result depends on where the range is cut, so
+    /// deriving morsels from the pool size would make `sum`/`std` answers
+    /// differ between a 4-core box and a 24-core one, and differ again under
+    /// `IBEX_CORES`. Keyed on rows, the answer depends only on the data: same
+    /// input, same result, any machine, any schedule.
+    ///
+    /// Morsels are large because a reduction's per-row cost is constant --
+    /// equal ranges finish together, so unlike a filter there is no imbalance
+    /// to hedge against and every extra morsel is pure dispatch and merge
+    /// overhead. The cap bounds the partial array.
+    [[nodiscard]] static auto morsel_cut_from_rows(std::size_t rows) -> std::size_t {
+        constexpr std::size_t kMinRowsPerMorsel = 65536;
+        constexpr std::size_t kMaxMorsels = 64;
+        return std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+    }
+
+    [[nodiscard]] auto dense_morsel_count(std::size_t n_cells, std::size_t rows) const
+        -> std::size_t {
+        constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
+        constexpr std::size_t kMergeToScanRatio = 4;
+        if (n_cells == 0 || n_aggs_ == 0) {
+            return 0;
+        }
+        const std::size_t per_morsel_bytes =
+            n_cells * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
+        if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
+            return 0;  // one worker's state alone blows the budget
+        }
+        std::size_t morsels = std::min(morsel_cut_from_rows(rows),
+                                       kPartialBudgetBytes / per_morsel_bytes);
+        if (morsels < 2 || morsels * n_cells > rows / kMergeToScanRatio) {
+            return 0;
+        }
+        return morsels;
+    }
+
     auto try_accumulate_parallel(const std::uint32_t* gids,
                                  const std::vector<const ColumnEntry*>& agg_entries,
                                  std::size_t rows, const std::vector<std::uint8_t>* skip = nullptr)
@@ -3561,41 +3750,11 @@ class HashAggregateState final {
         // varied with the schedule would let the same query answer differently
         // on two machines. Morsels run inline below when fan-out is not
         // available.
-        if (n_groups_ == 0 || n_aggs_ == 0) {
+        if (!aggs_are_slot_combinable(skip)) {
             return false;
         }
-        for (std::size_t a = 0; a < n_aggs_; ++a) {
-            if (skip != nullptr && (*skip)[a] != 0U) {
-                continue;
-            }
-            if (!agg_is_combinable(plan_[a].func)) {
-                return false;
-            }
-            // A boxed First/Last value lives outside the slot array, so a
-            // private copy would not capture it.
-            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
-                return false;
-            }
-        }
-
-        // Same budget and morsel shape as the Categorical path, for the same
-        // reasons: partial state is bounded by GROUP COUNT, and the merge costs
-        // one agg_combine per (morsel, group) while the scan it replaces costs
-        // one update per row. Fanning out only pays when the merge stays small
-        // against the scan — a high-cardinality group-by would merge more slots
-        // than it saved row updates.
-        constexpr std::size_t kMinRowsPerMorsel = 65536;
-        constexpr std::size_t kMaxMorsels = 64;
-        constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
-        constexpr std::size_t kMergeToScanRatio = 4;
-        const std::size_t per_morsel_bytes =
-            n_groups_ * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
-        if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
-            return false;
-        }
-        std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
-        morsels = std::min(morsels, kPartialBudgetBytes / per_morsel_bytes);
-        if (morsels < 2 || morsels * n_groups_ > rows / kMergeToScanRatio) {
+        const std::size_t morsels = dense_morsel_count(n_groups_, rows);
+        if (morsels == 0) {
             return false;
         }
 
@@ -4100,65 +4259,34 @@ class HashAggregateState final {
     /// merging them in ascending order while walking each morsel's own
     /// first-seen code list visits codes in precisely the order a serial scan
     /// would have met them.
-    auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
-                                       const std::vector<const ColumnEntry*>& agg_entries,
-                                       std::size_t rows) -> bool {
-        // Partition on the data alone -- not `exec_->can_fan_out()`, the thread
-        // budget, or whether this runs on a pool thread. Those choose who
-        // executes the morsels; the cut decides the arithmetic, and a cut that
-        // varied with the schedule would let the same query answer differently
-        // on two machines. Morsels run inline below when fan-out is not
-        // available.
-        for (std::size_t a = 0; a < n_aggs_; ++a) {
-            if (!agg_is_combinable(plan_[a].func)) {
-                return false;
-            }
-            // As above: a boxed First/Last value lives outside the slot.
-            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
-                return false;
-            }
-        }
-        const std::size_t dict_size = cat.dictionary().size();
-        if (dict_size == 0) {
-            return false;
-        }
-
-        // Same row-derived partition as the global aggregate, then bounded by
-        // what the per-worker slot arrays cost. Both inputs (row count and
-        // dictionary size) are properties of the DATA, so the partition — and
-        // therefore the float reduction order — is still independent of the
-        // machine and the schedule.
-        constexpr std::size_t kMinRowsPerMorsel = 65536;
-        constexpr std::size_t kMaxMorsels = 64;
-        constexpr std::size_t kPartialBudgetBytes = 32UL << 20;
-        const std::size_t per_morsel_bytes =
-            dict_size * ((n_aggs_ * sizeof(AggSlotCore)) + (scratch_stride_ * sizeof(double)));
-        if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
-            return false;  // one worker's state alone blows the budget
-        }
-        std::size_t morsels = std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
-        morsels = std::min(morsels, kPartialBudgetBytes / per_morsel_bytes);
-        if (morsels < 2) {
-            return false;
-        }
-        // The merge costs one agg_combine per (morsel, dictionary entry), so it
-        // scales with GROUP COUNT while the scan it replaces scales with rows.
-        // Fanning out only pays when the merge stays small against the scan:
-        // `by symbol` (252 groups) merges ~4k slots against 1M rows, but
-        // `by user_id` (100k groups) would merge ~1M — more work than it saves,
-        // and measured as a 17% REGRESSION when a smaller slot let it through
-        // the memory gate.
-        constexpr std::size_t kMergeToScanRatio = 4;
-        if (morsels * dict_size > rows / kMergeToScanRatio) {
-            return false;
-        }
-
-        const auto* codes = cat.codes_data();
+    /// Fused discovery + accumulation over a DENSE per-row group index.
+    ///
+    /// A Categorical code is a dense index into its dictionary; a tuple of
+    /// Categorical codes is a dense index into their Cartesian product, when
+    /// that product is bounded. Both are the same algorithm, and it is the one
+    /// that removes a whole pass: each morsel accumulates into a private
+    /// `n_cells x n_aggs` slot array indexed directly by that number, so there
+    /// is no hash probe, no gid array to materialize, and no separate Discovery
+    /// pass to write one. The merge walks morsels in ascending order and
+    /// assigns a gid the first time a cell is seen, which is what makes the
+    /// group order first-occurrence order.
+    ///
+    /// `index_of_row` is read for rows [0, rows). `prepare_range(begin, end)`
+    /// fills it for one morsel and runs on that morsel's worker -- a no-op for
+    /// the single-key path, whose codes already exist as an array. Ranges are
+    /// disjoint, so filling a shared buffer from it is safe.
+    /// `new_group(cell)` allocates the gid and records the group's key; it runs
+    /// serially, in the merge.
+    template <typename IndexT, typename Prepare, typename NewGroup>
+    void run_dense_fused(const IndexT* index_of_row, std::size_t n_cells,
+                         const std::vector<const ColumnEntry*>& agg_entries, std::size_t rows,
+                         std::vector<std::uint32_t>& dense_gid, std::size_t morsels,
+                         Prepare prepare_range, NewGroup new_group) {
         const std::size_t grain = (rows + morsels - 1) / morsels;
-        std::vector<AggSlotCore> partials(morsels * dict_size * n_aggs_);
-        std::vector<double> cat_partial_scratch(morsels * dict_size * scratch_stride_, 0.0);
-        // Per morsel, the codes it saw in first-occurrence order.
-        std::vector<std::vector<Column<Categorical>::code_type>> seen(morsels);
+        std::vector<AggSlotCore> partials(morsels * n_cells * n_aggs_);
+        std::vector<double> partial_scratch(morsels * n_cells * scratch_stride_, 0.0);
+        // Per morsel, the cells it saw in first-occurrence order.
+        std::vector<std::vector<std::uint32_t>> seen(morsels);
 
         const auto run_morsel = [&](std::size_t m, std::vector<std::uint8_t>& local_seen) {
             const std::size_t begin = m * grain;
@@ -4166,18 +4294,19 @@ class HashAggregateState final {
             if (begin >= end) {
                 return;
             }
+            prepare_range(begin, end);
             std::ranges::fill(local_seen, std::uint8_t{0});
             auto& order = seen[m];
             for (std::size_t row = begin; row < end; ++row) {
-                const auto code = codes[row];
-                if (local_seen[static_cast<std::size_t>(code)] == 0) {
-                    local_seen[static_cast<std::size_t>(code)] = 1;
-                    order.push_back(code);
+                const auto cell = static_cast<std::size_t>(index_of_row[row]);
+                if (local_seen[cell] == 0) {
+                    local_seen[cell] = 1;
+                    order.push_back(static_cast<std::uint32_t>(cell));
                 }
             }
-            accumulate_columns_into(codes, agg_entries, begin, end,
-                                    &partials[m * dict_size * n_aggs_],
-                                    cat_partial_scratch.data() + (m * dict_size * scratch_stride_));
+            accumulate_columns_into(
+                index_of_row, agg_entries, begin, end, &partials[m * n_cells * n_aggs_],
+                partial_scratch.data() + (m * n_cells * scratch_stride_));
         };
         const std::size_t threads =
             exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
@@ -4188,7 +4317,7 @@ class HashAggregateState final {
             auto& pool = process_worker_pool();
             std::atomic<std::size_t> cursor{0};
             auto batch = pool.submit(threads, [&](std::size_t) {
-                std::vector<std::uint8_t> local_seen(dict_size, 0);
+                std::vector<std::uint8_t> local_seen(n_cells, 0);
                 while (true) {
                     const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
                     if (m >= morsels) {
@@ -4199,26 +4328,22 @@ class HashAggregateState final {
             });
             batch.wait();
         } else {
-            std::vector<std::uint8_t> local_seen(dict_size, 0);
+            std::vector<std::uint8_t> local_seen(n_cells, 0);
             for (std::size_t m = 0; m < morsels; ++m) {
                 run_morsel(m, local_seen);
             }
         }
 
-        if (cat_dense_gid_.size() < dict_size) {
-            cat_dense_gid_.resize(dict_size, kNoGid);
-        }
         for (std::size_t m = 0; m < morsels; ++m) {
-            const AggSlotCore* src = &partials[m * dict_size * n_aggs_];
+            const AggSlotCore* src = &partials[m * n_cells * n_aggs_];
             const double* src_scratch =
-                cat_partial_scratch.data() + (m * dict_size * scratch_stride_);
-            for (const auto code : seen[m]) {
-                const auto idx = static_cast<std::size_t>(code);
-                std::uint32_t gid = cat_dense_gid_[idx];
+                partial_scratch.data() + (m * n_cells * scratch_stride_);
+            for (const auto cell : seen[m]) {
+                const auto idx = static_cast<std::size_t>(cell);
+                std::uint32_t gid = dense_gid[idx];
                 if (gid == kNoGid) {
-                    gid = alloc_group();
-                    cat_dense_gid_[idx] = gid;
-                    cat_order_.push_back(code);
+                    gid = new_group(idx);
+                    dense_gid[idx] = gid;
                 }
                 AggSlotCore* dst = &flat_slots_[(static_cast<std::size_t>(gid) * n_aggs_)];
                 for (std::size_t a = 0; a < n_aggs_; ++a) {
@@ -4236,6 +4361,33 @@ class HashAggregateState final {
             // report parallelism that never happened.
             exec_->parallel_stats->parallel_fields.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    auto try_process_rows_cat_parallel(const Column<Categorical>& cat,
+                                       const std::vector<const ColumnEntry*>& agg_entries,
+                                       std::size_t rows) -> bool {
+        if (!aggs_are_slot_combinable()) {
+            return false;
+        }
+        const std::size_t dict_size = cat.dictionary().size();
+        const std::size_t morsels = dense_morsel_count(dict_size, rows);
+        if (morsels == 0) {
+            return false;
+        }
+        // A Categorical code is already a dense index into [0, dict_size), and
+        // dicts only grow and never reorder, so existing gids stay valid and
+        // new entries just extend the array with sentinels.
+        if (cat_dense_gid_.size() < dict_size) {
+            cat_dense_gid_.resize(dict_size, kNoGid);
+        }
+        run_dense_fused(
+            cat.codes_data(), dict_size, agg_entries, rows, cat_dense_gid_, morsels,
+            [](std::size_t, std::size_t) {},
+            [&](std::size_t cell) {
+                const std::uint32_t gid = alloc_group();
+                cat_order_.push_back(static_cast<Column<Categorical>::code_type>(cell));
+                return gid;
+            });
         return true;
     }
 
@@ -4511,38 +4663,18 @@ class HashAggregateState final {
     }
 
     /// How many row-morsels to split a global aggregate into; 1 = stay serial.
+    ///
+    /// A global aggregate has one group, so it has no per-group state to
+    /// budget and nothing to merge but `n_aggs_` slots per morsel -- which is
+    /// why it takes the shared row cut without the grouped paths' byte and
+    /// merge-ratio gates.
     [[nodiscard]] auto ungrouped_morsels(std::size_t rows) const -> std::size_t {
-        // Deliberately NOT gated on `exec_->can_fan_out()`, the thread budget, or
-        // whether this runs on a pool thread. Those decide who EXECUTES the
-        // morsels, not how the range is cut, and a float reduction's result
-        // depends on where it is cut. Keeping the cut a function of the data
-        // alone is what makes one worker, eight workers, a serial run and a
-        // nested run agree bit for bit. The caller runs the morsels inline
-        // when it cannot fan out.
-        for (std::size_t a = 0; a < n_aggs_; ++a) {
-            if (!agg_is_combinable(plan_[a].func)) {
-                return 1;  // Skew/Kurtosis: no partial merge, stay serial.
-            }
-            // A non-numeric First/Last keeps its value in `text_store_`, which
-            // agg_combine cannot reach and workers must not write concurrently.
-            if (plan_[a].kind != ExprType::Int && plan_[a].kind != ExprType::Double) {
-                return 1;
-            }
+        // Skew/Kurtosis have no partial merge, and a non-numeric First/Last
+        // keeps its value in `text_store_`, which `agg_combine` cannot reach.
+        if (!aggs_are_slot_combinable()) {
+            return 1;
         }
-        // The partition is a function of the ROW COUNT ALONE — deliberately
-        // not of the thread count. A float reduction's result depends on where
-        // the range is cut, so deriving morsels from the pool size would make
-        // `sum`/`std` answers differ between a 4-core box and a 24-core one,
-        // and differ again under `--threads`. Keyed on rows, the answer depends
-        // only on the data: same input, same result, any machine, any schedule.
-        //
-        // Morsels are large because a reduction's per-row cost is constant —
-        // equal ranges finish together, so unlike a filter there is no
-        // imbalance to hedge against and every extra morsel is pure dispatch
-        // and merge overhead. The cap bounds the partial array.
-        constexpr std::size_t kMinRowsPerMorsel = 65536;
-        constexpr std::size_t kMaxMorsels = 64;
-        return std::clamp<std::size_t>(rows / kMinRowsPerMorsel, 1, kMaxMorsels);
+        return morsel_cut_from_rows(rows);
     }
 
     /// How one output column of the emitted chunk is written.
@@ -5151,6 +5283,9 @@ class HashAggregateState final {
     std::vector<std::uint32_t> multi_cat_cell_dense_;
     std::vector<std::uint32_t> multi_cat_slots_;  // open addressing on the code tuple: gid + 1
     std::vector<Column<Categorical>::code_type> multi_cat_codes_flat_;  // n_groups_ × n_keys
+    /// Per-row Cartesian cell for the fused multi-key Categorical path. Filled
+    /// by each morsel over its own disjoint slice, never read across morsels.
+    std::vector<std::uint32_t> multi_cat_cells_;
     std::vector<std::uint64_t> multi_cat_strides_;  // last-seen strides for rebuild detection
 
     // Single-string-key fast path.

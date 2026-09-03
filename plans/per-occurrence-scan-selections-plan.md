@@ -7,10 +7,14 @@ metadata:
 
 # Per-occurrence scan selections over one shared decode
 
-**Status: Phase 1 DONE (`78a09fad`), Phase 2a DONE (`bf783ef3`), Phase 2b
-attempted and reverted — it is a three-path problem, see below.** The regression
-that motivates it is diagnosed and bisected; two candidate fixes have now been
-built and rejected, both for the same reason in different places.
+**Status: FIXED for the `like` case (`f2b298db`); `scripts/ibex-e2e.sh` is
+green.** Phase 1 `78a09fad`, Phase 2a seam `bf783ef3`, Phase 2b + 3 `f2b298db`.
+
+What shipped is narrower than this plan's Phase 4 ambition and deliberately so:
+the split is gated on a **fusable `like`**, the one predicate shape where
+pushdown buys something a downstream filter cannot. Every other predicate keeps
+today's pooled decode. Phase 4 (narrowing the `!= 1` gate generally) stays open
+and now has a measured price attached — see *What the gate costs*.
 
 ## The defect
 
@@ -197,6 +201,26 @@ that actually fixes the e2e check and recovers the mechanism.
 400/300000/800/600000. `test_repl.cpp:1060` must stay green throughout —
 one decode of `{a, b}`, not three — since that is the property the rejected fix
 broke.
+
+### What the gate costs (measured 2026-09-03)
+
+The first working version split on ANY pushable predicate. It fixed the e2e
+check and regressed **q21 by +10.2% (min, 1/12 paired wins, interleaved)**.
+
+The cause is not decode -- that is shared -- it is the per-occurrence
+**gather**. `project_rows` materializes each occurrence's rows, so q21's three
+filtered `lineitem` occurrences each build their own 48M-row table instead of
+sharing one that downstream filters stream over. Pushing
+`l_receiptdate > l_commitdate` only evaluates it EARLIER; it does not remove
+work the way a fused `like` does.
+
+Hence the gate: split only for a `like` over a column the query reads from
+nowhere else, where the string column is never built at all. With it, **no PDS-H
+plan changes** (all 22 compared by operator profile).
+
+**A coarse timer nearly hid this.** `/usr/bin/time` (10ms granularity) put q21 at
+-0.9%; `time.perf_counter()` over 12 interleaved pairs put it at +10.2% with a
+1/12 paired signal. On queries this size, measure with a real clock.
 
 **Phase 4 — re-examine the `!= 1` gate.** It can then be narrowed from "any
 repeated source" to "a predicate that cannot be answered per occurrence",

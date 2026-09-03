@@ -319,11 +319,16 @@ TEST_CASE("scan_predicates_by_occurrence: records an unfiltered occurrence",
 
 TEST_CASE("scan_predicates_by_occurrence: agrees with the name-keyed map on one occurrence",
           "[ir][scan_predicates]") {
-    // A stacked filter does NOT push: `projected_scan` reaches a scan through
-    // column-only Project/Rename nodes, never through another Filter, so only
-    // the filter directly above the scan is a candidate. Pinned here because
-    // the per-occurrence view must agree with the name-keyed one wherever the
-    // name-keyed one still answers -- that is the whole claim of Phase 1.
+    // `projected_scan` reaches a scan through column-only Project/Rename nodes,
+    // never through another Filter, so with the stack intact only the inner
+    // filter is a candidate. A real plan never reaches this pass in that shape:
+    // canonicalize R19 (`try_filter_merge`) has already rewritten
+    // `Filter(p1, Filter(p2, x))` into `Filter(p1 AND p2, x)`, and then both
+    // conjuncts push. This builds the IR by hand precisely to bypass that and
+    // exercise the single-occurrence path directly.
+    //
+    // What is pinned is the Phase 1 claim: wherever the name-keyed map still
+    // answers, the per-occurrence view agrees with it exactly.
     auto plan = with_child(
         std::make_unique<ir::FilterNode>(ir::NodeId{2}, gt_zero("a")),
         with_child(std::make_unique<ir::FilterNode>(ir::NodeId{3}, gt_zero("b")), make_scan("t")));

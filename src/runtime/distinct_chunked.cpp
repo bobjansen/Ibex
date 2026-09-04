@@ -29,12 +29,11 @@
 #include <variant>
 #include <vector>
 
-#include "physical_plan.hpp"
-
 #include "chunk_conversion_internal.hpp"
 #include "interpreter_internal.hpp"
 #include "packed_key_encoder_internal.hpp"
 #include "physical_executor_internal.hpp"
+#include "physical_plan.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {

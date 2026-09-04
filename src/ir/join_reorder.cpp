@@ -161,10 +161,9 @@ auto preserves_multiset_without_observing_order(const Node& node) -> bool {
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
-void collect_binding_order_uses(const Node& node, std::string_view binding,
-                                bool order_is_erased, BindingOrderUses& out) {
-    if (node.kind() == NodeKind::Scan &&
-        node_cast<ScanNode>(node).source_name() == binding) {
+void collect_binding_order_uses(const Node& node, std::string_view binding, bool order_is_erased,
+                                BindingOrderUses& out) {
+    if (node.kind() == NodeKind::Scan && node_cast<ScanNode>(node).source_name() == binding) {
         ++out.count;
         out.all_order_insensitive = out.all_order_insensitive && order_is_erased;
         return;

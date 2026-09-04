@@ -41,9 +41,9 @@ using ScanPredicateMap = std::map<std::string, std::vector<Expr>>;
 /// exists so the later phases have somewhere to put "same decode, different
 /// rows".
 struct ScanOccurrence {
-    NodeId scan;                 ///< identity of the `ScanNode` itself
-    std::string source;          ///< the source it reads
-    std::vector<Expr> conjuncts; ///< pushable conjuncts of THIS occurrence
+    NodeId scan;                  ///< identity of the `ScanNode` itself
+    std::string source;           ///< the source it reads
+    std::vector<Expr> conjuncts;  ///< pushable conjuncts of THIS occurrence
 };
 
 /// Every scan occurrence in `root`, including unfiltered ones (empty

@@ -871,9 +871,10 @@ auto make_distinct_fixture() -> runtime::TableRegistry {
 
 TEST_CASE("E2E: count_distinct grouped, mixed with other aggregates, ignores nulls", "[e2e]") {
     auto tables = make_distinct_fixture();
-    auto out = run("t[select { nd = count_distinct(v), ns = count_distinct(s), "
-                   "total = sum(w), n = count() }, by { g }];",
-                   tables);
+    auto out =
+        run("t[select { nd = count_distinct(v), ns = count_distinct(s), "
+            "total = sum(w), n = count() }, by { g }];",
+            tables);
     REQUIRE(out.rows() == 3);
     const auto g = col_str(out, "g");
     const auto nd = col_i64(out, "nd");
@@ -902,7 +903,6 @@ TEST_CASE("E2E: count_distinct without group-by", "[e2e]") {
     REQUIRE(out.rows() == 1);
     CHECK(col_i64(out, "nd") == std::vector<std::int64_t>{4});  // {1, 2, 5, 9}, null skipped
 }
-
 
 // --- Rename ------------------------------------------------------------------
 

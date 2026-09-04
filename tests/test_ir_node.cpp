@@ -110,7 +110,7 @@ TEST_CASE("HeadNode stores count and optional group-by", "[ir][head]") {
     auto* head = dynamic_cast<ibex::ir::HeadNode*>(node.get());
     REQUIRE(head != nullptr);
     REQUIRE(head->kind() == ibex::ir::NodeKind::Head);
-    REQUIRE(head->count() == 3);
+    REQUIRE(head->count_literal() == 3);
     REQUIRE(head->group_by().size() == 1);
     REQUIRE(head->group_by()[0].name == "symbol");
 }
@@ -122,7 +122,7 @@ TEST_CASE("TailNode stores count and optional group-by", "[ir][tail]") {
     auto* tail = dynamic_cast<ibex::ir::TailNode*>(node.get());
     REQUIRE(tail != nullptr);
     REQUIRE(tail->kind() == ibex::ir::NodeKind::Tail);
-    REQUIRE(tail->count() == 3);
+    REQUIRE(tail->count_literal() == 3);
     REQUIRE(tail->group_by().size() == 1);
     REQUIRE(tail->group_by()[0].name == "symbol");
 }

@@ -109,21 +109,19 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         }
         case NodeKind::Head: {
             auto input = child();
-            const auto& head = node_cast<HeadNode>(node);
-            if (!input.rows.has_value() || !head.count_literal().has_value()) {
+            const auto limit = node_cast<HeadNode>(node).count_literal();
+            if (!input.rows.has_value() || !limit.has_value()) {
                 return input;
             }
-            return {.rows = std::min(*input.rows, *head.count_literal()),
-                    .heuristic = input.heuristic};
+            return {.rows = std::min(*input.rows, *limit), .heuristic = input.heuristic};
         }
         case NodeKind::Tail: {
             auto input = child();
-            const auto& tail = node_cast<TailNode>(node);
-            if (!input.rows.has_value() || !tail.count_literal().has_value()) {
+            const auto limit = node_cast<TailNode>(node).count_literal();
+            if (!input.rows.has_value() || !limit.has_value()) {
                 return input;
             }
-            return {.rows = std::min(*input.rows, *tail.count_literal()),
-                    .heuristic = input.heuristic};
+            return {.rows = std::min(*input.rows, *limit), .heuristic = input.heuristic};
         }
         // An aggregate emits one row per distinct group, so its size is the
         // distinct cardinality of its group keys -- which needs statistics we

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <ranges>
 #include <set>
 #include <string>
 #include <utility>
@@ -125,8 +126,8 @@ auto facts_for(const std::string& source, const SourceSchemas& sources) -> Sourc
 /// The second is what makes it transitive, and q10 needs that: `c_custkey`
 /// reaches `c_nationkey` by the first rule, then `n_name` by the second.
 auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>& edges,
-                const SourceSchemas& sources,
-                const SourceColumn* assumed_unique = nullptr) -> std::set<SourceColumn> {
+                const SourceSchemas& sources, const SourceColumn* assumed_unique = nullptr)
+    -> std::set<SourceColumn> {
     std::set<SourceColumn> closed = seed;
     bool grew = true;
     while (grew) {
@@ -137,9 +138,9 @@ auto fd_closure(const std::set<SourceColumn>& seed, const std::vector<JoinEdge>&
         // self-join would collapse the other side's group keys.
         const auto add_all_of = [&](const SourceColumn& rep) {
             for (const auto& column : facts_for(rep.source, sources).all_columns) {
-                if (closed.emplace(SourceColumn{.scan = rep.scan,
-                                                .source = rep.source,
-                                                .column = column})
+                if (closed
+                        .emplace(
+                            SourceColumn{.scan = rep.scan, .source = rep.source, .column = column})
                         .second) {
                     grew = true;
                 }
@@ -295,9 +296,9 @@ auto walk(NodePtr node, const SourceSchemas& sources) -> NodePtr {
 /// multi-hop lift (q10's `n_name`, two joins away) measured ~3% more at eight
 /// cores and is deliberately left out.
 struct LiftPlan {
-    ColumnRef group_key;         ///< The surviving group key, in aggregate output names.
-    SourceColumn key_origin;     ///< Where that key comes from.
-    std::vector<AggSpec> lifted; ///< `First` aggregates to move above the top-k.
+    ColumnRef group_key;          ///< The surviving group key, in aggregate output names.
+    SourceColumn key_origin;      ///< Where that key comes from.
+    std::vector<AggSpec> lifted;  ///< `First` aggregates to move above the top-k.
 };
 
 /// The `Aggregate` under a chain of `Order`/`Project` nodes, or nullptr.
@@ -400,10 +401,8 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
             continue;
         }
         for (const auto& order_key : node_cast<OrderNode>(*link).keys()) {
-            const bool lifts_sort_key =
-                std::ranges::any_of(lifted, [&](const AggSpec& spec) {
-                    return spec.alias == order_key.name;
-                });
+            const bool lifts_sort_key = std::ranges::any_of(
+                lifted, [&](const AggSpec& spec) { return spec.alias == order_key.name; });
             if (lifts_sort_key) {
                 return std::nullopt;
             }
@@ -420,8 +419,8 @@ auto plan_lift(Node& head_node, const Node& root, const SourceSchemas& sources)
 auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::uint64_t& next)
     -> NodePtr {
     const auto is_lifted = [&](const std::string& name) {
-        return std::ranges::any_of(
-            plan.lifted, [&](const AggSpec& spec) { return spec.alias == name; });
+        return std::ranges::any_of(plan.lifted,
+                                   [&](const AggSpec& spec) { return spec.alias == name; });
     };
 
     // The output the caller currently sees, which the rewrite must reproduce
@@ -457,17 +456,18 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
         AggregateNode* agg = aggregate_below(*head_node->mutable_children().front(), chain);
         std::vector<AggSpec> kept;
         for (const auto& spec : agg->aggregations()) {
-            if (!(spec.func == AggFunc::First && is_lifted(spec.alias))) {
+            if (spec.func != AggFunc::First || !is_lifted(spec.alias)) {
                 kept.push_back(spec);
             }
         }
-        auto narrowed = std::make_unique<AggregateNode>(agg->id(), agg->group_by(), std::move(kept));
+        auto narrowed =
+            std::make_unique<AggregateNode>(agg->id(), agg->group_by(), std::move(kept));
         narrowed->add_child(std::move(agg->mutable_children().front()));
 
         // Rebuild the chain bottom-up, dropping lifted columns from projections.
         NodePtr rebuilt = std::move(narrowed);
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            Node& link = **it;
+        for (auto& it : std::views::reverse(chain)) {
+            Node& link = *it;
             if (link.kind() == NodeKind::Project) {
                 std::vector<ColumnRef> cols;
                 for (const auto& col : node_cast<ProjectNode>(link).columns()) {
@@ -479,8 +479,8 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
                 project->add_child(std::move(rebuilt));
                 rebuilt = std::move(project);
             } else {
-                auto order = std::make_unique<OrderNode>(
-                    link.id(), node_cast<OrderNode>(link).keys());
+                auto order =
+                    std::make_unique<OrderNode>(link.id(), node_cast<OrderNode>(link).keys());
                 order->add_child(std::move(rebuilt));
                 rebuilt = std::move(order);
             }
@@ -532,8 +532,8 @@ auto apply_lift(NodePtr head_node, const Node& root, const LiftPlan& plan, std::
         aggregate_below(*left->mutable_children().front(), chain);
         for (const Node* link : chain) {
             if (link->kind() == NodeKind::Order) {
-                auto order = std::make_unique<OrderNode>(
-                    NodeId{next++}, node_cast<OrderNode>(*link).keys());
+                auto order =
+                    std::make_unique<OrderNode>(NodeId{next++}, node_cast<OrderNode>(*link).keys());
                 order->add_child(std::move(top));
                 top = std::move(order);
                 break;

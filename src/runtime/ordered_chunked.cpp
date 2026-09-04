@@ -752,7 +752,6 @@ class ChunkedOrderedLimitOperator final : public Operator {
     static constexpr std::uint32_t kNoCatGid = std::numeric_limits<std::uint32_t>::max();
 };
 
-
 }  // namespace
 
 namespace physical_executor_detail {

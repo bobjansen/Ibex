@@ -1,5 +1,22 @@
 # Null-aware keys (group-by, distinct, order, join)
 
+**Status: COMPLETE. All five stages are implemented and covered.** Verified
+against the tree on 2026-09-04 by running `tests/data/null_keys_check.ibex`,
+which exercises every case below and pits each null against a GENUINE zero:
+group-by (3 groups), `update ... by` (null group totals 30), `distinct` (3
+rows), `order` asc and desc (nulls last both ways, the position does not flip),
+inner join (null keys drop, 3 rows) and left join (null-filled, 5 rows), dcast
+(null row key preserved), asof join (null equality key unmatched), and a
+multi-column key where `{0,null}` and `{null,0}` stay distinct from each other
+and from `{0,0}`. `tests/test_null_keys.cpp` covers the same ground as unit
+tests, and `scripts/ibex-e2e.sh` runs the fixture.
+
+This file had carried no status marker at all, which is why the plans index
+listed it as "Unverified" long after it was done. Kept for the semantics
+section below -- the group-by/join inconsistency is a decision worth being able
+to cite -- and it is a removal candidate under the index's own convention that
+completed plans leave the tree.
+
 ## The bug
 
 Every operator that builds a key from a column reads the column's **value** and

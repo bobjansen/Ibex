@@ -562,12 +562,10 @@ void wait_for_batch(WorkerPool::Batch::State& state, std::unique_lock<std::mutex
         // up, and a wakeup for that arrives on the pool queue, not `state.done`.
         // The bounded re-check closes that window without spinning.
         if (state.profile_entry == nullptr || !state.account_wait) {
-            state.done.wait_for(lock, kCoopPollInterval,
-                                [&state] { return state.remaining == 0; });
+            state.done.wait_for(lock, kCoopPollInterval, [&state] { return state.remaining == 0; });
         } else {
             const auto start = std::chrono::steady_clock::now();
-            state.done.wait_for(lock, kCoopPollInterval,
-                                [&state] { return state.remaining == 0; });
+            state.done.wait_for(lock, kCoopPollInterval, [&state] { return state.remaining == 0; });
             parked += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start);
         }

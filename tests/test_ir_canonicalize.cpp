@@ -335,7 +335,7 @@ TEST_CASE("canonicalize R13: Head(Head(x)) collapses to tighter bound", "[ir][ca
     REQUIRE(out->kind() == ir::NodeKind::Head);
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
     const auto& h = static_cast<const ir::HeadNode&>(*out);
-    REQUIRE(h.count() == 10);
+    REQUIRE(h.count_literal() == 10);
 }
 
 TEST_CASE("canonicalize R14: Tail(Tail(x)) collapses to tighter bound", "[ir][canonicalize]") {
@@ -344,7 +344,7 @@ TEST_CASE("canonicalize R14: Tail(Tail(x)) collapses to tighter bound", "[ir][ca
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Tail);
     const auto& t = static_cast<const ir::TailNode&>(*out);
-    REQUIRE(t.count() == 50);
+    REQUIRE(t.count_literal() == 50);
 }
 
 namespace {
@@ -434,7 +434,7 @@ TEST_CASE("canonicalize R17: Filter(false) becomes Head(0)", "[ir][canonicalize]
     auto out = ir::canonicalize(std::move(tree));
     REQUIRE(out->kind() == ir::NodeKind::Head);
     const auto& h = static_cast<const ir::HeadNode&>(*out);
-    REQUIRE(h.count() == 0);
+    REQUIRE(h.count_literal() == 0);
     REQUIRE(out->children().front()->kind() == ir::NodeKind::Scan);
 }
 

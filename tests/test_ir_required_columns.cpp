@@ -485,9 +485,10 @@ TEST_CASE("deferrable_probe_scans: a filter absorbed into the build scan still c
               .contains("lineitem"));
 }
 
-TEST_CASE("deferrable_probe_scans: the no-absorbed and with-absorbed calls can disagree "
-          "on a small probe -- guards the prove_unique_columns caching window",
-          "[ir][scan_predicates][deferred_scan]") {
+TEST_CASE(
+    "deferrable_probe_scans: the no-absorbed and with-absorbed calls can disagree "
+    "on a small probe -- guards the prove_unique_columns caching window",
+    "[ir][scan_predicates][deferred_scan]") {
     // repl.cpp's `optimize_and_execute_plan` calls deferrable_probe_scans TWICE:
     //   1. before the join reorder, with absorbed={}, to decide which join-key
     //      columns `prove_unique_columns` may leave in the LazyTable cache_
@@ -509,14 +510,13 @@ TEST_CASE("deferrable_probe_scans: the no-absorbed and with-absorbed calls can d
     // window -- and should light this test up as the spec of the gap.
     const ir::SourceRowCounts rows{{"dim", 400000}, {"probe", 500000}};
     ir::SourceSchemas schemas;
-    schemas.emplace("dim", ir::SchemaInfo::known({ir::SchemaField{
-                               .name = "k",
-                               .type = ir::ColumnType::Int64,
-                               .nulls = ir::Nullability::Maybe}}));
-    schemas.emplace("probe", ir::SchemaInfo::known({ir::SchemaField{
-                                 .name = "k",
-                                 .type = ir::ColumnType::Int64,
-                                 .nulls = ir::Nullability::Maybe}}));
+    schemas.emplace(
+        "dim", ir::SchemaInfo::known({ir::SchemaField{
+                   .name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
+    schemas.emplace(
+        "probe",
+        ir::SchemaInfo::known({ir::SchemaField{
+            .name = "k", .type = ir::ColumnType::Int64, .nulls = ir::Nullability::Maybe}}));
 
     auto plan = inner_join(std::make_unique<ir::ScanNode>(ir::NodeId{1}, "dim"),
                            std::make_unique<ir::ScanNode>(ir::NodeId{2}, "probe"), "k");

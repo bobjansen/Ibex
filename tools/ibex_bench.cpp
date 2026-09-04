@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Bob Jansen
 
+#include <ibex/core/text.hpp>
 #include <ibex/format.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
@@ -8,6 +9,8 @@
 #include <ibex/runtime/rng.hpp>
 
 #include <CLI/CLI.hpp>
+
+#include <algorithm>
 
 // When jemalloc is linked, prevent large allocations from being returned to the OS
 // between benchmark iterations.  By default jemalloc decays dirty pages after 10 s,
@@ -31,6 +34,7 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <string_view>
@@ -39,23 +43,14 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <unordered_set>
 #include <vector>
 
-#if defined(__AVX2__)
+#ifdef __AVX2__
 #include <immintrin.h>
 #endif
 
 namespace {
 
-auto trim(std::string_view input) -> std::string_view {
-    auto start = input.find_first_not_of(" \t\n\r");
-    if (start == std::string_view::npos) {
-        return {};
-    }
-    auto end = input.find_last_not_of(" \t\n\r");
-    return input.substr(start, end - start + 1);
-}
-
 auto normalize_input(std::string_view input) -> std::string {
-    auto normalized = std::string(trim(input));
+    auto normalized = std::string(ibex::trim(input));
     auto last_non_space = normalized.find_last_not_of(" \t\n\r");
     if (last_non_space != std::string::npos && normalized[last_non_space] != ';') {
         normalized.push_back(';');
@@ -881,7 +876,8 @@ auto verify_group_stat(const ibex::runtime::Table& table, const ibex::runtime::T
         double expected = 0.0;
         if (kind == "median") {
             if (n > 0) {
-                expected = (n % 2 == 1) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+                expected =
+                    (n % 2 == 1) ? sorted[n / 2] : (sorted[(n / 2) - 1] + sorted[n / 2]) / 2.0;
             }
         } else if (kind == "quantile90") {
             if (n > 0) {
@@ -1051,7 +1047,7 @@ auto slice_table(const ibex::runtime::Table& table, std::size_t rows) -> ibex::r
                     for (std::size_t i = 0; i < n; ++i) {
                         data.emplace_back(col[i]);
                     }
-                    return ibex::Column<std::string>(std::move(data));
+                    return ibex::Column<std::string>(data);
                 } else if constexpr (std::is_same_v<ColType, ibex::Column<ibex::Date>>) {
                     std::vector<ibex::Date> data;
                     data.reserve(n);
@@ -1155,7 +1151,7 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         sliced.emplace("users", slice_table(*users, max_rows));
     }
 
-    auto result = ibex::runtime::interpret(*lowered.value(), sliced, &scalars);
+    auto result = ibex::runtime::interpret(**lowered, sliced, &scalars);
     if (!result) {
         return "interpret failed: " + result.error();
     }
@@ -1365,7 +1361,7 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         }
         if (auto err =
                 verify_join_row_count(*result, sliced.at("prices").rows(), "null_left_join")) {
-            return *err;
+            return err;
         }
     } else if (query.name == "null_semi_join") {
         if (table == nullptr || lookup == nullptr) {
@@ -1388,7 +1384,7 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
             }
         }
         if (auto err = verify_join_row_count(*result, expected, "null_semi_join")) {
-            return *err;
+            return err;
         }
     } else if (query.name == "null_anti_join") {
         if (table == nullptr || lookup == nullptr) {
@@ -1411,7 +1407,7 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
             }
         }
         if (auto err = verify_join_row_count(*result, expected, "null_anti_join")) {
-            return *err;
+            return err;
         }
     } else if (query.name == "null_cross_join_small") {
         if (prices_small == nullptr || lookup_small == nullptr) {
@@ -1419,7 +1415,7 @@ auto verify_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistr
         }
         std::size_t expected = sliced.at("prices_small").rows() * sliced.at("lookup_small").rows();
         if (auto err = verify_join_row_count(*result, expected, "null_cross_join_small")) {
-            return *err;
+            return err;
         }
     } else if (query.name == "filter_simple") {
         if (trades == nullptr) {
@@ -1476,10 +1472,8 @@ auto compute_stats(std::vector<double> times) -> BenchStats {
     double mx = times[0];
     double sq_sum = 0.0;
     for (double t : times) {
-        if (t < mn)
-            mn = t;
-        if (t > mx)
-            mx = t;
+        mn = std::min(t, mn);
+        mx = std::max(t, mx);
         sq_sum += (t - avg) * (t - avg);
     }
     double stddev = times.size() > 1 ? std::sqrt(sq_sum / static_cast<double>(times.size())) : 0.0;
@@ -1547,7 +1541,7 @@ auto pack_filter_micro_word_scalar(const std::uint8_t* mp, std::size_t lim) noex
     return bits;
 }
 
-#if defined(__AVX2__)
+#ifdef __AVX2__
 auto pack_filter_micro_word_avx2(const std::uint8_t* mp) noexcept -> std::uint64_t {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mp));
@@ -1569,7 +1563,7 @@ auto pack_filter_micro_mask(const std::vector<std::uint8_t>& mask,
     for (std::size_t w = 0; w < n_words; ++w) {
         const std::size_t base = w * 64;
         const std::size_t lim = std::min<std::size_t>(64, n - base);
-#if defined(__AVX2__)
+#ifdef __AVX2__
         const std::uint64_t bits = (lim == 64)
                                        ? pack_filter_micro_word_avx2(mask.data() + base)
                                        : pack_filter_micro_word_scalar(mask.data() + base, lim);
@@ -1600,7 +1594,7 @@ auto build_filter_micro_indices(const std::vector<std::uint64_t>& keep_words, st
 
 template <typename T>
 auto digest_primitive_column(const ibex::Column<T>& col) -> std::uint64_t {
-    if (col.size() == 0) {
+    if (col.empty()) {
         return 0;
     }
     const std::size_t mid = col.size() / 2;
@@ -1619,7 +1613,7 @@ auto digest_primitive_column(const ibex::Column<T>& col) -> std::uint64_t {
 
 template <typename Fn>
 auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
-                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+                                 std::size_t warmup_iters, std::size_t iters, const Fn& run_once)
     -> int {
     auto run_and_touch = [&]() -> int {
         auto merged = run_once();
@@ -1659,7 +1653,7 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
 
 template <typename Fn>
 auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
-                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+                                 std::size_t warmup_iters, std::size_t iters, const Fn& run_once)
     -> int {
     auto run_and_touch = [&]() { g_bench_sink ^= run_once(); };
 
@@ -1721,7 +1715,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                                         lowered.error().message);
                 return 1;
             }
-            auto result = ibex::runtime::interpret(*lowered.value(), fresh, &scalars);
+            auto result = ibex::runtime::interpret(**lowered, fresh, &scalars);
             if (!result) {
                 ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
                                         result.error());
@@ -1772,7 +1766,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         }
 
         for (std::size_t i = 0; i < warmup_iters; ++i) {
-            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+            auto result = ibex::runtime::interpret(**lowered, tables, &scalars);
             if (!result) {
                 ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
                                         result.error());
@@ -1785,7 +1779,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         std::vector<double> times(iters);
         for (std::size_t i = 0; i < iters; ++i) {
             auto t0 = std::chrono::steady_clock::now();
-            auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+            auto result = ibex::runtime::interpret(**lowered, tables, &scalars);
             auto t1 = std::chrono::steady_clock::now();
             if (!result) {
                 ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
@@ -1817,7 +1811,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
                                     lowered.error().message);
             return 1;
         }
-        auto result = ibex::runtime::interpret(*lowered.value(), tables, &scalars);
+        auto result = ibex::runtime::interpret(**lowered, tables, &scalars);
         if (!result) {
             ibex::formatting::print("error: interpret failed for {}: {}\n", query.name,
                                     result.error());
@@ -1855,6 +1849,7 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
 
 }  // namespace
 
+// NOLINTNEXTLINE(readability-function-size)
 int main(int argc, char** argv) {
     CLI::App app{"Ibex benchmark harness"};
 
@@ -2024,52 +2019,54 @@ int main(int argc, char** argv) {
         // Single-column group-by: exercises the string fast path (robin_hood).
         std::vector<BenchQuery> queries = {
             {
-                "mean_by_symbol",
-                "prices[select {avg_price = mean(price)}, by symbol]",
+                .name = "mean_by_symbol",
+                .source = "prices[select {avg_price = mean(price)}, by symbol]",
             },
             {
-                "ohlc_by_symbol",
-                "prices[select {open = first(price), high = max(price), low = min(price), last = "
-                "last(price)}, by symbol]",
+                .name = "ohlc_by_symbol",
+                .source = "prices[select {open = first(price), high = max(price), low = "
+                          "min(price), last = "
+                          "last(price)}, by symbol]",
             },
             {
-                "update_price_x2",
-                "prices[update {price_x2 = price * 2}]",
+                .name = "update_price_x2",
+                .source = "prices[update {price_x2 = price * 2}]",
             },
             {
-                "distinct_symbol",
-                "prices[distinct { symbol }]",
+                .name = "distinct_symbol",
+                .source = "prices[distinct { symbol }]",
             },
             {
-                "order_head_topk",
-                "prices[order price desc, head 100]",
+                .name = "order_head_topk",
+                .source = "prices[order price desc, head 100]",
             },
             {
-                "order_head_topk_by_symbol",
-                "prices[order price desc, head 3, by symbol]",
+                .name = "order_head_topk_by_symbol",
+                .source = "prices[order price desc, head 3, by symbol]",
             },
             {
-                "order_tail_topk",
-                "prices[order price desc, tail 100]",
+                .name = "order_tail_topk",
+                .source = "prices[order price desc, tail 100]",
             },
             {
-                "order_tail_topk_by_symbol",
-                "prices[order price desc, tail 3, by symbol]",
+                .name = "order_tail_topk_by_symbol",
+                .source = "prices[order price desc, tail 3, by symbol]",
             },
             // Parse + lower overhead: same queries timed with parsing included.
             // Run with --include-parse (default) to capture lexer/parser maps.
             {
-                "parse_mean_by_symbol",
-                "prices[select {avg_price = mean(price)}, by symbol]",
+                .name = "parse_mean_by_symbol",
+                .source = "prices[select {avg_price = mean(price)}, by symbol]",
             },
             {
-                "parse_ohlc_by_symbol",
-                "prices[select {open = first(price), high = max(price), low = min(price), last = "
-                "last(price)}, by symbol]",
+                .name = "parse_ohlc_by_symbol",
+                .source = "prices[select {open = first(price), high = max(price), low = "
+                          "min(price), last = "
+                          "last(price)}, by symbol]",
             },
             {
-                "parse_update_price_x2",
-                "prices[update {price_x2 = price * 2}]",
+                .name = "parse_update_price_x2",
+                .source = "prices[update {price_x2 = price * 2}]",
             },
         };
 
@@ -2380,17 +2377,19 @@ int main(int argc, char** argv) {
                     val_col.push_back(100.0 + static_cast<double>(i % 100));
                     validity.push_back(i % 2 == 0);  // even rows valid, odd rows null
                 }
-                fill_table.add_column("val", std::move(val_col), std::move(validity));
+                fill_table.add_column("val", std::move(val_col), validity);
             }
             ibex::runtime::TableRegistry fill_tables;
             fill_tables.emplace("fill_data", std::move(fill_table));
 
             ibex::formatting::print("\n-- Fill benchmarks ({} rows, 50% nulls) --\n", fill_rows);
             std::vector<BenchQuery> fill_queries = {
-                {"fill_null", "fill_data[update { v2 = fill_null(val, 0.0) }]"},
-                {"where_update_nullable", "fill_data[where is_null(val) update { val = 0.0 }]"},
-                {"fill_forward", "fill_data[update { v2 = fill_forward(val) }]"},
-                {"fill_backward", "fill_data[update { v2 = fill_backward(val) }]"},
+                {.name = "fill_null", .source = "fill_data[update { v2 = fill_null(val, 0.0) }]"},
+                {.name = "where_update_nullable",
+                 .source = "fill_data[where is_null(val) update { val = 0.0 }]"},
+                {.name = "fill_forward", .source = "fill_data[update { v2 = fill_forward(val) }]"},
+                {.name = "fill_backward",
+                 .source = "fill_data[update { v2 = fill_backward(val) }]"},
             };
             for (const auto& query : fill_queries) {
                 status =
@@ -2828,7 +2827,7 @@ int main(int argc, char** argv) {
                 for (std::size_t i = 0; i < indices.size(); ++i) {
                     dst[i] = src[indices[i]];
                 }
-                if (out.size() == 0) {
+                if (out.empty()) {
                     return std::uint64_t{0};
                 }
                 return static_cast<std::uint64_t>(out.code_at(0)) ^
@@ -2879,7 +2878,7 @@ int main(int argc, char** argv) {
                         bits &= bits - 1;
                     }
                 }
-                if (out.size() == 0) {
+                if (out.empty()) {
                     return std::uint64_t{0};
                 }
                 return static_cast<std::uint64_t>(out.code_at(0)) ^
@@ -2966,7 +2965,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 const auto symbol_digest =
-                    symbol_out.size() == 0
+                    symbol_out.empty()
                         ? std::uint64_t{0}
                         : static_cast<std::uint64_t>(symbol_out.code_at(0)) ^
                               (static_cast<std::uint64_t>(symbol_out.code_at(symbol_out.size() / 2))
@@ -3200,7 +3199,10 @@ int main(int argc, char** argv) {
 
         ibex::Column<std::string> sym_col;
         ibex::Column<std::int64_t> day_col;
-        ibex::Column<double> open_col, high_col, low_col, close_col;
+        ibex::Column<double> open_col;
+        ibex::Column<double> high_col;
+        ibex::Column<double> low_col;
+        ibex::Column<double> close_col;
         sym_col.reserve(reshape_rows);
         day_col.reserve(reshape_rows);
         open_col.reserve(reshape_rows);
@@ -3248,9 +3250,19 @@ int main(int argc, char** argv) {
             ibex::runtime::ScalarRegistry melt_scalars;
             auto melt_src = normalize_input("wide[melt {symbol, day}]");
             auto melt_parsed = ibex::parser::parse(melt_src);
+            if (!melt_parsed) {
+                ibex::formatting::print("error: parse failed for {}: {}\n", melt_query.name,
+                                        melt_parsed.error().format());
+                return 1;
+            }
             auto melt_lowered = ibex::parser::lower(*melt_parsed);
+            if (!melt_lowered) {
+                ibex::formatting::print("error: lower failed for {}: {}\n", melt_query.name,
+                                        melt_lowered.error().message);
+                return 1;
+            }
             auto long_result =
-                ibex::runtime::interpret(*melt_lowered.value(), reshape_tables, &melt_scalars);
+                ibex::runtime::interpret(**melt_lowered, reshape_tables, &melt_scalars);
             if (!long_result) {
                 ibex::formatting::print("error: failed to build long table for dcast: {}\n",
                                         long_result.error());
@@ -3538,7 +3550,7 @@ int main(int argc, char** argv) {
             q_bid.reserve(timeframe_rows);
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 q_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL});
-                q_bid.push_back(99.0 + static_cast<double>(i % 100) * 0.01);
+                q_bid.push_back(99.0 + (static_cast<double>(i % 100) * 0.01));
             }
             ibex::runtime::Table quotes_table;
             quotes_table.add_column("ts", std::move(q_ts));
@@ -3547,6 +3559,8 @@ int main(int argc, char** argv) {
             // Trade indices: deterministic 10% reservoir-style sample.
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
+            // Fine here
+            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
             std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 if ((rng() % 10ULL) == 0ULL) {
@@ -3561,8 +3575,8 @@ int main(int argc, char** argv) {
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
                 const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
-                t_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL +
-                                               jitter_ms * 1'000'000LL});
+                t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
+                                               (jitter_ms * 1'000'000LL)});
                 t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
             }
             ibex::runtime::Table trades_table;
@@ -3601,7 +3615,7 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 q_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL});
                 q_sym.push_back(sym_names[i % kAsofSymbols]);
-                q_bid.push_back(99.0 + static_cast<double>(i % 100) * 0.01);
+                q_bid.push_back(99.0 + (static_cast<double>(i % 100) * 0.01));
             }
             ibex::runtime::Table quotes_table;
             quotes_table.add_column("ts", std::move(q_ts));
@@ -3612,6 +3626,8 @@ int main(int argc, char** argv) {
             // index they derive from so every trade has same-symbol candidates.
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
+            // Fine here
+            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
             std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
                 if ((rng() % 10ULL) == 0ULL) {
@@ -3627,8 +3643,8 @@ int main(int argc, char** argv) {
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
                 const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
-                t_ts.push_back(ibex::Timestamp{static_cast<std::int64_t>(i) * 1'000'000'000LL +
-                                               jitter_ms * 1'000'000LL});
+                t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
+                                               (jitter_ms * 1'000'000LL)});
                 t_sym.push_back(sym_names[i % kAsofSymbols]);
                 t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
             }
@@ -3642,8 +3658,9 @@ int main(int argc, char** argv) {
             asof_tables.emplace("trades_tf", std::move(trades_table));
 
             BenchQuery asof_by_symbol{
-                "tf_asof_join_by_symbol",
-                R"(as_timeframe(trades_tf, "ts") asof join as_timeframe(quotes_tf, "ts") on {ts, symbol})"};
+                .name = "tf_asof_join_by_symbol",
+                .source =
+                    R"(as_timeframe(trades_tf, "ts") asof join as_timeframe(quotes_tf, "ts") on {ts, symbol})"};
             status = run_benchmark(asof_by_symbol, asof_tables, warmup_iters, iters,
                                    saved_include_parse);
         }

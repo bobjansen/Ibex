@@ -428,10 +428,9 @@ auto build_side_worth_deferring(const JoinNode& join, const std::string& probe_s
 
 /// The inner-join / key-arity / no-predicate shape a deferrable probe needs.
 auto is_probe_shaped_join(const JoinNode& join) -> bool {
-    return join.kind() == JoinKind::Inner &&
-           (join.keys().size() == 1 || join.keys().size() == 2) && !join.predicate().has_value() &&
-           join.children().size() == 2 && join.children()[0] != nullptr &&
-           join.children()[1] != nullptr;
+    return join.kind() == JoinKind::Inner && (join.keys().size() == 1 || join.keys().size() == 2) &&
+           !join.predicate().has_value() && join.children().size() == 2 &&
+           join.children()[0] != nullptr && join.children()[1] != nullptr;
 }
 
 /// Replace the single `Scan` at the bottom of a verified probe chain (only
@@ -550,9 +549,9 @@ void isolate_probes(NodePtr& node, const std::set<std::string>& sources,
         if (is_probe_shaped_join(join)) {
             if (auto match = match_probe_chain(*join.children()[1], join.keys().front().right);
                 match.has_value() && sources.contains(match->first)) {
-                if (const auto c = counts.find(match->first);
-                    c != counts.end() && c->second > 1) {
-                    auto instance = match->first + "#" + std::to_string(++next_instance[match->first]);
+                if (const auto c = counts.find(match->first); c != counts.end() && c->second > 1) {
+                    auto instance =
+                        match->first + "#" + std::to_string(++next_instance[match->first]);
                     instances.emplace(instance, match->first);
                     rename_chain_scan(join.mutable_children()[1], instance);
                 }

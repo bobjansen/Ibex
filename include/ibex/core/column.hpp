@@ -1265,7 +1265,7 @@ class Column<std::string> {
         }
         for (size_type i = 0; i < n; ++i) {
             if (fill_size > 0) {
-                std::memcpy(chars_.data() + i * fill_size, fill.data(), fill_size);
+                std::memcpy(chars_.data() + (i * fill_size), fill.data(), fill_size);
             }
             offsets_.push_back(static_cast<std::uint32_t>((i + 1) * fill_size));
         }

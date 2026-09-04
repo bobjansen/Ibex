@@ -27,14 +27,13 @@
 #include <deque>
 #include <expected>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "physical_plan.hpp"
 
 #include "chunk_conversion_internal.hpp"
 #include "execution_profile_internal.hpp"
@@ -43,6 +42,7 @@
 #include "kernel_types.hpp"
 #include "kernel_update.hpp"
 #include "physical_executor_internal.hpp"
+#include "physical_plan.hpp"
 #include "pipeline_executor_internal.hpp"
 
 namespace ibex::runtime {
@@ -646,6 +646,9 @@ class ChunkedHeadOperator final : public Operator {
 
         const Table t = chunk_to_table(std::move(chunk));
         std::vector<std::size_t> idx(remaining_);
+        // std::ranges::iota is C++23 (P2440) and libc++ does not implement it;
+        // the macOS CI build fails on it. Keep the iterator-pair form.
+        // NOLINTNEXTLINE(modernize-use-ranges)
         std::iota(idx.begin(), idx.end(), std::size_t{0});
         remaining_ = 0;
         done_ = true;
@@ -697,7 +700,6 @@ class ChunkedHeadOperator final : public Operator {
     bool done_ = false;
     robin_hood::unordered_flat_map<Key, std::size_t, KeyHash, KeyEq> seen_counts_;
 };
-
 
 }  // namespace
 
@@ -819,7 +821,6 @@ auto build_filter_update_project_gather_map(
         std::move(gather_columns), scalars, externs, exec,
         physical_filter_route(*step.filter_predicate, source_signature), preserve_empty_morsels);
 }
-
 
 }  // namespace
 

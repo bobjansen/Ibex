@@ -11,11 +11,11 @@
 //   let df = read_adbc("adbc_driver_sqlite", "", "select 1 as x");
 
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
 
 #include <arrow-adbc/adbc.h>
-#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <expected>
@@ -34,16 +34,6 @@ struct ParsedAdbcOptions {
     std::vector<std::pair<std::string, std::string>> connection;
     std::vector<std::pair<std::string, std::string>> statement;
 };
-
-auto trim(std::string_view text) -> std::string_view {
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())) != 0) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
 
 auto release_adbc_error(AdbcError* error) noexcept -> void {
     if (error != nullptr && error->release != nullptr) {
@@ -102,15 +92,15 @@ auto parse_adbc_options(std::string_view spec) -> std::expected<ParsedAdbcOption
         const std::size_t next = spec.find_first_of(";\n", pos);
         std::string_view item =
             next == std::string_view::npos ? spec.substr(pos) : spec.substr(pos, next - pos);
-        item = trim(item);
+        item = ibex::trim(item);
         if (!item.empty()) {
             const std::size_t eq = item.find('=');
             if (eq == std::string_view::npos || eq == 0 || eq + 1 >= item.size()) {
                 return std::unexpected(
                     "read_adbc options must be key=value entries separated by ';' or newlines");
             }
-            const std::string_view raw_key = trim(item.substr(0, eq));
-            const std::string_view raw_value = trim(item.substr(eq + 1));
+            const std::string_view raw_key = ibex::trim(item.substr(0, eq));
+            const std::string_view raw_value = ibex::trim(item.substr(eq + 1));
             const std::string key(raw_key);
             const std::string value(raw_value);
             if (key == "entrypoint") {

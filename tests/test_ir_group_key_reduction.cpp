@@ -344,9 +344,8 @@ TEST_CASE("group key proof candidates must determine the complete group key") {
     sources.emplace("orders", source({"o_orderkey", "o_orderdate"}));
     std::vector<ir::JoinKey> unrelated_keys{
         ir::JoinKey{std::string{"c_custkey"}, std::string{"o_orderkey"}}};
-    auto unrelated =
-        std::make_unique<ir::JoinNode>(ir::NodeId{4}, ir::JoinKind::Inner,
-                                      std::move(unrelated_keys));
+    auto unrelated = std::make_unique<ir::JoinNode>(ir::NodeId{4}, ir::JoinKind::Inner,
+                                                    std::move(unrelated_keys));
     unrelated->add_child(scan("customer"));
     unrelated->add_child(scan("orders"));
     auto partial = aggregate({"c_custkey", "c_name", "o_orderdate"}, std::move(unrelated));

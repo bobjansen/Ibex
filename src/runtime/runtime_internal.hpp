@@ -131,7 +131,7 @@ inline auto append_value(ColumnValue& out, const ColumnValue& src, std::size_t i
 /// alternative this replaced was leaving bit-packed columns serial, which
 /// answered the same question differently in the same engine.
 template <typename Body>
-void for_row_ranges(const ExecutionContext* exec, std::size_t n, Body&& body) {
+void for_row_ranges(const ExecutionContext* exec, std::size_t n, const Body& body) {
     constexpr std::size_t kMaxRanges = 64;
     constexpr std::size_t kAlign = 64;
     std::size_t ranges = 1;
@@ -504,7 +504,8 @@ struct ColumnGatherJob {
 /// which is the same reason the pipeline and the sort's gather both test it.
 template <typename GatherWhole>
 [[nodiscard]] auto gather_columns_batched(std::span<const ColumnGatherJob> jobs, std::size_t total,
-                                          const ExecutionContext* exec, GatherWhole&& gather_whole)
+                                          const ExecutionContext* exec,
+                                          const GatherWhole& gather_whole)
     -> std::vector<GatheredColumn> {
     std::vector<GatheredColumn> out(jobs.size());
 

@@ -24,7 +24,7 @@ using KafkaSchemaField = ibex::plugin::SchemaField;
 using ibex::plugin::parse_key_value_options;
 using ibex::plugin::table_from_json_payload;
 using ibex::plugin::table_row_to_json;
-using ibex::plugin::trim;
+using ibex::trim;
 
 inline auto parse_kafka_field_kind(std::string_view type_str)
     -> std::expected<KafkaFieldKind, std::string> {

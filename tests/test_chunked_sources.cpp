@@ -28,13 +28,13 @@
 #include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <map>
-#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -200,9 +200,8 @@ TEST_CASE("multi-key categorical aggregate: the fused parallel path matches a re
         REQUIRE(clo != nullptr);
         REQUIRE(chi != nullptr);
         for (std::size_t row = 0; row < out.rows(); ++row) {
-            const std::string key =
-                std::string((*ca)[row]) + "|" + std::string((*cb)[row]) + "|" +
-                std::string((*cc)[row]);
+            const std::string key = std::string((*ca)[row]) + "|" + std::string((*cb)[row]) + "|" +
+                                    std::string((*cc)[row]);
             INFO("row " << row << " key " << key);
             // Group order is first-occurrence order, whichever morsel found it.
             REQUIRE(key == order[row]);
@@ -408,8 +407,7 @@ TEST_CASE("chunked semi/anti join: a multi-chunk right side matches one chunk",
             const bool semi = std::string_view{query}.find("semi") != std::string_view::npos;
             std::size_t expected = 0;
             for (std::int64_t i = 0; i < kLeftRows; ++i) {
-                const std::int64_t id =
-                    sparse_outlier && i == kLeftRows - 1 ? 100'000'000 : i;
+                const std::int64_t id = sparse_outlier && i == kLeftRows - 1 ? 100'000'000 : i;
                 if (left_matches(id) == semi) {
                     ++expected;
                 }

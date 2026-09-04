@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -24,8 +25,6 @@
 #include <expected>
 #include <limits>
 #include <optional>
-#include <bit>
-
 #include <robin_hood.h>
 #include <string>
 #include <string_view>
@@ -1083,7 +1082,8 @@ auto aggregate_table(const Table& input, const std::vector<ir::ColumnRef>& group
                     count_with(
                         [&](std::size_t row) { return std::bit_cast<std::uint64_t>((*dc)[row]); });
                 } else if (const auto* bc = std::get_if<Column<bool>>(&col)) {
-                    count_with([&](std::size_t row) -> std::uint8_t { return (*bc)[row] ? 1U : 0U; });
+                    count_with(
+                        [&](std::size_t row) -> std::uint8_t { return (*bc)[row] ? 1U : 0U; });
                 } else if (const auto* dtc = std::get_if<Column<Date>>(&col)) {
                     count_with([&](std::size_t row) { return (*dtc)[row].days; });
                 } else if (const auto* tsc = std::get_if<Column<Timestamp>>(&col)) {

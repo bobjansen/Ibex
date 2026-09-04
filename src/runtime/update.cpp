@@ -960,7 +960,7 @@ auto mark_numeric_int_subtree(const std::vector<NumericUpdateNode>& nodes, std::
 
 template <typename T, typename Fn>
 auto eval_numeric_binary_block(T* dst, NumericBlockValue<T> lhs, NumericBlockValue<T> rhs,
-                               std::size_t count, Fn&& fn) -> void {
+                               std::size_t count, const Fn& fn) -> void {
     if (lhs.data != nullptr && rhs.data != nullptr) {
         for (std::size_t i = 0; i < count; ++i) {
             dst[i] = fn(lhs.data[i], rhs.data[i]);

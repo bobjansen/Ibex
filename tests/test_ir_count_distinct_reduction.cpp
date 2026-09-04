@@ -35,7 +35,8 @@ auto build_idiom(const std::vector<std::string>& group_keys, const std::vector<s
     }
     auto agg = std::make_unique<ir::AggregateNode>(
         ir::NodeId{3}, std::move(keys),
-        std::vector<ir::AggSpec>{ir::AggSpec{.func = ir::AggFunc::Count, .column = {}, .alias = "c"}});
+        std::vector<ir::AggSpec>{
+            ir::AggSpec{.func = ir::AggFunc::Count, .column = {}, .alias = "c"}});
     agg->add_child(std::move(distinct));
     return agg;
 }
@@ -55,7 +56,7 @@ TEST_CASE("count_distinct_reduction: fuses distinct+count on a non-null value co
           "[ir][count_distinct]") {
     auto tree = build_idiom({"brand", "size"}, {"brand", "size", "suppkey"});
     auto out = ir::fuse_distinct_count_to_count_distinct(std::move(tree),
-                                                        sources_with(ir::Nullability::Never));
+                                                         sources_with(ir::Nullability::Never));
 
     REQUIRE(out->kind() == ir::NodeKind::Aggregate);
     const auto& agg = ir::node_cast<ir::AggregateNode>(*out);
@@ -74,7 +75,7 @@ TEST_CASE("count_distinct_reduction: declines when the value column may be null"
           "[ir][count_distinct]") {
     auto tree = build_idiom({"brand", "size"}, {"brand", "size", "suppkey"});
     auto out = ir::fuse_distinct_count_to_count_distinct(std::move(tree),
-                                                        sources_with(ir::Nullability::Maybe));
+                                                         sources_with(ir::Nullability::Maybe));
     // Unchanged: still an Aggregate over a Distinct.
     REQUIRE(out->kind() == ir::NodeKind::Aggregate);
     CHECK(ir::node_cast<ir::AggregateNode>(*out).aggregations()[0].func == ir::AggFunc::Count);
@@ -87,7 +88,7 @@ TEST_CASE("count_distinct_reduction: declines when the projection has more than 
     // -> two non-key columns, not a count(distinct one_thing).
     auto tree = build_idiom({"brand", "size"}, {"brand", "size", "suppkey", "extra"});
     auto out = ir::fuse_distinct_count_to_count_distinct(std::move(tree),
-                                                        sources_with(ir::Nullability::Never));
+                                                         sources_with(ir::Nullability::Never));
     CHECK(ir::node_cast<ir::AggregateNode>(*out).aggregations()[0].func == ir::AggFunc::Count);
     CHECK(out->children()[0]->kind() == ir::NodeKind::Distinct);
 }
@@ -106,7 +107,7 @@ TEST_CASE("count_distinct_reduction: declines count(col), only bare count() qual
     agg->add_child(std::move(distinct));
 
     auto out = ir::fuse_distinct_count_to_count_distinct(std::move(agg),
-                                                        sources_with(ir::Nullability::Never));
+                                                         sources_with(ir::Nullability::Never));
     CHECK(ir::node_cast<ir::AggregateNode>(*out).aggregations()[0].func == ir::AggFunc::Count);
     CHECK(out->children()[0]->kind() == ir::NodeKind::Distinct);
 }

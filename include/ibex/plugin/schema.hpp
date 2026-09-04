@@ -26,12 +26,12 @@
 // Requires nlohmann/json — link nlohmann_json::nlohmann_json in the plugin.
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -63,16 +63,6 @@ struct SchemaField {
     std::string name;
     FieldKind kind = FieldKind::String;
 };
-
-inline auto trim(std::string_view text) -> std::string_view {
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())) != 0) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
 
 inline auto parse_field_kind(std::string_view type_str) -> std::expected<FieldKind, std::string> {
     if (type_str == "i64" || type_str == "int" || type_str == "int64") {
@@ -511,7 +501,7 @@ inline auto table_from_json_objects(const std::vector<nlohmann::json>& objects,
 /// Serialise one row of `table` as a compact JSON object string.
 inline auto table_row_to_json(const ibex::runtime::Table& table, std::size_t row)
     -> std::expected<std::string, std::string> {
-    using json = nlohmann::json;
+    using nlohmann::json;
     json object = json::object();
     for (const auto& entry : table.columns) {
         if (ibex::runtime::is_null(entry, row)) {
@@ -521,15 +511,12 @@ inline auto table_row_to_json(const ibex::runtime::Table& table, std::size_t row
         std::visit(
             [&](const auto& column) {
                 using Col = std::decay_t<decltype(column)>;
-                if constexpr (std::is_same_v<Col, ibex::Column<std::int64_t>>) {
+                if constexpr (std::is_same_v<Col, ibex::Column<std::int64_t>> ||
+                              std::is_same_v<Col, ibex::Column<double>> ||
+                              std::is_same_v<Col, ibex::Column<bool>>) {
                     object[entry.name] = column[row];
-                } else if constexpr (std::is_same_v<Col, ibex::Column<double>>) {
-                    object[entry.name] = column[row];
-                } else if constexpr (std::is_same_v<Col, ibex::Column<bool>>) {
-                    object[entry.name] = column[row];
-                } else if constexpr (std::is_same_v<Col, ibex::Column<std::string>>) {
-                    object[entry.name] = std::string(column[row]);
-                } else if constexpr (std::is_same_v<Col, ibex::Column<ibex::Categorical>>) {
+                } else if constexpr (std::is_same_v<Col, ibex::Column<std::string>> ||
+                                     std::is_same_v<Col, ibex::Column<ibex::Categorical>>) {
                     object[entry.name] = std::string(column[row]);
                 } else if constexpr (std::is_same_v<Col, ibex::Column<ibex::Date>>) {
                     object[entry.name] = column[row].days;

@@ -88,11 +88,11 @@ auto try_fuse(NodePtr node, std::uint64_t& next_id, const SourceSchemas& sources
     }
 
     std::vector<AggSpec> fused{AggSpec{.func = AggFunc::CountDistinct,
-                                      .column = ColumnRef{.name = std::move(*value_column)},
-                                      .alias = spec.alias,
-                                      .param = 0.0}};
-    auto fused_agg = std::make_unique<AggregateNode>(NodeId{next_id++},
-                                                     std::vector<ColumnRef>(keys), std::move(fused));
+                                       .column = ColumnRef{.name = std::move(*value_column)},
+                                       .alias = spec.alias,
+                                       .param = 0.0}};
+    auto fused_agg = std::make_unique<AggregateNode>(
+        NodeId{next_id++}, std::vector<ColumnRef>(keys), std::move(fused));
     fused_agg->add_child(std::move(distinct.mutable_children().front()));
     return fused_agg;
 }

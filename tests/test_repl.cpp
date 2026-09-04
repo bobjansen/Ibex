@@ -1057,8 +1057,7 @@ hi;
     REQUIRE(source_instances == 2);
 }
 
-TEST_CASE("REPL lazy scan: a source scanned twice is decoded once, filters stay",
-          "[repl][lazy]") {
+TEST_CASE("REPL lazy scan: a source scanned twice is decoded once, filters stay", "[repl][lazy]") {
     // The two subqueries filter the same lazy source differently. Applying one
     // occurrence's selection to the shared decode would be unsound, so the
     // source is decoded whole exactly once for the union of what both need and

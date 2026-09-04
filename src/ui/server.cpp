@@ -9,6 +9,8 @@
 #include <ibex/runtime/table_format.hpp>
 #include <ibex/ui/server.hpp>
 
+#include <ibex/core/text.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -62,7 +64,7 @@
 namespace ibex::ui {
 namespace {
 
-using json = nlohmann::json;
+using nlohmann::json;
 
 #ifdef _WIN32
 using Socket = SOCKET;
@@ -121,20 +123,10 @@ auto lower(std::string text) -> std::string {
     return text;
 }
 
-auto trim(std::string_view value) -> std::string_view {
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0) {
-        value.remove_prefix(1);
-    }
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0) {
-        value.remove_suffix(1);
-    }
-    return value;
-}
-
 auto read_request(Socket socket) -> std::optional<HttpRequest> {
     std::string raw;
     std::array<char, 8192> buffer{};
-    while (raw.find("\r\n\r\n") == std::string::npos) {
+    while (!raw.contains("\r\n\r\n")) {
         const auto count = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
         if (count <= 0) {
             return std::nullopt;
@@ -290,7 +282,7 @@ auto cell_json(const runtime::ColumnEntry& entry, std::size_t row) -> json {
         return nullptr;
     return std::visit(
         [row](const auto& column) -> json {
-            using T = typename std::decay_t<decltype(column)>::value_type;
+            using T = std::decay_t<decltype(column)>::value_type;
             if constexpr (std::same_as<T, Date>) {
                 return runtime::format_date(column[row]);
             } else if constexpr (std::same_as<T, Timestamp>) {
@@ -520,7 +512,7 @@ auto static_file(const StaticAssets& assets, std::string_view target) -> const S
     return &assets.at("/index.html");  // SPA navigation fallback.
 }
 
-#if defined(__linux__)
+#ifdef __linux__
 constexpr std::uint64_t kLandlockFilesystemAccess =
     LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE |
     LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
@@ -635,7 +627,7 @@ auto run_server(const ServerConfig& config, runtime::ExternRegistry& registry) -
                   << requested_data_directory.string() << "'\n";
         return 1;
     }
-#if defined(__linux__)
+#ifdef __linux__
     const auto plugin_directories = readable_plugin_directories(config.repl);
     if (!plugin_directories) {
         std::cerr << "error: could not resolve a configured UI plugin directory\n";

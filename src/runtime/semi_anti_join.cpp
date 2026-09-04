@@ -117,9 +117,12 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     static constexpr auto dense_bit(std::uint64_t slot) -> std::uint64_t {
         return std::uint64_t{1} << (slot & 63U);
     }
+    /// The dense bitmap is live iff it has slots; both build sites set a
+    /// span of at least one.
+    [[nodiscard]] auto dense_active() const -> bool { return dense_i64_nbits_ != 0; }
     [[nodiscard]] auto dense_contains(std::int64_t value) const -> bool {
         const std::uint64_t slot =
-            static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(*dense_i64_min_);
+            static_cast<std::uint64_t>(value) - static_cast<std::uint64_t>(dense_i64_min_);
         return slot < dense_i64_nbits_ &&
                (dense_i64_hits_[dense_word(slot)] & dense_bit(slot)) != 0;
     }
@@ -264,7 +267,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// right side that arrives as a single chunk still divides across the
     /// pool.
     template <typename Column_T, typename Fn>
-    void for_right_rows(std::size_t lo, std::size_t hi, Fn&& fn) const {
+    void for_right_rows(std::size_t lo, std::size_t hi, const Fn& fn) const {
         std::size_t base = 0;
         for (const auto& chunk : right_key_chunks_) {
             const auto* col = std::get_if<Column<Column_T>>(chunk.column.get());
@@ -517,7 +520,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
         // side alone would still let a null here be found by a genuine zero.
         // `for_right_rows` applies it for the Int64 paths; the set builds below
         // apply it per chunk.
-        const auto insert_all = [&]<typename T, typename Fn>(Fn&& insert) {
+        const auto insert_all = [&]<typename T, typename Fn>(const Fn& insert) {
             for (const auto& chunk : right_key_chunks_) {
                 const auto* col = std::get_if<Column<T>>(chunk.column.get());
                 if (col == nullptr) {
@@ -792,8 +795,8 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
             return filter_rows(std::move(t), [&](std::size_t row) {
                 bool match = false;
                 if (!probe_is_null(row)) {
-                    match = dense_i64_min_.has_value() ? dense_contains((*col)[row])
-                                                       : right_i64_.contains((*col)[row]);
+                    match = dense_active() ? dense_contains((*col)[row])
+                                           : right_i64_.contains((*col)[row]);
                 }
                 return keep_matches ? match : !match;
             });
@@ -907,7 +910,7 @@ class ChunkedSemiAntiJoinOperator final : public Operator {
     /// cache-resident. Populated by `try_build_dense_right` (probe the small
     /// right against a bitmap of itself) or `try_dense_intersection` (probe the
     /// large right against a bitmap of the smaller buffered left).
-    std::optional<std::int64_t> dense_i64_min_;
+    std::int64_t dense_i64_min_ = 0;
     std::size_t dense_i64_nbits_ = 0;
     std::vector<std::uint64_t> dense_i64_hits_;
     robin_hood::unordered_flat_set<double> right_f64_;

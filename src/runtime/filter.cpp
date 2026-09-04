@@ -1235,7 +1235,7 @@ struct NumericLiteralOperand {
 
 template <typename Fn>
 
-auto visit_numeric_operand(const NumericOperandSpec& spec, Fn&& fn) -> void {
+auto visit_numeric_operand(const NumericOperandSpec& spec, const Fn& fn) -> void {
     if (spec.kind == NumericSpecKind::Int64) {
         if (spec.is_lit) {
             fn(NumericLiteralOperand<std::int64_t>{spec.lit_i64});

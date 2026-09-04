@@ -741,10 +741,21 @@ auto order_table_resolved(const Table& input, const std::vector<ir::OrderKey>& r
                     for (std::size_t i = 0; i < rows; ++i)
                         code[i] = double_to_sortable_u64(fk.f64[i]);
                     break;
-                case FlatKind::Str:
-                    code =
-                        std::move(*ordinal_encode(fk.str, std::numeric_limits<std::size_t>::max()));
+                case FlatKind::Str: {
+                    // Uncapped: the encode only bails when the distinct count
+                    // EXCEEDS the cap, which a size_t count cannot do at
+                    // SIZE_MAX. Multi-key has no comparison fallback worth
+                    // taking, so the encoding is unconditional here; the guard
+                    // states that invariant rather than assuming it.
+                    auto encoded = ordinal_encode(fk.str, std::numeric_limits<std::size_t>::max());
+                    if (!encoded.has_value()) {
+                        return std::unexpected(
+                            "sort: ordinal encoding of string key exceeded "
+                            "the distinct-value limit");
+                    }
+                    code = std::move(*encoded);
                     break;
+                }
             }
             apply_descending(code, fk.ascending);
             codes.push_back(std::move(code));

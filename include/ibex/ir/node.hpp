@@ -720,7 +720,6 @@ class HeadNode final : public Node {
         }
         return std::nullopt;
     }
-    [[nodiscard]] auto count() const -> std::size_t { return count_literal().value(); }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }
@@ -750,7 +749,6 @@ class TailNode final : public Node {
         }
         return std::nullopt;
     }
-    [[nodiscard]] auto count() const -> std::size_t { return count_literal().value(); }
     [[nodiscard]] auto group_by() const noexcept -> const std::vector<ColumnRef>& {
         return group_by_;
     }

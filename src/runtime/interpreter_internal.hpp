@@ -541,7 +541,7 @@ struct KeyRowIndex {
     /// append the row's key to the caller's group vector and return its gid.
     template <typename MakeGroup>
     auto find_or_insert(const std::vector<Key>& groups, const std::vector<KeyCol>& cols,
-                        std::size_t row, MakeGroup&& make_group) -> std::uint32_t {
+                        std::size_t row, const MakeGroup& make_group) -> std::uint32_t {
         if (slots.empty()) {
             rehash(1024);
         }

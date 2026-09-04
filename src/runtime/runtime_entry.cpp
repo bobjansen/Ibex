@@ -86,7 +86,6 @@
 
 namespace ibex::runtime {
 
-
 auto materialize_operator(OperatorPtr op) -> std::expected<Table, std::string> {
     MaterializeOperator sink{std::move(op)};
     return sink.run();
@@ -150,7 +149,6 @@ auto aggregate_is_streamable(const ir::AggregateNode& agg) -> bool {
         }
     });
 }
-
 
 auto is_streamable_pair_int_join(const ir::JoinNode& join) -> bool {
     if (join.kind() != ir::JoinKind::Inner || join.predicate().has_value() ||
@@ -343,7 +341,6 @@ auto make_join_probe_operator(OperatorPtr source, std::optional<Table> materiali
     }
     return probe.attach_move(std::move(probe_source));
 }
-
 
 /// Planner seam: returns a pull-based operator that, when drained,
 /// produces the logical result of `node`. Chunked operators exist
@@ -570,8 +567,8 @@ auto build_physical_join(const physical::Plan& plan, const ir::Node& node,
         // key column, chunk by chunk -- `materialize_row_local` here copied the
         // whole right side into one growing Table on this thread (214ms of
         // q04's 244ms build) to hand the join a contiguity it never used.
-        auto right = build_operator(*join.children()[1], registry, scalars, externs, exec,
-                                    model_out);
+        auto right =
+            build_operator(*join.children()[1], registry, scalars, externs, exec, model_out);
         if (!right.has_value()) {
             return std::unexpected(std::move(right.error()));
         }

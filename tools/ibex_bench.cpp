@@ -31,6 +31,7 @@ const char* malloc_conf = "dirty_decay_ms:-1,muzzy_decay_ms:-1";
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <string>
 #include <string_view>
@@ -1619,7 +1620,7 @@ auto digest_primitive_column(const ibex::Column<T>& col) -> std::uint64_t {
 
 template <typename Fn>
 auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
-                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+                                 std::size_t warmup_iters, std::size_t iters, const Fn& run_once)
     -> int {
     auto run_and_touch = [&]() -> int {
         auto merged = run_once();
@@ -1659,7 +1660,7 @@ auto run_bitmap_kernel_benchmark(std::string_view bench_name, std::size_t rows,
 
 template <typename Fn>
 auto run_scalar_kernel_benchmark(std::string_view bench_name, std::size_t rows,
-                                 std::size_t warmup_iters, std::size_t iters, Fn&& run_once)
+                                 std::size_t warmup_iters, std::size_t iters, const Fn& run_once)
     -> int {
     auto run_and_touch = [&]() { g_bench_sink ^= run_once(); };
 

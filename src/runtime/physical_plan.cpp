@@ -1349,7 +1349,7 @@ namespace {
 /// bare-source `EmptyChain` case, not a materialized call at all.
 auto fallback_disposition(ir::NodeKind kind) -> std::string_view {
     switch (kind) {
-        case ir::NodeKind::Join:        // non-equi / nulls-equal / expect — materializing by design
+        case ir::NodeKind::Join:  // non-equi / nulls-equal / expect — materializing by design
         case ir::NodeKind::Melt:
         case ir::NodeKind::Dcast:
         case ir::NodeKind::Transpose:

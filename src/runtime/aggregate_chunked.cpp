@@ -351,9 +351,9 @@ class HashAggregateState final {
     };
     struct DistinctKeyHash {
         auto operator()(const DistinctKey& k) const -> std::size_t {
-            return robin_hood::hash_int((static_cast<std::uint64_t>(k.gid) *
-                                         0x9E3779B97F4A7C15ULL) ^
-                                        robin_hood::hash_int(k.bits));
+            return robin_hood::hash_int(
+                (static_cast<std::uint64_t>(k.gid) * 0x9E3779B97F4A7C15ULL) ^
+                robin_hood::hash_int(k.bits));
         }
     };
     struct DistinctAgg {
@@ -1316,8 +1316,8 @@ class HashAggregateState final {
             // append preserves per-partition first-occurrence order.
             std::vector<std::size_t> counts(job.part_count, 0);
             for (std::size_t row = 0; row < job.rows; ++row) {
-                const PairIntKey key{static_cast<std::uint64_t>(first[row]),
-                                     static_cast<std::uint64_t>(second[row])};
+                const PairIntKey key{.first = static_cast<std::uint64_t>(first[row]),
+                                     .second = static_cast<std::uint64_t>(second[row])};
                 ++counts[hasher(key) & mask];
             }
             for (std::size_t p = 0; p < job.part_count; ++p) {
@@ -1325,8 +1325,8 @@ class HashAggregateState final {
             }
             for (std::size_t row = 0; row < job.rows; ++row) {
                 OwnedPairRecord record;
-                record.key = {static_cast<std::uint64_t>(first[row]),
-                              static_cast<std::uint64_t>(second[row])};
+                record.key = {.first = static_cast<std::uint64_t>(first[row]),
+                              .second = static_cast<std::uint64_t>(second[row])};
                 record.first_row = job.row_base + row;
                 if (validity == nullptr || (*validity)[row]) {
                     record.slot.double_value = values[row];
@@ -3182,7 +3182,7 @@ class HashAggregateState final {
         bool dense_possible = false;
     };
 
-    [[nodiscard]] auto cat_cell_plan(const std::vector<const Column<Categorical>*>& cols) const
+    [[nodiscard]] static auto cat_cell_plan(const std::vector<const Column<Categorical>*>& cols)
         -> CatCellPlan {
         CatCellPlan plan;
         const std::size_t n_keys = cols.size();
@@ -3257,7 +3257,7 @@ class HashAggregateState final {
         if (!plan.dense_possible) {
             return false;  // the serial path migrates to the hash index
         }
-        const std::size_t n_cells = static_cast<std::size_t>(plan.total_cells);
+        const auto n_cells = static_cast<std::size_t>(plan.total_cells);
         const std::size_t morsels = dense_morsel_count(n_cells, rows);
         if (morsels == 0) {
             return false;
@@ -3281,9 +3281,9 @@ class HashAggregateState final {
                     const std::uint64_t s0 = plan.strides[0];
                     const std::uint64_t s1 = plan.strides[1];
                     for (std::size_t row = begin; row < end; ++row) {
-                        cells[row] = static_cast<std::uint32_t>(
-                            (static_cast<std::uint64_t>(k0[row]) * s0) +
-                            (static_cast<std::uint64_t>(k1[row]) * s1));
+                        cells[row] =
+                            static_cast<std::uint32_t>((static_cast<std::uint64_t>(k0[row]) * s0) +
+                                                       (static_cast<std::uint64_t>(k1[row]) * s1));
                     }
                     return;
                 }
@@ -3732,8 +3732,8 @@ class HashAggregateState final {
         if (per_morsel_bytes == 0 || per_morsel_bytes > kPartialBudgetBytes) {
             return 0;  // one worker's state alone blows the budget
         }
-        std::size_t morsels = std::min(morsel_cut_from_rows(rows),
-                                       kPartialBudgetBytes / per_morsel_bytes);
+        const std::size_t morsels =
+            std::min(morsel_cut_from_rows(rows), kPartialBudgetBytes / per_morsel_bytes);
         if (morsels < 2 || morsels * n_cells > rows / kMergeToScanRatio) {
             return 0;
         }
@@ -3909,9 +3909,8 @@ class HashAggregateState final {
                         if (validity != nullptr && !(*validity)[row]) {
                             continue;
                         }
-                        const std::string_view sv =
-                            categorical ? std::string_view{(*ccol)[row]}
-                                        : std::string_view{(*scol)[row]};
+                        const std::string_view sv = categorical ? std::string_view{(*ccol)[row]}
+                                                                : std::string_view{(*scol)[row]};
                         const std::uint32_t gid = gid_at(row);
                         const std::size_t h = robin_hood::hash_bytes(sv.data(), sv.size()) ^
                                               robin_hood::hash_int(gid);
@@ -3953,7 +3952,7 @@ class HashAggregateState final {
                     if (validity != nullptr && !(*validity)[row]) {
                         continue;
                     }
-                    const DistinctKey k{gid_at(row), bits_at(row)};
+                    const DistinctKey k{.gid = gid_at(row), .bits = bits_at(row)};
                     const std::size_t shard = DistinctKeyHash{}(k) & (kDistinctShards - 1);
                     if (shard < lo || shard >= hi) {
                         continue;
@@ -4304,9 +4303,9 @@ class HashAggregateState final {
                     order.push_back(static_cast<std::uint32_t>(cell));
                 }
             }
-            accumulate_columns_into(
-                index_of_row, agg_entries, begin, end, &partials[m * n_cells * n_aggs_],
-                partial_scratch.data() + (m * n_cells * scratch_stride_));
+            accumulate_columns_into(index_of_row, agg_entries, begin, end,
+                                    &partials[m * n_cells * n_aggs_],
+                                    partial_scratch.data() + (m * n_cells * scratch_stride_));
         };
         const std::size_t threads =
             exec_ != nullptr && par_.accumulation.decline == physical::FanOutDecline::None
@@ -4336,8 +4335,7 @@ class HashAggregateState final {
 
         for (std::size_t m = 0; m < morsels; ++m) {
             const AggSlotCore* src = &partials[m * n_cells * n_aggs_];
-            const double* src_scratch =
-                partial_scratch.data() + (m * n_cells * scratch_stride_);
+            const double* src_scratch = partial_scratch.data() + (m * n_cells * scratch_stride_);
             for (const auto cell : seen[m]) {
                 const auto idx = static_cast<std::size_t>(cell);
                 std::uint32_t gid = dense_gid[idx];
@@ -4992,9 +4990,8 @@ class HashAggregateState final {
             // Resolved once per task, not per row: a range-writable column
             // indexes its pre-sized buffer, a whole-column one appends. One
             // body either way, so no finalize formula is written twice.
-            auto* ints = slot_kind[ci] == EmitSlot::I64
-                             ? static_cast<std::int64_t*>(slot_data[ci])
-                             : nullptr;
+            auto* ints = slot_kind[ci] == EmitSlot::I64 ? static_cast<std::int64_t*>(slot_data[ci])
+                                                        : nullptr;
             auto* doubles =
                 slot_kind[ci] == EmitSlot::F64 ? static_cast<double*>(slot_data[ci]) : nullptr;
             const auto put_i = [&](std::size_t g, std::int64_t v) {
@@ -5041,8 +5038,8 @@ class HashAggregateState final {
                         put_d(g, agg_finalize_stddev(slot, scratch_for(g, i)[0]));
                         break;
                     case ir::AggFunc::Skew:
-                        put_d(g, agg_finalize_skew(slot, scratch_for(g, i)[0],
-                                                   scratch_for(g, i)[1]));
+                        put_d(g,
+                              agg_finalize_skew(slot, scratch_for(g, i)[0], scratch_for(g, i)[1]));
                         break;
                     case ir::AggFunc::Kurtosis:
                         put_d(g, agg_finalize_kurtosis(slot, scratch_for(g, i)[0],
@@ -5099,8 +5096,7 @@ class HashAggregateState final {
                 continue;
             }
             for (std::size_t lo = 0; lo < n_groups_; lo += span) {
-                tasks.push_back(
-                    {.column = c, .lo = lo, .hi = std::min(lo + span, n_groups_)});
+                tasks.push_back({.column = c, .lo = lo, .hi = std::min(lo + span, n_groups_)});
             }
         }
 

@@ -1491,7 +1491,9 @@ auto try_plan_direct_numeric_field(const ir::Expr& expr, const PredicateInput& i
     return DirectFieldPlan{.kind = DirectFieldKind::NumericBinary,
                            .expression = &expr,
                            .numeric_kind = *kind,
-                           .categorical_lengths = nullptr};
+                           .categorical_lengths = nullptr,
+                           .like_pattern = nullptr,
+                           .categorical_matches = nullptr};
 }
 
 auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& input)
@@ -1530,7 +1532,9 @@ auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& 
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .temporal_part = *part,
                                .dates = dates->data(),
-                               .categorical_lengths = nullptr};
+                               .categorical_lengths = nullptr,
+                               .like_pattern = nullptr,
+                               .categorical_matches = nullptr};
     }
     if (const auto* timestamps = std::get_if<Column<Timestamp>>(entry->column.get())) {
         return DirectFieldPlan{.kind = DirectFieldKind::TemporalPart,
@@ -1538,7 +1542,9 @@ auto try_plan_direct_temporal_field(const ir::Expr& expr, const PredicateInput& 
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .temporal_part = *part,
                                .timestamps = timestamps->data(),
-                               .categorical_lengths = nullptr};
+                               .categorical_lengths = nullptr,
+                               .like_pattern = nullptr,
+                               .categorical_matches = nullptr};
     }
     return std::nullopt;
 }
@@ -1565,7 +1571,9 @@ auto try_plan_direct_string_length_field(const ir::Expr& expr, const PredicateIn
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .byte_length = bytes,
                                .strings = strings,
-                               .categorical_lengths = nullptr};
+                               .categorical_lengths = nullptr,
+                               .like_pattern = nullptr,
+                               .categorical_matches = nullptr};
     }
     if (const auto* categorical = std::get_if<Column<Categorical>>(entry->column.get())) {
         auto lengths = std::make_shared<std::vector<std::int64_t>>();
@@ -1579,7 +1587,9 @@ auto try_plan_direct_string_length_field(const ir::Expr& expr, const PredicateIn
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .byte_length = bytes,
                                .categoricals = categorical,
-                               .categorical_lengths = std::move(lengths)};
+                               .categorical_lengths = std::move(lengths),
+                               .like_pattern = nullptr,
+                               .categorical_matches = nullptr};
     }
     return std::nullopt;
 }
@@ -1611,7 +1621,10 @@ auto try_plan_direct_predicate_int_field(const ir::Expr& expr) -> std::optional<
     }
     return DirectFieldPlan{.kind = DirectFieldKind::PredicateInt,
                            .expression = &inner,
-                           .numeric_kind = FixedWidthNumericKind::Int};
+                           .numeric_kind = FixedWidthNumericKind::Int,
+                           .categorical_lengths = nullptr,
+                           .like_pattern = nullptr,
+                           .categorical_matches = nullptr};
 }
 
 /// `Int64(like(<column>, "<pattern>"))` -> 0/1 integers, by range.
@@ -1671,7 +1684,9 @@ auto try_plan_direct_like_int_field(const ir::Expr& expr, const PredicateInput& 
                                .expression = &expr,
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .strings = strings,
-                               .like_pattern = std::move(shared_pattern)};
+                               .categorical_lengths = nullptr,
+                               .like_pattern = std::move(shared_pattern),
+                               .categorical_matches = nullptr};
     }
     if (const auto* categorical = std::get_if<Column<Categorical>>(entry->column.get())) {
         // One match per dictionary entry, not per row -- the same trade
@@ -1685,6 +1700,7 @@ auto try_plan_direct_like_int_field(const ir::Expr& expr, const PredicateInput& 
                                .expression = &expr,
                                .numeric_kind = FixedWidthNumericKind::Int,
                                .categoricals = categorical,
+                               .categorical_lengths = nullptr,
                                .like_pattern = std::move(shared_pattern),
                                .categorical_matches = std::move(matches)};
     }

@@ -26,59 +26,35 @@
 #include <ibex/runtime/worker_pool.hpp>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <deque>
-#include <exception>
 #include <expected>
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <new>
 #include <numeric>
 #include <optional>
 #include <pdqsort.h>
-#include <ratio>
 #include <robin_hood.h>
-#include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
-
-#include "physical_plan.hpp"
 
 #if defined(__AVX2__) || defined(__BMI2__)
 #include <immintrin.h>
 #endif
 
 #include "aggregate_chunked_internal.hpp"
-#include "chunk_conversion_internal.hpp"
-#include "execution_profile_internal.hpp"
 #include "interpreter_internal.hpp"
-#include "join_chunked_internal.hpp"
-#include "join_internal.hpp"
-#include "kernel_filter.hpp"
-#include "kernel_types.hpp"
-#include "kernel_update.hpp"
-#include "model_internal.hpp"
-#include "packed_key_encoder_internal.hpp"
-#include "physical_executor_internal.hpp"
-#include "pipeline_executor_internal.hpp"
-#include "reshape_internal.hpp"
 #include "runtime_internal.hpp"
 
 namespace ibex::runtime {
@@ -458,6 +434,9 @@ auto evaluate_rank_column(const Table& input, const ir::RankExpr& rank,
     } else {
         ensure_group_flat();
         idx.resize(rows);
+        // std::ranges::iota is C++23 (P2440) and libc++ does not implement it;
+        // the macOS CI build fails on it. Keep the iterator-pair form.
+        // NOLINTNEXTLINE(modernize-use-ranges)
         std::iota(idx.begin(), idx.end(), std::size_t{0});
         // pdqsort is unstable, but the comparator's `lhs < rhs` tiebreak makes the
         // order total, so the result matches a stable sort.

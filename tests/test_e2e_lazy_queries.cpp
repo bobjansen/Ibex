@@ -100,8 +100,8 @@ void register_lazy_source(ExternRegistry& registry, std::string name, Table data
 
 /// Run `script` through the whole-script planner and return the table handed to
 /// its `capture(df)` sink. Fails the test if the script does not execute.
-auto run_lazy_script(const char* script,
-                     std::vector<std::pair<std::string, Table>> sources) -> Table {
+auto run_lazy_script(const char* script, std::vector<std::pair<std::string, Table>> sources)
+    -> Table {
     ExternRegistry registry;
     for (auto& [name, data] : sources) {
         register_lazy_source(registry, std::move(name), std::move(data));
@@ -215,10 +215,9 @@ TEST_CASE("e2e lazy: three-way join chain", "[e2e][lazy]") {
     // q03/q10 shape -- customer -> orders -> lineitem, filtered on the ends,
     // aggregated. Exercises join reordering across three inputs.
     Table customer = make_table({{"c_custkey", {1, 2, 3}}, {"c_seg", {1, 2, 1}}});
-    Table orders =
-        make_table({{"o_orderkey", {10, 11, 12, 13}}, {"o_custkey", {1, 1, 2, 3}}});
-    Table lineitem = make_table({{"l_orderkey", {10, 10, 11, 12, 13}},
-                                 {"l_rev", {100, 50, 200, 300, 400}}});
+    Table orders = make_table({{"o_orderkey", {10, 11, 12, 13}}, {"o_custkey", {1, 1, 2, 3}}});
+    Table lineitem =
+        make_table({{"l_orderkey", {10, 10, 11, 12, 13}}, {"l_rev", {100, 50, 200, 300, 400}}});
 
     const char* src = R"(
 extern fn read_customer() -> DataFrame from "x.hpp";
@@ -279,8 +278,7 @@ result;
 }
 
 TEST_CASE("e2e lazy: grouped then joined", "[e2e][lazy]") {
-    Table sales =
-        make_table({{"region", {1, 1, 2, 2, 3}}, {"amount", {10, 15, 20, 5, 30}}});
+    Table sales = make_table({{"region", {1, 1, 2, 2, 3}}, {"amount", {10, 15, 20, 5, 30}}});
     Table region_names = make_table({{"region", {1, 2, 3}}, {"quota", {20, 20, 20}}});
 
     const char* src = R"(

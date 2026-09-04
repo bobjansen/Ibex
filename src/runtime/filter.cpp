@@ -3219,6 +3219,42 @@ auto select_bounds(const std::vector<BoundsSpec>& specs, const std::vector<SetSp
     return selected;
 }
 
+/// One range's survivors of `conjunct`, as ascending SOURCE row indices.
+///
+/// `compute_mask` produces a DENSE mask under a non-whole range, so mask row i
+/// denotes source row `rows.begin + i` -- the convention `for_each_selected_row`
+/// already relies on. Count first, then left-pack, for the same reason the
+/// whole-table path does: sizing the result up front makes the fill branchless.
+auto select_conjunct_range(const ir::Expr& conjunct, const Table& input,
+                           const ScalarRegistry* scalars, RowRange rows,
+                           std::vector<std::size_t>& out) -> std::expected<void, std::string> {
+    auto mask = compute_mask(conjunct, input, scalars, rows);
+    if (!mask) {
+        return std::unexpected(mask.error());
+    }
+    const std::size_t n = rows.count;
+    const auto* valid = mask->valid ? mask->valid->data() : nullptr;
+    const auto* values = mask->value.data();
+    const auto keeps = [&](std::size_t i) {
+        return values[i] != 0 && (valid == nullptr || valid[i] != 0);
+    };
+
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        kept += static_cast<std::size_t>(keeps(i));
+    }
+    // One slot of slack so the unconditional store below always lands
+    // in-bounds, including on the final rejected row.
+    out.assign(kept + 1, 0);
+    std::size_t pos = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        out[pos] = rows.begin + i;
+        pos += static_cast<std::size_t>(keeps(i));
+    }
+    out.resize(kept);
+    return {};
+}
+
 auto filter_selection_impl(const Table& input, const std::vector<ir::Expr>& conjuncts,
                            const ExecutionContext& exec, const ScalarRegistry* scalars,
                            std::vector<std::size_t> selected)
@@ -3341,30 +3377,70 @@ auto filter_selection(const Table& input, const std::vector<ir::Expr>& conjuncts
     // branches on a predicate that, at q10's ~25% hit rate, the predictor
     // cannot learn. Sizing the result up front makes the fill branchless.
     if (!conjuncts.empty()) {
-        auto mask = compute_mask(conjuncts.front(), input, scalars, RowRange::whole(input.rows()));
-        if (!mask) {
-            return std::unexpected(mask.error());
-        }
         const std::size_t rows = input.rows();
-        const auto* valid = mask->valid ? mask->valid->data() : nullptr;
-        const auto* values = mask->value.data();
-        auto keeps = [&](std::size_t row) {
-            return values[row] != 0 && (valid == nullptr || valid[row] != 0);
-        };
+        // The mask pass, the count pass and the pack pass each walk every row,
+        // and this is the ONLY path a column-vs-column predicate
+        // (`l_receiptdate > l_commitdate`) can take -- there is no literal bound
+        // for `build_bounds_plan` to fuse. Serially that is three passes over
+        // lineitem: measured 283ms at SF-8, against 59ms for the same predicate
+        // run by the pipeline's filter, which fans out. So fan out here too,
+        // with the blocked morsel shape `select_bounds` above uses.
+        //
+        // `is_subset_evaluable_expr` is the licence to split at all: a
+        // Transform/Generator call or a `rank` reads neighbouring rows, and a
+        // range would not see them. Ranges are visited in order and appended in
+        // order, so the selection is ascending and identical to the serial one.
+        const std::size_t morsels =
+            ir::is_subset_evaluable_expr(conjuncts.front()) ? select_bounds_morsels(exec, rows) : 1;
+        std::vector<std::size_t> selected;
+        if (morsels < 2) {
+            if (auto packed = select_conjunct_range(conjuncts.front(), input, scalars,
+                                                    RowRange::whole(rows), selected);
+                !packed) {
+                return std::unexpected(packed.error());
+            }
+        } else {
+            constexpr std::size_t kBlock = 4096;
+            const std::size_t grain = ((rows / morsels) + kBlock - 1) / kBlock * kBlock;
+            const std::size_t used = (rows + grain - 1) / grain;
+            std::vector<std::vector<std::size_t>> parts(used);
+            std::vector<std::optional<std::string>> errors(used);
 
-        std::size_t kept = 0;
-        for (std::size_t row = 0; row < rows; ++row) {
-            kept += static_cast<std::size_t>(keeps(row));
+            std::atomic<std::size_t> cursor{0};
+            auto batch = process_worker_pool().submit(std::min(used, morsels), [&](std::size_t) {
+                while (true) {
+                    const std::size_t m = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (m >= used) {
+                        return;
+                    }
+                    const std::size_t begin = m * grain;
+                    const RowRange range{.begin = begin,
+                                         .count = std::min(rows, begin + grain) - begin};
+                    if (auto packed = select_conjunct_range(conjuncts.front(), input, scalars,
+                                                            range, parts[m]);
+                        !packed) {
+                        errors[m] = std::move(packed.error());
+                    }
+                }
+            });
+            batch.wait();
+
+            // Lowest-index morsel wins, so which error surfaces does not depend
+            // on which worker happened to reach it first.
+            for (const auto& error : errors) {
+                if (error.has_value()) {
+                    return std::unexpected(*error);
+                }
+            }
+            std::size_t total = 0;
+            for (const auto& part : parts) {
+                total += part.size();
+            }
+            selected.reserve(total);
+            for (const auto& part : parts) {
+                selected.insert(selected.end(), part.begin(), part.end());
+            }
         }
-        // One slot of slack so the unconditional store below always lands
-        // in-bounds, including on the final rejected row.
-        std::vector<std::size_t> selected(kept + 1);
-        std::size_t out = 0;
-        for (std::size_t row = 0; row < rows; ++row) {
-            selected[out] = row;
-            out += static_cast<std::size_t>(keeps(row));
-        }
-        selected.resize(kept);
 
         using ConjunctDiff = std::vector<ir::Expr>::difference_type;
         const std::vector<ir::Expr> rest(conjuncts.begin() + ConjunctDiff{1}, conjuncts.end());

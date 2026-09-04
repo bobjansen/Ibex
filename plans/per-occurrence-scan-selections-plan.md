@@ -13,8 +13,9 @@ green.** Phase 1 `78a09fad`, Phase 2a seam `bf783ef3`, Phase 2b + 3 `f2b298db`.
 What shipped is narrower than this plan's Phase 4 ambition and deliberately so:
 the split is gated on a **fusable `like`**, the one predicate shape where
 pushdown buys something a downstream filter cannot. Every other predicate keeps
-today's pooled decode. Phase 4 (narrowing the `!= 1` gate generally) stays open
-and now has a measured price attached — see *What the gate costs*.
+today's pooled decode. Phase 4 (narrowing the `!= 1` gate generally) stays open,
+and its price — first measured at +11.3% on q21, then re-diagnosed and removed
+on 2026-09-04 — is in *What the gate costs*.
 
 ## The defect
 
@@ -202,17 +203,75 @@ that actually fixes the e2e check and recovers the mechanism.
 one decode of `{a, b}`, not three — since that is the property the rejected fix
 broke.
 
-### What the gate costs (measured 2026-09-03)
+### What the gate costs (measured 2026-09-03, re-diagnosed 2026-09-04)
 
 The first working version split on ANY pushable predicate. It fixed the e2e
 check and regressed **q21 by +10.2% (min, 1/12 paired wins, interleaved)**.
 
-The cause is not decode -- that is shared -- it is the per-occurrence
-**gather**. `project_rows` materializes each occurrence's rows, so q21's three
-filtered `lineitem` occurrences each build their own 48M-row table instead of
-sharing one that downstream filters stream over. Pushing
-`l_receiptdate > l_commitdate` only evaluates it EARLIER; it does not remove
-work the way a fused `like` does.
+The cause was read as the per-occurrence **gather** -- `project_rows`
+materializing each occurrence's 48M rows instead of streaming over a shared
+table. **That was wrong, and the correction is below.**
+
+### What it actually was (measured 2026-09-04, corrected)
+
+Same-binary A/B (`IBEX_SPLIT_ANY_FILTER`, patch at the end of this section)
+reproduced the regression at **+11.3% on q21, 14/16 paired losses** -- so it was
+not a build-layout artefact. But `perf stat` says the split does **less** work
+and is still slower:
+
+| | task-clock | wall | CPUs used |
+|---|---|---|---|
+| gate on | 3466 ms | 1.111 s | 3.12 |
+| split everything | 3349 ms | 1.235 s | 2.71 |
+
+Less CPU, more wall, fewer cores busy: a **serialization** cost, not a work
+cost. Timing the eager decode phase directly named it:
+
+```
+[decode] shared project cols=2 88.1 ms
+[selection] predicate cols=2 decode 181.6 ms, evaluate 283.3 ms
+[decode] __ibex_source_0#f1 cols=2 rows=30343541 selection 473.5 ms, gather 59.9 ms
+```
+
+**The gather is 60 ms.** The selection is 473 ms, and 283 ms of that is
+evaluating `l_receiptdate > l_commitdate` over 48M rows *serially*, in a
+pre-execution phase where nothing else runs. The pipeline's own filter runs the
+same predicate for 335 ms of POOL work in 59 ms of wall, because it fans out.
+
+`filter_selection`'s whole-table path was three serial passes -- a dense mask, a
+count, a pack -- and it is the only path a column-vs-column predicate can take,
+since `build_bounds_plan` needs a literal to fuse. **Fixed** by morselizing it
+with the blocked shape `select_bounds` already used, gated on
+`ir::is_subset_evaluable_expr` so a Transform/Generator/`rank` conjunct, which
+needs neighbouring rows, is never split across ranges.
+
+Results, interleaved, byte-identical throughout:
+
+* **q04 -5.5%** (19/20 paired wins, p<0.001) against a clean HEAD build -- the
+  fix pays on today's default path, with the gate untouched.
+* q21's eager evaluate 283 ms -> 147 ms; the occurrence's selection 465 -> 325 ms.
+* Suite with the gate ON: -0.5% geomean, byte-identical on 22. (q12's +5.1% in
+  the first pass did not reproduce at 20 repeats: a wash.)
+* **Suite with the gate WIDENED: -0.4% geomean, byte-identical on 22, nothing
+  regressed.** The +11.3% that forced the `like` gate is gone.
+
+So the price on Phase 4 has been paid, and pushing
+`l_receiptdate > l_commitdate` is no longer a losing trade -- it is simply not
+yet a winning one. Widening the gate remains a separate planner decision, taken
+on its own evidence, not a free rider on this fix.
+
+**The measurement switch**, to re-run any of the above -- deliberately NOT in
+the tree, since it is an unsupported path: in `collect_filtered_sources`
+(`src/ir/scan_predicates.cpp`) change
+
+```cpp
+if (like_predicate_column(conjunct) != nullptr) {
+```
+
+to `if (std::getenv("IBEX_SPLIT_ANY_FILTER") != nullptr || ...)`, then A/B the
+one binary through two wrapper scripts that differ only in that variable. Doing
+it from one binary matters: this box has a +-10% build-layout envelope, which is
+the same size as the effect.
 
 Hence the gate: split only for a `like` over a column the query reads from
 nowhere else, where the string column is never built at all. With it, **no PDS-H
@@ -224,7 +283,11 @@ plan changes** (all 22 compared by operator profile).
 
 **Phase 4 — re-examine the `!= 1` gate.** It can then be narrowed from "any
 repeated source" to "a predicate that cannot be answered per occurrence",
-which should be nearly nothing.
+which should be nearly nothing. **Unblocked 2026-09-04**: with the eager
+selection parallel, widening the gate measures −0.4% geomean and byte-identical
+across all 22, where it cost +11.3% on q21 before. The blocker is gone; what is
+left is whether a neutral suite result justifies the plan-shape change — a
+question about risk, not about cost.
 
 ## Gating and risk
 

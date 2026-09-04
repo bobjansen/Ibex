@@ -1,3 +1,11 @@
+> **Note (2026-09-04):** the step SHAs below (`5f7afc59`, `94957719`) no longer
+> resolve — the post-commit hook re-commits, so hashes recorded at authoring
+> time drift. The work is in `a5183b9a` "Name the retained subtree in
+> MaterializedCall", `d7f2d59f` "Route materializing breakers through one
+> interpret_node fallback", `4923c02e` "Keep fallback-breaker inputs on the
+> physical path" and `cb2888cd` "Accept the MaterializedCall adapter as the
+> Phase 5 end state". Cite by subject line, not by hash.
+
 # Explicit physical fallback adapter
 
 Phase 5 item 3 of [`kernel-pipeline-execution-plan.md`](kernel-pipeline-execution-plan.md):

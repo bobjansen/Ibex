@@ -7,7 +7,8 @@ metadata:
 
 # Late materialization of FD-determined payload columns
 
-**Status: BUILT AND MEASURED 2026-09-03, uncommitted.** `src/ir/group_key_reduction.cpp`
+**Status: LANDED `568c4974` "Lift FD-determined payload columns above a top-k"
+(2026-09-03).** `src/ir/group_key_reduction.cpp`
 (`plan_lift` / `apply_lift` / `lift_walk`), 4 tests in
 `tests/test_ir_group_key_reduction.cpp`.
 

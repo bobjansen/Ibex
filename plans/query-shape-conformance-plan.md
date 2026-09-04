@@ -7,7 +7,8 @@ pre-compaction commit's parent if a number needs chasing.
 
 ## What this was
 
-`eb5231c` ("Match query shapes") rewrote `benchmarking/tpch/queries/*.ibex` to
+`482eb583` ("Match query shapes"; recorded here as `eb5231c` before the
+post-commit hook re-committed it) rewrote `benchmarking/tpch/queries/*.ibex` to
 the upstream `polars-benchmark` shapes — no hand-written predicate/projection
 pushdown or join-key pre-renaming. Right for the suite to measure (it now shows
 what the *planner* does), but it cost **+13-16% at SF-2/8c** because the planner

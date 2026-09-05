@@ -1,0 +1,85 @@
+% Literature and format references. Arrow's influence on Ibex's column layouts
+% is confirmed by the project author; other comparisons supply context.
+% Metadata and relevant passages checked against publication/repository
+% sources on 2026-09-05. URLs are included in notes for plain.bst output.
+
+@misc{ibexBenchmarks,
+  author = {{Ibex project}},
+  title = {{Ibex} Benchmarks and Methodology},
+  year = {2026},
+  note = {Snapshot generated 3 September 2026, 13:08 UTC;
+          commit \texttt{0d991d3677f2927eb40c77ba9f489ad6877baa24}.
+          \url{https://ibexlang.org/benchmarks.html};
+          \url{https://ibexlang.org/methodology.html}.
+          Snapshot and CSV provenance recorded in the text}
+}
+
+@manual{arrowCData,
+  author = {{Apache Arrow contributors}},
+  title = {The {Arrow C} Data Interface},
+  organization = {Apache Software Foundation},
+  url = {https://arrow.apache.org/docs/format/CDataInterface.html},
+  note = {\url{https://arrow.apache.org/docs/format/CDataInterface.html}.
+          Accessed 2026-09-05}
+}
+
+@manual{arrowColumnar,
+  author = {{Apache Arrow contributors}},
+  title = {{Arrow Columnar Format}},
+  organization = {Apache Software Foundation},
+  url = {https://arrow.apache.org/docs/format/Columnar.html},
+  note = {Format version 1.5. Sections on physical memory layout, validity
+          bitmaps, fixed-size primitive, variable-size binary, and
+          dictionary-encoded layouts.
+          \url{https://arrow.apache.org/docs/format/Columnar.html}.
+          Accessed 2026-09-05}
+}
+
+@article{graefe1994,
+  author = {Goetz Graefe},
+  title = {{Volcano}---An Extensible and Parallel Query Evaluation System},
+  journal = {IEEE Transactions on Knowledge and Data Engineering},
+  volume = {6},
+  number = {1},
+  pages = {120--135},
+  year = {1994},
+  doi = {10.1109/69.273032},
+  note = {\url{https://doi.org/10.1109/69.273032}}
+}
+
+@inproceedings{boncz2005,
+  author = {Peter Boncz and Marcin Zukowski and Niels Nes},
+  title = {{MonetDB/X100}: Hyper-Pipelining Query Execution},
+  booktitle = {Proceedings of the Second Biennial Conference on Innovative
+               Data Systems Research (CIDR)},
+  pages = {225--237},
+  year = {2005},
+  url = {https://www.cidrdb.org/cidr2005/papers/P19.pdf},
+  note = {\url{https://www.cidrdb.org/cidr2005/papers/P19.pdf}}
+}
+
+@article{neumann2011,
+  author = {Thomas Neumann},
+  title = {Efficiently Compiling Efficient Query Plans for Modern Hardware},
+  journal = {Proceedings of the VLDB Endowment},
+  volume = {4},
+  number = {9},
+  pages = {539--550},
+  year = {2011},
+  doi = {10.14778/2002938.2002940},
+  url = {https://www.vldb.org/pvldb/vol4/p539-neumann.pdf},
+  note = {\url{https://doi.org/10.14778/2002938.2002940}}
+}
+
+@inproceedings{leis2014,
+  author = {Viktor Leis and Peter Boncz and Alfons Kemper and Thomas Neumann},
+  title = {Morsel-Driven Parallelism: A {NUMA}-Aware Query Evaluation
+           Framework for the Many-Core Age},
+  booktitle = {Proceedings of the 2014 ACM SIGMOD International Conference
+               on Management of Data},
+  pages = {743--754},
+  year = {2014},
+  doi = {10.1145/2588555.2610507},
+  url = {https://ir.cwi.nl/pub/22547},
+  note = {\url{https://doi.org/10.1145/2588555.2610507}}
+}

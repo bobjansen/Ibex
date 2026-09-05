@@ -2,14 +2,13 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
 #include <ibex/repl/repl.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_format.hpp>
 #include <ibex/ui/server.hpp>
-
-#include <ibex/core/text.hpp>
 
 #include <algorithm>
 #include <array>

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Bob Jansen
 
 #include <ibex/core/column.hpp>
-#include <ibex/core/time.hpp>
 #include <ibex/core/text.hpp>
+#include <ibex/core/time.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>

@@ -7,8 +7,8 @@
 # ibex_bench output format:
 #   bench <name>: iters=N, total_ms=X.XXX, avg_ms=X.XXX, rows=N
 #
-# The first two queries (mean_by_symbol, ohlc_by_symbol) are timed with
-# --no-include-parse (pure interpreter execution, no parse/lower overhead).
+# The in-memory queries are timed with
+# --include-parse (query construction and execution, excluding input loading).
 # The parse_* variants are always timed with parse+lower included by ibex_bench
 # internally; we expose them as the "ibex+parse" framework row.
 #
@@ -18,8 +18,8 @@
 #                   [--rng-micro-rows N] [--filter-micro-rows N] [--reshape-rows N]
 #                   [--mode memory|scan] [--out results/ibex.tsv]
 #
-# --mode memory (default): time pure execution; CSVs are read once outside the
-#   timer (matches polars eager). Framework tag: "ibex".
+# --mode memory (default): time parsing, lowering and execution; CSVs are read
+#   once outside the timer (matches resident Polars lazy). Framework tag: "ibex".
 # --mode scan: read CSVs and parse+lower+execute inside the timer (matches
 #   polars lazy scan_csv().collect()). Framework tag: "ibex_scan".
 
@@ -35,6 +35,11 @@ else
     BUILD_DIR="$IBEX_ROOT/build"
 fi
 IBEX_BENCH="$BUILD_DIR/tools/ibex_bench"
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] &&
+   ! rg -q '^CMAKE_BUILD_TYPE:[^=]+=Release$' "$BUILD_DIR/CMakeCache.txt"; then
+    echo "error: benchmark build must be configured as Release: $BUILD_DIR" >&2
+    exit 1
+fi
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 CSV="$SCRIPT_DIR/data/prices.csv"
@@ -102,14 +107,13 @@ fi
 mkdir -p "$(dirname "$OUT")"
 
 # ── Run ibex_bench ────────────────────────────────────────────────────────────
-# --no-include-parse: queries[0,1] (mean_by_symbol, ohlc_by_symbol) measure
-#   pure execution only. queries[2,3] (parse_*) always include parse regardless.
+# Include per-query parsing/lowering, as other engines include query planning.
 case "$MODE" in
     # IBEX_FW_SUFFIX tags a variant run of the SAME code — currently "-st" for
     # the IBEX_CORES=1 single-thread pass. Same convention as
     # bench_python.py / bench_clickhouse.py, so the suite can label a
     # thread-count variant without a second harness.
-    memory) MODE_ARGS=(--no-include-parse); FW_TAG="ibex${IBEX_FW_SUFFIX:-}" ;;
+    memory) MODE_ARGS=(--include-parse); FW_TAG="ibex${IBEX_FW_SUFFIX:-}" ;;
     scan)   MODE_ARGS=(--include-read);     FW_TAG="ibex_scan" ;;
     *) echo "unknown --mode: $MODE (expected memory|scan)" >&2; exit 1 ;;
 esac

@@ -112,6 +112,7 @@ cell_cutoff_ms <- as.numeric(Sys.getenv("IBEX_CELL_CUTOFF_MS", "30000"))
 timer <- function(fn) {
     r <- NULL
     for (i in seq_len(warmup)) {
+        r <- NULL
         t0 <- now_ms()
         r  <- fn()
         if (now_ms() - t0 > cell_cutoff_ms) {
@@ -120,11 +121,13 @@ timer <- function(fn) {
                         nrow = if (is.null(r)) 0L else nrow(r), peak_rss_mb = 0))
         }
     }
+    r <- NULL
     reset_peak_rss()
     times <- numeric(iters)
     for (i in seq_len(iters)) {
         elapsed <- -1
         for (attempt in seq_len(5L)) {
+            r <- NULL
             t0      <- now_ms()
             r       <- fn()
             elapsed <- now_ms() - t0
@@ -1009,30 +1012,33 @@ if (tf_rows > 0) {
     if (!skip_data_table) {
         dt_tf <- data.table(ts = ts_vec, price = price_vec)
         message("\n=== data.table (tf rolling) ===")
-        # `:= NULL` teardown throughout — see the update_price_x2 comment above.
+        # Return the requested result, including the derived column. The
+        # current row is included; the first one-second window has one row.
         bench("data.table", "tf_lag1",
-            function() { dt_tf[, prev := shift(price, 1L)]; dt_tf[, prev := NULL][] })
+            function() { out <- copy(dt_tf); out[, prev := shift(price, 1L)]; out })
         bench("data.table", "tf_rolling_count_1m",
-            function() { dt_tf[, c := frollsum(rep(1.0, .N), 60L)]; dt_tf[, c := NULL][] })
+            function() { out <- copy(dt_tf); out[, c := frollsum(rep(1.0, .N), 60L)]; out })
         bench("data.table", "tf_rolling_sum_1m",
-            function() { dt_tf[, s := frollsum(price, 60L)]; dt_tf[, s := NULL][] })
+            function() { out <- copy(dt_tf); out[, s := frollsum(price, 60L)]; out })
         bench("data.table", "tf_rolling_mean_5m",
-            function() { dt_tf[, m := frollmean(price, 300L)]; dt_tf[, m := NULL][] })
+            function() { out <- copy(dt_tf); out[, m := frollmean(price, 300L)]; out })
         # frollapply is generic but ~100× slower than the optimized fns and
         # scales O(n*window); cost-cap so large sizes don't dominate the run.
         # Empirical on c7i.xlarge: ~18us/row (median), ~7us/row (sd).
         bench_capped("data.table", "tf_rolling_median_1m",
-            function() { dt_tf[, med := frollapply(price, 60L, median)]; dt_tf[, med := NULL][] },
+            function() { out <- copy(dt_tf); out[, med := frollapply(price, 60L, median)]; out },
             per_row_us = 18, n = tf_rows)
         bench_capped("data.table", "tf_rolling_std_1m",
-            function() { dt_tf[, sd_ := frollapply(price, 60L, sd)]; dt_tf[, sd_ := NULL][] },
+            function() { out <- copy(dt_tf); out[, sd_ := frollapply(price, 60L, sd)]; out },
             per_row_us = 7, n = tf_rows)
-        # Full-series EWMA (alpha=0.1, adjust=False) via TTR::EMA — matches the
-        # pandas/polars ewm reference (n=1 seeds with the first value). Not
-        # time-windowed (no engine here uses ibex's time-windowed EWMA math).
+        # Time-windowed EWMA over the same trailing interval as Ibex.
+        rolling_ewma <- function(x) {
+            if (length(x) == 0) return(NA_real_)
+            Reduce(function(a, b) a + 0.1 * (b - a), x)
+        }
         bench("data.table", "tf_rolling_ewma_1m",
-            function() { dt_tf[, e := suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))]
-                         dt_tf[, e := NULL][] })
+            function() { out <- copy(dt_tf); out[, e := slider::slide_index_dbl(
+                price, ts, rolling_ewma, .before = lubridate::seconds(59))]; out })
         bench("data.table", "tf_resample_1m_ohlc",
             function() dt_tf[, .(open = data.table::first(price),
                                   high = max(price),
@@ -1041,17 +1047,18 @@ if (tf_rows > 0) {
                               by = .(bucket = lubridate::floor_date(ts, "minute"))])
 
         message("\n=== data.table (tf asof) ===")
-        set.seed(42L)
-        sample_idx <- sort(sample.int(tf_rows, size = tf_rows %/% 10L))
+        # Shared deterministic 10% fixture: indices 1,11,21,... match the
+        # Python/SQL/C++ harnesses' zero-based indices 0,10,20,...
+        sample_idx <- seq.int(1L, tf_rows, by = 10L)
         # 100 symbols partition both sides (quote i and trades derived from it
         # share symbol i %% 100), for the by-symbol roll join below.
         q_symbol <- paste0("SYM", (seq_len(tf_rows) - 1L) %% 100L)
         t_symbol <- paste0("SYM", (sample_idx - 1L) %% 100L)
         trades_dt  <- data.table(
             ts  = as.POSIXct(sample_idx - 1L, origin = "1970-01-01", tz = "UTC") +
-                  runif(length(sample_idx), 0, 0.999),
+                  ((sample_idx - 1L) * 37L %% 999) / 1000,
             symbol = t_symbol,
-            qty = sample.int(99L, length(sample_idx), replace = TRUE))
+            qty = ((sample_idx - 1L) * 13L %% 99L) + 1L)
         quotes_dt  <- data.table(ts = ts_vec, symbol = q_symbol,
                                  bid = 99.0 + (price_vec - 100.0) * 0.01)
         setkey(quotes_dt, ts)
@@ -1094,10 +1101,13 @@ if (tf_rows > 0) {
             function() tb_tf |> mutate(s = slide_index_dbl(price, ts, sd,
                                                             .before = lubridate::seconds(60))),
             per_row_us = 20, n = tf_rows)
-        # Full-series EWMA (alpha=0.1, adjust=False) via TTR::EMA — matches the
-        # pandas/polars ewm reference. Not time-windowed.
+        rolling_ewma <- function(x) {
+            if (length(x) == 0) return(NA_real_)
+            Reduce(function(a, b) a + 0.1 * (b - a), x)
+        }
         bench("dplyr", "tf_rolling_ewma_1m",
-            function() tb_tf |> mutate(e = suppressWarnings(TTR::EMA(price, n = 1L, ratio = 0.1))))
+            function() tb_tf |> mutate(e = slider::slide_index_dbl(
+                price, ts, rolling_ewma, .before = lubridate::seconds(59))))
         bench("dplyr", "tf_resample_1m_ohlc",
             function() tb_tf |>
                 mutate(bucket = lubridate::floor_date(ts, "minute")) |>

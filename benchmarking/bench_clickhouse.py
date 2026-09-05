@@ -11,7 +11,7 @@ Usage:
   uv run bench_clickhouse.py --csv data/prices.csv --csv-multi data/prices_multi.csv
   uv run bench_clickhouse.py --csv data/prices.csv --threads 1
 """
-import argparse, csv, pathlib, sys, time
+import argparse, csv, os, pathlib, sys, time
 import numpy as np
 from chdb.session import Session
 
@@ -26,11 +26,36 @@ from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, 
 LAST_PEAK_RSS_MB = 0.0
 
 
+class NativeResult:
+    """A complete engine-owned result, without serializing it across the API."""
+    def __init__(self, session):
+        self.session = session
+
+    @property
+    def num_rows(self):
+        return int(self.session.query("SELECT count() FROM _bench_sink", "TabSeparated").data().strip())
+
+    def to_arrow_table(self):
+        """Untimed value verification only."""
+        return self.session.query("SELECT * FROM _bench_sink", "ArrowTable")
+
+    def release(self):
+        self.session.query("DROP TABLE IF EXISTS _bench_sink")
+
+
+def release_result(result):
+    if isinstance(result, NativeResult):
+        result.release()
+
+
 def timer(fn, warmup: int, iters: int):
     """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result).
     Side effect: sets module global LAST_PEAK_RSS_MB to peak RSS during the measured iterations."""
     global LAST_PEAK_RSS_MB
+    result = None
     for _ in range(warmup):
+        release_result(result)
+        result = None  # Release the previous output outside the timed interval.
         _t0 = time.perf_counter()
         result = fn()
         if (time.perf_counter() - _t0) * 1000 > CELL_CUTOFF_MS:
@@ -38,9 +63,13 @@ def timer(fn, warmup: int, iters: int):
             # avg_ms < 0 is dropped by the writer (blank on the page).
             LAST_PEAK_RSS_MB = 0.0
             return (-1.0, -1.0, -1.0, 0.0, -1.0, -1.0, result)
+    release_result(result)
+    result = None
     reset_peak_rss()
     times = []
     for _ in range(iters):
+        release_result(result)
+        result = None
         t0 = time.perf_counter()
         result = fn()
         times.append((time.perf_counter() - t0) * 1000)
@@ -57,25 +86,19 @@ def timer(fn, warmup: int, iters: int):
     )
 
 
-def _count_rows(sess, sql):
-    """Run a count() wrapper query to get result row count (not timed)."""
-    res = sess.query(f"SELECT count() FROM ({sql})", "TabSeparated")
-    return int(res.data().strip())
-
-
-_SINK = "_bench_sink"
-
-
 def _materialize(sess, sql):
-    """Execute the query and materialise its full result into an in-memory table.
+    """Materialize natively by default; Arrow delivery is an explicit variant.
 
-    Unlike `FORMAT Null` (which streams rows through a sink and discards them in
-    bounded blocks), CREATE ... AS builds the whole result in ClickHouse's native
-    columnar memory — so output-heavy queries (melt/dcast/wide filters) pay the
-    same allocate+write cost ibex/polars/duckdb/datafusion do when they return a
-    result. Aggregations stay cheap because their result is small. CREATE OR
-    REPLACE drops the previous result first, so peak memory is one result."""
-    sess.query(f"CREATE OR REPLACE TABLE {_SINK} ENGINE = Memory AS {sql}")
+    CHDB_RESULT_MODE=arrow includes result serialization/transport. It is not
+    interchangeable with native engine execution for output-heavy queries.
+    """
+    mode = os.environ.get("CHDB_RESULT_MODE", "native")
+    if mode == "arrow":
+        return sess.query(sql, "ArrowTable")
+    if mode != "native":
+        raise ValueError("CHDB_RESULT_MODE must be native or arrow")
+    sess.query(f"CREATE OR REPLACE TABLE _bench_sink ENGINE=Memory AS {sql}")
+    return NativeResult(sess)
 
 
 # ── Benchmark suites ──────────────────────────────────────────────────────────
@@ -99,14 +122,14 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -135,9 +158,10 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     run(
         "ohlc_by_symbol",
         "SELECT symbol, "
-        "any(price) AS open, max(price) AS high, "
-        "min(price) AS low, anyLast(price) AS last "
-        "FROM prices GROUP BY symbol",
+        "argMin(price, _ord) AS open, max(price) AS high, "
+        "min(price) AS low, argMax(price, _ord) AS last "
+        "FROM (SELECT *, row_number() OVER () AS _ord FROM prices) "
+        "GROUP BY symbol",
     )
 
     run(
@@ -164,7 +188,8 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
 
     run(
         "order_tail_topk",
-        "SELECT * FROM prices ORDER BY price ASC LIMIT 100",
+        "SELECT * FROM (SELECT * FROM prices ORDER BY price ASC LIMIT 100) AS bottom "
+        "ORDER BY price DESC",
     )
 
     run(
@@ -362,7 +387,8 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         run(
             "count_by_symbol_day",
             "SELECT symbol, day, count() AS n "
-            "FROM prices_multi GROUP BY symbol, day",
+        "FROM (SELECT *, row_number() OVER () AS _ord FROM prices_multi) "
+        "GROUP BY symbol, day",
         )
 
         run(
@@ -374,9 +400,10 @@ def bench_clickhouse_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
         run(
             "ohlc_by_symbol_day",
             "SELECT symbol, day, "
-            "any(price) AS open, max(price) AS high, "
-            "min(price) AS low, anyLast(price) AS last "
-            "FROM prices_multi GROUP BY symbol, day",
+            "argMin(price, _ord) AS open, max(price) AS high, "
+            "min(price) AS low, argMax(price, _ord) AS last "
+            "FROM (SELECT *, row_number() OVER () AS _ord FROM prices_multi) "
+            "GROUP BY symbol, day",
         )
 
         # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
@@ -435,14 +462,14 @@ def bench_clickhouse_null(csv_path, csv_lookup_path, warmup, iters, sess):
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -506,14 +533,14 @@ def bench_clickhouse_reshape(warmup, iters, reshape_rows, sess):
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -630,14 +657,14 @@ def bench_clickhouse_events(csv_events_path, warmup, iters, sess, csv_users_path
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -716,14 +743,14 @@ def bench_clickhouse_fill(n_rows, warmup, iters, sess):
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -783,7 +810,8 @@ def bench_clickhouse_tf(n_rows, warmup, iters, sess):
     print("clickhouse: building tf data...", file=sys.stderr, flush=True)
     sess.query(f"""
         CREATE OR REPLACE TABLE tf_data ENGINE = Memory AS
-        SELECT toDateTime(number) AS ts, 100.0 + (number % 100) AS price
+        SELECT number AS _ord, toDateTime(number) AS ts,
+               100.0 + (number % 100) AS price
         FROM numbers({n_rows})
     """)
     rows = []
@@ -793,14 +821,14 @@ def bench_clickhouse_tf(n_rows, warmup, iters, sess):
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -821,27 +849,27 @@ def bench_clickhouse_tf(n_rows, warmup, iters, sess):
             )
         )
 
-    # Window [t-Ns, t] inclusive == N+1 rows on the 1s series: 60s -> 60 PRECEDING,
-    # 5m -> 300 PRECEDING.
+    # On this one-second fixture, 59/299 preceding rows represent Ibex's
+    # (t-duration, t] interval.
     def w(rows_back):
         return f"OVER (ORDER BY ts ROWS BETWEEN {rows_back} PRECEDING AND CURRENT ROW)"
 
     run("tf_lag1",
         f"SELECT lagInFrame(price, 1) {w(1)} AS prev FROM tf_data")
     run("tf_rolling_count_1m",
-        f"SELECT count(*) {w(60)} AS c FROM tf_data")
+        f"SELECT count(*) {w(59)} AS c FROM tf_data")
     run("tf_rolling_sum_1m",
-        f"SELECT sum(price) {w(60)} AS s FROM tf_data")
+        f"SELECT sum(price) {w(59)} AS s FROM tf_data")
     run("tf_rolling_mean_5m",
-        f"SELECT avg(price) {w(300)} AS m FROM tf_data")
+        f"SELECT avg(price) {w(299)} AS m FROM tf_data")
     run("tf_rolling_median_1m",
-        f"SELECT median(price) {w(60)} AS med FROM tf_data")
+        f"SELECT median(price) {w(59)} AS med FROM tf_data")
     run("tf_rolling_std_1m",
-        f"SELECT stddevSamp(price) {w(60)} AS s FROM tf_data")
+        f"SELECT stddevSamp(price) {w(59)} AS s FROM tf_data")
     run("tf_resample_1m_ohlc",
         "SELECT toStartOfInterval(ts, INTERVAL 60 SECOND) AS bucket, "
-        "       argMin(price, ts) AS open, max(price) AS high, "
-        "       min(price) AS low, argMax(price, ts) AS close "
+        "       argMin(price, _ord) AS open, max(price) AS high, "
+        "       min(price) AS low, argMax(price, _ord) AS close "
         "FROM tf_data GROUP BY bucket ORDER BY bucket")
     return rows
 
@@ -862,9 +890,9 @@ def bench_clickhouse_asof(n_rows, warmup, iters, sess):
     """)
     sess.query(f"""
         CREATE OR REPLACE TABLE trades ENGINE = Memory AS
-        SELECT toDateTime64(number + (cityHash64(number) % 1000) / 1000.0, 3) AS ts,
+        SELECT toDateTime64(number + ((number * 37) % 999) / 1000.0, 3) AS ts,
                'SYM' || toString(number % 100) AS symbol,
-               1 + (cityHash64(number) % 99) AS qty
+               1 + ((number * 13) % 99) AS qty
         FROM numbers({n_rows}) WHERE number % 10 = 0
     """)
     rows = []
@@ -874,14 +902,14 @@ def bench_clickhouse_asof(n_rows, warmup, iters, sess):
             print(f"  clickhouse/{name}: SKIPPED (cut at a smaller scale)", file=sys.stderr, flush=True)
             rows.append(cut_row("clickhouse", name))
             return
-        n = _count_rows(sess, sql)
-
         def fn():
-            _materialize(sess, sql)
+            return _materialize(sess, sql)
 
-        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, _ = timer(
+        avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
+        n = result.num_rows
+        release_result(result)
         print(
             f"  clickhouse/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,

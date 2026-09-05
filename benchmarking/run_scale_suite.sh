@@ -41,7 +41,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
-if [[ -f "${BUILD_DIR:-}" ]]; then
+if [[ -d "${BUILD_DIR:-}" ]]; then
     : # user-specified, keep it
 elif [[ -x "$IBEX_ROOT/build-release/tools/ibex_bench" ]]; then
     BUILD_DIR="$IBEX_ROOT/build-release"
@@ -240,15 +240,16 @@ if [[ -n "$THREADS" ]]; then
 fi
 
 DATA_ROOT="$SCRIPT_DIR/data/scales"
-RESULT_ROOT="$SCRIPT_DIR/results/scales"
-COMBINED_TSV="$SCRIPT_DIR/results/scales.tsv"
-COMBINED_CSV="$SCRIPT_DIR/results/scales.csv"
+OUTPUT_DIR="${IBEX_SCALE_OUTPUT_DIR:-$SCRIPT_DIR/results}"
+RESULT_ROOT="$OUTPUT_DIR/scales"
+COMBINED_TSV="$OUTPUT_DIR/scales.tsv"
+COMBINED_CSV="$OUTPUT_DIR/scales.csv"
 GEN_DATA="$SCRIPT_DIR/data/gen_data.py"
 # Carry-forward skip set. A harness cuts a cell whose warm iteration exceeds the
 # per-iteration budget and emits a sentinel row (avg_ms < 0); we record that
 # "framework|query" here and feed the accumulated set back via IBEX_SKIP_CELLS so
 # every LARGER size skips it outright — no ever-slower warm iteration is re-paid.
-SKIP_FILE="$SCRIPT_DIR/results/skip_cells.txt"
+SKIP_FILE="$OUTPUT_DIR/skip_cells.txt"
 
 mkdir -p "$DATA_ROOT" "$RESULT_ROOT" "$(dirname "$COMBINED_TSV")"
 : > "$SKIP_FILE"

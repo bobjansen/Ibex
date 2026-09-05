@@ -26,13 +26,19 @@ Diagnostics:
       - readability-implicit-bool-conversion
       - misc-no-recursion
       - readability-function-cognitive-complexity
+      - readability-avoid-nested-conditional-operator
       - modernize-use-trailing-return-type
       - readability-identifier-length
       - cppcoreguidelines-avoid-magic-numbers
       - readability-magic-numbers
       - readability-braces-around-statements
+      - cppcoreguidelines-avoid-non-const-global-variables
+      - cppcoreguidelines-owning-memory
+      - bugprone-easily-swappable-parameters
+      - cppcoreguidelines-pro-type-union-access
+      - cppcoreguidelines-pro-type-vararg
+      - misc-use-internal-linkage
     CheckOptions:
-      bugprone-easily-swappable-parameters.ModelImplicitConversions: false
       misc-include-cleaner.IgnoreHeaders: '(^|.*/)bits/.*'
   UnusedIncludes: Strict
 
@@ -40,6 +46,15 @@ InlayHints:
   Enabled: true
   ParameterNames: true
   DeducedTypes: true
+
+---
+If:
+  PathMatch: '(.*/)?include/ibex/plugin/schema\.hpp'
+CompileFlags:
+  # clangd otherwise infers this header's command from src/ir/schema.cpp,
+  # whose target does not use the plugin's header-only JSON dependency.
+  # The inferred command's working directory is build/.
+  Add: [-isystem, ../build/_deps/nlohmann_json-src/include]
 
 ---
 If:

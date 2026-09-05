@@ -94,6 +94,9 @@ FetchContent_Declare(
 )
 set(ARROW_BUILD_SHARED ON CACHE BOOL "" FORCE)
 set(ARROW_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+# Shared libraries require PIC; set it ourselves so Arrow's own CMakeLists
+# doesn't have to warn and flip it on for us.
+set(ARROW_POSITION_INDEPENDENT_CODE ON CACHE BOOL "" FORCE)
 set(ARROW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ARROW_BUILD_UTILITIES OFF CACHE BOOL "" FORCE)
 set(ARROW_FILESYSTEM ON CACHE BOOL "" FORCE)

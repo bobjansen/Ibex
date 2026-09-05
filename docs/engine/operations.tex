@@ -1,0 +1,294 @@
+\section{Operational detail: sources, operators, and retained state}
+\label{sec:operations}
+The preceding sections describe the engine's components. This section follows
+their execution boundaries: when a source is read, what an operator retains
+between pulls, and when output becomes available. These concrete mechanisms
+describe the host runtime; the compiled route must provide equivalent
+functionality under the contract in Section~2.
+
+\subsection{Binding a source and deciding what to read}
+A registered materialized table already owns or shares its column buffers.
+A lazy table instead starts with a schema, a row count, and a decoder supplied
+by its source. This allows a caller to resolve column demand before asking for
+column values. \code{LazyTable::project} finds demanded columns missing from
+its cache, decodes them, and returns columns in source-schema order. Its cache
+contains whole-source columns, so subsequent uses can reuse those buffers.
+
+Filtering adds a second decision: which rows need payload values? In the
+ordinary \code{project_where} path, the engine obtains columns needed by
+predicates, evaluates the predicates, and constructs a selection of surviving
+source-row indices. It then requests the demanded payload columns for those
+rows. Already cached columns can be gathered in memory. Newly decoded selected
+payloads are not inserted as whole-source cache entries: otherwise a later
+query could mistake a filtered subset for the original column.
+
+For example, a scan that filters ticks on \code{price} and returns only
+\code{ts} and \code{volume} needs the predicate's answer but does not need
+\code{price} in its output. An eligible reader can evaluate certain range or
+string predicates while decoding, returning the selection without constructing
+the full predicate column. If the reader reports that it cannot answer that
+request, the engine uses ordinary decode-and-filter execution. An error is
+different from a declined optimization and propagates to the caller.
+
+This separates three quantities: columns referenced by predicates, columns
+required by consumers, and source rows selected for those consumers. It also
+explains why column-demand analysis and decoding cannot be understood solely
+by looking at the final projection.
+
+\evidence{\src{src/runtime/lazy_table.cpp}, \code{LazyTable::project},
+\code{project_where}, \code{decode_whole_columns}, and \code{project_rows};
+\src{include/ibex/runtime/lazy_table.hpp}, \code{ColumnDecodeFn} and
+\code{LazySourceReader}.}
+
+\subsection{Source units and reader ownership}
+A lazy source may expose a sequence of \code{SourceUnit} ranges that covers
+its rows in order. A reader without such a decomposition is read as a whole.
+For a decomposed source, a unit restricts decoding to part of the source;
+selection indices still refer to the original source, not to positions
+starting at zero within that unit. The reader intersects the selection with
+the unit. Keeping one index space prevents a selection made before decoding
+from selecting different rows after partitioning.
+
+Each \code{LazySourceReader} owns its mutable decoder state. The reader
+factory and pool permit independent readers to share immutable resources
+without sharing a decoder cursor. In a scan pipeline, workers can produce
+different source units concurrently, while the sequence-indexed output buffer
+controls when the consumer receives them. Buffer capacity applies
+backpressure: production must wait when the consumer has not released space.
+The unit size belongs to the source decomposition; it is distinct from the
+morsel grain used to partition an already materialized input.
+
+\evidence{\src{include/ibex/runtime/lazy_table.hpp},
+\code{LazySourceReader::decode_units} and \code{decode};
+\src{src/runtime/lazy_table.cpp}, \code{acquire_reader} and
+\code{release_reader}; \src{src/runtime/pipeline_executor.cpp},
+\code{PipelinedScanOperator}.}
+
+\subsection{Map operations: sharing, evaluating, and gathering}
+A projection or rename can change a chunk's column entries without visiting
+its value rows. The \code{map_chunk} kernel receives source column positions
+and output names and constructs entries sharing the selected column values.
+The caller supplies the derived row-layout properties. This is a metadata
+operation over the columns, rather than a copy of every selected value.
+
+A filter changes the row set and therefore has different work to do. The
+predicate identifies survivors; gathering constructs output columns for those
+positions, together with their validity. An update evaluates expressions to
+produce replacement or additional columns. A fused filter/project step can
+gather only the columns required by its output. The physical map description
+records kernel capability and column representation/null-policy signatures,
+so representation-specific work is chosen at the execution boundary.
+
+Fixed-width kernels can borrow \code{ColumnView} objects containing a value
+pointer, a length, and a validity pointer. These views own no storage: the
+input chunk or table must remain alive during their use. A string or packed
+boolean column requires its own access pattern, rather than being treated
+as an ordinary array of independently addressable scalar objects.
+
+\evidence{\src{src/runtime/kernel_types.hpp}, \code{ColumnView},
+\code{ChunkView}, and \code{map_chunk};
+\src{include/ibex/runtime/pipeline.hpp}, \code{MapStep},
+\code{MapKernelCapability}, and \code{ColumnKernelSignature};
+\src{tests/test_physical_plan.cpp}, projection and fused-filter tests.}
+
+\subsection{Hash joins: build, probe, and output assembly}
+For an eligible equality join, the build phase constructs a lookup structure
+over one input. The probe phase looks up keys from the other input and gathers
+the matching payload columns. These phases have different lifetime needs:
+the index and its backing table must survive every probe, while probe chunks
+can be processed one at a time.
+
+\paragraph{Choosing the build side.}
+In the ordinary single-key streaming path, the right input is already
+materialized. If it is sufficiently small, the engine builds its index without
+draining the left input. Otherwise it buffers left chunks until their row count
+reaches the right-side count or the left input ends. If the count reaches the
+right-side count, it builds on the right and replays the buffered chunks before
+continuing the left stream. Only the exhausted smaller-left case needs to
+concatenate those chunks to consider building on the left. An ordering benefit
+can still favor building on the right. Thus build-side selection depends on
+both input size and useful ordering; it is not simply ``always hash the
+smaller table''.
+
+\paragraph{Representing repeated keys.}
+\code{JoinHashIndex} stores a head row for each key and a \code{chain_next}
+array linking build rows with the same key. A uniqueness flag identifies the
+case where chain traversal can be avoided. In the serial build, reverse row
+insertion makes duplicate chains traverse in original build-row order.
+Null keys are excluded in this streaming path, which implements the
+\code{nulls never} case. Other join semantics select other implementations.
+For categorical probes, the engine can resolve dictionary strings to index
+heads once per dictionary and then use row codes to access those heads.
+
+\paragraph{Producing rows.}
+Probing produces pairs of left and right row indices. Output assembly gathers
+the requested payloads through those pairs and applies the planned output
+names. Repeated keys can expand one probe row into many result rows, so memory
+for matches depends on result cardinality as well as input cardinality.
+Worker-private probe state retains shared ownership of the immutable build.
+The orientation and ordering logic must be considered when describing output
+order; the order of hash buckets is not a semantic ordering rule.
+
+\paragraph{Filtering a deferred probe source.}
+A separate deferred path obtains build keys before decoding the probe payload.
+It publishes a dynamic key filter and marks the filter ready. A supported
+source can use that filter to narrow candidate rows; exact join probing still
+determines matches. The two-phase path can find matching key rows first and
+materialize payload columns for survivors afterwards. If that optimization
+declines, execution returns to the ordinary materialization/probe path. This
+is why a deferred probe source cannot always be pulled independently before
+the join's build phase has run.
+
+\evidence{\src{src/runtime/join_chunked.cpp},
+\code{ChunkedInnerJoinOperator::initialize}, \code{BufferedThenStreamSource},
+\code{choose_and_build_single_key}, \code{JoinHashIndex},
+\code{fill_partitioned_heads}, \code{JoinProbe::resolve_categorical_heads},
+\code{JoinProbe::assemble_output}, \code{resolve_deferred_probe}, and
+\code{try_two_phase_probe}; \src{src/runtime/join_chunked_internal.hpp},
+\code{JoinProbeFactory}. This account covers the inspected streaming equality
+join family, not every join kind.}
+
+\subsection{Aggregation: state survives the input chunks}
+Aggregation replaces many input rows with group results. In the hash path,
+group state survives across chunk pulls, while each input chunk is released
+after its contribution has been accumulated. The coordinator enforces four
+phases:
+\begin{enumerate}
+  \item \emph{Discovery} identifies the group for each input row and retains
+    the active chunk while its column references are in use.
+  \item \emph{Accumulation} consumes the discovered group identifiers and
+    updates aggregate state, then releases the chunk. Some specialized paths
+    combine discovery and accumulation; an explicit transfer marker prevents
+    accumulating those values twice.
+  \item \emph{Final ordering}, after input exhaustion, brings partition-owned
+    groups into global first-occurrence order. Strategies that already use
+    global group identifiers need no deferred ordering merge.
+  \item \emph{Emission} constructs result columns from finalized group state.
+    The implementation rejects emission before input consumption or ordering
+    finalization is complete.
+\end{enumerate}
+For a grouped sum, the conceptual state is an accumulator for each group;
+processing row $i$ updates the accumulator selected by its group identifier.
+The implementation specializes discovery and accumulation by key and value
+representation. Distinct counting needs additional per-group value state,
+so ``one accumulator per group'' is not a memory model for every aggregate.
+The hash path can consume chunks without retaining all their original rows,
+but it emits its result only after the input has ended.
+
+\paragraph{When sorted input changes the algorithm.}
+The adaptive aggregate examines the first nonempty chunk and its ordering
+metadata. The sorted path requires the leading ordering keys to cover the
+grouping columns and rejects grouping entries carrying validity bitmaps.
+There are also aggregate-specific gates: distinct counting and nonnumeric
+\code{first}/\code{last}, for example, use the hash fallback in this path.
+On fallback, the inspected first chunk is prepended to the remaining stream;
+it is neither discarded nor read again from the source.
+
+When the sorted strategy is admitted, equal keys occupy contiguous runs.
+The operator retains the current group's state across chunk boundaries,
+closes it when the key changes, and buffers completed groups for output.
+At end of input it closes the remaining open group. The relevant ordering
+is ordering by the grouping keys: a time-ascending table with interleaved
+symbols does not automatically qualify for aggregation by symbol. This is
+an operational reason to distinguish a TimeFrame's time order from a
+group-contiguous layout.
+
+\evidence{\src{src/runtime/aggregate_chunked.cpp},
+\code{HashAggregateState::next_discovery}, \code{accumulate_discovery},
+\code{finalize_ordering}, \code{emit_output},
+\code{HashAggregatePhaseOperator::next}, and
+\code{ChunkedSortedAggregateOperator}, especially \code{decide_strategy},
+\code{sorted_on_group_by}, \code{needs_hash_fallback}, and \code{next_sorted}.}
+
+\subsection{Interchange and memory lifetime}
+The Arrow C Data Interface supplies array/schema descriptors and a release
+callback for sharing columnar data within a process~\cite{arrowCData}.
+Ibex's borrowing import copies values. Its adopting import instead creates a
+shared owner for the producer's array and, after successful validation and
+import, clears the caller's array descriptor. The retained owner's destructor
+eventually calls the producer's release function. Failed adoption leaves
+ownership with the caller.
+
+Whether a payload is adopted or converted depends on representation. The
+inspected implementation can borrow supported primitive buffers and validated
+UTF-8 buffers through that owner. Narrow integer inputs are widened into
+Ibex's integer representation; timestamps requiring a unit conversion also
+need new value storage. Sharing an external buffer therefore preserves a
+producer lifetime, while converting it allocates an Ibex representation.
+The implementation's \code{import_column} dispatch is the evidence here:
+the public header's shorter adoption comment lists fewer supported layouts.
+
+\evidence{\src{src/interop/arrow_c_data.cpp}, \code{AdoptedArrayOwner},
+\code{import_column}, \code{import_string_column},
+\code{import_table_from_arrow}, and \code{adopt_table_from_arrow}.}
+
+For operational reasoning, the following lists retained state rather than
+asserting an unmeasured whole-query memory bound. Shared buffers must be
+counted once even when several entries refer to them.
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Boundary & Storage that may remain live\\
+\midrule
+Lazy binding & Whole-source columns already decoded into its cache.\\
+Map pipeline & Input buffers, worker scratch/output, and buffered chunks.\\
+Hash join & Build table and index; buffered probe input and match indices.\\
+Hash aggregate & Group keys and aggregate state across all input chunks.\\
+Sorted aggregate & Open-group state and buffered completed-group output.\\
+Result sink & The growing result and the current incoming chunk.\\
+Arrow adoption & Producer storage retained by the shared array owner.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+The distinction between input consumption and output production is central:
+a bounded chunk interface can feed an operator whose retained state grows
+with the number of groups, join matches, or result rows.
+
+\section{A trade-summary workload}
+\label{sec:trade-workload}
+The runnable example \src{docs/engine/trade_summary.ibex} starts with five
+timestamped ticks in ascending time order. It constructs a TimeFrame, removes
+a zero-price tick, computes trade notionals, enriches symbols with an instrument
+table, and produces volume-weighted average prices (VWAP). This first workload
+uses a complete sample interval; window and resampling rules remain deferred.
+
+\lstinputlisting[firstline=15]{trade_summary.ibex}
+
+The instrument table has one row per symbol, with venue \code{XNAS} for both
+symbols. The expected data flow is:
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}lrlX@{}}
+\toprule
+Stage & Rows & Operation & Resulting work\\
+\midrule
+Ticks & 5 & Construct & Timestamp, symbol, price, volume columns.\\
+Eligible & 4 & Filter/update & Drop the zero price; calculate price times volume.\\
+Enriched & 4 & Join & Add the matching venue; these keys do not multiply rows.\\
+Totals & 2 & Aggregate & Accumulate volume and notional by symbol and venue.\\
+Report & 2 & Update/order & Divide totals and explicitly sort by symbol.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+The report contains AAPL with volume $30$, notional $3040$, and VWAP
+$3040/30$; MSFT has volume $20$, notional $4030$, and VWAP $201.5$.
+Keeping the division after aggregation expresses
+$\sum_i p_i v_i / \sum_i v_i$, rather than an unweighted mean of prices.
+The explicit final order makes this summary's presentation independent of
+the first occurrence of each symbol in the ticks.
+
+\paragraph{Observed execution boundary.}
+Running the example with the existing release executable and
+\code{--no-history} and \code{--report-planner} produced those two result rows and
+reported statement execution because there were no lazy table sources to plan
+against. Named intermediate results in this run are therefore separate
+statement results. The sequence above describes data dependencies; it is
+not a claim that the entire script became one fused physical pipeline.
+The numeric output validates this small workload, not the parallel strategy
+gates or compiled/interpreted parity. No engine rebuild or benchmark was
+performed for this check.
+
+Replacing the constructed input with a lazy file source would add demand
+analysis and decoder behavior to the trace. Its exact physical plan should
+be recorded from that run before making claims about pushdown or fusion.
+Similarly, adding windows later will introduce persistent ordered state whose
+boundaries need a separate treatment.

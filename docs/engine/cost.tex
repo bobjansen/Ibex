@@ -1,0 +1,186 @@
+\section{Execution cost and existing measurements}
+\label{sec:cost}
+Ibex already has a substantial measurement corpus. The scale suite and its
+published benchmark page provide observations across operators, row counts,
+and thread configurations~\cite{ibexBenchmarks}. This section uses a small,
+explicitly identified snapshot to ground the cost explanation. It separates
+what those measurements show from the mechanisms that can explain a cost;
+timing a query alone does not identify its bottleneck.
+
+\subsection{What determines the amount of work?}
+Row count is only one dimension. Let $n$ denote input rows, $s$ the fraction
+surviving a filter, $w$ the bytes of demanded payload per row, $g$ the number
+of groups, and $m$ the number of join-result rows. These are explanatory
+quantities, not parameters of a claimed Ibex optimizer cost model.
+
+\paragraph{Reading and selecting.}
+Column demand limits which payloads must be read. A selective scan can reduce
+payload materialization toward $snw$ bytes, but predicate evaluation still
+has its own input cost. Source encodings and page boundaries determine whether
+skipped rows also avoid decoding work. A small result therefore does not imply
+a proportionally cheap scan. Cached columns change the work again: gathering
+from existing buffers avoids source decoding but still reads and writes values.
+
+\paragraph{Computing and moving values.}
+A row-local expression such as doubling a price visits $n$ values and produces
+$n$ outputs. A projection can share payloads, whereas a filter generally gathers
+survivors into output buffers. Fusion can remove intermediate passes and avoid
+gathering unused columns. Fixed-width output volume depends on rows and width;
+string output also depends on the number of character bytes. Consequently,
+operations with similar arithmetic can have different allocation and copying
+costs. These mechanisms motivate a bandwidth hypothesis, but the published
+wall times alone do not establish memory-bandwidth saturation.
+
+\paragraph{Maintaining state.}
+Aggregation combines row processing with state indexed by $g$ groups. More
+groups, additional key components, and different key representations alter
+lookup and state-management work. A hash join similarly pays for its build
+index, probe lookups, and materializing $m$ matches. Duplicate keys can make
+$m$ much larger than either input. Reducing output width helps the gather,
+but does not eliminate the cost of identifying the matches.
+
+\paragraph{Ordering and reducing output.}
+Sorting a complete table and selecting its top 100 rows request different
+amounts of output and can use different algorithms. Ibex's bounded-heap top-k
+path performs selection before gathering its small result, rather than
+materializing a full sorted table. Useful input ordering can also avoid
+sorting or admit the sorted aggregate described in Section~\ref{sec:operations}.
+Maintaining time order can thus have an execution benefit as well as a semantic
+purpose, although time order and group-contiguous order are different facts.
+
+\evidence{\src{src/runtime/lazy_table.cpp}, selected decoding;
+\src{include/ibex/runtime/pipeline.hpp}, fused map descriptions;
+\src{src/runtime/join_chunked.cpp} and
+\src{src/runtime/aggregate_chunked.cpp}, state and output construction;
+\src{src/runtime/runtime_entry.cpp}, the TopK execution-path description.
+These are implementation-based explanations, not measured attribution of the
+timings below to individual phases.}
+
+\subsection{The measurement boundary}
+The inspected \src{docs/benchmarks.html} snapshot was generated on
+3 September 2026 at 13:08 UTC and records commit
+\code{0d991d3677f2927eb40c77ba9f489ad6877baa24}. Its source is
+\src{benchmarking/results/scales_aws_20260903T100845.csv}.
+The published methodology describes AWS r7i.2xlarge instances with 8 vCPUs
+(4 physical cores with two hardware threads each), 64 GB of memory, and one
+instance per engine. The timings below are reported means from that run,
+not fresh measurements of the current checkout.
+
+For that archived snapshot, the Ibex wrapper selects resident input tables
+and parses and lowers the query before the timed iterations. It warms up, then times
+\code{runtime::interpret}, including construction of the materialized result.
+This measures execution rather than file loading or C++ compilation. Separate
+parse-inclusive and scan-inclusive harness modes have different boundaries
+and must not be mixed into that interpretation. Physical execution decisions
+made inside \code{interpret} remain inside the timer.
+The revised in-memory harness includes parsing and lowering; its new results
+must be distinguished from this historical snapshot.
+
+\evidence{\src{docs/benchmarks.html}, embedded \code{PAYLOAD} metadata and
+timings; \src{docs/methodology.html};
+\src{benchmarking/gen_website.py}, \code{avg_ms} payload construction;
+\src{tools/ibex_bench.cpp}, \code{run_benchmark}, especially the
+\code{!include_parse} branch. The selected page cells were checked against
+their source CSV. The page snapshot does not expose individual iteration
+samples or the invocation's repetition count; harness defaults alone do not
+establish that count for this archived run.}
+
+\subsection{Representative observations}
+All times in Table~\ref{tab:cost-snapshot} are milliseconds. ``Default'' is
+the published \code{ibex} configuration; ``one'' is \code{ibex-st}, the same
+build with \code{IBEX_CORES=1}. Query identifiers are retained so the exact
+expressions can be found in the methodology page and harness.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Query & 1M, default & 16M, default & 16M, one\\
+\midrule
+\code{update_price_x2} & 0.212 & 4.363 & 18.995\\
+\code{mean_by_symbol} & 0.729 & 7.424 & 30.339\\
+\code{sort_price} & 21.431 & 516.333 & 697.558\\
+\code{order_head_topk} & 2.650 & 39.369 & 39.481\\
+\code{tf_rolling_sum_1m} & 2.880 & 53.370 & 50.783\\
+\code{tf_rolling_median_1m} & 29.884 & 485.317 & 483.917\\
+\code{tf_resample_1m_ohlc} & 4.342 & 98.409 & 96.602\\
+\bottomrule
+\end{tabular}
+\caption{Selected means from the identified September 2026 benchmark
+snapshot~\cite{ibexBenchmarks}. M denotes one million input rows.}
+\label{tab:cost-snapshot}
+\end{table}
+
+Three observations are useful for understanding the engine. First, at 16M
+rows, \code{mean_by_symbol} emits 252 groups, \code{order_head_topk} emits
+100 rows, and \code{sort_price} emits all 16M rows. Their timings concern
+different work and result sizes. In particular, top-k and full sorting are
+not interchangeable benchmark answers: the harness requests the top 100
+descending prices for the former and a full ascending sort for the latter.
+
+Second, comparing the reported 16M means gives about $4.35\times$ acceleration
+for doubling prices and $4.09\times$ for mean by symbol, but only about
+$1.35\times$ for full price sorting and essentially none for this top-k
+query. These ratios describe the complete operations at that scale. They do
+not mean that every phase has that speedup, or that eight vCPUs are eight
+independent physical cores.
+
+Third, the time-series rows expose substantial differences within the same
+workload family: the one-minute rolling median takes 485.317 ms at 16M rows,
+versus 53.370 ms for the rolling sum. The default and one-core means are close
+for these examples and for resampling. That is evidence of little observed
+threading benefit in this snapshot, not a statistical verdict about their
+small differences. The harness constructs timestamps at one-second spacing
+and the expressions include \code{as_timeframe}; these numbers therefore do
+not isolate window-state maintenance. Varying timestamp density or window
+duration would change a different dimension from simply adding more rows.
+The detailed window algorithms remain a later investigation.
+
+\evidence{The source CSV's \code{rows} and \code{avg_ms} columns;
+\src{tools/ibex_bench.cpp}, definitions of \code{order_head_topk},
+\code{sort_price}, and the TimeFrame benchmark group. The published page also
+notes that its cross-engine rolling-EWMA comparison uses different mathematics;
+that row is not treated here as a comparison of equivalent computations.}
+
+\subsection{Wall time, CPU work, and memory answer different questions}
+Parallel execution overlaps work, so adding per-operator or per-worker times
+does not generally reconstruct elapsed query time. The critical dependencies
+include build-before-probe, aggregate finalization, and ordered output delivery.
+Task submission, buffering, and merging also cost time. A larger thread budget
+is useful only where it reduces elapsed time enough to offset those costs.
+
+The repository's \src{benchmarking/work_multiplication.py} complements wall
+time with total child-process CPU consumption at different core counts.
+\src{MEASURING.md} records why this matters: a historical sharded decoder
+repeated work while still showing attractive parallel occupancy. High CPU
+growth is a diagnostic signal, not proof of redundant decoding; contention
+can also increase CPU time. Counting rows, calls, or bytes is needed to
+distinguish those explanations.
+
+The benchmark's memory column is absolute peak resident memory, including
+already-resident input and other live process storage. It is not an
+operator's incremental allocation count. The Ibex harness attempts to reset
+Linux's high-water mark before timed iterations; if that mechanism is
+unavailable, the code documents a lifetime-peak fallback. Consequently, these
+figures describe the footprint of the recorded harness execution and cannot
+be substituted directly for the per-operator state accounting above.
+
+\evidence{\src{MEASURING.md}, work multiplication and profile interpretation;
+\src{benchmarking/work_multiplication.py}; \src{tools/ibex_bench.cpp},
+\code{reset_peak_rss} and \code{peak_rss_mb}.}
+
+\subsection{Using the wider corpus}
+The scale suite provides broad coverage, while the PDS-H query suite,
+operator profiles, and focused time-series experiments provide complementary
+evidence. Their measurement boundaries and datasets should be recorded before
+combining results. Existing measurements are the starting point; new runs are
+needed only for a specific unresolved claim, such as the contribution of a
+particular decoder or the cost of maintaining an ordering guarantee.
+
+For causal claims about a change, the repository's paired, interleaved A/B
+workflow and per-operator profiles are more appropriate than differences
+between independently published snapshots. This document has reused the
+archived evidence without running a benchmark. It neither extrapolates those
+times to other machines nor treats a single snapshot as a current performance
+guarantee.

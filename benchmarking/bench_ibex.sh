@@ -36,7 +36,7 @@ else
 fi
 IBEX_BENCH="$BUILD_DIR/tools/ibex_bench"
 if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] &&
-   ! rg -q '^CMAKE_BUILD_TYPE:[^=]+=Release$' "$BUILD_DIR/CMakeCache.txt"; then
+   ! grep -qE '^CMAKE_BUILD_TYPE:[^=]+=Release$' "$BUILD_DIR/CMakeCache.txt"; then
     echo "error: benchmark build must be configured as Release: $BUILD_DIR" >&2
     exit 1
 fi

@@ -4,15 +4,10 @@
 
 """Benchmark pandas and polars on the same aggregation queries as ibex_bench.
 
-Two polars modes are available so the comparison covers both shapes a real
-caller hits:
-  • eager (always on): `pl.read_csv` once, then `df.<op>` per iteration. This
-    is the "data is already in memory" path and intentionally bypasses the
-    polars query optimizer.
-  • lazy (`--polars-lazy`): `pl.scan_csv(path).<chain>.collect()` per iteration.
-    This is the "data still needs to be read" path; the optimizer fires
-    (predicate pushdown into the CSV reader, projection pruning, slice/topk
-    fusion) and CSV I/O is part of the timed work.
+The default Polars mode loads data once, then constructs a resident LazyFrame
+query and collects its complete result inside each timed iteration. This
+enables optimization without timing CSV input. The separate --polars-lazy
+mode scans CSV inside the timed interval and is an I/O benchmark.
 
 Writes tab-separated results to --out (default: results/python.tsv).
 Progress goes to stderr; TSV rows go to the output file.
@@ -39,23 +34,38 @@ from bench_mem import reset_peak_rss, peak_rss_mb, CELL_CUTOFF_MS, should_skip, 
 LAST_PEAK_RSS_MB = 0.0
 
 
+def _windowed_ewma(values, alpha=0.1):
+    """Recursive EWMA over exactly the values in one trailing window."""
+    result = None
+    for value in values:
+        result = float(value) if result is None else result + alpha * (float(value) - result)
+    return result
+
+
 def timer(fn, warmup: int, iters: int):
     """Warmup then time fn(). Returns (avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, last_result).
     Side effect: sets module global LAST_PEAK_RSS_MB to the peak RSS during the measured iterations."""
     global LAST_PEAK_RSS_MB
     for _ in range(warmup):
+        result = None  # Release the previous output outside the timed interval.
         _t0 = time.perf_counter()
         result = fn()
+        if isinstance(result, pl.LazyFrame):
+            result = result.collect()
         if (time.perf_counter() - _t0) * 1000 > CELL_CUTOFF_MS:
             # Over the per-iteration budget: cut this cell. The sentinel
             # avg_ms < 0 is dropped by the writer (blank on the page).
             LAST_PEAK_RSS_MB = 0.0
             return (-1.0, -1.0, -1.0, 0.0, -1.0, -1.0, result)
+    result = None
     reset_peak_rss()
     times = []
     for _ in range(iters):
+        result = None
         t0 = time.perf_counter()
         result = fn()
+        if isinstance(result, pl.LazyFrame):
+            result = result.collect()
         times.append((time.perf_counter() - t0) * 1000)
     LAST_PEAK_RSS_MB = peak_rss_mb()
     t = np.array(times)
@@ -416,7 +426,9 @@ def bench_pandas(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     _fw = "polars"
     print("polars: loading...", file=sys.stderr, flush=True)
-    df = pl.read_csv(csv_path)
+    resident = pl.read_csv(csv_path)
+    n_rows = resident.height
+    df = resident.lazy()
     rows = []
 
     def run(name, fn):
@@ -470,7 +482,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     run("distinct_symbol", lambda: df.select("symbol").unique(maintain_order=True))
 
-    run("order_head_topk", lambda: df.sort("price", descending=True).head(100))
+    run("order_head_topk", lambda: df.top_k(100, by="price").sort("price", descending=True))
 
     run(
         "order_head_topk_by_symbol",
@@ -479,7 +491,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
         .head(3),
     )
 
-    run("order_tail_topk", lambda: df.sort("price", descending=True).tail(100))
+    run("order_tail_topk", lambda: df.bottom_k(100, by="price").sort("price", descending=True))
 
     run(
         "order_tail_topk_by_symbol",
@@ -595,7 +607,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     if pts_path is not None:
         pt = pl.read_csv(pts_path).sort("ts").with_columns(
             pl.from_epoch("ts", time_unit="ns").alias("dt")
-        )
+        ).lazy()
         run(
             "log_return_momentum",
             lambda: pt.with_columns(
@@ -669,19 +681,19 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     rng_gen = np.random.default_rng(42)
     run(
         "rand_uniform",
-        lambda: df.with_columns(pl.Series("r", rng_gen.uniform(0.0, 1.0, len(df)))),
+        lambda: df.with_columns(pl.Series("r", rng_gen.uniform(0.0, 1.0, n_rows))),
     )
     run(
         "rand_normal",
-        lambda: df.with_columns(pl.Series("n", rng_gen.standard_normal(len(df)))),
+        lambda: df.with_columns(pl.Series("n", rng_gen.standard_normal(n_rows))),
     )
     run(
         "rand_int",
-        lambda: df.with_columns(pl.Series("r", rng_gen.integers(1, 101, len(df)))),
+        lambda: df.with_columns(pl.Series("r", rng_gen.integers(1, 101, n_rows))),
     )
     run(
         "rand_bernoulli",
-        lambda: df.with_columns(pl.Series("r", rng_gen.binomial(1, 0.3, len(df)))),
+        lambda: df.with_columns(pl.Series("r", rng_gen.binomial(1, 0.3, n_rows))),
     )
 
     # Scalar row-wise math builtins.
@@ -698,7 +710,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     if csv_multi_path:
         print("polars: loading multi...", file=sys.stderr, flush=True)
-        dfm = pl.read_csv(csv_multi_path)
+        dfm = pl.read_csv(csv_multi_path).lazy()
 
         run(
             "count_by_symbol_day",
@@ -739,7 +751,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 
     if csv_trades_path:
         print("polars: loading trades...", file=sys.stderr, flush=True)
-        dft = pl.read_csv(csv_trades_path)
+        dft = pl.read_csv(csv_trades_path).lazy()
 
         run("filter_simple", lambda: dft.filter(pl.col("price") > 500.0))
 
@@ -773,7 +785,7 @@ def bench_polars(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
 # (predicate pushdown, projection pushdown, slice/topk fusion, …) is engaged
 # and CSV I/O is part of the timed work — the realistic shape for the
 # "I have a CSV on disk and I want this answer" workflow. Pair with the
-# eager `bench_polars` for the "data is already in memory" baseline.
+# resident `bench_polars` for the "data is already in memory" baseline.
 def bench_polars_lazy(csv_path, csv_multi_path, csv_trades_path, warmup, iters):
     _fw = "polars"
     print("polars-lazy: warming OS page cache...", file=sys.stderr, flush=True)
@@ -1213,6 +1225,9 @@ def bench_polars_null(csv_path, csv_lookup_path, warmup, iters):
     lookup_symbols = lookup.select("symbol").unique()
     prices_small = df.head(2000)
     lookup_small = lookup.head(64)
+    df, lookup = df.lazy(), lookup.lazy()
+    lookup_symbols = lookup_symbols.lazy()
+    prices_small, lookup_small = prices_small.lazy(), lookup_small.lazy()
     rows = []
 
     def run(name, fn):
@@ -1503,7 +1518,7 @@ def bench_polars_fill(n_rows, warmup, iters):
     )
     # Polars treats NaN and null distinctly; convert NaN -> null once so fill_*
     # benchmarks measure null-handling work (same semantics as Ibex/R).
-    df_fill = pl.DataFrame({"val": vals}).with_columns(pl.col("val").fill_nan(None))
+    df_fill = pl.DataFrame({"val": vals}).with_columns(pl.col("val").fill_nan(None)).lazy()
     rows = []
 
     def run(name, fn):
@@ -1630,8 +1645,8 @@ def bench_pandas_events(csv_events_path, warmup, iters, csv_users_path=None):
 def bench_polars_events(csv_events_path, warmup, iters, csv_users_path=None):
     _fw = "polars"
     print("polars: loading events...", file=sys.stderr, flush=True)
-    df = pl.read_csv(csv_events_path)
-    users = pl.read_csv(csv_users_path) if csv_users_path else None
+    df = pl.read_csv(csv_events_path).lazy()
+    users = pl.read_csv(csv_users_path).lazy() if csv_users_path else None
     rows = []
 
     def run(name, fn):
@@ -1737,7 +1752,8 @@ def bench_pandas_tf(n_rows, warmup, iters):
     # Pandas has no time-aware EWM with a window cap — use the standard
     # exponentially-weighted moving average (no window-length truncation).
     # Same alpha (0.1) as the ibex_bench query.
-    run("tf_rolling_ewma_1m",  lambda: df["price"].ewm(alpha=0.1, adjust=False).mean())
+    run("tf_rolling_ewma_1m",  lambda: df.assign(
+        e=df["price"].rolling(window=60, min_periods=1).apply(_windowed_ewma, raw=True)))
     run("tf_resample_1m_ohlc",
         lambda: df["price"].resample("60s").agg(["first", "max", "min", "last"]))
     return rows
@@ -1745,11 +1761,11 @@ def bench_pandas_tf(n_rows, warmup, iters):
 
 def bench_polars_tf(n_rows, warmup, iters):
     _fw = "polars"
-    """TimeFrame rolling + resample (Polars eager)."""
+    """TimeFrame rolling + resample on resident, optimized Polars queries."""
     print("polars: building tf data...", file=sys.stderr, flush=True)
     ts = pd.to_datetime(np.arange(n_rows), unit="s")
     price = 100.0 + (np.arange(n_rows) % 100).astype(float)
-    df = pl.DataFrame({"ts": ts, "price": price})
+    df = pl.DataFrame({"ts": ts, "price": price}).lazy()
     rows = []
 
     def run(name, fn):
@@ -1771,27 +1787,26 @@ def bench_polars_tf(n_rows, warmup, iters):
              f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}")
         )
 
-    # .rechunk() forces the shifted column to materialize: polars' shift is a
-    # zero-copy offset view, so without it this measures ~nothing (flat 0.2ms at
-    # any size) instead of the real lag-column cost the other engines pay.
+    # A materialized result may legitimately share input buffers.
     run("tf_lag1",
-        lambda: df.select(pl.col("price").shift(1).alias("prev")).rechunk())
+        lambda: df.select(pl.col("price").shift(1).alias("prev")))
     run("tf_rolling_count_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(c=pl.len()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(c=pl.len()), on="ts"))
     run("tf_rolling_sum_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").sum()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").sum()), on="ts"))
     run("tf_rolling_mean_5m",
-        lambda: df.rolling(index_column="ts", period="5m").agg(m=pl.col("price").mean()))
+        lambda: df.join(df.rolling(index_column="ts", period="5m").agg(m=pl.col("price").mean()), on="ts"))
     run("tf_rolling_min_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(mn=pl.col("price").min()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(mn=pl.col("price").min()), on="ts"))
     run("tf_rolling_max_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(mx=pl.col("price").max()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(mx=pl.col("price").max()), on="ts"))
     run("tf_rolling_median_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(med=pl.col("price").median()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(med=pl.col("price").median()), on="ts"))
     run("tf_rolling_std_1m",
-        lambda: df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").std()))
+        lambda: df.join(df.rolling(index_column="ts", period="60s").agg(s=pl.col("price").std()), on="ts"))
     run("tf_rolling_ewma_1m",
-        lambda: df.with_columns(pl.col("price").ewm_mean(alpha=0.1, adjust=False).alias("e")))
+        lambda: df.with_columns(pl.col("price").rolling_map(
+            _windowed_ewma, window_size=60, min_samples=1).alias("e")))
     run("tf_resample_1m_ohlc",
         lambda: df.group_by_dynamic("ts", every="60s").agg(
             open=pl.col("price").first(), high=pl.col("price").max(),
@@ -1814,14 +1829,17 @@ def bench_pandas_asof(n_rows, warmup, iters):
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
     }).sort_values("ts")
     # Trades: 10% sampled, jittered timestamps
-    rng = np.random.default_rng(42)
-    sample = np.sort(rng.choice(n_rows, size=n_rows // 10, replace=False))
+    # Shared deterministic 10% fixture: every engine joins the same quote
+    # indices, avoiding reservoir/sample implementation differences.
+    sample = np.arange(0, n_rows, 10, dtype=np.int64)
+    jitter_ms = (sample * 37) % 999
+    qty = (sample * 13) % 99 + 1
     trades = pd.DataFrame({
         "ts": (pd.to_datetime(sample, unit="s")
-                + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms")
+                + pd.to_timedelta(jitter_ms, unit="ms")
               ).astype("datetime64[ns]"),
         "symbol": pd.Categorical.from_codes(sample % n_sym, categories=sym_cats),
-        "qty": rng.integers(1, 100, len(sample)),
+        "qty": qty,
     }).sort_values("ts")
     rows = []
 
@@ -1852,7 +1870,7 @@ def bench_pandas_asof(n_rows, warmup, iters):
 
 def bench_polars_asof(n_rows, warmup, iters):
     _fw = "polars"
-    """Tf as-of join (Polars eager)."""
+    """Tf as-of join on resident, optimized Polars queries."""
     print("polars: building asof data...", file=sys.stderr, flush=True)
     # 100 symbols partition both sides (see pandas asof note).
     n_sym = 100
@@ -1860,14 +1878,13 @@ def bench_polars_asof(n_rows, warmup, iters):
         "ts": pd.to_datetime(np.arange(n_rows), unit="s"),
         "symbol": np.arange(n_rows) % n_sym,
         "bid": 99.0 + (np.arange(n_rows) % 100) * 0.01,
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts")
-    rng = np.random.default_rng(42)
-    sample = np.sort(rng.choice(n_rows, size=n_rows // 10, replace=False))
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").lazy()
+    sample = np.arange(0, n_rows, 10, dtype=np.int64)
     trades = pl.DataFrame({
-        "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta(rng.integers(0, 999, len(sample)), unit="ms"),
+        "ts": pd.to_datetime(sample, unit="s") + pd.to_timedelta((sample * 37) % 999, unit="ms"),
         "symbol": sample % n_sym,
-        "qty": rng.integers(1, 100, len(sample)),
-    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts")
+        "qty": (sample * 13) % 99 + 1,
+    }).with_columns(pl.col("symbol").cast(pl.Utf8)).sort("ts").lazy()
     rows = []
 
     def run(name, fn):

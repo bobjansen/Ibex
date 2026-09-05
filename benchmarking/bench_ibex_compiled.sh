@@ -121,15 +121,6 @@ EOF
         fi
     fi
 
-    fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmt.a"
-    if [[ ! -f "$fmt_lib" ]]; then
-        fmt_lib="$BUILD_DIR/_deps/fmt-build/libfmtd.a"
-    fi
-    if [[ ! -f "$fmt_lib" ]]; then
-        echo "error: fmt library not found in $BUILD_DIR/_deps/fmt-build" >&2
-        exit 1
-    fi
-
     # The runtime archive references symbols defined in the ir and core
     # archives (e.g. ibex::ir::is_row_local_update_expr), so link all three
     # in a group to resolve cross-archive references regardless of order.
@@ -145,7 +136,6 @@ EOF
         "$BUILD_DIR/src/ir/libibex_ir.a" \
         "$BUILD_DIR/src/core/libibex_core.a" \
         -Wl,--end-group \
-        "$fmt_lib" \
         -o "$bin_path"
 
     echo "$bin_path"

@@ -33,6 +33,7 @@ def timer(fn, warmup: int, iters: int):
     Side effect: sets module global LAST_PEAK_RSS_MB to peak RSS during the measured iterations."""
     global LAST_PEAK_RSS_MB
     for _ in range(warmup):
+        result = None  # Release previous output outside the timed interval.
         _t0 = time.perf_counter()
         result = fn()
         if (time.perf_counter() - _t0) * 1000 > CELL_CUTOFF_MS:
@@ -40,9 +41,11 @@ def timer(fn, warmup: int, iters: int):
             # avg_ms < 0 is dropped by the writer (blank on the page).
             LAST_PEAK_RSS_MB = 0.0
             return (-1.0, -1.0, -1.0, 0.0, -1.0, -1.0, result)
+    result = None
     reset_peak_rss()
     times = []
     for _ in range(iters):
+        result = None
         t0 = time.perf_counter()
         result = fn()
         times.append((time.perf_counter() - t0) * 1000)
@@ -164,7 +167,8 @@ def bench_datafusion_core(csv_path, csv_multi_path, csv_trades_path, warmup, ite
     run(
         "order_tail_topk",
         lambda: ctx.sql(
-            "SELECT * FROM prices ORDER BY price ASC LIMIT 100"
+            "SELECT * FROM (SELECT * FROM prices ORDER BY price ASC LIMIT 100) AS bottom "
+            "ORDER BY price DESC"
         ).collect(),
     )
 
@@ -899,8 +903,8 @@ def bench_datafusion_tf(n_rows, warmup, iters, ctx):
             )
         )
 
-    # Time-range frame: 1m / 5m windows over the timestamp, inclusive of the
-    # current row (matches the other engines' window semantics).
+    # On this one-second fixture, 59/299 seconds represent Ibex's
+    # (t-duration, t] interval using SQL's inclusive RANGE frame.
     def w(period):
         return (
             f"OVER (ORDER BY ts RANGE BETWEEN INTERVAL '{period}' PRECEDING "
@@ -911,15 +915,15 @@ def bench_datafusion_tf(n_rows, warmup, iters, ctx):
         lambda: ctx.sql(
             "SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").collect())
     run("tf_rolling_count_1m",
-        lambda: ctx.sql(f"SELECT count(*) {w('60 seconds')} AS c FROM tf_data").collect())
+        lambda: ctx.sql(f"SELECT count(*) {w('59 seconds')} AS c FROM tf_data").collect())
     run("tf_rolling_sum_1m",
-        lambda: ctx.sql(f"SELECT sum(price) {w('60 seconds')} AS s FROM tf_data").collect())
+        lambda: ctx.sql(f"SELECT sum(price) {w('59 seconds')} AS s FROM tf_data").collect())
     run("tf_rolling_mean_5m",
-        lambda: ctx.sql(f"SELECT avg(price) {w('300 seconds')} AS m FROM tf_data").collect())
+        lambda: ctx.sql(f"SELECT avg(price) {w('299 seconds')} AS m FROM tf_data").collect())
     run("tf_rolling_median_1m",
-        lambda: ctx.sql(f"SELECT median(price) {w('60 seconds')} AS med FROM tf_data").collect())
+        lambda: ctx.sql(f"SELECT median(price) {w('59 seconds')} AS med FROM tf_data").collect())
     run("tf_rolling_std_1m",
-        lambda: ctx.sql(f"SELECT stddev_samp(price) {w('60 seconds')} AS s FROM tf_data").collect())
+        lambda: ctx.sql(f"SELECT stddev_samp(price) {w('59 seconds')} AS s FROM tf_data").collect())
     run("tf_resample_1m_ohlc",
         lambda: ctx.sql(
             "SELECT date_bin(INTERVAL '60 seconds', ts) AS bucket, "

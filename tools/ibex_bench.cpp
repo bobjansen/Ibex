@@ -1798,6 +1798,9 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
         return 0;
     }
 
+    // Keep the full output alive until after timing, matching the columnar
+    // result returned by the other in-memory harnesses.
+    ibex::runtime::Table last_result;
     auto run_once = [&](std::size_t& last_rows) -> int {
         auto parsed = ibex::parser::parse(normalized);
         if (!parsed) {
@@ -1818,20 +1821,24 @@ auto run_benchmark(const BenchQuery& query, const ibex::runtime::TableRegistry& 
             return 1;
         }
         last_rows = result->rows();
+        last_result = std::move(*result);
         return 0;
     };
 
     std::size_t warmup_rows = 0;
     for (std::size_t i = 0; i < warmup_iters; ++i) {
+        last_result = {};
         if (run_once(warmup_rows) != 0) {
             return 1;
         }
     }
 
     std::size_t last_rows = 0;
+    last_result = {};
     reset_peak_rss();
     std::vector<double> times(iters);
     for (std::size_t i = 0; i < iters; ++i) {
+        last_result = {};
         auto t0 = std::chrono::steady_clock::now();
         if (run_once(last_rows) != 0) {
             return 1;
@@ -3560,10 +3567,8 @@ int main(int argc, char** argv) {
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
             // Fine here
-            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
-            std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
-                if ((rng() % 10ULL) == 0ULL) {
+                if ((i % 10ULL) == 0ULL) {
                     trade_idx.push_back(i);
                 }
             }
@@ -3574,10 +3579,10 @@ int main(int argc, char** argv) {
             t_ts.reserve(trade_idx.size());
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
-                const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
+                const auto jitter_ms = static_cast<std::int64_t>((i * 37ULL) % 999ULL);
                 t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
                                                (jitter_ms * 1'000'000LL)});
-                t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
+                t_qty.push_back(static_cast<std::int64_t>((i * 13ULL) % 99ULL) + 1);
             }
             ibex::runtime::Table trades_table;
             trades_table.add_column("ts", std::move(t_ts));
@@ -3627,10 +3632,8 @@ int main(int argc, char** argv) {
             std::vector<std::size_t> trade_idx;
             trade_idx.reserve(timeframe_rows / 10);
             // Fine here
-            // NOLINTNEXTLINE(bugprone-random-generator-seed, cert-msc51-cpp, cert-msc32-c)
-            std::mt19937_64 rng{42};
             for (std::size_t i = 0; i < timeframe_rows; ++i) {
-                if ((rng() % 10ULL) == 0ULL) {
+                if ((i % 10ULL) == 0ULL) {
                     trade_idx.push_back(i);
                 }
             }
@@ -3642,11 +3645,11 @@ int main(int argc, char** argv) {
             t_ts.reserve(trade_idx.size());
             t_qty.reserve(trade_idx.size());
             for (auto i : trade_idx) {
-                const auto jitter_ms = static_cast<std::int64_t>(rng() % 1000ULL);
+                const auto jitter_ms = static_cast<std::int64_t>((i * 37ULL) % 999ULL);
                 t_ts.push_back(ibex::Timestamp{(static_cast<std::int64_t>(i) * 1'000'000'000LL) +
                                                (jitter_ms * 1'000'000LL)});
                 t_sym.push_back(sym_names[i % kAsofSymbols]);
-                t_qty.push_back(static_cast<std::int64_t>(rng() % 99ULL) + 1);
+                t_qty.push_back(static_cast<std::int64_t>((i * 13ULL) % 99ULL) + 1);
             }
             ibex::runtime::Table trades_table;
             trades_table.add_column("ts", std::move(t_ts));

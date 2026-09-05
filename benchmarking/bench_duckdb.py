@@ -31,6 +31,7 @@ def timer(fn, warmup: int, iters: int):
     Side effect: sets module global LAST_PEAK_RSS_MB to peak RSS during the measured iterations."""
     global LAST_PEAK_RSS_MB
     for _ in range(warmup):
+        result = None  # Release the previous output outside the timed interval.
         _t0 = time.perf_counter()
         result = fn()
         if (time.perf_counter() - _t0) * 1000 > CELL_CUTOFF_MS:
@@ -38,9 +39,11 @@ def timer(fn, warmup: int, iters: int):
             # avg_ms < 0 is dropped by the writer (blank on the page).
             LAST_PEAK_RSS_MB = 0.0
             return (-1.0, -1.0, -1.0, 0.0, -1.0, -1.0, result)
+    result = None
     reset_peak_rss()
     times = []
     for _ in range(iters):
+        result = None
         t0 = time.perf_counter()
         result = fn()
         times.append((time.perf_counter() - t0) * 1000)
@@ -88,7 +91,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -113,7 +116,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "mean_by_symbol",
         lambda: con.sql(
             "SELECT symbol, AVG(price) AS avg_price FROM prices GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
@@ -123,26 +126,26 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "FIRST(price) AS open, MAX(price) AS high, "
             "MIN(price) AS low, LAST(price) AS last "
             "FROM prices GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "update_price_x2",
         lambda: con.sql(
             "SELECT *, price * 2 AS price_x2 FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "distinct_symbol",
-        lambda: con.sql("SELECT DISTINCT symbol FROM prices").fetchnumpy(),
+        lambda: con.sql("SELECT DISTINCT symbol FROM prices").to_arrow_table(),
     )
 
     run(
         "order_head_topk",
         lambda: con.sql(
             "SELECT * FROM prices ORDER BY price DESC LIMIT 100"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
@@ -151,14 +154,15 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
             "PARTITION BY symbol ORDER BY price DESC) AS rn FROM prices) "
             "WHERE rn <= 3"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "order_tail_topk",
         lambda: con.sql(
-            "SELECT * FROM prices ORDER BY price ASC LIMIT 100"
-        ).fetchnumpy(),
+            "SELECT * FROM (SELECT * FROM prices ORDER BY price ASC LIMIT 100) AS bottom "
+            "ORDER BY price DESC"
+        ).to_arrow_table(),
     )
 
     run(
@@ -167,37 +171,37 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
             "PARTITION BY symbol ORDER BY price ASC) AS rn FROM prices) "
             "WHERE rn <= 3"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Full-table sorts (no LIMIT — every row materialised in order).
     run(
         "sort_price",
-        lambda: con.sql("SELECT * FROM prices ORDER BY price ASC").fetchnumpy(),
+        lambda: con.sql("SELECT * FROM prices ORDER BY price ASC").to_arrow_table(),
     )
 
     run(
         "sort_price_desc",
-        lambda: con.sql("SELECT * FROM prices ORDER BY price DESC").fetchnumpy(),
+        lambda: con.sql("SELECT * FROM prices ORDER BY price DESC").to_arrow_table(),
     )
 
     run(
         "sort_symbol",
-        lambda: con.sql("SELECT * FROM prices ORDER BY symbol ASC").fetchnumpy(),
+        lambda: con.sql("SELECT * FROM prices ORDER BY symbol ASC").to_arrow_table(),
     )
 
     run(
         "sort_symbol_price",
         lambda: con.sql(
             "SELECT * FROM prices ORDER BY symbol ASC, price ASC"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "sort_symbol_price_desc",
         lambda: con.sql(
             "SELECT * FROM prices ORDER BY symbol ASC, price DESC"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
@@ -206,7 +210,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT *, SUM(price) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
             ") AS cs FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Cumulative product via exp(cumsum(ln)) — DuckDB has no PRODUCT window.
@@ -216,7 +220,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT *, EXP(SUM(LN(price)) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
             ")) AS cp FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Grouped window functions (partition by symbol).
@@ -225,7 +229,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT *, DENSE_RANK() OVER ("
             "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
@@ -233,7 +237,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT *, LAG(price, 1) OVER ("
             "PARTITION BY symbol ORDER BY rowid) AS prev FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
@@ -242,7 +246,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "SELECT *, SUM(price) OVER ("
             "PARTITION BY symbol ORDER BY rowid "
             "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cs FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Expensive group aggregates (by symbol): median, p90, sample stddev.
@@ -250,21 +254,21 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         "median_by_symbol",
         lambda: con.sql(
             "SELECT symbol, MEDIAN(price) AS med FROM prices GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "quantile_by_symbol",
         lambda: con.sql(
             "SELECT symbol, QUANTILE_CONT(price, 0.9) AS p90 FROM prices GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "std_by_symbol",
         lambda: con.sql(
             "SELECT symbol, STDDEV_SAMP(price) AS sd FROM prices GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Multi-stage pipeline: filter → group-by → order → head.
@@ -273,7 +277,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT symbol, AVG(price) AS avg FROM prices WHERE price > 500.0 "
             "GROUP BY symbol ORDER BY avg DESC LIMIT 10"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # update by → filter on derived column → re-aggregate.
@@ -284,7 +288,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "LN(price / LAG(price, 1) OVER (PARTITION BY symbol ORDER BY rowid)) AS lr "
             "FROM prices) "
             "SELECT symbol, COUNT(lr) AS pos_days FROM lr WHERE lr > 0.0 GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # rank within group → top-N per group → aggregate survivors.
@@ -294,7 +298,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "WITH ranked AS (SELECT *, DENSE_RANK() OVER ("
             "PARTITION BY symbol ORDER BY price DESC) AS rk FROM prices) "
             "SELECT symbol, AVG(price) AS avg_top10 FROM ranked WHERE rk <= 10 GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # grouped z-score → clip to ±3 → re-aggregate.
@@ -307,7 +311,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "clipped AS (SELECT symbol, LEAST(GREATEST(z, -3.0), 3.0) AS clipped FROM z) "
             "SELECT symbol, AVG(clipped) AS mean_z, STDDEV_SAMP(clipped) AS sd_z "
             "FROM clipped GROUP BY symbol"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Tier 3 funnel on the timestamped table: log returns → 5-minute time-windowed
@@ -325,48 +329,48 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
                 "RANGE BETWEEN 300000000000 PRECEDING AND CURRENT ROW) AS mom FROM base) "
                 "SELECT symbol, AVG(mom) AS mean_mom, STDDEV_SAMP(mom) AS std_mom, "
                 "AVG(mom) / STDDEV_SAMP(mom) AS sharpe FROM mom GROUP BY symbol"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
     # Transforms / single-pass language features.
     run(
         "pmin_clip",
-        lambda: con.sql("SELECT *, LEAST(price, 500.0) AS clipped FROM prices").fetchnumpy(),
+        lambda: con.sql("SELECT *, LEAST(price, 500.0) AS clipped FROM prices").to_arrow_table(),
     )
     run(
         "where_update_clip",
         lambda: con.sql(
             "SELECT symbol, CASE WHEN price > 900.0 THEN 900.0 ELSE price END AS price "
             "FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "where_update_expr",
         lambda: con.sql(
             "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price "
             "FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "where_update_multi",
         lambda: con.sql(
             "SELECT symbol, CASE WHEN price > 900.0 THEN price * 0.9 ELSE price END AS price, "
             "CASE WHEN price > 900.0 THEN price - 900.0 ELSE NULL END AS excess FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "where_update_window",
         lambda: con.sql(
             "SELECT symbol, price, CASE WHEN price > 900.0 THEN "
             "LAG(price) OVER (ORDER BY rowid) ELSE NULL END AS prev FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "rand_uniform",
         lambda: con.sql(
             "SELECT *, random() AS r FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Normal deviates via Box-Muller (DuckDB has no native normal RNG).
@@ -375,21 +379,21 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         lambda: con.sql(
             "SELECT *, sqrt(-2.0 * LN(random())) * cos(2.0 * pi() * random()) AS n "
             "FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "rand_int",
         lambda: con.sql(
             "SELECT *, CAST(floor(random() * 100) AS BIGINT) + 1 AS r FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "rand_bernoulli",
         lambda: con.sql(
             "SELECT *, CAST(random() < 0.3 AS INTEGER) AS r FROM prices"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Scalar row-wise math builtins.
@@ -405,7 +409,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
         ("cos_price", "SELECT *, cos(price) AS v FROM prices"),
         ("tanh_price", "SELECT *, tanh(price / 1000.0) AS v FROM prices"),
     ):
-        run(_name, lambda sql=_sql: con.sql(sql).fetchnumpy())
+        run(_name, lambda sql=_sql: con.sql(sql).to_arrow_table())
 
     if csv_multi_path:
         print("duckdb: loading multi...", file=sys.stderr, flush=True)
@@ -418,7 +422,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             lambda: con.sql(
                 "SELECT symbol, day, COUNT(*) AS n "
                 "FROM prices_multi GROUP BY symbol, day"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         run(
@@ -426,7 +430,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             lambda: con.sql(
                 "SELECT symbol, day, AVG(price) AS avg_price "
                 "FROM prices_multi GROUP BY symbol, day"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         run(
@@ -436,7 +440,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
                 "FIRST(price) AS open, MAX(price) AS high, "
                 "MIN(price) AS low, LAST(price) AS last "
                 "FROM prices_multi GROUP BY symbol, day"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         # Two-level rollup (funnel): by {symbol, day} then re-aggregate by symbol.
@@ -447,7 +451,7 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
                 "STDDEV_SAMP(price) AS daily_vol FROM prices_multi GROUP BY symbol, day) "
                 "SELECT symbol, AVG(daily_mean) AS mean_of_means, AVG(daily_vol) AS mean_vol "
                 "FROM daily GROUP BY symbol"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
     if csv_trades_path:
@@ -460,34 +464,34 @@ def bench_duckdb_core(csv_path, csv_multi_path, csv_trades_path, warmup, iters, 
             "filter_simple",
             lambda: con.sql(
                 "SELECT * FROM trades WHERE price > 500.0"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         run(
             "filter_and",
             lambda: con.sql(
                 "SELECT * FROM trades WHERE price > 500.0 AND qty < 100"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         run(
             "filter_arith",
             lambda: con.sql(
                 "SELECT * FROM trades WHERE price * qty > 50000.0"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         run(
             "filter_or",
             lambda: con.sql(
                 "SELECT * FROM trades WHERE price > 900.0 OR qty < 10"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         # Correlation over the numeric columns (price, qty).
         run(
             "corr_price_vol",
-            lambda: con.sql("SELECT CORR(price, qty) AS corr FROM trades").fetchnumpy(),
+            lambda: con.sql("SELECT CORR(price, qty) AS corr FROM trades").to_arrow_table(),
         )
 
     return rows
@@ -511,7 +515,7 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -536,32 +540,32 @@ def bench_duckdb_null(csv_path, csv_lookup_path, warmup, iters, con):
         "null_left_join",
         lambda: con.sql(
             "SELECT * FROM prices LEFT JOIN lookup USING (symbol)"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "null_semi_join",
         lambda: con.sql(
             "SELECT * FROM prices SEMI JOIN lookup_symbols USING (symbol)"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "null_anti_join",
         lambda: con.sql(
             "SELECT * FROM prices ANTI JOIN lookup_symbols USING (symbol)"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     # Low-cardinality inner join: prices ⋈ lookup on symbol.
     run(
         "inner_join_symbol",
         lambda: con.sql(
             "SELECT * FROM prices JOIN lookup USING (symbol)"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "null_cross_join_small",
         lambda: con.sql(
             "SELECT * FROM prices_small CROSS JOIN lookup_small"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     return rows
@@ -588,7 +592,7 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -631,7 +635,7 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         lambda: con.sql(
             "UNPIVOT wide ON open, high, low, close "
             "INTO NAME variable VALUE value"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Build long table for dcast
@@ -646,7 +650,7 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         lambda: con.sql(
             "PIVOT long_tbl ON variable USING FIRST(value) "
             "GROUP BY symbol, day"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # Typed-pivot variants: integer pivot key, and a categorical (ENUM) key.
@@ -660,7 +664,7 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         "dcast_long_to_wide_int_pivot",
         lambda: con.sql(
             "PIVOT long_int ON pivot_id USING FIRST(value) GROUP BY symbol, day"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     con.execute("DROP TABLE IF EXISTS long_cat")
@@ -674,7 +678,7 @@ def bench_duckdb_reshape(warmup, iters, reshape_rows, con):
         "dcast_long_to_wide_cat_pivot",
         lambda: con.sql(
             "PIVOT long_cat ON pivot_cat USING FIRST(value) GROUP BY symbol, day"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     return rows
@@ -699,7 +703,7 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -724,14 +728,14 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
         "sum_by_user",
         lambda: con.sql(
             "SELECT user_id, SUM(amount) AS total FROM events GROUP BY user_id"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     run(
         "filter_events",
         lambda: con.sql(
             "SELECT * FROM events WHERE amount > 500.0"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
 
     # High-cardinality inner join: events ⋈ users on user_id (~100K keys).
@@ -740,7 +744,7 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
             "inner_join_user",
             lambda: con.sql(
                 "SELECT * FROM events JOIN users USING (user_id)"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
         # Join-anchored pipelines (Tier 2): join → derive → roll up.
@@ -752,7 +756,7 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
                 "FROM events e JOIN users u USING (user_id)) "
                 "SELECT symbol, user_segment, SUM(revenue) AS total_rev "
                 "FROM j GROUP BY symbol, user_segment"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
         run(
             "join_filter_rank",
@@ -762,7 +766,7 @@ def bench_duckdb_events(csv_events_path, warmup, iters, con, csv_users_path=None
                 "r AS (SELECT *, DENSE_RANK() OVER ("
                 "PARTITION BY symbol ORDER BY amount DESC) AS rk FROM j) "
                 "SELECT * FROM r WHERE rk <= 5"
-            ).fetchnumpy(),
+            ).to_arrow_table(),
         )
 
     return rows
@@ -786,7 +790,7 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr,
@@ -811,13 +815,13 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
         "fill_null",
         lambda: con.sql(
             "SELECT COALESCE(val, 0.0) AS v2 FROM fill_data"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "where_update_nullable",
         lambda: con.sql(
             "SELECT CASE WHEN val IS NULL THEN 0.0 ELSE val END AS val FROM fill_data"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "fill_forward",
@@ -825,7 +829,7 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
             "SELECT LAST_VALUE(val IGNORE NULLS) OVER ("
             "ORDER BY rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
             ") AS v2 FROM fill_data"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     run(
         "fill_backward",
@@ -833,7 +837,7 @@ def bench_duckdb_fill(n_rows, warmup, iters, con):
             "SELECT FIRST_VALUE(val IGNORE NULLS) OVER ("
             "ORDER BY rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"
             ") AS v2 FROM fill_data"
-        ).fetchnumpy(),
+        ).to_arrow_table(),
     )
     return rows
 
@@ -857,7 +861,7 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr, flush=True,
@@ -865,8 +869,8 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
         rows.append(("duckdb", name, f"{avg_ms:.3f}", f"{min_ms:.3f}", f"{max_ms:.3f}",
                      f"{stddev_ms:.3f}", f"{p95_ms:.3f}", f"{p99_ms:.3f}", n, f"{LAST_PEAK_RSS_MB:.1f}"))
 
-    # All rolling queries use a range-based time window aligned with the ibex
-    # `window 1m` / `window 5m` semantics (inclusive on both ends).
+    # On this one-second fixture, 59/299 seconds represent Ibex's
+    # (t-duration, t] interval using SQL's inclusive RANGE frame.
     def w(period):
         return (
             f"OVER (ORDER BY ts RANGE BETWEEN INTERVAL {period} PRECEDING "
@@ -874,17 +878,17 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
         )
 
     run("tf_lag1",
-        lambda: con.sql("SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").fetchnumpy())
+        lambda: con.sql("SELECT lag(price) OVER (ORDER BY ts) AS prev FROM tf_data").to_arrow_table())
     run("tf_rolling_count_1m",
-        lambda: con.sql(f"SELECT count(*) {w('60 SECONDS')} AS c FROM tf_data").fetchnumpy())
+        lambda: con.sql(f"SELECT count(*) {w('59 SECONDS')} AS c FROM tf_data").to_arrow_table())
     run("tf_rolling_sum_1m",
-        lambda: con.sql(f"SELECT sum(price) {w('60 SECONDS')} AS s FROM tf_data").fetchnumpy())
+        lambda: con.sql(f"SELECT sum(price) {w('59 SECONDS')} AS s FROM tf_data").to_arrow_table())
     run("tf_rolling_mean_5m",
-        lambda: con.sql(f"SELECT avg(price) {w('300 SECONDS')} AS m FROM tf_data").fetchnumpy())
+        lambda: con.sql(f"SELECT avg(price) {w('299 SECONDS')} AS m FROM tf_data").to_arrow_table())
     run("tf_rolling_median_1m",
-        lambda: con.sql(f"SELECT median(price) {w('60 SECONDS')} AS med FROM tf_data").fetchnumpy())
+        lambda: con.sql(f"SELECT median(price) {w('59 SECONDS')} AS med FROM tf_data").to_arrow_table())
     run("tf_rolling_std_1m",
-        lambda: con.sql(f"SELECT stddev_samp(price) {w('60 SECONDS')} AS s FROM tf_data").fetchnumpy())
+        lambda: con.sql(f"SELECT stddev_samp(price) {w('59 SECONDS')} AS s FROM tf_data").to_arrow_table())
     # DuckDB has no built-in time-aware EWMA. Skip — leave the cell empty so
     # the page surfaces that rather than printing a misleading number.
     run("tf_resample_1m_ohlc",
@@ -894,7 +898,7 @@ def bench_duckdb_tf(n_rows, warmup, iters, con):
             "       max(price) AS high, min(price) AS low, "
             "       last(price ORDER BY ts) AS close "
             "FROM tf_data GROUP BY bucket ORDER BY bucket"
-        ).fetchnumpy())
+        ).to_arrow_table())
     return rows
 
 
@@ -913,12 +917,12 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         CREATE OR REPLACE TABLE trades AS
         WITH sampled AS (
             SELECT i FROM generate_series(0, {n_rows - 1}) t(i)
-            USING SAMPLE 10 PERCENT (reservoir, 42)
+            WHERE i % 10 = 0
         )
         SELECT TIMESTAMP '1970-01-01' + INTERVAL (i) SECOND
-                 + INTERVAL ((hash(i) % 999)) MILLISECOND AS ts,
+                 + INTERVAL ((i * 37) % 999) MILLISECOND AS ts,
                'SYM' || (i % 100) AS symbol,
-               1 + (hash(i) % 99) AS qty
+               1 + ((i * 13) % 99) AS qty
         FROM sampled ORDER BY ts;
     """)
     rows = []
@@ -931,7 +935,7 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         avg_ms, min_ms, max_ms, stddev_ms, p95_ms, p99_ms, result = timer(
             fn, warmup, iters
         )
-        n = len(next(iter(result.values())))
+        n = result.num_rows
         print(
             f"  duckdb/{name}: avg_ms={avg_ms:.3f}, stddev_ms={stddev_ms:.3f}, p99_ms={p99_ms:.3f}, rows={n}",
             file=sys.stderr, flush=True,
@@ -943,13 +947,13 @@ def bench_duckdb_asof(n_rows, warmup, iters, con):
         lambda: con.sql(
             "SELECT t.ts, t.qty, q.bid "
             "FROM trades t ASOF LEFT JOIN quotes q ON t.ts >= q.ts"
-        ).fetchnumpy())
+        ).to_arrow_table())
     run("tf_asof_join_by_symbol",
         lambda: con.sql(
             "SELECT t.ts, t.qty, q.bid "
             "FROM trades t ASOF LEFT JOIN quotes q "
             "ON t.symbol = q.symbol AND t.ts >= q.ts"
-        ).fetchnumpy())
+        ).to_arrow_table())
     return rows
 
 

@@ -143,10 +143,12 @@
     </p>
     <p class="bench-note">
       <strong>Caveats.</strong> Every engine now materialises its full result.
-      <code>tf rolling EWMA</code> is time-windowed in Ibex versus full-series in
-      Polars (both O(n), different maths). Each page is generated from a single
-      run; <code>SQLite</code> and the data.table <code>rolling median/std</code>
-      cells are omitted (they dominate wall-clock and add no competitive signal).
+      <code>tf rolling EWMA</code> uses the bounded window definition in Ibex,
+      pandas and Polars. ClickHouse statistical/OHLC cells <em>cannot compute
+      correctly under the shared semantics</em> and are excluded from claims.
+      Each page is generated from a single run; <code>SQLite</code> and the
+      data.table <code>rolling median/std</code> cells are omitted (they dominate
+      wall-clock and add no competitive signal).
     </p>
     <p class="bench-note">
       <strong>The code behind these numbers.</strong> Every query's exact code, in

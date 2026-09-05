@@ -3,6 +3,7 @@
 
 #include <ibex/core/text.hpp>
 #include <ibex/format.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/parser/lower.hpp>
 #include <ibex/parser/parser.hpp>
 #include <ibex/runtime/interpreter.hpp>

@@ -28,6 +28,7 @@
 #include <ibex/core/column.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/runtime/interpreter.hpp>
 #include <ibex/runtime/table_properties.hpp>
 

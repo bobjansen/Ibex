@@ -5,6 +5,7 @@
 #include <ibex/core/decimal.hpp>
 #include <ibex/core/text.hpp>
 #include <ibex/core/time.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/format.hpp>
 #include <ibex/ir/cardinality.hpp>
 #include <ibex/ir/distinct_key_reduction.hpp>

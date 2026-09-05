@@ -12,6 +12,7 @@
 
 #include <ibex/core/text.hpp>
 #include <ibex/interop/arrow_c_data.hpp>
+#include <ibex/core/text.hpp>
 #include <ibex/runtime/extern_registry.hpp>
 #include <ibex/runtime/operator.hpp>
 

@@ -11,6 +11,8 @@
 #include <ibex/runtime/table_format.hpp>
 #include <ibex/ui/server.hpp>
 
+#include <ibex/core/text.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>

@@ -87,6 +87,10 @@ class Builder {
         return std::make_unique<RenameNode>(next_id(), std::move(renames));
     }
 
+    [[nodiscard]] auto map(std::vector<FieldSpec> fields) -> std::unique_ptr<MapNode> {
+        return std::make_unique<MapNode>(next_id(), std::move(fields));
+    }
+
     [[nodiscard]] auto window(Duration duration, bool select_only = false, bool aligned = false)
         -> NodePtr {
         auto node = std::make_unique<WindowNode>(next_id(), duration);

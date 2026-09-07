@@ -68,6 +68,7 @@ auto estimate(const Node& node, const SourceRowCounts& sources, const SourceSche
         // These operators retain row count exactly.
         case NodeKind::Project:
         case NodeKind::Update:
+        case NodeKind::Map:
         case NodeKind::Rename:
         case NodeKind::Order:
         case NodeKind::AsTimeframe:

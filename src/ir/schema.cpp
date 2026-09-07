@@ -981,6 +981,25 @@ auto infer_schema(const Node& node, const SourceSchemas& sources) -> SchemaInfo 
                                  child_schema(node, sources));
         }
 
+        case NodeKind::Map: {
+            // `map` keeps only its named fields, one row per input row. Each
+            // field reads the input schema (like `update`); no column survives
+            // implicitly, so no time index and no unique key carries through.
+            const auto& map_node = node_cast<MapNode>(node);
+            const SchemaInfo input = child_schema(node, sources);
+            if (!input.is_known()) {
+                return SchemaInfo::unknown();
+            }
+            std::vector<SchemaField> out;
+            out.reserve(map_node.fields().size());
+            for (const auto& field : map_node.fields()) {
+                out.push_back(SchemaField{.name = field.alias,
+                                          .type = expr_type(field.expr, input),
+                                          .nulls = expr_nullability(field.expr, input)});
+            }
+            return SchemaInfo::known(std::move(out));
+        }
+
         case NodeKind::Aggregate: {
             // Output: group-by key columns followed by one column per aggregate.
             // Known even from an Unknown child (the output column set is fixed),
@@ -1403,6 +1422,15 @@ auto check_column_refs(const Node& node, const SourceSchemas& sources,
             collect_expr_columns(field.expr, refs);
         }
         if (auto err = check_refs("update", refs)) {
+            return err;
+        }
+    }
+    if (check_expressions && node.kind() == NodeKind::Map) {
+        std::vector<ColumnRef> refs;
+        for (const auto& field : node_cast<MapNode>(node).fields()) {
+            collect_expr_columns(field.expr, refs);
+        }
+        if (auto err = check_refs("map", refs)) {
             return err;
         }
     }

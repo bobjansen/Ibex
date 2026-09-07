@@ -481,6 +481,23 @@ auto Emitter::emit_node(const ir::Node& node) -> std::string {
             return var;
         }
 
+        case ir::NodeKind::Map: {
+            const auto& mn = ir::node_cast<ir::MapNode>(node);
+            auto child = emit_node(require_single_child(mn, "MapNode"));
+            auto var = fresh_var();
+            *out_ << "    auto " << var << " = ibex::ops::map(" << child << ", {\n";
+            bool first = true;
+            for (const auto& f : mn.fields()) {
+                if (!first)
+                    *out_ << ",\n";
+                first = false;
+                *out_ << "        ibex::ops::make_field(\"" << escape_string(f.alias) << "\", "
+                      << emit_expr(f.expr) << ")";
+            }
+            *out_ << "\n    });\n";
+            return var;
+        }
+
         case ir::NodeKind::Rename: {
             const auto& ren = ir::node_cast<ir::RenameNode>(node);
             auto child = emit_node(require_single_child(ren, "RenameNode"));

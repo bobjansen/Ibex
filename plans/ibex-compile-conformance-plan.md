@@ -69,7 +69,7 @@ Nothing tells you the surfaces have diverged until a user hits it.
 
 | Construct | S2 whole-script | S1 transpile | Symptom |
 |---|---|---|---|
-| `map { }` clause | via S3 peel; W1a keeps it there, S2 declines | **no** — `lower` errors "map { } runs only on the interpreter path" | W1a (S1) · W1b (S2, deferred) |
+| `map { }` clause (pure cells) | via S3 peel; S2 declines | **yes** — `MapNode` → `ibex::ops::map` (**W1a DONE**) | effectful cells: W1b |
 | non-literal extern-call args (`read_csv(runtime_path)`) | **no** — `src/repl/repl.cpp:5010` "whole-script execution requires literal extern arguments" | **no** — `src/codegen/emitter.cpp:1422/1469` "non-literal argument in extern call" | S1 half falls out of W1a's `emit_raw_expr`; general lift W2; S2 half W1b |
 | top-level `fn … -> DataFrame` as the result | S2 declines on **any** `fn` (`src/repl/repl.cpp:~5216`) → runs on S3 | **no** — "no expression to lower" / "unsupported scalar let" | W3 |
 | `model { }` clause | yes | **no** — `src/codegen/emitter.cpp:860` "model clause is not yet supported in compiled mode" | W4 |
@@ -82,6 +82,41 @@ Nothing tells you the surfaces have diverged until a user hits it.
 (new), plus the throw-guards above.
 
 ---
+
+## W1a — **DONE** (2026-09-07, uncommitted)
+
+`map { }` transpiles. Decision at implementation time (deviating from the
+"native `for` loop" sketch below): the emitter emits a call to a new
+`ibex::ops::map` kernel that re-enters the interpreter's row-wise `update`
+evaluator, then keeps only the named columns. `MapNode` gained a real
+`interpret()` case (not emitter-only after all — the emitted `ibex::ops::map`
+re-enters it). Byte-identical to surface 3 for pure cells; **effectful cells
+(externs in a `map` field) stay unsupported until W1b** — `lower_expr_to_ir`
+rejects a table-extern call in a field, so such a script simply fails to
+transpile, exactly as before.
+
+Landed:
+- `ir::NodeKind::Map` + `ir::MapNode` (one child + `std::vector<FieldSpec>`),
+  `Builder::map`, `node_kind_v`.
+- `src/parser/lower.cpp`: `MapClause` → `MapNode`, gated on `allow_map_` (set
+  only by `lower_program`, i.e. surface 1). Surface 2 (`lower_script` free fn)
+  and surface 3 (`lower_expr`) still error "map { } runs only on the
+  interpreter path" — so whole-script *declines* (→ REPL peel) with no extra
+  code. `map { }` must be the sole clause of its block.
+- IR visitors: `schema.cpp` (output = field list only; also `check_column_refs`),
+  `cardinality.cpp` (row-count-preserving), `required_columns.cpp` (demand =
+  field-expr columns), plus `infer_output_column_names` / `clone_node` in
+  `lower.cpp`.
+- `interpret_node` `case Map`: `update_table` then project to the aliases.
+- `ibex::ops::map` (`ops.hpp` / `ops.cpp`); emitter `case Map`.
+- Tests: `tests/test_lower.cpp` (S1 builds a MapNode, S2 declines, map+other
+  clause rejected), `tests/test_codegen.cpp` (emit string-match),
+  `tests/data/compile_map.ibex` + `scripts/ibex-e2e.sh` check. Parity gate
+  `ibex_parity_interpreter_vs_transpiled` runs `map_rows.ibex` for real
+  (marker deleted).
+
+Not done (moved to / stays in W1b): native-loop emit, effectful cells,
+retiring the S3 peel, unifying the two expression evaluators.
 
 ## Step 0 — make divergence loud — **DONE** (`tests/parity/`)
 
@@ -260,9 +295,9 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
 ## Sequencing
 
 1. ~~**Step 0** (parity conformance gate)~~ — **DONE**.
-2. **W1a** (`MapNode` + native-loop emit) — self-contained, no runtime
-   changes, delivers `map` on `ibex_compile`. This is the emitter learning to
-   emit real code; `emit_raw_expr`-as-C++ is reused by W2 and W4.
+2. ~~**W1a** (`MapNode` + `ibex::ops::map` kernel emit)~~ — **DONE** (kernel
+   route, not native loop; see the W1a section above). `emit_raw_expr`-as-C++
+   was *not* built, so W2/W4 do not inherit it.
 3. **W3** (functions) — independent, high user value, the S2 half is one line.
 4. **W2** (top-level non-literal extern args) — emitter half falls out of
    W1a's `emit_raw_expr`; S2 half needs W1b.

@@ -211,6 +211,7 @@ if(IBEX_WASM)
     # The WASM spike statically links only data_gen (see wasm/); it builds the
     # plugin's translation unit directly rather than as a shared object.
 elseif(NOT IBEX_MINIMAL_RUNTIME)
+    add_subdirectory(libs/args)
     add_subdirectory(libs/csv)
     add_subdirectory(libs/json)
     add_subdirectory(libs/data_gen)

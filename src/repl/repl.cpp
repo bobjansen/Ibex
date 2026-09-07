@@ -2000,6 +2000,9 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
         if (std::holds_alternative<std::int64_t>(val)) {
             return val;
         }
+        if (std::holds_alternative<bool>(val)) {
+            return runtime::ScalarValue{static_cast<std::int64_t>(std::get<bool>(val) ? 1 : 0)};
+        }
         if (std::holds_alternative<double>(val)) {
             double v = std::get<double>(val);
             if (v != std::trunc(v)) {
@@ -2008,6 +2011,25 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
                                        " to Int (use floor(), ceil(), or round())");
             }
             return runtime::ScalarValue{static_cast<std::int64_t>(v)};
+        }
+        if (const auto* s = std::get_if<std::string>(&val)) {
+            std::string trimmed = *s;
+            const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+            trimmed.erase(trimmed.begin(),
+                          std::ranges::find_if(trimmed, not_space));
+            trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), not_space).base(),
+                          trimmed.end());
+            std::int64_t out{};
+            const char* begin = trimmed.c_str();
+            if (!trimmed.empty() && trimmed.front() == '+') {
+                ++begin;
+            }
+            const auto [ptr, ec] = std::from_chars(begin, trimmed.c_str() + trimmed.size(), out);
+            if (ec != std::errc{} || ptr != trimmed.c_str() + trimmed.size() || trimmed.empty()) {
+                return std::unexpected(std::string(callee) + "(): cannot parse '" + *s +
+                                       "' as an integer");
+            }
+            return runtime::ScalarValue{out};
         }
         return std::unexpected(std::string(callee) + "(): cannot cast " +
                                std::string(scalar_value_type_name(val)) + " to Int");
@@ -2018,6 +2040,19 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
     }
     if (std::holds_alternative<std::int64_t>(val)) {
         return runtime::ScalarValue{static_cast<double>(std::get<std::int64_t>(val))};
+    }
+    if (const auto* s = std::get_if<std::string>(&val)) {
+        errno = 0;
+        char* end = nullptr;
+        const double v = std::strtod(s->c_str(), &end);
+        while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)) != 0) {
+            ++end;
+        }
+        if (end == s->c_str() || *end != '\0' || errno == ERANGE) {
+            return std::unexpected(std::string(callee) + "(): cannot parse '" + *s +
+                                   "' as a number");
+        }
+        return runtime::ScalarValue{v};
     }
     return std::unexpected(std::string(callee) + "(): cannot cast " +
                            std::string(scalar_value_type_name(val)) + " to Float");

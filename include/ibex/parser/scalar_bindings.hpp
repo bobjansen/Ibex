@@ -184,39 +184,50 @@ struct ScalarBindingSet {
     return std::nullopt;
 }
 
+// One layer of scalar-expression wrapper around the `scalar(<table>)` call:
+// a cast `Int64(_)`, or `coalesce(_, <literal>)`.
+struct DeferredWrap {
+    std::string callee;                    // cast name, or "coalesce"
+    std::optional<ir::Literal> extra_arg;  // the coalesce default (nullopt for a cast)
+};
+
 // Recognize a `let name = <value>` whose RHS is a `scalar(<table>)` subquery,
-// optionally wrapped in one scalar cast or a `coalesce(_, <literal>)`. Returns
-// nullopt when `value` is not one of those shapes (the caller then treats it as
-// a plain scalar let). A recognized-but-malformed shape returns an error.
+// wrapped in any number of scalar casts and `coalesce(_, <literal>)` layers.
+// Returns nullopt when `value` is not one of those shapes (the caller then
+// treats it as a plain scalar let). A recognized-but-malformed shape errors.
 [[nodiscard]] inline auto try_build_deferred_scalar_binding(const std::string& name,
                                                             const Expr& value, LowerContext& ctx,
                                                             int& counter)
     -> std::optional<std::expected<ir::DeferredScalarBinding, std::string>> {
     using Ret = std::expected<ir::DeferredScalarBinding, std::string>;
-    const auto* outer = std::get_if<CallExpr>(&value.node);
-    if (outer == nullptr) {
-        return std::nullopt;
-    }
 
+    // Peel wrapper layers, outermost first, until we reach `scalar(...)`.
+    std::vector<DeferredWrap> wraps;
+    const Expr* cur = &value;
     const CallExpr* scalar_call = nullptr;
-    enum class Wrap : std::uint8_t { Bare, Cast, Coalesce } wrap = Wrap::Bare;
-    std::optional<ir::Literal> coalesce_default;
-    if (outer->callee == "scalar") {
-        scalar_call = outer;
-    } else if (is_scalar_cast_name(outer->callee) && outer->args.size() == 1) {
-        scalar_call = std::get_if<CallExpr>(&outer->args[0]->node);
-        wrap = Wrap::Cast;
-    } else if (outer->callee == "coalesce" && outer->args.size() == 2) {
-        scalar_call = std::get_if<CallExpr>(&outer->args[0]->node);
-        coalesce_default = ir_literal_from_ast(*outer->args[1]);
-        wrap = Wrap::Coalesce;
-        if (!coalesce_default.has_value()) {
-            return std::nullopt;  // non-literal default is not a v1 deferred shape
+    while (true) {
+        const auto* call = std::get_if<CallExpr>(&cur->node);
+        if (call == nullptr) {
+            return std::nullopt;
         }
-    } else {
-        return std::nullopt;
-    }
-    if (scalar_call == nullptr || scalar_call->callee != "scalar") {
+        if (call->callee == "scalar") {
+            scalar_call = call;
+            break;
+        }
+        if (is_scalar_cast_name(call->callee) && call->args.size() == 1) {
+            wraps.push_back(DeferredWrap{.callee = call->callee, .extra_arg = std::nullopt});
+            cur = call->args[0].get();
+            continue;
+        }
+        if (call->callee == "coalesce" && call->args.size() == 2) {
+            auto lit = ir_literal_from_ast(*call->args[1]);
+            if (!lit.has_value()) {
+                return std::nullopt;  // non-literal default is not a deferred shape
+            }
+            wraps.push_back(DeferredWrap{.callee = "coalesce", .extra_arg = std::move(lit)});
+            cur = call->args[0].get();
+            continue;
+        }
         return std::nullopt;
     }
     if (scalar_call->args.empty() || scalar_call->args.size() > 2) {
@@ -238,27 +249,16 @@ struct ScalarBindingSet {
     }
 
     std::string tmp = "__ibex_scalar_src_" + std::to_string(counter++);
-    ir::Expr ref{.node = ir::ColumnRef{.name = tmp, .lexical = true}};
-    ir::Expr residual;
-    switch (wrap) {
-        case Wrap::Bare:
-            residual = std::move(ref);
-            break;
-        case Wrap::Cast: {
-            ir::CallExpr call;
-            call.callee = outer->callee;
-            call.args.emplace_back(std::move(ref));
-            residual = ir::Expr{.node = std::move(call)};
-            break;
+    ir::Expr residual{.node = ir::ColumnRef{.name = tmp, .lexical = true}};
+    // Rebuild the wrapper layers inside-out.
+    for (auto it = wraps.rbegin(); it != wraps.rend(); ++it) {
+        ir::CallExpr call;
+        call.callee = it->callee;
+        call.args.emplace_back(std::move(residual));
+        if (it->extra_arg.has_value()) {
+            call.args.emplace_back(ir::Expr{.node = std::move(*it->extra_arg)});
         }
-        case Wrap::Coalesce: {
-            ir::CallExpr call;
-            call.callee = "coalesce";
-            call.args.emplace_back(std::move(ref));
-            call.args.emplace_back(ir::Expr{.node = std::move(*coalesce_default)});
-            residual = ir::Expr{.node = std::move(call)};
-            break;
-        }
+        residual = ir::Expr{.node = std::move(call)};
     }
 
     ir::DeferredScalarBinding binding;

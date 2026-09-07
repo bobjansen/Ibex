@@ -46,29 +46,30 @@ namespace {
 // the whole-program lowerer must skip them the same way it skips a plain scalar
 // `let` (they have no place in the relational result tree).
 [[nodiscard]] auto is_deferred_scalar_let_shape(const Expr& value) -> bool {
-    const auto* outer = std::get_if<CallExpr>(&value.node);
-    if (outer == nullptr) {
+    const auto is_cast = [](std::string_view c) {
+        return c == "Int64" || c == "Int32" || c == "Int" || c == "Float64" || c == "Float32" ||
+               c == "Date" || c == "Timestamp";
+    };
+    const Expr* cur = &value;
+    while (true) {
+        const auto* call = std::get_if<CallExpr>(&cur->node);
+        if (call == nullptr) {
+            return false;
+        }
+        if (call->callee == "scalar") {
+            return !call->args.empty() && call->args.size() <= 2;
+        }
+        if (is_cast(call->callee) && call->args.size() == 1) {
+            cur = call->args[0].get();
+            continue;
+        }
+        if (call->callee == "coalesce" && call->args.size() == 2 &&
+            std::holds_alternative<LiteralExpr>(call->args[1]->node)) {
+            cur = call->args[0].get();
+            continue;
+        }
         return false;
     }
-    const auto is_scalar_call = [](const Expr& e) {
-        const auto* c = std::get_if<CallExpr>(&e.node);
-        return c != nullptr && c->callee == "scalar" && !c->args.empty() && c->args.size() <= 2;
-    };
-    if (outer->callee == "scalar") {
-        return !outer->args.empty() && outer->args.size() <= 2;
-    }
-    const bool is_cast = outer->callee == "Int64" || outer->callee == "Int32" ||
-                         outer->callee == "Int" || outer->callee == "Float64" ||
-                         outer->callee == "Float32" || outer->callee == "Date" ||
-                         outer->callee == "Timestamp";
-    if (is_cast && outer->args.size() == 1) {
-        return is_scalar_call(*outer->args[0]);
-    }
-    if (outer->callee == "coalesce" && outer->args.size() == 2) {
-        return is_scalar_call(*outer->args[0]) &&
-               std::holds_alternative<LiteralExpr>(outer->args[1]->node);
-    }
-    return false;
 }
 
 struct LoweredAggList {

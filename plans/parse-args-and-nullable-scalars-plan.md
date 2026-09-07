@@ -40,14 +40,21 @@ one exception, and only because extraction throws.
   `test_interpreter.cpp` "extract_scalar yields a null scalar". Full suite green
   (1849 cases).
 
+**Slice 2 landed (uncommitted, 2026-09-07):**
+
+- Row-count expressions (`take` / `head` / `tail` / `rep` length / `Table(n)` /
+  `Series(n)` / RNG shape — all route through `evaluate_row_count_expr_impl`)
+  now give a clear "row count expression is null" error on a null scalar.
+- `aggregate_series` (the `max(<series>)` REPL path) returns a null scalar for
+  an all-null series instead of erroring — consistent with the column path.
+- SPEC.md: §3, §5.7, §6.7 (new), §11.2, §12.2 edited.
+
 **Not yet done:** codegen (scalar bindings still lower to bare `T`;
 `emitter.cpp` emits a placeholder for the monostate arm — `collect_scalar_bindings`
-never produces one so it's unreachable); `aggregate_series` (the `max(<series>)`
-REPL path) still errors on an all-null series; strict-use-site guards for `take` /
-`__window_n` / `rep` count / ctor dims / RNG shape when fed a null scalar; a null
-scalar has no static type (`infer_expr_type` falls through to String); SPEC.md
-edits. The one-arg `scalar(<table>)` form is REPL-only — not wired in `lower.cpp`
-for the compiled path.
+never produces one so it's unreachable); per-call rolling `__window_n` /
+`__window_ns` guard (separate path from row-count); a null scalar has no static
+type (`infer_expr_type` falls through to String); the one-arg `scalar(<table>)`
+form is REPL-only — not wired in `lower.cpp` for the compiled path.
 
 ### Semantics
 

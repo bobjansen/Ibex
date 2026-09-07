@@ -2209,6 +2209,9 @@ auto evaluate_row_count_expr_impl(const ir::Expr& expr, const ScalarRegistry* sc
     if (!value) {
         return std::unexpected("row count expression: " + value.error());
     }
+    if (std::holds_alternative<Null>(value.value())) {
+        return std::unexpected("row count expression is null; a count must be a present value");
+    }
     if (const auto* i = std::get_if<std::int64_t>(&value.value())) {
         if (*i < 0) {
             return std::unexpected("row count expression must be non-negative");

@@ -1609,12 +1609,10 @@ auto aggregate_series(std::string_view name, const ColumnValue& column, double p
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected(std::string(name) + "(): produced no result");
     }
-    // ScalarValue is null-free by design; an aggregate with no valid
-    // observations has no scalar image.
+    // An aggregate with no valid observations reduces to a null scalar (the
+    // monostate alternative), consistent with the column path.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return std::unexpected(std::string(name) +
-                               "(): result is null (no valid observations); "
-                               "scalars cannot hold null");
+        return ScalarValue{std::monostate{}};
     }
     return scalar_from_column(*entry->column, 0);
 }

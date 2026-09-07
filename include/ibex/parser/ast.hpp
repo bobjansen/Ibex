@@ -239,6 +239,14 @@ struct MeltClause {
     std::vector<Field> id_fields;
 };
 
+/// Row-wise `map { name = expr, ... }`: evaluate the field expressions once per
+/// input row, with that row's columns in scope as scalars. Cell expressions may
+/// call effectful externs (`read_csv`, `write_parquet`). Output is one row per
+/// input row with exactly the named columns. Must be the last clause of a block.
+struct MapClause {
+    std::vector<Field> fields;
+};
+
 struct DcastClause {
     std::string pivot_column;
 };
@@ -288,7 +296,8 @@ struct ModelClause {
 using Clause =
     std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
                  OrderClause, HeadClause, TailClause, ByClause, WindowClause, ResampleClause,
-                 MeltClause, DcastClause, CovClause, CorrClause, TransposeClause, ModelClause>;
+                 MeltClause, DcastClause, CovClause, CorrClause, TransposeClause, ModelClause,
+                 MapClause>;
 
 struct BlockExpr {
     ExprPtr base;

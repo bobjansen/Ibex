@@ -1555,6 +1555,12 @@ class Parser {
                 clauses.push_back(std::move(*clause));
             } while (match(TokenKind::Comma) && !check(TokenKind::RBracket));
         }
+        for (std::size_t i = 0; i + 1 < clauses.size(); ++i) {
+            if (std::holds_alternative<MapClause>(clauses[i])) {
+                error_ = make_error(previous(), "map { } must be the last clause of a block");
+                return std::nullopt;
+            }
+        }
         return clauses;
     }
 
@@ -1645,6 +1651,31 @@ class Parser {
                 return std::nullopt;
             }
             return RenameClause{.fields = std::move(*fields)};
+        }
+        if (match(TokenKind::KeywordMap)) {
+            // Row-wise `map { name = expr, ... }`. Only plain assignments — no
+            // tuple LHS and no `map ... =>` compile-time expansion (that form
+            // stays inside select/update braces).
+            if (!consume(TokenKind::LBrace, "expected '{' after 'map'")) {
+                return std::nullopt;
+            }
+            auto result = parse_clause_field_list_after_open_brace();
+            if (!result.has_value()) {
+                return std::nullopt;
+            }
+            if (!result->tuple_fields.empty() || !result->map_fields.empty()) {
+                error_ = make_error(previous(),
+                                    "map { } takes only 'name = expr' fields");
+                return std::nullopt;
+            }
+            for (const auto& field : result->fields) {
+                if (field.expr == nullptr) {
+                    error_ = make_error(previous(),
+                                        "map { } field '" + field.name + "' needs '= expr'");
+                    return std::nullopt;
+                }
+            }
+            return MapClause{.fields = std::move(result->fields)};
         }
         if (match(TokenKind::KeywordBy)) {
             if (match(TokenKind::LBrace)) {

@@ -3791,7 +3791,13 @@ inline auto write_parquet(const ibex::runtime::Table& table, std::string_view pa
     auto arrow_table = arrow::Table::Make(schema, arrays,
                                           static_cast<int64_t>(table.rows()));
 
-    // Open output file
+    // Open output file, creating the parent directory if it does not exist yet
+    // (so `csv_dir_to_parquet` can write into a fresh output directory).
+    if (const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+        !parent.empty()) {
+        std::error_code mkdir_ec;
+        std::filesystem::create_directories(parent, mkdir_ec);
+    }
     auto sink_result = arrow::io::FileOutputStream::Open(std::string(path));
     if (!sink_result.ok()) {
         throw std::runtime_error("write_parquet: cannot open for writing: " + std::string(path) +

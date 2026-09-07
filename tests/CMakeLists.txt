@@ -11,6 +11,7 @@ set(IBEX_TEST_SOURCES
     test_args.cpp
     test_column.cpp
     test_csv.cpp
+    test_fs.cpp
     test_json.cpp
     test_e2e.cpp
     test_e2e_lazy_queries.cpp
@@ -74,6 +75,7 @@ target_include_directories(ibex_tests PRIVATE
     "${PROJECT_SOURCE_DIR}/src/runtime"
     "${PROJECT_SOURCE_DIR}/libs/args"
     "${PROJECT_SOURCE_DIR}/libs/csv"
+    "${PROJECT_SOURCE_DIR}/libs/fs"
     "${PROJECT_SOURCE_DIR}/libs/kafka"
     "${PROJECT_SOURCE_DIR}/libs/json"
 )

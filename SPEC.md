@@ -1216,6 +1216,7 @@ Within a single block:
 | C22 | `cov`, `corr`, and `transpose` are mutually exclusive with each other and with `select`, `update`, `by`, `distinct`, `melt`, `dcast`, `window`, and `resample`. |
 | C23 | `cov` and `corr` silently drop non-numeric columns; at least one numeric column must remain. |
 | C23 | `transpose` requires all data columns to share the same type (error on mixed types). |
+| C24 | At most **one** `map { }` clause, and it must be the **last** clause of the block. |
 
 Violation of any constraint is a **compile-time error**.
 
@@ -1518,6 +1519,40 @@ Every column in the result of `gen_prices(symbols)` is added to (or replaces a
 column in) `prices`. No column enumeration is required. This is useful when the
 set of new columns is determined by the called function rather than statically
 known at the call site.
+
+**`map { name = expr, ... }`**
+
+A row-wise application block. Unlike `update`/`select` — which evaluate each
+field expression once over a whole column vector — `map` evaluates its field
+expressions **once per input row**, with that row's columns bound as scalars in
+the expression scope (shadowing any outer scalar `let`). The result is a new
+DataFrame with exactly the named columns, one row per input row. Each field
+expression must produce a **scalar**; a field that yields a column or a table is
+an error. A field column's type is that of its first non-null value (an integer
+column widens to Float64 if a later row yields a float); genuinely mixed types
+are a runtime error.
+
+Because evaluation is per-row and scalar, `map` field expressions may call
+**effectful** externs — including a table-returning reader feeding a
+table-consuming writer:
+
+```
+list_files("data/csv", "*.csv")[map {
+    source = path,
+    target = `data/parquet/${stem}.parquet`,
+    rows   = write_parquet(read_csv(path), `data/parquet/${stem}.parquet`)
+}]
+```
+
+Rows are processed in input order and fields left-to-right, so side effects
+occur in a defined order. An error in any row aborts the block (effects from
+earlier rows are not rolled back). `map` must be the last clause of its block
+(C24); chain further work as `let out = base[map { ... }]; out[...]`.
+
+*Current implementation status:* `map` runs on the interpreter / statement
+execution path (scripts and the REPL). The distinction from the existing
+compile-time `map v in list => ...` expansion (valid only **inside**
+`select`/`update` braces, Section 5.3) is grammatical position.
 
 **`rename { new_name = old_name, ... }`**
 
@@ -3367,6 +3402,7 @@ bundled I/O backends are:
 | `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
 | `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet; local files, HTTPS URLs, and `s3://` object reads |
 | `args` | `parse_args(spec[, argv])` | — | Command-line argument parsing (see below) |
+| `fs` | `list_files(dir[, pattern[, recursive]])` | — | Directory listing as a DataFrame (see below) |
 
 **`parse_args`** turns a spec string and an argument vector into a table with a
 **fixed schema** — one row per argument:
@@ -3469,6 +3505,31 @@ let df = read_json("data.json");
 JSON object (produces a one-row DataFrame). Type inference follows:
 Int64 → Float64 → Bool → String. Mixed integer/float columns widen to Float64.
 JSON `null` values and missing keys produce null bitmaps.
+
+**`list_files`** (plugin `fs`) returns one row per directory entry:
+
+| Column | Type | Meaning |
+|--------|------|---------|
+| `path` | String | directory joined with the entry name |
+| `name` | String | file name including any extension |
+| `stem` | String | file name without the final extension |
+| `ext`  | String | final extension without the dot (`""` if none) |
+| `size_bytes` | Int64 | file size for regular files, `0` otherwise |
+| `is_dir` | Bool | |
+
+`pattern` is a shell glob (`*`, `?`, `[set]`) matched against `name` only
+(default `"*"`); `recursive` (default `false`) descends into subdirectories. A
+missing or non-directory `dir` is a runtime error. Rows are ordered by `path`.
+Combined with the row-wise `map { }` clause (Section 5.3), this is how a whole
+directory is transformed — e.g. every CSV to Parquet:
+
+```
+import "fs";
+list_files("data/csv", "*.csv")[map {
+    source = path,
+    rows   = write_parquet(read_csv(path), `data/parquet/${stem}.parquet`)
+}];
+```
 
 All plugins can also be loaded via `import` (Section 13.4):
 

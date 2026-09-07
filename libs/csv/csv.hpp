@@ -1435,6 +1435,11 @@ inline void csv_write_cell(std::ostream& out, const ibex::runtime::ColumnEntry& 
 /// double-quotes, or newlines are quoted per RFC 4180.
 inline auto write_csv(const ibex::runtime::Table& table, std::string_view path) -> std::int64_t {
     std::string path_str{path};
+    if (const std::filesystem::path parent = std::filesystem::path(path_str).parent_path();
+        !parent.empty()) {
+        std::error_code mkdir_ec;
+        std::filesystem::create_directories(parent, mkdir_ec);
+    }
     std::ofstream ofs{path_str};
     if (!ofs) {
         throw std::runtime_error("write_csv: cannot open for writing: " + path_str);

@@ -1996,7 +1996,10 @@ TEST_CASE("REPL reports why the whole-script planner declined", "[repl][lazy][pl
         CHECK(line == "planner: statements (script has no lazy table sources to plan against)");
     }
 
-    SECTION("a function declaration") {
+    SECTION("a function declaration no longer forces the statement path") {
+        // A `fn` declaration used to be a blanket decline (W3): `lower_script`
+        // now registers and inlines UDFs, so a function-organised script plans
+        // as one block.
         ibex::runtime::ExternRegistry registry;
         register_recording_lazy_source(registry, decode_calls);
         const std::string source = R"(
@@ -2006,8 +2009,7 @@ fn double_it(x: Int) -> Int {
 }
 read_fake()[select { n = count() }];
 )";
-        CHECK(capture_planner_line(source, registry) ==
-              "planner: statements (script declares a function)");
+        CHECK(capture_planner_line(source, registry) == "planner: whole-script");
     }
 
     SECTION("a non-DataFrame type annotation") {

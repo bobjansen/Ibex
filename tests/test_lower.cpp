@@ -93,6 +93,34 @@ TEST_CASE("Lower rejects map { } combined with another clause") {
     REQUIRE_FALSE(result.has_value());
 }
 
+TEST_CASE("Lower inlines a table-returning user function at its call site") {
+    auto program = require_parse(
+        "fn wide(src: DataFrame, lo: Int) -> DataFrame effects {} {\n"
+        "    let hits = src[filter v >= lo];\n"
+        "    hits[select { k, v }];\n"
+        "}\n"
+        "wide(df, 3);");
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    // Body inlined: Project(Filter(Scan df)) — no call node survives.
+    const auto* project = as_node<ir::ProjectNode>(result->get());
+    REQUIRE(project != nullptr);
+    REQUIRE(project->children().size() == 1);
+    const auto* filter = as_node<ir::FilterNode>(project->children()[0].get());
+    REQUIRE(filter != nullptr);
+    const auto* scan = as_node<ir::ScanNode>(filter->children()[0].get());
+    REQUIRE(scan != nullptr);
+    CHECK(scan->source_name() == "df");
+}
+
+TEST_CASE("Lower rejects a recursive table-returning user function") {
+    auto program = require_parse(
+        "fn loop(src: DataFrame) -> DataFrame effects {} { loop(src); }\n"
+        "loop(df);");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+}
+
 TEST_CASE("Lower carries the scope escape into the IR") {
     // SPEC.md Section 6.2: `price` is the column, `^price` the lexical binding
     // it shadows. Both lower to a ColumnRef, told apart by `lexical`.

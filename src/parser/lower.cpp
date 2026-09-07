@@ -1851,6 +1851,9 @@ class Lowerer {
             return node;
         }
         if (!table_externs_.contains(call.callee)) {
+            if (auto fn = functions_.find(call.callee); fn != functions_.end()) {
+                return inline_table_udf(*fn->second, call);
+            }
             return std::unexpected(LowerError{.message = "unknown table function: " + call.callee});
         }
         auto bound_args = bind_extern_call_args(call);
@@ -3064,6 +3067,118 @@ class Lowerer {
         auto result = lower_expr_to_ir(*body_shape->final_expr);
         inline_scopes_.pop_back();
         inlining_active_.erase(fn.name);
+        return result;
+    }
+
+    /// Inline a call to a table-returning user function in table position: lower
+    /// each argument in the caller's scope, then install table-typed params as
+    /// IR bindings (as if `let`-bound) and scalar params into a fresh inline
+    /// scope, and lower the body's trailing expression. Body `let` bindings are
+    /// folded in the same way. Only `let`-prefixed single-expression bodies
+    /// inline; direct recursion is rejected.
+    auto inline_table_udf(const FunctionDecl& fn, const CallExpr& call) -> LowerResult {
+        if (fn.return_type.kind != Type::Kind::DataFrame &&
+            fn.return_type.kind != Type::Kind::TimeFrame) {
+            return std::unexpected(LowerError{
+                .message = "function '" + fn.name + "' does not return a DataFrame"});
+        }
+        if (bindings_ == nullptr) {
+            return std::unexpected(
+                LowerError{.message = "table function '" + fn.name + "' cannot be inlined here"});
+        }
+        auto body_shape = inlinable_body_shape(fn);
+        if (!body_shape.has_value()) {
+            return std::unexpected(LowerError{
+                .message = "table function '" + fn.name +
+                           "' cannot be inlined: only single-expression or let-prefixed bodies "
+                           "are inlined"});
+        }
+        if (call.args.size() > fn.params.size()) {
+            return std::unexpected(LowerError{.message = fn.name + ": too many arguments"});
+        }
+        std::vector<const Expr*> bound(fn.params.size(), nullptr);
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            bound[i] = call.args[i].get();
+        }
+        for (const auto& narg : call.named_args) {
+            const auto param = std::find_if(fn.params.begin(), fn.params.end(),
+                                            [&](const Param& p) { return p.name == narg.name; });
+            if (param == fn.params.end()) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": unknown named argument '" + narg.name + "'"});
+            }
+            const auto pos = static_cast<std::size_t>(std::distance(fn.params.begin(), param));
+            if (bound[pos] != nullptr) {
+                return std::unexpected(LowerError{
+                    .message = fn.name + ": duplicate argument for '" + narg.name + "'"});
+            }
+            bound[pos] = narg.value.get();
+        }
+        if (!inlining_active_.insert(fn.name).second) {
+            return std::unexpected(LowerError{
+                .message = "recursive table function '" + fn.name + "' cannot be inlined"});
+        }
+
+        std::vector<std::string> installed_bindings;
+        robin_hood::unordered_map<std::string, ir::NodePtr> shadowed;
+        const auto shadow = [&](const std::string& name, ir::NodePtr node) {
+            if (auto it = bindings_->find(name); it != bindings_->end() && !shadowed.contains(name)) {
+                shadowed.emplace(name, std::move(it->second));
+            }
+            (*bindings_)[name] = std::move(node);
+            installed_bindings.push_back(name);
+        };
+        const auto cleanup = [&] {
+            for (const auto& name : installed_bindings) {
+                bindings_->erase(name);
+            }
+            for (auto& [name, node] : shadowed) {
+                (*bindings_)[name] = std::move(node);
+            }
+            inline_scopes_.pop_back();
+            inlining_active_.erase(fn.name);
+        };
+
+        inline_scopes_.emplace_back();
+        for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            const auto& param = fn.params[i];
+            const Expr* arg = bound[i] != nullptr ? bound[i] : param.default_value.get();
+            if (arg == nullptr) {
+                cleanup();
+                return std::unexpected(
+                    LowerError{.message = fn.name + ": missing argument '" + param.name + "'"});
+            }
+            if (param.type.kind == Type::Kind::DataFrame ||
+                param.type.kind == Type::Kind::TimeFrame) {
+                auto lowered = lower_expr(*arg);
+                if (!lowered.has_value()) {
+                    cleanup();
+                    return lowered;
+                }
+                shadow(param.name, std::move(lowered.value()));
+            } else {
+                auto lowered = lower_expr_to_ir(*arg);
+                if (!lowered.has_value()) {
+                    cleanup();
+                    return std::unexpected(lowered.error());
+                }
+                inline_scopes_.back().insert_or_assign(param.name, std::move(lowered.value()));
+            }
+        }
+        for (const auto* let : body_shape->lets) {
+            if (auto tbl = lower_expr(*let->value); tbl.has_value()) {
+                shadow(let->name, std::move(tbl.value()));
+            } else {
+                auto scalar = lower_expr_to_ir(*let->value);
+                if (!scalar.has_value()) {
+                    cleanup();
+                    return std::unexpected(scalar.error());
+                }
+                inline_scopes_.back().insert_or_assign(let->name, std::move(scalar.value()));
+            }
+        }
+        auto result = lower_expr(*body_shape->final_expr);
+        cleanup();
         return result;
     }
 

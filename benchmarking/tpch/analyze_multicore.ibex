@@ -1,0 +1,103 @@
+// PDS-H: Ibex multicore vs Polars multicore.
+//
+// Run:
+//   build/tools/ibex benchmarking/tpch/analyze_multicore.ibex -- \
+//       benchmarking/tpch/results/history.tsv --sf 8
+//
+// This script prints several tables; the per-query ones have 22 rows. The REPL
+// truncates rendered tables to 10 rows by default -- set IBEX_MAX_ROWS=all
+// (or a number) to see every row:
+//   IBEX_MAX_ROWS=all build/tools/ibex benchmarking/tpch/analyze_multicore.ibex -- ...
+//
+// Input is a TSV in the `benchmarking/tpch/results/history.tsv` shape; the
+// columns actually used are `commit`, `scale_factor`, `framework`, `query`,
+// `min_ms`. Every run in the file for the chosen scale factor is collapsed to
+// one number per query (the minimum `min_ms`); pass `--commit <hash>` to pin to
+// a single run instead.
+//
+// "Multicore" == the framework name without a `-st` suffix. Defaults compare
+// `ibex` against `pdsh-polars-stream`; override with `--ibex` / `--polars`
+// (e.g. `--polars polars` or `--polars pdsh-polars`).
+//
+// Speedup convention (matches the other analyze_*.ibex scripts):
+//   speedup        = polars_ms / ibex_ms   (> 1.0 -> Ibex faster)
+//   ibex_faster_pct = round((speedup - 1) * 100)   (negative -> Ibex slower)
+// min_ms is the statistic compared: a corrupted wall clock only inflates a
+// sample, so the minimum across re-measures / runs is the honest number.
+
+extern fn read_csv(
+    path: String,
+    nulls: String = "",
+    delimiter: String = ",",
+    has_header: Bool = true,
+    schema: String = ""
+) -> DataFrame from "csv.hpp";
+
+extern fn parse_args(spec: String, argv: String = "") -> DataFrame from "args.hpp";
+
+let args = parse_args("path : positional # results TSV (history.tsv shape) ; sf : int # scale factor to analyze ; ibex : string = ibex # ibex (multicore) framework name ; polars : string = pdsh-polars-stream # polars (multicore) framework name ; commit : string? # restrict to one commit (default: best min_ms across all runs)");
+
+let path       = scalar(args[filter name == "path",   select { value }]);
+let sf         = Int64(scalar(args[filter name == "sf", select { value }]));
+let ibex_fw    = scalar(args[filter name == "ibex",   select { value }]);
+let pl_fw      = scalar(args[filter name == "polars", select { value }]);
+let commit_sel = coalesce(scalar(args[filter name == "commit", select { value }]), "");
+
+// history.tsv and the per-run *.tsv files are tab-separated.
+let raw0 = read_csv(path, "", "\t", true, "");
+let raw = raw0[filter { commit_sel == "" || commit == commit_sel }];
+
+// Collapse every run / re-measure for this scale factor to one number per query.
+let ibex = raw[filter framework == ibex_fw && scale_factor == sf]
+              [select { ibex_ms = min(min_ms) }, by query];
+let polars = raw[filter framework == pl_fw && scale_factor == sf]
+                [select { polars_ms = min(min_ms) }, by query];
+
+let cmp = (ibex join polars on {query})
+            [update {
+                speedup = polars_ms / ibex_ms,
+                ibex_faster_pct = round((polars_ms / ibex_ms - 1.0) * 100.0, nearest)
+            }];
+
+// --- Every query, slowest (for Ibex) first. -------------------------------
+print("== Ibex vs Polars, per query (speedup = polars_ms / ibex_ms) ==");
+cmp[select { query, ibex_ms, polars_ms, speedup, ibex_faster_pct }]
+   [order { speedup asc }];
+
+// --- Where Ibex already wins, biggest margin first. -----------------------
+print("== Ibex faster ==");
+cmp[filter speedup >= 1.0]
+   [select { query, ibex_ms, polars_ms, speedup, ibex_faster_pct }]
+   [order { speedup desc }];
+
+// --- Where Ibex is behind, worst first (the work queue). ------------------
+print("== Ibex slower ==");
+cmp[filter speedup < 1.0]
+   [select { query, ibex_ms, polars_ms, speedup, ibex_faster_pct }]
+   [order { speedup asc }];
+
+// --- Headline: geomean speedup, suite wall, win/loss count. ---------------
+// geomean(speedup) = exp(mean(log(speedup))); suite_speedup weights by wall.
+let logs = cmp[update { log_speedup = log(speedup) }];
+
+let summary = logs[select {
+    queries         = count(),
+    wins            = sum(Int64(speedup >= 1.0)),
+    losses          = sum(Int64(speedup < 1.0)),
+    ibex_total_ms   = sum(ibex_ms),
+    polars_total_ms = sum(polars_ms),
+    mean_log        = mean(log_speedup),
+    best            = max(speedup),
+    worst           = min(speedup)
+}];
+
+print("== Headline ==");
+summary[update {
+    geomean_speedup = exp(mean_log),
+    suite_speedup   = polars_total_ms / ibex_total_ms
+}]
+[select {
+    queries, wins, losses,
+    ibex_total_ms, polars_total_ms,
+    suite_speedup, geomean_speedup, best, worst
+}];

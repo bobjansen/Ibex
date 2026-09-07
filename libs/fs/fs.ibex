@@ -1,0 +1,24 @@
+// Ibex filesystem library.
+//
+//   import "fs";
+//   list_files("data/csv", "*.csv");
+//   csv_dir_to_parquet("data/csv", "data/parquet");
+
+import "csv";
+import "parquet";
+
+// One row per directory entry: path, name, stem, ext, size_bytes, is_dir.
+// `pattern` is a shell glob (`*`, `?`, `[set]`) matched against the file name.
+extern fn list_files(dir: String, pattern: String = "*", recursive: Bool = false)
+    -> DataFrame from "fs.hpp";
+
+// Convert every `*.csv` in `src_dir` to a Parquet file of the same stem in
+// `dst_dir`. Returns one row per file: source path, target path, and the row
+// count written. A malformed CSV aborts the batch.
+fn csv_dir_to_parquet(src_dir: String, dst_dir: String) -> DataFrame {
+    list_files(src_dir, "*.csv")[map {
+        source = path,
+        target = `${dst_dir}/${stem}.parquet`,
+        rows   = write_parquet(read_csv(path), `${dst_dir}/${stem}.parquet`)
+    }];
+}

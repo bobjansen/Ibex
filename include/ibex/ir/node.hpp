@@ -595,6 +595,10 @@ enum class NodeKind : std::uint8_t {
     FilterHead,  ///< Fused Head(Filter(x)) — produced by canonicalize R7.
     FilterTail,  ///< Fused Tail(Filter(x)) — produced by canonicalize R8.
     TopK,        ///< Fused Head(Order(x)) / Tail(Order(x)) — produced by canonicalize R16.
+    Map,         ///< Row-wise `map { name = expr, ... }`: one row per input row, only the
+                 ///< named columns. Emitter-only today — `parser::lower` (surface 1) is the
+                 ///< only producer; whole-script declines and the REPL peels a `map` clause
+                 ///< before lowering, so the optimizer treats it as an ordered barrier.
 };
 
 /// How a StreamNode triggers output emission.
@@ -1225,6 +1229,28 @@ class TransposeNode final : public Node {
     explicit TransposeNode(NodeId id) : Node(NodeKind::Transpose, id) {}
 };
 
+/// Map node: row-wise `map { alias = expr, ... }`. Evaluates each field
+/// expression once per input row against that row's columns and produces a
+/// frame with one row per input row and exactly the named columns (unlike
+/// `update`, which retains every input column). Row order is preserved.
+///
+/// This is an emitter-only IR node: `parser::lower` (surface 1, `ibex_compile`)
+/// is the only path that builds one. `try_execute_whole_script` declines on a
+/// `map` clause and the REPL statement path peels it before lowering, so
+/// `interpret()` only ever sees a `MapNode` when re-entered from emitted
+/// `ibex::ops::map`. Because surface 1 still runs `ir::optimize_plan`, every
+/// pass must treat it as opaque, ordered and effectful (mirror `NodeKind::Stream`).
+class MapNode final : public Node {
+   public:
+    MapNode(NodeId id, std::vector<FieldSpec> fields)
+        : Node(NodeKind::Map, id), fields_(std::move(fields)) {}
+
+    [[nodiscard]] auto fields() const noexcept -> const std::vector<FieldSpec>& { return fields_; }
+
+   private:
+    std::vector<FieldSpec> fields_;
+};
+
 /// Matmul node: matrix multiply left × right.
 /// child[0] = left (m×k), child[1] = right (k×n).
 /// Numeric-only columns are extracted from each operand.
@@ -1384,6 +1410,7 @@ template <> inline constexpr NodeKind node_kind_v<ModelNode>       = NodeKind::M
 template <> inline constexpr NodeKind node_kind_v<FilterHeadNode>  = NodeKind::FilterHead;
 template <> inline constexpr NodeKind node_kind_v<FilterTailNode>  = NodeKind::FilterTail;
 template <> inline constexpr NodeKind node_kind_v<TopKNode>        = NodeKind::TopK;
+template <> inline constexpr NodeKind node_kind_v<MapNode>         = NodeKind::Map;
 // clang-format on
 
 /// Checked downcast from the `Node` base to a concrete node type. The IR is a

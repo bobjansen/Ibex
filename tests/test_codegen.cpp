@@ -466,6 +466,27 @@ TEST_CASE("emitter: call expression preserves named args", "[codegen]") {
     CHECK(contains(out, "ibex::ops::NamedArgExpr{\"times\""));
 }
 
+TEST_CASE("emitter: map node - row-wise fields", "[codegen]") {
+    ir::Builder b;
+    ir::FieldSpec doubled{
+        .alias = "doubled",
+        .expr = ir::Expr{ir::BinaryExpr{
+            .op = ir::ArithmeticOp::Mul,
+            .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "n"}}),
+            .right = ir::make_expr_ptr(ir::Expr{ir::Literal{std::int64_t{2}}})}}};
+    ir::FieldSpec tag{.alias = "tag", .expr = ir::Expr{ir::ColumnRef{.name = "label"}}};
+
+    auto map_node = b.map({std::move(doubled), std::move(tag)});
+    map_node->add_child(make_source(b, "rows.csv"));
+
+    auto out = emit_to_string(*map_node);
+    CHECK(contains(out, "ibex::ops::map("));
+    CHECK(contains(out, "ibex::ops::make_field(\"doubled\""));
+    CHECK(contains(out, "ibex::ops::make_field(\"tag\""));
+    CHECK(contains(out, "ibex::ir::ArithmeticOp::Mul"));
+    CHECK(contains(out, "ibex::ops::col_ref(\"label\")"));
+}
+
 // --- Chained pipeline --------------------------------------------------------
 
 TEST_CASE("emitter: filter then project pipeline", "[codegen]") {

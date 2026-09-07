@@ -1,1 +1,0 @@
-W1a — ibex_compile has no MapNode case; parser::lower errors on a MapClause. Plan: plans/ibex-compile-conformance-plan.md

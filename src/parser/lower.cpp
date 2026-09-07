@@ -885,6 +885,15 @@ auto infer_output_column_names(const ir::Node& node) -> std::optional<std::vecto
             }
             return names;
         }
+        case NodeKind::Map: {
+            const auto& map_node = ir::node_cast<ir::MapNode>(node);
+            std::vector<std::string> names;
+            names.reserve(map_node.fields().size());
+            for (const auto& field : map_node.fields()) {
+                names.push_back(field.alias);
+            }
+            return names;
+        }
         case NodeKind::Rename: {
             const auto& rename = ir::node_cast<ir::RenameNode>(node);
             if (rename.children().empty()) {
@@ -1590,6 +1599,9 @@ class Lowerer {
     }
 
     auto lower_program(const Program& program) -> LowerResult {
+        // Surface 1 (`ibex_compile`) is the only path allowed to lower a
+        // `map { }` clause into a `MapNode`; see the note on `MapNode`.
+        allow_map_ = true;
         auto plan = lower_script(program);
         if (!plan.has_value()) {
             return std::unexpected(plan.error());
@@ -2203,6 +2215,47 @@ class Lowerer {
                            "melt, dcast, window, resample, rename, cov, corr, and transpose"});
         }
 
+        // `map { }` is the terminal, standalone clause of a block: it replaces
+        // the column set outright and evaluates its fields row-wise. Surfaces 2
+        // (whole-script) and 3 (REPL statement) never lower one — the REPL peels
+        // it and the whole-script driver declines — so a `MapNode` is only ever
+        // built here, on the `ibex_compile` path (`allow_map_`).
+        if (state.map != nullptr) {
+            if (!allow_map_) {
+                return std::unexpected(
+                    LowerError{.message = "map { } runs only on the interpreter path"});
+            }
+            const bool has_other_clause =
+                state.filter || state.select || state.distinct || state.update || state.rename ||
+                state.order || state.head || state.tail || state.by || state.window ||
+                state.resample || state.melt || state.dcast || state.cov || state.corr ||
+                state.transpose || state.model;
+            if (has_other_clause) {
+                return std::unexpected(
+                    LowerError{.message = "map { } must be the only clause in its block"});
+            }
+            if (state.map->fields.empty()) {
+                return std::unexpected(LowerError{.message = "map { } needs at least one field"});
+            }
+            std::vector<ir::FieldSpec> fields;
+            fields.reserve(state.map->fields.size());
+            for (const auto& field : state.map->fields) {
+                if (field.expr == nullptr) {
+                    return std::unexpected(
+                        LowerError{.message = "map { } field '" + field.name + "' needs an expression"});
+                }
+                auto expr = lower_expr_to_ir(*field.expr);
+                if (!expr.has_value()) {
+                    return std::unexpected(expr.error());
+                }
+                fields.push_back(
+                    ir::FieldSpec{.alias = field.name, .expr = std::move(expr.value())});
+            }
+            auto map_node = builder_.map(std::move(fields));
+            map_node->add_child(std::move(base.value()));
+            return ir::NodePtr{std::move(map_node)};
+        }
+
         auto node = std::move(base.value());
 
         if (state.filter) {
@@ -2525,6 +2578,7 @@ class Lowerer {
         const CorrClause* corr = nullptr;
         const TransposeClause* transpose = nullptr;
         const ModelClause* model = nullptr;
+        const MapClause* map = nullptr;
         std::string error;
 
         auto record(const Clause& clause) -> bool {
@@ -2665,11 +2719,12 @@ class Lowerer {
                 return true;
             }
             if (std::holds_alternative<MapClause>(clause)) {
-                // The REPL peels a trailing `map { }` off and runs it row-wise
-                // before lowering (it composes effectful externs). Reaching here
-                // means a caller lowered a block that still has one.
-                error = "map { } runs only on the interpreter path";
-                return false;
+                if (map != nullptr) {
+                    error = "duplicate map clause";
+                    return false;
+                }
+                map = &std::get<MapClause>(clause);
+                return true;
             }
             return true;
         }
@@ -4925,6 +4980,11 @@ class Lowerer {
                 clone = builder_.rename(rename.renames());
                 break;
             }
+            case ir::NodeKind::Map: {
+                const auto& map_node = ir::node_cast<ir::MapNode>(node);
+                clone = builder_.map(map_node.fields());
+                break;
+            }
             case ir::NodeKind::Window: {
                 const auto& window = ir::node_cast<ir::WindowNode>(node);
                 clone = builder_.window(window.duration(), window.select_only(), window.aligned());
@@ -5170,6 +5230,7 @@ class Lowerer {
     TableRefCounts let_counts_;
     std::vector<SharedBinding> shared_bindings_;
     bool share_repeated_bindings_ = false;
+    bool allow_map_ = false;
     robin_hood::unordered_map<std::string, std::vector<std::string>> compile_time_lists_;
     robin_hood::unordered_set<std::string> table_externs_;
     robin_hood::unordered_set<std::string> sink_externs_;

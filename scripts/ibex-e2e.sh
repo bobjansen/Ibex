@@ -426,6 +426,12 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     rg -n "read_parquet\\(\\\"data/flights-1m.parquet\\\"\\)" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
 
+    echo "▸ transpile (map clause)"
+    out_cpp="$(mktemp --suffix=.cpp)"
+    "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_map.ibex" -o "$out_cpp"
+    rg -n "ibex::ops::map\\(" "$out_cpp" >/dev/null
+    rm -f "$out_cpp"
+
     echo "▸ transpile (parquet https)"
     out_cpp="$(mktemp --suffix=.cpp)"
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parquet_https.ibex" -o "$out_cpp"

@@ -68,6 +68,31 @@ TEST_CASE("Lower filter and select to IR") {
     REQUIRE(scan->source_name() == "df");
 }
 
+TEST_CASE("Lower map { } to a MapNode on the transpile path") {
+    auto program = require_parse("df[map { d = n * 2, tag = label }];");
+
+    // Surface 1 (ibex_compile) builds a MapNode over the scan.
+    auto result = parser::lower(program);
+    REQUIRE(result.has_value());
+    const auto* map_node = as_node<ir::MapNode>(result->get());
+    REQUIRE(map_node != nullptr);
+    REQUIRE(map_node->fields().size() == 2);
+    CHECK(map_node->fields()[0].alias == "d");
+    CHECK(map_node->fields()[1].alias == "tag");
+    REQUIRE(map_node->children().size() == 1);
+    CHECK(map_node->children()[0]->kind() == ir::NodeKind::Scan);
+
+    // Surface 2 (whole-script) declines: the REPL peels a map clause instead.
+    auto script = parser::lower_script(program);
+    REQUIRE_FALSE(script.has_value());
+}
+
+TEST_CASE("Lower rejects map { } combined with another clause") {
+    auto program = require_parse("df[filter n > 0, map { d = n }];");
+    auto result = parser::lower(program);
+    REQUIRE_FALSE(result.has_value());
+}
+
 TEST_CASE("Lower carries the scope escape into the IR") {
     // SPEC.md Section 6.2: `price` is the column, `^price` the lexical binding
     // it shadows. Both lower to a ColumnRef, told apart by `lexical`.

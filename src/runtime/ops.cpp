@@ -194,6 +194,14 @@ auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -
     return delegate(std::move(upd_node), t);
 }
 
+auto map(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields) -> runtime::Table {
+    ir::Builder b;
+    auto scan_node = b.scan(kSrcKey);
+    auto map_node = b.map(fields);
+    map_node->add_child(std::move(scan_node));
+    return delegate(std::move(map_node), t);
+}
+
 auto update(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields,
             const std::vector<TupleSource>& tuple_sources, const std::vector<std::string>& group_by)
     -> runtime::Table {

@@ -206,6 +206,32 @@ of the call, joining the strict-use-site list. (Symmetric with §11's "an extern
 
 ## Part 2 — `parse_args`
 
+### Status — **LANDED (uncommitted, 2026-09-07)**
+
+- `libs/args/` plugin: `args.hpp` (header-only parser), `args.cpp` (`ibex_register`),
+  `args.ibex` stub, CMake. Added to the top-level plugin list + `tests/` include path.
+- `parse_args(spec, argv="")` — global-scope functions in `args.hpp` (like
+  `read_csv`) so the transpiler's bare `parse_args(...)` call resolves. 1-arg /
+  empty argv reads `IBEX_ARGS` (one entry per line); non-empty argv overrides.
+- CLI: `tools/ibex_repl.cpp` stashes everything after `--` into `IBEX_ARGS`.
+- **String → Int / Float casts added** (`Int64("42")`, `Float64(" 3.5 ")`) —
+  `expr.cpp` registry `to_int`/`to_float` + `numeric_cast_kernel` bare-column +
+  `repl.cpp` `apply_scalar_cast`. Needed because the `value` column is String.
+  SPEC §3.1.1 + §12.1 updated.
+- Deferred-scalar residual now peels **arbitrary nested** cast / coalesce layers
+  (`Int64(coalesce(scalar(...), "-1"))`), not just one.
+- Tests: `tests/test_args.cpp` (spec parsing, arg parsing, errors, + an
+  end-to-end REPL case through `scalar()` + casts). `deferred_scalar_let.ibex`
+  parity case extended with the nested wrapper. Full suite green (1858),
+  parity green (32).
+
+**Not done:** `flat_map(read_*)` → multi-path `ScanNode` (the file-list idiom
+still needs `map`/`flat_map` to return a Table per element + `concat`); `--help`
+/ `-h`; `env VAR` in the spec; `...` for unknown-option passthrough; short-flag
+bundling (`-abc`); a `parse_args` parity case (the interpreter reference in
+`structured_runner` would need import expansion + plugin registration — the
+deferred-scalar mechanism it rides on is already parity-tested).
+
 ### Declaration
 
 ```ibex

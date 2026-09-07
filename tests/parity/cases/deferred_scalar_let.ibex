@@ -4,11 +4,13 @@
 //   threshold: a plain scalar(<one-column table>)
 //   cap:       Int64(scalar(...)) -- a cast over the extracted value
 //   floor:     coalesce(scalar(<empty subquery>), 25) -- null recovered to 25
+//   nested:    Int64(coalesce(scalar(<empty>), "35")) -- a cast wrapping coalesce
 let prices = Table { sym = ["A", "B", "C", "D", "E"], px = [10, 20, 30, 40, 50] };
 let threshold = scalar(prices[filter sym == "B", select { px }]);
 let cap = Int64(scalar(prices[filter sym == "D", select { px }]));
 let floor = coalesce(scalar(prices[filter sym == "Z", select { px }]), 25);
+let nested = Int64(coalesce(scalar(prices[filter sym == "Z", select { px }]), "35"));
 
 prices[
-    filter px >= threshold && px <= cap && px >= floor
+    filter px >= threshold && px <= cap && px >= floor && px <= nested
 ][select { sym, px }][order { px asc }];

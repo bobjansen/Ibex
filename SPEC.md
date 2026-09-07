@@ -424,6 +424,13 @@ convert to the nearest integer before casting.
 **Int → Float casts** always succeed (subject to precision loss for very large
 `Int64` values converted to `Float32` or `Float64`).
 
+**String → Int / Float casts** parse the whole string (leading and trailing
+ASCII whitespace is ignored). `Int64("42")`, `Float64(" 3.5 ")`. A string that
+is not entirely a number — `Int64("4x")`, `Int64("")` — is a runtime error, as
+is a fractional value for a `String → Int` cast (`Int64("3.9")`). Null stays
+null. This is the idiom for reading a typed value out of a text column, such as
+the `value` column of `parse_args` (Section 12.1).
+
 **Bool → Int casts** map `false` to `0` and `true` to `1`, which is what makes a
 predicate countable: `sum(Int64(price > vwap))` counts the rows above VWAP. (A
 null stays null, as with every scalar function.)
@@ -3359,6 +3366,40 @@ bundled I/O backends are:
 | `csv`  | `read_csv(path)` | `write_csv(df, path)` | RFC 4180 CSV, optional custom delimiter, optional no-header mode |
 | `json` | `read_json(path)` | `write_json(df, path)` | JSON array-of-objects / JSON-Lines |
 | `parquet` | `read_parquet(path)` | `write_parquet(df, path)` | Apache Parquet; local files, HTTPS URLs, and `s3://` object reads |
+| `args` | `parse_args(spec[, argv])` | — | Command-line argument parsing (see below) |
+
+**`parse_args`** turns a spec string and an argument vector into a table with a
+**fixed schema** — one row per argument:
+
+| Column | Meaning |
+|--------|---------|
+| `kind`  | `"option"` \| `"flag"` \| `"positional"` |
+| `name`  | canonical option name; the positional's declared name, or `""` |
+| `index` | 0-based occurrence within `(kind, name)` |
+| `value` | the string value; a flag is `"true"` / `"false"` |
+
+`value` is always `String`; the caller casts (`Int64(...)`, `Date(...)` —
+Section 3.1.1). The spec drives parsing only (aliases, which tokens take a
+value, defaults, required checks, lexical type validation) — it does not shape
+the schema. One spec line per option:
+
+```
+<name> [(<aliases>)] : <type><arity?><?> [= <default>] [# help]
+```
+
+`<arity>` is a single value (the default), `flag`, `+` / `*` (repeated),
+`positional`, or `positional+` / `positional*`. A trailing `?` makes the option
+optional — absent, it produces no row (so `scalar()` of that selection is null,
+Section 6.7). One argument vector comes from the `IBEX_ARGS` environment
+variable (one entry per line, populated by the CLI from everything after a `--`
+separator); a non-empty second argument overrides it.
+
+```
+import "args";
+let args  = parse_args("threads (t) : int = 4 ; input : positional+");
+let n     = Int64(scalar(args[filter name == "threads", select { value }]));
+let files = args[filter kind == "positional", select { path = value }];
+```
 
 A common example using the bundled CSV plugin:
 

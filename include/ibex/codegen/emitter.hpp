@@ -71,6 +71,10 @@ class Emitter {
     /// When emitting a stream transform, holds the C++ variable name that
     /// substitutes for `ScanNode("__stream_input__")` in the transform IR.
     std::string stream_scan_var_;
+    /// Compile-time scalar `let` values, keyed by name. A reference to one in an
+    /// extern-call argument position emits the literal value (extern calls in
+    /// generated code take plain C++ arguments, not a scalar registry lookup).
+    robin_hood::unordered_map<std::string, Config::ScalarValue> compile_time_scalars_;
 
     auto fresh_var() -> std::string;
 
@@ -98,7 +102,7 @@ class Emitter {
     auto emit_expr(const ir::Expr& expr) -> std::string;
 
     /// Emit a raw C++ value expression for extern call arguments (literals only).
-    static auto emit_raw_expr(const ir::Expr& expr) -> std::string;
+    auto emit_raw_expr(const ir::Expr& expr) -> std::string;
 
     static auto emit_compare_op(ir::CompareOp op) -> std::string;
     static auto emit_arith_op(ir::ArithmeticOp op) -> std::string;

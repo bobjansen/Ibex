@@ -21,6 +21,7 @@
 #include <optional>
 #include <robin_hood.h>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -31,6 +32,7 @@
 namespace ibex::runtime {
 
 class ExecutionProfileState;
+class ExternRegistry;
 
 enum class ScalarKind : std::uint8_t {
     Int,
@@ -378,6 +380,12 @@ struct Table {
 
 using TableRegistry = robin_hood::unordered_map<std::string, Table>;
 using ScalarRegistry = robin_hood::unordered_map<std::string, ScalarValue>;
+
+/// Evaluate `bindings` in order against `tables` / `scalars`, inserting each
+/// result (including null) into `scalars`. See ir::DeferredScalarBinding.
+[[nodiscard]] auto materialize_deferred_scalar_bindings(
+    std::span<const ir::DeferredScalarBinding> bindings, const TableRegistry& tables,
+    ScalarRegistry& scalars, const ExternRegistry* externs) -> std::expected<void, std::string>;
 
 class LazyTable;
 
@@ -930,6 +938,12 @@ class ExternRegistry;
                                            const ScalarRegistry* scalars = nullptr,
                                            const ExternRegistry* externs = nullptr)
     -> std::expected<std::size_t, std::string>;
+
+/// Evaluate a scalar-valued expression against `scalars` (no column input).
+/// Returns a null scalar (monostate) when the expression evaluates to null.
+[[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars = nullptr,
+                                        const ExternRegistry* externs = nullptr)
+    -> std::expected<ScalarValue, std::string>;
 
 /// Merge two validity bitmaps (`a && b`) for the first `n` rows.
 /// Returns nullopt when both inputs are nullopt-equivalent (nullptr).

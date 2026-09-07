@@ -203,6 +203,17 @@ void visit(const Node& node, const ColumnDemand& need, DemandSink& out) {
             return;
         }
 
+        // Map fixes its own output too: the input demand is exactly the columns
+        // its field expressions read, whatever the parent asked for.
+        case NodeKind::Map: {
+            ColumnDemand below;
+            for (const auto& field : node_cast<MapNode>(node).fields()) {
+                collect_refs(field.expr, below);
+            }
+            visit_children(node, below, out);
+            return;
+        }
+
         case NodeKind::Update: {
             const auto& update = node_cast<UpdateNode>(node);
             ColumnDemand below;

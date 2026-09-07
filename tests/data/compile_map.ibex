@@ -1,0 +1,8 @@
+extern fn read_csv(path: String) -> DataFrame from "csv.hpp";
+
+// Row-wise `map { }` on the transpile path (conformance plan W1a): the emitter
+// lowers it to a native `ibex::ops::map` call over the child plan.
+read_csv("data/iris.csv")[map {
+    sl2 = sepal_length * 2.0,
+    kind = species
+}];

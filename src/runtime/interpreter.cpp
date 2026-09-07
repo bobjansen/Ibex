@@ -568,6 +568,36 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             }
             return result;
         }
+        case ir::NodeKind::Map: {
+            // Emitter-only node (see MapNode's doc comment): reached only when
+            // emitted `ibex::ops::map` re-enters the interpreter. Evaluate the
+            // fields row-wise with the shared update evaluator, then keep only
+            // the named columns, in order.
+            const auto& map_node = ir::node_cast<ir::MapNode>(node);
+            if (map_node.children().empty()) {
+                return std::unexpected("map node missing child");
+            }
+            auto child =
+                interpret_node(*map_node.children().front(), registry, scalars, externs, exec);
+            if (!child) {
+                return std::unexpected(child.error());
+            }
+            auto merged = update_table(std::move(child.value()), map_node.fields(), scalars,
+                                       externs, exec);
+            if (!merged) {
+                return std::unexpected(merged.error());
+            }
+            Table out;
+            for (const auto& field : map_node.fields()) {
+                const auto* entry = merged->find_entry(field.alias);
+                if (entry == nullptr) {
+                    return std::unexpected("map: field '" + field.alias +
+                                           "' missing after evaluation");
+                }
+                out.add_column_from(field.alias, *entry);
+            }
+            return out;
+        }
         case ir::NodeKind::Rename: {
             const auto& rename = ir::node_cast<ir::RenameNode>(node);
             if (rename.children().empty()) {

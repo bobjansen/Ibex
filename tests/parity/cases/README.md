@@ -35,4 +35,6 @@ Current markers:
 
 | Case | Reason |
 |------|--------|
-| `map_rows` | W1a — `ibex_compile` has no `MapNode` case |
+| _(none)_ | |
+
+W1a (`map { }` on `ibex_compile`) is closed — `map_rows` runs for real.

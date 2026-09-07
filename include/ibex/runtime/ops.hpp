@@ -107,6 +107,11 @@ void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto rename(const runtime::Table& t, const std::vector<ir::RenameSpec>& renames)
     -> runtime::Table;
 
+/// Row-wise `map { alias = expr, ... }`: one row per input row, only the named
+/// columns. Emitted by `ibex_compile` for a `map` clause.
+[[nodiscard]] auto map(const runtime::Table& t, const std::vector<ir::FieldSpec>& fields)
+    -> runtime::Table;
+
 [[nodiscard]] auto as_timeframe(const runtime::Table& t, const std::string& column)
     -> runtime::Table;
 

@@ -250,7 +250,32 @@ extern-arg ABI).
 
 ---
 
-## W3 — user functions on surfaces 1 & 2
+## W3 — user functions on surfaces 1 & 2 — **DONE** (2026-09-07, uncommitted)
+
+Both halves landed:
+- **S2 decline removed** (`try_execute_whole_script`): `fn` declarations no
+  longer force the statement path. `lower_script` registers them
+  (`collect_declaration`) and inlines scalar/aggregate/table UDF calls; a shape
+  it still can't lower declines with its own "did not lower" reason (→ S3).
+- **Table-UDF inliner** (`Lowerer::inline_table_udf`, called from
+  `lower_table_call` when the callee is a registered `fn`, not a table extern):
+  lowers each argument in the caller's scope, installs `DataFrame`/`TimeFrame`
+  params as IR bindings (shadowing + restore) and scalar params into a fresh
+  `inline_scopes_` frame, folds body `let`s the same way, then lowers the
+  body's trailing expression. `inlinable_body_shape` (lets + one trailing
+  expr); direct recursion rejected via `inlining_active_`. `bindings_ == nullptr`
+  (statement-path lowering) → not inlinable.
+
+So `ibex_compile` now transpiles a script whose result routes through a
+table-returning `fn`, and the whole-script planner plans function-organised
+scripts. Test: `tests/parity/cases/table_udf.ibex` (transpile+match),
+`tests/test_lower.cpp` (inline shape, recursion rejected).
+
+Still open: `ibex_compile` on `import "fs"; csv_dir_to_parquet(…)` — the stub
+declares a `fn`, and `csv_dir_to_parquet`'s body uses `map` with an **effectful**
+cell, which is W1b, not W3.
+
+### original plan (kept for history)
 
 1. `try_execute_whole_script` (`src/repl/repl.cpp:~5216`): the
    `decline("script declares a function")` is conservative — `lower_script`
@@ -298,7 +323,7 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
 2. ~~**W1a** (`MapNode` + `ibex::ops::map` kernel emit)~~ — **DONE** (kernel
    route, not native loop; see the W1a section above). `emit_raw_expr`-as-C++
    was *not* built, so W2/W4 do not inherit it.
-3. **W3** (functions) — independent, high user value, the S2 half is one line.
+3. ~~**W3** (functions)~~ — **DONE**: S2 decline removed + `inline_table_udf`.
 4. **W2** (top-level non-literal extern args) — emitter half falls out of
    W1a's `emit_raw_expr`; S2 half needs W1b.
 5. **W1b** (runtime extern-expr evaluator) — only if S2 `map` planning or

@@ -5383,9 +5383,10 @@ auto try_execute_whole_script(const parser::Program& program, runtime::ExternReg
     };
 
     for (const auto& stmt : program.statements) {
-        if (std::holds_alternative<parser::FunctionDecl>(stmt)) {
-            return decline("script declares a function");
-        }
+        // A `fn` declaration is no longer a blanket decline: `lower_script`
+        // registers it (`collect_declaration`) and inlines scalar, aggregate,
+        // and table-returning UDF calls. A shape it still cannot lower falls
+        // back to the statement path with its own "did not lower" reason.
         if (std::holds_alternative<parser::TupleLetStmt>(stmt)) {
             return decline("script uses a tuple `let`");
         }

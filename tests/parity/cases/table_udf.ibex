@@ -1,0 +1,11 @@
+// Table-returning user function inlined at its call site (conformance plan W3).
+// `ibex_compile` and the interpreter must agree. Pure (no plugins): a Table
+// literal in, a filter + computed select out, driven through a `fn` that takes
+// a DataFrame and a scalar and has a `let` binding in its body.
+fn top(df: DataFrame, lo: Int) -> DataFrame effects {} {
+    let hits = df[filter v >= lo];
+    hits[select { k, doubled = v * 2 }];
+}
+
+let t = Table { k = ["a", "b", "c", "d"], v = [1, 5, 9, 3] };
+top(t, 4);

@@ -669,8 +669,8 @@ ewma(col, alpha)  // ignores null rows; returns null for an empty group
 
 A null aggregate result behaves like any other null downstream: it broadcasts
 as null in an `update ... by` field (including compound expressions such as
-`sum(x) / count()`), and extracting it with `scalar()` is a runtime error —
-scalars cannot hold null.
+`sum(x) / count()`), and extracting it with `scalar()` yields a **null scalar**
+(Section 6.7, Section 12.2).
 
 IEEE floating-point `NaN`, `+Inf`, and `-Inf` values are **not** null. They are
 stored as ordinary `Float64` payloads and are therefore not skipped
@@ -2364,6 +2364,12 @@ refers to the query enclosing it, and subqueries do not nest.
 `scalar` keeps its two-argument form — `scalar(table, column)` extracts a value
 from a one-row table (Section 12). Arity tells the two apart.
 
+An uncorrelated subquery over an empty input, or one whose aggregate is null (an
+empty or all-null group), yields a **null scalar** (Section 6.7); in
+`filter … == scalar(…)` the comparison is then null and the row is dropped
+(Section 3), matching SQL. For a correlated subquery, a captured key with no
+matching inner rows yields null for that key.
+
 ---
 
 ## 6. Column Resolution Rules
@@ -2486,6 +2492,35 @@ When the operand's schema is not statically known (e.g. an I/O source without an
 ascription), or is **open** (a `*` wildcard schema, which permits unlisted
 columns), these references are validated at run time as before — an absent name
 is not provably missing when extra columns may exist.
+
+### 6.7 Null Scalars
+
+A scalar binding may be null. It carries a value of its scalar type together
+with a validity bit, exactly as a column cell does; a null binding is one whose
+validity bit is clear.
+
+Null scalars arise from `scalar()` on a null cell or an empty one-argument
+subquery (Section 12.2), from a scalar-context aggregate over no valid
+observations (`scalar(t[select { m = mean(x) }])` on an empty `t`), and from an
+extern whose declared return type admits null.
+
+A null scalar **propagates** through arithmetic, comparison, scalar functions,
+and `${}` interpolation under the ordinary null rules of Section 3
+(`null + x = null`, `null > x = null`, `abs(null) = null`,
+`` `px=${null}` `` renders `null`). `is null` / `is not null`, `coalesce`, and
+`fill_null` consume it. A cast of null is null of the target type.
+
+A null scalar is a **runtime error** only where a value must be present:
+
+- a row-count expression — `take`, `head`, `tail`, `rep`'s length, a `Table(n)` /
+  `Series(n)` dimension, an RNG shape argument;
+- a per-call rolling window size (`__window_n` / `__window_ns`);
+- an argument to an extern parameter that is not declared nullable — checked
+  statically where provable, otherwise at the call.
+
+It is **not** an error as the right-hand side of a `filter` comparison: the
+comparison is then null and the row is dropped (Section 3), which matches SQL's
+scalar-subquery behaviour.
 
 ---
 
@@ -3249,7 +3284,10 @@ Extern function parameters may be any scalar type (`Int`, `Int64`, `Float64`,
 supported in the current runtime.
 
 Return types may be scalar or table types (`DataFrame`, `TimeFrame`). Extern
-functions cannot return `Series`.
+functions cannot return `Series`. A scalar return may be null; the caller
+receives a null scalar and the rules of Section 6.7 apply. An extern never
+receives a null argument — a null reaching a non-nullable parameter is rejected
+before the call (Section 6.7).
 
 ### 11.3 Calling Convention
 
@@ -3410,9 +3448,13 @@ scalar(df: DataFrame<S>, col: Ident) -> T
 ```
 
 Extracts a single scalar from a one-row DataFrame. `col` names a column in `S`.
-It is a runtime error if the DataFrame has any row count other than 1, or if
-the cell is null — scalar bindings cannot hold null (test with `is null` or
-fill with `coalesce` first).
+If the single cell is null, the result is a **null scalar** of `col`'s type
+(Section 6.7). It is a runtime error if the DataFrame has any row count other
+than 1 — **except** for the one-argument form `scalar(<table>)` (the table must
+have exactly one column), where a zero-row input yields a null scalar. This is
+the form a correlated/uncorrelated subquery takes in a `filter` predicate
+(Section 5.7); as a plain value expression it is the way to read an optional
+lookup that may match nothing.
 
 ### 12.3 Join Functions
 

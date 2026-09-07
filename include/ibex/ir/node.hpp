@@ -213,6 +213,23 @@ struct Expr {
     return (ref != nullptr && ref->lexical) ? nullptr : ref;
 }
 
+/// A scalar `let` whose value is not a compile-time constant -- it contains a
+/// `scalar(<table>)` subquery (possibly wrapped in scalar ops such as a cast).
+/// The compiled path and the interpreter reference both evaluate it at run time
+/// (runtime::materialize_deferred_scalar_bindings), in declaration order, after
+/// the compile-time bindings and before the main pipeline.
+struct DeferredScalarSource {
+    std::string tmp_name;               ///< ScalarRegistry key the extracted value lands under
+    NodePtr plan;                       ///< a one-column table plan
+    std::optional<std::string> column;  ///< nullopt: sole column (one-arg scalar())
+};
+
+struct DeferredScalarBinding {
+    std::string name;
+    std::vector<DeferredScalarSource> sources;
+    Expr value;  ///< residual scalar expr; each scalar(...) is a lexical ref to its source's tmp_name
+};
+
 inline ExprPtr::ExprPtr() = default;
 
 inline ExprPtr::ExprPtr(std::nullptr_t) noexcept {}

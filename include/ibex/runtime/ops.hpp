@@ -30,6 +30,17 @@ struct TupleSource {
 void set_scalars(const runtime::ScalarRegistry* scalars);
 [[nodiscard]] auto eval_row_count(const ir::Expr& expr) -> std::size_t;
 
+/// Extract a scalar (possibly null) from a subquery result table. With
+/// `zero_rows_is_null`, an empty table yields null (one-arg `scalar(<table>)`);
+/// `column` empty means "the sole column". Used by deferred scalar `let`s.
+[[nodiscard]] auto scalar_of_table(const runtime::Table& table, const std::string& column,
+                                   bool zero_rows_is_null) -> runtime::ScalarValue;
+
+/// Evaluate a scalar expression against the current scalar registry
+/// (set via set_scalars). Used by deferred scalar `let`s for the residual
+/// expression (a cast / coalesce over the extracted value).
+[[nodiscard]] auto eval_scalar(const ir::Expr& expr) -> runtime::ScalarValue;
+
 // ─── Core table operations ────────────────────────────────────────────────────
 //  These are the functions emitted by ibex_compile into the generated C++ file.
 

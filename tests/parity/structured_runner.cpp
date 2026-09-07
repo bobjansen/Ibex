@@ -32,14 +32,20 @@ auto main(int argc, char* const* argv) -> int {
     }
     // Scalar `let` bindings are not lowered into IR — reconstruct the registry
     // the same way ibex_compile does so the interpreter reference resolves them.
-    auto scalar_bindings = ibex::parser::collect_scalar_bindings(*parsed);
+    auto scalar_bindings = ibex::parser::collect_scalar_binding_set(*parsed);
     if (!scalar_bindings) {
         std::cerr << scalar_bindings.error() << '\n';
         return 1;
     }
     ibex::runtime::ScalarRegistry scalars;
-    for (auto& [name, value] : *scalar_bindings) {
+    for (auto& [name, value] : scalar_bindings->compile_time) {
         scalars[name] = std::move(value);
+    }
+    if (auto ok = ibex::runtime::materialize_deferred_scalar_bindings(scalar_bindings->deferred, {},
+                                                                      scalars, nullptr);
+        !ok) {
+        std::cerr << ok.error() << '\n';
+        return 1;
     }
     auto interpreted = ibex::runtime::interpret(**lowered, {}, &scalars);
     if (!interpreted) {

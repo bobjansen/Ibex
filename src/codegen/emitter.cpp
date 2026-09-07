@@ -123,7 +123,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
         out << "int main() {\n";
     }
 
-    if (!config.scalar_bindings.empty()) {
+    const bool has_scalars =
+        !config.scalar_bindings.empty() || !config.deferred_scalar_bindings.empty();
+    if (has_scalars) {
         out << "    ibex::runtime::ScalarRegistry _ibex_scalars;\n";
         for (const auto& [name, value] : config.scalar_bindings) {
             out << "    _ibex_scalars[\"" << escape_string(name) << "\"] = ";
@@ -154,6 +156,26 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
             out << ";\n";
         }
         out << "    ibex::ops::set_scalars(&_ibex_scalars);\n\n";
+
+        // Deferred scalar `let`s: run each subplan, extract, then evaluate the
+        // residual expression against the registry. Same order and semantics as
+        // runtime::materialize_deferred_scalar_bindings.
+        for (const auto& binding : config.deferred_scalar_bindings) {
+            for (const auto& source : binding.sources) {
+                out << "    {\n";
+                auto src_var = emit_node(*source.plan);
+                out << "        _ibex_scalars[\"" << escape_string(source.tmp_name)
+                    << "\"] = ibex::ops::scalar_of_table(" << src_var << ", \""
+                    << escape_string(source.column.value_or("")) << "\", "
+                    << (source.column.has_value() ? "false" : "true") << ");\n";
+                out << "    }\n";
+            }
+            out << "    _ibex_scalars[\"" << escape_string(binding.name)
+                << "\"] = ibex::ops::eval_scalar(" << emit_expr(binding.value) << ");\n";
+        }
+        if (!config.deferred_scalar_bindings.empty()) {
+            out << "\n";
+        }
     }
 
     if (config.bench_mode) {

@@ -107,6 +107,8 @@ auto eval_scalar(const ir::Expr& expr) -> runtime::ScalarValue {
     return std::move(*value);
 }
 
+auto scalar_arg(const ir::Expr& expr) -> ScalarArg { return ScalarArg{eval_scalar(expr)}; }
+
 auto filter(const runtime::Table& t, ir::Expr pred) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);

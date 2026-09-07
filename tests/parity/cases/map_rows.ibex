@@ -1,0 +1,18 @@
+// Row-wise `map { }` clause (SPEC 5.3). Pure — no plugins — so the parity
+// harness runs it without a plugin search path. Marked `.unsupported` for
+// ibex_compile: see plans/ibex-compile-conformance-plan.md workstream W1a.
+//
+// `map` is kept as the whole trailing expression (not `t[map{}][order{}]`):
+// the interpreter's Slice-1 peel only fires on the outermost trailing clause,
+// so a chained block still hits the lowering guard. W1a's real MapNode lowering
+// removes that restriction. Input row order is the output order here.
+let t = Table {
+    n = [1, 2, 3, 4],
+    label = ["a", "b", "c", "d"]
+};
+
+t[map {
+    doubled = n * 2,
+    parity = n % 2,
+    tag = label
+}];

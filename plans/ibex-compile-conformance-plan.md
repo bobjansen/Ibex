@@ -83,22 +83,29 @@ Nothing tells you the surfaces have diverged until a user hits it.
 
 ---
 
-## Step 0 — make divergence loud (do this first)
+## Step 0 — make divergence loud — **DONE** (`tests/parity/`)
 
-Upgrade the parity harness from allowlist to **conformance gate**:
+The parity harness (`tests/parity/run_parity.sh`, ctest
+`ibex_parity_interpreter_vs_transpiled`) is now a **conformance gate**:
 
-1. Every `.ibex` under `tests/parity/cases/` that surface 3 runs must also
-   transpile+run on surface 1 **or** carry a sibling `<name>.unsupported`
-   marker file with a one-line reason. A case that neither matches nor is
-   marked fails the test.
-2. Add a `tests/parity/cases/` case for *each* construct in the matrix above —
-   the ones that fail get `.unsupported` markers naming their workstream. This
-   turns the matrix into executable state: closing a workstream = deleting its
-   markers.
-3. Point `plans/README.md` and this file's matrix at the marker set as the
-   source of truth.
+- Every `cases/<name>.ibex` must transpile+match on `ibex_compile` **or** carry
+  a `cases/<name>.unsupported` marker whose first line is a one-line reason.
+- A marked case is instead checked two ways: `ibex_eval` must still run it
+  (valid Ibex / interpreter regression guard) and `ibex_compile` must still
+  reject it (**stale-marker detection** — a marker that starts passing fails
+  the suite so it gets deleted).
+- An unmarked case that does not transpile fails with instructions.
+- Orphan markers (no `.ibex`) fail.
 
-`tests/parity/structured_runner.cpp` + `run_parity.sh` are the files.
+`cases/README.md` documents the convention and lists current markers.
+Seeded with `cases/map_rows.ibex` + `.unsupported` (W1a). **Remaining matrix
+constructs get a marked case as their workstream is picked up** — adding a
+broken `model {}` / window case now, before W4/W5, just risks a flaky
+`ibex_eval` sanity check. Closing a workstream = deleting its marker(s).
+
+**Known Slice-1 limitation surfaced while writing the case:** the S3 `map`
+peel only fires on the *outermost trailing* clause, so `t[map{}][order{}]`
+still hits the lowering guard. W1a's real `MapNode` lowering removes this.
 
 ---
 
@@ -252,8 +259,7 @@ has been chased one combo at a time — W5 is finishing that list. Lower priorit
 
 ## Sequencing
 
-1. **Step 0** (parity conformance gate) — first; everything is measured
-   against it.
+1. ~~**Step 0** (parity conformance gate)~~ — **DONE**.
 2. **W1a** (`MapNode` + native-loop emit) — self-contained, no runtime
    changes, delivers `map` on `ibex_compile`. This is the emitter learning to
    emit real code; `emit_raw_expr`-as-C++ is reused by W2 and W4.

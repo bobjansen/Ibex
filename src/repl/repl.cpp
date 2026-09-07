@@ -1104,7 +1104,31 @@ auto build_builtin_tables() -> runtime::TableRegistry {
     return registry;
 }
 
-void print_table(const runtime::Table& table, std::size_t max_rows = 10) {
+// Row cap for rendered tables. `IBEX_MAX_ROWS` overrides the default of 10
+// (`IBEX_MAX_ROWS=0` or "all" prints every row) — handy for scripts that dump a
+// full results table. Explicit callers (`:head <table> n`) pass their own count.
+std::size_t default_max_rows() {
+    const char* env = std::getenv("IBEX_MAX_ROWS");
+    if (env == nullptr || env[0] == '\0') {
+        return 10;
+    }
+    if (std::string_view{env} == "all") {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (end == env || *end != '\0') {
+        return 10;
+    }
+    return parsed == 0 ? std::numeric_limits<std::size_t>::max()
+                       : static_cast<std::size_t>(parsed);
+}
+
+void print_table(const runtime::Table& table) {
+    runtime::format_table(table, std::cout, default_max_rows());
+}
+
+void print_table(const runtime::Table& table, std::size_t max_rows) {
     runtime::format_table(table, std::cout, max_rows);
 }
 

@@ -1355,6 +1355,16 @@ auto evaluate_row_count_expr(const ir::Expr& expr, const ScalarRegistry* scalars
     return evaluate_row_count_expr_impl(expr, scalars, externs);
 }
 
+auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars,
+                          const ExternRegistry* externs)
+    -> std::expected<ScalarValue, std::string> {
+    auto value = eval_expr(expr, Table{}, 0, scalars, externs);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    return scalar_from_expr(*value);
+}
+
 auto merge_validity_bitmaps(const ValidityBitmap* a, const ValidityBitmap* b, std::size_t n)
     -> std::optional<ValidityBitmap> {
     return merge_validity(a, 0, b, 0, n);
@@ -1549,6 +1559,40 @@ auto extract_scalar(const Table& table, const std::string& column, bool zero_row
         return ScalarValue{std::monostate{}};
     }
     return scalar_from_column(*entry->column, 0);
+}
+
+auto materialize_deferred_scalar_bindings(std::span<const ir::DeferredScalarBinding> bindings,
+                                          const TableRegistry& tables, ScalarRegistry& scalars,
+                                          const ExternRegistry* externs)
+    -> std::expected<void, std::string> {
+    for (const auto& binding : bindings) {
+        for (const auto& source : binding.sources) {
+            if (source.plan == nullptr) {
+                return std::unexpected("deferred scalar '" + binding.name + "': missing subplan");
+            }
+            auto table = interpret(*source.plan, tables, &scalars, externs);
+            if (!table) {
+                return std::unexpected("deferred scalar '" + binding.name + "': " + table.error());
+            }
+            std::string column = source.column.value_or(
+                table->columns.empty() ? std::string{} : table->columns.front().name);
+            if (!source.column.has_value() && table->columns.size() != 1) {
+                return std::unexpected("scalar(<table>): '" + binding.name +
+                                       "' subquery must have exactly one column");
+            }
+            auto value = extract_scalar(*table, column, /*zero_rows_is_null=*/!source.column);
+            if (!value) {
+                return std::unexpected("deferred scalar '" + binding.name + "': " + value.error());
+            }
+            scalars[source.tmp_name] = std::move(*value);
+        }
+        auto result = eval_expr(binding.value, Table{}, 0, &scalars, externs);
+        if (!result) {
+            return std::unexpected("deferred scalar '" + binding.name + "': " + result.error());
+        }
+        scalars[binding.name] = scalar_from_expr(*result);
+    }
+    return {};
 }
 
 auto is_scalar_builtin(std::string_view name) -> bool {

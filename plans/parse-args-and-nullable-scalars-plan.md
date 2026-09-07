@@ -56,6 +56,81 @@ never produces one so it's unreachable); per-call rolling `__window_n` /
 type (`infer_expr_type` falls through to String); the one-arg `scalar(<table>)`
 form is REPL-only — not wired in `lower.cpp` for the compiled path.
 
+### Part 1c — runtime scalar `let` bindings in the compiled path (REQUIRED for Part 2)
+
+**LANDED (uncommitted, 2026-09-07).** `let n = scalar(<table>)`,
+`let n = <cast>(scalar(...))`, and `let n = coalesce(scalar(...), <literal>)`
+now compile. Parity green (32 cases incl. new `deferred_scalar_let`), full unit
+suite green.
+
+- `ir::DeferredScalarBinding` / `DeferredScalarSource` in `ir/node.hpp`.
+- `parser::collect_scalar_binding_set` → `{compile_time, deferred}`;
+  `try_build_deferred_scalar_binding` recognizes the three shapes, lowers the
+  subquery table, builds the residual `ir::Expr` (lexical ref / cast call /
+  coalesce call). Records each table let's schema + name so later lets resolve.
+- `lower.cpp::is_deferred_scalar_let_shape` — the whole-program lowerer skips
+  these lets (like a plain scalar let).
+- `runtime::materialize_deferred_scalar_bindings` (shared by the interpreter
+  reference) + `runtime::evaluate_scalar_expr`; `ops::scalar_of_table` /
+  `ops::eval_scalar` for the emitted code.
+- `emitter.cpp` emits each subplan + the two registry inserts before the query;
+  `ibex_compile.cpp` / `structured_runner.cpp` wire the new return shape.
+
+**Not done:** residual shapes beyond one cast / one coalesce (e.g.
+`scalar(a) + scalar(b)`, arithmetic chains) still error; a deferred binding
+can't be referenced by a *later compile-time* scalar let (`eval_scalar_expr`'s
+env doesn't see it).
+
+
+`ibex_compile` only supports **compile-time** scalar lets (`collect_scalar_bindings`
+folds literal/arithmetic). `let n = scalar(<table>)` — and anything built on it,
+`let n = Int64(scalar(...))` — errors: "unsupported scalar let". `parse_args`
+needs exactly this shape in compiled scripts, so it must be added, at parity with
+the interpreter reference.
+
+**No parity gap exists today** — the constructs that could diverge aren't
+supported by `ibex_compile` at all (verified: 31/31 parity cases green after
+slices 1–2, incl. `correlated_scalar_subquery`). This is a *new capability*, not
+a divergence fix.
+
+**Design.** A runtime scalar let decomposes into:
+
+```
+DeferredScalarBinding {
+  name;                                        // the let name
+  sources: [(tmp_name, ir::NodePtr subplan)];  // each subplan is a 1-column table
+  value: ir::Expr;                             // residual scalar expr; each
+                                               // scalar(<table>) replaced by a
+                                               // lexical ref to its tmp_name
+}
+```
+
+Execution (a shared runtime helper, called by both the emitter's output and the
+interpreter reference):
+
+1. for each `(tmp, subplan)`: `interpret(subplan)` → `extract_scalar(result,
+   <sole column>, zero_rows_is_null=true)` → store `tmp` in the `ScalarRegistry`.
+2. `eval_expr(value, {}, 0, &scalars, externs)` → `scalar_from_expr` → store
+   `name`. (`value` for a bare `scalar()` is just `lexical_ref(tmp)`.)
+
+Deferred bindings run in declaration order, after the compile-time ones, before
+the main pipeline — they may reference earlier bindings.
+
+**Touch list:**
+- `scalar_bindings.hpp` — `collect_scalar_bindings` returns
+  `{compile_time, deferred}`; walk the let-value AST, lower each `scalar(...)`
+  inner table via `lower_expr`, substitute a tmp ref, keep the residual.
+- runtime — `materialize_deferred_scalar_bindings(std::span<const
+  DeferredScalarBinding>, TableRegistry&, ScalarRegistry&, const ExternRegistry*)`.
+- `ops.hpp` — `eval_scalar(const ir::Expr&) -> ScalarValue`,
+  `scalar_of_table(const Table&) -> ScalarValue`.
+- `emitter.cpp` — emit each subplan via `emit_node`, then the two `_ibex_scalars`
+  inserts, before `set_scalars`.
+- `ibex_compile.cpp`, `tests/parity/structured_runner.cpp` — wire the new return
+  shape.
+- parity case: `let n = scalar(t[...select{x}]); u[filter k == n]` and
+  `let n = Int64(scalar(...))`.
+
 ### Semantics
 
 A scalar binding carries a value of its scalar type **plus a validity bit**,

@@ -81,6 +81,32 @@ auto eval_row_count(const ir::Expr& expr) -> std::size_t {
     return *count;
 }
 
+auto scalar_of_table(const runtime::Table& table, const std::string& column, bool zero_rows_is_null)
+    -> runtime::ScalarValue {
+    std::string col = column;
+    if (col.empty()) {
+        if (!zero_rows_is_null && table.columns.size() != 1) {
+            throw std::runtime_error("scalar(<table>): subquery must have exactly one column");
+        }
+        if (!table.columns.empty()) {
+            col = table.columns.front().name;
+        }
+    }
+    auto value = runtime::extract_scalar(table, col, zero_rows_is_null);
+    if (!value) {
+        throw std::runtime_error(value.error());
+    }
+    return std::move(*value);
+}
+
+auto eval_scalar(const ir::Expr& expr) -> runtime::ScalarValue {
+    auto value = runtime::evaluate_scalar_expr(expr, scalars_ptr(), nullptr);
+    if (!value) {
+        throw std::runtime_error(value.error());
+    }
+    return std::move(*value);
+}
+
 auto filter(const runtime::Table& t, ir::Expr pred) -> runtime::Table {
     ir::Builder b;
     auto scan_node = b.scan(kSrcKey);

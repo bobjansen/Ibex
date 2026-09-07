@@ -38,6 +38,10 @@ class Emitter {
         /// Scalar bindings captured from `let` statements and initialized
         /// before the emitted query executes.
         std::vector<std::pair<std::string, ScalarValue>> scalar_bindings;
+        /// Scalar `let`s whose value is a `scalar(<table>)` subquery: their
+        /// subplans run and the value is extracted into the registry at run
+        /// time, in order, after `scalar_bindings` and before the query.
+        std::vector<ir::DeferredScalarBinding> deferred_scalar_bindings;
         /// Whether to emit ibex::ops::print() for the final result.
         bool print_result = true;
         /// Emit a self-contained benchmark harness: data is loaded once

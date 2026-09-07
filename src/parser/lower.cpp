@@ -40,6 +40,37 @@ namespace ibex::parser {
 
 namespace {
 
+// A `let` whose RHS is a `scalar(<table>)` subquery -- optionally wrapped in one
+// scalar cast, or `coalesce(_, <literal>)`. These are runtime scalar bindings:
+// `collect_scalar_binding_set` turns them into ir::DeferredScalarBinding, and
+// the whole-program lowerer must skip them the same way it skips a plain scalar
+// `let` (they have no place in the relational result tree).
+[[nodiscard]] auto is_deferred_scalar_let_shape(const Expr& value) -> bool {
+    const auto* outer = std::get_if<CallExpr>(&value.node);
+    if (outer == nullptr) {
+        return false;
+    }
+    const auto is_scalar_call = [](const Expr& e) {
+        const auto* c = std::get_if<CallExpr>(&e.node);
+        return c != nullptr && c->callee == "scalar" && !c->args.empty() && c->args.size() <= 2;
+    };
+    if (outer->callee == "scalar") {
+        return !outer->args.empty() && outer->args.size() <= 2;
+    }
+    const bool is_cast = outer->callee == "Int64" || outer->callee == "Int32" ||
+                         outer->callee == "Int" || outer->callee == "Float64" ||
+                         outer->callee == "Float32" || outer->callee == "Date" ||
+                         outer->callee == "Timestamp";
+    if (is_cast && outer->args.size() == 1) {
+        return is_scalar_call(*outer->args[0]);
+    }
+    if (outer->callee == "coalesce" && outer->args.size() == 2) {
+        return is_scalar_call(*outer->args[0]) &&
+               std::holds_alternative<LiteralExpr>(outer->args[1]->node);
+    }
+    return false;
+}
+
 struct LoweredAggList {
     std::vector<ir::AggSpec> aggs;
     std::vector<ir::FieldSpec> preagg_updates;
@@ -1420,6 +1451,11 @@ class Lowerer {
                     // Scalar let bindings are handled by the REPL/tooling layer;
                     // the IR lowerer only needs to accept them so later table
                     // expressions can still be lowered.
+                    if (is_deferred_scalar_let_shape(*let_stmt.value)) {
+                        // A runtime scalar(<table>) binding: collected separately
+                        // into ir::DeferredScalarBinding; nothing to lower here.
+                        continue;
+                    }
                     auto scalar = lower_expr_to_ir(*let_stmt.value);
                     if (!scalar.has_value()) {
                         if (infer_compile_time_list(*let_stmt.value).has_value()) {

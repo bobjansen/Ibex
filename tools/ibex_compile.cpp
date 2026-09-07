@@ -78,7 +78,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto scalar_bindings = ibex::parser::collect_scalar_bindings(*scalar_program);
+    auto scalar_bindings = ibex::parser::collect_scalar_binding_set(*scalar_program);
     if (!scalar_bindings) {
         std::cerr << "ibex_compile: " << scalar_bindings.error() << "\n";
         return 1;
@@ -105,7 +105,8 @@ int main(int argc, char* argv[]) {
     config.bench_mode = bench;
     config.bench_warmup = bench_warmup;
     config.bench_iters = bench_iters;
-    config.scalar_bindings = std::move(*scalar_bindings);
+    config.scalar_bindings = std::move(scalar_bindings->compile_time);
+    config.deferred_scalar_bindings = std::move(scalar_bindings->deferred);
     {
         robin_hood::unordered_set<std::string> seen_headers;
         for (const auto& stmt : program->statements) {

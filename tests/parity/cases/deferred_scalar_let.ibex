@@ -1,0 +1,14 @@
+// Runtime scalar `let` bindings: the RHS is a scalar(<table>) subquery, so the
+// value is not known at compile time -- both the interpreter reference and the
+// emitted C++ must run the subplan, extract the scalar, and agree.
+//   threshold: a plain scalar(<one-column table>)
+//   cap:       Int64(scalar(...)) -- a cast over the extracted value
+//   floor:     coalesce(scalar(<empty subquery>), 25) -- null recovered to 25
+let prices = Table { sym = ["A", "B", "C", "D", "E"], px = [10, 20, 30, 40, 50] };
+let threshold = scalar(prices[filter sym == "B", select { px }]);
+let cap = Int64(scalar(prices[filter sym == "D", select { px }]));
+let floor = coalesce(scalar(prices[filter sym == "Z", select { px }]), 25);
+
+prices[
+    filter px >= threshold && px <= cap && px >= floor
+][select { sym, px }][order { px asc }];

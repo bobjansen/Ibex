@@ -18,8 +18,11 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <robin_hood.h>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -139,13 +142,141 @@ using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std
     return std::unexpected("unsupported scalar expression");
 }
 
-// Walk a program's top-level statements and evaluate every scalar `let`,
-// returning them in declaration order. Table-valued lets are lowered (so later
-// scalar lets can reference them via the shared LowerContext) but not returned.
-[[nodiscard]] inline auto collect_scalar_bindings(const Program& program)
-    -> std::expected<std::vector<std::pair<std::string, ScalarValue>>, std::string> {
-    std::vector<std::pair<std::string, ScalarValue>> ordered;
+// Scalar `let` bindings split by how they are evaluated: `compile_time` folds
+// to a constant during lowering; `deferred` contains a `scalar(<table>)`
+// subquery and is evaluated at run time (both by the interpreter reference and
+// by the emitted C++) via runtime::materialize_deferred_scalar_bindings.
+struct ScalarBindingSet {
+    std::vector<std::pair<std::string, ScalarValue>> compile_time;
+    std::vector<ir::DeferredScalarBinding> deferred;
+};
+
+[[nodiscard]] inline auto is_scalar_cast_name(std::string_view callee) -> bool {
+    return callee == "Int64" || callee == "Int32" || callee == "Int" || callee == "Float64" ||
+           callee == "Float32" || callee == "Date" || callee == "Timestamp";
+}
+
+[[nodiscard]] inline auto ir_literal_from_ast(const Expr& expr) -> std::optional<ir::Literal> {
+    const auto* lit = std::get_if<LiteralExpr>(&expr.node);
+    if (lit == nullptr) {
+        return std::nullopt;
+    }
+    return std::visit(
+        [](const auto& v) -> std::optional<ir::Literal> {
+            if constexpr (std::is_same_v<std::decay_t<decltype(v)>, DurationLiteral>) {
+                return std::nullopt;
+            } else {
+                return ir::Literal{.value = v};
+            }
+        },
+        lit->value);
+}
+
+[[nodiscard]] inline auto ast_column_name(const Expr& expr) -> std::optional<std::string> {
+    if (const auto* id = std::get_if<IdentifierExpr>(&expr.node)) {
+        return id->name;
+    }
+    if (const auto* lit = std::get_if<LiteralExpr>(&expr.node)) {
+        if (const auto* s = std::get_if<std::string>(&lit->value)) {
+            return *s;
+        }
+    }
+    return std::nullopt;
+}
+
+// Recognize a `let name = <value>` whose RHS is a `scalar(<table>)` subquery,
+// optionally wrapped in one scalar cast or a `coalesce(_, <literal>)`. Returns
+// nullopt when `value` is not one of those shapes (the caller then treats it as
+// a plain scalar let). A recognized-but-malformed shape returns an error.
+[[nodiscard]] inline auto try_build_deferred_scalar_binding(const std::string& name,
+                                                            const Expr& value, LowerContext& ctx,
+                                                            int& counter)
+    -> std::optional<std::expected<ir::DeferredScalarBinding, std::string>> {
+    using Ret = std::expected<ir::DeferredScalarBinding, std::string>;
+    const auto* outer = std::get_if<CallExpr>(&value.node);
+    if (outer == nullptr) {
+        return std::nullopt;
+    }
+
+    const CallExpr* scalar_call = nullptr;
+    enum class Wrap : std::uint8_t { Bare, Cast, Coalesce } wrap = Wrap::Bare;
+    std::optional<ir::Literal> coalesce_default;
+    if (outer->callee == "scalar") {
+        scalar_call = outer;
+    } else if (is_scalar_cast_name(outer->callee) && outer->args.size() == 1) {
+        scalar_call = std::get_if<CallExpr>(&outer->args[0]->node);
+        wrap = Wrap::Cast;
+    } else if (outer->callee == "coalesce" && outer->args.size() == 2) {
+        scalar_call = std::get_if<CallExpr>(&outer->args[0]->node);
+        coalesce_default = ir_literal_from_ast(*outer->args[1]);
+        wrap = Wrap::Coalesce;
+        if (!coalesce_default.has_value()) {
+            return std::nullopt;  // non-literal default is not a v1 deferred shape
+        }
+    } else {
+        return std::nullopt;
+    }
+    if (scalar_call == nullptr || scalar_call->callee != "scalar") {
+        return std::nullopt;
+    }
+    if (scalar_call->args.empty() || scalar_call->args.size() > 2) {
+        return std::nullopt;
+    }
+
+    auto plan = lower_expr(*scalar_call->args[0], ctx);
+    if (!plan.has_value()) {
+        return Ret{std::unexpected("scalar let '" + name +
+                                   "': scalar() argument is not a table: " + plan.error().message)};
+    }
+    std::optional<std::string> column;
+    if (scalar_call->args.size() == 2) {
+        column = ast_column_name(*scalar_call->args[1]);
+        if (!column.has_value()) {
+            return Ret{std::unexpected("scalar let '" + name +
+                                       "': scalar() column must be an identifier or string")};
+        }
+    }
+
+    std::string tmp = "__ibex_scalar_src_" + std::to_string(counter++);
+    ir::Expr ref{.node = ir::ColumnRef{.name = tmp, .lexical = true}};
+    ir::Expr residual;
+    switch (wrap) {
+        case Wrap::Bare:
+            residual = std::move(ref);
+            break;
+        case Wrap::Cast: {
+            ir::CallExpr call;
+            call.callee = outer->callee;
+            call.args.emplace_back(std::move(ref));
+            residual = ir::Expr{.node = std::move(call)};
+            break;
+        }
+        case Wrap::Coalesce: {
+            ir::CallExpr call;
+            call.callee = "coalesce";
+            call.args.emplace_back(std::move(ref));
+            call.args.emplace_back(ir::Expr{.node = std::move(*coalesce_default)});
+            residual = ir::Expr{.node = std::move(call)};
+            break;
+        }
+    }
+
+    ir::DeferredScalarBinding binding;
+    binding.name = name;
+    binding.sources.push_back(ir::DeferredScalarSource{
+        .tmp_name = std::move(tmp), .plan = std::move(plan.value()), .column = std::move(column)});
+    binding.value = std::move(residual);
+    return Ret{std::move(binding)};
+}
+
+// Walk a program's top-level statements and classify every scalar `let`.
+// Table-valued lets are lowered (so later scalar lets and subqueries can
+// reference them via the shared LowerContext) but not returned.
+[[nodiscard]] inline auto collect_scalar_binding_set(const Program& program)
+    -> std::expected<ScalarBindingSet, std::string> {
+    ScalarBindingSet out;
     robin_hood::unordered_map<std::string, ScalarValue> env;
+    int deferred_counter = 0;
 
     LowerContext lower_ctx;
 
@@ -174,20 +305,55 @@ using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std
 
         auto table_result = lower_expr(*let_stmt->value, lower_ctx);
         if (table_result) {
+            // Record the binding's schema so a later scalar(<table>) subquery
+            // or table let that references it can resolve its columns.
+            if (auto schema = ir::infer_schema(*table_result.value(), lower_ctx.source_schemas);
+                schema.is_known()) {
+                lower_ctx.source_schemas.insert_or_assign(let_stmt->name, std::move(schema));
+            }
             lower_ctx.bindings[let_stmt->name] = std::move(table_result.value());
+            lower_ctx.lexical_names.insert(let_stmt->name);
             continue;
         }
 
         auto scalar_result = eval_scalar_expr(*let_stmt->value, env);
-        if (!scalar_result) {
-            return std::unexpected("unsupported scalar let '" + let_stmt->name +
-                                   "': " + scalar_result.error());
+        if (scalar_result) {
+            env[let_stmt->name] = scalar_result.value();
+            out.compile_time.emplace_back(let_stmt->name, scalar_result.value());
+            // Later table lets may filter/compute against this scalar; a bare
+            // name there must resolve as a binding, not a missing column.
+            lower_ctx.lexical_names.insert(let_stmt->name);
+            continue;
         }
-        env[let_stmt->name] = scalar_result.value();
-        ordered.emplace_back(let_stmt->name, scalar_result.value());
+
+        if (auto deferred =
+                try_build_deferred_scalar_binding(let_stmt->name, *let_stmt->value, lower_ctx,
+                                                  deferred_counter);
+            deferred.has_value()) {
+            if (!deferred->has_value()) {
+                return std::unexpected(deferred->error());
+            }
+            out.deferred.push_back(std::move(deferred->value()));
+            lower_ctx.lexical_names.insert(let_stmt->name);
+            continue;
+        }
+
+        return std::unexpected("unsupported scalar let '" + let_stmt->name +
+                               "': " + scalar_result.error());
     }
 
-    return ordered;
+    return out;
+}
+
+// Backwards-compatible: the compile-time bindings only. Prefer
+// collect_scalar_binding_set for paths that must also honour deferred bindings.
+[[nodiscard]] inline auto collect_scalar_bindings(const Program& program)
+    -> std::expected<std::vector<std::pair<std::string, ScalarValue>>, std::string> {
+    auto set = collect_scalar_binding_set(program);
+    if (!set) {
+        return std::unexpected(set.error());
+    }
+    return std::move(set->compile_time);
 }
 
 }  // namespace ibex::parser

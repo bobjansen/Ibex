@@ -86,6 +86,10 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
     out_ = &out;
     tmp_counter_ = 0;
     cached_vars_.clear();
+    compile_time_scalars_.clear();
+    for (const auto& [name, value] : config.scalar_bindings) {
+        compile_time_scalars_.emplace(name, value);
+    }
 
     // Preamble
     if (!config.source_name.empty()) {
@@ -1411,6 +1415,36 @@ auto Emitter::emit_raw_expr(const ir::Expr& expr) -> std::string {
     return std::visit(
         [&](const auto& node) -> std::string {
             using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, ir::ColumnRef>) {
+                // Only a compile-time scalar `let` is valid here; emit its value.
+                const auto it = compile_time_scalars_.find(node.name);
+                if (it == compile_time_scalars_.end()) {
+                    throw std::runtime_error("ibex_compile: non-literal argument in extern call: '" +
+                                             node.name + "'");
+                }
+                return std::visit(
+                    [&](const auto& v) -> std::string {
+                        using V = std::decay_t<decltype(v)>;
+                        if constexpr (std::is_same_v<V, std::monostate>) {
+                            throw std::runtime_error(
+                                "ibex_compile: null scalar in extern call argument");
+                        } else if constexpr (std::is_same_v<V, std::int64_t>) {
+                            return std::to_string(v);
+                        } else if constexpr (std::is_same_v<V, double>) {
+                            return format_double(v);
+                        } else if constexpr (std::is_same_v<V, bool>) {
+                            return v ? "1" : "0";
+                        } else if constexpr (std::is_same_v<V, std::string>) {
+                            return "\"" + escape_string(v) + "\"";
+                        } else if constexpr (std::is_same_v<V, Date>) {
+                            return "ibex::Date{std::int32_t{" + std::to_string(v.days) + "}}";
+                        } else {
+                            static_assert(std::is_same_v<V, Timestamp>);
+                            return "ibex::Timestamp{std::int64_t{" + std::to_string(v.nanos) + "}}";
+                        }
+                    },
+                    it->second);
+            }
             if constexpr (std::is_same_v<T, ir::Literal>) {
                 return std::visit(
                     [&](const auto& v) -> std::string {

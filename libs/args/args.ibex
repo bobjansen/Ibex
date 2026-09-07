@@ -1,0 +1,21 @@
+// Declarative command-line argument parsing.
+//
+// `spec` is a newline- or `;`-separated list of option declarations:
+//
+//   <name> [(<aliases>)] : <type><arity?><?> [= <default>] [# help]
+//
+//   <type>  : int | int64 | float | float64 | bool | string | date | timestamp
+//   <arity> : (none, a single --name VALUE) | flag | + | * |
+//             positional | positional+ | positional*
+//   <?>     : trailing `?` makes the option optional (absent -> no row)
+//
+// Returns one row per argument:
+//   kind:  "option" | "flag" | "positional"
+//   name:  canonical option name (or the positional's declared name)
+//   index: 0-based occurrence within (kind, name)
+//   value: the string value ("true"/"false" for a flag); cast it yourself
+//
+// argv comes from the IBEX_ARGS environment variable (one argument per line).
+// Pass a non-empty `argv` (newline- or space-separated) to parse that instead --
+// handy for tests and embedding.
+extern fn parse_args(spec: String, argv: String = "") -> DataFrame from "args.hpp";

@@ -8,6 +8,7 @@ add_library(ibex_test_warning_suppressions INTERFACE)
 set(IBEX_TEST_SOURCES
     catch_string_view_apple.cpp
     test_arrow_c_data.cpp
+    test_args.cpp
     test_column.cpp
     test_csv.cpp
     test_json.cpp
@@ -71,6 +72,7 @@ target_include_directories(ibex_tests PRIVATE
     # test_filter_range.cpp exercises the range-aware evaluators, which are
     # declared in the runtime's internal headers rather than the public API.
     "${PROJECT_SOURCE_DIR}/src/runtime"
+    "${PROJECT_SOURCE_DIR}/libs/args"
     "${PROJECT_SOURCE_DIR}/libs/csv"
     "${PROJECT_SOURCE_DIR}/libs/kafka"
     "${PROJECT_SOURCE_DIR}/libs/json"

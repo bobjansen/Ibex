@@ -21,6 +21,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -71,12 +74,58 @@ constexpr auto rng_func_returns_int(std::string_view name) -> bool;
 // arguments (round's mode is a syntactic identifier; is_null is null-aware) are
 // handled outside this table, in the call sites below.
 
+// Parse an entire string as an Int64 / Float64. Leading and trailing ASCII
+// whitespace is tolerated; anything else left over is a failure. Used by the
+// String -> numeric casts (SPEC 3.1.1).
+auto parse_string_as_int(std::string_view s) -> std::optional<std::int64_t> {
+    while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.front())) != 0)) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (std::isspace(static_cast<unsigned char>(s.back())) != 0)) {
+        s.remove_suffix(1);
+    }
+    if (s.empty()) {
+        return std::nullopt;
+    }
+    std::int64_t out{};
+    const auto* begin = s.data();
+    if (!s.empty() && s.front() == '+') {
+        begin += 1;  // std::from_chars rejects a leading '+'
+    }
+    const auto [ptr, ec] = std::from_chars(begin, s.data() + s.size(), out);
+    if (ec != std::errc{} || ptr != s.data() + s.size()) {
+        return std::nullopt;
+    }
+    return out;
+}
+
+auto parse_string_as_double(std::string_view s) -> std::optional<double> {
+    const std::string owned(s);
+    const char* begin = owned.c_str();
+    char* end = nullptr;
+    errno = 0;
+    const double value = std::strtod(begin, &end);
+    if (end == begin || errno == ERANGE) {
+        return std::nullopt;
+    }
+    while (*end != '\0' && (std::isspace(static_cast<unsigned char>(*end)) != 0)) {
+        ++end;
+    }
+    if (*end != '\0') {
+        return std::nullopt;
+    }
+    return value;
+}
+
 auto expr_value_to_double(const ExprValue& v) -> std::optional<double> {
     if (const auto* i = std::get_if<std::int64_t>(&v)) {
         return static_cast<double>(*i);
     }
     if (const auto* d = std::get_if<double>(&v)) {
         return *d;
+    }
+    if (const auto* s = std::get_if<std::string>(&v)) {
+        return parse_string_as_double(*s);
     }
     return std::nullopt;
 }
@@ -603,6 +652,25 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
             return ComputedColumn{.column = ColumnValue{std::move(out)},
                                   .validity = std::move(out_validity)};
         }
+        if (const auto* strs = std::get_if<Column<std::string>>(&col)) {
+            Column<std::int64_t> out;
+            out.resize(rows);
+            auto* op = out.data();
+            for (std::size_t i = 0; i < rows; ++i) {
+                if (validity != nullptr && !(*validity)[i]) {
+                    op[i] = 0;
+                    continue;
+                }
+                auto parsed = parse_string_as_int((*strs)[i]);
+                if (!parsed) {
+                    return std::unexpected(call.callee + "(): cannot parse '" +
+                                           std::string((*strs)[i]) + "' as an integer");
+                }
+                op[i] = *parsed;
+            }
+            return ComputedColumn{.column = ColumnValue{std::move(out)},
+                                  .validity = std::move(out_validity)};
+        }
         return std::unexpected(call.callee + "(): cannot cast non-numeric to Int");
     }
 
@@ -616,6 +684,25 @@ auto numeric_cast_kernel(const ir::CallExpr& call, const Table& input, std::size
         const auto* ip = ints->data();
         for (std::size_t i = 0; i < rows; ++i) {
             op[i] = static_cast<double>(ip[i]);
+        }
+        return ComputedColumn{.column = ColumnValue{std::move(out)},
+                              .validity = std::move(out_validity)};
+    }
+    if (const auto* strs = std::get_if<Column<std::string>>(&col)) {
+        Column<double> out;
+        out.resize(rows);
+        auto* op = out.data();
+        for (std::size_t i = 0; i < rows; ++i) {
+            if (validity != nullptr && !(*validity)[i]) {
+                op[i] = 0.0;
+                continue;
+            }
+            auto parsed = parse_string_as_double((*strs)[i]);
+            if (!parsed) {
+                return std::unexpected(call.callee + "(): cannot parse '" +
+                                       std::string((*strs)[i]) + "' as a number");
+            }
+            op[i] = *parsed;
         }
         return ComputedColumn{.column = ColumnValue{std::move(out)},
                               .validity = std::move(out_validity)};
@@ -961,12 +1048,19 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .max_args = 1,
             .scalar_kernel = ScalarKernel::NumericCast,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-                if (a[0] == ExprType::Int || a[0] == ExprType::Double) {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double ||
+                    a[0] == ExprType::String) {
                     return ExprType::Double;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");
             },
             .exec = ScalarExec{.eval = [](std::string_view, const std::vector<ExprValue>& a) -> IV {
+                if (const auto* s = std::get_if<std::string>(a.data())) {
+                    if (auto d = parse_string_as_double(*s)) {
+                        return ExprValue{*d};
+                    }
+                    return std::unexpected("Float64(): cannot parse '" + *s + "' as a number");
+                }
                 if (auto d = expr_value_to_double(a[0])) {
                     return ExprValue{*d};
                 }
@@ -987,7 +1081,8 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                 // Bool casts to 0/1 — the standard SQL spelling for counting a
                 // predicate (`sum(Int64(is_not_null(x)))`, which is what
                 // `count(x)` lowers to).
-                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::Bool) {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::Bool ||
+                    a[0] == ExprType::String) {
                     return ExprType::Int;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
@@ -1007,6 +1102,13 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
                                                "floor(), ceil(), or round())");
                     }
                     return ExprValue{static_cast<std::int64_t>(*d)};
+                }
+                if (const auto* s = std::get_if<std::string>(a.data())) {
+                    if (auto parsed = parse_string_as_int(*s)) {
+                        return ExprValue{*parsed};
+                    }
+                    return std::unexpected(std::string(name) + "(): cannot parse '" + *s +
+                                           "' as an integer");
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Int");
             }},

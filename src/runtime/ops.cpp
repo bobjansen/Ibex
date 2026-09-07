@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -107,7 +108,27 @@ auto eval_scalar(const ir::Expr& expr) -> runtime::ScalarValue {
     return std::move(*value);
 }
 
-auto scalar_arg(const ir::Expr& expr) -> ScalarArg { return ScalarArg{eval_scalar(expr)}; }
+auto scalar_arg(const ir::Expr& expr) -> ScalarArg {
+    return ScalarArg{eval_scalar(expr)};
+}
+
+void forward_cli_args(int argc, char** argv) {
+    if (argc <= 1 || argv == nullptr) {
+        return;
+    }
+    std::string joined;
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1) {
+            joined += '\n';
+        }
+        joined += argv[i];
+    }
+#ifdef _WIN32
+    _putenv_s("IBEX_ARGS", joined.c_str());
+#else
+    ::setenv("IBEX_ARGS", joined.c_str(), /*overwrite=*/1);
+#endif
+}
 
 auto filter(const runtime::Table& t, ir::Expr pred) -> runtime::Table {
     ir::Builder b;

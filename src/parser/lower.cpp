@@ -2228,11 +2228,11 @@ class Lowerer {
                 return std::unexpected(
                     LowerError{.message = "map { } runs only on the interpreter path"});
             }
-            const bool has_other_clause =
-                state.filter || state.select || state.distinct || state.update || state.rename ||
-                state.order || state.head || state.tail || state.by || state.window ||
-                state.resample || state.melt || state.dcast || state.cov || state.corr ||
-                state.transpose || state.model;
+            const bool has_other_clause = state.filter || state.select || state.distinct ||
+                                          state.update || state.rename || state.order ||
+                                          state.head || state.tail || state.by || state.window ||
+                                          state.resample || state.melt || state.dcast ||
+                                          state.cov || state.corr || state.transpose || state.model;
             if (has_other_clause) {
                 return std::unexpected(
                     LowerError{.message = "map { } must be the only clause in its block"});
@@ -2244,8 +2244,8 @@ class Lowerer {
             fields.reserve(state.map->fields.size());
             for (const auto& field : state.map->fields) {
                 if (field.expr == nullptr) {
-                    return std::unexpected(
-                        LowerError{.message = "map { } field '" + field.name + "' needs an expression"});
+                    return std::unexpected(LowerError{.message = "map { } field '" + field.name +
+                                                                 "' needs an expression"});
                 }
                 auto expr = lower_expr_to_ir(*field.expr);
                 if (!expr.has_value()) {
@@ -3079,8 +3079,8 @@ class Lowerer {
     auto inline_table_udf(const FunctionDecl& fn, const CallExpr& call) -> LowerResult {
         if (fn.return_type.kind != Type::Kind::DataFrame &&
             fn.return_type.kind != Type::Kind::TimeFrame) {
-            return std::unexpected(LowerError{
-                .message = "function '" + fn.name + "' does not return a DataFrame"});
+            return std::unexpected(
+                LowerError{.message = "function '" + fn.name + "' does not return a DataFrame"});
         }
         if (bindings_ == nullptr) {
             return std::unexpected(
@@ -3115,14 +3115,15 @@ class Lowerer {
             bound[pos] = narg.value.get();
         }
         if (!inlining_active_.insert(fn.name).second) {
-            return std::unexpected(LowerError{
-                .message = "recursive table function '" + fn.name + "' cannot be inlined"});
+            return std::unexpected(LowerError{.message = "recursive table function '" + fn.name +
+                                                         "' cannot be inlined"});
         }
 
         std::vector<std::string> installed_bindings;
         robin_hood::unordered_map<std::string, ir::NodePtr> shadowed;
         const auto shadow = [&](const std::string& name, ir::NodePtr node) {
-            if (auto it = bindings_->find(name); it != bindings_->end() && !shadowed.contains(name)) {
+            if (auto it = bindings_->find(name);
+                it != bindings_->end() && !shadowed.contains(name)) {
                 shadowed.emplace(name, std::move(it->second));
             }
             (*bindings_)[name] = std::move(node);

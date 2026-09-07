@@ -47,7 +47,9 @@ auto rows_of(const ibex::runtime::Table& table) -> std::vector<Row> {
     return out;
 }
 
-auto tokens(std::vector<std::string> v) -> std::vector<std::string> { return v; }
+auto tokens(std::vector<std::string> v) -> std::vector<std::string> {
+    return v;
+}
 
 }  // namespace
 
@@ -96,7 +98,8 @@ TEST_CASE("parse_args: --name=value, --no-flag, repeated", "[args]") {
 }
 
 TEST_CASE("parse_args: `--` forces positionals", "[args]") {
-    const auto rows = rows_of(parse_args_from_tokens("rest : positional*", tokens({"--", "-x", "--y"})));
+    const auto rows =
+        rows_of(parse_args_from_tokens("rest : positional*", tokens({"--", "-x", "--y"})));
     CHECK(rows[0] == Row{"positional", "rest", 0, "-x"});
     CHECK(rows[1] == Row{"positional", "rest", 1, "--y"});
 }
@@ -117,9 +120,8 @@ TEST_CASE("parse_args: errors", "[args]") {
 }
 
 TEST_CASE("parse_args: a single-value option given twice is an error", "[args]") {
-    CHECK_THROWS_WITH(
-        parse_args_from_tokens("out : string", tokens({"--out", "a", "--out", "b"})),
-        Catch::Matchers::ContainsSubstring("more than once"));
+    CHECK_THROWS_WITH(parse_args_from_tokens("out : string", tokens({"--out", "a", "--out", "b"})),
+                      Catch::Matchers::ContainsSubstring("more than once"));
 }
 
 TEST_CASE("parse_args: bare positional when none declared gets name \"\"", "[args]") {
@@ -156,8 +158,8 @@ let args = parse_args(spec, "-t 9 -v");
     REQUIRE(setup.ok);
 
     SECTION("cast of a present option") {
-        const auto r = session.execute(
-            "Int64(scalar(args[filter name == \"threads\", select { value }]));");
+        const auto r =
+            session.execute("Int64(scalar(args[filter name == \"threads\", select { value }]));");
         REQUIRE(r.ok);
         REQUIRE(r.scalar.has_value());
         CHECK(std::get<std::int64_t>(*r.scalar) == 9);

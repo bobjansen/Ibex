@@ -127,6 +127,9 @@ void Emitter::emit(std::ostream& out, const ir::Node& root, const Config& config
         if (config.bench_mode)
             throw std::runtime_error("table entry point cannot be a benchmark harness");
         out << "ibex::runtime::Table " << config.entry_point_name << "() {\n";
+    } else if (config.forward_cli_args) {
+        out << "int main(int argc, char** argv) {\n";
+        out << "    ibex::ops::forward_cli_args(argc, argv);\n\n";
     } else {
         out << "int main() {\n";
     }

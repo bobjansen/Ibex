@@ -1120,8 +1120,7 @@ std::size_t default_max_rows() {
     if (end == env || *end != '\0') {
         return 10;
     }
-    return parsed == 0 ? std::numeric_limits<std::size_t>::max()
-                       : static_cast<std::size_t>(parsed);
+    return parsed == 0 ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(parsed);
 }
 
 void print_table(const runtime::Table& table) {
@@ -2039,8 +2038,7 @@ auto apply_scalar_cast(const runtime::ScalarValue& val, std::string_view callee)
         if (const auto* s = std::get_if<std::string>(&val)) {
             std::string trimmed = *s;
             const auto not_space = [](unsigned char c) { return std::isspace(c) == 0; };
-            trimmed.erase(trimmed.begin(),
-                          std::ranges::find_if(trimmed, not_space));
+            trimmed.erase(trimmed.begin(), std::ranges::find_if(trimmed, not_space));
             trimmed.erase(std::find_if(trimmed.rbegin(), trimmed.rend(), not_space).base(),
                           trimmed.end());
             std::int64_t out{};
@@ -3712,8 +3710,7 @@ auto eval_map_clause(parser::MapClause& clause, const runtime::Table& input,
                      runtime::ScalarRegistry& scalars, ColumnRegistry& columns,
                      ModelRegistry& models, const FunctionRegistry& functions,
                      CompileTimeListRegistry& compile_time_lists,
-                     const ExternDeclRegistry& extern_decls,
-                     const runtime::ExternRegistry& externs)
+                     const ExternDeclRegistry& extern_decls, const runtime::ExternRegistry& externs)
     -> std::expected<runtime::Table, std::string> {
     if (clause.fields.empty()) {
         return std::unexpected("map { } needs at least one field");
@@ -3734,9 +3731,9 @@ auto eval_map_clause(parser::MapClause& clause, const runtime::Table& input,
             row_scalars[entry.name] = map_cell_scalar(entry, r);
         }
         for (std::size_t f = 0; f < nf; ++f) {
-            auto value = eval_expr_value(*clause.fields[f].expr, tables, lazy_tables, row_scalars,
-                                         columns, models, functions, compile_time_lists,
-                                         extern_decls, externs);
+            auto value =
+                eval_expr_value(*clause.fields[f].expr, tables, lazy_tables, row_scalars, columns,
+                                models, functions, compile_time_lists, extern_decls, externs);
             if (!value) {
                 return std::unexpected(value.error());
             }
@@ -3872,16 +3869,16 @@ auto eval_table_expr(parser::Expr& expr, runtime::TableRegistry& tables,
             parser::MapClause map_clause =
                 std::move(std::get<parser::MapClause>(block->clauses.back()));
             block->clauses.pop_back();
-            auto input = eval_table_expr(expr, tables, lazy_tables, scalars, columns, models,
-                                         functions, compile_time_lists, extern_decls, externs,
-                                         nullptr);
+            auto input =
+                eval_table_expr(expr, tables, lazy_tables, scalars, columns, models, functions,
+                                compile_time_lists, extern_decls, externs, nullptr);
             block->clauses.emplace_back(std::move(map_clause));
             if (!input) {
                 return std::unexpected(input.error());
             }
-            return eval_map_clause(std::get<parser::MapClause>(block->clauses.back()), input.value(),
-                                   tables, lazy_tables, scalars, columns, models, functions,
-                                   compile_time_lists, extern_decls, externs);
+            return eval_map_clause(std::get<parser::MapClause>(block->clauses.back()),
+                                   input.value(), tables, lazy_tables, scalars, columns, models,
+                                   functions, compile_time_lists, extern_decls, externs);
         }
         if (block->base && std::holds_alternative<parser::CallExpr>(block->base->node)) {
             auto* call = std::get_if<parser::CallExpr>(&block->base->node);

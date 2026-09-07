@@ -11,8 +11,8 @@
 #include <csv.hpp>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <fs.hpp>
+#include <fstream>
 #include <string>
 #include <variant>
 #include <vector>
@@ -22,8 +22,8 @@ namespace {
 namespace stdfs = std::filesystem;
 
 auto make_temp_dir(const std::string& tag) -> stdfs::path {
-    const auto dir = stdfs::temp_directory_path() /
-                     ("ibex_fs_test_" + tag + "_" + std::to_string(::getpid()));
+    const auto dir =
+        stdfs::temp_directory_path() / ("ibex_fs_test_" + tag + "_" + std::to_string(::getpid()));
     std::error_code ec;
     stdfs::remove_all(dir, ec);
     stdfs::create_directories(dir);
@@ -130,9 +130,7 @@ auto make_registry() -> ibex::runtime::ExternRegistry {
 TEST_CASE("map clause: row-wise scalar evaluation", "[fs][map]") {
     auto registry = make_registry();
     ibex::repl::ReplSession session(ibex::repl::ReplConfig{}, registry);
-    REQUIRE(session
-                .execute("let t = Table { x = [1, 2, 3], label = [\"a\", \"b\", \"c\"] };")
-                .ok);
+    REQUIRE(session.execute("let t = Table { x = [1, 2, 3], label = [\"a\", \"b\", \"c\"] };").ok);
 
     SECTION("columns are in scope as scalars") {
         const auto r = session.execute("t[map { doubled = x * 2, tag = label }];");

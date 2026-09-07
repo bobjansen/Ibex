@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IBEX_ROOT="${IBEX_ROOT:-$(dirname "$SCRIPT_DIR")}"
 BUILD_DIR="${BUILD_DIR:-$IBEX_ROOT/build}"
 RELEASE_DIR="${RELEASE_DIR:-$IBEX_ROOT/build-release}"
+CXX="${CXX:-clang++}"
 
 SKIP_BUILD=false
 SKIP_TESTS=false
@@ -437,6 +438,29 @@ if [[ "$SKIP_COMPILE" == false ]]; then
     "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_scalar_arg.ibex" -o "$out_cpp"
     rg -n "read_csv\\(ibex::ops::scalar_arg\\(" "$out_cpp" >/dev/null
     rm -f "$out_cpp"
+
+    echo "▸ transpile + run (parse_args forwards argv)"
+    pa_cpp="$(mktemp --suffix=.cpp)"
+    pa_bin="$(mktemp -u)"
+    "$BUILD_DIR/tools/ibex_compile" "$IBEX_ROOT/tests/data/compile_parse_args.ibex" -o "$pa_cpp"
+    rg -n "int main\\(int argc, char\\*\\* argv\\)" "$pa_cpp" >/dev/null
+    rg -n "ibex::ops::forward_cli_args\\(argc, argv\\)" "$pa_cpp" >/dev/null
+    "$CXX" -std=c++23 \
+        -I"$IBEX_ROOT/include" -I"$IBEX_ROOT/libraries" -I"$IBEX_ROOT/libs/args" \
+        -isystem "$BUILD_DIR/_deps/robin_hood-src/src/include" \
+        "$pa_cpp" \
+        "$BUILD_DIR/src/runtime/libibex_runtime.a" "$BUILD_DIR/src/parser/libibex_parser.a" \
+        "$BUILD_DIR/src/ir/libibex_ir.a" "$BUILD_DIR/src/core/libibex_core.a" \
+        -o "$pa_bin"
+    pa_default="$("$pa_bin")"
+    pa_cli="$("$pa_bin" --limit 3 --tag hello)"
+    if ! grep -q '"base"' <<<"$pa_default" || [[ "$(grep -c '^|' <<<"$pa_default")" -ne 3 ]]; then
+        echo "error: parse_args default run wrong:" >&2; echo "$pa_default" >&2; exit 1
+    fi
+    if ! grep -q '"hello"' <<<"$pa_cli" || [[ "$(grep -c '^|' <<<"$pa_cli")" -ne 4 ]]; then
+        echo "error: parse_args argv run wrong:" >&2; echo "$pa_cli" >&2; exit 1
+    fi
+    rm -f "$pa_cpp" "$pa_bin"
 
     echo "▸ transpile (parquet https)"
     out_cpp="$(mktemp --suffix=.cpp)"

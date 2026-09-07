@@ -468,12 +468,11 @@ TEST_CASE("emitter: call expression preserves named args", "[codegen]") {
 
 TEST_CASE("emitter: map node - row-wise fields", "[codegen]") {
     ir::Builder b;
-    ir::FieldSpec doubled{
-        .alias = "doubled",
-        .expr = ir::Expr{ir::BinaryExpr{
-            .op = ir::ArithmeticOp::Mul,
-            .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "n"}}),
-            .right = ir::make_expr_ptr(ir::Expr{ir::Literal{std::int64_t{2}}})}}};
+    ir::FieldSpec doubled{.alias = "doubled",
+                          .expr = ir::Expr{ir::BinaryExpr{
+                              .op = ir::ArithmeticOp::Mul,
+                              .left = ir::make_expr_ptr(ir::Expr{ir::ColumnRef{.name = "n"}}),
+                              .right = ir::make_expr_ptr(ir::Expr{ir::Literal{std::int64_t{2}}})}}};
     ir::FieldSpec tag{.alias = "tag", .expr = ir::Expr{ir::ColumnRef{.name = "label"}}};
 
     auto map_node = b.map({std::move(doubled), std::move(tag)});
@@ -494,10 +493,8 @@ TEST_CASE("emitter: non-literal row-count argument resolves at run time", "[code
     auto construct = b.construct_rows(ir::Expr{ir::ColumnRef{.name = "n"}});
 
     codegen::Emitter::Config cfg;
-    cfg.deferred_scalar_bindings.push_back(
-        ir::DeferredScalarBinding{.name = "n",
-                                  .sources = {},
-                                  .value = ir::Expr{ir::Literal{std::int64_t{3}}}});
+    cfg.deferred_scalar_bindings.push_back(ir::DeferredScalarBinding{
+        .name = "n", .sources = {}, .value = ir::Expr{ir::Literal{std::int64_t{3}}}});
     auto out = emit_to_string(*construct, cfg);
     CHECK(contains(out, "ibex::ops::scalar_arg("));
     CHECK(contains(out, "ibex::ops::col_ref(\"n\")"));
@@ -508,6 +505,22 @@ TEST_CASE("emitter: a bare unbound name in an extern argument is still an error"
     ir::Builder b;
     auto construct = b.construct_rows(ir::Expr{ir::ColumnRef{.name = "mystery"}});
     CHECK_THROWS(emit_to_string(*construct));
+}
+
+TEST_CASE("emitter: forward_cli_args changes the main signature", "[codegen]") {
+    ir::Builder b;
+    auto project = b.project({ir::ColumnRef{.name = "x"}});
+    project->add_child(make_source(b, "t.csv"));
+
+    codegen::Emitter::Config cfg;
+    cfg.forward_cli_args = true;
+    auto out = emit_to_string(*project, cfg);
+    CHECK(contains(out, "int main(int argc, char** argv)"));
+    CHECK(contains(out, "ibex::ops::forward_cli_args(argc, argv);"));
+
+    auto plain = emit_to_string(*project);
+    CHECK(contains(plain, "int main() {"));
+    CHECK_FALSE(contains(plain, "forward_cli_args"));
 }
 
 // --- Chained pipeline --------------------------------------------------------

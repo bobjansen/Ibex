@@ -1664,14 +1664,13 @@ class Parser {
                 return std::nullopt;
             }
             if (!result->tuple_fields.empty() || !result->map_fields.empty()) {
-                error_ = make_error(previous(),
-                                    "map { } takes only 'name = expr' fields");
+                error_ = make_error(previous(), "map { } takes only 'name = expr' fields");
                 return std::nullopt;
             }
             for (const auto& field : result->fields) {
                 if (field.expr == nullptr) {
-                    error_ = make_error(previous(),
-                                        "map { } field '" + field.name + "' needs '= expr'");
+                    error_ =
+                        make_error(previous(), "map { } field '" + field.name + "' needs '= expr'");
                     return std::nullopt;
                 }
             }

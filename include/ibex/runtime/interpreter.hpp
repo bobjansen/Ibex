@@ -941,7 +941,8 @@ class ExternRegistry;
 
 /// Evaluate a scalar-valued expression against `scalars` (no column input).
 /// Returns a null scalar (monostate) when the expression evaluates to null.
-[[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr, const ScalarRegistry* scalars = nullptr,
+[[nodiscard]] auto evaluate_scalar_expr(const ir::Expr& expr,
+                                        const ScalarRegistry* scalars = nullptr,
                                         const ExternRegistry* externs = nullptr)
     -> std::expected<ScalarValue, std::string>;
 

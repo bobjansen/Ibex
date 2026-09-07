@@ -1,0 +1,12 @@
+import "args";
+
+// `parse_args` in compiled mode (conformance plan W2 / libs/args): the emitted
+// `main` forwards its own argv to `IBEX_ARGS`, so `./binary --limit 3 --tag x`
+// works the way `ibex script.ibex -- --limit 3 --tag x` does. With no argv the
+// spec defaults apply.
+let args = parse_args("limit : int = 2 # row limit ; tag : string = base # a label");
+let lim = Int64(scalar(args[filter name == "limit", select { value }]));
+let tag = scalar(args[filter name == "tag", select { value }]);
+
+let rows = Table { k = ["a", "b", "c", "d"], v = [1, 2, 3, 4] };
+rows[update { label = tag }][head lim];

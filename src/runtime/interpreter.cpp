@@ -582,8 +582,8 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
             if (!child) {
                 return std::unexpected(child.error());
             }
-            auto merged = update_table(std::move(child.value()), map_node.fields(), scalars,
-                                       externs, exec);
+            auto merged =
+                update_table(std::move(child.value()), map_node.fields(), scalars, externs, exec);
             if (!merged) {
                 return std::unexpected(merged.error());
             }

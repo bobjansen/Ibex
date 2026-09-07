@@ -565,7 +565,8 @@ auto broadcast_cast_result(const ScalarValue& value, bool to_int, std::size_t ro
         if (to_int) {
             Column<std::int64_t> col;
             col.resize(rows, 0);
-            return ComputedColumn{.column = ColumnValue{std::move(col)}, .validity = std::move(none)};
+            return ComputedColumn{.column = ColumnValue{std::move(col)},
+                                  .validity = std::move(none)};
         }
         Column<double> col;
         col.resize(rows, 0.0);
@@ -1048,8 +1049,7 @@ const robin_hood::unordered_map<std::string_view, BuiltinFn>& builtins() {
             .max_args = 1,
             .scalar_kernel = ScalarKernel::NumericCast,
             .infer = [](std::string_view name, const std::vector<ExprType>& a) -> IT {
-                if (a[0] == ExprType::Int || a[0] == ExprType::Double ||
-                    a[0] == ExprType::String) {
+                if (a[0] == ExprType::Int || a[0] == ExprType::Double || a[0] == ExprType::String) {
                     return ExprType::Double;
                 }
                 return std::unexpected(std::string(name) + "(): cannot cast non-numeric to Float");

@@ -293,11 +293,10 @@ struct ModelClause {
     std::vector<ModelParam> params;
 };
 
-using Clause =
-    std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
-                 OrderClause, HeadClause, TailClause, ByClause, WindowClause, ResampleClause,
-                 MeltClause, DcastClause, CovClause, CorrClause, TransposeClause, ModelClause,
-                 MapClause>;
+using Clause = std::variant<FilterClause, SelectClause, DistinctClause, UpdateClause, RenameClause,
+                            OrderClause, HeadClause, TailClause, ByClause, WindowClause,
+                            ResampleClause, MeltClause, DcastClause, CovClause, CorrClause,
+                            TransposeClause, ModelClause, MapClause>;
 
 struct BlockExpr {
     ExprPtr base;

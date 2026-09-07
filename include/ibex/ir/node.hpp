@@ -227,7 +227,8 @@ struct DeferredScalarSource {
 struct DeferredScalarBinding {
     std::string name;
     std::vector<DeferredScalarSource> sources;
-    Expr value;  ///< residual scalar expr; each scalar(...) is a lexical ref to its source's tmp_name
+    Expr value;  ///< residual scalar expr; each scalar(...) is a lexical ref to its source's
+                 ///< tmp_name
 };
 
 inline ExprPtr::ExprPtr() = default;

@@ -1749,3 +1749,29 @@ TEST_CASE("Parse left(...) / right(...) require a bare column name") {
     REQUIRE_FALSE(unclosed.has_value());
     CHECK(unclosed.error().message.find("expected ')' after left(column)") != std::string::npos);
 }
+
+TEST_CASE("Parse map { } clause") {
+    auto result = parse(R"(
+files[map { source = path, out = `${dir}/${stem}.parquet` }];
+)");
+    REQUIRE(result.has_value());
+    REQUIRE(result->statements.size() == 1);
+    const auto& expr_stmt = std::get<ExprStmt>(result->statements[0]);
+    const auto& block = require_block(*expr_stmt.expr);
+    REQUIRE(block.clauses.size() == 1);
+    const auto* map_clause = std::get_if<MapClause>(&block.clauses.front());
+    REQUIRE(map_clause != nullptr);
+    REQUIRE(map_clause->fields.size() == 2);
+    CHECK(map_clause->fields[0].name == "source");
+    CHECK(map_clause->fields[1].name == "out");
+}
+
+TEST_CASE("Parse rejects map { } that is not the last clause") {
+    auto result = parse("t[map { y = x }, filter y > 0];");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().message.find("last clause") != std::string::npos);
+}
+
+TEST_CASE("Parse rejects a bare field in map { }") {
+    REQUIRE_FALSE(parse("t[map { x }];").has_value());
+}

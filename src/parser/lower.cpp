@@ -288,6 +288,13 @@ auto clone_clause(const Clause& clause) -> Clause {
                     out.params.push_back(ModelParam{.name = p.name, .value = clone_expr(*p.value)});
                 }
                 return out;
+            } else if constexpr (std::is_same_v<T, MapClause>) {
+                MapClause out;
+                out.fields.reserve(c.fields.size());
+                for (const auto& f : c.fields) {
+                    out.fields.push_back(clone_field(f));
+                }
+                return out;
             } else {
                 return Clause{c};
             }
@@ -2656,6 +2663,13 @@ class Lowerer {
                 }
                 model = &std::get<ModelClause>(clause);
                 return true;
+            }
+            if (std::holds_alternative<MapClause>(clause)) {
+                // The REPL peels a trailing `map { }` off and runs it row-wise
+                // before lowering (it composes effectful externs). Reaching here
+                // means a caller lowered a block that still has one.
+                error = "map { } runs only on the interpreter path";
+                return false;
             }
             return true;
         }

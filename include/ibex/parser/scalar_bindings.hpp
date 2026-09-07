@@ -26,8 +26,11 @@
 
 namespace ibex::parser {
 
-using ScalarValue =
-    std::variant<std::int64_t, double, bool, std::string, ibex::Date, ibex::Timestamp>;
+// Must stay identical to ibex::runtime::ScalarValue and
+// ibex::codegen::Emitter::Config::ScalarValue -- see the note there. The
+// leading std::monostate is the null alternative.
+using ScalarValue = std::variant<std::monostate, std::int64_t, double, bool, std::string, ibex::Date,
+                                 ibex::Timestamp>;
 
 [[nodiscard]] inline auto eval_scalar_expr(
     const Expr& expr, const robin_hood::unordered_map<std::string, ScalarValue>& env)

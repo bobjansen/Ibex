@@ -597,18 +597,27 @@ struct Null {
 
 using ExprValue = std::variant<Null, std::int64_t, double, bool, std::string, Date, Timestamp>;
 
-/// ScalarValue -> ExprValue: always valid (ScalarValue is the null-free subset).
+/// ScalarValue -> ExprValue: total. The monostate (null) alternative maps to
+/// ExprValue::Null.
 inline auto expr_from_scalar(const ScalarValue& v) -> ExprValue {
-    return std::visit([](const auto& x) -> ExprValue { return x; }, v);
+    return std::visit(
+        [](const auto& x) -> ExprValue {
+            if constexpr (std::is_same_v<std::decay_t<decltype(x)>, std::monostate>) {
+                return Null{};
+            } else {
+                return x;
+            }
+        },
+        v);
 }
 
-/// ExprValue -> ScalarValue: nullopt on Null (no scalar image). Callers at
-/// the REPL/extern boundary decide how to surface that.
-inline auto scalar_from_expr(const ExprValue& v) -> std::optional<ScalarValue> {
+/// ExprValue -> ScalarValue: total. ExprValue::Null maps to the monostate
+/// (null) alternative of ScalarValue.
+inline auto scalar_from_expr(const ExprValue& v) -> ScalarValue {
     return std::visit(
-        [](const auto& x) -> std::optional<ScalarValue> {
+        [](const auto& x) -> ScalarValue {
             if constexpr (std::is_same_v<std::decay_t<decltype(x)>, Null>) {
-                return std::nullopt;
+                return ScalarValue{std::monostate{}};
             } else {
                 return ScalarValue{x};
             }
@@ -1123,9 +1132,17 @@ inline auto broadcast_scalar_column(const ScalarValue& value, std::size_t rows) 
     return std::visit(
         [rows](const auto& v) -> ColumnValue {
             using V = std::decay_t<decltype(v)>;
-            Column<V> col;
-            col.resize(rows, v);
-            return ColumnValue{std::move(col)};
+            if constexpr (std::is_same_v<V, std::monostate>) {
+                // A null scalar has no column type. Callers that can reach a
+                // null must broadcast it themselves (typed null column); this
+                // path is a contract violation.
+                invariant_violation("broadcast_scalar_column: null scalar has no column image");
+                return ColumnValue{Column<std::int64_t>{}};
+            } else {
+                Column<V> col;
+                col.resize(rows, v);
+                return ColumnValue{std::move(col)};
+            }
         },
         value);
 }

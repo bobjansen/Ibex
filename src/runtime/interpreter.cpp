@@ -986,9 +986,9 @@ auto interpret_node(const ir::Node& node, const TableRegistry& registry,
                     if (!val)
                         return std::unexpected(val.error());
                     auto scalar = scalar_from_expr(val.value());
-                    if (!scalar.has_value())
+                    if (is_null_scalar(scalar))
                         return std::unexpected("null argument in stream extern call");
-                    out.push_back(std::move(*scalar));
+                    out.push_back(std::move(scalar));
                 }
                 return out;
             };
@@ -1531,8 +1531,11 @@ auto join_tables(const Table& left, const Table& right, ir::JoinKind kind,
                            null_match, expect, take);
 }
 
-auto extract_scalar(const Table& table, const std::string& column)
+auto extract_scalar(const Table& table, const std::string& column, bool zero_rows_is_null)
     -> std::expected<ScalarValue, std::string> {
+    if (table.rows() == 0 && zero_rows_is_null) {
+        return ScalarValue{std::monostate{}};
+    }
     if (table.rows() != 1) {
         return std::unexpected("scalar() requires exactly one row");
     }
@@ -1540,10 +1543,10 @@ auto extract_scalar(const Table& table, const std::string& column)
     if (entry == nullptr || entry->column == nullptr) {
         return std::unexpected("column not found: " + column);
     }
-    // ScalarValue is null-free by design; a null cell has no scalar image.
+    // A null cell yields a null scalar (the monostate alternative), not an
+    // error -- see plans/parse-args-and-nullable-scalars-plan.md Part 1.
     if (entry->validity.has_value() && !(*entry->validity)[0]) {
-        return std::unexpected("scalar value of '" + column +
-                               "' is null; scalars cannot hold null");
+        return ScalarValue{std::monostate{}};
     }
     return scalar_from_column(*entry->column, 0);
 }
@@ -1577,11 +1580,10 @@ auto eval_scalar_builtin(std::string_view name, const std::vector<ScalarValue>& 
     if (!result) {
         return std::unexpected(result.error());
     }
-    auto scalar = scalar_from_expr(*result);
-    if (!scalar.has_value()) {
-        return std::unexpected(std::string(name) + ": returned null in scalar context");
-    }
-    return std::move(*scalar);
+    // A null result is now a valid scalar (the monostate alternative); null
+    // propagation and the null-handling builtins (coalesce, is null) rely on
+    // it reaching the caller rather than erroring here.
+    return scalar_from_expr(*result);
 }
 
 auto aggregate_series(std::string_view name, const ColumnValue& column, double param)
